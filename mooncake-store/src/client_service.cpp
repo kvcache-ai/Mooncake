@@ -3266,9 +3266,34 @@ void Client::PutToLocalFile(const std::string& key,
     // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
-        // Store the object
-        auto store_result = backend->StoreObject(path, value, key);
         ReplicaType replica_type = ReplicaType::DISK;
+        // Store the object
+        auto store_result = backend->StoreObject(
+            path, value, key,
+            [this, replica_type](const std::vector<std::string>& evicted_keys)
+                -> tl::expected<void, ErrorCode> {
+                auto evict_results = master_client_.BatchEvictDiskReplica(
+                    evicted_keys, replica_type);
+                if (evict_results.size() != evicted_keys.size()) {
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                for (size_t i = 0; i < evict_results.size(); ++i) {
+                    if (!evict_results[i]) {
+                        if (evict_results[i].error() ==
+                            ErrorCode::OBJECT_NOT_FOUND) {
+                            VLOG(1) << "Master no longer tracks evicted key: "
+                                    << evicted_keys[i];
+                            continue;
+                        }
+                        LOG(WARNING)
+                            << "Failed to notify master about evicted key: "
+                            << evicted_keys[i]
+                            << ", error: " << evict_results[i].error();
+                        return tl::make_unexpected(evict_results[i].error());
+                    }
+                }
+                return {};
+            });
 
         if (!store_result) {
             // If storage failed, revoke the put operation
@@ -3278,21 +3303,6 @@ void Client::PutToLocalFile(const std::string& key,
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
             return;
-        }
-
-        // Notify master about any evicted disk replicas (batch)
-        if (!store_result.value().empty()) {
-            const auto& evicted_keys = store_result.value();
-            auto evict_results = master_client_.BatchEvictDiskReplica(
-                evicted_keys, replica_type);
-            for (size_t i = 0; i < evict_results.size(); ++i) {
-                if (!evict_results[i]) {
-                    LOG(WARNING)
-                        << "Failed to notify master about evicted key: "
-                        << evicted_keys[i]
-                        << ", error: " << evict_results[i].error();
-                }
-            }
         }
 
         // If storage succeeded, end the put operation
