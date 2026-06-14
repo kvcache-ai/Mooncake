@@ -1,8 +1,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <barrier>
+#include <chrono>
 #include <filesystem>
 #include <thread>
+#include <vector>
 
 #include "allocator.h"
 #include "storage_backend.h"
@@ -540,6 +544,243 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
         FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
     ASSERT_TRUE(load_result);
     // No crash = success. No metrics pointer, so nothing to verify.
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_SerializesSameKey) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    constexpr int kConcurrency = 8;
+
+    std::atomic<int> success_count{0};
+    std::atomic<int> started{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (result) {
+                fileStorage.ReleaseBuffer(result->batch_id);
+                success_count.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(), kConcurrency)
+        << "All concurrent BatchGet calls should succeed";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_DifferentKeysRunConcurrently) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 2u) << "Need at least 2 keys for this test";
+
+    std::atomic<int> success_count{0};
+    std::vector<std::thread> threads;
+
+    for (size_t i = 0; i < std::min(keys.size(), size_t(4)); ++i) {
+        threads.emplace_back([&, i] {
+            auto result = fileStorage.BatchGet({keys[i]}, {sizes[i]});
+            if (result) {
+                fileStorage.ReleaseBuffer(result->batch_id);
+                success_count.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(),
+              static_cast<int>(std::min(keys.size(), size_t(4))))
+        << "All different-key BatchGet calls should succeed";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBypassesSingleflight) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 2u);
+
+    auto result = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(result) << "Multi-key BatchGet should succeed";
+    fileStorage.ReleaseBuffer(result->batch_id);
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    const std::string& expected_data = batch_data.at(target_key);
+    constexpr int kConcurrency = 16;
+
+    std::atomic<int> success_count{0};
+    std::atomic<int> shared_batch_count{0};
+    std::atomic<int> started{0};
+    std::atomic<uint64_t> leader_batch_id{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (!result) return;
+
+            uint64_t expected = 0;
+            if (leader_batch_id.compare_exchange_strong(expected,
+                                                        result->batch_id)) {
+                // First to set — this is the leader
+            }
+            if (result->batch_id == leader_batch_id.load()) {
+                shared_batch_count.fetch_add(1);
+            }
+
+            // Verify data correctness: read from staging pointer
+            ASSERT_EQ(result->pointers.size(), 1u);
+            auto* data_ptr = reinterpret_cast<const char*>(result->pointers[0]);
+            std::string actual(data_ptr, target_size);
+            EXPECT_EQ(actual, expected_data)
+                << "Data mismatch for batch_id=" << result->batch_id;
+
+            fileStorage.ReleaseBuffer(result->batch_id);
+            success_count.fetch_add(1);
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(), kConcurrency)
+        << "All concurrent BatchGet calls should succeed";
+
+    // With staging sharing, most threads should get the same batch_id.
+    // At minimum the leader + some waiters share a batch.
+    LOG(INFO) << "Staging sharing results: " << shared_batch_count.load() << "/"
+              << kConcurrency << " threads shared the same batch_id (leader="
+              << leader_batch_id.load() << ")";
+    EXPECT_GT(shared_batch_count.load(), 1)
+        << "At least 2 threads should share the same staging buffer";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_RefCountRelease) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    constexpr int kConcurrency = 8;
+
+    std::vector<uint64_t> batch_ids(kConcurrency, 0);
+    std::atomic<int> started{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    // Phase 1: all threads get batch_ids but DON'T release yet
+    std::barrier sync_point(kConcurrency + 1);  // +1 for main thread
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&, i] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            ASSERT_TRUE(result);
+            batch_ids[i] = result->batch_id;
+            sync_point.arrive_and_wait();  // signal: got batch_id
+            sync_point.arrive_and_wait();  // wait: main says release
+            fileStorage.ReleaseBuffer(result->batch_id);
+        });
+    }
+
+    sync_point.arrive_and_wait();  // wait for all threads to get batch_ids
+
+    // Verify: shared batch_ids still valid (not GC'd) because ref_count > 0
+    uint64_t shared_id = batch_ids[0];
+    int shared_count = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        if (batch_ids[i] == shared_id) {
+            shared_count++;
+        }
+    }
+    LOG(INFO) << "RefCount test: " << shared_count << "/" << kConcurrency
+              << " threads share batch_id=" << shared_id;
+
+    // Phase 2: let all threads release
+    sync_point.arrive_and_wait();
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // After all releases, batch should be fully cleaned up.
+    // A subsequent BatchGet for the same key should get a NEW batch_id.
+    auto fresh = fileStorage.BatchGet({target_key}, {target_size});
+    ASSERT_TRUE(fresh);
+    EXPECT_NE(fresh->batch_id, shared_id)
+        << "After all releases, a new BatchGet should allocate a fresh batch";
+    fileStorage.ReleaseBuffer(fresh->batch_id);
 }
 
 }  // namespace mooncake

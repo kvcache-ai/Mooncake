@@ -320,7 +320,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     return {};
 }
 
-tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
@@ -359,6 +359,88 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
     return batch_result;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    if (keys.size() == 1) {
+        const auto& key = keys[0];
+        std::shared_ptr<ColdReadFlight> flight;
+        bool is_leader = false;
+
+        {
+            std::unique_lock<std::mutex> lock(singleflight_mutex_);
+            singleflight_cv_.wait(lock, [&] {
+                return inflight_cold_reads_.find(key) !=
+                           inflight_cold_reads_.end() ||
+                       inflight_cold_reads_.size() <
+                           kMaxDistinctColdReadFlights;
+            });
+            auto it = inflight_cold_reads_.find(key);
+            if (it != inflight_cold_reads_.end()) {
+                flight = it->second;
+            } else {
+                flight = std::make_shared<ColdReadFlight>();
+                inflight_cold_reads_[key] = flight;
+                is_leader = true;
+            }
+        }
+
+        if (!is_leader) {
+            // Bounded spin (pure userspace), then cv wait (kernel fallback).
+            constexpr int kSpinIterations = 1024;
+            for (int i = 0; i < kSpinIterations; ++i) {
+                if (flight->done.load(std::memory_order_acquire)) break;
+                PAUSE();
+            }
+            if (!flight->done.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lock(singleflight_mutex_);
+                singleflight_cv_.wait(lock, [&] {
+                    return flight->done.load(std::memory_order_acquire);
+                });
+            }
+            // Propagate leader errors without redundant SSD IO.
+            if (!flight->result) {
+                return flight->result;
+            }
+            // Share the leader's staging buffer under client_buffer_mutex_
+            // to prevent ReleaseBuffer/GC from freeing it mid-increment.
+            MutexLocker locker(&client_buffer_mutex_);
+            auto it =
+                client_buffer_allocated_batches_.find(flight->result->batch_id);
+            if (it != client_buffer_allocated_batches_.end()) {
+                it->second->ref_count.fetch_add(1, std::memory_order_relaxed);
+                return flight->result;
+            }
+            locker.unlock();
+            return BatchGetOnce(keys, sizes);
+        }
+
+        // Leader: do SSD IO.
+        tl::expected<BatchGetResult, ErrorCode> result;
+        try {
+            result = BatchGetOnce(keys, sizes);
+        } catch (...) {
+            FinishFlight(key, *flight,
+                         tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            throw;
+        }
+        FinishFlight(key, *flight, result);
+        return result;
+    }
+
+    return BatchGetOnce(keys, sizes);
+}
+
+void FileStorage::FinishFlight(const std::string& key, ColdReadFlight& flight,
+                               tl::expected<BatchGetResult, ErrorCode> result) {
+    flight.result = std::move(result);
+    flight.done.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(singleflight_mutex_);
+        inflight_cold_reads_.erase(key);
+    }
+    singleflight_cv_.notify_all();
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -948,7 +1030,9 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                 auto gc_now = std::chrono::steady_clock::now();
                 for (auto it = client_buffer_allocated_batches_.begin();
                      it != client_buffer_allocated_batches_.end();) {
-                    if (gc_now >= it->second->lease_timeout) {
+                    if (gc_now >= it->second->lease_timeout &&
+                        it->second->ref_count.load(std::memory_order_relaxed) <=
+                            1) {
                         it = client_buffer_allocated_batches_.erase(it);
                     } else {
                         ++it;
@@ -993,7 +1077,9 @@ void FileStorage::ClientBufferGCThreadFunc() {
                 auto now = std::chrono::steady_clock::now();
                 for (auto it = client_buffer_allocated_batches_.begin();
                      it != client_buffer_allocated_batches_.end();) {
-                    if (now >= it->second->lease_timeout) {
+                    if (now >= it->second->lease_timeout &&
+                        it->second->ref_count.load(std::memory_order_relaxed) <=
+                            1) {
                         VLOG(1) << "GC releasing batch_id: " << it->first
                                 << " (lease expired)";
                         it = client_buffer_allocated_batches_.erase(it);
@@ -1012,15 +1098,19 @@ void FileStorage::ClientBufferGCThreadFunc() {
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     MutexLocker locker(&client_buffer_mutex_);
     auto it = client_buffer_allocated_batches_.find(batch_id);
-    if (it != client_buffer_allocated_batches_.end()) {
-        VLOG(1) << "Releasing buffer for batch_id: " << batch_id
-                << " (transfer completed)";
-        client_buffer_allocated_batches_.erase(it);
-        return true;
+    if (it == client_buffer_allocated_batches_.end()) {
+        VLOG(1) << "batch_id " << batch_id
+                << " not found (may have been GC'd already)";
+        return false;
     }
-    VLOG(1) << "batch_id " << batch_id
-            << " not found (may have been GC'd already)";
-    return false;
+    if (it->second->ref_count.fetch_sub(1, std::memory_order_acq_rel) <= 1) {
+        VLOG(1) << "Releasing buffer for batch_id: " << batch_id
+                << " (last reference)";
+        client_buffer_allocated_batches_.erase(it);
+    } else {
+        VLOG(1) << "Decremented ref_count for batch_id: " << batch_id;
+    }
+    return true;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
