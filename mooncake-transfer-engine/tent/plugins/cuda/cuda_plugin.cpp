@@ -13,12 +13,15 @@
 // limitations under the License.
 
 #include "tent/device_plugin.h"
+#include "tent/platform/cuda_utils.h"
 
 #include <cuda_runtime.h>
 #include <string.h>
 #include <stdio.h>
 #include <string>
 #include <glog/logging.h>
+
+using mooncake::tent::getCudaDeviceForPtr;
 
 struct cuda_plugin_ctx_t {
     // reserved
@@ -86,17 +89,18 @@ static int cuda_alloc(void* ctx_, void** pptr, size_t size, const char* loc) {
 static int cuda_free(void* ctx_, void* ptr, size_t size) {
     (void)ctx_;
     (void)size;
-    cudaPointerAttributes attrs;
-    CHECK_CUDA(cudaPointerGetAttributes(&attrs, ptr));
-    if (attrs.type == cudaMemoryTypeDevice) {
-        CHECK_CUDA(cudaFree(ptr));
-        return 0;
-    }
-    return -2;
+    if (getCudaDeviceForPtr(ptr) < 0) return -2;
+    CHECK_CUDA(cudaFree(ptr));
+    return 0;
 }
 
 static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
     (void)ctx_;
+    int dev = getCudaDeviceForPtr(src);
+    if (dev < 0) dev = getCudaDeviceForPtr(dst);
+    if (dev < 0)
+        return -1;  // Neither pointer is device memory; let memcpy handle it
+    CHECK_CUDA(cudaSetDevice(dev));
     CHECK_CUDA(cudaMemcpy(dst, src, length, cudaMemcpyDefault));
     return 0;
 }
@@ -105,12 +109,11 @@ static int cuda_query_location(void* ctx_, void* addr, size_t size,
                                location_t* buf, size_t buf_count) {
     (void)ctx_;
     if (buf_count == 0) return -1;
-    cudaPointerAttributes attr{};
-    cudaError_t err = cudaPointerGetAttributes(&attr, addr);
-    if (err != cudaSuccess || attr.type != cudaMemoryTypeDevice) return 0;
+    int dev = getCudaDeviceForPtr(addr);
+    if (dev < 0) return 0;
     buf[0].start = addr;
     buf[0].length = size;
-    snprintf(buf[0].location, LOCATION_LEN, "cuda:%d", attr.device);
+    snprintf(buf[0].location, LOCATION_LEN, "cuda:%d", dev);
     return 1;
 }
 

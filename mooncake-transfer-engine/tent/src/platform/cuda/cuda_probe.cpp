@@ -25,7 +25,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <cuda_runtime.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
@@ -39,6 +38,7 @@
 
 namespace mooncake {
 namespace tent {
+
 static std::vector<Topology::NicEntry> listInfiniBandDevices() {
     int num_devices = 0;
     std::vector<Topology::NicEntry> devices;
@@ -263,16 +263,7 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
 }
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, addr);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
-        return MTYPE_UNKNOWN;
-    }
-    if (attributes.type == cudaMemoryTypeDevice) return MTYPE_CUDA;
-    return MTYPE_CPU;
+    return getCudaDeviceForPtr(addr) >= 0 ? MTYPE_CUDA : MTYPE_CPU;
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -296,20 +287,9 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-
-    result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
-        return entries;
-    }
-
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genCudaNodeName(attributes.device)});
+    int cudaDev = getCudaDeviceForPtr(start);
+    if (cudaDev >= 0) {
+        entries.push_back({(uint64_t)start, len, genCudaNodeName(cudaDev)});
         return entries;
     }
 
