@@ -116,6 +116,53 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/workers/max_retry_count");
     setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
               "transports/rdma/disable_gpu_direct_rdma");
+
+    // MLX5 Direct Verbs configuration for UDP sport override and LAG balancing
+    const char* mlx5_udp_sports_env = std::getenv("MC_MLX5_QP_UDP_SPORTS");
+    if (mlx5_udp_sports_env && *mlx5_udp_sports_env) {
+        std::vector<uint16_t> ports;
+        std::stringstream ss(mlx5_udp_sports_env);
+        std::string item;
+        bool ok = true;
+        while (std::getline(ss, item, ',')) {
+            // Trim leading/trailing whitespace
+            auto l = item.find_first_not_of(" \t");
+            auto r = item.find_last_not_of(" \t");
+            if (l == std::string::npos) continue;
+            item = item.substr(l, r - l + 1);
+            try {
+                int val = std::stoi(item);
+                if (val < 0 || val > 65535) {
+                    LOG(WARNING)
+                        << "MC_MLX5_QP_UDP_SPORTS entry out of range: " << item;
+                    ok = false;
+                    break;
+                }
+                ports.push_back(static_cast<uint16_t>(val));
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Invalid MC_MLX5_QP_UDP_SPORTS entry: " << item
+                             << ". Error: " << e.what();
+                ok = false;
+                break;
+            }
+        }
+        if (ok && !ports.empty()) {
+            config.set("transports/rdma/mlx5_qp_udp_sports", ports);
+        } else if (!ok) {
+            LOG(WARNING)
+                << "Ignore MC_MLX5_QP_UDP_SPORTS entirely due to parse errors";
+        }
+    }
+
+    const char* mlx5_lag_balance_env =
+        std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
+    if (mlx5_lag_balance_env && *mlx5_lag_balance_env) {
+        bool val = parseBool(mlx5_lag_balance_env, false);
+        config.set("transports/rdma/mlx5_qp_lag_port_balance", val);
+        LOG(INFO) << "MC_MLX5_QP_LAG_PORT_BALANCE = "
+                  << (val ? "true" : "false");
+    }
+
     return status;
 }
 

@@ -128,6 +128,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     std::string name() const { return endpoint_name_; }
 
+    std::string peerNicName() const { return peer_nic_name_; }
+
     // Notification QP operations
     uint32_t notifyQpNum() const { return notify_qp_ ? notify_qp_->qp_num : 0; }
 

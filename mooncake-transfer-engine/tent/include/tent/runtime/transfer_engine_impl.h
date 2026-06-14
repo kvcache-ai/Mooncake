@@ -264,6 +264,13 @@ class TransferEngineImpl {
     bool enable_auto_failover_on_poll_{true};
     bool enable_progress_worker_{false};
 
+    // Track RDMA failures to skip RDMA when threshold exceeded
+    std::atomic<int> rdma_failure_count_{0};
+    std::atomic<uint64_t> rdma_failure_window_start_ns_{0};
+    int rdma_failure_threshold_{3};
+    uint64_t rdma_failure_time_window_ns_{
+        300000000000ULL};  // 300 seconds (5 minutes)
+
     // Guards alive_batches_ and serializes pollTaskStatus /
     // updateTaskStatusAfterPoll / lazyFreeBatch against the optional
     // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
