@@ -324,6 +324,7 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
             std::string("Failed to get GDS batch status: Code ") +
             std::to_string(result.err) + LOC_MARK);
     status.s = PENDING;
+    status.transferred_bytes = 0;
     size_t complete_count = 0;
     for (size_t index = range.base; index < range.base + range.count; ++index) {
         auto& event = gds_batch->io_events[index];
