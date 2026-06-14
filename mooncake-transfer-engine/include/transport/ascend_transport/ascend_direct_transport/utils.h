@@ -79,6 +79,13 @@ std::string GenAdxlEngineName(const std::string &ip, const uint64_t port);
 
 uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id);
 
+// True when HCCL_INTRA_ROCE_ENABLE=1 or ASCEND_GLOBAL_RESOURCE_CONFIG sets
+// comm_resource_config.protocol_desc to a roce:* entry (string or array).
+bool IsRoceModeEnabled();
+
+// Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
+bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
+
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext *out_context);
 
 /**
