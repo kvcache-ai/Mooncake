@@ -290,8 +290,8 @@ bool RdmaEndPoint::finishDestroy() {
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
-        LOG(WARNING) << "Previous connection will be discarded";
-        disconnectUnlocked();
+        LOG(ERROR) << "Cannot change peer path on connected endpoint (unidirectional lifecycle)";
+        return;
     }
     peer_nic_path_ = peer_nic_path;
 }
@@ -327,7 +327,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
             peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
             if (peer_server_name.empty() || peer_nic_name.empty()) {
                 LOG(ERROR) << "Parse peer nic path failed: " << peer_nic_path_;
-                disconnectUnlocked();
+                beginDestroyNoLock();
                 return ERR_INVALID_ARGUMENT;
             }
         }
@@ -413,23 +413,19 @@ int RdmaEndPoint::setupConnectionsByActive() {
                     return 0;
                 }
 
-                // This mismatch scenario should be rare. It may occur when a
-                // peer first sends us an Active RPC and establishes a
-                // connection, then restarts, and eventually accepts and
-                // responds to our Active RPC.
-                LOG(WARNING) << "Peer QP list mismatch on connected endpoint, "
-                                "re-establishing connection: "
-                             << toString();
-
-                int ret =
-                    resetConnection("re-establishing connection (active)");
-                if (ret) return ret;
+                // Peer QP list mismatch - this indicates the peer has restarted.
+                // Reject the handshake instead of resetting. Endpoints have
+                // unidirectional lifecycle and are never reset or reused.
+                // The caller should create a new endpoint.
+                LOG(ERROR) << "Peer QP list mismatch on connected endpoint: "
+                           << toString() << ", cannot reuse (unidirectional lifecycle)";
+                return ERR_REJECT_HANDSHAKE;
             }
 
             if (!peer_desc.reply_msg.empty()) {
                 LOG(ERROR) << "Rejected handshake request by peer "
                            << local_desc.peer_nic_path;
-                disconnectUnlocked();
+                beginDestroyNoLock();
                 return ERR_REJECT_HANDSHAKE;
             }
 
@@ -444,7 +440,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                            << peer_desc.local_nic_path
                            << ", peer.peer_nic_path: "
                            << peer_desc.peer_nic_path;
-                disconnectUnlocked();
+                beginDestroyNoLock();
                 return ERR_REJECT_HANDSHAKE;
             }
 
@@ -514,7 +510,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 if (ret == ERR_DEVICE_NOT_FOUND) {
                     LOG(ERROR) << "Peer NIC " << peer_nic_name
                                << " not found in " << peer_server_name;
-                    disconnectUnlocked();
+                    beginDestroyNoLock();
                 } else {
                     resetConnection("failed connection setup (active)");
                 }
@@ -528,28 +524,35 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                             HandShakeDesc &local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
-        // If already connected with the same peer QP info, return success
+        // Idempotency check: if the incoming handshake is from the same peer
+        // and carries the same peer QP list as the established connection,
+        // this is a duplicate request. Re-using the existing connection is
+        // safe and avoids resetting QPs that may already have in-flight RDMA.
         if (peer_qp_num_list_ == peer_desc.qp_num) {
             fillLocalHandshakeDesc(context_, peer_nic_path_, qpNum(),
                                    local_desc);
-            LOG(INFO) << "Received same peer QP numbers, reusing connection.";
+            LOG(INFO) << "Endpoint already established, reusing connection.";
             return 0;
         }
-        // Different peer (e.g., peer restarted)
-        LOG(WARNING) << "Re-establish connection: " << toString();
-
-        int ret = resetConnection("re-establishing connection (passive)");
-        if (ret) return ret;
+        // Endpoint already connected to a different peer (e.g., peer restarted).
+        // Reject the request instead of resetting. Endpoints have unidirectional
+        // lifecycle and are never reset or reused. The caller should create a new
+        // endpoint by removing this one from the store.
+        LOG(ERROR) << "Endpoint already established with " << peer_nic_path_
+                   << ", cannot accept new connection (unidirectional lifecycle)";
+        local_desc.reply_msg =
+            "Endpoint already connected to different peer, cannot reuse";
+        return ERR_REJECT_HANDSHAKE;
     }
 
-    // At this point, the state can only be UNCONNECTED or CONNECTING.
-    // Even if the state is CONNECTING, we can still safely proceed to
-    // establish the connection on this same endpoint. Because we're holding
-    // the lock, even if there are already Active RPCs sent to the same
-    // peer nic path by setupConnectionsByActive on another thread, it will
-    // be blocked after the RPC return. Once the lock is released,
-    // they will simply observe the CONNECTED state and safely reuse the QP.
-    // This inherently handles simultaneous open.
+    // At this point, the state must be UNCONNECTED for handshake to proceed.
+    // CONNECTING state is not valid for passive handshake since we don't allow
+    // endpoint reuse after destruction.
+    auto curr_status = status_.load(std::memory_order_relaxed);
+    if (curr_status != UNCONNECTED) {
+        LOG(ERROR) << "Endpoint not in UNCONNECTED state: " << curr_status;
+        return ERR_ENDPOINT;
+    }
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
@@ -652,7 +655,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
 
 void RdmaEndPoint::disconnect() {
     RWSpinlock::WriteGuard guard(lock_);
-    disconnectUnlocked();
+    beginDestroyNoLock();
 }
 
 int RdmaEndPoint::disconnectUnlocked() {
