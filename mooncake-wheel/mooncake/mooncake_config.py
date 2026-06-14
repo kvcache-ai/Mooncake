@@ -65,6 +65,28 @@ _SIZE_SUFFIXES = [
     ("b", 1),
 ]
 
+# All protocols accepted by the Transfer Engine. The Python API commonly uses
+# "tcp" and "rdma"; the remaining values are handled at the C++ level. Keep this
+# in sync with the protocol list documented in the module docstring above.
+_VALID_PROTOCOLS = frozenset({
+    "tcp",
+    "rdma",
+    "nvmeof",
+    "nvlink",
+    "nvlink_intra",
+    "hip",
+    "barex",
+    "cxl",
+    "ascend",
+})
+
+# Required fields that must be present AND non-empty.
+_REQUIRED_NON_EMPTY_FIELDS = (
+    "local_hostname",
+    "metadata_server",
+    "master_server_address",
+)
+
 
 def _parse_segment_size(value) -> int:
     if isinstance(value, int):
@@ -140,6 +162,38 @@ class MooncakeConfig:
     master_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
+
+    def __post_init__(self):
+        """Validate configuration invariants, failing fast with clear errors.
+
+        This runs for every ``MooncakeConfig`` instance regardless of how it is
+        constructed (``from_file``, ``load_from_env`` or direct instantiation),
+        so a misconfiguration is reported here with an actionable message
+        instead of surfacing as a cryptic failure deep inside the C++ engine.
+        """
+        if (
+            not isinstance(self.protocol, str)
+            or self.protocol.lower() not in _VALID_PROTOCOLS
+        ):
+            raise ValueError(
+                f"Invalid protocol: {self.protocol!r}. Supported protocols are: "
+                f"{', '.join(sorted(_VALID_PROTOCOLS))}."
+            )
+
+        for field_name in ("global_segment_size", "local_buffer_size"):
+            value = getattr(self, field_name)
+            if value < 0:
+                raise ValueError(
+                    f"Invalid {field_name}: {value}. Size must be non-negative."
+                )
+
+        for field_name in _REQUIRED_NON_EMPTY_FIELDS:
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"Config field {field_name!r} must be a non-empty string, "
+                    f"got {value!r}."
+                )
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
