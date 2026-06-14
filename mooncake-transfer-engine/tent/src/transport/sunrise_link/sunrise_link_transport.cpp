@@ -99,10 +99,21 @@ static void NormalizeMappedHostPointer(void** ptr,
     }
 }
 
+struct SavedTangDevice {
+    int dev{-1};
+    SavedTangDevice() { tangGetDevice(&dev); }
+    ~SavedTangDevice() {
+        if (dev >= 0) tangSetDevice(dev);
+    }
+    SavedTangDevice(const SavedTangDevice&) = delete;
+    SavedTangDevice& operator=(const SavedTangDevice&) = delete;
+};
+
 static tangError_t QueryPointerAttrsBestEffort(void* ptr,
                                                tangPointerAttributes* attr,
                                                int preferred_dev) {
     if (!ptr || !attr) return tangErrorInvalidValue;
+    SavedTangDevice saved;
 
     if (preferred_dev >= 0) {
         tangSetDevice(preferred_dev);

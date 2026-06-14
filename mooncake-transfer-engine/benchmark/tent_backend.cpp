@@ -19,9 +19,7 @@
 #include "tent/runtime/topology.h"
 #include "tent/runtime/transport_selector.h"
 
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#elif defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE)
 #include "cuda_alike.h"
 #endif
 
@@ -105,28 +103,13 @@ int TENTBenchRunner::allocateBuffers() {
     if (seg_type == "DRAM") {
         device_prefix = "cpu";
         num_buffers = numa_num_configured_nodes();
-#ifdef USE_CUDA
-    } else if (seg_type == "VRAM") {
-        device_prefix = "cuda";
-        int gpu_count = 0;
-        cudaGetDeviceCount(&gpu_count);
-        start_idx = 0;
-        num_buffers = gpu_count;
-        if (XferBenchConfig::local_gpu_id != -1) {
-            start_idx = XferBenchConfig::local_gpu_id;
-            num_buffers = 1;
-            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
-                << "local_gpu_id " << start_idx << " out of range [0, "
-                << gpu_count << ")";
-        }
-#elif defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (seg_type == "VRAM") {
         device_prefix = "cuda";
         int gpu_count = 0;
         auto err = cudaGetDeviceCount(&gpu_count);
         LOG_ASSERT(err == cudaSuccess && gpu_count > 0)
-            << "No Sunrise devices found or cudaGetDeviceCount failed: "
-            << cudaGetErrorString(err);
+            << "cudaGetDeviceCount failed: " << cudaGetErrorString(err);
         start_idx = 0;
         num_buffers = gpu_count;
         if (XferBenchConfig::local_gpu_id != -1) {
@@ -161,14 +144,9 @@ int TENTBenchRunner::allocateBuffers() {
     for (int i = 0; i < num_buffers; ++i) {
         auto location = device_prefix + ":" + std::to_string(start_idx + i);
         MemoryOptions options;
-#ifdef USE_SUNRISE
-        if (seg_type == "VRAM") {
-            options.type = SUNRISE_LINK;
-            options.location = location;
-        }
-#endif
         if (!xport_type.empty()) {
             options.type = getTransportType(xport_type);
+            options.location = location;
         }
 
         auto t0 = getCurrentTimeInNano();
@@ -271,18 +249,7 @@ static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     return numa_node;
 }
 
-#ifdef USE_CUDA
-static inline int getGpuDeviceNumaID(int gpu_id) {
-    char pci_bus_id[20];
-    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
-    if (err != cudaSuccess) {
-        LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
-        return 0;
-    }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
-    return getNumaNodeFromPciDevice(pci_bus_id);
-}
-#elif defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline int getGpuDeviceNumaID(int gpu_id) {
     char pci_bus_id[20];
     auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
