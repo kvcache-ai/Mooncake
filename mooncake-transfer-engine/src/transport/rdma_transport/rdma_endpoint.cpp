@@ -290,7 +290,8 @@ bool RdmaEndPoint::finishDestroy() {
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
-        LOG(ERROR) << "Cannot change peer path on connected endpoint (unidirectional lifecycle)";
+        LOG(ERROR) << "Cannot change peer path on connected endpoint "
+                      "(unidirectional lifecycle)";
         return;
     }
     peer_nic_path_ = peer_nic_path;
@@ -413,12 +414,13 @@ int RdmaEndPoint::setupConnectionsByActive() {
                     return 0;
                 }
 
-                // Peer QP list mismatch - this indicates the peer has restarted.
-                // Reject the handshake instead of resetting. Endpoints have
-                // unidirectional lifecycle and are never reset or reused.
-                // The caller should create a new endpoint.
+                // Peer QP list mismatch - this indicates the peer has
+                // restarted. Reject the handshake instead of resetting.
+                // Endpoints have unidirectional lifecycle and are never reset
+                // or reused. The caller should create a new endpoint.
                 LOG(ERROR) << "Peer QP list mismatch on connected endpoint: "
-                           << toString() << ", cannot reuse (unidirectional lifecycle)";
+                           << toString()
+                           << ", cannot reuse (unidirectional lifecycle)";
                 return ERR_REJECT_HANDSHAKE;
             }
 
@@ -534,12 +536,13 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             LOG(INFO) << "Endpoint already established, reusing connection.";
             return 0;
         }
-        // Endpoint already connected to a different peer (e.g., peer restarted).
-        // Reject the request instead of resetting. Endpoints have unidirectional
-        // lifecycle and are never reset or reused. The caller should create a new
-        // endpoint by removing this one from the store.
-        LOG(ERROR) << "Endpoint already established with " << peer_nic_path_
-                   << ", cannot accept new connection (unidirectional lifecycle)";
+        // Endpoint already connected to a different peer (e.g., peer
+        // restarted). Reject the request instead of resetting. Endpoints have
+        // unidirectional lifecycle and are never reset or reused. The caller
+        // should create a new endpoint by removing this one from the store.
+        LOG(ERROR)
+            << "Endpoint already established with " << peer_nic_path_
+            << ", cannot accept new connection (unidirectional lifecycle)";
         local_desc.reply_msg =
             "Endpoint already connected to different peer, cannot reuse";
         return ERR_REJECT_HANDSHAKE;
