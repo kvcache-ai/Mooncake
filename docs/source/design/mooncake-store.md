@@ -602,6 +602,35 @@ Key differences from soft pin:
 - Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
 - Hard pin is immutable once set. Soft pin status is automatically refreshed on access.
 
+## Store Agent Hints
+
+Mooncake Store can attach optional agent-workflow metadata to an object through
+`ReplicateConfig::agent_hints`:
+
+```cpp
+struct AgentHints {
+    std::string workflow_id{};
+    std::string agent_id{};
+    std::string step_id{};
+    int64_t step_index{0};
+    int64_t total_steps{0};
+    std::string parent_step_id{};
+    std::vector<std::string> children_step_ids{};
+    std::string tool_name{};
+    int64_t expected_tool_duration_ms{0};
+    int64_t cache_ttl_ms{0};
+    std::string shared_prefix_hash{};
+    std::string reuse_hint{"neutral"};
+};
+```
+
+The initial Store-side behavior is intentionally narrow: `reuse_hint="keep"`
+maps to the existing soft-pin retention path, and `cache_ttl_ms` can extend the
+soft-pin timeout. `reuse_hint="neutral"` and `reuse_hint="discard"` do not add
+retention by themselves. `workflow_id` remains an annotation in this layer and
+is not mapped to `group_ids`, because groups also affect sharding, lease refresh,
+and grouped eviction.
+
 ## Zombie Object Cleanup
 
 If a Client crashes or experiences a network failure after sending a `PutStart` request but before it can send the corresponding `PutEnd` or `PutRevoke` request to the Master, the object initiated by `PutStart` enters a "zombie" state—rendering it neither usable nor deletable. The existence of such "zombie objects" not only consumes storage space but also prevents subsequent `Put` operations on the same keys. To mitigate these issues, the Master records the start time of each `PutStart` request and employs two timeout thresholds—`put_start_discard_timeout` and `put_start_release_timeout`—to clean up zombie objects.
