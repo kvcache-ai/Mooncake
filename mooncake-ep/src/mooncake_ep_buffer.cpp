@@ -212,6 +212,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
+    bool all_ranks_p2p = p2p_transport_ && p2p_transport_->allPeersAccessible();
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -250,7 +251,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x.data_ptr(),
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
-            num_experts, rank, num_ranks, use_fp8, workspace,
+            num_experts, rank, num_ranks, use_fp8, all_ranks_p2p, workspace,
             launch_stream, timeout_ticks, phases);
     };
     if (return_recv_hook) {
@@ -397,6 +398,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
+    bool all_ranks_p2p = p2p_transport_ && p2p_transport_->allPeersAccessible();
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -435,8 +437,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy);
+            num_ranks, all_ranks_p2p, workspace, launch_stream, timeout_ticks,
+            phases, zero_copy);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
