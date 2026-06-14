@@ -712,6 +712,22 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(local_data->transport_endpoint);
             break;
         }
+        case ReplicaType::DISTRIBUTED_DISK: {
+            const auto *distributed_data =
+                std::get_if<DistributedDiskReplicaData>(&replica.data_);
+            if (!distributed_data) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "serialize_msgpack Replica missing "
+                                       "DistributedDiskReplicaData"));
+            }
+            // Format: [file_path, offset, object_size]
+            packer.pack_array(3);
+            packer.pack(distributed_data->file_path);
+            packer.pack(static_cast<int64_t>(distributed_data->offset));
+            packer.pack(static_cast<uint64_t>(distributed_data->object_size));
+            break;
+        }
         default:
             // Unsupported replica type
             packer.pack(static_cast<int8_t>(255));
@@ -743,87 +759,115 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                         obj.via.array.size)));
     }
 
-    auto *array_items = obj.via.array.ptr;
+    try {
+        auto *array_items = obj.via.array.ptr;
 
-    // 1. Deserialize id_ member variable
-    auto id = static_cast<ReplicaID>(array_items[0].as<uint64_t>());
+        // 1. Deserialize id_ member variable
+        auto id = static_cast<ReplicaID>(array_items[0].as<uint64_t>());
 
-    // 2. Deserialize status_ member variable
-    auto status = static_cast<ReplicaStatus>(array_items[1].as<int16_t>());
+        // 2. Deserialize status_ member variable
+        auto status = static_cast<ReplicaStatus>(array_items[1].as<int16_t>());
 
-    // 3. Deserialize replica_type
-    auto replica_type_code = array_items[2].as<int8_t>();
+        // 3. Deserialize replica_type
+        auto replica_type_code = array_items[2].as<int8_t>();
 
-    // 4. Parse payload by type
-    std::shared_ptr<Replica> replica;
-    switch (replica_type_code) {
-        case static_cast<int8_t>(ReplicaType::MEMORY): {
-            // MEMORY: payload is AllocatedBuffer
-            auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
-                array_items[3], segment_view);
-            if (!buffer_result) {
-                return tl::unexpected(buffer_result.error());
+        // 4. Parse payload by type
+        std::shared_ptr<Replica> replica;
+        switch (replica_type_code) {
+            case static_cast<int8_t>(ReplicaType::MEMORY): {
+                // MEMORY: payload is AllocatedBuffer
+                auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
+                    array_items[3], segment_view);
+                if (!buffer_result) {
+                    return tl::unexpected(buffer_result.error());
+                }
+                replica = std::make_shared<Replica>(
+                    std::move(buffer_result.value()), status);
+                break;
             }
-            replica = std::make_shared<Replica>(
-                std::move(buffer_result.value()), status);
-            break;
-        }
-        case static_cast<int8_t>(ReplicaType::DISK): {
-            const auto &payload = array_items[3];
-            if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 2) {
-                return tl::unexpected(
-                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                       "deserialize_msgpack Replica DISK "
-                                       "payload is not valid array[2]"));
-            }
-            auto *payload_items = payload.via.array.ptr;
-            std::string file_path = payload_items[0].as<std::string>();
-            uint64_t object_size = payload_items[1].as<uint64_t>();
+            case static_cast<int8_t>(ReplicaType::DISK): {
+                const auto &payload = array_items[3];
+                if (payload.type != msgpack::type::ARRAY ||
+                    payload.via.array.size != 2) {
+                    return tl::unexpected(
+                        SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                           "deserialize_msgpack Replica DISK "
+                                           "payload is not valid array[2]"));
+                }
+                auto *payload_items = payload.via.array.ptr;
+                std::string file_path = payload_items[0].as<std::string>();
+                uint64_t object_size = payload_items[1].as<uint64_t>();
 
-            replica = std::make_shared<Replica>(std::move(file_path),
-                                                object_size, status);
-            break;
-        }
-        case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
-            const auto &payload = array_items[3];
-            if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 3) {
-                return tl::unexpected(
-                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                       "deserialize_msgpack Replica LOCAL_DISK "
-                                       "payload is not valid array[3]"));
+                replica = std::make_shared<Replica>(std::move(file_path),
+                                                    object_size, status);
+                break;
             }
-            auto *payload_items = payload.via.array.ptr;
-            std::string client_id_str = payload_items[0].as<std::string>();
-            uint64_t object_size = payload_items[1].as<uint64_t>();
-            std::string transport_endpoint = payload_items[2].as<std::string>();
+            case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
+                const auto &payload = array_items[3];
+                if (payload.type != msgpack::type::ARRAY ||
+                    payload.via.array.size != 3) {
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        "deserialize_msgpack Replica LOCAL_DISK "
+                        "payload is not valid array[3]"));
+                }
+                auto *payload_items = payload.via.array.ptr;
+                std::string client_id_str = payload_items[0].as<std::string>();
+                uint64_t object_size = payload_items[1].as<uint64_t>();
+                std::string transport_endpoint =
+                    payload_items[2].as<std::string>();
 
-            UUID client_id;
-            if (!StringToUuid(client_id_str, client_id)) {
+                UUID client_id;
+                if (!StringToUuid(client_id_str, client_id)) {
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        fmt::format(
+                            "deserialize_msgpack Replica invalid client_id "
+                            "UUID: {}",
+                            client_id_str)));
+                }
+
+                replica = std::make_shared<Replica>(
+                    client_id, object_size, std::move(transport_endpoint),
+                    status);
+                break;
+            }
+            case static_cast<int8_t>(ReplicaType::DISTRIBUTED_DISK): {
+                const auto &payload = array_items[3];
+                if (payload.type != msgpack::type::ARRAY ||
+                    payload.via.array.size != 3) {
+                    return tl::unexpected(
+                        SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                           "deserialize_msgpack Replica "
+                                           "DISTRIBUTED_DISK payload is "
+                                           "not valid array[3]"));
+                }
+                auto *payload_items = payload.via.array.ptr;
+                std::string file_path = payload_items[0].as<std::string>();
+                int64_t offset = payload_items[1].as<int64_t>();
+                uint64_t object_size = payload_items[2].as<uint64_t>();
+
+                replica = std::make_shared<Replica>(
+                    std::move(file_path), offset, object_size, status);
+                break;
+            }
+            default:
                 return tl::unexpected(SerializationError(
                     ErrorCode::DESERIALIZE_FAIL,
-                    fmt::format("deserialize_msgpack Replica invalid client_id "
-                                "UUID: {}",
-                                client_id_str)));
-            }
-
-            replica = std::make_shared<Replica>(
-                client_id, object_size, std::move(transport_endpoint), status);
-            break;
+                    fmt::format("deserialize Replica invalid replica type: {}",
+                                replica_type_code)));
         }
-        default:
-            return tl::unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                fmt::format("deserialize Replica invalid replica type: {}",
-                            replica_type_code)));
+
+        // Restore the original id (overwrite the auto-generated one)
+        // Note: refcnt_ is not restored, it remains 0 (default value)
+        replica->id_ = id;
+
+        return replica;
+    } catch (const std::exception &e) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize Replica exception: {}", e.what())));
     }
-
-    // Restore the original id (overwrite the auto-generated one)
-    // Note: refcnt_ is not restored, it remains 0 (default value)
-    replica->id_ = id;
-
-    return replica;
 }
 
 tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(

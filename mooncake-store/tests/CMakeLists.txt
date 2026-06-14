@@ -56,6 +56,7 @@ endif()
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
+add_store_test(bitmap_page_allocator_test bitmap_page_allocator_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(segment_test segment_test.cpp)
@@ -146,10 +147,11 @@ target_link_libraries(
          gtest_main
          pthread)
 if(STORE_USE_K8S_LEASE)
-  target_link_libraries(high_availability_test
-                        PRIVATE ${K8S_LEASE_WRAPPER_LIB})
+  target_link_libraries(high_availability_test PRIVATE ${K8S_LEASE_WRAPPER_LIB})
 endif()
-if(STORE_USE_ETCD OR STORE_USE_REDIS OR STORE_USE_K8S_LEASE)
+if(STORE_USE_ETCD
+   OR STORE_USE_REDIS
+   OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 add_ha_test(ha_backend_availability_test

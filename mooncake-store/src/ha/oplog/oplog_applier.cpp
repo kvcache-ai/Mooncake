@@ -445,6 +445,8 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
 
     // Deserialize payload using struct_pack (msgpack binary format)
     MetadataPayload payload;
+    // TODO: Add a legacy decoder for pre-DISTRIBUTED_DISK Replica::Descriptor
+    // payloads when we formally support HA/oplog cross-version compatibility.
     auto result = struct_pack::deserialize_to(payload, entry.payload);
     if (result != struct_pack::errc::ok) {
         LOG(ERROR) << "OpLogApplier: failed to deserialize payload for key="

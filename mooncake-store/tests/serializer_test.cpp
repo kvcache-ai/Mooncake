@@ -1,7 +1,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "replica.h"
+#include "segment.h"
 #include "serializer.h"
+#include "serialize/serializer.hpp"
 
 namespace mooncake::test {
 
@@ -163,6 +166,64 @@ TEST_F(SerializerTest, ExampleClassDeserializationWithException) {
     // exception.
     auto restored = deserialize_from<ExampleClassWithException>(buffer);
     EXPECT_EQ(restored, nullptr);
+}
+
+TEST_F(SerializerTest, DistributedDiskReplicaDescriptorAndSerialization) {
+    Replica::Descriptor variant_descriptor;
+    variant_descriptor.descriptor_variant = MemoryDescriptor{};
+    EXPECT_EQ(variant_descriptor.descriptor_variant.index(), 0);
+    variant_descriptor.descriptor_variant = NoFDescriptor{};
+    EXPECT_EQ(variant_descriptor.descriptor_variant.index(), 1);
+    variant_descriptor.descriptor_variant = DiskDescriptor{};
+    EXPECT_EQ(variant_descriptor.descriptor_variant.index(), 2);
+    variant_descriptor.descriptor_variant = LocalDiskDescriptor{};
+    EXPECT_EQ(variant_descriptor.descriptor_variant.index(), 3);
+    variant_descriptor.descriptor_variant = DistributedDiskDescriptor{};
+    EXPECT_EQ(variant_descriptor.descriptor_variant.index(), 4);
+
+    Replica replica("/mnt/3fs/mooncake/bucket_00.data", 131072, 4096,
+                    ReplicaStatus::COMPLETE);
+
+    EXPECT_TRUE(replica.is_distributed_disk_replica());
+    EXPECT_EQ(replica.type(), ReplicaType::DISTRIBUTED_DISK);
+    EXPECT_EQ(replica.get_distributed_disk_data().file_path,
+              "/mnt/3fs/mooncake/bucket_00.data");
+    EXPECT_EQ(replica.get_distributed_disk_data().offset, 131072);
+    EXPECT_EQ(replica.get_distributed_disk_data().object_size, 4096);
+
+    auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_distributed_disk_replica());
+    const auto& distributed_descriptor =
+        descriptor.get_distributed_disk_descriptor();
+    EXPECT_EQ(distributed_descriptor.file_path,
+              "/mnt/3fs/mooncake/bucket_00.data");
+    EXPECT_EQ(distributed_descriptor.offset, 131072);
+    EXPECT_EQ(distributed_descriptor.object_size, 4096);
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    SegmentView segment_view(nullptr);
+    auto serialize_result =
+        Serializer<Replica>::serialize(replica, segment_view, packer);
+    ASSERT_TRUE(serialize_result) << serialize_result.error().message;
+
+    msgpack::object_handle object_handle =
+        msgpack::unpack(buffer.data(), buffer.size());
+    auto deserialize_result =
+        Serializer<Replica>::deserialize(object_handle.get(), segment_view);
+    ASSERT_TRUE(deserialize_result) << deserialize_result.error().message;
+
+    auto restored = deserialize_result.value();
+    ASSERT_NE(restored, nullptr);
+    EXPECT_EQ(restored->id(), replica.id());
+    EXPECT_EQ(restored->status(), ReplicaStatus::COMPLETE);
+    EXPECT_TRUE(restored->is_distributed_disk_replica());
+    EXPECT_EQ(restored->type(), ReplicaType::DISTRIBUTED_DISK);
+
+    const auto& restored_data = restored->get_distributed_disk_data();
+    EXPECT_EQ(restored_data.file_path, "/mnt/3fs/mooncake/bucket_00.data");
+    EXPECT_EQ(restored_data.offset, 131072);
+    EXPECT_EQ(restored_data.object_size, 4096);
 }
 
 }  // namespace mooncake::test
