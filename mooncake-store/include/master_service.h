@@ -1092,7 +1092,8 @@ class MasterService {
             agent_hints = std::move(new_agent_hints);
         }
 
-        uint64_t EffectiveSoftPinTtlLocked(uint64_t default_soft_ttl) const {
+        uint64_t EffectiveSoftPinTtlLocked(uint64_t default_soft_ttl) const
+            REQUIRES(lock) {
             if (!agent_hints.has_value() || agent_hints->cache_ttl_ms <= 0) {
                 return default_soft_ttl;
             }

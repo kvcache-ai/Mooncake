@@ -183,7 +183,8 @@ tl::expected<std::optional<AgentHints>, SerializationError> UnpackAgentHints(
             SerializationError(ErrorCode::DESERIALIZE_FAIL, error_message));
     }
 
-    // Read the v1 prefix only; later writer versions may append fields.
+    // Keep the v1 field count as the minimum readable prefix. Later writer
+    // versions may append fields without breaking older snapshot readers.
     AgentHints hints;
     try {
         const msgpack::object* array = obj.via.array.ptr;
