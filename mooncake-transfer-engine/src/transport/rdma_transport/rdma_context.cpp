@@ -662,8 +662,8 @@ int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
     // pointer identity and returns the path from the live map key, and we arm
     // the pause only if the endpoint was actually found. No-op when TTL is 0.
     std::string deleted_peer_nic_path;
-    int ret =
-        endpoint_store_->deleteEndpointByPtr(endpoint_ptr, &deleted_peer_nic_path);
+    int ret = endpoint_store_->deleteEndpointByPtr(endpoint_ptr,
+                                                   &deleted_peer_nic_path);
     if (!deleted_peer_nic_path.empty()) pauseConnect(deleted_peer_nic_path);
     return ret;
 }

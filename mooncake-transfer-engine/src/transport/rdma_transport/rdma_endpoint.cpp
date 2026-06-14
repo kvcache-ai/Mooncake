@@ -699,8 +699,8 @@ int RdmaEndPoint::disconnectUnlocked() {
         ibv_qp_attr cur_attr;
         ibv_qp_init_attr cur_init_attr;
         bool qp_in_reset = false;
-        if (ibv_query_qp(qp_list_[i], &cur_attr, IBV_QP_STATE, &cur_init_attr) ==
-            0) {
+        if (ibv_query_qp(qp_list_[i], &cur_attr, IBV_QP_STATE,
+                         &cur_init_attr) == 0) {
             qp_in_reset = (cur_attr.qp_state == IBV_QPS_RESET);
         }
 

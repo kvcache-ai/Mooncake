@@ -94,8 +94,8 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
-int FIFOEndpointStore::deleteEndpointByPtr(
-    const RdmaEndPoint *endpoint_ptr, std::string *deleted_peer_nic_path) {
+int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr,
+                                           std::string *deleted_peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find endpoint by pointer
     for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();

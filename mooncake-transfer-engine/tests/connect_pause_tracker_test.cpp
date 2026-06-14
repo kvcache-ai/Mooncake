@@ -52,11 +52,11 @@ TEST(ConnectPauseTracker, PausedUntilExpiry) {
     auto clk = std::make_shared<FakeClock>();
     auto t = makeTracker(clk);
     const std::string peer = "10.0.0.1:1234";
-    t.pause(peer, 1000);  // paused until ts == 1000
+    t.pause(peer, 1000);            // paused until ts == 1000
     EXPECT_TRUE(t.isPaused(peer));  // now == 0
     clk->now = 999;
-    EXPECT_TRUE(t.isPaused(peer));  // just before expiry
-    clk->now = 1000;                // at expiry (>= until)
+    EXPECT_TRUE(t.isPaused(peer));   // just before expiry
+    clk->now = 1000;                 // at expiry (>= until)
     EXPECT_FALSE(t.isPaused(peer));  // expired
     EXPECT_EQ(t.size(), 0u);         // and lazily deleted on the failing check
 }
