@@ -1335,10 +1335,18 @@ auto MasterService::GetReplicaList(const std::string& key,
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
 
+        bool has_memory_replica = false;
+        bool has_ssd_replica = false;
+        for (const auto& replica : replica_list) {
+            has_memory_replica |= replica.is_memory_replica();
+            has_ssd_replica |=
+                replica.is_disk_replica() || replica.is_local_disk_replica();
+        }
+
         // TODO: NoF SSD support (ranhaojia)
-        if (replica_list[0].is_memory_replica()) {
+        if (has_memory_replica) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
-        } else if (replica_list[0].is_disk_replica()) {
+        } else if (has_ssd_replica) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
         }
         MasterMetricManager::instance().inc_valid_get_nums();
