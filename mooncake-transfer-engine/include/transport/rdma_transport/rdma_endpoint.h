@@ -92,9 +92,9 @@ class RdmaEndPoint {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
-    // Interrupts the connection, which can be triggered by user or by internal
-    // error. Use setupConnectionsByActive or setupConnectionsByPassive to
-    // reconnect
+    // Interrupts the connection. Endpoints have unidirectional lifecycle -
+    // once disconnect is called, the endpoint is marked for destruction and
+    // cannot be reused. A new endpoint must be created for future connections.
     void disconnect();
 
     // Destroy QPs before CQs (in RDMA Context)
@@ -112,6 +112,10 @@ class RdmaEndPoint {
 
    private:
     int disconnectUnlocked();
+
+    // Same as beginDestroy but must be called while already holding lock_.
+    // Used by disconnectUnlocked to avoid deadlock.
+    void beginDestroyNoLock();
 
     // Resets the connection.
     //
