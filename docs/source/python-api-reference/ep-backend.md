@@ -177,7 +177,7 @@ dist.init_process_group(
     ),
 )
 
-backend = dist.group.WORLD._get_backend(device)
+backend = dist.group.WORLD
 join_ranks = [2]
 
 while not all(pg.get_peer_state(backend, join_ranks)):
@@ -204,7 +204,7 @@ dist.init_process_group(
     ),
 )
 
-backend = dist.group.WORLD._get_backend(device)
+backend = dist.group.WORLD
 pg.join_group(backend)
 ```
 
