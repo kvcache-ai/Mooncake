@@ -861,11 +861,16 @@ void TransferEngineOperationState::wait_for_completion() {
 
     while (true) {
         if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
             std::lock_guard<std::mutex> lock(mutex_);
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
+            // Another caller (e.g. is_completed()) may have set the result
+            // right at the timeout boundary; don't overwrite it or log a false
+            // timeout in that case.
+            if (!result_.has_value()) {
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_;
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+            }
             return;
         }
 
