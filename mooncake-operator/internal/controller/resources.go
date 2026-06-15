@@ -221,6 +221,18 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 	}
 	portStr := strconv.Itoa(int(transferPort))
 
+	// Failover configuration defaults
+	failoverThreshold := int32(3)
+	failoverRecovery := int32(30)
+	if mc.Spec.Workers.TransportFailover != nil {
+		if mc.Spec.Workers.TransportFailover.FailoverThreshold > 0 {
+			failoverThreshold = mc.Spec.Workers.TransportFailover.FailoverThreshold
+		}
+		if mc.Spec.Workers.TransportFailover.RecoverySeconds > 0 {
+			failoverRecovery = mc.Spec.Workers.TransportFailover.RecoverySeconds
+		}
+	}
+
 	container := corev1.Container{
 		Name:            "worker",
 		Image:           image,
@@ -352,6 +364,19 @@ sys.exit(0)
 						FieldPath: "status.podIP",
 					},
 				},
+			},
+			// Transport failover configuration (RDMA -> TCP)
+			{
+				Name:  "MC_FAILOVER_ENABLED",
+				Value: fmt.Sprintf("%v", mc.Spec.Workers.TransportFailover == nil || mc.Spec.Workers.TransportFailover.Enabled),
+			},
+			{
+				Name:  "MC_FAILOVER_THRESHOLD",
+				Value: strconv.Itoa(int(failoverThreshold)),
+			},
+			{
+				Name:  "MC_FAILOVER_RECOVERY_SECS",
+				Value: strconv.Itoa(int(failoverRecovery)),
 			},
 		},
 		Resources: mc.Spec.Workers.Resources,

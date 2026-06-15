@@ -541,6 +541,52 @@ TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     EXPECT_EQ(result.transport, RDMA);
 }
 
+// ---------------------------------------------------------------------------
+// Test RailMonitor integration: skip RDMA when rails are unhealthy
+// ---------------------------------------------------------------------------
+
+TEST(TransportSelectorTest, RailMonitorSkipUnhealthyRdma) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+
+    auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
+    rdma->setDramToDram(true);
+    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
+    tcp->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    // Without RailMonitor, RDMA should be selected
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, RDMA)
+        << "Without RailMonitor, RDMA should be selected";
+
+    // Setting a RailMonitor that reports not ready should skip RDMA
+    // (Note: In a real scenario, RailMonitor would be loaded with topology.
+    //  Here we test the mechanism by setting a monitor that's not ready.)
+    // The RailMonitor::ready() returns false by default (not loaded),
+    // so setting it should cause RDMA to be skipped.
+    RailMonitor monitor;
+    selector.setRailMonitor(&monitor);
+
+    result = selector.select(ctx, transports);
+    // RailMonitor not loaded (ready() = false) → RDMA skipped → fallback to TCP
+    EXPECT_EQ(result.transport, TCP)
+        << "With RailMonitor not ready, RDMA should be skipped for TCP";
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

@@ -42,6 +42,8 @@ export default function Home() {
   const [opLoading, setOpLoading] = useState(true)
   const [scaling, setScaling] = useState(false)
   const [scaleInput, setScaleInput] = useState('2')
+  const [rdmaStatus, setRdmaStatus] = useState<Record<string, any[]>>({})
+  const [rdmaLoading, setRdmaLoading] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     let cancelled = false
@@ -116,6 +118,40 @@ export default function Home() {
     }
     setScaling(false)
   }, [])
+
+  // Fetch RDMA status for all clusters
+  useEffect(() => {
+    if (clusters.length === 0) return
+    let cancelled = false
+    async function fetchRdma() {
+      const newStatus: Record<string, any[]> = {}
+      const newLoading: Record<string, boolean> = {}
+      for (const cluster of clusters) {
+        const ns = cluster.metadata?.namespace || 'default'
+        const name = cluster.metadata?.name || ''
+        const key = `${ns}/${name}`
+        newLoading[key] = true
+        try {
+          const r = await fetch(`/api/clusters/${ns}/${name}/rdma-status`)
+          const d = await r.json()
+          if (!cancelled) newStatus[key] = d.workers || []
+        } catch (e) {
+          if (!cancelled) newStatus[key] = []
+        }
+        if (!cancelled) newLoading[key] = false
+      }
+      if (!cancelled) {
+        setRdmaStatus(newStatus)
+        setRdmaLoading(newLoading)
+      }
+    }
+    fetchRdma()
+    const interval = setInterval(fetchRdma, 15000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [clusters])
 
   const total = clusters.length
   const running = clusters.filter(c => c.status?.phase === 'Running').length
@@ -321,6 +357,95 @@ export default function Home() {
           )}
         </div>
       </div>
+
+      {/* RDMA Transport Status Section */}
+      {clusters.length > 0 && (
+        <div className="mt-8">
+          <h2 className="text-xl font-semibold text-gray-900">RDMA Transport Status</h2>
+          {Object.keys(rdmaStatus).length === 0 ? (
+            <div className="mt-4 bg-white overflow-hidden shadow rounded-lg p-5 text-gray-500">
+              Loading RDMA status...
+            </div>
+          ) : (
+            Object.entries(rdmaStatus).map(([clusterKey, workers]) => {
+              const healthy = workers.filter(w => w.rdmaAvailable).length
+              const total = workers.length
+              const requested = workers.filter(w => w.rdmaRequested).length
+              return (
+                <div key={clusterKey} className="mt-4 bg-white overflow-hidden shadow rounded-lg">
+                  <div className="p-5">
+                    <div className="flex items-center mb-4">
+                      <span className="text-sm font-medium text-gray-500">Cluster:</span>
+                      <span className="ml-2 text-sm font-semibold text-gray-900">{clusterKey}</span>
+                      {requested > 0 && (
+                        <span className={`ml-4 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                          healthy === total ? 'bg-green-100 text-green-800' :
+                          healthy > 0 ? 'bg-yellow-100 text-yellow-800' :
+                          'bg-red-100 text-red-800'
+                        }`}>
+                          {healthy}/{total} workers RDMA healthy
+                        </span>
+                      )}
+                    </div>
+
+                    {requested === 0 ? (
+                      <p className="text-sm text-gray-500">No workers configured with RDMA</p>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full text-sm">
+                          <thead>
+                            <tr className="border-b border-gray-200">
+                              <th className="text-left py-2 pr-4 text-gray-500 font-medium">Worker Pod</th>
+                              <th className="text-left py-2 pr-4 text-gray-500 font-medium">Node</th>
+                              <th className="text-left py-2 pr-4 text-gray-500 font-medium">RDMA Status</th>
+                              <th className="text-left py-2 text-gray-500 font-medium">Active/Total</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {workers.filter(w => w.rdmaRequested).map(w => (
+                              <tr key={w.podName} className="border-b border-gray-100 hover:bg-gray-50">
+                                <td className="py-2 pr-4 font-mono text-xs text-gray-900 truncate max-w-xs">
+                                  {w.podName}
+                                </td>
+                                <td className="py-2 pr-4 text-xs text-gray-500 font-mono">{w.nodeName}</td>
+                                <td className="py-2 pr-4">
+                                  <RdmaStatusBadge available={w.rdmaAvailable} requested={w.rdmaRequested} />
+                                </td>
+                                <td className="py-2 text-xs text-gray-500 font-mono">
+                                  {w.rdmaAllocated}/{w.nodeRdmaDevices}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )
+            })
+          )}
+        </div>
+      )}
     </div>
+  )
+}
+
+function RdmaStatusBadge({ available, requested }: { available: boolean; requested: boolean }) {
+  if (!requested) {
+    return (
+      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-500">
+        N/A
+      </span>
+    )
+  }
+  return available ? (
+    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+      Available
+    </span>
+  ) : (
+    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+      Unavailable
+    </span>
   )
 }

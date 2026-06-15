@@ -24,6 +24,7 @@
 #endif
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
+#include "transport/rdma_transport/mock_rdma_transport.h"
 #endif
 #include "transport/transport.h"
 #ifdef USE_NVMEOF
@@ -68,9 +69,43 @@
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
-    : metadata_(metadata), local_server_name_(local_server_name) {}
+    : metadata_(metadata), local_server_name_(local_server_name) {
+    // Load failover configuration from environment variables
+    const char* threshold = std::getenv("MC_FAILOVER_THRESHOLD");
+    if (threshold) {
+        failover_threshold_ = std::stoi(threshold);
+        if (failover_threshold_ < 1) failover_threshold_ = 1;
+    }
+    const char* recovery = std::getenv("MC_FAILOVER_RECOVERY_SECS");
+    if (recovery) {
+        recovery_secs_ = std::stoi(recovery);
+        if (recovery_secs_ < 1) recovery_secs_ = 1;
+    }
 
-MultiTransport::~MultiTransport() {}
+    // Start health monitor background thread
+    const char* failover_enabled = std::getenv("MC_FAILOVER_ENABLED");
+    bool enable_monitor = true;  // Enabled by default
+    if (failover_enabled) {
+        std::string val(failover_enabled);
+        enable_monitor = (val == "1" || val == "true" || val == "yes");
+    }
+
+    if (enable_monitor) {
+        health_monitor_running_.store(true, std::memory_order_release);
+        health_monitor_thread_ = std::thread(&MultiTransport::healthMonitorLoop, this);
+        LOG(INFO) << "[MultiTransport] Failover monitor started "
+                  << "(threshold=" << failover_threshold_
+                  << ", recovery=" << recovery_secs_ << "s)";
+    }
+}
+
+MultiTransport::~MultiTransport() {
+    // Stop health monitor thread
+    health_monitor_running_.store(false, std::memory_order_release);
+    if (health_monitor_thread_.joinable()) {
+        health_monitor_thread_.join();
+    }
+}
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     auto batch_desc = new BatchDesc();
@@ -135,11 +170,63 @@ Status MultiTransport::submitTransfer(
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second);
+        auto* transport = entry.first;
+        auto* proto_name = transport->getName();
+        auto status = transport->submitTransferTask(entry.second);
         if (!status.ok()) {
-            // LOG(ERROR) << "Failed to submit transfer task to "
-            //            << entry.first->getName();
+            // Check if this is an RDMA transport that should trigger failover
+            std::string proto_str(proto_name);
+            if (proto_str == "rdma" || proto_str == "mock_rdma" ||
+                proto_str == "ascend") {
+                std::lock_guard<std::mutex> lock(health_mutex_);
+                auto it = transport_health_.find(proto_str);
+                if (it != transport_health_.end()) {
+                    it->second.consecutive_failures++;
+                    if (it->second.consecutive_failures >= failover_threshold_) {
+                        it->second.markUnhealthy(recovery_secs_);
+                        LOG(WARNING) << "[MultiTransport] " << proto_str
+                                    << " marked unhealthy after "
+                                    << it->second.consecutive_failures
+                                    << " consecutive failures. "
+                                    << "Cooldown for " << recovery_secs_ << "s";
+                    }
+                } else {
+                    TransportHealth health;
+                    health.consecutive_failures = 1;
+                    transport_health_[proto_str] = health;
+                }
+            }
+
+            // Attempt TCP fallback for this batch
+            if (transport_map_.count("tcp")) {
+                auto* tcp = transport_map_["tcp"].get();
+                if (tcp != transport) {
+                    LOG(WARNING) << "[MultiTransport] " << proto_str
+                                << " submit failed, retrying with TCP";
+                    auto retry_status = tcp->submitTransferTask(entry.second);
+                    if (retry_status.ok()) {
+                        overall_status = Status::OK();
+                        continue;
+                    }
+                }
+            }
             overall_status = status;
+        } else {
+            // Success: reset consecutive failure counter for RDMA
+            std::string proto_str(proto_name);
+            if (proto_str == "rdma" || proto_str == "mock_rdma" ||
+                proto_str == "ascend") {
+                std::lock_guard<std::mutex> lock(health_mutex_);
+                auto it = transport_health_.find(proto_str);
+                if (it != transport_health_.end()) {
+                    if (it->second.consecutive_failures > 0) {
+                        it->second.consecutive_failures = 0;
+                        it->second.markHealthy();
+                        LOG(INFO) << "[MultiTransport] " << proto_str
+                                 << " recovered after successful transfer";
+                    }
+                }
+            }
         }
     }
     return overall_status;
@@ -306,7 +393,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
     Transport* transport = nullptr;
     if (std::string(proto) == "rdma") {
-        transport = new RdmaTransport();
+        if (isMockRdmaEnabled()) {
+            transport = new MockRdmaTransport();
+        } else {
+            transport = new RdmaTransport();
+        }
     }
 #ifdef USE_UB
     else if (std::string(proto) == "ub") {
@@ -426,6 +517,21 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 
     transport_map_[proto] = std::shared_ptr<Transport>(transport);
+
+    // When installing RDMA transport, also register TCP as fallback if available.
+    // TCP transport is installed via installTransport("tcp", topo) so it goes
+    // through the normal install path (which calls the virtual install method).
+    if ((proto == "rdma") && !transport_map_.count("tcp")) {
+#ifdef USE_TCP
+        LOG(INFO) << "[MultiTransport] Auto-installing TCP transport as "
+                 << "RDMA failover fallback";
+        Transport* tcp = installTransport("tcp", topo);
+        if (!tcp) {
+            LOG(WARNING) << "[MultiTransport] Failed to install TCP fallback";
+        }
+#endif
+    }
+
     return transport;
 }
 
@@ -445,6 +551,28 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         proto = "ascend";
     }
 #endif
+    // Failover: if RDMA transport is unhealthy, try TCP fallback
+    if (proto == "rdma" || proto == "ascend") {
+        std::lock_guard<std::mutex> lock(health_mutex_);
+        auto it = transport_health_.find(proto);
+        if (it != transport_health_.end() && !it->second.healthy) {
+            if (it->second.isCoolingDown()) {
+                // RDMA is in cooldown, try TCP fallback
+                if (transport_map_.count("tcp")) {
+                    LOG(WARNING) << "[MultiTransport] RDMA unhealthy, "
+                                << "falling back to TCP";
+                    transport = transport_map_["tcp"].get();
+                    return Status::OK();
+                }
+            } else {
+                // Cooldown expired, allow retry but clear health
+                it->second.markHealthy();
+                LOG(INFO) << "[MultiTransport] RDMA cooldown expired, "
+                         << "retrying RDMA";
+            }
+        }
+    }
+
     if (!transport_map_.count(proto)) {
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");
@@ -479,6 +607,35 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         preferred_proto = "ascend";
     }
 #endif
+
+    // Failover: if preferred transport is unhealthy, try next in list
+    {
+        std::lock_guard<std::mutex> lock(health_mutex_);
+        auto it = transport_health_.find(preferred_proto);
+        if (it != transport_health_.end() && !it->second.healthy) {
+            if (it->second.isCoolingDown()) {
+                // Try next transport in the protocol list
+                for (const auto& fallback_proto : protos) {
+                    if (fallback_proto == preferred_proto) continue;
+                    if (!transport_map_.count(fallback_proto)) continue;
+                    auto fallback_it = transport_health_.find(fallback_proto);
+                    if (fallback_it != transport_health_.end() &&
+                        !fallback_it->second.healthy) {
+                        continue;
+                    }
+                    LOG(WARNING) << "[MultiTransport] " << preferred_proto
+                                << " unhealthy, failover to " << fallback_proto;
+                    preferred_proto = fallback_proto;
+                    break;
+                }
+            } else {
+                it->second.markHealthy();
+                LOG(INFO) << "[MultiTransport] " << preferred_proto
+                         << " cooldown expired, retrying";
+            }
+        }
+    }
+
     if (!transport_map_.count(preferred_proto)) {
         return Status::NotSupportedTransport("Transport " + preferred_proto +
                                              " not installed");
@@ -519,6 +676,48 @@ void* MultiTransport::getBaseAddr() {
     }
 #endif
     return 0;
+}
+
+void MultiTransport::markTransportUnhealthy(const std::string& proto,
+                                             int recovery_secs) {
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    transport_health_[proto].markUnhealthy(recovery_secs);
+    LOG(WARNING) << "[MultiTransport] " << proto << " marked unhealthy "
+                 << "(cooldown=" << recovery_secs << "s)";
+}
+
+void MultiTransport::markTransportHealthy(const std::string& proto) {
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    auto it = transport_health_.find(proto);
+    if (it != transport_health_.end()) {
+        it->second.markHealthy();
+        LOG(INFO) << "[MultiTransport] " << proto << " marked healthy";
+    }
+}
+
+bool MultiTransport::isTransportHealthy(const std::string& proto) const {
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    auto it = transport_health_.find(proto);
+    if (it == transport_health_.end()) return true;  // No tracking = healthy
+    return it->second.healthy;
+}
+
+void MultiTransport::tryRecoverTransports() {
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    for (auto& entry : transport_health_) {
+        if (!entry.second.healthy && !entry.second.isCoolingDown()) {
+            entry.second.markHealthy();
+            LOG(INFO) << "[MultiTransport] " << entry.first
+                     << " cooldown expired, recovering";
+        }
+    }
+}
+
+void MultiTransport::healthMonitorLoop() {
+    while (health_monitor_running_.load(std::memory_order_acquire)) {
+        tryRecoverTransports();
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
 }
 
 }  // namespace mooncake

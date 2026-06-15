@@ -181,3 +181,8 @@ if (ENABLE_MULTI_PROTOCOL)
     target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest gtest_main)
     add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()
+
+# Mock RDMA transport and failover tests (no real RDMA hardware needed)
+add_executable(mock_rdma_transport_test ${WORKSPACE}/mock_rdma_transport_test.cpp)
+target_link_libraries(mock_rdma_transport_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME mock_rdma_transport_test COMMAND mock_rdma_transport_test)

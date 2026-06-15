@@ -15,6 +15,7 @@
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/platform.h"
+#include "tent/transport/rdma/rdma_transport.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
 #include <glog/logging.h>
@@ -312,6 +313,21 @@ bool TransportSelector::isTransportAvailable(
     // Special constraints
     if ((type == NVLINK || type == SHM) && !context.same_machine) {
         return false;  // NVLINK and SHM only work on same machine
+    }
+
+    // RDMA availability check: use RdmaTransport::available() if available,
+    // and RailMonitor to check rail health
+    if (type == RDMA) {
+        auto* rdma_transport = dynamic_cast<RdmaTransport*>(transport.get());
+        if (rdma_transport && !rdma_transport->available()) {
+            VLOG(1) << "RDMA transport reports unavailable (no active contexts)";
+            return false;
+        }
+        // RailMonitor check: if all rails are marked failed, skip RDMA
+        if (rail_monitor_ && !rail_monitor_->ready()) {
+            VLOG(1) << "RDMA transport skipped: RailMonitor reports no healthy rails";
+            return false;
+        }
     }
 
     const auto& caps = transport->capabilities();

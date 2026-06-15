@@ -318,6 +318,13 @@ Status RdmaTransport::install(std::string& local_segment_name,
     return Status::OK();
 }
 
+bool RdmaTransport::available() const {
+    for (const auto& ctx : context_set_) {
+        if (ctx && ctx->active()) return true;
+    }
+    return false;
+}
+
 Status RdmaTransport::uninstall() {
     if (installed_) {
         // Stop notification worker thread

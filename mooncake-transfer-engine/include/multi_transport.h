@@ -15,11 +15,41 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <thread>
 #include <unordered_map>
 
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// Transport health tracking for automatic failover
+struct TransportHealth {
+    bool healthy = true;
+    int consecutive_failures = 0;
+    std::chrono::steady_clock::time_point cooldown_until;
+
+    bool isCoolingDown() const {
+        return !healthy &&
+               std::chrono::steady_clock::now() < cooldown_until;
+    }
+
+    void markUnhealthy(int recovery_secs) {
+        healthy = false;
+        consecutive_failures++;
+        cooldown_until =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(recovery_secs);
+    }
+
+    void markHealthy() {
+        healthy = true;
+        consecutive_failures = 0;
+    }
+};
+
 class MultiTransport {
    public:
     using BatchID = Transport::BatchID;
@@ -56,6 +86,21 @@ class MultiTransport {
     Transport *getTransport(const std::string &proto);
 
     /**
+     * @brief Mark a transport as unhealthy (triggers failover).
+     */
+    void markTransportUnhealthy(const std::string &proto, int recovery_secs);
+
+    /**
+     * @brief Mark a transport as healthy again.
+     */
+    void markTransportHealthy(const std::string &proto);
+
+    /**
+     * @brief Check if a specific transport is currently healthy.
+     */
+    bool isTransportHealthy(const std::string &proto) const;
+
+    /**
      * @brief Check if TCP is the only installed transport.
      *
      * When only TCP transport is available (no RDMA, NVLink, etc.),
@@ -76,13 +121,32 @@ class MultiTransport {
                               std::string &preferred_proto);
 #endif
 
+    /// Try to recover transports whose cooldown has expired.
+    void tryRecoverTransports();
+
+    /// Background health monitor thread.
+    void healthMonitorLoop();
+
    private:
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
-};
+
+    /// Per-transport health tracking for automatic failover.
+    std::map<std::string, TransportHealth> transport_health_;
+    mutable std::mutex health_mutex_;
+
+    /// Health monitor thread control.
+    std::atomic<bool> health_monitor_running_{false};
+    std::thread health_monitor_thread_;
+
+    /// Failover configuration.
+    int failover_threshold_ = 3;
+    int recovery_secs_ = 30;
+};  // class MultiTransport
+
 }  // namespace mooncake
 
 #endif  // MULTI_TRANSPORT_H_

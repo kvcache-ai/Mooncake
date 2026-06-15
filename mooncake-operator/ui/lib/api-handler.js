@@ -1001,4 +1001,91 @@ if (cancelDrainMatch && req.method === 'POST') {
   }
 }
 
+// GET /api/clusters/:namespace/:name/rdma-status
+// Returns per-worker RDMA availability status by checking each worker pod's
+// RDMA device allocation and health.
+const rdmaStatusMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/rdma-status$/)
+if (rdmaStatusMatch && req.method === 'GET') {
+  try {
+    const [, namespace, name] = rdmaStatusMatch
+
+    // Get all worker pods
+    const podResult = await k8sRequest(
+      `/api/v1/namespaces/${namespace}/pods?labelSelector=app=mooncake-worker,cluster=${name}`
+    )
+    const pods = podResult?.items || []
+
+    // Get all nodes to check RDMA device allocatable
+    const nodesResult = await k8sRequest('/api/v1/nodes')
+    const nodeRdma = new Map()
+    for (const node of (nodesResult?.items || [])) {
+      const allocatable = node.status?.allocatable || {}
+      const rdmaDevices = allocatable['rdma/hca_shared_devices_a']
+      nodeRdma.set(node.metadata.name, rdmaDevices ? parseInt(rdmaDevices) : 0)
+    }
+
+    const workers = []
+    for (const pod of pods) {
+      const podName = pod.metadata?.name || ''
+      const podIP = pod.status?.podIP || ''
+      const nodeName = pod.spec?.nodeName || ''
+      const phase = pod.status?.phase || ''
+      const ready = (pod.status?.conditions || []).some(
+        c => c.type === 'Ready' && c.status === 'True'
+      )
+
+      // Check if RDMA resources were allocated to this container
+      let rdmaRequested = false
+      let rdmaAllocated = 0
+      for (const container of (pod.spec?.containers || [])) {
+        const limits = container.resources?.limits || {}
+        if (limits['rdma/hca_shared_devices_a']) {
+          rdmaRequested = true
+          rdmaAllocated = parseInt(limits['rdma/hca_shared_devices_a'])
+        }
+      }
+
+      const nodeRdmaCount = nodeRdma.get(nodeName) || 0
+
+      // Also try to query the worker pod's transfer health endpoint
+      let rdmaAvailable = false
+      let transportHealth = {}
+      if (ready && podIP) {
+        try {
+          const containerPort = pod.spec?.containers?.[0]?.ports?.find(
+            p => p.name === 'metrics'
+          )?.containerPort || 9003
+          const proxyPrefix = `/api/v1/namespaces/${namespace}/pods/${podName}:${containerPort}/proxy`
+          const healthText = await k8sRequest(`${proxyPrefix}/transport_health`)
+          if (typeof healthText === 'string') {
+            const health = JSON.parse(healthText)
+            rdmaAvailable = health?.rdma?.available ?? (rdmaRequested && rdmaAllocated > 0)
+            transportHealth = health?.transports || {}
+          }
+        } catch (e) {
+          // Transport health endpoint not available; fall back to resource check
+          rdmaAvailable = rdmaRequested && rdmaAllocated > 0
+        }
+      }
+
+      workers.push({
+        podName,
+        podIP,
+        nodeName,
+        phase,
+        ready,
+        rdmaAvailable,
+        rdmaRequested,
+        rdmaAllocated,
+        nodeRdmaDevices: nodeRdmaCount,
+        transportHealth,
+      })
+    }
+
+    return jsonReply(res, 200, { workers })
+  } catch (e) {
+    return jsonReply(res, 500, { error: e.message })
+  }
+}
+
 module.exports = { handleApiRequest }

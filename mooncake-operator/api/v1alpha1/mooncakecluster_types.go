@@ -135,10 +135,34 @@ type WorkerSpec struct {
 	// +kubebuilder:default=13006
 	TransferPort int32 `json:"transferPort,omitempty"`
 
+	// TransportFailover defines the RDMA-to-TCP failover configuration.
+	// When enabled, RDMA transfer failures will automatically fall back to TCP.
+	// +optional
+	TransportFailover *TransportFailoverSpec `json:"transportFailover,omitempty"`
+
 	// Migration defines the worker data migration configuration (optional).
 	// Used when scaling down workers — data is drained before pod termination.
 	// +optional
 	Migration *WorkerMigrationConfig `json:"migration,omitempty"`
+}
+
+// TransportFailoverSpec defines the RDMA-to-TCP automatic failover configuration.
+type TransportFailoverSpec struct {
+	// Enabled enables automatic RDMA-to-TCP failover.
+	// +kubebuilder:default=true
+	Enabled bool `json:"enabled,omitempty"`
+
+	// FailoverThreshold is the number of consecutive RDMA failures before
+	// falling back to TCP transport.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=3
+	FailoverThreshold int32 `json:"failoverThreshold,omitempty"`
+
+	// RecoverySeconds is the cooldown period in seconds before retrying RDMA
+	// after a failover event.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=30
+	RecoverySeconds int32 `json:"recoverySeconds,omitempty"`
 }
 
 // WorkerMigrationConfig defines the data migration configuration for worker scale-down.
