@@ -416,16 +416,30 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
             return BatchGetOnce(keys, sizes);
         }
 
-        // Leader: do SSD IO.
-        tl::expected<BatchGetResult, ErrorCode> result;
-        try {
-            result = BatchGetOnce(keys, sizes);
-        } catch (...) {
-            FinishFlight(key, *flight,
-                         tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-            throw;
-        }
-        FinishFlight(key, *flight, result);
+        // Leader: do SSD IO. Always publish a terminal state so waiters cannot
+        // block forever if the read path throws.
+        struct FlightFinisher {
+            FileStorage* storage;
+            const std::string& key;
+            ColdReadFlight& flight;
+            bool finished{false};
+
+            ~FlightFinisher() {
+                if (!finished) {
+                    storage->FinishFlight(
+                        key, flight,
+                        tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+                }
+            }
+
+            void Finish(tl::expected<BatchGetResult, ErrorCode> result) {
+                storage->FinishFlight(key, flight, std::move(result));
+                finished = true;
+            }
+        } finisher{this, key, *flight};
+
+        auto result = BatchGetOnce(keys, sizes);
+        finisher.Finish(result);
         return result;
     }
 
