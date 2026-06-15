@@ -54,7 +54,7 @@ class TransferExecutorBase {
         int32_t connect_timeout = 10000;
         int32_t transfer_timeout = 10000;
         bool use_async_transfer = false;
-        bool auto_connect = false;
+        bool auto_connect = true;
         bool use_short_connection = false;
         bool use_buffer_pool = false;
         bool dummy_real_mode = false;
