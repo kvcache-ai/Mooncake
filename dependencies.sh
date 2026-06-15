@@ -49,10 +49,24 @@ check_success() {
     fi
 }
 
+read_os_release_value() {
+    local key="$1"
+    awk -F= -v key="$key" '
+        $1 == key {
+            value = $0
+            sub(/^[^=]*=/, "", value)
+            gsub(/^"|"$/, "", value)
+            print value
+            exit
+        }
+    ' "$OS_RELEASE_FILE"
+}
+
 # Function to detect OS
 detect_os() {
     if [ -f "$OS_RELEASE_FILE" ]; then
-        . "$OS_RELEASE_FILE"
+        ID=$(read_os_release_value ID)
+        VERSION_ID=$(read_os_release_value VERSION_ID)
         OS=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
         OS_VERSION=$VERSION_ID
     elif [ -f /etc/redhat-release ]; then
