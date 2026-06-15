@@ -27,6 +27,7 @@
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/congestion_control.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
 #include "tent/runtime/progress_worker.h"
@@ -185,7 +186,8 @@ TransferEngineImpl::TransferEngineImpl()
       available_(false),
       port_(0),
       ipv6_(false),
-      merge_requests_(true) {
+      merge_requests_(true),
+      cc_plugin_(createDefaultCongestionControlPlugin()) {
     ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
@@ -201,7 +203,8 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
       available_(false),
       port_(0),
       ipv6_(false),
-      merge_requests_(true) {
+      merge_requests_(true),
+      cc_plugin_(createDefaultCongestionControlPlugin()) {
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
@@ -1248,6 +1251,22 @@ Status TransferEngineImpl::submitTransfer(
         auto select_result = resolveTransport(merged_request, 0);
         task.type = select_result.transport;
         task.device_mask = select_result.device_mask;
+
+        // Congestion control admission check
+        {
+            AdmitContext admit_ctx{
+                merged_request,
+                0,  // TODO: track global_inflight_bytes
+                0,  // TODO: track per-device inflight from DeviceSelector
+                -1, // device_id not yet determined at this stage
+                merged_request.priority};
+            auto decision = cc_plugin_->onAdmit(admit_ctx);
+            if (decision.device_mask_override != 0) {
+                // Apply congestion control device mask constraint
+                task.device_mask &= decision.device_mask_override;
+            }
+        }
+
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1600,6 +1619,22 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
 
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
+}
+
+Status TransferEngineImpl::setCongestionControlPlugin(
+    std::shared_ptr<CongestionControlPlugin> plugin) {
+    if (!plugin) {
+        return Status::InvalidArgument(
+            "congestion control plugin cannot be null" LOC_MARK);
+    }
+    cc_plugin_ = std::move(plugin);
+    LOG(INFO) << "Congestion control plugin set: " << cc_plugin_->getName();
+    return Status::OK();
+}
+
+CongestionControlPlugin* TransferEngineImpl::getCongestionControlPlugin()
+    const {
+    return cc_plugin_.get();
 }
 
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {

@@ -20,6 +20,7 @@
 
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/shared_quota.h"
+#include "tent/runtime/congestion_control.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
@@ -448,6 +449,16 @@ void Workers::asyncPollCq() {
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
+            // Emit congestion signal on timeout
+            auto* cc_plugin = device_selector_->getCongestionControlPlugin();
+            if (cc_plugin) {
+                CongestionSignal signal;
+                signal.type = CongestionSignal::TIMEOUT_SPIKE;
+                signal.device_id = slice->source_dev_id;
+                signal.timestamp_ns = current_ts;
+                signal.severity = 1.0;  // Timeout is maximum severity
+                cc_plugin->onCongestionSignal(signal);
+            }
             if (!ep) {
                 updateSliceStatus(slice, TIMEOUT);
                 slice_to_remove.push_back(slice);

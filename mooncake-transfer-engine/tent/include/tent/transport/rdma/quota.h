@@ -36,6 +36,7 @@ static constexpr double kMinBwGbps = 10.0;
 static constexpr double kMaxBwGbps = 800.0;
 
 class SharedSlotManager;
+class CongestionControlPlugin;
 
 /**
  * @brief DeviceSelector implements NIC selection with two modes:
@@ -141,6 +142,13 @@ class DeviceSelector {
     void setSmartSelection(bool enable) { smart_selection_enabled_ = enable; }
     bool getSmartSelection() const { return smart_selection_enabled_; }
 
+    void setCongestionControlPlugin(CongestionControlPlugin* plugin) {
+        cc_plugin_ = plugin;
+    }
+    CongestionControlPlugin* getCongestionControlPlugin() const {
+        return cc_plugin_;
+    }
+
     void setLearningRate(double alpha) {
         sched_params_.bandwidth_learning_rate = std::clamp(alpha, 0.0, 1.0);
     }
@@ -202,6 +210,7 @@ class DeviceSelector {
     std::shared_ptr<SharedSlotManager> slot_manager_;
     bool smart_selection_enabled_ = true;
     SchedulingParams sched_params_;
+    CongestionControlPlugin* cc_plugin_ = nullptr;
 
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,
