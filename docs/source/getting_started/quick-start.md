@@ -8,21 +8,16 @@ Install the Mooncake Transfer Engine package from PyPI, which includes both Moon
 
 **For CUDA-enabled systems:**
 ```bash
-pip install mooncake-transfer-engine
+pip install mooncake-transfer-engine numpy pyzmq
 ```
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
 
 **For non-CUDA systems:**
 ```bash
-pip install mooncake-transfer-engine-non-cuda
+pip install mooncake-transfer-engine-non-cuda numpy pyzmq
 ```
 
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
-
-**Additional dependencies for the examples below:**
-```bash
-pip install numpy pyzmq
-```
 
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
 
