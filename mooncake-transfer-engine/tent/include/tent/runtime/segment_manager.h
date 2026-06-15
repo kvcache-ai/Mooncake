@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -110,6 +111,14 @@ class SegmentManager {
    public:
     SegmentDescRef getLocal() { return local_desc_; }
 
+    // Returns a serialized JSON snapshot of local_desc_. The result is cached
+    // and shared across concurrent GetSegmentDesc RPC handlers; the cache is
+    // invalidated by synchronizeLocal() (which is called on every register /
+    // unregisterLocalMemory). This avoids re-dumping the full segment desc on
+    // every peer fetch — the previous behavior multiplied dump cost by the
+    // number of concurrent peer RPCs and dominated remote getRemote latency.
+    std::shared_ptr<const std::string> getLocalDumpedJson();
+
     Status synchronizeLocal();
 
     Status deleteLocal();
@@ -145,11 +154,15 @@ class SegmentManager {
     std::unique_ptr<SegmentRegistry> registry_;
 
     std::string file_desc_basepath_;
-    uint64_t ttl_ms_ = 10 * 1000;  // N.B. Frequent TTL harms p999
+    uint64_t ttl_ms_ = 60 * 60 * 1000;  // 1h; remote SegmentUpdate push handles invalidation
 
     // shared_ptr to prevent UAF in async callbacks
     std::shared_ptr<RWSpinlock> subscribers_lock_;
     std::shared_ptr<std::unordered_set<std::string>> subscribers_;
+
+    // Cache for the serialized JSON of local_desc_. Reset by synchronizeLocal.
+    std::mutex local_json_cache_mu_;
+    std::shared_ptr<const std::string> local_json_cache_;
 };
 }  // namespace tent
 }  // namespace mooncake
