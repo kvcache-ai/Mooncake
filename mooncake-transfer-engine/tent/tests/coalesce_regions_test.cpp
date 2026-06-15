@@ -75,8 +75,7 @@ TEST(CoalesceRegionsTest, TieBreakIsDeterministic) {
 }
 
 TEST(CoalesceRegionsTest, MajorityWins) {
-    auto entries =
-        makeEntries({{900 * kKiB, "cpu:0"}, {100 * kKiB, "cpu:1"}});
+    auto entries = makeEntries({{900 * kKiB, "cpu:0"}, {100 * kKiB, "cpu:1"}});
     auto out = coalesceRegions(entries);
     ASSERT_EQ(out.size(), 1u);
     EXPECT_EQ(out[0].size, 1000 * kKiB);
@@ -125,8 +124,7 @@ TEST(CoalesceRegionsTest, AutoBucketBoundedBy128) {
 }
 
 TEST(CoalesceRegionsTest, AutoBucketRespectsMinFloor) {
-    auto entries =
-        makeEntries({{50 * kKiB, "cpu:0"}, {50 * kKiB, "cpu:0"}});
+    auto entries = makeEntries({{50 * kKiB, "cpu:0"}, {50 * kKiB, "cpu:0"}});
     auto out = coalesceRegions(entries);  // auto: 1 MiB floor applies
     ASSERT_EQ(out.size(), 1u);
     EXPECT_EQ(out[0].size, 100 * kKiB);
@@ -137,8 +135,7 @@ TEST(CoalesceRegionsTest, AutoBucketRespectsMinFloor) {
 // yield bucket_bytes=0 → divide-by-zero / take=0 infinite loop. Defensive
 // floor inside the helper must keep the call well-defined.
 TEST(CoalesceRegionsTest, DefensiveZeroParams) {
-    auto entries =
-        makeEntries({{256 * kKiB, "cpu:0"}, {256 * kKiB, "cpu:1"}});
+    auto entries = makeEntries({{256 * kKiB, "cpu:0"}, {256 * kKiB, "cpu:1"}});
     auto out = coalesceRegions(entries,
                                /*max_buckets=*/0,
                                /*min_bucket_bytes=*/0);

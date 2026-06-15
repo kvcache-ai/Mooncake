@@ -229,18 +229,16 @@ using SegmentDescRef = std::shared_ptr<SegmentDesc>;
 // routing-hint Regions. Each bucket emits one Region carrying the bucket's
 // majority NUMA label; receivers consume Region as a max-overlap NIC hint.
 inline std::vector<Region> coalesceRegions(
-    const std::vector<RangeLocation>& entries,
-    size_t max_buckets = 128,
+    const std::vector<RangeLocation>& entries, size_t max_buckets = 128,
     size_t min_bucket_bytes = static_cast<size_t>(1) << 20) {
     std::vector<Region> out;
     if (entries.empty()) return out;
 
     size_t total = 0;
     for (auto& e : entries) total += e.len;
-    size_t computed = max_buckets > 0
-                          ? total / max_buckets +
-                                (total % max_buckets != 0 ? 1 : 0)
-                          : 0;
+    size_t computed = max_buckets > 0 ? total / max_buckets +
+                                            (total % max_buckets != 0 ? 1 : 0)
+                                      : 0;
     // Defensive floor: bucket_bytes == 0 would loop forever / divide by zero.
     // Hit only when caller passes both min_bucket_bytes=0 and max_buckets=0.
     size_t bucket_bytes =

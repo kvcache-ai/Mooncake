@@ -1083,7 +1083,8 @@ std::optional<BufferKey> toBufferKey(BufferDesc* buffer) {
 
 std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     ControlService* metadata, const std::vector<Request>& requests) {
-    // Group requests by target_id so withCachedSegment fires at most once per peer.
+    // Group requests by target_id so withCachedSegment fires at most once per
+    // peer.
     std::vector<RequestBoundaryInfo> boundaries(requests.size());
     auto* local_desc = metadata->segmentManager().getLocal().get();
 
@@ -1107,7 +1108,8 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
                 bool any_missing = false;
                 for (size_t i : idxs) {
                     const auto& r = requests[i];
-                    auto* buffer = target_desc->findBuffer(r.target_offset, r.length);
+                    auto* buffer =
+                        target_desc->findBuffer(r.target_offset, r.length);
                     if (!buffer) {
                         any_missing = true;
                         boundaries[i].target_key = std::nullopt;

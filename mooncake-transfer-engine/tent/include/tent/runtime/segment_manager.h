@@ -154,7 +154,8 @@ class SegmentManager {
     std::unique_ptr<SegmentRegistry> registry_;
 
     std::string file_desc_basepath_;
-    uint64_t ttl_ms_ = 60 * 60 * 1000;  // 1h; remote SegmentUpdate push handles invalidation
+    uint64_t ttl_ms_ =
+        60 * 60 * 1000;  // 1h; remote SegmentUpdate push handles invalidation
 
     // shared_ptr to prevent UAF in async callbacks
     std::shared_ptr<RWSpinlock> subscribers_lock_;
