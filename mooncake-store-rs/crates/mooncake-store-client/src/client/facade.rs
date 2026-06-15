@@ -2012,6 +2012,13 @@ impl Drop for StoreClient {
         }
         self.control_client.clear_channels();
         self._control_plane.shutdown();
+        // Worker clones (restore-promotion threads) share the same
+        // Arc<Mutex<StoreState>> as the primary client.  They must NOT
+        // clean up shared state (memory, remote segments, local transports)
+        // because the primary client is still using it.
+        if !self.owns_cold_tier_lifecycle {
+            return;
+        }
         let Some(transport) = self.transport.as_deref() else {
             return;
         };
