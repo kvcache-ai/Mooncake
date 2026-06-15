@@ -295,7 +295,7 @@ jobs:
       run: |
         apt update -y
         apt install -y ninja-build
-        python3 -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.0
+        python3 -m pip install torch==2.5.0
         python3 -m pip install torchada==0.1.48
         ln -sfn /usr/local/musa /usr/local/cuda
         ln -sfn /usr/local/musa/bin/mcc /usr/local/musa/bin/nvcc
