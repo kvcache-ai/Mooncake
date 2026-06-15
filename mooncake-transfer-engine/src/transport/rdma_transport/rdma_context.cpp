@@ -392,24 +392,13 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #endif
         CUdeviceptr allocBase;
         size_t allocSize;
-#if defined(USE_MLU)
-        allocBase = (CUdeviceptr)addr;
-        result = cuPointerGetAttribute(
-            &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
-#else
         result =
             cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
-#endif
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
-#if defined(USE_MLU)
-            LOG(ERROR) << "Failed to call cuPointerGetAttribute range size for "
-                       << (uintptr_t)addr << " cuda error=" << errStr;
-#else
             LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
-#endif
 #if defined(USE_CUDA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif

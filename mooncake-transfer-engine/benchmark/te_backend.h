@@ -90,6 +90,7 @@ class TEBenchRunner : public BenchRunner {
     std::condition_variable cv_task_;
     std::condition_variable cv_done_;
     int pending_ = 0;
+    bool init_ok_ = true;
 };
 
 }  // namespace tent

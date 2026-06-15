@@ -186,7 +186,7 @@ transfer_submit_write(target_hostname, buffer, peer_buffer_address, length)
 - `length` (int): 要传输的字节数
 
 **返回值：**
-- `int`: 用于跟踪操作的批次ID，失败时返回负值
+- `int`: 用于跟踪操作的批次ID，失败时返回0
 
 #### transfer_check_status()
 

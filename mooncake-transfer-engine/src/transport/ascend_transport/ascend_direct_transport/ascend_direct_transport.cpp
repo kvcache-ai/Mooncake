@@ -149,17 +149,9 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->protocol = "ascend";
 
     dummy_real_mode_ = globalConfig().ascend_agent_mode;
-    char *roce_enable_str = std::getenv("HCCL_INTRA_ROCE_ENABLE");
-    if (roce_enable_str) {
-        std::optional<int32_t> roce_enable =
-            parseFromString<int32_t>(roce_enable_str);
-        if (roce_enable.has_value() && roce_enable.value() == 1) {
-            roce_mode_ = true;
-            LOG(INFO) << "Roce mode is enabled.";
-        } else {
-            LOG(WARNING) << "HCCL_INTRA_ROCE_ENABLE is not valid, value:"
-                         << roce_enable_str;
-        }
+    roce_mode_ = IsRoceModeEnabled();
+    if (roce_mode_) {
+        LOG(INFO) << "Roce mode is enabled.";
     }
     char *adxl_base_port = std::getenv("ASCEND_BASE_PORT");
     if (adxl_base_port) {
@@ -175,6 +167,7 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     }
     const auto [host_ip, port] = parseHostNameWithPort(local_server_name_);
     (void)port;
+    desc->rank_info.hostIp = host_ip;
     uint32_t device_count = 0;
     CHECK_ACL(aclrtGetDeviceCount(&device_count));
     if (dummy_real_mode_) {

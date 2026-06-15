@@ -373,8 +373,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         callbacks_[taskId] = [this, processNextChunk, state, meta,
                               bufferToTensor, bufferOffset, realSize,
                               future]() {
-            for (int i = 0; i < meta->size; ++i) {
-                meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
+            if (meta->activeRanksTensor.device().is_cpu()) {
+                for (int i = 0; i < meta->size; ++i) {
+                    meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
+                }
             }
             bufferToTensor(
                 (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],

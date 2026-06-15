@@ -129,7 +129,10 @@ int main(int argc, char* argv[]) {
     for (int num_threads = XferBenchConfig::start_num_threads;
          !interrupted && num_threads <= XferBenchConfig::max_num_threads;
          num_threads *= 2) {
-        runner->startInitiator(num_threads);
+        if (runner->startInitiator(num_threads) != 0) {
+            interrupted = true;
+            break;
+        }
         for (size_t block_size = XferBenchConfig::start_block_size;
              !interrupted && block_size <= XferBenchConfig::max_block_size;
              block_size *= 2) {
