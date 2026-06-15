@@ -299,9 +299,11 @@ jobs:
         mkdir -p /tmp/musa-lib-fix
         ln -sf libmusa.so.4.3.4 /usr/lib/x86_64-linux-gnu/libmusa.so.4
         ln -sf libmusa.so.4.3.4 /usr/lib/x86_64-linux-gnu/libmusa.so
+        ln -sf /usr/lib/x86_64-linux-gnu/libmusa.so.4.3.4 /usr/local/musa/lib/libmusa.so
         ln -sf /usr/lib/x86_64-linux-gnu/libmusa.so.4.3.4 /tmp/musa-lib-fix/libmusa.so.4
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
         export LD_LIBRARY_PATH=/tmp/musa-lib-fix:/usr/local/musa/lib:${LD_LIBRARY_PATH:-}
+        export LIBRARY_PATH=/usr/local/musa/lib:/usr/lib/x86_64-linux-gnu:${LIBRARY_PATH:-}
         bash -x dependencies.sh -y
         mkdir build
         cd build
@@ -314,6 +316,7 @@ jobs:
         [ -f ~/.bashrc ] && source ~/.bashrc || true
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
         export LD_LIBRARY_PATH=/tmp/musa-lib-fix:/usr/local/musa/lib:${LD_LIBRARY_PATH:-}
+        export LIBRARY_PATH=/usr/local/musa/lib:/usr/lib/x86_64-linux-gnu:${LIBRARY_PATH:-}
         cmake --build .
         cmake --install .
       shell: bash
