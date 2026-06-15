@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import NavUser from './nav-user'
 
 export const metadata: Metadata = {
   title: 'Mooncake Operator',
@@ -30,6 +31,7 @@ export default function RootLayout({
                   </a>
                 </div>
               </div>
+              <NavUser />
             </div>
           </div>
         </nav>

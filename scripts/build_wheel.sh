@@ -6,8 +6,13 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
+# Fast mode: when WHEEL_REUSE=1, only update binaries inside an existing wheel
+# without running python -m build or auditwheel. This is ~10x faster (~10s vs ~130s)
+# and should be used when only C++ code / .so binaries changed.
+WHEEL_REUSE="${WHEEL_REUSE:-0}"
+
 # Get Python version from environment variable or argument
-PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
+PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # CMake build directory (default: build).  EP/PG extensions are staged under
@@ -107,8 +112,12 @@ else
 fi
 
 echo "Copying transfer_engine_bench..."
-# Copy transfer_engine_bench
-cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
+# Copy transfer_engine_bench (optional — not built in all configurations)
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench" ]; then
+    cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
+else
+    echo "Skipping transfer_engine_bench (not built - disable BUILD_EXAMPLES to skip)"
+fi
 
 if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
@@ -141,6 +150,52 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
         CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
     fi
+fi
+
+# Fast mode: when WHEEL_REUSE=1, only update binaries inside an existing wheel
+# without running python -m build or auditwheel. This is ~10x faster (~10s vs ~130s)
+# and should be used when only C++ code / .so binaries changed.
+# Note: the full build puts the wheel in mooncake-wheel/dist/ (after cd mooncake-wheel),
+# but the fast path runs before cd, so we check both OUTPUT_DIR and mooncake-wheel/dist.
+WHHEEL_LOCATION=""
+if [ "$WHEEL_REUSE" = "1" ]; then
+    if ls mooncake-wheel/${OUTPUT_DIR}/*.whl 2>/dev/null | head -1 | grep -q .; then
+        WHHEEL_LOCATION="mooncake-wheel/${OUTPUT_DIR}"
+    elif ls ${OUTPUT_DIR}/*.whl 2>/dev/null | head -1 | grep -q .; then
+        WHHEEL_LOCATION="${OUTPUT_DIR}"
+    fi
+fi
+if [ -n "$WHHEEL_LOCATION" ]; then
+    EXISTING_WHEEL=$(ls ${WHHEEL_LOCATION}/*.whl | head -1)
+    echo "Fast wheel reuse: updating binaries in existing wheel ${EXISTING_WHEEL}"
+
+    REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
+    mkdir -p ${REPAIRED_DIR}
+
+    WHEEL_UNPACK_DIR=$(mktemp -d)
+    python${PYTHON_VERSION} -m wheel unpack "$EXISTING_WHEEL" -d "$WHEEL_UNPACK_DIR"
+    UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+
+    # Update binaries inside the unpacked wheel
+    for so_file in mooncake-wheel/mooncake/*.so mooncake-wheel/mooncake/*.bin; do
+        [ -f "$so_file" ] && cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")" 2>/dev/null || true
+    done
+    # Copy master binary
+    for bin_file in mooncake-wheel/mooncake/mooncake_master mooncake-wheel/mooncake/mooncake_client; do
+        [ -f "$bin_file" ] && cp "$bin_file" "$UNPACKED_PKG_DIR/mooncake/" 2>/dev/null || true
+    done
+
+    # Repack
+    python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+    rm -rf "$WHEEL_UNPACK_DIR"
+
+    rm -f ${WHHEEL_LOCATION}/*.whl
+    mv ${REPAIRED_DIR}/*.whl ${WHHEEL_LOCATION}/
+
+    cd ..
+    [[ -f mooncake-wheel/pyproject.toml.backup ]] && mv mooncake-wheel/pyproject.toml.backup mooncake-wheel/pyproject.toml
+    echo "Wheel package updated (fast mode)!"
+    exit 0
 fi
 
 if [ "$NPU_BUILD" = "1" ]; then
@@ -208,8 +263,8 @@ if [ "$NPU_BUILD" = "1" ]; then
         exit 1
     fi
     "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel
-elif command -v pip &>/dev/null; then
-    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
+elif command -v pip3 &>/dev/null; then
+    python${PYTHON_VERSION} -m pip install --break-system-packages --upgrade build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
     uv pip install build setuptools wheel auditwheel

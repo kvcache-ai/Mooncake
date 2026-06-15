@@ -7,10 +7,11 @@ metadata:
     app.kubernetes.io/name: mooncake-operator-ui
     app.kubernetes.io/component: webui
 spec:
+  type: NodePort
   selector:
     app.kubernetes.io/name: mooncake-operator-ui
   ports:
   - port: 3000
     targetPort: http
+    nodePort: 31590
     name: http
-  type: LoadBalancer

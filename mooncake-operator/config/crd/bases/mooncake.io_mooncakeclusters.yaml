@@ -320,10 +320,10 @@ spec:
                         type: object
                     type: object
                   segmentSize:
-                    default: 4Gi
+                    default: 1Gi
                     description: SegmentSize is the memory segment size per worker
-                      (e.g. "4Gi").
-                    type: string
+                      (e.g. "1Gi"). Must be less than or equal to worker
+                      resources.limits.memory.
                   transferPort:
                     default: 13006
                     description: TransferPort is the port for the transfer engine RPC

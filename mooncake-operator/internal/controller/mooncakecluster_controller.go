@@ -116,6 +116,11 @@ func (r *MooncakeClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		mc.Status.Phase = "Creating"
 	}
 
+	// 4a. Validate segmentSize against worker memory limit
+	if err := validateSegmentSize(&mc); err != nil {
+		return r.setFailed(ctx, &mc, "InvalidSegmentSize", err)
+	}
+
 	// 5. Reconcile all sub-resources
 	if err := r.reconcileConfigMap(ctx, &mc); err != nil {
 		return r.setFailed(ctx, &mc, "ConfigMapError", err)

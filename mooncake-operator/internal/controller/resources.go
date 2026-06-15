@@ -14,6 +14,51 @@ import (
 	mooncakev1alpha1 "github.com/kvcache-ai/Mooncake/mooncake-operator/api/v1alpha1"
 )
 
+// parseK8sMemory converts a Kubernetes memory quantity string (e.g. "1Gi", "512Mi")
+// to bytes for comparison. Returns an error if the quantity cannot be parsed.
+func parseK8sMemory(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty memory quantity")
+	}
+	// resource.ParseQuantity handles both binary (Ki/Mi/Gi/Ti) and decimal (K/M/G/T) suffixes.
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory quantity %q: %w", s, err)
+	}
+	return q.Value(), nil
+}
+
+// validateSegmentSize ensures that segmentSize does not exceed the worker pod's
+// memory limit. The mooncake_client allocates a global segment of the configured
+// size inside the container, so it must fit within the container's cgroup limit.
+func validateSegmentSize(mc *mooncakev1alpha1.MooncakeCluster) error {
+	segBytes, err := parseK8sMemory(mc.Spec.Workers.SegmentSize)
+	if err != nil {
+		return fmt.Errorf("invalid segmentSize: %w", err)
+	}
+
+	// Determine the effective memory limit from the worker spec.
+	// If no memory limit is set, we cannot validate — skip (Kubernetes will enforce
+	// the node's allocatable if needed).
+	limits := mc.Spec.Workers.Resources.Limits
+	memLimit, hasLimit := limits[corev1.ResourceMemory]
+	if !hasLimit || memLimit.IsZero() {
+		return nil
+	}
+
+	limitBytes := memLimit.Value()
+	if segBytes > limitBytes {
+		return fmt.Errorf(
+			"segmentSize %s (%d bytes) exceeds worker memory limit %s (%d bytes); "+
+				"segmentSize must be <= worker resources.limits.memory",
+			mc.Spec.Workers.SegmentSize, segBytes,
+			memLimit.String(), limitBytes,
+		)
+	}
+	return nil
+}
+
 func (r *MooncakeClusterReconciler) buildMasterStatefulSet(mc *mooncakev1alpha1.MooncakeCluster) *appsv1.StatefulSet {
 	labels := labelsForCluster(mc)
 	selector := map[string]string{"app": "mooncake-master", "cluster": mc.Name}
