@@ -218,7 +218,7 @@ class TestMooncakeConfigValidation(unittest.TestCase):
         return MooncakeConfig(**kwargs)
 
     def test_valid_protocols_accepted(self):
-        for protocol in ["tcp", "rdma", "RDMA", "Tcp", "cxl", "ascend", "nvlink_intra"]:
+        for protocol in ["tcp", "rdma", "efa", "RDMA", "Tcp", "cxl", "ascend", "nvlink_intra"]:
             with self.subTest(protocol=protocol):
                 config = self.make(protocol=protocol)
                 self.assertEqual(config.protocol, protocol)

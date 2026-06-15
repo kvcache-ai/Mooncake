@@ -20,6 +20,7 @@ Python API Level (Commonly Used):
 Transfer Engine C++ Level (Advanced):
 -------------------------------------
 In addition to tcp and rdma, the C++ Transfer Engine also supports:
+- efa: AWS Elastic Fabric Adapter transport (libfabric-based)
 - nvmeof: NVMe over Fabric for direct NVMe storage access
 - nvlink: NVIDIA NVLink for inter-GPU communication across nodes
 - nvlink_intra: NVIDIA NVLink for intra-node GPU communication
@@ -71,6 +72,7 @@ _SIZE_SUFFIXES = [
 _VALID_PROTOCOLS = frozenset({
     "tcp",
     "rdma",
+    "efa",
     "nvmeof",
     "nvlink",
     "nvlink_intra",
