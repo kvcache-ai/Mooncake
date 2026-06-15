@@ -1666,6 +1666,14 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    // Success-side invalidation: a concurrent read between the pre-upsert
+    // RemoveHotKey() and UpsertEnd could have read the old value and submitted
+    // an async hot-cache fill with a still-valid token. Invalidate again now
+    // that the new value is committed so that stale fill cannot publish.
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     return {};
 }
 
@@ -2283,7 +2291,9 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     }
 
     // Process successful operations
+    std::vector<std::string> finalized_keys;
     if (!successful_keys.empty()) {
+        finalized_keys.reserve(successful_keys.size());
         auto end_responses = master_client_.BatchUpsertEnd(successful_keys);
         if (end_responses.size() != successful_keys.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
@@ -2304,11 +2314,21 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                                          "BatchUpsertEnd failed");
                 } else {
                     ops[op_idx].SetSuccess();
+                    finalized_keys.emplace_back(successful_keys[i]);
                     VLOG(1) << "Successfully completed upsert for key "
                             << successful_keys[i];
                 }
             }
         }
+    }
+
+    // Success-side invalidation for finalized upserts only: a concurrent read
+    // between StartBatchUpsert()'s pre-invalidation and BatchUpsertEnd could
+    // have read the old value and submitted an async hot-cache fill with a
+    // still-valid token. Invalidate again now that the new values are
+    // committed so those stale fills cannot publish.
+    if (hot_cache_ && !finalized_keys.empty()) {
+        hot_cache_->RemoveHotKeys(finalized_keys);
     }
 
     // Process failed operations that need cleanup
