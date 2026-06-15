@@ -6,6 +6,8 @@ on:
 
 jobs:
   qoder-review:
+    # Skip fork and cross-repo PRs (head repo must match this repository)
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
