@@ -156,6 +156,37 @@ Debug checklist:
 4. Run EP tests with fallback enabled and disabled to separate correctness from
    transport setup.
 
+## RDMA connection errors or severe latency from wrong HCA selection
+
+Symptoms can include connection setup failures, repeated transport timeouts,
+unexpected fallback, very low bandwidth, or RDMA retry-style errors when the
+backend auto-selects an unsuitable NIC/HCA. This commonly happens on machines
+with multiple RDMA devices where some devices are for management traffic, are on
+different fabrics, or are not reachable from peer ranks.
+
+Fix: set an explicit device filter before initializing Mooncake PG/EP so all
+ranks use the intended HCA list.
+
+For application code:
+
+```python
+from mooncake import pg
+
+pg.set_device_filter(["mlx5_1", "mlx5_2"])
+# call dist.init_process_group(...) after setting the filter
+```
+
+For PG tests and benchmarks:
+
+```bash
+MOONCAKE_PGTEST_DEVICE_FILTERS=mlx5_1,mlx5_2 \
+python -m unittest discover -s mooncake-pg/tests -k CUDA -v
+```
+
+Use the same filter on every rank. If the problem disappears after setting the
+filter, treat the original failure as a topology/device-selection issue rather
+than an EP kernel or collective correctness problem.
+
 ## EP output mismatch or buffer overflow symptoms
 
 Common causes:
