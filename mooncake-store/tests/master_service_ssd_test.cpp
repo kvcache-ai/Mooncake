@@ -27,6 +27,64 @@ class MasterServiceSSDTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    config.allocation_strategy_type =
+        AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+    return std::make_unique<MasterService>(config);
+}
+
+void MountMemoryAndLocalDisk(MasterService& service, const UUID& client_id,
+                             const std::string& segment_name,
+                             size_t base_addr) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = base_addr;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
+    ASSERT_TRUE(service.ReportSsdCapacity(client_id, 1000).has_value());
+}
+
+void PutAndOffload(MasterService& service, const UUID& client_id,
+                   const std::string& key, int64_t object_size,
+                   const std::string& local_disk_endpoint) {
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, object_size, config).has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+
+    StorageObjectMetadata metadata;
+    metadata.data_size = object_size;
+    metadata.transport_endpoint = local_disk_endpoint;
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_id, {key}, {metadata}).has_value());
+}
+
+void ExpectNextAllocationOnSegment(MasterService& service,
+                                   const UUID& client_id,
+                                   const std::string& key,
+                                   const std::string& expected_segment) {
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto result = service.PutStart(client_id, key, 64, config);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    ASSERT_TRUE((*result)[0].is_memory_replica());
+    EXPECT_EQ((*result)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              expected_segment);
+}
+
 TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
@@ -489,6 +547,47 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplica_InvalidReplicaTypeReturnsError) {
         service_->EvictDiskReplica(client_id, key, ReplicaType::MEMORY);
     EXPECT_FALSE(evict_result.has_value());
     EXPECT_EQ(evict_result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(MasterServiceSSDTest, RemoveReleasesLocalDiskUsageTracking) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client1 = generate_uuid();
+    UUID client2 = generate_uuid();
+    const std::string segment1 = "ssd_remove_segment_1";
+    const std::string segment2 = "ssd_remove_segment_2";
+    MountMemoryAndLocalDisk(*service, client1, segment1, 0x400000000);
+    MountMemoryAndLocalDisk(*service, client2, segment2, 0x500000000);
+
+    PutAndOffload(*service, client1, "ssd_remove_released", 800, segment1);
+    PutAndOffload(*service, client2, "ssd_remove_baseline", 100, segment2);
+
+    ASSERT_TRUE(service->Remove("ssd_remove_released").has_value());
+
+    ExpectNextAllocationOnSegment(*service, client1, "ssd_remove_probe",
+                                  segment1);
+}
+
+TEST_F(MasterServiceSSDTest,
+       BatchReplicaClearAllSegmentsReleasesLocalDiskUsageTracking) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client1 = generate_uuid();
+    UUID client2 = generate_uuid();
+    const std::string segment1 = "ssd_clear_segment_1";
+    const std::string segment2 = "ssd_clear_segment_2";
+    MountMemoryAndLocalDisk(*service, client1, segment1, 0x600000000);
+    MountMemoryAndLocalDisk(*service, client2, segment2, 0x700000000);
+
+    PutAndOffload(*service, client1, "ssd_clear_released", 800, segment1);
+    PutAndOffload(*service, client2, "ssd_clear_baseline", 100, segment2);
+
+    auto clear_result =
+        service->BatchReplicaClear({"ssd_clear_released"}, client1, "");
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+    EXPECT_EQ((*clear_result)[0], "ssd_clear_released");
+
+    ExpectNextAllocationOnSegment(*service, client1, "ssd_clear_probe",
+                                  segment1);
 }
 
 }  // namespace mooncake::test

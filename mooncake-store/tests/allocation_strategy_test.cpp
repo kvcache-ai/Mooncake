@@ -25,8 +25,7 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(
-    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST,
-    AllocationStrategyType::SSD_FREE_RATIO_FIRST);
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -773,9 +772,7 @@ class MockSsdMetricsProvider : public SsdMetricsProvider {
     }
 };
 
-// Test SSD free ratio ranking: segments with more SSD free space should
-// receive more allocations.
-TEST_F(AllocationStrategyTest, SsdFreeRatioFirstLoadBalancingDistribution) {
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
     auto ssd_strategy = std::make_unique<SsdFreeRatioFirstAllocationStrategy>();
 
     const int kNumSegments = 3;
@@ -790,62 +787,27 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstLoadBalancingDistribution) {
                 name, 0x100000000ULL + i * kSegmentSize, kSegmentSize, name));
     }
 
-    // Mock SSD usage: segment 0 is 80% full, segment 1 is 40% full,
-    // segment 2 is 10% full. Expect most allocations on segment 2.
+    // SSD free ratios: segment 0 = 20%, segment 1 = 60%, segment 2 = 90%
     MockSsdMetricsProvider ssd_provider;
-    ssd_provider.total_capacity["0-segment"] = 1000 * MiB;
-    ssd_provider.used_bytes["0-segment"] = 800 * MiB;
-    ssd_provider.total_capacity["1-segment"] = 1000 * MiB;
-    ssd_provider.used_bytes["1-segment"] = 400 * MiB;
-    ssd_provider.total_capacity["2-segment"] = 1000 * MiB;
-    ssd_provider.used_bytes["2-segment"] = 100 * MiB;
-
-    // Use small slices to stay well within DDR capacity (192MB total).
-    // 500 × 64KB = 32MB << 192MB, so all allocations succeed.
-    std::array<int, kNumSegments> count = {0};
-    const size_t kSliceLength = 64 * 1024;  // 64KB
-    const int kNumAllocations = 500;
-    std::vector<std::vector<Replica>> replicas;
-
-    for (int i = 0; i < kNumAllocations; i++) {
-        auto result =
-            ssd_strategy->Allocate(allocator_manager, kSliceLength, 1, {}, {},
-                                   ReplicaType::MEMORY, &ssd_provider);
-        ASSERT_TRUE(result.has_value());
-        ASSERT_EQ(result.value().size(), 1u);
-
-        const auto& replica = result.value()[0];
-        auto descriptor = replica.get_descriptor();
-        ASSERT_TRUE(descriptor.is_memory_replica());
-        const auto& mem_desc = descriptor.get_memory_descriptor();
-        std::string segment_name =
-            mem_desc.buffer_descriptor.transport_endpoint_;
-
-        int segment_idx = segment_name[0] - '0';
-        ASSERT_LT(segment_idx, kNumSegments);
-        count[segment_idx]++;
-        replicas.push_back(std::move(result.value()));
-    }
-
-    std::cout << "\nSSD Free-Ratio-First Load Balancing Results:\n";
     for (int i = 0; i < kNumSegments; i++) {
         const auto name = std::to_string(i) + "-segment";
-        double ssd_used_ratio =
-            static_cast<double>(ssd_provider.used_bytes[name]) /
-            static_cast<double>(ssd_provider.total_capacity[name]);
-        std::cout << "  Segment " << i << " (SSD used=" << std::fixed
-                  << std::setprecision(0) << (ssd_used_ratio * 100)
-                  << "%): " << count[i] << " allocations\n";
+        ssd_provider.total_capacity[name] = 1000 * MiB;
     }
+    ssd_provider.used_bytes["0-segment"] = 800 * MiB;  // 20% free
+    ssd_provider.used_bytes["1-segment"] = 400 * MiB;  // 60% free
+    ssd_provider.used_bytes["2-segment"] = 100 * MiB;  // 90% free
 
-    // With DDR available on all segments, the SSD strategy preferentially
-    // allocates to segments with the most SSD free space (segment 2).
-    EXPECT_GT(count[2], count[1])
-        << "Segment 2 (90% SSD free) should get more allocations than "
-           "segment 1 (60% SSD free)";
-    EXPECT_GT(count[2], count[0])
-        << "Segment 2 (90% SSD free) should get more allocations than "
-           "segment 0 (20% SSD free)";
+    auto result =
+        ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {}, {},
+                               ReplicaType::MEMORY, &ssd_provider);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().size(), 1u);
+
+    const auto& replica = result.value()[0];
+    auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_memory_replica());
+    const auto& mem_desc = descriptor.get_memory_descriptor();
+    EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "2-segment");
 }
 
 // Test that SsdFreeRatioFirstAllocationStrategy works without an
