@@ -61,9 +61,37 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/scheduler/lru_policy.cpp
     tiered_cache/scheduler/client_scheduler.cpp
     task_manager.cpp
+    # HA OpLog components (ported from main branch)
+    ha/oplog/oplog_manager.cpp
+    ha/oplog/oplog_serializer.cpp
+    ha/oplog/localfs_oplog_store.cpp
+    ha/oplog/polling_oplog_change_notifier.cpp
+    ha/oplog/oplog_store_factory.cpp
+    standby_state_machine.cpp
+    ha_metric_manager.cpp
 )
 
 set(EXTRA_LIBS "")
+
+# Find xxHash (required for ComputeChecksum)
+find_path(
+  XXHASH_INCLUDE_DIR
+  NAMES xxhash.h
+  PATHS /usr/include /usr/local/include)
+find_library(
+  XXHASH_LIBRARY
+  NAMES xxhash libxxhash
+  PATHS /usr/lib /usr/local/lib /usr/lib64)
+if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
+  message(
+    STATUS "Found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}")
+  list(APPEND MASTER_EXTRA_INCS ${XXHASH_INCLUDE_DIR})
+else()
+  message(
+    FATAL_ERROR
+      "xxHash library/header not found. Please install xxhash (development headers) and try again."
+  )
+endif()
 
 if(USE_3FS)
   add_subdirectory(hf3fs)
@@ -87,6 +115,7 @@ add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 # Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., vendor-specific hardware)
 # to targets that don't need it (e.g., mooncake_master).
 # Targets that need transfer_engine should link it explicitly.
+target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 target_link_libraries(mooncake_store
     PUBLIC
         cachelib_memory_allocator
@@ -94,6 +123,7 @@ target_link_libraries(mooncake_store
         glog::glog
         gflags::gflags
         JsonCpp::JsonCpp
+        ${XXHASH_LIBRARY}
         ${EXTRA_LIBS}
         asio_shared
     PRIVATE

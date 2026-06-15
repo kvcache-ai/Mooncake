@@ -171,6 +171,7 @@ enum class ErrorCode : int32_t {
     ETCD_KEY_NOT_EXIST = -1001,     ///< key not found in etcd.
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
+    OPLOG_ENTRY_NOT_FOUND = -1004,  ///< OpLog entry not found.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
@@ -518,6 +519,48 @@ inline std::ostream& operator<<(std::ostream& os,
             break;
     }
     return os;
+}
+
+inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
+    if (cluster_id.empty()) {
+        return false;
+    }
+    if (cluster_id.size() > 128) {
+        return false;
+    }
+    for (unsigned char c : cluster_id) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
+                        c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Sequence ID comparison utilities for OpLog and HA components.
+// These use signed difference to handle uint64_t wrap-around correctly:
+//   IsSequenceNewer(0, UINT64_MAX) = true  (0 is newer after wrap)
+//   IsSequenceNewer(UINT64_MAX, 0) = false (UINT64_MAX is older before wrap)
+//
+// Assumes gap < 2^63, which is always true for sequence IDs in practice.
+inline bool IsSequenceNewer(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlder(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a - b) < 0;
+}
+
+inline bool IsSequenceEqual(uint64_t a, uint64_t b) { return a == b; }
+
+inline bool IsSequenceNewerOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlderOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) < 0;
 }
 
 }  // namespace mooncake
