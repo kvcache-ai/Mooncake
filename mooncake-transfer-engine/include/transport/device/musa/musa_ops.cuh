@@ -127,9 +127,7 @@ __device__ __forceinline__ void mc_grid_sync() {}
 // for cross-GPU (MTLink) visibility.  CUDA hardware guarantees this without
 // explicit fences, so mc_fence() is a no-op there.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void mc_fence() {
-    __threadfence_system();
-}
+__device__ __forceinline__ void mc_fence() { __threadfence_system(); }
 
 // ---------------------------------------------------------------------------
 // Fence/barrier/fence: ensures all threads' writes are globally visible

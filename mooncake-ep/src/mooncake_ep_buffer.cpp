@@ -205,16 +205,15 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 #ifdef MOONCAKE_EP_USE_MUSA
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch,
-                                 launch_stream);
+                                 num_ranks, phase_epoch, launch_stream);
 #endif
     };
 
     auto wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_USE_MUSA
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch,
-                                 launch_stream, timeout_ticks);
+                                 num_ranks, phase_epoch, launch_stream,
+                                 timeout_ticks);
 #endif
     };
 
@@ -238,8 +237,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x.data_ptr(),
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
-            num_experts, rank, num_ranks, use_fp8, workspace,
-            launch_stream, timeout_ticks, phases);
+            num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
+            timeout_ticks, phases);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -362,16 +361,15 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 #ifdef MOONCAKE_EP_USE_MUSA
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch,
-                                 launch_stream);
+                                 num_ranks, phase_epoch, launch_stream);
 #endif
     };
 
     auto wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_USE_MUSA
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch,
-                                 launch_stream, timeout_ticks);
+                                 num_ranks, phase_epoch, launch_stream,
+                                 timeout_ticks);
 #endif
     };
 

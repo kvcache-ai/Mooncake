@@ -136,9 +136,7 @@ __device__ __forceinline__ void mc_fence() {}
 // before any thread proceeds.  On CUDA, __syncthreads() implies a memory
 // fence, so a single __syncthreads() is sufficient.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void mc_fence_barrier_fence() {
-    __syncthreads();
-}
+__device__ __forceinline__ void mc_fence_barrier_fence() { __syncthreads(); }
 
 // ---------------------------------------------------------------------------
 // Byte-swap helpers (for mlx5 big-endian WQE fields)

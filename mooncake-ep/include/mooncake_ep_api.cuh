@@ -25,8 +25,7 @@ void mark_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
 void wait_phase_ack(int* ack_buffer, int rank, int num_ranks, int epoch,
                     cudaStream_t stream, int64_t timeout_ticks);
 
-void mark_and_wait_phase_ack(void* mxa_buffer,
-                             const int32_t* nvlink_available,
+void mark_and_wait_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
                              void* const* ipc_peer_ptrs, int* ack_buffer,
                              int rank, int num_ranks, int epoch,
                              cudaStream_t stream, int64_t timeout_ticks);
