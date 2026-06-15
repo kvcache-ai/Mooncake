@@ -175,7 +175,7 @@ class Buffer:
                 for _ in range(self.group_size)
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = torch.stack(handles).cpu().tolist()
+            remote_handles = [h.tolist() for h in handles]
             from mooncake.ep import get_active_ranks
             active_ranks_mask = get_active_ranks(self.backend).tolist()
             self.runtime.sync_nvlink_ipc_handles(remote_handles,

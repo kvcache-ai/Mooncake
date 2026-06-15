@@ -28,14 +28,6 @@ using mooncake::device::mc_atomic_add_release;
 using mooncake::device::mc_fence;
 using mooncake::device::mc_fence_barrier_fence;
 
-__device__ __forceinline__ int4 mc_ld_plain_int4(const int4* ptr) {
-    return *ptr;
-}
-
-__device__ __forceinline__ void mc_st_plain_int4(const int4* ptr, const int4& val) {
-    *const_cast<int4*>(ptr) = val;
-}
-
 __global__ void mark_phase_ack_kernel(void* mxa_buffer,
                                       const int32_t* nvlink_available,
                                       void* const* ipc_peer_ptrs,
@@ -148,7 +140,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* next_clean_buffer,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
-         bool all_ranks_p2p,
          int64_t timeout_ticks,
          int phases) {
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -268,11 +259,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
                     mc_fence();
-                    if (all_ranks_p2p) {
-                        UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_plain_int4, mc_st_plain_int4);
-                    } else {
-                        UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
-                    }
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
                     mc_fence();
                 } else {
                     // IBGDA path — send directly from source buffer
@@ -412,8 +399,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
         // Copy tokens
         EP_DEVICE_ASSERT(num_scales <= 64);
-        if (not all_ranks_p2p)
-            mc_fence();
+        mc_fence();
         for (int i = sub_warp_id; i < num_recv_tokens; i += kNumWarpsPerGroup) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
@@ -425,13 +411,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4;
-            if (not all_ranks_p2p)
-                mc_fence();
-            if (all_ranks_p2p) {
-                UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, mc_ld_plain_int4, mc_st_plain_int4);
-            } else {
-                UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, mc_ld_nc, mc_st_na);
-            }
+            mc_fence();
+            UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, mc_ld_nc, mc_st_na);
 
             // Copy scales
             if (kUseFP8) {
@@ -462,8 +443,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              bool all_ranks_p2p, void* workspace, cudaStream_t stream,
-              int64_t timeout_ticks, int phases) {
+              void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
     constexpr int kNumMaxTopK = 11;
     constexpr int kNumWarpsPerGroup = 4;
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -500,8 +480,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, all_ranks_p2p, \
-              timeout_ticks, phases); } break
+              num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -524,7 +503,6 @@ combine(void* combined_x, int32_t* active_ranks,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
-        bool all_ranks_p2p,
         int64_t timeout_ticks,
         int phases, bool zero_copy) {
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -602,13 +580,8 @@ combine(void* combined_x, int32_t* active_ranks,
             if (write_dst != nullptr) {
                 // Local or P2P path — warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
-                if (all_ranks_p2p) {
-                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_plain_int4, mc_st_plain_int4);
-                } else {
-                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
-                }
-                if (not all_ranks_p2p)
-                    mc_fence();
+                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
+                mc_fence();
             } else {
                 // IBGDA path — stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
@@ -674,8 +647,7 @@ combine(void* combined_x, int32_t* active_ranks,
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
-            if (not all_ranks_p2p)
-                mc_fence();
+            mc_fence();
             // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];
             float reg_topk_weights[kNumMaxTopk];
@@ -693,8 +665,7 @@ combine(void* combined_x, int32_t* active_ranks,
                 auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
 
                 // Reduce
-                auto rdma_x_ptr = reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id;
-                auto x_vec = all_ranks_p2p ? mc_ld_plain_int4(rdma_x_ptr) : mc_ld_nc(rdma_x_ptr);
+                auto x_vec = mc_ld_nc(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
                 const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
                 #pragma unroll
                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
@@ -724,7 +695,7 @@ void combine(void* combined_x, int32_t* active_ranks,
              int* next_clean_buffer,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
-             bool all_ranks_p2p, void* workspace, cudaStream_t stream,
+             void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
@@ -754,7 +725,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
-              all_ranks_p2p, timeout_ticks, phases, zero_copy); } break
+              timeout_ticks, phases, zero_copy); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
