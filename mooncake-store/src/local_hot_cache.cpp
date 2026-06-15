@@ -76,7 +76,23 @@ LocalHotCache::~LocalHotCache() {
 
 bool LocalHotCache::PutHotKey(HotMemBlock* block) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    return putHotKeyLocked(block);
+}
 
+bool LocalHotCache::PutHotKey(HotMemBlock* block,
+                              const HotCachePutToken& token) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    // Validate the token and publish under the same lock so a concurrent
+    // Remove/Bump cannot slip in between the check and the publish.
+    if (block && !block->key_.empty() &&
+        !isPutTokenValidLocked(block->key_, token)) {
+        // Stale async fill: drop the data and return the block to the pool.
+        block->key_.clear();
+    }
+    return putHotKeyLocked(block);
+}
+
+bool LocalHotCache::putHotKeyLocked(HotMemBlock* block) {
     // Drain deferred LRU touches
     drainDeferredTouches();
 
@@ -93,7 +109,8 @@ bool LocalHotCache::PutHotKey(HotMemBlock* block) {
 
     // Race condition check: did someone else insert this key while we were
     // copying
-    if (key_to_lru_it_.find(key) != key_to_lru_it_.end()) {
+    if (key_to_lru_it_.find(key) != key_to_lru_it_.end() ||
+        hasActiveBlockForKeyLocked(key)) {
         // Lost race -> Return to lru tail as free block
         block->key_.clear();
         block->ref_count = 0;
@@ -135,15 +152,40 @@ HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
 }
 
 void LocalHotCache::ReleaseHotKey(const std::string& key) {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
-    if (it == key_to_lru_it_.end()) {
-        return;
+    if (it != key_to_lru_it_.end()) {
+        HotMemBlock* block = *(it->second);
+        if (block && block->ref_count > 0) {
+            block->ref_count--;
+            return;
+        }
     }
-    HotMemBlock* block = *(it->second);
-    if (block) {
-        block->ref_count--;
+
+    // The entry may have been removed while a reader still holds the block.
+    // Keep the key on active removed blocks so release can find and retire it.
+    for (auto& owned_block : blocks_) {
+        HotMemBlock* block = owned_block.get();
+        if (block && block->key_ == key && block->ref_count > 0) {
+            block->ref_count--;
+            if (block->ref_count == 0 &&
+                key_to_lru_it_.find(key) == key_to_lru_it_.end()) {
+                block->key_.clear();
+                block->accessed.store(false, std::memory_order_relaxed);
+            }
+            return;
+        }
     }
+}
+
+bool LocalHotCache::hasActiveBlockForKeyLocked(const std::string& key) const {
+    for (const auto& owned_block : blocks_) {
+        const HotMemBlock* block = owned_block.get();
+        if (block && block->key_ == key && block->ref_count > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
@@ -156,9 +198,10 @@ bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
     lru_queue_.erase(it->second);
     key_to_lru_it_.erase(it);
 
-    block->key_.clear();
-    block->ref_count = 0;
-    block->accessed.store(false, std::memory_order_relaxed);
+    if (block->ref_count == 0) {
+        block->key_.clear();
+        block->accessed.store(false, std::memory_order_relaxed);
+    }
     lru_queue_.push_back(block);
 
     return true;
@@ -195,27 +238,33 @@ size_t LocalHotCache::RemoveHotKeys(const std::vector<std::string>& keys) {
     return removed;
 }
 
-size_t LocalHotCache::RemoveHotKeysByRegex(
-    const std::string& regex_pattern) {
+size_t LocalHotCache::RemoveHotKeysByRegex(const std::string& regex_pattern) {
     std::regex pattern;
     try {
         pattern = std::regex(regex_pattern, std::regex::ECMAScript);
     } catch (const std::regex_error& e) {
-        LOG(ERROR) << "RemoveHotKeysByRegex: invalid pattern: "
-                   << regex_pattern << ", error: " << e.what();
+        LOG(ERROR) << "RemoveHotKeysByRegex: invalid pattern: " << regex_pattern
+                   << ", error: " << e.what();
+        return 0;
+    }
+
+    std::vector<std::string> matching_keys;
+    {
+        std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+        matching_keys.reserve(key_to_lru_it_.size());
+        for (const auto& [key, _] : key_to_lru_it_) {
+            if (std::regex_search(key, pattern)) {
+                matching_keys.emplace_back(key);
+            }
+        }
+    }
+
+    if (matching_keys.empty()) {
         return 0;
     }
 
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
     drainDeferredTouches();
-
-    std::vector<std::string> matching_keys;
-    matching_keys.reserve(key_to_lru_it_.size());
-    for (const auto& [key, _] : key_to_lru_it_) {
-        if (std::regex_search(key, pattern)) {
-            matching_keys.emplace_back(key);
-        }
-    }
 
     size_t removed = 0;
     for (const auto& key : matching_keys) {
@@ -231,17 +280,19 @@ size_t LocalHotCache::RemoveAllHotKeys() {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
     cache_epoch_.fetch_add(1, std::memory_order_relaxed);
 
-    const size_t removed = key_to_lru_it_.size();
-    key_to_lru_it_.clear();
-    key_generation_.clear();
-    lru_queue_.clear();
-
-    for (auto& block : blocks_) {
-        block->key_.clear();
-        block->ref_count = 0;
-        block->accessed.store(false, std::memory_order_relaxed);
-        lru_queue_.push_back(block.get());
+    std::vector<std::string> keys;
+    keys.reserve(key_to_lru_it_.size());
+    for (const auto& [key, _] : key_to_lru_it_) {
+        keys.emplace_back(key);
     }
+
+    size_t removed = 0;
+    for (const auto& key : keys) {
+        if (removeHotKeyLocked(key)) {
+            ++removed;
+        }
+    }
+    key_generation_.clear();
     return removed;
 }
 
@@ -250,8 +301,7 @@ void LocalHotCache::BumpKeyGeneration(const std::string& key) {
     key_generation_[key]++;
 }
 
-void LocalHotCache::BumpKeyGenerations(
-    const std::vector<std::string>& keys) {
+void LocalHotCache::BumpKeyGenerations(const std::vector<std::string>& keys) {
     if (keys.empty()) {
         return;
     }
@@ -270,16 +320,16 @@ void LocalHotCache::Clear() {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
     cache_epoch_.fetch_add(1, std::memory_order_relaxed);
 
-    key_to_lru_it_.clear();
-    key_generation_.clear();
-    lru_queue_.clear();
-
-    for (auto& block : blocks_) {
-        block->key_.clear();
-        block->ref_count = 0;
-        block->accessed.store(false, std::memory_order_relaxed);
-        lru_queue_.push_back(block.get());
+    std::vector<std::string> keys;
+    keys.reserve(key_to_lru_it_.size());
+    for (const auto& [key, _] : key_to_lru_it_) {
+        keys.emplace_back(key);
     }
+
+    for (const auto& key : keys) {
+        removeHotKeyLocked(key);
+    }
+    key_generation_.clear();
 }
 
 HotCachePutToken LocalHotCache::AcquirePutToken(const std::string& key) {
@@ -291,16 +341,20 @@ HotCachePutToken LocalHotCache::AcquirePutToken(const std::string& key) {
     return token;
 }
 
-bool LocalHotCache::IsPutTokenValid(const std::string& key,
-                                    const HotCachePutToken& token) const {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+bool LocalHotCache::isPutTokenValidLocked(const std::string& key,
+                                          const HotCachePutToken& token) const {
     if (token.cache_epoch != cache_epoch_.load(std::memory_order_relaxed)) {
         return false;
     }
     auto it = key_generation_.find(key);
-    const uint64_t current_gen =
-        (it != key_generation_.end()) ? it->second : 0;
+    const uint64_t current_gen = (it != key_generation_.end()) ? it->second : 0;
     return token.key_generation == current_gen;
+}
+
+bool LocalHotCache::IsPutTokenValid(const std::string& key,
+                                    const HotCachePutToken& token) const {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    return isPutTokenValidLocked(key, token);
 }
 
 bool LocalHotCache::TouchHotKey(const std::string& key) {
@@ -526,17 +580,12 @@ void LocalHotCacheHandler::workerThread() {
         // Execute the task if we have one
         if (task.hot_cache && task.block) {
             try {
-                if (!task.hot_cache->IsPutTokenValid(task.key, task.token)) {
-                    VLOG(2) << "Put task cancelled (stale token): " << task.key;
-                    task.block->key_.clear();
-                    task.hot_cache->PutHotKey(task.block);
-                    continue;
-                }
-                // Insert the pre-filled block into LRU
-                if (task.hot_cache->PutHotKey(task.block)) {
+                // Validate token and publish atomically: a Remove/Bump that
+                // races after the check can no longer resurrect a stale fill.
+                if (task.hot_cache->PutHotKey(task.block, task.token)) {
                     VLOG(2) << "Put task completed: " << task.key;
                 } else {
-                    VLOG(2) << "Put task skipped: " << task.key;
+                    VLOG(2) << "Put task skipped or cancelled: " << task.key;
                 }
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async hot cache put for key "

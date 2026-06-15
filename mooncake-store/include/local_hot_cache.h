@@ -72,6 +72,15 @@ class LocalHotCache {
     bool PutHotKey(HotMemBlock* block);
 
     /**
+     * @brief Insert a populated block only if its async fill token is still
+     * valid, checking the token and publishing atomically under one lock.
+     * If the token is stale (the key was removed/overwritten since the fill
+     * started), the block is returned to the pool instead of being published.
+     * @return true if the block was published, false if cancelled or on error.
+     */
+    bool PutHotKey(HotMemBlock* block, const HotCachePutToken& token);
+
+    /**
      * @brief Check if the key exists in cache.
      * @param key Cache key: {request key}
      */
@@ -205,7 +214,11 @@ class LocalHotCache {
    private:
     // Drain deferred LRU touches: splice accessed blocks to front
     void drainDeferredTouches();
+    bool putHotKeyLocked(HotMemBlock* block);
     bool removeHotKeyLocked(const std::string& key);
+    bool hasActiveBlockForKeyLocked(const std::string& key) const;
+    bool isPutTokenValidLocked(const std::string& key,
+                               const HotCachePutToken& token) const;
 
     size_t block_size_;  // Actual block size used by this cache
 

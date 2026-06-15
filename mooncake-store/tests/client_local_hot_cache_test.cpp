@@ -476,9 +476,103 @@ TEST_F(LocalHotCacheTest, GetHotKeyProtectsBlockFromReuse) {
     HotMemBlock* block2 = cache.GetHotKey("key2");
     ASSERT_NE(block2, nullptr);
     VerifySliceData(block2, 1024, 'B');
+    cache.ReleaseHotKey("key2");
 
     // key1 should be evicted since we only have 1 block
     EXPECT_FALSE(cache.HasHotKey("key1"));
+}
+
+TEST_F(LocalHotCacheTest, RemoveHotKeyKeepsActiveReaderBlockUntilRelease) {
+    const size_t cache_size = 16 * 1024 * 1024;  // 1 block
+    LocalHotCache cache(cache_size);
+
+    Slice slice1 = CreateSlice(1024, 'A');
+    ASSERT_TRUE(PutHotKeyHelper(cache, "key1", slice1));
+
+    HotMemBlock* held = cache.GetHotKey("key1");
+    ASSERT_NE(held, nullptr);
+    EXPECT_EQ(held->ref_count.load(), 1);
+
+    EXPECT_TRUE(cache.RemoveHotKey("key1"));
+    EXPECT_FALSE(cache.HasHotKey("key1"));
+
+    Slice slice2 = CreateSlice(1024, 'B');
+    EXPECT_FALSE(PutHotKeyHelper(cache, "key2", slice2))
+        << "Removed active block must not be reused before ReleaseHotKey";
+
+    cache.ReleaseHotKey("key1");
+    EXPECT_EQ(held->ref_count.load(), 0);
+
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key2", slice2));
+    EXPECT_TRUE(cache.HasHotKey("key2"));
+}
+
+TEST_F(LocalHotCacheTest, RemoveHotKeyBlocksSameKeyPublishUntilReaderRelease) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    LocalHotCache cache(cache_size);
+
+    Slice slice1 = CreateSlice(1024, 'A');
+    ASSERT_TRUE(PutHotKeyHelper(cache, "key1", slice1));
+
+    HotMemBlock* held = cache.GetHotKey("key1");
+    ASSERT_NE(held, nullptr);
+
+    EXPECT_TRUE(cache.RemoveHotKey("key1"));
+
+    Slice slice2 = CreateSlice(1024, 'B');
+    EXPECT_FALSE(PutHotKeyHelper(cache, "key1", slice2))
+        << "ReleaseHotKey(key) cannot distinguish old and new same-key blocks";
+
+    cache.ReleaseHotKey("key1");
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key1", slice2));
+}
+
+TEST_F(LocalHotCacheTest, ClearDoesNotRequeueDetachedInFlightBlock) {
+    const size_t cache_size = 16 * 1024 * 1024;  // 1 block
+    LocalHotCache cache(cache_size);
+
+    HotCachePutToken token = cache.AcquirePutToken("pending_key");
+    HotMemBlock* block = cache.GetFreeBlock();
+    ASSERT_NE(block, nullptr);
+    EXPECT_EQ(cache.GetCacheSize(), 0);
+
+    block->key_ = "pending_key";
+    cache.Clear();
+    EXPECT_EQ(cache.GetCacheSize(), 0);
+    EXPECT_FALSE(cache.IsPutTokenValid("pending_key", token));
+
+    block->key_.clear();
+    EXPECT_FALSE(cache.PutHotKey(block));
+    EXPECT_EQ(cache.GetCacheSize(), 1)
+        << "The detached block should be returned exactly once";
+}
+
+// Token check and publish must be atomic: a generation bump that races after
+// the token was captured must cancel the fill instead of resurrecting it.
+TEST_F(LocalHotCacheTest, PutHotKeyWithTokenRejectsStaleFill) {
+    const size_t cache_size = 16 * 1024 * 1024;  // 1 block
+    LocalHotCache cache(cache_size);
+
+    // Stale: token captured, then key generation bumped (as Remove would).
+    HotCachePutToken stale = cache.AcquirePutToken("k");
+    cache.BumpKeyGeneration("k");
+    HotMemBlock* b1 = cache.GetFreeBlock();
+    ASSERT_NE(b1, nullptr);
+    b1->key_ = "k";
+    b1->size = 1024;
+    EXPECT_FALSE(cache.PutHotKey(b1, stale));
+    EXPECT_FALSE(cache.HasHotKey("k"));
+    EXPECT_EQ(cache.GetCacheSize(), 1)
+        << "Stale fill must be returned to the pool, not published";
+
+    // Valid: token still current -> published.
+    HotCachePutToken fresh = cache.AcquirePutToken("k");
+    HotMemBlock* b2 = cache.GetFreeBlock();
+    ASSERT_NE(b2, nullptr);
+    b2->key_ = "k";
+    b2->size = 1024;
+    EXPECT_TRUE(cache.PutHotKey(b2, fresh));
+    EXPECT_TRUE(cache.HasHotKey("k"));
 }
 
 // Test LocalHotCacheHandler basic functionality
@@ -531,8 +625,7 @@ TEST_F(LocalHotCacheTest, ConcurrentAccess) {
 
     // Each thread puts and gets keys
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&cache, t, keys_per_thread, &successful_puts,
-                              &successful_gets]() {
+        threads.emplace_back([&cache, t, &successful_puts, &successful_gets]() {
             for (int i = 0; i < keys_per_thread; ++i) {
                 std::string key =
                     "thread_" + std::to_string(t) + "_key_" + std::to_string(i);
