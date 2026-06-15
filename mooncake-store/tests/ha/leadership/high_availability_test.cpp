@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
@@ -316,6 +317,118 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
 }
 
 #ifdef STORE_USE_ETCD
+
+// WaitForViewChange must return promptly when the leader's master_view key is
+// deleted, driven by the etcd watch rather than the timeout. We give it a long
+// (5s) timeout but delete the key after ~300ms; a watch-based implementation
+// returns shortly after the deletion, well before the timeout would fire.
+TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsPromptlyOnLeaderLoss) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:5555");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    // Release leadership from another thread after a short delay; this revokes
+    // the lease and deletes the master_view key, which the watch observes.
+    std::thread releaser([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        coordinator->ReleaseLeadership(session);
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto changed = coordinator->WaitForViewChange(session.view.view_version,
+                                                  std::chrono::seconds(5));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    releaser.join();
+
+    ASSERT_TRUE(changed.has_value());
+    EXPECT_TRUE(changed->changed);
+    EXPECT_FALSE(changed->current_view.has_value());
+    // Must be driven by the watch (key deleted at ~300ms), not the 5s timeout.
+    EXPECT_LT(elapsed, std::chrono::seconds(3));
+}
+
+// WaitForViewChange must honor its timeout when the leader is stable: the watch
+// blocks with no deletion event, and the timer cancels it so the call returns
+// timed_out at roughly the requested deadline -- neither returning early nor
+// hanging past it.
+TEST_F(HighAvailabilityTest, WaitForViewChangeTimesOutWhenStable) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:4444");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    const auto timeout = std::chrono::milliseconds(500);
+    const auto start = std::chrono::steady_clock::now();
+    auto result =
+        coordinator->WaitForViewChange(session.view.view_version, timeout);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->changed);
+    EXPECT_TRUE(result->timed_out);
+    // Did not return early (watch did not spuriously fire) ...
+    EXPECT_GE(elapsed, std::chrono::milliseconds(400));
+    // ... and did not hang past the deadline (timer cancelled the watch).
+    EXPECT_LT(elapsed, std::chrono::seconds(3));
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
+
+// When the observed view already differs from the caller's known version,
+// WaitForViewChange returns immediately via the initial read, without arming a
+// watch. Passing no known version while a leader exists is one such case.
+TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:3333");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    const auto start = std::chrono::steady_clock::now();
+    auto result =
+        coordinator->WaitForViewChange(std::nullopt, std::chrono::seconds(5));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->changed);
+    ASSERT_TRUE(result->current_view.has_value());
+    EXPECT_EQ(result->current_view->view_version, session.view.view_version);
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
 
 TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
