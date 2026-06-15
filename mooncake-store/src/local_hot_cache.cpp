@@ -310,8 +310,14 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
         return false;
     }
 
-    // Check size compatibility
-    if (slice.size > block->size) {
+    // Check size compatibility against the block's physical capacity.
+    // block->size carries the *logical* length of the last object stored in
+    // the block (set below and relied upon as the object length on the read
+    // path), and GetFreeBlock() does not reset it on reuse. Comparing against
+    // block->size would therefore reject any object larger than the previous
+    // one a recycled block happened to hold, permanently shrinking the block's
+    // usable capacity. The true capacity is the fixed block size.
+    if (slice.size > hot_cache_->GetBlockSize()) {
         // Slice too big for block, return block to pool
         block->key_.clear();
         hot_cache_->PutHotKey(block);
