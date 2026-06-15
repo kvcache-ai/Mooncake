@@ -222,7 +222,8 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     unit.erase(0, unit.find_first_not_of(" \t\r\n"));
 
     // Convert to uppercase for comparison
-    std::transform(unit.begin(), unit.end(), unit.begin(), ::toupper);
+    std::transform(unit.begin(), unit.end(), unit.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
 
     // Apply unit multiplier
     const double KB = 1024.0;
