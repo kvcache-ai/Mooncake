@@ -297,6 +297,8 @@ jobs:
         apt install -y ninja-build
         python3 -m pip install torchada==0.1.48
         mkdir -p /tmp/musa-lib-fix
+        ln -sf libmusa.so.4.3.4 /usr/lib/x86_64-linux-gnu/libmusa.so.4
+        ln -sf libmusa.so.4.3.4 /usr/lib/x86_64-linux-gnu/libmusa.so
         ln -sf /usr/lib/x86_64-linux-gnu/libmusa.so.4.3.4 /tmp/musa-lib-fix/libmusa.so.4
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
         export LD_LIBRARY_PATH=/tmp/musa-lib-fix:/usr/local/musa/lib:${LD_LIBRARY_PATH:-}
