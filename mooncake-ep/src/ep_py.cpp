@@ -21,13 +21,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t, std::string>())
+        .def(py::init<int, int, int64_t>())
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
         .def("update_local_qpns", &MooncakeEpBuffer::update_local_qpns)
         .def("is_roce", &MooncakeEpBuffer::is_roce)
-        .def("sync_ib", &MooncakeEpBuffer::sync_ib)
-        .def("sync_roce", &MooncakeEpBuffer::sync_roce)
+        .def("sync_ibgda_peers", &MooncakeEpBuffer::sync_ibgda_peers)
         .def("get_mr_info", &MooncakeEpBuffer::get_mr_info)
         .def("get_gid", &MooncakeEpBuffer::get_gid)
         .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
