@@ -144,44 +144,6 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
     return info;
 }
 
-py::object tensor_dtype_to_torch_dtype(TensorDtype dtype) {
-    auto torch = torch_module();
-    switch (dtype) {
-        case TensorDtype::FLOAT32:
-            return torch.attr("float32");
-        case TensorDtype::FLOAT64:
-            return torch.attr("float64");
-        case TensorDtype::INT8:
-            return torch.attr("int8");
-        case TensorDtype::UINT8:
-            return torch.attr("uint8");
-        case TensorDtype::INT16:
-            return torch.attr("int16");
-        case TensorDtype::UINT16:
-            return torch.attr("uint16");
-        case TensorDtype::INT32:
-            return torch.attr("int32");
-        case TensorDtype::UINT32:
-            return torch.attr("uint32");
-        case TensorDtype::INT64:
-            return torch.attr("int64");
-        case TensorDtype::UINT64:
-            return torch.attr("uint64");
-        case TensorDtype::BOOL:
-            return torch.attr("bool");
-        case TensorDtype::FLOAT16:
-            return torch.attr("float16");
-        case TensorDtype::BFLOAT16:
-            return torch.attr("bfloat16");
-        case TensorDtype::FLOAT8_E4M3:
-            return torch.attr("float8_e4m3fn");
-        case TensorDtype::FLOAT8_E5M2:
-            return torch.attr("float8_e5m2");
-        default:
-            return py::none();
-    }
-}
-
 py::tuple tensor_shape_tuple(const TensorMetadata &metadata) {
     std::vector<int64_t> shape_vec;
     shape_vec.reserve(metadata.header.ndim);
