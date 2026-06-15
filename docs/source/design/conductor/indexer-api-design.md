@@ -421,7 +421,7 @@ splitting publishers or writing PR/integration notes.
 | `block_hashes` (legacy) | Yes | Conditional | — | Alias of `seq_hashes` when `kv_events_emit_legacy_compat` is enabled on master. |
 | `parent_hash` | Yes | — | — | Radix parent link; master has no sequence tree. |
 | `parent_block_hash` (legacy) | Yes | — | — | Same as `parent_hash`. |
-| `base_block_idx` | Yes | — | — | Depth of first block in batch; master unknown. |
+| `base_block_idx` | Yes | Partial | — | Depth of first block in batch; master uses `0` for standalone pool blocks. |
 | `token_ids` | Yes | — | — | Required for `/query` by tokens or hash recomputation when engine is non-standard. |
 | `block_size` (in-event) | Yes | — | — | Per-block token count in SGLang `BlockStored`; master uses envelope-level config only. |
 

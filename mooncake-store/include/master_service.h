@@ -1912,13 +1912,18 @@ class MasterService {
     static std::string MediumForReplicaType(ReplicaType replica_type);
     static std::string MediumForMetadata(const ObjectMetadata& metadata);
     void PublishKvStored(const std::string& key, ReplicaType replica_type,
-                         const ObjectMetadata& metadata);
+                         const ObjectMetadata& metadata,
+                         const std::string& tenant_id);
     void PublishKvRemoved(const std::string& key,
-                          const ObjectMetadata& metadata);
-    void PublishKvRemoved(const std::string& key, const std::string& medium);
+                          const ObjectMetadata& metadata,
+                          const std::string& tenant_id);
+    void PublishKvRemoved(const std::string& key, const std::string& medium,
+                          const std::string& tenant_id);
     void PublishKvRemovedAfterEvict(const std::string& key,
                                     uint64_t freed_bytes,
-                                    const ObjectMetadata& metadata);
+                                    const std::string& medium,
+                                    const ObjectMetadata& metadata,
+                                    const std::string& tenant_id);
 };
 
 }  // namespace mooncake

@@ -1734,7 +1734,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
-    PublishKvStored(key, replica_type, metadata);
+    PublishKvStored(key, replica_type, metadata, tenant_id);
     return {};
 }
 
@@ -1836,7 +1836,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (metadata.IsValid() == false) {
-        PublishKvRemoved(key, metadata);
         accessor.Erase();
     }
     return {};
@@ -2208,21 +2207,30 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
     auto& metadata = accessor.Get();
 
-    if (replica_type == ReplicaType::DISK) {
-        metadata.EraseReplicas(
-            [](const Replica& replica) { return replica.is_disk_replica(); });
-        MasterMetricManager::instance().dec_file_cache_nums();
-    } else if (replica_type == ReplicaType::LOCAL_DISK) {
-        metadata.EraseReplicas([&client_id](const Replica& replica) {
-            return replica.is_local_disk_replica() &&
-                   replica.get_descriptor()
-                           .get_local_disk_descriptor()
-                           .client_id == client_id;
-        });
-    } else {
+    if (replica_type != ReplicaType::DISK &&
+        replica_type != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const size_t erased =
+        replica_type == ReplicaType::DISK
+            ? metadata.EraseReplicas([](const Replica& replica) {
+                  return replica.is_disk_replica();
+              })
+            : metadata.EraseReplicas([&client_id](const Replica& replica) {
+                  return replica.is_local_disk_replica() &&
+                         replica.get_descriptor()
+                                 .get_local_disk_descriptor()
+                                 .client_id == client_id;
+              });
+    if (replica_type == ReplicaType::DISK) {
+        MasterMetricManager::instance().dec_file_cache_nums();
+    }
+
+    if (erased > 0) {
+        PublishKvRemoved(key, "disk", tenant_id);
     }
 
     if (!metadata.IsValid()) {
@@ -2732,7 +2740,7 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    PublishKvRemoved(key, metadata);
+    PublishKvRemoved(key, metadata, tenant_id);
     auto& tenant_state = accessor.GetTenantState();
     ErasePromotionTaskIfPresent(tenant_state, key);
     accessor.Erase();
@@ -5139,7 +5147,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             result.freed_bytes += freed;
             if (freed > 0) {
                 result.evicted_objects++;
-                PublishKvRemovedAfterEvict(member_key, freed, member_metadata);
+                PublishKvRemovedAfterEvict(member_key, freed, "cpu",
+                                           member_metadata, tenant_id);
             }
             if (member_key != key && !member_metadata.IsValid()) {
                 EraseMetadata(tenant_state, member_it, tenant_id);
@@ -5222,9 +5231,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             tenant_state, /*allow_soft_pinned=*/false);
                         total_freed_size += evict_result.freed_bytes;
                         if (!it->second.IsGrouped()) {
-                            PublishKvRemovedAfterEvict(it->first,
-                                                       evict_result.freed_bytes,
-                                                       it->second);
+                            PublishKvRemovedAfterEvict(
+                                it->first, evict_result.freed_bytes, "cpu",
+                                it->second, tenant_it->first);
                         }
                         if (it->second.IsValid() == false) {
                             it = EraseMetadata(tenant_state, it,
@@ -5300,8 +5309,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             total_freed_size += evict_result.freed_bytes;
                             if (!it->second.IsGrouped()) {
                                 PublishKvRemovedAfterEvict(
-                                    it->first, evict_result.freed_bytes,
-                                    it->second);
+                                    it->first, evict_result.freed_bytes, "cpu",
+                                    it->second, tenant_it->first);
                             }
                             if (!it->second.IsValid()) {
                                 it = EraseMetadata(tenant_state, it,
@@ -5365,8 +5374,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             total_freed_size += evict_result.freed_bytes;
                             if (!it->second.IsGrouped()) {
                                 PublishKvRemovedAfterEvict(
-                                    it->first, evict_result.freed_bytes,
-                                    it->second);
+                                    it->first, evict_result.freed_bytes, "cpu",
+                                    it->second, tenant_it->first);
                             }
                             if (!it->second.IsValid()) {
                                 it = EraseMetadata(tenant_state, it,
@@ -5501,6 +5510,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
                 total_freed_size += metadata.size * erased;
                 shard_evicted_count++;
+                PublishKvRemoved(it->first, "disk", tenant_it->first);
                 if (!metadata.IsValid()) {
                     it = EraseMetadata(tenant_state, it, tenant_it->first);
                 } else {
@@ -7337,7 +7347,8 @@ std::string MasterService::MediumForMetadata(const ObjectMetadata& metadata) {
 
 void MasterService::PublishKvStored(const std::string& key,
                                     ReplicaType replica_type,
-                                    const ObjectMetadata& metadata) {
+                                    const ObjectMetadata& metadata,
+                                    const std::string& tenant_id) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
@@ -7345,35 +7356,38 @@ void MasterService::PublishKvStored(const std::string& key,
     if (replica_type == ReplicaType::ALL) {
         medium = MediumForMetadata(metadata);
     }
-    kv_event_publisher_->PublishStored(key, medium);
+    kv_event_publisher_->PublishStored(key, medium, tenant_id);
 }
 
 void MasterService::PublishKvRemoved(const std::string& key,
-                                     const std::string& medium) {
+                                     const std::string& medium,
+                                     const std::string& tenant_id) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    kv_event_publisher_->PublishRemoved(key, medium);
+    kv_event_publisher_->PublishRemoved(key, medium, tenant_id);
 }
 
 void MasterService::PublishKvRemoved(const std::string& key,
-                                     const ObjectMetadata& metadata) {
-    PublishKvRemoved(key, MediumForMetadata(metadata));
+                                     const ObjectMetadata& metadata,
+                                     const std::string& tenant_id) {
+    PublishKvRemoved(key, MediumForMetadata(metadata), tenant_id);
 }
 
 void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
                                                uint64_t freed_bytes,
-                                               const ObjectMetadata& metadata) {
+                                               const std::string& medium,
+                                               const ObjectMetadata& metadata,
+                                               const std::string& tenant_id) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    bool published = false;
     if (freed_bytes > 0) {
-        PublishKvRemoved(key, "cpu");
-        published = true;
+        PublishKvRemoved(key, medium, tenant_id);
+        return;
     }
-    if (!metadata.IsValid() && !published) {
-        PublishKvRemoved(key, metadata);
+    if (!metadata.IsValid()) {
+        PublishKvRemoved(key, metadata, tenant_id);
     }
 }
 

@@ -30,10 +30,13 @@ class KvEventPublisher {
     bool enabled() const { return config_.enabled; }
 
     // Non-blocking enqueue; never drops events (unbounded queue).
+    // tenant_id empty uses config_.tenant_id (RFC envelope default).
     void PublishStored(const std::string& object_key,
-                       const std::string& medium);
+                       const std::string& medium,
+                       const std::string& tenant_id = "");
     void PublishRemoved(const std::string& object_key,
-                        const std::string& medium);
+                        const std::string& medium,
+                        const std::string& tenant_id = "");
 
     struct Stats {
         uint64_t published_batches{0};
@@ -55,6 +58,7 @@ class KvEventPublisher {
         EventKind kind;
         std::string object_key;
         std::string medium;
+        std::string tenant_id;
     };
 
     void Enqueue(PendingEvent event);
@@ -91,8 +95,10 @@ class KvEventPublisher {
 
     bool enabled() const { return false; }
 
-    void PublishStored(const std::string&, const std::string&) {}
-    void PublishRemoved(const std::string&, const std::string&) {}
+    void PublishStored(const std::string&, const std::string&,
+                       const std::string& = "") {}
+    void PublishRemoved(const std::string&, const std::string&,
+                        const std::string& = "") {}
 
     struct Stats {
         uint64_t published_batches{0};

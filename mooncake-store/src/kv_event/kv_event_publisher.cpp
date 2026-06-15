@@ -141,19 +141,21 @@ KvEventPublisher::~KvEventPublisher() {
 }
 
 void KvEventPublisher::PublishStored(const std::string& object_key,
-                                     const std::string& medium) {
+                                     const std::string& medium,
+                                     const std::string& tenant_id) {
     if (!config_.enabled) {
         return;
     }
-    Enqueue(PendingEvent{EventKind::kStored, object_key, medium});
+    Enqueue(PendingEvent{EventKind::kStored, object_key, medium, tenant_id});
 }
 
 void KvEventPublisher::PublishRemoved(const std::string& object_key,
-                                      const std::string& medium) {
+                                      const std::string& medium,
+                                      const std::string& tenant_id) {
     if (!config_.enabled) {
         return;
     }
-    Enqueue(PendingEvent{EventKind::kRemoved, object_key, medium});
+    Enqueue(PendingEvent{EventKind::kRemoved, object_key, medium, tenant_id});
 }
 
 KvEventPublisher::Stats KvEventPublisher::GetStats() const {
@@ -248,6 +250,9 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         const bool is_stored = item.pending.kind == EventKind::kStored;
         const char* rfc_type = is_stored ? "stored" : "removed";
         const char* legacy_type = is_stored ? "BlockStored" : "BlockRemoved";
+        const std::string& tenant_id = item.pending.tenant_id.empty()
+                                           ? config_.tenant_id
+                                           : item.pending.tenant_id;
 
         const size_t map_size =
             ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields);
@@ -272,7 +277,7 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         packer.pack("lora_name");
         PackOptionalString(packer, config_.lora_name);
         packer.pack("tenant_id");
-        packer.pack(config_.tenant_id);
+        packer.pack(tenant_id);
         packer.pack("backend_id");
         packer.pack(config_.backend_id);
         packer.pack("medium");
@@ -291,8 +296,10 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         }
 
         if (is_stored) {
+            // Master keys are standalone pool blocks; depth 0 satisfies RFC
+            // #1527 requirement that base_block_idx or parent_hash be present.
             packer.pack("base_block_idx");
-            packer.pack_nil();
+            packer.pack(static_cast<uint32_t>(0));
             packer.pack("parent_hash");
             packer.pack_nil();
             packer.pack("token_ids");
