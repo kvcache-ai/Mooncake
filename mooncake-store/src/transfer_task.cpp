@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include "gpu_staging_utils.h"
 #include "transfer_engine.h"
@@ -845,26 +846,49 @@ void TransferEngineOperationState::wait_for_completion() {
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
+    // Adaptive backoff. Each iteration already issues a getTransferStatus() for
+    // every task in the batch, so the previous lock-poll-repeat with no yield
+    // pinned a CPU core at 100% for the entire transfer (this is the default,
+    // non-event-driven completion path). Spin briefly to keep latency low for
+    // fast transfers, then yield, then sleep with a capped backoff so a slow
+    // transfer no longer burns a core. The mutex is released before backing
+    // off.
+    int poll_iter = 0;
+    constexpr int kSpinIters = 64;     // tight re-poll: lowest latency
+    constexpr int kYieldIters = 1024;  // cooperative yield phase
+    std::chrono::microseconds backoff{50};
+    constexpr std::chrono::microseconds kMaxBackoff{500};
+
     while (true) {
         if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_milliseconds << " milliseconds for batch "
                        << batch_id_;
+            std::lock_guard<std::mutex> lock(mutex_);
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            check_task_status();
+            if (result_.has_value()) {
+                VLOG(1) << "Transfer engine operation completed for batch "
+                        << batch_id_ << " with result: "
+                        << static_cast<int>(result_.value());
+                break;
+            }
+        }  // release mutex_ before backing off
+
+        if (poll_iter < kSpinIters) {
+            ++poll_iter;
+        } else if (poll_iter < kYieldIters) {
+            ++poll_iter;
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(backoff);
+            backoff = std::min(backoff * 2, kMaxBackoff);
         }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
     }
 #endif
 }
