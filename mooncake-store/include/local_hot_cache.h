@@ -191,6 +191,16 @@ class LocalHotCache {
     size_t GetBlockSize() const { return block_size_; }
 
     /**
+     * @brief Get the base address of the bulk allocation.
+     */
+    void* GetBaseAddress() const { return bulk_memory_standard_; }
+
+    /**
+     * @brief Get the total size of the bulk allocation in bytes.
+     */
+    size_t GetTotalSize() const { return bulk_memory_size_; }
+
+    /**
      * @brief Get the shm segment backing this cache.
      * Only valid when constructed with use_shm=true.
      * @return shared_ptr to the ShmSegment, or nullptr if shm is disabled.

@@ -30,8 +30,10 @@
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA)
 #include <cuda_runtime.h>
+#elif defined(USE_SUNRISE)
+#include "cuda_alike.h"
 #endif
 
 #ifdef USE_HIP
@@ -151,7 +153,7 @@ void printStatsHeader();
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {
     cudaPointerAttributes attr;
     auto ret = cudaPointerGetAttributes(&attr, ptr);
@@ -168,7 +170,7 @@ static inline bool isHipMemory(void* ptr) {
 #endif
 
 static inline bool isGpuMemory(void* ptr) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_SUNRISE)
     if (isCudaMemory(ptr)) return true;
 #endif
 #ifdef USE_HIP
@@ -179,10 +181,16 @@ static inline bool isGpuMemory(void* ptr) {
 
 static inline uint8_t fillData(void* addr, size_t length) {
     uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
-#ifdef USE_CUDA
+#if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> ref_data(length, seed);
         cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyDefault);
+        return seed;
+    }
+#elif defined(USE_SUNRISE)
+    if (isCudaMemory(addr)) {
+        std::vector<uint8_t> ref_data(length, seed);
+        tangMemcpy(addr, ref_data.data(), length, tangMemcpyHostToDevice);
         return seed;
     }
 #endif
@@ -199,10 +207,19 @@ static inline uint8_t fillData(void* addr, size_t length) {
 
 static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     std::vector<uint8_t> ref_data(length, seed);
-#ifdef USE_CUDA
+#if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> act_data(length);
         cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#elif defined(USE_SUNRISE)
+    if (isCudaMemory(addr)) {
+        std::vector<uint8_t> act_data(length);
+        tangMemcpy(act_data.data(), addr, length, tangMemcpyDeviceToHost);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

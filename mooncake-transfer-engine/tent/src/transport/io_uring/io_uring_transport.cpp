@@ -117,14 +117,16 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto io_uring_batch = Slab<IOUringSubBatch>::Get().allocate();
     if (!io_uring_batch)
         return Status::InternalError("Unable to allocate IO Uring sub-batch");
-    batch = io_uring_batch;
     io_uring_batch->max_size = max_size;
     io_uring_batch->task_list.reserve(max_size);
     int rc = io_uring_queue_init(max_size, &io_uring_batch->ring, 0);
-    if (rc)
+    if (rc) {
+        Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
         return Status::InternalError(
             std::string("io_uring_queue_init failed: ") + strerror(-rc) +
             LOC_MARK);
+    }
+    batch = io_uring_batch;
     return Status::OK();
 }
 
