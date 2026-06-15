@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -21,7 +23,69 @@ namespace etcd {
 namespace {
 
 constexpr int kKeepAliveReadyTimeoutMs = 1000;
-constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
+// Fallback poll interval used only when a watch cannot be armed (e.g. the watch
+// RPC fails, or the remaining timeout is too small to be worth a watch). The
+// steady-state path blocks on an etcd watch and does not poll.
+constexpr auto kViewChangeFallbackPollInterval = std::chrono::milliseconds(200);
+// Upper bound for waiting on the watch goroutine to fully stop before the
+// watch context is destroyed. Mirrors the value used by the oplog notifier.
+constexpr int kWatchStopTimeoutMs = 5000;
+
+// Shared state between WaitForViewChange and the etcd watch callback. The
+// callback only flips `changed` and wakes the waiter; the waiter decides what
+// the change means by re-reading the view.
+struct ViewChangeWatchState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool changed = false;
+};
+
+// C-style trampoline invoked by the etcd watch goroutine for every event on the
+// watched prefix (PUT / DELETE / WATCH_BROKEN). Any event is treated as "the
+// view may have changed"; the waiter re-reads to find out what actually
+// happened. The watch context outlives every callback because the waiter calls
+// CancelWatchWithPrefix + WaitWatchWithPrefixStopped before it is destroyed.
+void ViewChangeWatchCallback(void* context, const char* /*key*/,
+                             size_t /*key_size*/, const char* /*value*/,
+                             size_t /*value_size*/, int /*event_type*/,
+                             int64_t /*mod_revision*/) {
+    auto* state = static_cast<ViewChangeWatchState*>(context);
+    if (state == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->changed = true;
+    }
+    state->cv.notify_all();
+}
+
+// RAII guard that tears the prefix watch down (and waits for the goroutine to
+// exit, so no further callbacks can run) before the associated
+// ViewChangeWatchState is destroyed. Declared after the state so it is
+// destroyed first.
+class PrefixWatchGuard {
+   public:
+    explicit PrefixWatchGuard(std::string prefix)
+        : prefix_(std::move(prefix)) {}
+    ~PrefixWatchGuard() {
+        if (!active_) {
+            return;
+        }
+        EtcdHelper::CancelWatchWithPrefix(prefix_.c_str(), prefix_.size());
+        EtcdHelper::WaitWatchWithPrefixStopped(prefix_.c_str(), prefix_.size(),
+                                               kWatchStopTimeoutMs);
+    }
+
+    PrefixWatchGuard(const PrefixWatchGuard&) = delete;
+    PrefixWatchGuard& operator=(const PrefixWatchGuard&) = delete;
+
+    void Arm() { active_ = true; }
+
+   private:
+    std::string prefix_;
+    bool active_ = false;
+};
 
 class EtcdLeadershipMonitorHandle final : public LeadershipMonitorHandle {
    public:
@@ -249,19 +313,6 @@ EtcdLeaderCoordinator::WaitForViewChange(
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (true) {
-        auto current_view = ReadCurrentView();
-        if (!current_view) {
-            return tl::make_unexpected(current_view.error());
-        }
-
-        if (!IsSameViewVersion(current_view.value(), known_version)) {
-            return ViewChangeResult{
-                .changed = true,
-                .timed_out = false,
-                .current_view = current_view.value(),
-            };
-        }
-
         if (timeout <= std::chrono::milliseconds::zero() ||
             std::chrono::steady_clock::now() >= deadline) {
             return ViewChangeResult{
@@ -274,8 +325,67 @@ EtcdLeaderCoordinator::WaitForViewChange(
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now());
-        std::this_thread::sleep_for(
-            std::min(kViewChangePollInterval, remaining));
+
+        // Arm the watch BEFORE reading the view. The watch is established at
+        // some etcd revision R_watch; the subsequent read observes a revision
+        // R_read >= R_watch. Any change to master_view at revision C is then
+        // caught by exactly one of the two: C < R_read (the read sees it) or
+        // C >= R_watch (the watch delivers it), and the two ranges overlap, so
+        // a change happening between read and watch cannot be missed. The watch
+        // starts from the current revision (start_revision = 0), which also
+        // avoids depending on a possibly-compacted historical revision.
+        //
+        // `state` must outlive `guard`: the guard cancels the watch and waits
+        // for the goroutine to exit (no more callbacks) in its destructor,
+        // before `state` is destroyed. Declaration order guarantees this.
+        ViewChangeWatchState state;
+        PrefixWatchGuard guard(master_view_key_);
+
+        bool watching = false;
+        if (remaining > kViewChangeFallbackPollInterval) {
+            // Defensively clear any lingering watch on this key, then arm a new
+            // one. Both calls are no-ops when nothing is registered.
+            EtcdHelper::CancelWatchWithPrefix(master_view_key_.c_str(),
+                                              master_view_key_.size());
+            EtcdHelper::WaitWatchWithPrefixStopped(master_view_key_.c_str(),
+                                                   master_view_key_.size(),
+                                                   kWatchStopTimeoutMs);
+            auto watch_err = EtcdHelper::WatchWithPrefixFromRevision(
+                master_view_key_.c_str(), master_view_key_.size(),
+                /*start_revision=*/0, &state, &ViewChangeWatchCallback);
+            if (watch_err == ErrorCode::OK) {
+                watching = true;
+                guard.Arm();
+            }
+        }
+
+        auto current_view = ReadCurrentView();
+        if (!current_view) {
+            return tl::make_unexpected(current_view.error());
+        }
+        if (!IsSameViewVersion(current_view.value(), known_version)) {
+            return ViewChangeResult{
+                .changed = true,
+                .timed_out = false,
+                .current_view = current_view.value(),
+            };
+        }
+
+        if (!watching) {
+            // Could not arm a watch (RPC failed, or too little time left).
+            // Fall back to a short poll so a change is still picked up.
+            std::this_thread::sleep_for(
+                std::min(kViewChangeFallbackPollInterval, remaining));
+            continue;
+        }
+
+        // Block until the watch reports an event or the caller's deadline
+        // elapses. Either way we loop and re-read: an event tells us the view
+        // changed (re-read returns it), a timeout falls through to the deadline
+        // check above and returns timed_out.
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.cv.wait_for(lock, remaining,
+                          [&state]() { return state.changed; });
     }
 }
 

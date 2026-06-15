@@ -577,7 +577,14 @@ ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
 }
 
 void Client::LeaderMonitorThreadMain() {
-    constexpr auto kViewChangeTimeout = std::chrono::milliseconds(1000);
+    // WaitForViewChange now blocks on a backend watch and returns as soon as
+    // leadership actually changes, so this timeout no longer drives polling
+    // cadence -- it is only a periodic re-sync safety net that re-reads the
+    // current view in case a watch event was missed (e.g. a connection blip).
+    // Keeping it long (30s instead of 1s) collapses steady-state backend load
+    // from ~1 read/sec/client to ~1 read/30s/client without affecting failover
+    // responsiveness, which is driven by the watch.
+    constexpr auto kViewChangeTimeout = std::chrono::milliseconds(30000);
     constexpr auto kErrorRetryInterval = std::chrono::milliseconds(1000);
 
     while (leader_monitor_running_.load()) {
