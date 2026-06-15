@@ -281,7 +281,7 @@ jobs:
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
-    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+    container: registry.mthreads.com/mcconline/musa-pytorch-release-public:rc4.3.0-v2.5.0-qy2
     steps:
     - uses: actions/checkout@v4
       with:
@@ -295,6 +295,11 @@ jobs:
       run: |
         apt update -y
         apt install -y ninja-build
+        python3 -m pip install torchada==0.1.48
+        mkdir -p /tmp/musa-lib-fix
+        ln -sf /usr/lib/x86_64-linux-gnu/libmusa.so.4.3.4 /tmp/musa-lib-fix/libmusa.so.4
+        export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        export LD_LIBRARY_PATH=/tmp/musa-lib-fix:/usr/local/musa/lib:${LD_LIBRARY_PATH:-}
         bash -x dependencies.sh -y
         mkdir build
         cd build
@@ -304,7 +309,9 @@ jobs:
     - name: Build project
       run: |
         cd build
-        source ~/.bashrc
+        [ -f ~/.bashrc ] && source ~/.bashrc || true
+        export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        export LD_LIBRARY_PATH=/tmp/musa-lib-fix:/usr/local/musa/lib:${LD_LIBRARY_PATH:-}
         cmake --build .
         cmake --install .
       shell: bash
