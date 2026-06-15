@@ -1,15 +1,9 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
 #include <sstream>
-#include <chrono>
 #include <transfer_engine.h>
 
 namespace mooncake {
-
-static bool epTimingEnabled() {
-    const char* env = std::getenv("MOONCAKE_EP_TIMING");
-    return env && (env[0] == '1' || env[0] == 'Y' || env[0] == 'y');
-}
 
 // Initialize an RDMA transport: register memory, allocate control buffer,
 // create QPs.  Returns true on success, false if IBGDA is unavailable.
@@ -259,37 +253,9 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         mark_send_done();
     } else {
 #ifdef MOONCAKE_EP_USE_MUSA
-        if (epTimingEnabled()) {
-            using hrc = std::chrono::high_resolution_clock;
-            auto t0 = hrc::now();
-            launcher(LOW_LATENCY_SEND_PHASE);
-            cudaStreamSynchronize(launch_stream);
-            auto t1 = hrc::now();
-            mark_send_done();
-            cudaStreamSynchronize(launch_stream);
-            auto t2 = hrc::now();
-            wait_peer_send_done();
-            cudaStreamSynchronize(launch_stream);
-            auto t3 = hrc::now();
-            launcher(LOW_LATENCY_RECV_PHASE);
-            cudaStreamSynchronize(launch_stream);
-            auto t4 = hrc::now();
-            auto send_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            auto ack_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-            auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
-            auto recv_us = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
-            LOG(INFO) << "[EP_TIMING] dispatch rank=" << rank
-                      << " tokens=" << num_tokens
-                      << " send=" << send_us << "us"
-                      << " mark_ack=" << ack_us << "us"
-                      << " wait_ack=" << wait_us << "us"
-                      << " recv=" << recv_us << "us"
-                      << " total=" << (send_us + ack_us + wait_us + recv_us) << "us";
-        } else {
-            launcher(LOW_LATENCY_SEND_PHASE);
-            mark_and_wait_peer_send_done();
-            launcher(LOW_LATENCY_RECV_PHASE);
-        }
+        launcher(LOW_LATENCY_SEND_PHASE);
+        mark_and_wait_peer_send_done();
+        launcher(LOW_LATENCY_RECV_PHASE);
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif
@@ -445,37 +411,9 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         mark_send_done();
     } else {
 #ifdef MOONCAKE_EP_USE_MUSA
-        if (epTimingEnabled()) {
-            using hrc = std::chrono::high_resolution_clock;
-            auto t0 = hrc::now();
-            launcher(LOW_LATENCY_SEND_PHASE);
-            cudaStreamSynchronize(launch_stream);
-            auto t1 = hrc::now();
-            mark_send_done();
-            cudaStreamSynchronize(launch_stream);
-            auto t2 = hrc::now();
-            wait_peer_send_done();
-            cudaStreamSynchronize(launch_stream);
-            auto t3 = hrc::now();
-            launcher(LOW_LATENCY_RECV_PHASE);
-            cudaStreamSynchronize(launch_stream);
-            auto t4 = hrc::now();
-            auto send_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            auto ack_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-            auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
-            auto recv_us = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
-            LOG(INFO) << "[EP_TIMING] combine rank=" << rank
-                      << " tokens=" << num_combined_tokens
-                      << " send=" << send_us << "us"
-                      << " mark_ack=" << ack_us << "us"
-                      << " wait_ack=" << wait_us << "us"
-                      << " recv=" << recv_us << "us"
-                      << " total=" << (send_us + ack_us + wait_us + recv_us) << "us";
-        } else {
-            launcher(LOW_LATENCY_SEND_PHASE);
-            mark_and_wait_peer_send_done();
-            launcher(LOW_LATENCY_RECV_PHASE);
-        }
+        launcher(LOW_LATENCY_SEND_PHASE);
+        mark_and_wait_peer_send_done();
+        launcher(LOW_LATENCY_RECV_PHASE);
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif

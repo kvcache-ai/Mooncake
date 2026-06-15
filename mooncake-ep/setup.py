@@ -48,22 +48,6 @@ if use_musa:
         "--cuda-gpu-arch=mp_31",
         "-O3",
     ]
-    # MC_EP_MUSA_NO_FENCE: make mc_fence a no-op (perf experiment only).
-    if os.getenv("MC_EP_MUSA_NO_FENCE", "").upper() in {"1", "ON", "TRUE", "YES"}:
-        device_args.append("-DMC_EP_MUSA_NO_FENCE")
-        cxx_args.append("-DMC_EP_MUSA_NO_FENCE")
-    # MC_EP_MUSA_NO_BAR_SYNC: make mc_bar_sync a no-op (perf experiment only).
-    if os.getenv("MC_EP_MUSA_NO_BAR_SYNC", "").upper() in {"1", "ON", "TRUE", "YES"}:
-        device_args.append("-DMC_EP_MUSA_NO_BAR_SYNC")
-        cxx_args.append("-DMC_EP_MUSA_NO_BAR_SYNC")
-    # MC_EP_MUSA_NO_FBF: make mc_fence_barrier_fence a no-op (perf experiment only).
-    if os.getenv("MC_EP_MUSA_NO_FBF", "").upper() in {"1", "ON", "TRUE", "YES"}:
-        device_args.append("-DMC_EP_MUSA_NO_FBF")
-        cxx_args.append("-DMC_EP_MUSA_NO_FBF")
-    # MC_EP_MUSA_NO_ST_RELEASE: make mc_st_release a plain store (perf experiment only).
-    if os.getenv("MC_EP_MUSA_NO_ST_RELEASE", "").upper() in {"1", "ON", "TRUE", "YES"}:
-        device_args.append("-DMC_EP_MUSA_NO_ST_RELEASE")
-        cxx_args.append("-DMC_EP_MUSA_NO_ST_RELEASE")
 else:
     cxx_args.append("-DUSE_CUDA")
     device_args = [

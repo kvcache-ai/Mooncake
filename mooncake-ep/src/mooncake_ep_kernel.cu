@@ -467,11 +467,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     constexpr int kNumMaxTopK = 11;
     constexpr int kNumWarpsPerGroup = 4;
 #ifdef MOONCAKE_EP_USE_MUSA
-    // MUSA all-P2P dispatch is send-kernel dominated.  Using slightly fewer
-    // expert groups per CTA increases CTA count and exposes more token/top-k
-    // work while still preserving enough data warps for top-k<=11 plus the
-    // count warp.  More aggressive values (e.g. 4 groups) can starve the
-    // finish-counter protocol on MT S5000.
+    // MT S5000 benefits from slightly more CTAs while keeping enough warps for top-k<=11.
     constexpr int kNumWarpGroups = 5;
 #else
     constexpr int kNumWarpGroups = 8;
