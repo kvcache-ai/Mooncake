@@ -33,35 +33,35 @@ __global__ void mark_phase_ack_kernel(void* mxa_buffer,
                                       void* const* ipc_peer_ptrs,
                                       int* ack_buffer, int rank,
                                       int num_ranks, int epoch) {
-    const int peer = static_cast<int>(threadIdx.x);
-    if (peer >= num_ranks)
-        return;
-
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
         ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
 
-    if (peer == rank) {
-        mc_st_release(ack_buffer + rank, epoch);
-        return;
+    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
+         peer += static_cast<int>(blockDim.x)) {
+        if (peer == rank) {
+            mc_st_release(ack_buffer + rank, epoch);
+        } else {
+            void* dst = mc_route_put(comm_ctx, peer, ack_buffer + rank);
+            if (dst != nullptr)
+                mc_st_release(reinterpret_cast<int*>(dst), epoch);
+        }
     }
-
-    void* dst = mc_route_put(comm_ctx, peer, ack_buffer + rank);
-    if (dst != nullptr)
-        mc_st_release(reinterpret_cast<int*>(dst), epoch);
 }
 
 __global__ void wait_phase_ack_kernel(int* ack_buffer, int rank, int num_ranks,
                                       int epoch, int64_t timeout_ticks) {
-    const int peer = static_cast<int>(threadIdx.x);
-    if (peer >= num_ranks || peer == rank)
-        return;
+    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
+         peer += static_cast<int>(blockDim.x)) {
+        if (peer == rank)
+            continue;
 
-    unsigned long long start_time = clock64();
-    while (mc_ld_acquire(ack_buffer + peer) < epoch) {
-        unsigned long long end_time = clock64();
-        if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
-            return;
+        int64_t start_time = static_cast<int64_t>(clock64());
+        while (mc_ld_acquire(ack_buffer + peer) < epoch) {
+            int64_t end_time = static_cast<int64_t>(clock64());
+            if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                return;
+        }
     }
 }
 
@@ -69,13 +69,12 @@ __global__ void mark_and_wait_phase_ack_kernel(
         void* mxa_buffer, const int32_t* nvlink_available,
         void* const* ipc_peer_ptrs, int* ack_buffer, int rank, int num_ranks,
         int epoch, int64_t timeout_ticks) {
-    const int peer = static_cast<int>(threadIdx.x);
-
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
         ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
 
-    if (peer < num_ranks) {
+    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
+         peer += static_cast<int>(blockDim.x)) {
         if (peer == rank) {
             mc_st_release(ack_buffer + rank, epoch);
         } else {
@@ -87,14 +86,17 @@ __global__ void mark_and_wait_phase_ack_kernel(
 
     __syncthreads();
 
-    if (peer >= num_ranks || peer == rank)
-        return;
+    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
+         peer += static_cast<int>(blockDim.x)) {
+        if (peer == rank)
+            continue;
 
-    unsigned long long start_time = clock64();
-    while (mc_ld_acquire(ack_buffer + peer) < epoch) {
-        unsigned long long end_time = clock64();
-        if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
-            return;
+        int64_t start_time = static_cast<int64_t>(clock64());
+        while (mc_ld_acquire(ack_buffer + peer) < epoch) {
+            int64_t end_time = static_cast<int64_t>(clock64());
+            if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                return;
+        }
     }
 }
 
