@@ -1370,7 +1370,6 @@ TEST_F(FileStorageTest,
     RunBatchPutHealWipeScenario(data_path);
 }
 
-
 TEST_F(FileStorageTest, BatchGetSingleflight_SerializesSameKey) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
