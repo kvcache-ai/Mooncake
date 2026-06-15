@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -238,6 +239,34 @@ inline TensorMetadata BuildTensorMetadata(
     return metadata;
 }
 
+inline std::optional<size_t> TensorMetadataExpectedDataBytes(
+    const TensorMetadata &metadata) {
+    auto element_size = TensorDtypeElementSize(metadata.header.dtype);
+    if (!element_size.has_value()) {
+        return std::nullopt;
+    }
+
+    size_t numel = 1;
+    for (int32_t i = 0; i < metadata.header.ndim; ++i) {
+        const int64_t dim = metadata.layout.local_shape.dims[i];
+        if (dim < 0) {
+            return std::nullopt;
+        }
+        const auto dim_size = static_cast<size_t>(dim);
+        if (dim_size != 0 &&
+            numel > std::numeric_limits<size_t>::max() / dim_size) {
+            return std::nullopt;
+        }
+        numel *= dim_size;
+    }
+
+    if (*element_size != 0 &&
+        numel > std::numeric_limits<size_t>::max() / *element_size) {
+        return std::nullopt;
+    }
+    return numel * *element_size;
+}
+
 inline bool ValidateTensorMetadata(const TensorMetadata &metadata,
                                    size_t total_length) {
     if (metadata.header.magic != kTensorObjectMagic ||
@@ -276,10 +305,16 @@ inline bool ValidateTensorMetadata(const TensorMetadata &metadata,
     }
 
     for (int32_t i = 0; i < metadata.header.ndim; ++i) {
-        if (metadata.layout.global_shape.dims[i] <= 0 ||
+        if (metadata.layout.global_shape.dims[i] < 0 ||
             metadata.layout.local_shape.dims[i] < 0) {
             return false;
         }
+    }
+
+    auto expected_data_bytes = TensorMetadataExpectedDataBytes(metadata);
+    if (!expected_data_bytes.has_value() ||
+        metadata.header.data_bytes != *expected_data_bytes) {
+        return false;
     }
 
     for (size_t i = metadata.header.ndim; i < kMaxTensorDims; ++i) {
