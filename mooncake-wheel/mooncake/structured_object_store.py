@@ -33,6 +33,7 @@ class BundleTransferPolicy:
 
     max_inflight_put: int = 1
     put_mode: Literal["auto", "batch", "parallel"] = "auto"
+    copy_mode: Literal["auto", "zero_copy", "copy"] = "auto"
 
 
 @dataclass
@@ -185,6 +186,7 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
         max_inflight_put: Optional[int] = None,
+        pre_registered_buffers: Optional[Mapping[str, bool]] = None,
     ) -> RemoteBundleRef:
         """Store a structured object described by JSON metadata plus named members."""
         return self._structured_store.put_structured_object(
@@ -193,6 +195,7 @@ class MooncakeBundleTransfer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             max_inflight_put=max_inflight_put,
+            pre_registered_buffers=pre_registered_buffers,
         )
 
     def read_spec(
@@ -225,8 +228,12 @@ class _StructuredObjectLayer:
         chunk_bytes: Optional[int],
         policy: Optional[BundleTransferPolicy],
         max_inflight_put: Optional[int],
+        pre_registered_buffers: Optional[Mapping[str, bool]],
     ) -> RemoteBundleRef:
         metadata, buffers = _encode_structured_fields(payload.metadata, payload.buffers)
+        _validate_pre_registered_structured_buffers(
+            payload.buffers, buffers, pre_registered_buffers
+        )
         return self._bundle_store.put_bundle(
             meta=_encode_structured_metadata(metadata),
             buffers=buffers,
@@ -234,6 +241,7 @@ class _StructuredObjectLayer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             max_inflight_put=max_inflight_put,
+            pre_registered_buffers=pre_registered_buffers,
         )
 
     def read_spec(
@@ -506,12 +514,16 @@ class _BundleManifestStore:
         result = policy or BundleTransferPolicy()
         if max_inflight_put is not None:
             result = BundleTransferPolicy(
-                max_inflight_put=max_inflight_put, put_mode=result.put_mode
+                max_inflight_put=max_inflight_put,
+                put_mode=result.put_mode,
+                copy_mode=result.copy_mode,
             )
         if result.max_inflight_put < 1:
             raise ValueError("max_inflight_put must be positive")
         if result.put_mode not in {"auto", "batch", "parallel"}:
             raise ValueError(f"unsupported put_mode: {result.put_mode}")
+        if result.copy_mode not in {"auto", "zero_copy", "copy"}:
+            raise ValueError(f"unsupported copy_mode: {result.copy_mode}")
         return result
 
     def _validate_manifest(self, manifest: Mapping[str, Any]) -> None:
@@ -607,7 +619,13 @@ class _MooncakePayloadTransport:
         transfer_policy: BundleTransferPolicy,
         pre_registered: bool,
     ) -> list[str]:
+        if transfer_policy.copy_mode == "copy":
+            return self._put_chunks_direct(chunk_keys, chunks)
         if not self._has_batch_put_support():
+            if transfer_policy.copy_mode == "zero_copy":
+                raise RuntimeError(
+                    "zero-copy put requested but batch_put_from is unavailable"
+                )
             return self._put_chunks_direct(chunk_keys, chunks)
         put_mode = self._resolve_put_mode(chunks, transfer_policy)
         if put_mode == "batch":
@@ -1221,6 +1239,46 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
             "shape": list(array.shape),
         }, array.view(np.uint8).reshape(-1)
     return {"encoding": "bytes"}, value
+
+
+def _validate_pre_registered_structured_buffers(
+    original_buffers: Mapping[str, Any],
+    encoded_buffers: Mapping[str, Any],
+    pre_registered_buffers: Optional[Mapping[str, bool]],
+) -> None:
+    if not pre_registered_buffers:
+        return
+    for name, pre_registered in pre_registered_buffers.items():
+        if not pre_registered:
+            continue
+        if name not in original_buffers or name not in encoded_buffers:
+            raise ValueError(f"unknown pre-registered structured buffer: {name}")
+        if not _is_same_writable_buffer(original_buffers[name], encoded_buffers[name]):
+            raise ValueError(
+                f"pre-registered structured buffer {name} must be the same writable contiguous buffer used for transfer"
+            )
+
+
+def _is_same_writable_buffer(original: Any, encoded: Any) -> bool:
+    try:
+        original_view = memoryview(original)
+        encoded_view = memoryview(encoded)
+    except TypeError:
+        return False
+    if not original_view.contiguous or not encoded_view.c_contiguous:
+        return False
+    if original_view.readonly or encoded_view.readonly:
+        return False
+    if original_view.nbytes != encoded_view.nbytes:
+        return False
+    try:
+        original_bytes = original_view.cast("B")
+        encoded_bytes = encoded_view.cast("B")
+        original_ptr = ctypes.addressof(ctypes.c_char.from_buffer(original_bytes))
+        encoded_ptr = ctypes.addressof(ctypes.c_char.from_buffer(encoded_bytes))
+    except (BufferError, TypeError, ValueError):
+        return False
+    return original_ptr == encoded_ptr
 
 
 def _structured_field_specs(metadata: Mapping[str, Any]) -> dict[str, Any]:
