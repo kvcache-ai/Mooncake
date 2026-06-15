@@ -682,9 +682,48 @@ MasterService::EraseMetadata(
     const std::string& tenant_id) {
     const std::string key = it->first;
     const std::string group_id = it->second.group_id;
+    ReleaseLocalDiskUsage(it->second.GetAllReplicas());
     auto next = tenant_state.metadata.erase(it);
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
     return next;
+}
+
+void MasterService::ReleaseLocalDiskUsage(
+    const std::vector<Replica>& replicas) {
+    std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
+    for (const auto& replica : replicas) {
+        if (!replica.is_local_disk_replica()) {
+            continue;
+        }
+        const auto descriptor =
+            replica.get_descriptor().get_local_disk_descriptor();
+        if (descriptor.object_size > 0) {
+            bytes_by_client[descriptor.client_id] += descriptor.object_size;
+        }
+    }
+    if (bytes_by_client.empty()) {
+        return;
+    }
+
+    ScopedLocalDiskSegmentAccess ssd_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_segments = ssd_access.getClientLocalDiskSegment();
+    for (const auto& [client_id, bytes] : bytes_by_client) {
+        auto disk_it = client_segments.find(client_id);
+        if (disk_it != client_segments.end()) {
+            disk_it->second->ssd_used_bytes.fetch_sub(
+                bytes, std::memory_order_relaxed);
+        }
+    }
+}
+
+size_t MasterService::EraseReplicasAndTrackSsdUsage(
+    ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& pred_fn) {
+    auto erased_replicas = metadata.PopReplicas(pred_fn);
+    const size_t erased_count = erased_replicas.size();
+    ReleaseLocalDiskUsage(erased_replicas);
+    return erased_count;
 }
 
 void MasterService::RebuildGroupRoutingIndex() {
@@ -1238,7 +1277,7 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
-            metadata.EraseReplicas(match_replica_on_segment);
+            EraseReplicasAndTrackSsdUsage(metadata, match_replica_on_segment);
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
@@ -1820,12 +1859,13 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         MasterMetricManager::instance().dec_file_cache_nums();
     }
 
-    metadata.EraseReplicas([replica_type](const Replica& replica) {
-        if (replica_type == ReplicaType::ALL) {
-            return replica.is_memory_replica() || replica.is_nof_replica();
-        }
-        return replica.type() == replica_type;
-    });
+    EraseReplicasAndTrackSsdUsage(
+        metadata, [replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return replica.is_memory_replica() || replica.is_nof_replica();
+            }
+            return replica.type() == replica_type;
+        });
 
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
@@ -2210,33 +2250,13 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
             [](const Replica& replica) { return replica.is_disk_replica(); });
         MasterMetricManager::instance().dec_file_cache_nums();
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
-        // Pop matching replicas and track their total size
-        auto erased =
-            metadata.PopReplicas([&client_id](const Replica& replica) {
+        EraseReplicasAndTrackSsdUsage(
+            metadata, [&client_id](const Replica& replica) {
                 return replica.is_local_disk_replica() &&
                        replica.get_descriptor()
                                .get_local_disk_descriptor()
                                .client_id == client_id;
             });
-
-        int64_t evicted_size = 0;
-        for (const auto& replica : erased) {
-            evicted_size += replica.get_descriptor()
-                                .get_local_disk_descriptor()
-                                .object_size;
-        }
-
-        // Decrement SSD usage tracking
-        if (evicted_size > 0) {
-            ScopedLocalDiskSegmentAccess ssd_access =
-                segment_manager_.getLocalDiskSegmentAccess();
-            auto& client_segments = ssd_access.getClientLocalDiskSegment();
-            auto disk_it = client_segments.find(client_id);
-            if (disk_it != client_segments.end()) {
-                disk_it->second->ssd_used_bytes.fetch_sub(
-                    evicted_size, std::memory_order_relaxed);
-            }
-        }
     } else {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
@@ -3022,12 +3042,13 @@ bool MasterService::CleanupStaleHandles(
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
     // Remove those with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner client is no longer alive.
-    metadata.EraseReplicas([&alive_clients](const Replica& replica) {
-        return (replica.has_invalid_mem_handle() ||
-                replica.has_invalid_nof_handle() ||
-                replica.has_stale_local_disk_client(alive_clients)) &&
-               replica.is_completed();
-    });
+    EraseReplicasAndTrackSsdUsage(
+        metadata, [&alive_clients](const Replica& replica) {
+            return (replica.has_invalid_mem_handle() ||
+                    replica.has_invalid_nof_handle() ||
+                    replica.has_stale_local_disk_client(alive_clients)) &&
+                   replica.is_completed();
+        });
 
     // Return true if no valid replicas remain after cleanup
     return !metadata.IsValid();

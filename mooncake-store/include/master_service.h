@@ -1269,6 +1269,10 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const std::string& tenant_id);
+    void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    size_t EraseReplicasAndTrackSsdUsage(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,

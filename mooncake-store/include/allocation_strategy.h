@@ -701,6 +701,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         int64_t total = ssd_provider->getSsdTotalCapacity(name);
         if (total <= 0) return 1.0;
         int64_t used = ssd_provider->getSsdUsedBytes(name);
+        used = std::clamp<int64_t>(used, 0, total);
         int64_t free_bytes = total - used;
         return static_cast<double>(free_bytes) / static_cast<double>(total);
     }
