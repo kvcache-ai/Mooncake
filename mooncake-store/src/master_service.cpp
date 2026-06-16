@@ -1181,12 +1181,9 @@ auto MasterService::BatchReplicaClear(
                 });
 
             // Erase the entire metadata (all replicas will be deallocated)
-            bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
-                return r.is_local_disk_replica() && r.is_completed();
-            });
-            auto& shard = accessor.GetShard();
+            // accessor.Erase() internally calls EraseMetadata which already
+            // decrements disk_object_count via OnDiskReplicaRemoved.
             accessor.Erase();
-            shard.OnDiskReplicaRemoved(had_completed_disk);
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
                        "for key="
@@ -1250,14 +1247,10 @@ auto MasterService::BatchReplicaClear(
             }
 
             // If no valid replicas remain, erase the entire metadata
+            // accessor.Erase() internally calls EraseMetadata which already
+            // decrements disk_object_count via OnDiskReplicaRemoved.
             if (!metadata.IsValid()) {
-                bool had_completed_disk =
-                    metadata.HasReplica([](const Replica& r) {
-                        return r.is_local_disk_replica() && r.is_completed();
-                    });
-                auto& shard = accessor.GetShard();
                 accessor.Erase();
-                shard.OnDiskReplicaRemoved(had_completed_disk);
             }
 
             cleared_keys.emplace_back(key);
@@ -5365,19 +5358,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
                          });
         auto target_timeout = candidates[evict_num - 1].lease_timeout;
 
+        // Try candidates up to target_timeout first. If re-validation skips
+        // some, continue trying candidates beyond target_timeout so that
+        // actual evicted count reaches evict_num.
+        long remaining = evict_num;
+        // First pass: candidates with lease_timeout <= target_timeout
         for (auto& c : candidates) {
-            if (c.lease_timeout > target_timeout) {
-                no_pin_objects.push_back(c.lease_timeout);
-                continue;
-            }
-            // Re-acquire shard lock and look up by key
+            if (remaining <= 0) break;
+            if (c.lease_timeout > target_timeout) continue;
             MetadataShardAccessorRW shard(this, c.shard_idx);
             auto tenant_it = shard->tenants.find(c.tenant_id);
             if (tenant_it == shard->tenants.end()) continue;
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.find(c.key);
             if (it == tenant_state.metadata.end()) continue;
-            // Re-validate: state may have changed since Phase 1
             if (!it->second.IsLeaseExpired(now) ||
                 it->second.IsSoftPinned(now) ||
                 !can_evict_replicas(it->second)) {
@@ -5392,6 +5386,34 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 EraseMetadata(tenant_state, it, c.tenant_id, &shard);
             }
             evicted_count += evict_result.evicted_objects;
+            remaining -= evict_result.evicted_objects;
+        }
+        // Second pass: try beyond-target_timeout candidates if we still
+        // haven't evicted enough
+        for (auto& c : candidates) {
+            if (remaining <= 0) break;
+            if (c.lease_timeout <= target_timeout) continue;
+            MetadataShardAccessorRW shard(this, c.shard_idx);
+            auto tenant_it = shard->tenants.find(c.tenant_id);
+            if (tenant_it == shard->tenants.end()) continue;
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.find(c.key);
+            if (it == tenant_state.metadata.end()) continue;
+            if (!it->second.IsLeaseExpired(now) ||
+                it->second.IsSoftPinned(now) ||
+                !can_evict_replicas(it->second)) {
+                no_pin_objects.push_back(c.lease_timeout);
+                continue;
+            }
+            auto evict_result = try_evict_group_or_object(
+                c.tenant_id, c.key, it->second, shard, tenant_state,
+                /*allow_soft_pinned=*/false);
+            total_freed_size += evict_result.freed_bytes;
+            if (!it->second.IsValid()) {
+                EraseMetadata(tenant_state, it, c.tenant_id, &shard);
+            }
+            evicted_count += evict_result.evicted_objects;
+            remaining -= evict_result.evicted_objects;
         }
     }
 
