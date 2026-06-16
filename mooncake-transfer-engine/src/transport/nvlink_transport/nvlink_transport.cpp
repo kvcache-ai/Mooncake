@@ -483,6 +483,9 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         cuMemRelease(handle);
                         return -1;
                     }
+                    // Mapping holds a reference; release imported handle to
+                    // avoid ref_count leak.
+                    cuMemRelease(handle);
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = entry.length;
@@ -600,6 +603,8 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         cuMemRelease(handle);
         return nullptr;
     }
+    // Mapping holds a reference; release the handle to avoid ref_count leak.
+    cuMemRelease(handle);
     return ptr;
 }
 
