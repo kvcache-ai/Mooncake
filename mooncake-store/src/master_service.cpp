@@ -20,6 +20,9 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "segment.h"
+#ifdef USE_HTTP
+#include "transfer_metadata_plugin.h"
+#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -8754,24 +8757,85 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
 void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
     http_metadata_server_ = server;
     if (server) {
-        LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled";
+        LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
+                     "(co-located metadata server)";
     }
 }
 
+void MasterService::setHttpMetadataRemoteUrl(
+    const std::string& metadata_connstring) {
+#ifdef USE_HTTP
+    // Only http/https metadata servers are supported for remote cleanup. Guard
+    // the scheme here to avoid MetadataStoragePlugin::Create()'s LOG(FATAL)
+    // path for unsupported backends (etcd / redis / P2PHANDSHAKE), which are
+    // left for a future change.
+    if (metadata_connstring.rfind("http://", 0) == 0 ||
+        metadata_connstring.rfind("https://", 0) == 0) {
+        try {
+            http_metadata_remote_ =
+                MetadataStoragePlugin::Create(metadata_connstring);
+            LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
+                         "(remote metadata server "
+                      << metadata_connstring << ")";
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to initialize remote HTTP metadata client "
+                            "for "
+                         << metadata_connstring << ": " << e.what()
+                         << ". Metadata cleanup on timeout disabled.";
+            http_metadata_remote_.reset();
+        }
+        return;
+    }
+    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but the "
+                    "configured metadata server '"
+                 << metadata_connstring
+                 << "' is not an HTTP endpoint; remote cleanup currently "
+                    "supports only http(s). Metadata cleanup on timeout "
+                    "disabled.";
+#else
+    (void)metadata_connstring;
+    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but this build "
+                    "has no HTTP metadata support (USE_HTTP=OFF); metadata "
+                    "cleanup on timeout disabled.";
+#endif
+}
+
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
-    if (!http_metadata_server_) {
+    const std::string ram_key = http_metadata_prefix_ + "ram/" + segment_name;
+    const std::string rpc_key =
+        http_metadata_prefix_ + "rpc_meta/" + segment_name;
+
+    // Co-located metadata server: remove via direct in-process call (no
+    // network overhead).
+    if (http_metadata_server_) {
+        bool ram_removed = http_metadata_server_->removeKey(ram_key);
+        bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
+        LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
+                  << ", ram_key_removed=" << ram_removed
+                  << ", rpc_key_removed=" << rpc_removed;
         return;
     }
 
-    std::string ram_key = http_metadata_prefix_ + "ram/" + segment_name;
-    bool ram_removed = http_metadata_server_->removeKey(ram_key);
+    // Separately-deployed metadata server: best-effort removal over HTTP.
+    // Failures/exceptions must never escape into the client-monitor thread.
+    if (http_metadata_remote_) {
+        bool ram_removed = false;
+        bool rpc_removed = false;
+        try {
+            ram_removed = http_metadata_remote_->remove(ram_key);
+            rpc_removed = http_metadata_remote_->remove(rpc_key);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Remote HTTP metadata cleanup failed for segment: "
+                         << segment_name << ": " << e.what();
+            return;
+        }
+        LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
+                  << segment_name << ", ram_key_removed=" << ram_removed
+                  << ", rpc_key_removed=" << rpc_removed;
+        return;
+    }
 
-    std::string rpc_key = http_metadata_prefix_ + "rpc_meta/" + segment_name;
-    bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
-
-    LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
-              << ", ram_key_removed=" << ram_removed
-              << ", rpc_key_removed=" << rpc_removed;
+    // Neither configured: cleanup is disabled, nothing to do.
 }
 
 }  // namespace mooncake

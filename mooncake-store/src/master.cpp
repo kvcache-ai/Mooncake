@@ -5,8 +5,11 @@
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <cstdlib>  // For std::getenv
+#include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
-#include <thread>   // For std::thread
+#include <string>
+#include <thread>  // For std::thread
+#include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
@@ -59,6 +62,52 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
                    << ". " << error;
     }
     return parsed_value;
+}
+
+// Derive the metadata server connection string from the cluster's existing
+// configuration so that the master can clean up stale HTTP metadata when the
+// metadata server is deployed separately (not co-located in this process).
+// Sources, in priority order:
+//   1) MOONCAKE_TE_META_DATA_SERVER  (the Transfer Engine metadata connstring
+//      shared cluster-wide, e.g. "http://host:8080/metadata")
+//   2) MOONCAKE_CONFIG_PATH json -> "metadata_server"
+// Returns an empty string if nothing usable is found. The caller is
+// responsible for validating the scheme (only http(s) is supported).
+std::string ResolveMetadataServerForCleanup() {
+    if (const char* env = std::getenv("MOONCAKE_TE_META_DATA_SERVER")) {
+        std::string value(env);
+        // "P2PHANDSHAKE" is a peer-to-peer mode with no central metadata
+        // server, so there is nothing to clean up remotely.
+        if (!value.empty() && value != "P2PHANDSHAKE") {
+            return value;
+        }
+    }
+
+    if (const char* cfg = std::getenv("MOONCAKE_CONFIG_PATH")) {
+        if (cfg[0] != '\0') {
+            try {
+                std::ifstream fin(cfg);
+                if (fin) {
+                    Json::CharReaderBuilder builder;
+                    Json::Value root;
+                    std::string errs;
+                    if (Json::parseFromStream(builder, fin, &root, &errs) &&
+                        root.isMember("metadata_server")) {
+                        return root["metadata_server"].asString();
+                    }
+                    if (!errs.empty()) {
+                        LOG(WARNING) << "Failed to parse MOONCAKE_CONFIG_PATH ("
+                                     << cfg << "): " << errs;
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Error reading MOONCAKE_CONFIG_PATH (" << cfg
+                             << "): " << e.what();
+            }
+        }
+    }
+
+    return {};
 }
 
 }  // namespace
@@ -1104,14 +1153,37 @@ int main(int argc, char* argv[]) {
         protocol = "rdma";
     }
 
-    // Validate: enable_metadata_cleanup_on_timeout requires
-    // enable_http_metadata_server
+    // enable_metadata_cleanup_on_timeout requires a reachable HTTP metadata
+    // server. Two topologies are supported:
+    //   1) Co-located: enable_http_metadata_server=true -> the master cleans
+    //      up via the in-process server (no network overhead).
+    //   2) Separately deployed: the master derives the metadata server address
+    //      from the cluster's existing configuration
+    //      (MOONCAKE_TE_META_DATA_SERVER, or MOONCAKE_CONFIG_PATH json's
+    //      "metadata_server") and cleans up via HTTP DELETE. Only http(s)
+    //      endpoints are supported for now (etcd/redis left for future work).
+    // If neither is available, cleanup is disabled with a warning so the main
+    // process is never affected.
+    std::string http_metadata_remote_url;
     if (master_config.enable_metadata_cleanup_on_timeout &&
         !master_config.enable_http_metadata_server) {
-        LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set to true but "
-                     << "enable_http_metadata_server is false. "
-                     << "Disabling metadata cleanup on timeout.";
-        master_config.enable_metadata_cleanup_on_timeout = false;
+        std::string derived = ResolveMetadataServerForCleanup();
+        if (derived.rfind("http://", 0) == 0 ||
+            derived.rfind("https://", 0) == 0) {
+            http_metadata_remote_url = std::move(derived);
+            LOG(INFO) << "enable_metadata_cleanup_on_timeout: HTTP metadata "
+                         "server is deployed separately; cleanup will target "
+                      << http_metadata_remote_url;
+        } else {
+            LOG(WARNING)
+                << "enable_metadata_cleanup_on_timeout is set to true but "
+                   "enable_http_metadata_server is false and no HTTP metadata "
+                   "server address could be derived from the cluster config "
+                   "(set MOONCAKE_TE_META_DATA_SERVER=http://host:port/metadata "
+                   "or MOONCAKE_CONFIG_PATH). Disabling metadata cleanup on "
+                   "timeout.";
+            master_config.enable_metadata_cleanup_on_timeout = false;
+        }
     }
 
     LOG(INFO)
@@ -1216,18 +1288,19 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        // Only pass HttpMetadataServer pointer if cleanup is enabled
-        // Note: enable_metadata_cleanup_on_timeout is automatically disabled
-        // if enable_http_metadata_server is false (validated earlier)
+        // Wire metadata cleanup on client timeout. Prefer the co-located
+        // in-process server; otherwise use the separately-deployed HTTP
+        // metadata server derived from the cluster configuration above.
         mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
-        if (master_config.enable_metadata_cleanup_on_timeout) {
+        if (master_config.enable_metadata_cleanup_on_timeout &&
+            master_config.enable_http_metadata_server) {
             metadata_server_ptr = http_metadata_server.get();
         }
 
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(
                 mooncake::WrappedMasterServiceConfig(master_config, version),
-                metadata_server_ptr);
+                metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting);

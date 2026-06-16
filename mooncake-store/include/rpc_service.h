@@ -20,10 +20,16 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
-    // Constructor with optional HttpMetadataServer pointer for cleanup on
-    // timeout If http_metadata_server is nullptr, cleanup is disabled
+    // Constructor with optional metadata-cleanup-on-timeout configuration.
+    // - http_metadata_server: in-process pointer used when the HTTP metadata
+    //   server is co-located in the master process (nullptr = not co-located).
+    // - http_metadata_remote_url: http(s) connection string used when the
+    //   metadata server is deployed separately (empty = none). Only consulted
+    //   when http_metadata_server is nullptr. If both are unset, cleanup is
+    //   disabled.
     WrappedMasterService(const WrappedMasterServiceConfig& config,
-                         HttpMetadataServer* http_metadata_server = nullptr);
+                         HttpMetadataServer* http_metadata_server = nullptr,
+                         const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
 

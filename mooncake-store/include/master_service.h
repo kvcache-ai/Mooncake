@@ -47,6 +47,7 @@ class EtcdOpLogStore;
 class AllocationStrategy;
 class EvictionStrategy;
 class HttpMetadataServer;
+struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
 namespace test {
@@ -750,6 +751,17 @@ class MasterService {
      * disabled.
      */
     void setHttpMetadataServer(HttpMetadataServer* server);
+
+    /**
+     * @brief Configure cleanup against a separately-deployed HTTP metadata
+     * server (not co-located in the master process). The master sends HTTP
+     * DELETE requests to this endpoint when a client times out. Only http://
+     * and https:// connection strings are supported; other schemes (etcd /
+     * redis / P2PHANDSHAKE) are ignored with a warning and leave cleanup
+     * disabled.
+     * @param metadata_connstring e.g. "http://host:8080/metadata".
+     */
+    void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
     void SnapshotThreadFunc();
@@ -1883,6 +1895,12 @@ class MasterService {
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
+
+    // Remote HTTP metadata storage client, used when the metadata server is
+    // deployed separately from the master (not co-located). nullptr means no
+    // remote cleanup. Mutually exclusive with http_metadata_server_ in
+    // practice (co-located prefers the in-process pointer).
+    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;

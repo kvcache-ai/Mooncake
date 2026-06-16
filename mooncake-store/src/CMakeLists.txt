@@ -297,6 +297,7 @@ target_link_libraries(
           pthread
           ibverbs
           mooncake_common
+          JsonCpp::JsonCpp
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
