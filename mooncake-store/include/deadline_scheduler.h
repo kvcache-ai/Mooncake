@@ -100,6 +100,9 @@ class DeadlineScheduler {
                 }
             }
 
+            // Run callbacks with the scheduler mutex released: callbacks may
+            // acquire other locks, so holding mutex_ here risks lock-order
+            // inversion deadlocks.
             for (auto& rec : expired) {
                 callback_(rec.id);
             }

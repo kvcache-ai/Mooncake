@@ -126,6 +126,8 @@ performance/mooncake/index
 design/architecture
 design/mooncake-store
 design/p2p-store
+design/mooncake-backend-pg
+design/mooncake-ep
 design/transfer-engine/index
 design/hicache-design
 design/engram
@@ -154,6 +156,7 @@ api-reference/http/index
 
 troubleshooting/error-code
 troubleshooting/troubleshooting
+troubleshooting/pg-ep-troubleshooting
 :::
 
 
