@@ -712,17 +712,19 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         auto& shard = tenant_quota_shards_[i];
         std::lock_guard<std::mutex> lock(shard.mutex);
-        for (auto& [tenant_id, state] : shard.tenants) {
+        for (auto it = shard.tenants.begin(); it != shard.tenants.end();) {
+            const auto& tenant_id = it->first;
+            auto& state = it->second;
             if (!state.has_explicit_policy) {
                 state.requested_quota_bytes = default_tenant_quota_bytes_;
             }
             if (!state.has_explicit_policy && state.used_bytes == 0 &&
                 state.reserved_bytes == 0 && state.committed_count == 0) {
-                state.effective_quota_bytes = 0;
-                state.over_quota = false;
+                it = shard.tenants.erase(it);
                 continue;
             }
             active_tenants.emplace_back(i, tenant_id);
+            ++it;
         }
     }
 
@@ -730,7 +732,11 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
         for (const auto& [shard_idx, tenant_id] : active_tenants) {
             auto& shard = tenant_quota_shards_[shard_idx];
             std::lock_guard<std::mutex> lock(shard.mutex);
-            auto& state = shard.tenants[tenant_id];
+            auto it = shard.tenants.find(tenant_id);
+            if (it == shard.tenants.end()) {
+                continue;
+            }
+            auto& state = it->second;
             state.effective_quota_bytes = std::numeric_limits<uint64_t>::max();
             state.over_quota = false;
         }
@@ -742,7 +748,11 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
         const auto& [shard_idx, tenant_id] = active_tenants[ordinal];
         auto& shard = tenant_quota_shards_[shard_idx];
         std::lock_guard<std::mutex> lock(shard.mutex);
-        auto& state = shard.tenants[tenant_id];
+        auto it = shard.tenants.find(tenant_id);
+        if (it == shard.tenants.end()) {
+            continue;
+        }
+        auto& state = it->second;
         uint64_t effective = 0;
         if (active_count > 0 && capacity > 0) {
             effective = capacity / active_count;
@@ -779,6 +789,9 @@ tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
     if (static_cast<unsigned __int128>(state.used_bytes) +
             state.reserved_bytes + bytes >
         state.effective_quota_bytes) {
+        if (did_insert) {
+            shard.tenants.erase(it);
+        }
         return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
     }
 

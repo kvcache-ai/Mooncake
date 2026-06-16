@@ -1,6 +1,7 @@
 #include "master_service.h"
 
 #include <limits>
+#include <mutex>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -89,6 +90,25 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void ReleaseQuotaPartial(MasterService& service,
                              const std::string& tenant_id, uint64_t bytes) {
         service.ReleaseTenantQuotaPartial(tenant_id, bytes);
+    }
+
+    void RecomputeTenantQuotas(MasterService& service) {
+        service.RecomputeTenantEffectiveQuotas();
+    }
+
+    void SetExplicitTenantPolicy(MasterService& service,
+                                 const std::string& tenant_id,
+                                 uint64_t requested_quota_bytes) {
+        const auto normalized_tenant = NormalizeTenantId(tenant_id);
+        const auto shard_idx =
+            service.getTenantQuotaShardIndex(normalized_tenant);
+        auto& shard = service.tenant_quota_shards_[shard_idx];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto& state = shard.tenants[normalized_tenant];
+        state.requested_quota_bytes = requested_quota_bytes;
+        state.effective_quota_bytes = requested_quota_bytes;
+        state.has_explicit_policy = true;
+        state.over_quota = false;
     }
 
     void ExpectSameAccounting(const TenantQuotaSnapshot& before,
@@ -190,6 +210,37 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_FALSE(reserve.has_value());
     EXPECT_EQ(reserve.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     ExpectSameAccounting(before, Snapshot(service, "tenant-a"));
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       FirstOverQuotaReserveDoesNotCreateTenantState) {
+    MasterService service(MakeConfig(/*default_quota=*/100,
+                                     /*pool_capacity=*/100));
+
+    auto reserve = ReserveQuota(service, "tenant-a", 101);
+
+    ASSERT_FALSE(reserve.has_value());
+    EXPECT_EQ(reserve.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
+}
+
+TEST_F(MasterServiceTenantQuotaTest, RecomputePrunesEmptyInheritedTenantState) {
+    MasterService service(MakeConfig(/*default_quota=*/100,
+                                     /*pool_capacity=*/1000));
+    ASSERT_TRUE(ReserveQuota(service, "tenant-a", 40).has_value());
+    AbortQuota(service, "tenant-a", 40);
+    ASSERT_TRUE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
+    SetExplicitTenantPolicy(service, "tenant-explicit", 200);
+
+    RecomputeTenantQuotas(service);
+
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
+    auto explicit_snapshot = Snapshot(service, "tenant-explicit");
+    EXPECT_TRUE(explicit_snapshot.has_explicit_policy);
+    EXPECT_EQ(explicit_snapshot.requested_quota_bytes, 200);
 }
 
 TEST_F(MasterServiceTenantQuotaTest, CommitMismatchDoesNotMutateAccounting) {
