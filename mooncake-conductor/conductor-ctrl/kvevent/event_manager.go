@@ -90,7 +90,10 @@ func NewEventManager(
 func (m *EventManager) Start() error {
 	slog.Info("Starting KV Event Manager...")
 
-	// Subscribe to all services concurrently
+	// Subscribe to all services concurrently.
+	// m.mu serialises the check-then-act inside subscribeToService and
+	// serialises with concurrent /register HTTP handlers so that
+	// m.subscribers, m.activeConfigs, and m.services stay consistent.
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(m.services))
 
@@ -98,7 +101,10 @@ func (m *EventManager) Start() error {
 		wg.Add(1)
 		go func(service common.ServiceConfig) {
 			defer wg.Done()
-			if _, err := m.subscribeToService(service); err != nil {
+			m.mu.Lock()
+			_, err := m.subscribeToService(service)
+			m.mu.Unlock()
+			if err != nil {
 				slog.Error("Failed to initiate subscription",
 					"service_type", service.Type,
 					"instance_id", service.InstanceID,
@@ -226,23 +232,39 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) (bool, error
 
 func (m *EventManager) unsubscribeFromService(instanceID string, tenantID string, dpRank int) {
 	svcKey := makeServiceKey(instanceID, tenantID, dpRank)
-	if client, exists := m.subscribers.Load(svcKey); exists {
-		client.Stop()
-		m.subscribers.Delete(svcKey)
-		m.activeConfigs.Delete(svcKey)
 
-		// Remove engine_instance from tenant's instance set
-		m.tenantMutex.Lock()
-		if instanceSet, exists := m.tenantInstanceMap[tenantID]; exists {
-			delete(instanceSet, instanceID)
-		}
-		m.tenantMutex.Unlock()
-		slog.Info("Successfully unsubscribed from service",
-			"service_key", svcKey,
-			"instance_id", instanceID,
-			"tenant_id", tenantID,
-		)
+	// Atomically remove from tracking maps under m.mu so that a
+	// concurrent /register sees a consistent (empty) state.
+	m.mu.Lock()
+	client, exists := m.subscribers.LoadAndDelete(svcKey)
+	if exists {
+		m.activeConfigs.Delete(svcKey)
 	}
+	m.mu.Unlock()
+
+	if client == nil {
+		return
+	}
+
+	// Stop the ZMQ client OUTSIDE m.mu to avoid deadlock:
+	// HandleEvent acquires m.mu.RLock().  If the ZMQ event-loop
+	// goroutine is currently inside HandleEvent (or about to
+	// enter it), holding m.mu while waiting for that goroutine to
+	// exit via client.Stop() → wg.Wait() would deadlock.
+	client.Stop()
+
+	// Remove engine_instance from tenant's instance set
+	m.tenantMutex.Lock()
+	if instanceSet, exists := m.tenantInstanceMap[tenantID]; exists {
+		delete(instanceSet, instanceID)
+	}
+	m.tenantMutex.Unlock()
+
+	slog.Info("Successfully unsubscribed from service",
+		"service_key", svcKey,
+		"instance_id", instanceID,
+		"tenant_id", tenantID,
+	)
 }
 
 func (m *EventManager) getIndexer() *prefixindex.PrefixCacheTable {
@@ -438,16 +460,20 @@ func (m *EventManager) StartHTTPServer() error {
 		}
 		targetKey := makeServiceKey(req.InstanceID, targetTenant, req.DPRank)
 
-		// Direct lookup and removal
+		// Direct lookup and removal.
+		// Hold m.mu only for the existence check; unsubscribeFromService
+		// handles map removal under its own m.mu and calls client.Stop()
+		// outside the lock to avoid deadlock with HandleEvent's RLock.
 		m.mu.Lock()
-		if _, exists := m.activeConfigs.Load(targetKey); !exists {
-			m.mu.Unlock()
+		_, exists := m.activeConfigs.Load(targetKey)
+		m.mu.Unlock()
+
+		if !exists {
 			http.Error(w, fmt.Sprintf("service not found: %s", targetKey), http.StatusNotFound)
 			return
 		}
 
 		m.unsubscribeFromService(req.InstanceID, targetTenant, req.DPRank)
-		m.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
