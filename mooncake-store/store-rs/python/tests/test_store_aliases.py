@@ -113,6 +113,7 @@ class StoreAliasTests(unittest.TestCase):
         spec.loader.exec_module(module)
 
         self.assertNotIn("mooncake.store", sys.modules)
+        self.assertNotIn("mooncake._runtime", sys.modules)
         self.assertNotIn("mooncake._store_rs", sys.modules)
 
     def test_store_export_prefers_store_rs_python_module_over_stale_native_store(
