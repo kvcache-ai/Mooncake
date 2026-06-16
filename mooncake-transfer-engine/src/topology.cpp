@@ -32,6 +32,7 @@
 #include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "char_util.h"
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>

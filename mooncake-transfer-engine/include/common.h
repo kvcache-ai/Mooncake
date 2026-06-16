@@ -24,7 +24,6 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -56,13 +55,6 @@
 
 namespace mooncake {
 const static int LOCAL_SEGMENT_ID = 0;
-
-// Lowercase a single byte safely. Passing a (possibly signed) char straight
-// to std::tolower is UB when the byte is > 0x7F; the argument must be
-// representable as unsigned char or equal EOF.
-static inline char te_lower(char c) {
-    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-}
 
 enum class HandShakeRequestType {
     Connection = 0,

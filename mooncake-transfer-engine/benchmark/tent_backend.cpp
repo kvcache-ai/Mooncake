@@ -14,7 +14,7 @@
 
 #include "tent_backend.h"
 #include "utils.h"
-#include "common.h"
+#include "char_util.h"
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"

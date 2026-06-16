@@ -15,7 +15,7 @@
 #include "tent/runtime/memory_prober.h"
 #include "tent/device_plugin.h"
 #include "tent/common/utils/prefault.h"
-#include "common.h"
+#include "char_util.h"
 
 #include <filesystem>
 #include <dlfcn.h>

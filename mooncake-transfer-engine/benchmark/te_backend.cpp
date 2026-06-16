@@ -17,6 +17,7 @@
 #include "te_backend.h"
 #include "utils.h"
 #include "common.h"
+#include "char_util.h"
 
 #if defined(USE_CUDA)
 #include <bits/stdint-uintn.h>

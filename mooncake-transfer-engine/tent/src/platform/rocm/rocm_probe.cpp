@@ -15,7 +15,7 @@
 #include "tent/platform/rocm.h"
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
-#include "common.h"
+#include "char_util.h"
 
 #include <glog/logging.h>
 #include <fstream>
