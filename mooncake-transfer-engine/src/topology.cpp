@@ -14,14 +14,17 @@
 
 #include <glog/logging.h>
 
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
-#include <ctype.h>
+
+#include "pci_topology.h"
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -136,11 +139,7 @@ static bool isIbDeviceAvailable(struct ibv_device *device) {
     return has_active_port;
 }
 
-struct InfinibandDevice {
-    std::string name;
-    std::string pci_bus_id;
-    int numa_node;
-};
+// InfinibandDevice is defined in pci_topology.h
 
 static std::vector<InfinibandDevice> listInfiniBandDevices(
     const std::vector<std::string> &filter) {
@@ -188,9 +187,28 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
         std::ifstream(path) >> numa_node;
 
+        // Read PCIe link speed and width to compute bandwidth.
+        // Used to distinguish high-bandwidth backend NICs from
+        // lower-bandwidth front-end/management NICs.
+        double pci_bw_gbps = 0.0;
+        {
+            double speed_gts = 0.0;
+            int width = 0;
+            snprintf(path, sizeof(path), "%s/current_link_speed",
+                     resolved_path);
+            std::ifstream speed_file(path);
+            if (speed_file.is_open()) speed_file >> speed_gts;
+            snprintf(path, sizeof(path), "%s/current_link_width",
+                     resolved_path);
+            std::ifstream width_file(path);
+            if (width_file.is_open()) width_file >> width;
+            pci_bw_gbps = speed_gts * width;
+        }
+
         devices.push_back(InfinibandDevice{.name = std::move(device_name),
                                            .pci_bus_id = std::move(pci_bus_id),
-                                           .numa_node = numa_node});
+                                           .numa_node = numa_node,
+                                           .pci_bw_gbps = pci_bw_gbps});
     }
     ibv_free_device_list(device_list);
     return devices;
@@ -320,9 +338,18 @@ static std::vector<TopologyEntry> discoverCpuTopology(
         int node_id = atoi(entry->d_name + strlen(prefix));
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
-        // an HCA connected to the same cpu NUMA node is preferred
+        // An HCA connected to the same cpu NUMA node is preferred.
+        // Among same-NUMA HCAs, only keep those with the highest PCIe
+        // bandwidth to filter out lower-bandwidth management NICs.
+        double best_bw = 0.0;
         for (const auto &hca : all_hca) {
-            if (hca.numa_node == node_id) {
+            if (hca.numa_node == node_id && hca.pci_bw_gbps > best_bw) {
+                best_bw = hca.pci_bw_gbps;
+            }
+        }
+        for (const auto &hca : all_hca) {
+            if (hca.numa_node == node_id &&
+                (best_bw <= 0.0 || hca.pci_bw_gbps >= best_bw)) {
                 preferred_hca.push_back(hca.name);
             } else {
                 avail_hca.push_back(hca.name);
@@ -341,104 +368,95 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
 
-static int getPciDistance(const char *bus1, const char *bus2) {
-    char buf[PATH_MAX];
-    char path1[PATH_MAX];
-    char path2[PATH_MAX];
-    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus1);
-    if (realpath(buf, path1) == NULL) {
-        return -1;
-    }
-    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus2);
-    if (realpath(buf, path2) == NULL) {
-        return -1;
+// PciPathType, InfinibandDevice, kMaxPciDepth, normalizePciBusId,
+// classifyGpuNicPath, and selectPreferredHcas are defined in pci_topology.h.
+using mooncake::InfinibandDevice;
+using mooncake::normalizePciBusId;
+using mooncake::selectPreferredHcas;
+
+static std::string getPciParent(const std::string &normalized_pci_bus_id) {
+    std::string path = "/sys/bus/pci/devices/" + normalized_pci_bus_id + "/..";
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) == nullptr) {
+        return "";
     }
 
-    char *ptr1 = path1;
-    char *ptr2 = path2;
-    while (*ptr1 && *ptr1 == *ptr2) {
-        ptr1++;
-        ptr2++;
-    }
-    int distance = 0;
-    for (; *ptr1; ptr1++) {
-        distance += (*ptr1 == '/');
-    }
-    for (; *ptr2; ptr2++) {
-        distance += (*ptr2 == '/');
+    std::string full_path(resolved);
+    auto pos = full_path.rfind('/');
+    if (pos == std::string::npos) {
+        return "";
     }
 
-    return distance;
+    std::string parent = full_path.substr(pos + 1);
+    if (parent.find(':') != std::string::npos &&
+        std::isxdigit(static_cast<unsigned char>(parent[0]))) {
+        return parent;
+    }
+    // Include the PCI root bus (e.g. "pci0008:00") so that devices behind
+    // different root ports on the same root complex share a common ancestor.
+    if (parent.rfind("pci", 0) == 0 && parent.find(':') != std::string::npos) {
+        return parent;
+    }
+    return "";
 }
 
-static bool isSameNumaNode(const char *bus1, const char *bus2) {
-    char path[PATH_MAX];
-    int numa1 = -1;
-    int numa2 = -1;
-    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus1);
-    std::ifstream(path) >> numa1;
-    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus2);
-    std::ifstream(path) >> numa2;
-    return (numa1 != -1 && numa1 == numa2);
+static std::vector<std::string> buildPciAncestorChain(
+    const std::string &pci_bus_id) {
+    std::vector<std::string> chain;
+    std::string current = normalizePciBusId(pci_bus_id);
+    while (!current.empty() && chain.size() < kMaxPciDepth) {
+        chain.push_back(current);
+        current = getPciParent(current);
+    }
+    return chain;
+}
+
+static int getPciNumaNode(const std::string &pci_bus_id) {
+    std::string path =
+        "/sys/bus/pci/devices/" + normalizePciBusId(pci_bus_id) + "/numa_node";
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return -1;
+    }
+
+    int numa_node = -1;
+    file >> numa_node;
+    return numa_node;
 }
 
 static std::vector<TopologyEntry> discoverCudaTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     std::vector<TopologyEntry> topology;
-    int device_count;
+    int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
         device_count = 0;
     }
+
+    // sysfs lookups are expensive; build each HCA's ancestor chain once.
+    std::vector<std::vector<std::string>> nic_ancestor_chains;
+    nic_ancestor_chains.reserve(all_hca.size());
+    for (const auto &hca : all_hca) {
+        nic_ancestor_chains.push_back(buildPciAncestorChain(hca.pci_bus_id));
+    }
+
     for (int i = 0; i < device_count; i++) {
         char pci_bus_id[20];
         if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) !=
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
 
-        std::vector<std::string> preferred_hca;
-        std::vector<std::string> avail_hca;
+        std::string gpu_pci_bus_id = normalizePciBusId(pci_bus_id);
+        int gpu_numa_node = getPciNumaNode(gpu_pci_bus_id);
+        auto gpu_ancestor_chain = buildPciAncestorChain(gpu_pci_bus_id);
 
-        // Find HCAs with minimum distance in one pass.
-        int min_distance = INT_MAX;
-        std::vector<std::string> min_distance_hcas;
+        auto partition = selectPreferredHcas(gpu_ancestor_chain, gpu_numa_node,
+                                             all_hca, nic_ancestor_chains);
 
-        std::vector<InfinibandDevice> same_numa_hca;
-        for (const auto &hca : all_hca) {
-            if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
-                same_numa_hca.push_back(hca);
-            }
-        }
-        const auto &candidate_preferred_hca =
-            same_numa_hca.empty() ? all_hca : same_numa_hca;
-
-        for (const auto &hca : candidate_preferred_hca) {
-            int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
-            if (distance >= 0) {
-                if (distance < min_distance) {
-                    min_distance = distance;
-                    min_distance_hcas.clear();
-                    min_distance_hcas.push_back(hca.name);
-                } else if (distance == min_distance) {
-                    min_distance_hcas.push_back(hca.name);
-                }
-            }
-        }
-
-        // Add HCAs with minimum distance to preferred_hca, others to avail_hca
-        for (const auto &hca : all_hca) {
-            if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(),
-                          hca.name) != min_distance_hcas.end()) {
-                preferred_hca.push_back(hca.name);
-            } else {
-                avail_hca.push_back(hca.name);
-            }
-        }
         topology.push_back(
             TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
-                          .preferred_hca = std::move(preferred_hca),
-                          .avail_hca = std::move(avail_hca)});
+                          .preferred_hca = std::move(partition.preferred_hca),
+                          .avail_hca = std::move(partition.avail_hca)});
     }
     return topology;
 }
