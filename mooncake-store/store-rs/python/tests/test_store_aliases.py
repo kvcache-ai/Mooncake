@@ -84,16 +84,46 @@ class StoreAliasTests(unittest.TestCase):
     def test_store_import_tolerates_native_without_buffer_pool(self) -> None:
         self.assertIsNone(STORE_MODULE.BufferPool)
 
-    def test_package_prefers_store_rs_python_module_over_stale_native_store(
+    def test_package_import_does_not_eagerly_load_store_rs_native(
         self,
     ) -> None:
-        _, store_module = _load_package_with_stale_native_store()
+        for name in list(sys.modules):
+            if name == "mooncake" or name.startswith("mooncake."):
+                del sys.modules[name]
+
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        package_dir = repo_root / "python" / "mooncake"
+        fake_build_info = types.ModuleType("mooncake._build_info")
+        fake_build_info.BUILD_INFO = {
+            "branch": "test",
+            "commit": "test",
+            "build_time": "test",
+        }
+        sys.modules["mooncake._build_info"] = fake_build_info
+
+        spec = importlib.util.spec_from_file_location(
+            "mooncake",
+            package_dir / "__init__.py",
+            submodule_search_locations=[str(package_dir)],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to create mooncake package spec")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["mooncake"] = module
+        spec.loader.exec_module(module)
+
+        self.assertNotIn("mooncake.store", sys.modules)
+        self.assertNotIn("mooncake._store_rs", sys.modules)
+
+    def test_store_export_prefers_store_rs_python_module_over_stale_native_store(
+        self,
+    ) -> None:
+        package_module, _ = _load_package_with_stale_native_store()
+        store_type = package_module.MooncakeDistributedStore
+        store_module = sys.modules["mooncake.store"]
 
         self.assertEqual(pathlib.Path(store_module.__file__).name, "store.py")
-        self.assertEqual(
-            store_module.MooncakeDistributedStore.__name__,
-            "MooncakeDistributedStore",
-        )
+        self.assertIs(store_type, store_module.MooncakeDistributedStore)
 
     def test_put_batch_delegates_to_batch_put(self) -> None:
         store = object.__new__(MooncakeDistributedStore)
