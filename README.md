@@ -278,6 +278,27 @@ sudo make install # optional, make it ready to be used by vLLM/SGLang
 
 For custom accelerator backends, Docker deployment, NVMe-oF, EFA, CXL, Redis / HTTP metadata, Rust bindings, or other advanced build options, see the [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
+### Skills for AI coding assistants
+
+Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command:
+
+| Skill | Description |
+|-------|-------------|
+| `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
+| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
+| `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
+
+Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
+
+```text
+/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
+/plugin install mooncake-troubleshoot@mooncake
+/plugin install mooncake-ci-local@mooncake
+/plugin install mooncake-api@mooncake
+```
+
+The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.
+
 <h2 id="trace">📦 Open Source Trace</h2>
 
 ```json
