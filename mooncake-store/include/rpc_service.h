@@ -1,5 +1,7 @@
 #pragma once
 
+#include <csignal>
+
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>

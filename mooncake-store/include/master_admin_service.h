@@ -1,5 +1,7 @@
 #pragma once
 
+#include <csignal>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
