@@ -844,6 +844,16 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 		return -1
 	}
 	doneCh := make(chan struct{})
+	// createdCh reports whether the server-side watch was successfully
+	// established. The goroutine sends exactly one value: true once etcd
+	// confirms the watch (clientv3.WithCreatedNotify), or false if the
+	// goroutine exits before that confirmation. The wrapper blocks on it before
+	// returning, so callers can rely on "watch is live server-side" the moment
+	// WatchWithPrefixFromRevision returns OK. This closes the race where the
+	// goroutine had not yet issued storeClient.Watch() when the caller
+	// proceeded to read the current view. Buffered (size 1) so the goroutine
+	// never blocks on the send even if the wrapper has already timed out.
+	createdCh := make(chan bool, 1)
 	storePrefixWatchCtx[p] = prefixWatchInfo{
 		cancel:          cancel,
 		callbackContext: callbackContext,
@@ -851,16 +861,30 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 	}
 	storePrefixWatchMutex.Unlock()
 
-	go func(doneCh chan struct{}) {
+	go func(doneCh chan struct{}, createdCh chan bool) {
+		// createdSignalled guards against sending on createdCh more than once.
+		createdSignalled := false
+		signalCreated := func(ok bool) {
+			if !createdSignalled {
+				createdSignalled = true
+				createdCh <- ok
+			}
+		}
 		defer func() {
-			// Remove watch entry and signal completion
+			// Report failure if the watch was never confirmed (e.g. the
+			// goroutine exits before any response), then remove the watch
+			// entry and signal completion. Ordering matters: the failure
+			// signal is sent before `done` is closed.
+			signalCreated(false)
 			storePrefixWatchMutex.Lock()
 			delete(storePrefixWatchCtx, p)
 			storePrefixWatchMutex.Unlock()
 			close(doneCh)
 		}()
 
-		opts := []clientv3.OpOption{clientv3.WithPrefix()}
+		// WithCreatedNotify makes etcd send an initial response with
+		// Created == true as soon as the watch is registered server-side.
+		opts := []clientv3.OpOption{clientv3.WithPrefix(), clientv3.WithCreatedNotify()}
 		if startRevision > 0 {
 			opts = append(opts, clientv3.WithRev(int64(startRevision)))
 		}
@@ -879,6 +903,11 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 						C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
 						return
 					}
+				}
+				// The first response with Created == true confirms the
+				// server-side watch is established; release the waiter.
+				if watchResp.Created {
+					signalCreated(true)
 				}
 				if watchResp.Err() != nil {
 					// Watch error. Check if context was cancelled.
@@ -945,9 +974,35 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 				return
 			}
 		}
-	}(doneCh)
+	}(doneCh, createdCh)
 
-	return 0
+	// Block until the server confirms the watch is established. Returning OK
+	// then guarantees the watch is live server-side, so a caller that arms the
+	// watch before reading state will not miss an event in between.
+	const watchCreatedTimeout = 5 * time.Second
+	select {
+	case created := <-createdCh:
+		if !created {
+			// The goroutine exited before the watch was confirmed (e.g. the
+			// Watch RPC failed). It has already torn itself down; wait for it
+			// to finish so the prefix entry is gone and no callback is in
+			// flight, then report failure.
+			cancel()
+			<-doneCh
+			*errMsg = C.CString("etcd watch goroutine exited before the watch was established")
+			return -1
+		}
+		return 0
+	case <-time.After(watchCreatedTimeout):
+		// The watch was not established within the timeout. Tear down the
+		// goroutine and report failure so the caller can fall back. Wait for
+		// the goroutine to fully exit so the prefix entry is removed and no
+		// callback can be in flight when we return.
+		cancel()
+		<-doneCh
+		*errMsg = C.CString("timeout waiting for etcd watch to be created")
+		return -1
+	}
 }
 
 func cancelAndDeletePrefixWatch(p string) int {

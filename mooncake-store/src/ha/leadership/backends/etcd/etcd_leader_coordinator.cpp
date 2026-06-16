@@ -61,20 +61,43 @@ void ViewChangeWatchCallback(void* context, const char* /*key*/,
 }
 
 // RAII guard that tears the prefix watch down (and waits for the goroutine to
-// exit, so no further callbacks can run) before the associated
-// ViewChangeWatchState is destroyed. Declared after the state so it is
-// destroyed first.
+// exit, so no further callbacks can run) before the heap-allocated
+// ViewChangeWatchState it owns is released.
+//
+// The watch state is HEAP-allocated (not stack-scoped) on purpose. The Go watch
+// goroutine holds a raw pointer to it and may still invoke the callback until
+// it has fully stopped. CancelWatchWithPrefix + WaitWatchWithPrefixStopped are
+// used to drain it, but WaitWatchWithPrefixStopped can time out. If it does, a
+// callback may still fire later, so freeing the state would be a
+// use-after-free. Mirroring the oplog notifier's policy, the guard therefore
+// only deletes the state when the stop wait SUCCEEDS; on timeout/failure it
+// intentionally LEAKS the state (and logs a warning) to avoid UAF.
 class PrefixWatchGuard {
    public:
-    explicit PrefixWatchGuard(std::string prefix)
-        : prefix_(std::move(prefix)) {}
+    PrefixWatchGuard(std::string prefix, ViewChangeWatchState* state)
+        : prefix_(std::move(prefix)), state_(state) {}
     ~PrefixWatchGuard() {
         if (!active_) {
+            // Watch was never armed: no goroutine ever received the pointer, so
+            // it is safe to free the state unconditionally.
+            delete state_;
             return;
         }
         EtcdHelper::CancelWatchWithPrefix(prefix_.c_str(), prefix_.size());
-        EtcdHelper::WaitWatchWithPrefixStopped(prefix_.c_str(), prefix_.size(),
-                                               kWatchStopTimeoutMs);
+        ErrorCode wait_err = EtcdHelper::WaitWatchWithPrefixStopped(
+            prefix_.c_str(), prefix_.size(), kWatchStopTimeoutMs);
+        if (wait_err == ErrorCode::OK) {
+            // Goroutine has fully exited; no callback can be in flight.
+            delete state_;
+        } else {
+            // The watch goroutine did not stop in time. It may still invoke the
+            // callback with `state_`, so we intentionally leak the state to
+            // avoid a use-after-free.
+            LOG(WARNING) << "Prefix watch goroutine did not stop in time for "
+                            "prefix "
+                         << prefix_
+                         << "; leaking ViewChangeWatchState to avoid UAF";
+        }
     }
 
     PrefixWatchGuard(const PrefixWatchGuard&) = delete;
@@ -84,6 +107,7 @@ class PrefixWatchGuard {
 
    private:
     std::string prefix_;
+    ViewChangeWatchState* state_ = nullptr;
     bool active_ = false;
 };
 
@@ -311,6 +335,15 @@ EtcdLeaderCoordinator::WaitForViewChange(
         return tl::make_unexpected(err);
     }
 
+    // LIMITATION: prefix watches are keyed globally by prefix in the etcd Go
+    // wrapper (storePrefixWatchCtx is a map<prefix, ...>). Because every waiter
+    // here watches the same `master_view_key_` prefix, only a SINGLE waiter per
+    // process per prefix is supported: a second concurrent WaitForViewChange on
+    // the same prefix would collide on that registration. The intended
+    // deployment model is one waiter per process/prefix, which holds for the
+    // store client. Revisit (e.g. per-waiter watch IDs) if multiple
+    // same-process clients ever need to watch the same master_view
+    // concurrently.
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (true) {
         if (timeout <= std::chrono::milliseconds::zero() ||
@@ -335,11 +368,13 @@ EtcdLeaderCoordinator::WaitForViewChange(
         // starts from the current revision (start_revision = 0), which also
         // avoids depending on a possibly-compacted historical revision.
         //
-        // `state` must outlive `guard`: the guard cancels the watch and waits
-        // for the goroutine to exit (no more callbacks) in its destructor,
-        // before `state` is destroyed. Declaration order guarantees this.
-        ViewChangeWatchState state;
-        PrefixWatchGuard guard(master_view_key_);
+        // The watch state is heap-allocated and owned by `guard`. The guard
+        // cancels the watch and waits for the goroutine to exit before
+        // releasing the state in its destructor; if the goroutine fails to stop
+        // in time it leaks the state instead of freeing it, so an in-flight
+        // callback can never reference freed memory (see PrefixWatchGuard).
+        auto* state = new ViewChangeWatchState();
+        PrefixWatchGuard guard(master_view_key_, state);
 
         bool watching = false;
         if (remaining > kViewChangeFallbackPollInterval) {
@@ -352,7 +387,7 @@ EtcdLeaderCoordinator::WaitForViewChange(
                                                    kWatchStopTimeoutMs);
             auto watch_err = EtcdHelper::WatchWithPrefixFromRevision(
                 master_view_key_.c_str(), master_view_key_.size(),
-                /*start_revision=*/0, &state, &ViewChangeWatchCallback);
+                /*start_revision=*/0, state, &ViewChangeWatchCallback);
             if (watch_err == ErrorCode::OK) {
                 watching = true;
                 guard.Arm();
@@ -383,9 +418,9 @@ EtcdLeaderCoordinator::WaitForViewChange(
         // elapses. Either way we loop and re-read: an event tells us the view
         // changed (re-read returns it), a timeout falls through to the deadline
         // check above and returns timed_out.
-        std::unique_lock<std::mutex> lock(state.mutex);
-        state.cv.wait_for(lock, remaining,
-                          [&state]() { return state.changed; });
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait_for(lock, remaining,
+                           [state]() { return state->changed; });
     }
 }
 
