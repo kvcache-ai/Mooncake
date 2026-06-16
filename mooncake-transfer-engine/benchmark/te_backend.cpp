@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <fstream>
+#include <cctype>
 
 #include "te_backend.h"
 #include "utils.h"
@@ -50,7 +51,10 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id;
+         (*ch =
+              static_cast<char>(std::tolower(static_cast<unsigned char>(*ch))));
+         ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #elif defined(USE_SUNRISE)
@@ -63,7 +67,10 @@ static inline int getSunriseDeviceNumaID(int dev_id) {
                      << tangGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id;
+         (*ch =
+              static_cast<char>(std::tolower(static_cast<unsigned char>(*ch))));
+         ch++);
     std::string sysfs_path =
         "/sys/bus/pci/devices/" + std::string(pci_bus_id) + "/numa_node";
     std::ifstream numa_file(sysfs_path);
