@@ -36,6 +36,7 @@ endfunction()
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
+add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
@@ -146,10 +147,11 @@ target_link_libraries(
          gtest_main
          pthread)
 if(STORE_USE_K8S_LEASE)
-  target_link_libraries(high_availability_test
-                        PRIVATE ${K8S_LEASE_WRAPPER_LIB})
+  target_link_libraries(high_availability_test PRIVATE ${K8S_LEASE_WRAPPER_LIB})
 endif()
-if(STORE_USE_ETCD OR STORE_USE_REDIS OR STORE_USE_K8S_LEASE)
+if(STORE_USE_ETCD
+   OR STORE_USE_REDIS
+   OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 add_ha_test(ha_backend_availability_test
