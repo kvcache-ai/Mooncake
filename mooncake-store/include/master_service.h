@@ -1844,6 +1844,7 @@ class MasterService {
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
+    const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;

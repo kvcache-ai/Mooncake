@@ -153,8 +153,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(
-          CreateAllocationStrategy(config.allocation_strategy_type)),
+      allocation_strategy_type_(config.enable_cxl
+                                    ? AllocationStrategyType::CXL
+                                    : config.allocation_strategy_type),
+      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -1426,13 +1428,18 @@ auto MasterService::AllocateAndInsertMetadata(
             preferred_segments = config.preferred_segments;
         }
 
-        ScopedLocalDiskSegmentAccess ssd_access =
-            segment_manager_.getLocalDiskSegmentAccess();
+        const SsdMetricsProvider* ssd_provider = nullptr;
+        std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
+        if (allocation_strategy_type_ ==
+            AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
+            ssd_access.emplace(segment_manager_.getLocalDiskSegmentAccess());
+            ssd_provider = &*ssd_access;
+        }
 
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
-            &ssd_access);
+            ssd_provider);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
@@ -3376,6 +3383,17 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    std::shared_ptr<LocalDiskSegment> local_disk_segment;
+    {
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_segments = ssd_access.getClientLocalDiskSegment();
+        auto disk_it = client_segments.find(client_id);
+        if (disk_it != client_segments.end()) {
+            local_disk_segment = disk_it->second;
+        }
+    }
+
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -3405,30 +3423,19 @@ auto MasterService::NotifyOffloadSuccess(
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, object_id.user_key,
                               object_id.tenant_id, replica);
-        if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
+        if (!res) {
+            if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                continue;
+            }
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id
                        << ", tenant_id=" << object_id.tenant_id
                        << ", key=" << object_id.user_key;
             return tl::make_unexpected(res.error());
         }
-    }
-
-    // Track SSD usage for the client
-    {
-        int64_t total_ssd_increment = 0;
-        for (size_t i = 0; i < tasks.size(); ++i) {
-            total_ssd_increment += metadatas[i].data_size;
-        }
-        if (total_ssd_increment > 0) {
-            ScopedLocalDiskSegmentAccess ssd_access =
-                segment_manager_.getLocalDiskSegmentAccess();
-            auto& client_segments = ssd_access.getClientLocalDiskSegment();
-            auto disk_it = client_segments.find(client_id);
-            if (disk_it != client_segments.end()) {
-                disk_it->second->ssd_used_bytes.fetch_add(
-                    total_ssd_increment, std::memory_order_relaxed);
-            }
+        if (local_disk_segment && metadata.data_size > 0) {
+            local_disk_segment->ssd_used_bytes.fetch_add(
+                metadata.data_size, std::memory_order_relaxed);
         }
     }
 
