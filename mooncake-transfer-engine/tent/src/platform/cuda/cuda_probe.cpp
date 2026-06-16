@@ -16,6 +16,7 @@
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
+#include "common.h"
 
 #include <glog/logging.h>
 #include <fstream>
@@ -26,7 +27,6 @@
 #include <utility>
 #include <vector>
 #include <cuda_runtime.h>
-#include <cctype>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -191,9 +191,7 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
                          << cudaGetErrorString(err);
             continue;
         }
-        for (char* ch = pci_bus_id; (*ch = static_cast<char>(std::tolower(
-                                         static_cast<unsigned char>(*ch))));
-             ch++);
+        for (char* ch = pci_bus_id; (*ch = te_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;

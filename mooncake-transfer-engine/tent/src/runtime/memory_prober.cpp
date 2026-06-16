@@ -15,9 +15,9 @@
 #include "tent/runtime/memory_prober.h"
 #include "tent/device_plugin.h"
 #include "tent/common/utils/prefault.h"
+#include "common.h"
 
 #include <filesystem>
-#include <cctype>
 #include <dlfcn.h>
 #include <cstdlib>
 #include <iostream>
@@ -375,9 +375,7 @@ void MemoryProber::probeDeviceMemory(
                                                      sizeof(pci_bus_id));
         if (err) continue;
 
-        for (char* ch = pci_bus_id; (*ch = static_cast<char>(std::tolower(
-                                         static_cast<unsigned char>(*ch))));
-             ch++);
+        for (char* ch = pci_bus_id; (*ch = te_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;

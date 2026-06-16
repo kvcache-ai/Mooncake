@@ -21,7 +21,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <cctype>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -395,9 +394,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = static_cast<char>(std::tolower(
-                                         static_cast<unsigned char>(*ch))));
-             ch++);
+        for (char *ch = pci_bus_id; (*ch = te_lower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
