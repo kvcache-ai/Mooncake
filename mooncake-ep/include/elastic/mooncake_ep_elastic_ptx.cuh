@@ -39,7 +39,8 @@ __forceinline__ __device__ int get_lane_idx() {
 
 /// Election
 __forceinline__ __device__ int elect_one_sync() {
-#ifndef DISABLE_SM90_FEATURES
+#if !defined(DISABLE_SM90_FEATURES) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     int pred = 0;
     asm volatile(
         "{\n"
@@ -59,31 +60,40 @@ __forceinline__ __device__ int elect_one_sync() {
 /// TMA and `cp.async`
 __forceinline__ __device__ void mbarrier_init_with_fence(
     mbarrier* ptr, const int& arrive_count = 1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::"r"(arrive_count),
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
     asm volatile("fence.mbarrier_init.release.cluster;" ::);
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_invalidate(mbarrier* ptr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(
         static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_arrive(mbarrier* ptr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0]; \n\t" ::"r"(
         static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_arrive_and_set_tx(
     mbarrier* ptr, const int& num_bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile(
         "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" ::"r"(
             num_bytes),
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_wait_and_flip_phase(
     mbarrier* ptr, arrival_phase& phase) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile(
         "{\n\t"
         ".reg .pred       P1; \n\t"
@@ -94,17 +104,22 @@ __forceinline__ __device__ void mbarrier_wait_and_flip_phase(
         "DONE: \n\t"
         "}" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
         "r"(phase), "r"(0x989680));
+#endif
     phase ^= 1;
 }
 
 __forceinline__ __device__ void tma_store_fence() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("fence.proxy.async.shared::cta;");
+#endif
 }
 
 template <int kNumRemainingWaits = 0>
 __forceinline__ __device__ void tma_store_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits)
                  : "memory");
+#endif
 }
 
 enum TMACacheHint : int64_t {
@@ -116,6 +131,7 @@ __forceinline__ __device__ void tma_load_1d(
     const void* dst_ptr, const void* src_ptr, mbarrier* ptr,
     const int& num_bytes,
     const TMACacheHint& hint = TMACacheHint::kEvictFirst) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     // NOTES: normally, the loaded part will be evicted soon
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::"
@@ -124,11 +140,17 @@ __forceinline__ __device__ void tma_load_1d(
         "l"(src_ptr), "r"(num_bytes),
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))), "l"(hint)
         : "memory");
+#else
+    auto* dst = static_cast<char*>(const_cast<void*>(dst_ptr));
+    const auto* src = static_cast<const char*>(src_ptr);
+    for (int i = 0; i < num_bytes; ++i) dst[i] = src[i];
+#endif
 }
 
 __forceinline__ __device__ void tma_store_1d(
     const void* dst_ptr, const void* src_ptr, const int& num_bytes,
     const TMACacheHint& hint = TMACacheHint::kEvictNormal) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     // NOTES: normally, the stored part will be used soon
     asm volatile(
         "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], "
@@ -136,10 +158,17 @@ __forceinline__ __device__ void tma_store_1d(
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(src_ptr))),
         "r"(num_bytes), "l"(hint)
         : "memory");
+#else
+    auto* dst = static_cast<char*>(const_cast<void*>(dst_ptr));
+    const auto* src = static_cast<const char*>(src_ptr);
+    for (int i = 0; i < num_bytes; ++i) dst[i] = src[i];
+#endif
 }
 
 __forceinline__ __device__ void tma_store_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("cp.async.bulk.commit_group;");
+#endif
 }
 
 template <class dtype_t>

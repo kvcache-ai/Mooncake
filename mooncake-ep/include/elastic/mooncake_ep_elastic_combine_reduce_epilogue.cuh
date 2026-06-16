@@ -74,7 +74,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
     // Will block until the main combine kernel has finished and all data are
     // visible NOTES: PDL is used, please do not use `__ldg`
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     cudaGridDependencySynchronize();
+#endif
 
     // Read from buffers and do reduction
     for (int token_idx = global_warp_idx; token_idx < num_combined_tokens;

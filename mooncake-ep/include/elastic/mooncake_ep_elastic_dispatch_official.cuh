@@ -500,7 +500,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                    thread_idx);
 
     // Trigger the copy epilogue kernel
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     cudaTriggerProgrammaticLaunchCompletion();
+#endif
 
     // Clean atomic counters
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");

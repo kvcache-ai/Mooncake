@@ -61,7 +61,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_copy_epilogue_impl(
 
     // Will block until the main dispatch kernel has finished and all data are
     // visible NOTES: PDL is used, please do not use `__ldg`
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     cudaGridDependencySynchronize();
+#endif
 
     // For no CPU sync case, the number of received tokens should be read from
     // the GPU tensor
