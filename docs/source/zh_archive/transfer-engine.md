@@ -423,5 +423,6 @@ int init(const std::string &metadata_conn_string,
 - `MC_MIN_RPC_PORT` 指定 RPC 服务使用的最小端口号。默认值为 15000。
 - `MC_MAX_RPC_PORT` 指定 RPC 服务使用的最大端口号。默认值为 17000。
 - `MC_PATH_ROUNDROBIN` 指定 RDMA 路径选择使用 Round Robin 模式，这对于传输大块数据可能有利。
+- `MC_TE_FILTERS` 可选，逗号分隔的 IB 设备名白名单（如 `mlx5_0,mlx5_2`），用于 Legacy Transfer Engine 拓扑自动发现时限制可见 RDMA 网卡；未设置时不限制。
 - `WITH_NVIDIA_PEERMEM` 设置为 `1`、`ON` 或 `TRUE` 时，Mooncake 使用 `ibv_reg_mr()` 直接注册 GPU 内存（需要 `nvidia-peermem` 内核模块）。默认情况下（未设置或为 `0`），Mooncake 使用不需要 `nvidia-peermem` 的 DMA-BUF 路径。
 - `MC_ENDPOINT_STORE_TYPE` 选择 FIFO Endpoint Store (`FIFO`) 或者 Sieve Endpoint Store (`SIEVE`)，模式是 `SIEVE`。
