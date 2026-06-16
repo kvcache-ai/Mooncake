@@ -3,8 +3,6 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as package_version
 
 from ._build_info import BUILD_INFO
 
@@ -20,13 +18,8 @@ _STORE_EXPORTS = {
     "stop_metrics_server",
 }
 
-_DISTRIBUTION_NAME = "mooncake"
 __edition__ = "pro"
-
-try:
-    __version__ = package_version(_DISTRIBUTION_NAME)
-except PackageNotFoundError:
-    __version__ = "1.0.0+pro.1"
+__version__ = "1.0.0+pro.1"
 
 __build_branch__ = BUILD_INFO["branch"]
 __build_commit__ = BUILD_INFO["commit"]
