@@ -21,6 +21,7 @@
 #include <queue>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -48,6 +49,9 @@ struct NVLinkSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
+    // Completion events created in startTransfer (one per submit). Owned here
+    // and destroyed in freeSubBatch so they are not leaked.
+    std::vector<cudaEvent_t> completion_events;
     virtual size_t size() const { return task_list.size(); }
 };
 

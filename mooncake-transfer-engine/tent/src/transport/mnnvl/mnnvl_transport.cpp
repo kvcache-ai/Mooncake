@@ -154,7 +154,11 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
-    // CHECK_CUDA(cudaStreamDestroy(mnnvl_batch->stream));
+    // Destroy completion events created in startTransfer (each pushed exactly
+    // once, so no double-destroy). Streams are pool-managed and not destroyed.
+    for (auto event : mnnvl_batch->completion_events) {
+        cudaEventDestroy(event);
+    }
     Slab<MnnvlSubBatch>::Get().deallocate(mnnvl_batch);
     batch = nullptr;
     return Status::OK();
@@ -260,8 +264,15 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
     }
 
     cudaEvent_t event;
-    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    auto event_err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    if (event_err != cudaSuccess) {
+        LOG(ERROR) << "MnnvlTransport: cudaEventCreateWithFlags failed: "
+                   << cudaGetErrorString(event_err);
+        for (auto *task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
     cudaEventRecord(event, batch->async_stream.get());
+    batch->completion_events.push_back(event);
     for (auto *task : tasks) task->completion_event = event;
 }
 
