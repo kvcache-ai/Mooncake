@@ -1,11 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -23,13 +23,13 @@ class DeadlineScheduler {
 
     ~DeadlineScheduler() { Stop(); }
 
-    void Schedule(const Id& id, Clock::time_point deadline) {
+    void Schedule(Id id, Clock::time_point deadline) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_) {
                 return;
             }
-            queue_.push(Record{id, deadline});
+            PushRecord(Record{std::move(id), deadline});
             if (!timer_running_.load()) {
                 timer_running_.store(true);
                 timer_thread_ = std::thread([this]() { this->TimerLoop(); });
@@ -41,17 +41,13 @@ class DeadlineScheduler {
     template <typename Predicate>
     void RemoveIf(Predicate predicate) {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<Record> remaining;
-        remaining.reserve(queue_.size());
-        while (!queue_.empty()) {
-            auto rec = queue_.top();
-            queue_.pop();
-            if (!predicate(rec.id)) {
-                remaining.push_back(rec);
-            }
-        }
-        for (auto& rec : remaining) {
-            queue_.push(rec);
+        auto erase_begin = std::remove_if(
+            records_.begin(), records_.end(),
+            [&](const Record& rec) { return predicate(rec.id); });
+        if (erase_begin != records_.end()) {
+            records_.erase(erase_begin, records_.end());
+            std::make_heap(records_.begin(), records_.end(),
+                           std::greater<Record>{});
         }
         timer_cv_.notify_one();
     }
@@ -74,29 +70,28 @@ class DeadlineScheduler {
             std::vector<Record> expired;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                if (queue_.empty()) {
+                if (records_.empty()) {
                     timer_cv_.wait(lock, [this]() {
-                        return !timer_running_.load() || !queue_.empty();
+                        return !timer_running_.load() || !records_.empty();
                     });
                     if (!timer_running_.load()) break;
                     continue;
                 }
 
                 auto now = Clock::now();
-                auto next_deadline = queue_.top().deadline;
+                auto next_deadline = NextRecord().deadline;
                 if (next_deadline > now) {
                     timer_cv_.wait_until(
                         lock, next_deadline, [this, next_deadline]() {
-                            return !timer_running_.load() || queue_.empty() ||
-                                   queue_.top().deadline < next_deadline;
+                            return !timer_running_.load() || records_.empty() ||
+                                   NextRecord().deadline < next_deadline;
                         });
                     if (!timer_running_.load()) break;
                     continue;
                 }
 
-                while (!queue_.empty() && queue_.top().deadline <= now) {
-                    expired.push_back(queue_.top());
-                    queue_.pop();
+                while (!records_.empty() && NextRecord().deadline <= now) {
+                    expired.push_back(PopNextRecord());
                 }
             }
 
@@ -118,10 +113,24 @@ class DeadlineScheduler {
         }
     };
 
+    void PushRecord(Record record) {
+        records_.push_back(std::move(record));
+        std::push_heap(records_.begin(), records_.end(),
+                       std::greater<Record>{});
+    }
+
+    Record PopNextRecord() {
+        std::pop_heap(records_.begin(), records_.end(), std::greater<Record>{});
+        auto record = std::move(records_.back());
+        records_.pop_back();
+        return record;
+    }
+
+    const Record& NextRecord() const { return records_.front(); }
+
     Callback callback_;
     std::mutex mutex_;
-    std::priority_queue<Record, std::vector<Record>, std::greater<Record>>
-        queue_;
+    std::vector<Record> records_;
     std::thread timer_thread_;
     std::atomic<bool> timer_running_{false};
     bool stopping_{false};
