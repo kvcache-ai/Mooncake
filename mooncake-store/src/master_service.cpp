@@ -5363,7 +5363,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // evicted count reaches evict_num (treat evict_num as a minimum).
         long evicted_this_pass = 0;
         size_t candidate_idx = 0;
-        while (evicted_this_pass < evict_num && candidate_idx < candidates.size()) {
+        while (evicted_this_pass < evict_num &&
+               candidate_idx < candidates.size()) {
             auto& c = candidates[candidate_idx];
             candidate_idx++;
             if (c.lease_timeout > target_timeout) {
@@ -5392,7 +5393,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             evicted_count += evict_result.evicted_objects;
             evicted_this_pass += evict_result.evicted_objects;
         }
-        // Any remaining candidates beyond what we processed go to no_pin_objects
+        // Any remaining candidates beyond what we processed go to
+        // no_pin_objects
         for (; candidate_idx < candidates.size(); candidate_idx++) {
             no_pin_objects.push_back(candidates[candidate_idx].lease_timeout);
         }
