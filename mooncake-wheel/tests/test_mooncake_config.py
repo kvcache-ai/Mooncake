@@ -70,6 +70,34 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.enable_ssd_offload, False)
         self.assertEqual(config.ssd_offload_path, "")
 
+    def test_enable_ssd_offload_string_values(self):
+        """String booleans in the JSON must be parsed, matching load_from_env.
+
+        Config files and generators sometimes emit booleans as strings. from_file
+        used bool(value), so any non-empty string (including "false") turned SSD
+        offload on, disagreeing with load_from_env which parses the string.
+        """
+        cases = [
+            ("false", False),
+            ("False", False),
+            ("0", False),
+            ("true", True),
+            ("1", True),
+            (True, True),
+            (False, False),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                config_data = {
+                    "local_hostname": "localhost",
+                    "metadata_server": "localhost:8080",
+                    "master_server_address": "localhost:8081",
+                    "enable_ssd_offload": raw,
+                }
+                self.write_config(config_data)
+                config = MooncakeConfig.from_file(self.config_file)
+                self.assertEqual(config.enable_ssd_offload, expected)
+
     def test_missing_required_field(self):
         """Test missing required field"""
         for field in ["local_hostname", "metadata_server", "master_server_address"]:
