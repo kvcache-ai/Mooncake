@@ -1,5 +1,5 @@
-#include <mooncake_ep_elastic_buffer.h>
-#include <mooncake_ep_elastic_launch.cuh>
+#include <elastic/mooncake_ep_elastic_buffer.h>
+#include <elastic/mooncake_ep_elastic_launch.cuh>
 
 #include <algorithm>
 #include <cstdlib>
@@ -134,6 +134,11 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
     config_.num_gpu_timeout_secs = num_gpu_timeout_secs;
 
     topology_ = discover_topology(rank, num_ranks, allow_hybrid_mode);
+    if (!allow_multiple_reduction) {
+        throw std::runtime_error(
+            "Mooncake ElasticBuffer currently supports only "
+            "allow_multiple_reduction=true");
+    }
     if (num_buffer_bytes == 0) {
         num_buffer_bytes = calculate_buffer_size(
             num_ranks, num_max_tokens_per_rank, hidden, num_topk,
@@ -283,7 +288,6 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
                   static_cast<int64_t>(config_.num_gpu_timeout_secs) * 1000;
     auto launch_ctx = make_launch_context(*native_buffer_, topology_,
                                           mapped_host_workspace_, timeout_cycles);
-    std::memset(host_workspace_, 0, host_workspace_bytes_);
 
     auto psum_num_recv_tokens_per_scaleup_rank = cached_mode
         ? cached_handle->psum_num_recv_tokens_per_scaleup_rank
@@ -353,13 +357,17 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         num_smem_bytes, cached_mode, config_.deterministic,
         false, launch_ctx, launch_stream.stream());
 
-    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    const int num_recv_output_capacity = do_expand
+        ? num_recv_tokens * num_topk
+        : num_recv_tokens;
+    auto recv_x = torch::empty({num_recv_output_capacity, hidden}, x.options());
     auto recv_x_scales = std::optional<torch::Tensor>();
     void* recv_x_scales_ptr = nullptr;
     int recv_sf_token_stride = 0;
     int recv_sf_hidden_stride = 0;
     if (use_sf) {
-        recv_x_scales = torch::empty({num_recv_tokens, num_sf_packs}, sf->options());
+        recv_x_scales = torch::empty({num_recv_output_capacity, num_sf_packs},
+                                     sf->options());
         recv_x_scales_ptr = recv_x_scales->data_ptr();
         recv_sf_token_stride = static_cast<int>(recv_x_scales->stride(0));
         recv_sf_hidden_stride = static_cast<int>(recv_x_scales->stride(1));
@@ -369,15 +377,20 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     auto recv_topk_weights = std::optional<torch::Tensor>();
     float* recv_topk_weights_ptr = nullptr;
     if (topk_weights.has_value()) {
-        recv_topk_weights = torch::empty({num_recv_tokens, num_topk},
-                                         topk_weights->options());
+        recv_topk_weights = do_expand
+            ? torch::empty({num_recv_output_capacity}, topk_weights->options())
+            : torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
     auto recv_src_metadata = torch::empty(
         {num_recv_tokens, num_topk + 2},
         torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
-    auto sliced_psum_num_recv_tokens_per_expert =
-        psum_num_recv_tokens_per_expert.slice(0, 1, num_local_experts + 1);
+    auto handle_psum_num_recv_tokens_per_expert = do_expand
+        ? psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts)
+        : psum_num_recv_tokens_per_expert.slice(0, 1, num_local_experts + 1);
+    auto epilogue_psum_num_recv_tokens_per_expert = do_expand
+        ? psum_num_recv_tokens_per_expert
+        : handle_psum_num_recv_tokens_per_expert;
 
     launch_mooncake_elastic_dispatch_copy_epilogue(
         recv_x.data_ptr(), recv_x_scales_ptr, recv_topk_idx.data_ptr<int64_t>(),
@@ -390,7 +403,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         num_sms, num_smem_bytes, use_hybrid ? hybrid_channels : num_channels,
         do_expand, cached_mode, launch_ctx,
         psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-        sliced_psum_num_recv_tokens_per_expert.data_ptr<int>(),
+        epilogue_psum_num_recv_tokens_per_expert.data_ptr<int>(),
         launch_stream.stream());
 
     if (do_cpu_sync || !async_with_compute_stream) {
@@ -401,6 +414,56 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         event = EventHandle(launch_stream);
     }
 
+    std::vector<int> num_recv_tokens_per_expert_list;
+    int actual_num_recv_tokens = num_recv_tokens;
+    int actual_num_output_tokens = num_recv_tokens;
+    if (do_cpu_sync) {
+        auto scaleup_psum_cpu = psum_num_recv_tokens_per_scaleup_rank.cpu();
+        auto expert_psum_cpu = psum_num_recv_tokens_per_expert.cpu();
+        const auto* scaleup_psum = scaleup_psum_cpu.data_ptr<int>();
+        const auto* expert_psum = expert_psum_cpu.data_ptr<int>();
+        actual_num_recv_tokens = scaleup_psum[topology_.num_scaleup_ranks - 1];
+        EP_HOST_ASSERT(actual_num_recv_tokens >= 0 &&
+                       actual_num_recv_tokens <= num_recv_tokens);
+        actual_num_output_tokens = actual_num_recv_tokens;
+
+        num_recv_tokens_per_expert_list.reserve(num_local_experts);
+        const auto align_count = [expert_alignment](int value) {
+            return ((value + expert_alignment - 1) / expert_alignment) *
+                   expert_alignment;
+        };
+        if (do_expand) {
+            int previous_psum = 0;
+            for (int i = 0; i < num_local_experts; ++i) {
+                const int count = expert_psum[i] - align_count(previous_psum);
+                EP_HOST_ASSERT(count >= 0);
+                num_recv_tokens_per_expert_list.push_back(count);
+                previous_psum = expert_psum[i];
+            }
+            actual_num_output_tokens =
+                num_local_experts == 0 ? 0 : expert_psum[num_local_experts - 1];
+        } else {
+            for (int i = 0; i < num_local_experts; ++i) {
+                const int count = expert_psum[i + 1] - expert_psum[i];
+                EP_HOST_ASSERT(count >= 0);
+                num_recv_tokens_per_expert_list.push_back(count);
+            }
+        }
+        EP_HOST_ASSERT(actual_num_output_tokens >= 0 &&
+                       actual_num_output_tokens <= recv_x.size(0));
+
+        recv_x = recv_x.slice(0, 0, actual_num_output_tokens);
+        if (recv_x_scales.has_value()) {
+            recv_x_scales = recv_x_scales->slice(0, 0, actual_num_output_tokens);
+        }
+        recv_topk_idx = recv_topk_idx.slice(0, 0, actual_num_recv_tokens);
+        if (recv_topk_weights.has_value()) {
+            recv_topk_weights =
+                recv_topk_weights->slice(0, 0, actual_num_output_tokens);
+        }
+        recv_src_metadata = recv_src_metadata.slice(0, 0, actual_num_recv_tokens);
+    }
+
     ElasticNativeHandle handle;
     handle.do_expand = do_expand;
     handle.num_experts = num_experts;
@@ -408,7 +471,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     handle.num_max_tokens_per_rank = num_max_tokens_per_rank;
     handle.num_sms = num_sms;
     handle.topk_idx = cached_mode ? cached_handle->topk_idx : topk_idx.clone();
-    handle.psum_num_recv_tokens_per_expert = sliced_psum_num_recv_tokens_per_expert;
+    handle.psum_num_recv_tokens_per_expert = handle_psum_num_recv_tokens_per_expert;
     handle.psum_num_recv_tokens_per_scaleup_rank =
         psum_num_recv_tokens_per_scaleup_rank;
     handle.recv_src_metadata = recv_src_metadata;
@@ -417,6 +480,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     handle.dst_buffer_slot_idx = dst_buffer_slot_idx;
     handle.token_metadata_at_forward = token_metadata_at_forward;
     handle.channel_linked_list = channel_linked_list;
+    handle.num_recv_tokens_per_expert_list = num_recv_tokens_per_expert_list;
 
     ElasticDispatchOutput output;
     output.recv_x = recv_x;

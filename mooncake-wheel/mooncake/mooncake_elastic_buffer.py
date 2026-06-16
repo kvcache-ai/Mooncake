@@ -1,12 +1,11 @@
-import math
 import os
 import warnings
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 
-from .mooncake_ep_buffer import Buffer, EventOverlap
+from .mooncake_ep_buffer import EventOverlap
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -102,6 +101,11 @@ class ElasticBuffer:
         num_gpu_timeout_secs: int = 100,
         explicitly_destroy: bool = False,
     ) -> None:
+        if not allow_multiple_reduction:
+            raise NotImplementedError(
+                "Mooncake ElasticBuffer currently supports only "
+                "allow_multiple_reduction=True"
+            )
         self.group = group
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
@@ -245,8 +249,15 @@ class ElasticBuffer:
             active_ranks_mask = self._active_ranks_mask()
             self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
         except Exception as exc:
+            if bool(self.runtime.ibgda_disabled()):
+                raise RuntimeError(
+                    f"[Rank {self.rank_idx}] Failed to exchange IPC handles "
+                    "for ElasticBuffer and RDMA is disabled; native elastic "
+                    "mode cannot continue safely."
+                ) from exc
             warnings.warn(
-                f"[Rank {self.rank_idx}] Failed to exchange IPC handles for ElasticBuffer: {exc}. Falling back.",
+                f"[Rank {self.rank_idx}] Failed to exchange IPC handles for ElasticBuffer: {exc}. "
+                "Continuing with RDMA-only routing.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -397,19 +408,37 @@ class ElasticBuffer:
     def dispatch(
         self,
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        topk_idx: torch.Tensor,
+        topk_idx: Optional[torch.Tensor] = None,
         topk_weights: Optional[torch.Tensor] = None,
         num_experts: Optional[int] = None,
         num_max_tokens_per_rank: Optional[int] = None,
-        expert_alignment: int = 1,
+        expert_alignment: Optional[int] = None,
         handle: Optional[EPHandle] = None,
         do_expand: bool = False,
-        do_cpu_sync: bool = True,
+        do_cpu_sync: Optional[bool] = None,
         num_sms: Optional[int] = None,
         async_with_compute_stream: bool = False,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], Optional[torch.Tensor], EPHandle, EventOverlap]:
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
+        if handle is not None:
+            if topk_idx is not None or topk_weights is not None:
+                raise AssertionError("topk_idx and topk_weights must be None when cached handle is provided")
+            if do_cpu_sync:
+                raise AssertionError("Cannot do CPU sync with cached handle")
+            if handle.native_handle is None:
+                raise RuntimeError("Cached EPHandle is missing its native Mooncake handle")
+            topk_idx = handle.topk_idx
+            num_max_tokens_per_rank = num_max_tokens_per_rank or handle.num_max_tokens_per_rank
+            num_experts = num_experts or handle.num_experts
+            expert_alignment = handle.expert_alignment if expert_alignment is None else expert_alignment
+            num_sms = handle.num_sms if num_sms is None else num_sms
+            do_cpu_sync = False
+        else:
+            if topk_idx is None:
+                raise AssertionError("topk_idx must be provided when cached handle is not provided")
+            expert_alignment = 1 if expert_alignment is None else expert_alignment
+            do_cpu_sync = True if do_cpu_sync is None else do_cpu_sync
         if do_expand:
             warnings.warn(
                 "do_expand=True was requested. Mooncake currently returns the native packed expert layout; "
@@ -462,7 +491,31 @@ class ElasticBuffer:
             native_handle=native_handle,
         )
         recv_x = (output.recv_x, output.recv_x_scales) if output.recv_x_scales is not None else output.recv_x
-        return recv_x, output.recv_topk_idx, output.recv_topk_weights, elastic_handle, EventOverlap(output.event)
+        tensors_to_record = (
+            x_data,
+            topk_idx,
+            active_ranks,
+            output.recv_x,
+            output.recv_topk_idx,
+            native_handle.topk_idx,
+            native_handle.psum_num_recv_tokens_per_scaleup_rank,
+            native_handle.psum_num_recv_tokens_per_expert,
+            native_handle.recv_src_metadata,
+            native_handle.dst_buffer_slot_idx,
+            *(() if sf is None else (sf,)),
+            *(() if topk_weights is None else (topk_weights,)),
+            *(() if output.recv_x_scales is None else (output.recv_x_scales,)),
+            *(() if output.recv_topk_weights is None else (output.recv_topk_weights,)),
+            *(() if native_handle.token_metadata_at_forward is None else (native_handle.token_metadata_at_forward,)),
+            *(() if native_handle.channel_linked_list is None else (native_handle.channel_linked_list,)),
+        )
+        return (
+            recv_x,
+            output.recv_topk_idx,
+            output.recv_topk_weights,
+            elastic_handle,
+            EventOverlap(output.event, tensors_to_record if async_with_compute_stream else None),
+        )
 
     def combine(
         self,
@@ -488,7 +541,25 @@ class ElasticBuffer:
             async_with_compute_stream,
             None,
         )
-        return output.combined_x, output.combined_topk_weights, EventOverlap(output.event)
+        native_handle = handle.native_handle
+        tensors_to_record = (
+            x,
+            topk_weights,
+            active_ranks,
+            output.combined_x,
+            native_handle.topk_idx,
+            native_handle.psum_num_recv_tokens_per_scaleup_rank,
+            native_handle.psum_num_recv_tokens_per_expert,
+            native_handle.recv_src_metadata,
+            native_handle.dst_buffer_slot_idx,
+            *(() if native_handle.token_metadata_at_forward is None else (native_handle.token_metadata_at_forward,)),
+            *(() if native_handle.channel_linked_list is None else (native_handle.channel_linked_list,)),
+        )
+        return (
+            output.combined_x,
+            output.combined_topk_weights,
+            EventOverlap(output.event, tensors_to_record if async_with_compute_stream else None),
+        )
 
 
 __all__ = ["ElasticBuffer", "EPHandle", "EventOverlap"]

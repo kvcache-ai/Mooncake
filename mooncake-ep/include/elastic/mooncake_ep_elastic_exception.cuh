@@ -3,29 +3,11 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
-#include <exception>
-#include <string>
+#include <mooncake_ep_exception.cuh>
 #include <sstream>
 
 #ifndef EP_STATIC_ASSERT
 #define EP_STATIC_ASSERT(cond, reason) static_assert(cond, reason)
-#endif
-
-#ifndef MOONCAKE_EP_EXCEPTION_CLASS_DEFINED
-#define MOONCAKE_EP_EXCEPTION_CLASS_DEFINED
-class EPException : public std::exception {
-private:
-    std::string message = {};
-
-public:
-    explicit EPException(const char* name, const char* file, const int line, const std::string& error) {
-        std::stringstream ss;
-        ss << name << " exception (" << file << ":" << line << "): " << error;
-        message = ss.str();
-    }
-
-    const char* what() const noexcept override { return message.c_str(); }
-};
 #endif
 
 #define EPExceptionWithLineInfo(name, message) EPException(name, __FILE__, __LINE__, message)

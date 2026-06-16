@@ -4,7 +4,7 @@
 #include <type_traits>
 
 #include <mooncake_ep_utils.cuh>
-#include <mooncake_ep_elastic_ptx.cuh>
+#include <elastic/mooncake_ep_elastic_ptx.cuh>
 #include <transport/device/comm_device.cuh>
 
 namespace mooncake::elastic::transport {
@@ -140,8 +140,35 @@ struct MooncakeGin {
                                   reinterpret_cast<int*>(dst_ptr),
                                   static_cast<int32_t>(value));
             } else {
-                device::mc_rdma_put(ctx, qp_idx, dst_rank, qps_per_rank,
-                                    &value, dst_ptr, sizeof(value_t), 0);
+                // Device RDMA WRITE sources must be registered GDR addresses;
+                // a by-value scalar lives in thread-local storage and is not a
+                // valid IBGDA source.  Current elastic uses remote int64
+                // put_value only for single-writer, zeroed notify slots, so a
+                // split 32-bit RED add is equivalent to writing the packed word.
+                auto* words = reinterpret_cast<int32_t*>(dst_ptr);
+                const auto signed_value = static_cast<int64_t>(value);
+                const auto low = static_cast<int32_t>(
+                    static_cast<uint64_t>(signed_value) & 0xffffffffull);
+                const auto high = static_cast<int32_t>(signed_value >> 32);
+                if ((flags & kRedAddReleaseLowWordLast) == 0) {
+                    if (low != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words, low);
+                    }
+                    if (high != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words + 1, high);
+                    }
+                } else {
+                    if (high != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words + 1, high);
+                    }
+                    if (low != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words, low);
+                    }
+                }
             }
         }
     }

@@ -5,9 +5,9 @@
 #include <string>
 
 #include <mooncake_ep_configs.cuh>
-#include <mooncake_ep_elastic_api.cuh>
-#include <mooncake_ep_elastic_exception.cuh>
-#include <mooncake_ep_elastic_launch.cuh>
+#include <elastic/mooncake_ep_elastic_api.cuh>
+#include <elastic/mooncake_ep_elastic_exception.cuh>
+#include <elastic/mooncake_ep_elastic_launch.cuh>
 #include <transport/device/comm_device.cuh>
 
 namespace mooncake {
@@ -431,13 +431,17 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
         do {                                                                   \
             constexpr int kHiddenBytes = (HB);                                 \
             constexpr int kNumSFPacks = (SFP);                                 \
-            auto kernel = cached_mode ?                                        \
+            auto kernel = do_expand ?                                          \
                 elastic::dispatch_copy_epilogue_impl<                          \
-                    false, true, S, C, kElasticNumEpilogueWarps, SO, SU,       \
+                    true, false, S, C, kElasticNumEpilogueWarps, SO, SU,       \
                     kHiddenBytes, kNumSFPacks, M, E, K> :                      \
-                elastic::dispatch_copy_epilogue_impl<                          \
-                    false, false, S, C, kElasticNumEpilogueWarps, SO, SU,      \
-                    kHiddenBytes, kNumSFPacks, M, E, K>;                       \
+                (cached_mode ?                                                 \
+                    elastic::dispatch_copy_epilogue_impl<                      \
+                        false, true, S, C, kElasticNumEpilogueWarps, SO, SU,   \
+                        kHiddenBytes, kNumSFPacks, M, E, K> :                  \
+                    elastic::dispatch_copy_epilogue_impl<                      \
+                        false, false, S, C, kElasticNumEpilogueWarps, SO, SU,  \
+                        kHiddenBytes, kNumSFPacks, M, E, K>);                  \
             launch_cooperative(kernel, S, num_threads, smem_bytes, stream,     \
                                ctx.buffer, ctx.workspace,                      \
                                psum_num_recv_tokens_per_scaleup_rank,          \
@@ -454,7 +458,7 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
         if (hidden == H && num_experts == E && num_topk == K &&                \
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
-            elem_size == EL && num_sf_packs == SFP && !do_expand &&            \
+            elem_size == EL && num_sf_packs == SFP &&                          \
             num_channels == hybrid_num_channels(S)) {                          \
             LAUNCH_HYBRID_DISPATCH_EPILOGUE((H) * (EL), SFP, E, K, M, S, SO, SU, \
                                             (S) * kElasticNumHybridForwardWarps); \
@@ -493,13 +497,17 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
     do {                                                                       \
         constexpr int kHiddenBytes = (HB);                                     \
         constexpr int kNumSFPacks = (SFP);                                     \
-        auto kernel = cached_mode ?                                            \
+        auto kernel = do_expand ?                                              \
             elastic::dispatch_copy_epilogue_impl<                              \
-                false, true, S, 1, kElasticNumEpilogueWarps, 1, R,             \
+                true, false, S, 1, kElasticNumEpilogueWarps, 1, R,             \
                 kHiddenBytes, kNumSFPacks, M, E, K> :                          \
-            elastic::dispatch_copy_epilogue_impl<                              \
-                false, false, S, 1, kElasticNumEpilogueWarps, 1, R,            \
-                kHiddenBytes, kNumSFPacks, M, E, K>;                           \
+            (cached_mode ?                                                     \
+                elastic::dispatch_copy_epilogue_impl<                          \
+                    false, true, S, 1, kElasticNumEpilogueWarps, 1, R,         \
+                    kHiddenBytes, kNumSFPacks, M, E, K> :                      \
+                elastic::dispatch_copy_epilogue_impl<                          \
+                    false, false, S, 1, kElasticNumEpilogueWarps, 1, R,        \
+                    kHiddenBytes, kNumSFPacks, M, E, K>);                      \
         launch_cooperative(kernel, S, num_threads, smem_bytes, stream,         \
                            ctx.buffer, ctx.workspace,                          \
                            psum_num_recv_tokens_per_scaleup_rank,              \
@@ -515,7 +523,7 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
     if (hidden == H && num_experts == E && num_topk == K &&                    \
         num_max_tokens_per_rank == M && num_sms == S &&                       \
         ctx.num_scaleup_ranks == R && elem_size == EL &&                       \
-        num_sf_packs == SFP && !do_expand) {                                   \
+        num_sf_packs == SFP) {                                                 \
         LAUNCH_DISPATCH_EPILOGUE((H) * (EL), SFP, E, K, M, S, R);              \
         return;                                                               \
     }

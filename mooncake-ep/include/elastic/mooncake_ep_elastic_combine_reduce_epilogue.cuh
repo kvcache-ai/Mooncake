@@ -3,11 +3,11 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
-#include <mooncake_ep_elastic_compiled.cuh>
-#include <mooncake_ep_elastic_ptx.cuh>
-#include <mooncake_ep_elastic_layout.cuh>
+#include <elastic/mooncake_ep_elastic_compiled.cuh>
+#include <elastic/mooncake_ep_elastic_ptx.cuh>
+#include <elastic/mooncake_ep_elastic_layout.cuh>
 
-#include <mooncake_ep_elastic_combine_utils.cuh>
+#include <elastic/mooncake_ep_elastic_combine_utils.cuh>
 
 
 namespace mooncake::elastic {

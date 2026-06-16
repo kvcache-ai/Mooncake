@@ -3,6 +3,8 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <tuple>
+
 namespace mooncake::elastic::math {
 
 template <typename T>

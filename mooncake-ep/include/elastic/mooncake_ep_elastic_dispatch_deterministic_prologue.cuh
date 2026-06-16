@@ -5,9 +5,9 @@
 
 #include <cooperative_groups.h>
 
-#include <mooncake_ep_elastic_compiled.cuh>
-#include <mooncake_ep_elastic_math.cuh>
-#include <mooncake_ep_elastic_ptx.cuh>
+#include <elastic/mooncake_ep_elastic_compiled.cuh>
+#include <elastic/mooncake_ep_elastic_math.cuh>
+#include <elastic/mooncake_ep_elastic_ptx.cuh>
 
 
 namespace mooncake::elastic {

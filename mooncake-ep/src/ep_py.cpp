@@ -1,5 +1,5 @@
 #include <mooncake_ep_buffer.h>
-#include <mooncake_ep_elastic_buffer.h>
+#include <elastic/mooncake_ep_elastic_buffer.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>

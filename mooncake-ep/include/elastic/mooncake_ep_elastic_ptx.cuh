@@ -5,8 +5,8 @@
 
 #include <cuda_bf16.h>
 
-#include <mooncake_ep_elastic_compiled.cuh>
-#include <mooncake_ep_elastic_exception.cuh>
+#include <elastic/mooncake_ep_elastic_compiled.cuh>
+#include <elastic/mooncake_ep_elastic_exception.cuh>
 
 namespace mooncake::elastic::ptx {
 
