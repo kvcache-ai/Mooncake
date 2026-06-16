@@ -23,6 +23,15 @@ spec:
     - jsonPath: .status.workerReady
       name: Worker
       type: integer
+    - jsonPath: .status.proxyReady
+      name: Proxy
+      type: integer
+    - jsonPath: .status.prefillReady
+      name: Prefill
+      type: integer
+    - jsonPath: .status.decodeReady
+      name: Decode
+      type: integer
     - jsonPath: .status.leaderNode
       name: Leader
       type: string
@@ -324,6 +333,7 @@ spec:
                     description: SegmentSize is the memory segment size per worker
                       (e.g. "1Gi"). Must be less than or equal to worker
                       resources.limits.memory.
+                    type: string
                   transferPort:
                     default: 13006
                     description: TransferPort is the port for the transfer engine RPC
@@ -332,6 +342,29 @@ spec:
                     maximum: 65535
                     minimum: 1024
                     type: integer
+                  transportFailover:
+                    description: TransportFailover defines the RDMA-to-TCP automatic
+                      failover configuration.
+                    properties:
+                      enabled:
+                        default: true
+                        description: Enabled enables automatic RDMA-to-TCP failover.
+                        type: boolean
+                      failoverThreshold:
+                        default: 3
+                        description: FailoverThreshold is the number of consecutive
+                          RDMA failures before falling back to TCP.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      recoverySeconds:
+                        default: 30
+                        description: RecoverySeconds is the cooldown period in seconds
+                          before retrying RDMA after failover.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
                   migration:
                     description: Migration defines the worker data migration configuration (optional).
                     properties:

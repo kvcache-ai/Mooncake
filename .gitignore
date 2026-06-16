@@ -215,6 +215,23 @@ mooncake-operator/.kube/
 mooncake-operator/bin/
 mooncake-operator/mooncake-operator
 
+# CMake build artifacts
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+cmake_install.cmake
+compile_commands.json
+mooncake-store/include/version.h
+
+# Docker build support files (local build artifacts)
+/mooncake_master.bin
+/libk8s_lease_wrapper.bin
+docker-pip-cache/*.whl
+mooncake-wheel/mooncake/mooncake_client
+
 # Stripped binaries (build artifacts)
 *.stripped
 

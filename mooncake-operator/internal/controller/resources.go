@@ -233,6 +233,12 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 		}
 	}
 
+	// Determine transfer protocol based on RDMA enablement
+	protocol := "tcp"
+	if mc.Spec.Workers.RDMAEnabled {
+		protocol = "rdma"
+	}
+
 	container := corev1.Container{
 		Name:            "worker",
 		Image:           image,
@@ -267,6 +273,7 @@ exec mooncake_client \
   --global_segment_size="` + convertSegmentSize(mc.Spec.Workers.SegmentSize) + `" \
   --local_buffer_size=512MB \
   --metadata_server="${METADATA_SERVER}" \
+  --protocol="` + protocol + `" \
   --host="${POD_IP}:${MC_STORE_CLIENT_MIN_PORT}"
 `,
 		},
@@ -382,10 +389,27 @@ sys.exit(0)
 		Resources: mc.Spec.Workers.Resources,
 	}
 
+	volumes := []corev1.Volume{}
+
 	// RDMA device resources
 	if mc.Spec.Workers.RDMAEnabled {
-		container.Resources.Limits = mergeResourceList(container.Resources.Limits, corev1.ResourceList{
-			"rdma/hca_shared_devices_a": resource.MustParse("1"),
+		// Privileged mode required for accessing RDMA device nodes via hostPath
+		container.SecurityContext = &corev1.SecurityContext{
+			Privileged: boolPtr(true),
+		}
+		// Mount /dev/infiniband from host for RDMA device access
+		volumes = append(volumes, corev1.Volume{
+			Name: "rdma-dev",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/dev/infiniband",
+					Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
+				},
+			},
+		})
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      "rdma-dev",
+			MountPath: "/dev/infiniband",
 		})
 	}
 
@@ -395,8 +419,6 @@ sys.exit(0)
 			"nvidia.com/gpu": resource.MustParse("1"),
 		})
 	}
-
-	volumes := []corev1.Volume{}
 
 	// Hugepages
 	if mc.Spec.Workers.HugepagesEnabled {
@@ -872,3 +894,7 @@ func resourcePtr(q resource.Quantity) *resource.Quantity {
 }
 
 func int64Ptr(i int64) *int64 { return &i }
+
+func hostPathTypePtr(t corev1.HostPathType) *corev1.HostPathType { return &t }
+
+func boolPtr(b bool) *bool { return &b }

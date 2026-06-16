@@ -25,6 +25,7 @@ RUN apt-get update && \
         libunwind-dev \
         libcurl4 \
         libibverbs1 \
+        ibverbs-providers \
         python3 \
         python3-pip && \
     rm -rf /var/lib/apt/lists/*

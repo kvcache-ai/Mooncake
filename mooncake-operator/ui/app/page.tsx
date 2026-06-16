@@ -134,7 +134,9 @@ export default function Home() {
         try {
           const r = await fetch(`/api/clusters/${ns}/${name}/rdma-status`)
           const d = await r.json()
-          if (!cancelled) newStatus[key] = d.workers || []
+          if (!cancelled) {
+            newStatus[key] = (d.workers || []).map((w: any) => ({ ...w, crRdmaEnabled: d.crRdmaEnabled }))
+          }
         } catch (e) {
           if (!cancelled) newStatus[key] = []
         }
@@ -377,6 +379,11 @@ export default function Home() {
                     <div className="flex items-center mb-4">
                       <span className="text-sm font-medium text-gray-500">Cluster:</span>
                       <span className="ml-2 text-sm font-semibold text-gray-900">{clusterKey}</span>
+                      {workers.some((w: any) => w.softRoce) && (
+                        <span className="ml-3 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
+                          Soft-RoCE
+                        </span>
+                      )}
                       {requested > 0 && (
                         <span className={`ml-4 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
                           healthy === total ? 'bg-green-100 text-green-800' :
@@ -412,7 +419,7 @@ export default function Home() {
                                   <RdmaStatusBadge available={w.rdmaAvailable} requested={w.rdmaRequested} />
                                 </td>
                                 <td className="py-2 text-xs text-gray-500 font-mono">
-                                  {w.rdmaAllocated}/{w.nodeRdmaDevices}
+                                  {w.softRoce ? 'Soft-RoCE' : `${w.rdmaAllocated}/${w.nodeRdmaDevices}`}
                                 </td>
                               </tr>
                             ))}

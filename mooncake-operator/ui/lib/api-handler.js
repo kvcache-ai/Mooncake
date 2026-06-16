@@ -607,6 +607,8 @@ async function handleApiRequest(req, res) {
       const rpcPort = spec.master?.rpcPort || 50051
       const metadataPort = spec.master?.httpMetadataServerPort || 8080
       const segmentSize = spec.workers?.segmentSize || '4Gi'
+      const rdmaEnabled = spec.workers?.rdmaEnabled || false
+      const protocol = rdmaEnabled ? 'rdma' : 'tcp'
 
       // Convert segmentSize to bytes for the Python script
       const segmentBytes = parseDataSize(segmentSize) || 4 * 1024 * 1024 * 1024
@@ -688,6 +690,43 @@ sys.exit(0 if failure == 0 else 1)`
 ${pythonScript}
 PYEOF`
 
+      const testContainer = {
+        name: 'store-test',
+        image: image,
+        imagePullPolicy: 'IfNotPresent',
+        command: ['bash', '-c', bashCommand],
+        env: [
+          { name: 'MC_MASTER_ADDR', value: masterAddr },
+          { name: 'MC_METADATA_SERVER', value: metadataServer },
+          { name: 'MC_SEGMENT_SIZE', value: String(segmentBytes) },
+          { name: 'MC_LOCAL_BUFFER_SIZE', value: String(512 * 1024 * 1024) },
+          { name: 'MC_PROTOCOL', value: protocol },
+          { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },
+          { name: 'TEST_DATA_SIZE', value: String(dataSizeBytes) },
+          { name: 'TEST_REPLICA_NUM', value: String(repNum) },
+          { name: 'TEST_REPEAT_COUNT', value: String(repCount) },
+          { name: 'LD_LIBRARY_PATH', value: '/usr/local/lib/mooncake' },
+        ],
+      }
+
+      const podSpec = {
+        restartPolicy: 'Never',
+        containers: [testContainer],
+      }
+
+      // When RDMA is enabled, grant the test pod privileged access to /dev/infiniband
+      if (rdmaEnabled) {
+        testContainer.securityContext = { privileged: true }
+        podSpec.volumes = [{
+          name: 'rdma-dev',
+          volumeSource: { hostPath: { path: '/dev/infiniband', type: 'DirectoryOrCreate' } },
+        }]
+        testContainer.volumeMounts = [{
+          name: 'rdma-dev',
+          mountPath: '/dev/infiniband',
+        }]
+      }
+
       const job = {
         apiVersion: 'batch/v1',
         kind: 'Job',
@@ -696,27 +735,7 @@ PYEOF`
           backoffLimit: 0,
           ttlSecondsAfterFinished: 3600,
           template: {
-            spec: {
-              restartPolicy: 'Never',
-              containers: [{
-                name: 'store-test',
-                image: image,
-                imagePullPolicy: 'IfNotPresent',
-                command: ['bash', '-c', bashCommand],
-                env: [
-                  { name: 'MC_MASTER_ADDR', value: masterAddr },
-                  { name: 'MC_METADATA_SERVER', value: metadataServer },
-                  { name: 'MC_SEGMENT_SIZE', value: String(segmentBytes) },
-                  { name: 'MC_LOCAL_BUFFER_SIZE', value: String(512 * 1024 * 1024) },
-                  { name: 'MC_PROTOCOL', value: 'tcp' },
-                  { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },
-                  { name: 'TEST_DATA_SIZE', value: String(dataSizeBytes) },
-                  { name: 'TEST_REPLICA_NUM', value: String(repNum) },
-                  { name: 'TEST_REPEAT_COUNT', value: String(repCount) },
-                  { name: 'LD_LIBRARY_PATH', value: '/usr/local/lib/mooncake' },
-                ],
-              }],
-            },
+            spec: podSpec,
           },
         },
       }
@@ -994,96 +1013,124 @@ if (cancelDrainMatch && req.method === 'POST') {
   }
 }
 
+      // GET /api/clusters/:namespace/:name/rdma-status
+      // Returns per-worker RDMA availability status by checking each worker pod's
+      // RDMA device allocation and health.
+      const rdmaStatusMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/rdma-status$/)
+      if (rdmaStatusMatch && req.method === 'GET') {
+        try {
+          const [, namespace, name] = rdmaStatusMatch
+
+          // Check cluster CR for rdmaEnabled (covers Soft-RoCE / hostPath RDMA)
+          let crRdmaEnabled = false
+          try {
+            const clusterCR = await k8sRequest(
+              `/apis/mooncake.io/v1alpha1/namespaces/${namespace}/mooncakeclusters/${name}`
+            )
+            crRdmaEnabled = !!clusterCR?.spec?.workers?.rdmaEnabled
+          } catch (e) {
+            // CR not found; proceed with pod-level checks only
+          }
+
+          // Get all worker pods
+          const podResult = await k8sRequest(
+            `/api/v1/namespaces/${namespace}/pods?labelSelector=app=mooncake-worker,cluster=${name}`
+          )
+          const pods = podResult?.items || []
+
+          // Get all nodes to check RDMA device allocatable
+          const nodesResult = await k8sRequest('/api/v1/nodes')
+          const nodeRdma = new Map()
+          for (const node of (nodesResult?.items || [])) {
+            const allocatable = node.status?.allocatable || {}
+            const rdmaDevices = allocatable['rdma/hca_shared_devices_a']
+            nodeRdma.set(node.metadata.name, rdmaDevices ? parseInt(rdmaDevices) : 0)
+          }
+
+          const workers = []
+          for (const pod of pods) {
+            const podName = pod.metadata?.name || ''
+            const podIP = pod.status?.podIP || ''
+            const nodeName = pod.spec?.nodeName || ''
+            const phase = pod.status?.phase || ''
+            const ready = (pod.status?.conditions || []).some(
+              c => c.type === 'Ready' && c.status === 'True'
+            )
+
+            // Check if RDMA resources were allocated to this container
+            let rdmaRequested = false
+            let rdmaAllocated = 0
+            let softRoce = false
+            for (const container of (pod.spec?.containers || [])) {
+              const limits = container.resources?.limits || {}
+              if (limits['rdma/hca_shared_devices_a']) {
+                rdmaRequested = true
+                rdmaAllocated = parseInt(limits['rdma/hca_shared_devices_a'])
+              }
+              // Detect Soft-RoCE via /dev/infiniband hostPath mount
+              const mounts = container.volumeMounts || []
+              for (const m of mounts) {
+                if (m.mountPath === '/dev/infiniband') softRoce = true
+              }
+            }
+
+            const nodeRdmaCount = nodeRdma.get(nodeName) || 0
+
+            // Also try to query the worker pod's transfer health endpoint
+            let rdmaAvailable = false
+            let transportHealth = {}
+            if (ready && podIP) {
+              try {
+                const containerPort = pod.spec?.containers?.[0]?.ports?.find(
+                  p => p.name === 'metrics'
+                )?.containerPort || 9003
+                const proxyPrefix = `/api/v1/namespaces/${namespace}/pods/${podName}:${containerPort}/proxy`
+                const healthText = await k8sRequest(`${proxyPrefix}/transport_health`)
+                if (typeof healthText === 'string') {
+                  const health = JSON.parse(healthText)
+                  rdmaAvailable = health?.rdma?.available ?? (rdmaRequested && rdmaAllocated > 0)
+                  transportHealth = health?.transports || {}
+                }
+              } catch (e) {
+                // Transport health endpoint not available; fall back to resource/CR check
+              }
+            }
+
+            // RDMA is available if: health says so, OR device plugin allocated, OR Soft-RoCE hostPath, OR CR says rdmaEnabled
+            if (!rdmaAvailable) {
+              rdmaAvailable = rdmaRequested && rdmaAllocated > 0
+            }
+            if (!rdmaAvailable) {
+              rdmaAvailable = softRoce && crRdmaEnabled
+            }
+            if (!rdmaAvailable) {
+              rdmaAvailable = crRdmaEnabled && ready
+            }
+
+            workers.push({
+              podName,
+              podIP,
+              nodeName,
+              phase,
+              ready,
+              rdmaAvailable,
+              rdmaRequested: rdmaRequested || softRoce,
+              rdmaAllocated: rdmaAllocated || (softRoce ? 1 : 0),
+              softRoce,
+              nodeRdmaDevices: nodeRdmaCount,
+              transportHealth,
+            })
+          }
+
+          return jsonReply(res, 200, { workers, crRdmaEnabled })
+        } catch (e) {
+          return jsonReply(res, 500, { error: e.message })
+        }
+      }
+
       return false // not handled
   } catch (e) {
     console.error('[api-handler] Unhandled error:', e.message)
-    return jsonReply(res, 500, { error: e.message })
-  }
-}
-
-// GET /api/clusters/:namespace/:name/rdma-status
-// Returns per-worker RDMA availability status by checking each worker pod's
-// RDMA device allocation and health.
-const rdmaStatusMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/rdma-status$/)
-if (rdmaStatusMatch && req.method === 'GET') {
-  try {
-    const [, namespace, name] = rdmaStatusMatch
-
-    // Get all worker pods
-    const podResult = await k8sRequest(
-      `/api/v1/namespaces/${namespace}/pods?labelSelector=app=mooncake-worker,cluster=${name}`
-    )
-    const pods = podResult?.items || []
-
-    // Get all nodes to check RDMA device allocatable
-    const nodesResult = await k8sRequest('/api/v1/nodes')
-    const nodeRdma = new Map()
-    for (const node of (nodesResult?.items || [])) {
-      const allocatable = node.status?.allocatable || {}
-      const rdmaDevices = allocatable['rdma/hca_shared_devices_a']
-      nodeRdma.set(node.metadata.name, rdmaDevices ? parseInt(rdmaDevices) : 0)
-    }
-
-    const workers = []
-    for (const pod of pods) {
-      const podName = pod.metadata?.name || ''
-      const podIP = pod.status?.podIP || ''
-      const nodeName = pod.spec?.nodeName || ''
-      const phase = pod.status?.phase || ''
-      const ready = (pod.status?.conditions || []).some(
-        c => c.type === 'Ready' && c.status === 'True'
-      )
-
-      // Check if RDMA resources were allocated to this container
-      let rdmaRequested = false
-      let rdmaAllocated = 0
-      for (const container of (pod.spec?.containers || [])) {
-        const limits = container.resources?.limits || {}
-        if (limits['rdma/hca_shared_devices_a']) {
-          rdmaRequested = true
-          rdmaAllocated = parseInt(limits['rdma/hca_shared_devices_a'])
-        }
-      }
-
-      const nodeRdmaCount = nodeRdma.get(nodeName) || 0
-
-      // Also try to query the worker pod's transfer health endpoint
-      let rdmaAvailable = false
-      let transportHealth = {}
-      if (ready && podIP) {
-        try {
-          const containerPort = pod.spec?.containers?.[0]?.ports?.find(
-            p => p.name === 'metrics'
-          )?.containerPort || 9003
-          const proxyPrefix = `/api/v1/namespaces/${namespace}/pods/${podName}:${containerPort}/proxy`
-          const healthText = await k8sRequest(`${proxyPrefix}/transport_health`)
-          if (typeof healthText === 'string') {
-            const health = JSON.parse(healthText)
-            rdmaAvailable = health?.rdma?.available ?? (rdmaRequested && rdmaAllocated > 0)
-            transportHealth = health?.transports || {}
-          }
-        } catch (e) {
-          // Transport health endpoint not available; fall back to resource check
-          rdmaAvailable = rdmaRequested && rdmaAllocated > 0
-        }
-      }
-
-      workers.push({
-        podName,
-        podIP,
-        nodeName,
-        phase,
-        ready,
-        rdmaAvailable,
-        rdmaRequested,
-        rdmaAllocated,
-        nodeRdmaDevices: nodeRdmaCount,
-        transportHealth,
-      })
-    }
-
-    return jsonReply(res, 200, { workers })
-  } catch (e) {
     return jsonReply(res, 500, { error: e.message })
   }
 }
