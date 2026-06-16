@@ -54,6 +54,8 @@ This document describes `SsdFreeRatioFirstAllocationStrategy`, an allocation str
 
 The flow follows the same high-level structure as the existing `FreeRatioFirstAllocationStrategy`: sample a subset of candidates, compute a ranking metric, sort, and allocate from the top. The key difference is that the ranking metric is SSD free ratio rather than DRAM free ratio.
 
+`MasterService` only passes an `SsdMetricsProvider` when the effective allocation strategy is `SSD_FREE_RATIO_FIRST`. Non-SSD strategies receive `nullptr`, so they avoid unnecessary local-disk segment access.
+
 ---
 
 ## Core Algorithm
@@ -71,6 +73,8 @@ ssd_free_ratio = (ssd_total_capacity - ssd_used_bytes) / ssd_total_capacity
 ```
 
 A segment with 1 TB total SSD capacity and 200 GB used has an SSD free ratio of 0.80. A segment whose SSD is full has a ratio of 0.0.
+
+Before calculating the ratio, `ssd_used_bytes` is clamped to `[0, ssd_total_capacity]`. This keeps transient concurrent accounting drift from producing a negative free ratio or a value greater than 1.0. If no SSD metrics provider is available, or if the reported total capacity is not positive, the strategy treats the segment as fully free.
 
 ### Sorting
 
@@ -90,12 +94,12 @@ After allocating from the SSD-ranked candidates, any remaining replicas that cou
 
 ### `ssd_used_bytes` counter
 
-`LocalDiskSegment` maintains an atomic counter `ssd_used_bytes` that tracks the total number of bytes currently occupied by offloaded replicas on the segment's SSD. This counter is updated at two points:
+`LocalDiskSegment` maintains `ssd_total_capacity_bytes`, updated by `ReportSsdCapacity`, and an atomic counter `ssd_used_bytes` that tracks the total number of bytes currently occupied by offloaded replicas on the segment's SSD. `ssd_used_bytes` is updated alongside metadata changes:
 
-- **Increment**: `NotifyOffloadSuccess` increments `ssd_used_bytes` by the object size when the master adds a `LOCAL_DISK` replica to the object entry. This happens after the client has confirmed a successful write to SSD.
-- **Decrement**: `EvictDiskReplica` decrements `ssd_used_bytes` by the object size when the master removes a `LOCAL_DISK` replica (either through explicit eviction or object deletion).
+- **Increment**: `NotifyOffloadSuccess` increments `ssd_used_bytes` by the object size only after the master successfully adds a `LOCAL_DISK` replica to the object entry. If the object has already disappeared from metadata, the notification is ignored and the counter is not changed.
+- **Decrement**: The master decrements `ssd_used_bytes` when a `LOCAL_DISK` replica is actually removed from metadata. Full object deletion releases all associated local-disk usage through `EraseMetadata`, while partial replica deletion uses `EraseReplicasAndTrackSsdUsage` to pop erased replicas and release usage for removed `LOCAL_DISK` entries.
 
-The counter is atomic to allow concurrent updates from multiple RPC handler threads without requiring a separate lock.
+The counter is atomic to allow concurrent updates from multiple RPC handler threads without requiring a separate lock. The allocation strategy treats it as an eventually consistent placement signal and clamps it before computing the free ratio.
 
 ### `SsdMetricsProvider` interface
 
@@ -126,9 +130,9 @@ The parameter is passed as a gflag to the master process at startup.
 |------|--------|
 | `mooncake-store/include/types.h` | Add `SSD_FREE_RATIO_FIRST` enum value to the allocation strategy enum |
 | `mooncake-store/include/allocation_strategy.h` | Add `SsdMetricsProvider` interface and `SsdFreeRatioFirstAllocationStrategy` class |
-| `mooncake-store/include/segment.h` | Add `ssd_used_bytes` atomic field to `LocalDiskSegment`; inherit `SsdMetricsProvider` |
+| `mooncake-store/include/segment.h` | Add `ssd_total_capacity_bytes` and `ssd_used_bytes` fields to `LocalDiskSegment`; inherit `SsdMetricsProvider` |
 | `mooncake-store/src/segment.cpp` | Implement `getSsdTotalCapacity` and `getSsdUsedBytes` |
-| `mooncake-store/src/master_service.cpp` | Integrate `SsdFreeRatioFirstAllocationStrategy` into allocation dispatch; update `ssd_used_bytes` in `NotifyOffloadSuccess` and `EvictDiskReplica` |
+| `mooncake-store/src/master_service.cpp` | Pass SSD metrics only to `SSD_FREE_RATIO_FIRST`; update `ssd_used_bytes` after successful `NotifyOffloadSuccess` metadata insertion; release usage when `LOCAL_DISK` replicas are erased |
 
 ---
 
