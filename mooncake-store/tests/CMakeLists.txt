@@ -70,6 +70,8 @@ add_store_test(oplog_serializer_test ha/oplog/oplog_serializer_test.cpp)
 add_store_test(localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
 add_store_test(standby_state_machine_test ha/oplog/standby_state_machine_test.cpp)
 add_store_test(ha_metric_manager_test ha/oplog/ha_metric_manager_test.cpp)
+add_store_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
+add_store_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
