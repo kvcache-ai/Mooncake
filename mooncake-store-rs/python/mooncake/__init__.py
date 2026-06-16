@@ -46,14 +46,14 @@ __all__ = sorted(
 )
 
 
-def _install_store_rs_module_alias() -> None:
+def _load_store_rs_module_alias():
     name = f"{__name__}.store"
     existing = sys.modules.get(name)
     if (
         existing is not None
         and pathlib.Path(getattr(existing, "__file__", "")).suffix == ".py"
     ):
-        return
+        return existing
 
     store_py = pathlib.Path(__file__).with_name("store.py")
     spec = importlib.util.spec_from_file_location(name, store_py)
@@ -63,15 +63,12 @@ def _install_store_rs_module_alias() -> None:
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-
-
-_install_store_rs_module_alias()
+    return module
 
 
 def __getattr__(name: str):
     if name in _STORE_EXPORTS:
-        from . import store as store_module
-
+        store_module = _load_store_rs_module_alias()
         return getattr(store_module, name)
     raise AttributeError(name)
 

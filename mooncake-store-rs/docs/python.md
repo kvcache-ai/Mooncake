@@ -286,7 +286,7 @@ pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 
 After installation, both interfaces are available:
 
-- `python -c "import mooncake"` loads the native extension
+- `python -c "import mooncake"` loads package metadata only; the Store-RS native extension is loaded lazily when callers access `mooncake.store` or the top-level Store-RS compatibility exports
 - `python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"` shows the active Pro runtime
 - `python -c "import mooncake; print(mooncake.__build_info__)"` shows the packaged build branch, commit, and build time without loading the native extension
 - `mooncake-store-client --help` runs the packaged standalone client command
