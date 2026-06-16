@@ -1446,7 +1446,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
-        // Open file for this bucket (cheap syscall, no lock needed)
+        // Open file for this bucket (cached via GetOrOpenFile for reads)
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
             LOG(ERROR) << "Failed to get bucket data path, bucket_id="
@@ -1454,7 +1454,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
-        auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+        auto file_res = GetOrOpenFile(filepath_res.value(), FileMode::Read);
         if (!file_res) {
             LOG(ERROR) << "Failed to open bucket file: "
                        << filepath_res.value();
@@ -1462,16 +1462,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            // ---- Batch submission path ----
+            // Collect all key read requests into ReadDesc array, then submit
+            // them in one batch_read call for NVMe queue depth > 1.
+
+            struct ReadEntry {
+                UringFile::ReadDesc desc;
+                std::string key;
+                int64_t offset_in_buffer;
+                size_t actual_size;
+            };
+            std::vector<ReadEntry> entries;
+            entries.reserve(read_plans.size());
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
@@ -1482,39 +1490,108 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     static_cast<size_t>(aligned_end - aligned_offset);
                 int64_t offset_in_buffer = actual_offset - aligned_offset;
 
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-
-                if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    read_res = plan.dest_slice.size;
-                }
-            } else
-#endif
-            {
-                // Fallback to vector_read for non-UringFile
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
+                entries.push_back(
+                    {{plan.dest_slice.ptr, aligned_size, aligned_offset},
+                     plan.key,
+                     offset_in_buffer,
+                     plan.dest_slice.size});
             }
 
-            if (!read_res) {
-                LOG(ERROR) << "vector_read failed for key: " << plan.key
-                           << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
+            // Build descs, skipping zero-length entries (clamped to EOF)
+            std::vector<UringFile::ReadDesc> descs;
+            descs.reserve(entries.size());
+            for (const auto& e : entries) {
+                descs.push_back(e.desc);
             }
 
-            if (read_res.value() != plan.dest_slice.size) {
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
-                           << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
+            // The write path (non-uring) does not pad files to alignment.
+            // Aligned reads may extend past EOF, causing the kernel to
+            // return fewer bytes (short read). Compute expected_total
+            // accounting for EOF, but keep desc.len as aligned_size
+            // so O_DIRECT requests stay block-aligned.
+            std::error_code size_ec;
+            auto file_size =
+                std::filesystem::file_size(filepath_res.value(), size_ec);
+            if (size_ec) {
+                LOG(ERROR) << "Failed to get file size for bucket_id="
+                           << bucket_id << ": " << size_ec.message();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+
+            size_t expected_total = 0;
+            for (const auto& e : entries) {
+                int64_t actual_offset = e.desc.off + e.offset_in_buffer;
+
+                // Check: actual data must fit in the file
+                if (static_cast<uint64_t>(actual_offset + e.actual_size) >
+                    file_size) {
+                    LOG(ERROR)
+                        << "Key data extends beyond EOF: key=" << e.key
+                        << ", bucket_id=" << bucket_id
+                        << ", data_end=" << (actual_offset + e.actual_size)
+                        << ", file_size=" << file_size;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+
+                // Expected bytes for this entry: full aligned_size,
+                // or truncated at EOF (kernel will short-read)
+                uint64_t read_end =
+                    static_cast<uint64_t>(e.desc.off) + e.desc.len;
+                if (read_end > file_size) {
+                    expected_total +=
+                        file_size - static_cast<uint64_t>(e.desc.off);
+                } else {
+                    expected_total += e.desc.len;
+                }
+            }
+
+            // Submit all SQEs at once; NVMe processes them in parallel.
+            // desc.len stays as aligned_size (block-aligned for O_DIRECT).
+            // The kernel returns fewer bytes at EOF (short read).
+            auto batch_res = uring_file->batch_read(
+                descs.data(), static_cast<int>(descs.size()));
+            if (!batch_res) {
+                LOG(ERROR) << "batch_read failed for bucket_id=" << bucket_id
+                           << ", error=" << static_cast<int>(batch_res.error());
+                return tl::make_unexpected(batch_res.error());
+            }
+
+            // Validate total bytes read
+            if (batch_res.value() != expected_total) {
+                LOG(ERROR) << "batch_read short read for bucket_id="
+                           << bucket_id << ", expected=" << expected_total
+                           << ", got=" << batch_res.value()
+                           << ", num_keys=" << entries.size();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+
+            // Adjust each key's data pointer to actual data start
+            for (const auto& e : entries) {
+                batch_object.at(e.key).ptr =
+                    static_cast<char*>(e.desc.buf) + e.offset_in_buffer;
+            }
+        } else
+#endif
+        {
+            // Fallback: non-io_uring path, read key by key
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                auto read_res = file->vector_read(&iov, 1, actual_offset);
+
+                if (!read_res) {
+                    LOG(ERROR) << "vector_read failed for key: " << plan.key
+                               << ", bucket_id=" << plan.bucket_id
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
+                }
+
+                if (read_res.value() != plan.dest_slice.size) {
+                    LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                               << ", expected: " << plan.dest_slice.size
+                               << ", got: " << read_res.value();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
             }
         }
     }
@@ -2378,6 +2455,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
+        // Invalidate fd cache before deleting to avoid stale fd reuse
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path_res.value());
+        }
         fs::remove(data_path_res.value(), ec);
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove data file: "
