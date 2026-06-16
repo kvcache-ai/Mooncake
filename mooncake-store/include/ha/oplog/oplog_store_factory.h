@@ -33,7 +33,7 @@ static constexpr OpLogStoreType kDefaultOpLogStoreType =
 inline OpLogStoreType ParseOpLogStoreType(const std::string& type_str) {
     std::string lower = type_str;
     std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+                   [](unsigned char c) -> char { return std::tolower(c); });
     if (lower == "localfs" || lower == "local_fs") {
         return OpLogStoreType::LOCAL_FS;
     }

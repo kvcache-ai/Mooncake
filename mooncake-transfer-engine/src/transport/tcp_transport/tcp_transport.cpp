@@ -605,7 +605,7 @@ TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
     if (getenv("MC_TCP_ENABLE_CONNECTION_POOL") != nullptr) {
         std::string val(getenv("MC_TCP_ENABLE_CONNECTION_POOL"));
         std::transform(val.begin(), val.end(), val.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) -> char { return std::tolower(c); });
         if (val == "0" || val == "false" || val == "no") {
             enable_connection_pool_ = false;
         } else {
