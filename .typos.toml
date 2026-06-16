@@ -15,4 +15,7 @@ Optin = "Optin"
 [files]
 extend-exclude = [
   "mooncake-transfer-engine/tent/include/tent/thirdparty/nlohmann/json.h",
+  # DeepEP-derived elastic kernel headers keep upstream identifiers such as
+  # `ue8m0x4`; exclude the imported header block from spelling checks.
+  "mooncake-ep/include/elastic/*",
 ]
