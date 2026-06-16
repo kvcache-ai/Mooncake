@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <shared_mutex>
@@ -15,6 +16,7 @@
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
+#include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "common.h"
 #include "segment.h"
@@ -212,6 +214,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
+    // Initialize HTTP metadata key prefix (read env var once at startup)
+    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
+    if (custom_prefix && std::strlen(custom_prefix) > 0) {
+        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
+        if (http_metadata_prefix_.back() != '/') {
+            http_metadata_prefix_ += '/';
+        }
+    } else {
+        http_metadata_prefix_ = "mooncake/";
+    }
+
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -7032,6 +7045,8 @@ void MasterService::ClientMonitorFunc() {
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_mem_segment";
+                    // Clean up HTTP metadata if enabled
+                    cleanupHttpMetadata(segment_names[i]);
                 }
                 for (auto& client_id : expired_clients) {
                     segment_access.UnmountLocalDiskSegment(client_id);
@@ -8734,6 +8749,29 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
+    http_metadata_server_ = server;
+    if (server) {
+        LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled";
+    }
+}
+
+void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
+    if (!http_metadata_server_) {
+        return;
+    }
+
+    std::string ram_key = http_metadata_prefix_ + "ram/" + segment_name;
+    bool ram_removed = http_metadata_server_->removeKey(ram_key);
+
+    std::string rpc_key = http_metadata_prefix_ + "rpc_meta/" + segment_name;
+    bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
+
+    LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
+              << ", ram_key_removed=" << ram_removed
+              << ", rpc_key_removed=" << rpc_removed;
 }
 
 }  // namespace mooncake

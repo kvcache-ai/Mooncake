@@ -13,8 +13,12 @@
 namespace mooncake {
 
 WrappedMasterService::WrappedMasterService(
-    const WrappedMasterServiceConfig& config)
-    : master_service_(MasterServiceConfig(config)) {}
+    const WrappedMasterServiceConfig& config,
+    HttpMetadataServer* http_metadata_server)
+    : master_service_(MasterServiceConfig(config)) {
+    // Set HttpMetadataServer reference for cleanup on client timeout
+    master_service_.setHttpMetadataServer(http_metadata_server);
+}
 
 WrappedMasterService::~WrappedMasterService() = default;
 
