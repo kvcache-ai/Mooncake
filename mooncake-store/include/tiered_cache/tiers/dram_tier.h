@@ -34,6 +34,12 @@ class DramCacheTier : public CacheTier {
     MemoryType GetMemoryType() const override { return MemoryType::DRAM; }
 
    private:
+    tl::expected<std::string, ErrorCode> AllocateMemory();
+    tl::expected<void, ErrorCode> RegisterWithEngine(
+        const std::string& location);
+    tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
+    CreateAllocator();
+
     UUID tier_id_;
     size_t capacity_;
     std::vector<std::string> tags_;
