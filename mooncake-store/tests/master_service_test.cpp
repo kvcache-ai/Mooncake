@@ -713,6 +713,93 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
 }
 
+TEST_F(MasterServiceTest, BatchGetReplicaListPreservesOrderWithGroupedKeys) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string grouped_key_a = "batch_get_grouped_a";
+    const std::string missing_key = "batch_get_missing";
+    const std::string ungrouped_key = "batch_get_ungrouped";
+    const std::string grouped_key_b = "batch_get_grouped_b";
+    const std::string pending_key = "batch_get_pending";
+
+    ReplicateConfig grouped_config_a;
+    grouped_config_a.replica_num = 1;
+    grouped_config_a.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(grouped_key_a)};
+    PutCompletedObject(*service_, client_id, grouped_key_a, grouped_config_a);
+
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, ungrouped_key, ungrouped_config);
+
+    ReplicateConfig grouped_config_b;
+    grouped_config_b.replica_num = 1;
+    grouped_config_b.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(grouped_key_b)};
+    PutCompletedObject(*service_, client_id, grouped_key_b, grouped_config_b);
+
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, pending_key, "default", 1024,
+                               ungrouped_config)
+                    .has_value());
+
+    const std::vector<std::string> keys = {
+        grouped_key_a, missing_key, ungrouped_key, grouped_key_b, pending_key};
+    auto results = service_->BatchGetReplicaList(keys, "default");
+
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_FALSE(results[0]->replicas.empty());
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, results[1].error());
+    ASSERT_TRUE(results[2].has_value());
+    EXPECT_FALSE(results[2]->replicas.empty());
+    ASSERT_TRUE(results[3].has_value());
+    EXPECT_FALSE(results[3]->replicas.empty());
+    ASSERT_FALSE(results[4].has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, results[4].error());
+}
+
+TEST_F(MasterServiceTest, BatchGetReplicaListKeepsTenantIsolation) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "batch_get_tenant_shared_key";
+    const std::string tenant_a = "batch_get_tenant_a";
+    const std::string tenant_b = "batch_get_tenant_b";
+
+    ReplicateConfig config_a;
+    config_a.replica_num = 1;
+    config_a.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_a, 1024, config_a)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+
+    ReplicateConfig config_b;
+    config_b.replica_num = 1;
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_b, 2048, config_b)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto tenant_a_results = service_->BatchGetReplicaList({key}, tenant_a);
+    auto tenant_b_results = service_->BatchGetReplicaList({key}, tenant_b);
+    auto default_results = service_->BatchGetReplicaList({key}, "default");
+
+    ASSERT_EQ(tenant_a_results.size(), 1u);
+    ASSERT_EQ(tenant_b_results.size(), 1u);
+    ASSERT_EQ(default_results.size(), 1u);
+    EXPECT_TRUE(tenant_a_results[0].has_value());
+    EXPECT_TRUE(tenant_b_results[0].has_value());
+    ASSERT_FALSE(default_results[0].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, default_results[0].error());
+}
+
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
