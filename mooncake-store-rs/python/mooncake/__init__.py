@@ -4,8 +4,6 @@ import importlib.util
 import pathlib
 import sys
 
-from ._build_info import BUILD_INFO
-
 _STORE_EXPORTS = {
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
@@ -17,22 +15,20 @@ _STORE_EXPORTS = {
     "start_metrics_server",
     "stop_metrics_server",
 }
+_BUILD_EXPORTS = {
+    "__build_branch__",
+    "__build_commit__",
+    "__build_info__",
+    "__build_time__",
+}
 
 __edition__ = "pro"
 __version__ = "1.0.0+pro.1"
 
-__build_branch__ = BUILD_INFO["branch"]
-__build_commit__ = BUILD_INFO["commit"]
-__build_time__ = BUILD_INFO["build_time"]
-__build_info__ = dict(BUILD_INFO)
-
 __all__ = sorted(
     _STORE_EXPORTS
+    | _BUILD_EXPORTS
     | {
-        "__build_branch__",
-        "__build_commit__",
-        "__build_info__",
-        "__build_time__",
         "__edition__",
         "__version__",
     }
@@ -59,12 +55,25 @@ def _load_store_rs_module_alias():
     return module
 
 
+def _load_build_exports() -> None:
+    from ._build_info import BUILD_INFO
+
+    info = dict(BUILD_INFO)
+    globals()["__build_branch__"] = info["branch"]
+    globals()["__build_commit__"] = info["commit"]
+    globals()["__build_time__"] = info["build_time"]
+    globals()["__build_info__"] = info
+
+
 def __getattr__(name: str):
     if name in _STORE_EXPORTS:
         store_module = _load_store_rs_module_alias()
         return getattr(store_module, name)
+    if name in _BUILD_EXPORTS:
+        _load_build_exports()
+        return globals()[name]
     raise AttributeError(name)
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | _STORE_EXPORTS)
+    return sorted(set(globals()) | _STORE_EXPORTS | _BUILD_EXPORTS)
