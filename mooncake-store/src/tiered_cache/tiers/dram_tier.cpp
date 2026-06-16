@@ -244,15 +244,25 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
     if (engine != nullptr) engine_ = engine;
 
     auto alloc_result = AllocateMemory();
-    if (!alloc_result) return tl::unexpected(alloc_result.error());
+    if (!alloc_result) {
+        LOG(ERROR) << "DramCacheTier " << tier_id_
+                   << " Init failed: AllocateMemory error";
+        return tl::unexpected(alloc_result.error());
+    }
 
     if (engine_) {
         auto reg = RegisterWithEngine(*alloc_result);
-        if (!reg) return tl::unexpected(reg.error());
+        if (!reg) {
+            LOG(ERROR) << "DramCacheTier " << tier_id_
+                       << " Init failed: RegisterWithEngine error";
+            return tl::unexpected(reg.error());
+        }
     }
 
     auto alloc = CreateAllocator();
     if (!alloc) {
+        LOG(ERROR) << "DramCacheTier " << tier_id_
+                   << " Init failed: CreateAllocator error, rolling back";
         if (engine_) engine_->unregisterLocalMemory(memory_buffer_.get());
         return tl::unexpected(alloc.error());
     }
