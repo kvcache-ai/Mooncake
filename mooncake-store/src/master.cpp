@@ -1179,7 +1179,8 @@ int main(int argc, char* argv[]) {
                 << "enable_metadata_cleanup_on_timeout is set to true but "
                    "enable_http_metadata_server is false and no HTTP metadata "
                    "server address could be derived from the cluster config "
-                   "(set MOONCAKE_TE_META_DATA_SERVER=http://host:port/metadata "
+                   "(set "
+                   "MOONCAKE_TE_META_DATA_SERVER=http://host:port/metadata "
                    "or MOONCAKE_CONFIG_PATH). Disabling metadata cleanup on "
                    "timeout.";
             master_config.enable_metadata_cleanup_on_timeout = false;
