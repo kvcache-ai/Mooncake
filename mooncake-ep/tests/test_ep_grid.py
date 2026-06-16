@@ -13,6 +13,26 @@ from mooncake.mooncake_ep_buffer import Buffer
 import mooncake.pg as pg
 
 
+def using_musa_backend() -> bool:
+    return os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    }
+
+
+def import_torchada_if_needed():
+    if not using_musa_backend():
+        return
+    try:
+        import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
+    except ImportError as exc:
+        raise unittest.SkipTest(
+            "torchada is required when MOONCAKE_EP_USE_MUSA is enabled"
+        ) from exc
+
+
 def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     hidden = x_fp8.shape[-1]
     x_view = x_fp8.reshape(-1, hidden // 128, 128).float()
@@ -185,7 +205,7 @@ def run_test_iteration(
 
 
 def worker(rank, world_size, config_dict):
-    import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
+    import_torchada_if_needed()
 
     # Device filter
     device_filter = [
@@ -219,7 +239,7 @@ def worker(rank, world_size, config_dict):
 
 class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
-        import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
+        import_torchada_if_needed()
         self.world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
