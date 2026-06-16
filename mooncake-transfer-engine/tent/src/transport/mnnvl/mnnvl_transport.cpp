@@ -272,7 +272,6 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto &task = mnnvl_batch->task_list[task_id];
-    status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
         auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
@@ -282,6 +281,9 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
             task.status_word = TransferStatusEnum::FAILED;
         }
     }
+    // Read status AFTER the poll so a just-observed completion/failure is
+    // reported on this call rather than one poll cycle late.
+    status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
 
