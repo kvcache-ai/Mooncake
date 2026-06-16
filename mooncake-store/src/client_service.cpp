@@ -628,6 +628,18 @@ ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
+    // TEs created through the Store entry (Client::Create ->
+    // InitTransferEngine) are tagged so ascend_direct can resolve a per-role
+    // link config (e.g. Store=RoCE/D2H, P2P=HCCS/D2D). The flag only needs to
+    // be live while the ascend transport is installed below; reset it on every
+    // exit path. Assumes TE inits are serialized within the process.
+    struct StoreTeInitGuard {
+        ~StoreTeInitGuard() { globalConfig().ascend_store_te_init = false; }
+    } store_te_init_guard;
+    if (protocol == "ascend") {
+        globalConfig().ascend_store_te_init = true;
+    }
+
     // Check if using TENT mode - TENT handles transport configuration
     // internally
     bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
