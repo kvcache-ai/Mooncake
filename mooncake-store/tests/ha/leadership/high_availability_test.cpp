@@ -400,8 +400,10 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeTimesOutWhenStable) {
 }
 
 // When the observed view already differs from the caller's known version,
-// WaitForViewChange returns immediately via the initial read, without arming a
-// watch. Passing no known version while a leader exists is one such case.
+// WaitForViewChange returns promptly: it arms the watch (now established
+// synchronously via WithCreatedNotify) and then the initial read short-circuits
+// on the version mismatch before any event is awaited. Passing no known version
+// while a leader exists is one such case.
 TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
