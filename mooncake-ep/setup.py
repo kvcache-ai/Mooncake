@@ -38,7 +38,9 @@ setup(
             sources=[
                 "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",
+                "src/mooncake_ep_elastic_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
+                "src/mooncake_ep_elastic_kernel.cu",
             ],
             extra_compile_args={
                 "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0", "-DUSE_CUDA"],

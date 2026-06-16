@@ -207,6 +207,7 @@ if(WITH_EP)
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_elastic_buffer.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
     DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
   # ep.so / pg.so link against engine.so by that exact bare name. Create a

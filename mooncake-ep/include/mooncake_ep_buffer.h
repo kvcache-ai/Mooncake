@@ -16,6 +16,7 @@
 namespace mooncake {
 
 class TransferEngine;
+class MooncakeElasticBuffer;
 
 // MAX_QP_COUNT is defined in mooncake_ep_configs.cuh (shared with kernel code).
 
@@ -64,6 +65,8 @@ struct BufferPair {
 
 struct MooncakeEpBuffer {
    private:
+    friend class MooncakeElasticBuffer;
+
     // Device info and communication
     int device_id;
     int rank, num_ranks;
