@@ -1454,18 +1454,23 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     }
 
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
-    std::vector<std::vector<size_t>> keys_by_shard(kNumShards);
+    constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
+    std::array<size_t, kNumShards> key_list_heads;
+    key_list_heads.fill(kInvalidKeyIndex);
+    std::vector<size_t> next_key_indexes(keys.size(), kInvalidKeyIndex);
     {
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-        for (size_t i = 0; i < keys.size(); ++i) {
+        for (size_t i = keys.size(); i > 0; --i) {
+            const size_t original_idx = i - 1;
             const auto scoped_key =
-                MakeTenantScopedKey(normalized_tenant, keys[i]);
+                MakeTenantScopedKey(normalized_tenant, keys[original_idx]);
             const auto route_it = object_group_ids_.find(scoped_key);
             const size_t shard_idx =
                 route_it == object_group_ids_.end()
-                    ? getShardIndex(normalized_tenant, keys[i])
+                    ? getShardIndex(normalized_tenant, keys[original_idx])
                     : getShardIndex(route_it->second);
-            keys_by_shard[shard_idx].push_back(i);
+            next_key_indexes[original_idx] = key_list_heads[shard_idx];
+            key_list_heads[shard_idx] = original_idx;
         }
     }
 
@@ -1474,8 +1479,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
-        const auto& key_indexes = keys_by_shard[shard_idx];
-        if (key_indexes.empty()) {
+        if (key_list_heads[shard_idx] == kInvalidKeyIndex) {
             continue;
         }
 
@@ -1483,7 +1487,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         {
             MetadataShardAccessorRO shard(this, shard_idx);
             const auto tenant_it = shard->tenants.find(normalized_tenant);
-            for (const auto original_idx : key_indexes) {
+            for (size_t original_idx = key_list_heads[shard_idx];
+                 original_idx != kInvalidKeyIndex;
+                 original_idx = next_key_indexes[original_idx]) {
                 const std::string& key = keys[original_idx];
                 MasterMetricManager::instance().inc_total_get_nums();
 
