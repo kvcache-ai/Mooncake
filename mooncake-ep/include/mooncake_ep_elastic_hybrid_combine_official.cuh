@@ -89,13 +89,13 @@ hybrid_combine_impl(nv_bfloat16* x,
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
     __syncwarp();
 
-    // NCCL Gin handle
+    // Mooncake Gin handle
     // Each warp is a channel
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM>(sm_idx, warp_idx % kNumChannelsPerSM);
     const auto gin = transport::MooncakeGin(comm_ctx, qp_idx, sharing_mode, kNumQPs,
                                            scaleout_rank_idx, scaleup_rank_idx,
-                                           kNumScaleupRanks);
+                                           kNumScaleupRanks, kNumRanks);
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before

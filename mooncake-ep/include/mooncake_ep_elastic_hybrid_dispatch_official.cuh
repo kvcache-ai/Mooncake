@@ -76,13 +76,13 @@ hybrid_dispatch_impl(
     // Named barrier indices
     constexpr int kNotifyBarrierIndex = 1;
 
-    // NCCL Gin handle
+    // Mooncake Gin handle
     // Each warp is a channel
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, (kNumNotifyWarps > 0)>(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = transport::MooncakeGin(comm_ctx, qp_idx, sharing_mode, kNumQPs,
                                            scaleout_rank_idx, scaleup_rank_idx,
-                                           kNumScaleupRanks);
+                                           kNumScaleupRanks, kNumRanks);
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
@@ -346,7 +346,9 @@ hybrid_dispatch_impl(
 
                 // NOTES: the "release" scope will be `sys` for the local rank (we may involve NVLink so not `gpu`)
                 // For RDMA requests, "release" is ensured by "atomic"
-                gin.red_add_rel<transport::ScaleoutTeam>(ptr, signaled_tail - old_signaled_tail, lane_idx);
+                gin.red_add_rel<transport::ScaleoutTeam>(
+                    ptr, signaled_tail - old_signaled_tail, lane_idx,
+                    transport::kRedAddReleaseLowWordLast);
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
             __syncwarp();

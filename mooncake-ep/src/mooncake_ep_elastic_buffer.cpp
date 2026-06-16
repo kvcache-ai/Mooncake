@@ -40,9 +40,11 @@ int64_t elastic_workspace_num_bytes() {
     constexpr int64_t kNumMaxExperts = 2048;
     constexpr int64_t kNumMaxChannels = 8 * 160;
     constexpr int64_t kNumMaxInflightAGRS = 32;
+    constexpr int64_t kNumBarrierTags = 16;
 
     int64_t num_bytes = 0;
-    num_bytes += sizeof(unsigned long long) + 2 * kNumMaxRanks * sizeof(int);
+    num_bytes += kNumBarrierTags *
+                 (sizeof(unsigned long long) + 2 * kNumMaxRanks * sizeof(int));
     num_bytes += (kNumMaxRanks + kNumMaxExperts) * sizeof(int64_t);
     num_bytes += kNumMaxRanks * sizeof(int64_t) * 2;
     num_bytes += kNumMaxExperts * sizeof(int64_t) * 2;
@@ -54,6 +56,10 @@ int64_t elastic_workspace_num_bytes() {
     num_bytes += 2 * 2 * sizeof(int64_t);
     num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
     return align_i64(num_bytes, 32);
+}
+
+int64_t elastic_atomic_scratch_num_bytes() {
+    return elastic_workspace_num_bytes();
 }
 
 int device_smem_bytes() {
@@ -77,19 +83,24 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     // the registered GDR buffer base.  DeepEP elastic writes both `buffer` and
     // `workspace` pointers to peer ranks through GIN, so both regions must live
     // inside the same peer-visible registered allocation.  The elastic buffer
-    // size already reserves `elastic_workspace_num_bytes()` first; use that
-    // prefix as the workspace and place the communication buffer after it.
+    // size reserves `elastic_workspace_num_bytes()` first; use that prefix as
+    // the workspace.  RDMA atomics also need a separate local response area:
+    // mlx5 atomics write the fetched old value to the WQE local address, so
+    // reusing the remote signal workspace as `local_atomic_base` can corrupt
+    // the barrier/signal slots.  Reserve an equal-sized scratch prefix after
+    // the workspace, then place the communication buffer after both prefixes.
     const auto workspace_bytes = elastic_workspace_num_bytes();
+    const auto atomic_scratch_bytes = elastic_atomic_scratch_num_bytes();
     ctx.gdr_buffer = gdr_base;
     ctx.nvlink_available = buffer.p2p_transport_->availableTablePtr();
     ctx.ipc_peer_ptrs = buffer.p2p_transport_->peerPtrsTablePtr();
     ctx.raddrs = rdma ? rdma->raddrsPtr() : nullptr;
     ctx.rkeys = rdma ? rdma->rkeysPtr() : nullptr;
     ctx.qp_devctxs = rdma ? rdma->qpDevCtxsPtr() : nullptr;
-    ctx.rdma_send_signal_buffer = gdr_base;
+    ctx.rdma_send_signal_buffer = gdr_base + workspace_bytes;
     ctx.rdma_recv_signal_buffer = gdr_base;
     ctx.workspace = gdr_base;
-    ctx.buffer = gdr_base + workspace_bytes;
+    ctx.buffer = gdr_base + workspace_bytes + atomic_scratch_bytes;
     ctx.mapped_host_workspace = mapped_host_workspace;
     ctx.rank = topology.rank_idx;
     ctx.num_ranks = topology.num_ranks;
@@ -166,6 +177,7 @@ int64_t MooncakeElasticBuffer::calculate_buffer_size(
     const int64_t combine_bytes = dispatch_bytes * combine_factor;
     const int64_t hybrid_factor = allow_hybrid_mode && num_ranks > 1 ? 2 : 1;
     return elastic_workspace_num_bytes() +
+           elastic_atomic_scratch_num_bytes() +
            hybrid_factor * (dispatch_bytes + combine_bytes);
 }
 
@@ -395,7 +407,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     handle.expert_alignment = expert_alignment;
     handle.num_max_tokens_per_rank = num_max_tokens_per_rank;
     handle.num_sms = num_sms;
-    handle.topk_idx = topk_idx.clone();
+    handle.topk_idx = cached_mode ? cached_handle->topk_idx : topk_idx.clone();
     handle.psum_num_recv_tokens_per_expert = sliced_psum_num_recv_tokens_per_expert;
     handle.psum_num_recv_tokens_per_scaleup_rank =
         psum_num_recv_tokens_per_scaleup_rank;

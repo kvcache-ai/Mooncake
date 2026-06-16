@@ -77,18 +77,18 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
     if (kNumSMs > 1 && sm_idx > 0) return;
 
-    const int status = static_cast<int>((*workspace.get_nvl_barrier_counter_ptr()) & 3);
+    const int status = static_cast<int>((*workspace.get_nvl_barrier_counter_ptr(kTag)) & 3);
     const int phase = status & 1;
     const int sign = status >> 1;
-    const int* base_signal = workspace.get_nvl_barrier_signal_ptr(phase);
+    const int* base_signal = workspace.get_nvl_barrier_signal_ptr(kTag, phase);
 
     if (thread_idx < kNumRanks) {
         auto* dst_ptr = const_cast<int*>(base_signal) + rank_idx;
-        gin.put_value<team_t>(dst_ptr, sign ? -1 : 1, thread_idx);
+        gin.red_add_rel<team_t>(dst_ptr, sign ? -1 : 1, thread_idx);
     }
     __syncthreads();
 
-    if (thread_idx == 0) atomicAdd(workspace.get_nvl_barrier_counter_ptr(), 1ULL);
+    if (thread_idx == 0) atomicAdd(workspace.get_nvl_barrier_counter_ptr(kTag), 1ULL);
 
     timeout_while<kNumTimeoutCycles>(thread_idx == 0, [=](const bool& is_last_check) {
         int sum = 0;
@@ -96,12 +96,12 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
         for (int i = 0; i < kNumRanks; ++i) {
             sum += ptx::ld_acquire_sys<int>(const_cast<int*>(base_signal) + i);
         }
-        // Mooncake's portable barrier uses one release-store slot per source
-        // rank.  Unlike DeepEP/NCCL GIN RED semantics, the negative phase does
-        // not atomically add -1 to a previous +1 value; it overwrites each
-        // per-rank slot with -1.  Therefore the completed sums alternate
-        // between +kNumRanks and -kNumRanks across the two slot phases.
-        const auto target = sign ? -kNumRanks : kNumRanks;
+        // Mooncake's portable barrier uses one additive slot per source rank.
+        // Each positive phase adds +1 into a zeroed phase slot; the matching
+        // negative phase later adds -1 into the same phase slot.  This matches
+        // RDMA atomic-add semantics and avoids relying on a remote store
+        // primitive for non-P2P peers.
+        const auto target = sign ? 0 : kNumRanks;
         if (sum == target) return true;
         if (is_last_check) {
             printf("Mooncake elastic barrier timeout, tag: %d, rank: %d, signal-sum: %d, target: %d\n",

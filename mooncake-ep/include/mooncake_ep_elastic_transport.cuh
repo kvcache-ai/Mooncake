@@ -13,6 +13,9 @@ struct WorldTeam {};
 struct ScaleupTeam {};
 struct ScaleoutTeam {};
 
+constexpr int kRedAddReleaseHighWordLast = 0;
+constexpr int kRedAddReleaseLowWordLast = 1 << 0;
+
 // Mooncake Device API adapter for DeepEP's NCCL GIN usage.
 //
 // DeepEP elastic kernels express all remote communication through a small GIN
@@ -31,7 +34,7 @@ struct MooncakeGin {
     device::CommCtx ctx;
     int qp_idx = 0;
     int sharing_mode = 0;
-    int num_qps = 1;
+    int qps_per_rank = 1;
     int scaleout_rank_idx = 0;
     int scaleup_rank_idx = 0;
     int num_scaleup_ranks = 0;
@@ -42,11 +45,12 @@ struct MooncakeGin {
                                            int num_qps,
                                            int scaleout_rank_idx = 0,
                                            int scaleup_rank_idx = 0,
-                                           int num_scaleup_ranks = 0)
+                                           int num_scaleup_ranks = 0,
+                                           int num_ranks = 1)
         : ctx(ctx),
           qp_idx(qp_idx),
           sharing_mode(sharing_mode),
-          num_qps(num_qps),
+          qps_per_rank(max(1, num_qps / max(1, num_ranks))),
           scaleout_rank_idx(scaleout_rank_idx),
           scaleup_rank_idx(scaleup_rank_idx),
           num_scaleup_ranks(num_scaleup_ranks) {}
@@ -112,7 +116,7 @@ struct MooncakeGin {
             // so a system fence is sufficient to publish the writes.
             __threadfence_system();
         } else {
-            device::mc_rdma_put(ctx, qp_idx, dst_rank, max(1, num_qps), src_ptr,
+            device::mc_rdma_put(ctx, qp_idx, dst_rank, qps_per_rank, src_ptr,
                                 dst_ptr, static_cast<uint32_t>(num_bytes), 0);
         }
     }
@@ -132,12 +136,11 @@ struct MooncakeGin {
             }
         } else {
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
-                device::mc_signal(ctx, dst_rank, qp_idx, max(1, num_qps),
+                device::mc_signal(ctx, dst_rank, qp_idx, qps_per_rank,
                                   reinterpret_cast<int*>(dst_ptr),
                                   static_cast<int32_t>(value));
             } else {
-                const int lane_id = threadIdx.x & 31;
-                device::mc_rdma_put(ctx, qp_idx, dst_rank, max(1, num_qps),
+                device::mc_rdma_put(ctx, qp_idx, dst_rank, qps_per_rank,
                                     &value, dst_ptr, sizeof(value_t), 0);
             }
         }
@@ -152,12 +155,11 @@ struct MooncakeGin {
             if (routed != nullptr) {
                 device::mc_atomic_add_release(routed, static_cast<int>(value));
             } else {
-                device::mc_red_add(ctx, dst_rank, qp_idx, max(1, num_qps),
+                device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
                                    reinterpret_cast<int*>(dst_ptr), static_cast<int32_t>(value));
             }
         } else if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
                              sizeof(value_t) == sizeof(int64_t)) {
-            const int logical_dst_rank = dst_rank;
             dst_rank = world_rank<team_t>(dst_rank);
             auto* routed = static_cast<int64_t*>(
                 device::mc_route_put(ctx, dst_rank, dst_ptr));
@@ -172,11 +174,37 @@ struct MooncakeGin {
                 ptx::red_add_rel_sys(routed, static_cast<int64_t>(value));
             } else {
                 // Mooncake's current Device API only exposes 32-bit remote
-                // reduction.  Keep the old direct-write fallback for non-P2P
-                // transports so unsupported IBGDA configurations fail by the
-                // existing timeout checks instead of compilation; same-node
-                // hybrid scale-up/scale-out uses the P2P atomic path above.
-                put_value<team_t>(dst_ptr, value, logical_dst_rank, flags);
+                // reduction.  Do not emulate the 64-bit add with an RDMA WRITE
+                // from a thread-local scalar: IBGDA WQEs use the registered GDR
+                // buffer lkey, so a stack/local address is not a valid DMA
+                // source on true cross-node runs.  Split the packed signal into
+                // two 32-bit remote reductions instead, publishing the readiness
+                // word last.  Most notify counters use high word as the ready
+                // count; hybrid channel tails use low word as the finish flag.
+                auto* words = reinterpret_cast<int32_t*>(dst_ptr);
+                const auto signed_value = static_cast<int64_t>(value);
+                const auto low = static_cast<int32_t>(
+                    static_cast<uint64_t>(signed_value) & 0xffffffffull);
+                const auto high = static_cast<int32_t>(signed_value >> 32);
+                if ((flags & kRedAddReleaseLowWordLast) == 0) {
+                    if (low != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words, low);
+                    }
+                    if (high != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words + 1, high);
+                    }
+                } else {
+                    if (high != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words + 1, high);
+                    }
+                    if (low != 0) {
+                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                                           words, low);
+                    }
+                }
             }
         } else {
             put_value<team_t>(dst_ptr, value, dst_rank, flags);

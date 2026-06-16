@@ -81,7 +81,7 @@ class ElasticBuffer:
     _NUM_MAX_RANKS = 1024
     _NUM_MAX_EXPERTS = 2048
     _NUM_MAX_CHANNELS = 8 * 160
-    _NUM_BARRIER_SIGNAL_BYTES = 16
+    _NUM_BARRIER_TAGS = 16
     _NUM_MAX_INFLIGHT_AGRS = 32
 
     def __init__(
@@ -262,7 +262,9 @@ class ElasticBuffer:
     @staticmethod
     def _workspace_num_bytes() -> int:
         num_bytes = 0
-        num_bytes += 8 + 2 * ElasticBuffer._NUM_MAX_RANKS * 4
+        num_bytes += ElasticBuffer._NUM_BARRIER_TAGS * (
+            8 + 2 * ElasticBuffer._NUM_MAX_RANKS * 4
+        )
         num_bytes += (ElasticBuffer._NUM_MAX_RANKS + ElasticBuffer._NUM_MAX_EXPERTS) * 8
         num_bytes += ElasticBuffer._NUM_MAX_RANKS * 8 * 2
         num_bytes += ElasticBuffer._NUM_MAX_EXPERTS * 8 * 2
@@ -274,6 +276,12 @@ class ElasticBuffer:
         num_bytes += 2 * 2 * 8
         num_bytes += (ElasticBuffer._NUM_MAX_INFLIGHT_AGRS + 1) * ElasticBuffer._NUM_MAX_RANKS * 4
         return _align(num_bytes, 32)
+
+    @staticmethod
+    def _atomic_scratch_num_bytes() -> int:
+        # Mirrors the native runtime: RDMA atomics need a local response area
+        # separate from the remote-visible workspace.
+        return ElasticBuffer._workspace_num_bytes()
 
     @staticmethod
     def get_buffer_size_hint(
@@ -315,7 +323,11 @@ class ElasticBuffer:
         combine_factor = 3 if allow_multiple_reduction else 4
         combine_bytes = dispatch_bytes * combine_factor
         hybrid_factor = 2 if allow_hybrid_mode and num_ranks > 1 else 1
-        return int(ElasticBuffer._workspace_num_bytes() + hybrid_factor * (dispatch_bytes + combine_bytes))
+        return int(
+            ElasticBuffer._workspace_num_bytes()
+            + ElasticBuffer._atomic_scratch_num_bytes()
+            + hybrid_factor * (dispatch_bytes + combine_bytes)
+        )
 
     @staticmethod
     def get_engram_storage_size_hint(

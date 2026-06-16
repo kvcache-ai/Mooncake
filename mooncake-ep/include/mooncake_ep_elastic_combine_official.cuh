@@ -75,7 +75,8 @@ combine_impl(nv_bfloat16* x,
     // Gin handle
     // We treat each warp as a "channel"
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumWarps>(sm_idx, warp_idx);
-    const auto gin = transport::MooncakeGin(comm_ctx, qp_idx, sharing_mode, kNumQPs);
+    const auto gin = transport::MooncakeGin(comm_ctx, qp_idx, sharing_mode, kNumQPs,
+                                           0, 0, 0, kNumRanks);
 
     // Full barrier to ensure the remote buffer is available
     const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);

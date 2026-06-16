@@ -26,11 +26,16 @@ struct WorkspaceLayout {
 
     // Mooncake Device API does not rely on NCCL GIN remote RED on a single
     // symmetric signal word.  Use per-source-rank signal slots for both phases:
-    // each sender writes its own slot with release semantics and receivers poll
-    // the full slot vector.  This mirrors the proven Mooncake IPC/RDMA memory
-    // model and avoids treating CUDA IPC peer pointers as NCCL symmetric memory.
-    static constexpr int64_t kNumBarrierSignalBytes =
+    // each sender atomically updates its own slot with release semantics and
+    // receivers poll the full slot vector.  Keep an independent counter/slot
+    // vector for each logical barrier tag, as hybrid kernels mix world and
+    // scale-up-only barriers in the same workspace and therefore must not share
+    // phase/sign state across tags.
+    static constexpr int kNumBarrierTags = 16;
+    static constexpr int64_t kNumBarrierBytesPerTag =
         sizeof(unsigned long long) + 2 * kNumMaxRanks * sizeof(int);
+    static constexpr int64_t kNumBarrierSignalBytes =
+        kNumBarrierTags * kNumBarrierBytesPerTag;
 
     __forceinline__ __device__ __host__
     WorkspaceLayout(void* workspace,
@@ -89,12 +94,21 @@ struct WorkspaceLayout {
         return math::align<int64_t>(num_bytes, 32);
     }
 
-    __forceinline__ __device__ __host__ unsigned long long* get_nvl_barrier_counter_ptr() const {
-        return static_cast<unsigned long long*>(workspace);
+    __forceinline__ __device__ __host__
+    unsigned long long* get_nvl_barrier_counter_ptr(int tag = 0) const {
+        EP_UNIFIED_ASSERT(tag >= 0 && tag < kNumBarrierTags);
+        return math::advance_ptr<unsigned long long>(
+            workspace, tag * kNumBarrierBytesPerTag);
     }
 
-    __forceinline__ __device__ __host__ int* get_nvl_barrier_signal_ptr(const int& phase) const {
-        return math::advance_ptr<int>(workspace, sizeof(unsigned long long) + phase * kNumMaxRanks * sizeof(int));
+    __forceinline__ __device__ __host__
+    int* get_nvl_barrier_signal_ptr(int tag, int phase) const {
+        EP_UNIFIED_ASSERT(tag >= 0 && tag < kNumBarrierTags);
+        EP_UNIFIED_ASSERT(phase >= 0 && phase < 2);
+        return math::advance_ptr<int>(
+            workspace, tag * kNumBarrierBytesPerTag +
+                           sizeof(unsigned long long) +
+                           phase * kNumMaxRanks * sizeof(int));
     }
 
     __forceinline__ __device__ __host__ int64_t* get_notify_reduction_workspace_ptr() const {

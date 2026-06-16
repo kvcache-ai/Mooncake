@@ -70,7 +70,8 @@ dispatch_impl(
     // We treat each warp as a "channel"
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumDispatchWarps, (kNumNotifyWarps > 0)>(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
-    const auto gin = transport::MooncakeGin(comm_ctx, qp_idx, sharing_mode, kNumQPs);
+    const auto gin = transport::MooncakeGin(comm_ctx, qp_idx, sharing_mode, kNumQPs,
+                                           0, 0, 0, kNumRanks);
 
     // Barrier without TMA store flush, without prologue grid sync
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
