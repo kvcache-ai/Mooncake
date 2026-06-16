@@ -7259,6 +7259,10 @@ void MasterService::GracefulUnmountScheduler::TimerLoop() {
             queue_.pop();
         }
 
+        // Release the scheduler mutex before UnmountSegment (which takes
+        // snapshot_mutex_) to avoid a lock-order inversion deadlock.
+        lock.unlock();
+
         for (auto& rec : expired) {
             if (service_) {
                 auto result =
