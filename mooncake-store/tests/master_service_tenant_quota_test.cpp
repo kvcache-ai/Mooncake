@@ -1,6 +1,7 @@
 #include "master_service.h"
 
 #include <limits>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -14,9 +15,10 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     MasterServiceConfig MakeConfig(uint64_t default_quota,
                                    uint64_t pool_capacity,
-                                   bool enable_quota = true) {
+                                   bool enable_quota = true,
+                                   std::string root_fs_dir = "") {
         return MasterServiceConfig::builder()
-            .set_root_fs_dir("")
+            .set_root_fs_dir(root_fs_dir)
             .set_enable_tenant_quota(enable_quota)
             .set_default_tenant_quota_bytes(default_quota)
             .set_tenant_quota_pool_capacity_bytes(pool_capacity)
@@ -261,6 +263,32 @@ TEST_F(MasterServiceTenantQuotaTest, RemoveReleasesCommittedCharge) {
 
     ASSERT_TRUE(service.Remove("key", "tenant-a", /*force=*/true).has_value());
     EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
+    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       DiskPutEndBeforeMemoryKeepsQuotaReservation) {
+    MasterService service(
+        MakeConfig(/*default_quota=*/1000, /*pool_capacity=*/1000,
+                   /*enable_quota=*/true, /*root_fs_dir=*/"/tmp/mooncake"));
+    UUID client_id = MountSegment(service);
+
+    auto start =
+        service.PutStart(client_id, "key", "tenant-a", 400, MemoryConfig());
+    ASSERT_TRUE(start.has_value()) << toString(start.error());
+    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
+    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 400);
+
+    auto disk_end =
+        service.PutEnd(client_id, "key", "tenant-a", ReplicaType::DISK);
+    ASSERT_TRUE(disk_end.has_value()) << toString(disk_end.error());
+    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
+    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 400);
+
+    auto memory_end =
+        service.PutEnd(client_id, "key", "tenant-a", ReplicaType::MEMORY);
+    ASSERT_TRUE(memory_end.has_value()) << toString(memory_end.error());
+    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 400);
     EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
 }
 

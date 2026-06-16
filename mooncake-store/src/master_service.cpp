@@ -502,39 +502,42 @@ MasterService::GetTenantQuotaSnapshotForTesting(
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-
-    // Tell the client monitor thread to start timing for this client. To
-    // avoid the following undesired situations, this message must be sent
-    // after locking the segment mutex and before the mounting operation
-    // completes:
-    // 1. Sending the message before the lock: the client expires and
-    // unmouting invokes before this mounting are completed, which prevents
-    // this segment being able to be unmounted forever;
-    // 2. Sending the message after mounting the segment: After mounting
-    // this segment, when trying to push id to the queue, the queue is
-    // already full. However, at this point, the message must be sent,
-    // otherwise this client cannot be monitored and expired.
     {
-        PodUUID pod_client_id;
-        pod_client_id.first = client_id.first;
-        pod_client_id.second = client_id.second;
-        if (!client_ping_queue_.push(pod_client_id)) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=client_ping_queue_full";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+
+        // Tell the client monitor thread to start timing for this client. To
+        // avoid the following undesired situations, this message must be sent
+        // after locking the segment mutex and before the mounting operation
+        // completes:
+        // 1. Sending the message before the lock: the client expires and
+        // unmouting invokes before this mounting are completed, which prevents
+        // this segment being able to be unmounted forever;
+        // 2. Sending the message after mounting the segment: After mounting
+        // this segment, when trying to push id to the queue, the queue is
+        // already full. However, at this point, the message must be sent,
+        // otherwise this client cannot be monitored and expired.
+        {
+            PodUUID pod_client_id;
+            pod_client_id.first = client_id.first;
+            pod_client_id.second = client_id.second;
+            if (!client_ping_queue_.push(pod_client_id)) {
+                LOG(ERROR) << "segment_name=" << segment.name
+                           << ", error=client_ping_queue_full";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
         }
-    }
 
-    LOG(INFO) << "client_id=" << client_id
-              << ", action=mount_segment, segment_name=" << segment.name;
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=mount_segment, segment_name=" << segment.name;
 
-    auto err = segment_access.MountSegment(segment, client_id);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+        auto err = segment_access.MountSegment(segment, client_id);
+        if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            // Return OK because this is an idempotent operation
+            return {};
+        } else if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
     }
     RecomputeTenantEffectiveQuotas();
     return {};
@@ -570,44 +573,50 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    std::unique_lock<std::shared_mutex> lock(client_mutex_);
-    if (ok_client_.contains(client_id)) {
-        LOG(WARNING) << "client_id=" << client_id
-                     << ", warn=client_already_remounted";
-        // Return OK because this is an idempotent operation
-        return {};
+    {
+        std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        if (ok_client_.contains(client_id)) {
+            LOG(WARNING) << "client_id=" << client_id
+                         << ", warn=client_already_remounted";
+            // Return OK because this is an idempotent operation
+            return {};
+        }
+
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+
+            // Tell the client monitor thread to start timing for this client.
+            // To avoid the following undesired situations, this message must be
+            // sent after locking the segment mutex or client mutex and before
+            // the remounting operation completes:
+            // 1. Sending the message before the lock: the client expires and
+            // unmouting invokes before this remounting are completed, which
+            // prevents this segment being able to be unmounted forever;
+            // 2. Sending the message after remounting the segments: After
+            // remounting these segments, when trying to push id to the queue,
+            // the queue is already full. However, at this point, the message
+            // must be sent, otherwise this client cannot be monitored and
+            // expired.
+            PodUUID pod_client_id;
+            pod_client_id.first = client_id.first;
+            pod_client_id.second = client_id.second;
+            if (!client_ping_queue_.push(pod_client_id)) {
+                LOG(ERROR) << "client_id=" << client_id
+                           << ", error=client_ping_queue_full";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+
+            ErrorCode err = segment_access.ReMountSegment(segments, client_id);
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+        }
+
+        // Change the client status to OK
+        ok_client_.insert(client_id);
+        MasterMetricManager::instance().inc_active_clients();
     }
-
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-
-    // Tell the client monitor thread to start timing for this client. To
-    // avoid the following undesired situations, this message must be sent
-    // after locking the segment mutex or client mutex and before the remounting
-    // operation completes:
-    // 1. Sending the message before the lock: the client expires and
-    // unmouting invokes before this remounting are completed, which prevents
-    // this segment being able to be unmounted forever;
-    // 2. Sending the message after remounting the segments: After remounting
-    // these segments, when trying to push id to the queue, the queue is
-    // already full. However, at this point, the message must be sent,
-    // otherwise this client cannot be monitored and expired.
-    PodUUID pod_client_id;
-    pod_client_id.first = client_id.first;
-    pod_client_id.second = client_id.second;
-    if (!client_ping_queue_.push(pod_client_id)) {
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    ErrorCode err = segment_access.ReMountSegment(segments, client_id);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
-    }
-
-    // Change the client status to OK
-    ok_client_.insert(client_id);
-    MasterMetricManager::instance().inc_active_clients();
     RecomputeTenantEffectiveQuotas();
 
     return {};
@@ -1304,11 +1313,14 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     ClearInvalidHandles();
 
     // 3. Commit the unmount operation
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                       metrics_dec_capacity);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
     }
     RecomputeTenantEffectiveQuotas();
     return {};
@@ -2339,7 +2351,12 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (metadata.reserved_quota_charge_bytes > 0) {
+    const bool has_memory_replica = metadata.HasMemReplica();
+    const bool should_settle_quota =
+        replica_type == ReplicaType::MEMORY ||
+        (replica_type == ReplicaType::ALL && has_memory_replica) ||
+        !has_memory_replica;
+    if (metadata.reserved_quota_charge_bytes > 0 && should_settle_quota) {
         const uint64_t actual_charge = CompletedMemoryQuotaCharge(metadata);
         const uint64_t commit_charge =
             actual_charge > metadata.committed_quota_charge_bytes
