@@ -109,7 +109,8 @@ class MooncakeElasticBuffer {
     ElasticCombineOutput combine(
         const torch::Tensor& x, const ElasticNativeHandle& handle,
         const std::optional<torch::Tensor>& topk_weights,
-        torch::Tensor& active_ranks, int num_sms, bool async_with_compute_stream,
+        torch::Tensor& active_ranks, int num_sms,
+        bool async_with_compute_stream,
         const std::optional<torch::Tensor>& out);
 
     MooncakeEpBuffer& native_buffer() { return *native_buffer_; }
@@ -118,14 +119,13 @@ class MooncakeElasticBuffer {
     bool use_fast_path() { return native_buffer_->use_fast_path(); }
     void update_local_qpns() { native_buffer_->update_local_qpns(); }
     bool is_roce() const { return native_buffer_->is_roce(); }
-    void sync_ibgda_peers(
-        const std::vector<int64_t>& remote_addrs,
-        const std::vector<int32_t>& remote_keys,
-        const std::vector<std::vector<int32_t>>& peer_qpns,
-        const std::vector<std::vector<int32_t>>& peer_lids,
-        const std::vector<int64_t>& subnet_prefixes,
-        const std::vector<int64_t>& interface_ids,
-        const std::vector<int>& active_ranks_mask) {
+    void sync_ibgda_peers(const std::vector<int64_t>& remote_addrs,
+                          const std::vector<int32_t>& remote_keys,
+                          const std::vector<std::vector<int32_t>>& peer_qpns,
+                          const std::vector<std::vector<int32_t>>& peer_lids,
+                          const std::vector<int64_t>& subnet_prefixes,
+                          const std::vector<int64_t>& interface_ids,
+                          const std::vector<int>& active_ranks_mask) {
         native_buffer_->sync_ibgda_peers(remote_addrs, remote_keys, peer_qpns,
                                          peer_lids, subnet_prefixes,
                                          interface_ids, active_ranks_mask);

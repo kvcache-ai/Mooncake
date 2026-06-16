@@ -25,13 +25,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<>())
         .def_readwrite("do_expand", &ElasticNativeHandle::do_expand)
         .def_readwrite("num_experts", &ElasticNativeHandle::num_experts)
-        .def_readwrite("expert_alignment", &ElasticNativeHandle::expert_alignment)
+        .def_readwrite("expert_alignment",
+                       &ElasticNativeHandle::expert_alignment)
         .def_readwrite("num_max_tokens_per_rank",
                        &ElasticNativeHandle::num_max_tokens_per_rank)
         .def_readwrite("num_sms", &ElasticNativeHandle::num_sms)
         .def_readwrite("topk_idx", &ElasticNativeHandle::topk_idx)
-        .def_readwrite("psum_num_recv_tokens_per_scaleup_rank",
-                       &ElasticNativeHandle::psum_num_recv_tokens_per_scaleup_rank)
+        .def_readwrite(
+            "psum_num_recv_tokens_per_scaleup_rank",
+            &ElasticNativeHandle::psum_num_recv_tokens_per_scaleup_rank)
         .def_readwrite("psum_num_recv_tokens_per_expert",
                        &ElasticNativeHandle::psum_num_recv_tokens_per_expert)
         .def_readwrite("recv_src_metadata",
@@ -84,8 +86,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &MooncakeEpBuffer::get_next_combine_buffer);
 
     py::class_<MooncakeElasticBuffer>(m, "ElasticBuffer")
-        .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool,
-                      bool, bool, bool, bool, int, int, int, int>(),
+        .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
+                      bool, bool, bool, int, int, int, int>(),
              py::arg("rank"), py::arg("num_ranks"), py::arg("num_buffer_bytes"),
              py::arg("num_max_tokens_per_rank"), py::arg("hidden"),
              py::arg("num_topk"), py::arg("use_fp8_dispatch"),
@@ -114,18 +116,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_ipc_handle", &MooncakeElasticBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles",
              &MooncakeElasticBuffer::sync_nvlink_ipc_handles)
-        .def("dispatch", &MooncakeElasticBuffer::dispatch,
-             py::arg("x"), py::arg("sf"), py::arg("topk_idx"),
-             py::arg("topk_weights"), py::arg("active_ranks"),
-             py::arg("num_experts"), py::arg("num_max_tokens_per_rank"),
-             py::arg("expert_alignment"), py::arg("num_sms"),
-             py::arg("do_expand"), py::arg("do_cpu_sync"),
+        .def("dispatch", &MooncakeElasticBuffer::dispatch, py::arg("x"),
+             py::arg("sf"), py::arg("topk_idx"), py::arg("topk_weights"),
+             py::arg("active_ranks"), py::arg("num_experts"),
+             py::arg("num_max_tokens_per_rank"), py::arg("expert_alignment"),
+             py::arg("num_sms"), py::arg("do_expand"), py::arg("do_cpu_sync"),
              py::arg("async_with_compute_stream"),
              py::arg("cached_handle") = std::nullopt)
-        .def("combine", &MooncakeElasticBuffer::combine,
-             py::arg("x"), py::arg("handle"), py::arg("topk_weights"),
+        .def("combine", &MooncakeElasticBuffer::combine, py::arg("x"),
+             py::arg("handle"), py::arg("topk_weights"),
              py::arg("active_ranks"), py::arg("num_sms"),
-             py::arg("async_with_compute_stream"), py::arg("out") = std::nullopt);
+             py::arg("async_with_compute_stream"),
+             py::arg("out") = std::nullopt);
 }
 
 }  // namespace mooncake

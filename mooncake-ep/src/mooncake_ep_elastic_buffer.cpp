@@ -31,8 +31,8 @@ int hybrid_num_channels(int num_sms) {
 
 int hybrid_num_max_tokens_per_channel(int num_max_tokens_per_rank,
                                       int num_sms) {
-    return static_cast<int>(ceil_div_i64(num_max_tokens_per_rank,
-                                         hybrid_num_channels(num_sms)));
+    return static_cast<int>(
+        ceil_div_i64(num_max_tokens_per_rank, hybrid_num_channels(num_sms)));
 }
 
 int64_t elastic_workspace_num_bytes() {
@@ -144,13 +144,13 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
             num_ranks, num_max_tokens_per_rank, hidden, num_topk,
             use_fp8_dispatch, allow_hybrid_mode, allow_multiple_reduction);
     }
-    native_buffer_ = std::make_unique<MooncakeEpBuffer>(rank, num_ranks,
-                                                        num_buffer_bytes);
+    native_buffer_ =
+        std::make_unique<MooncakeEpBuffer>(rank, num_ranks, num_buffer_bytes);
     host_workspace_bytes_ = elastic_workspace_num_bytes();
     CUDA_CHECK(cudaHostAlloc(&host_workspace_, host_workspace_bytes_,
                              cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostGetDevicePointer(&mapped_host_workspace_,
-                                        host_workspace_, 0));
+    CUDA_CHECK(
+        cudaHostGetDevicePointer(&mapped_host_workspace_, host_workspace_, 0));
     std::memset(host_workspace_, 0, host_workspace_bytes_);
 }
 
@@ -168,21 +168,20 @@ int64_t MooncakeElasticBuffer::calculate_buffer_size(
     bool allow_multiple_reduction) {
     num_topk = std::max<int64_t>(1, num_topk);
     const int64_t dtype_bytes = use_fp8_dispatch ? 1 : 2;
-    const int64_t scale_bytes = use_fp8_dispatch ? ceil_div_i64(hidden, 128) * 4 : 0;
-    const int64_t token_bytes = align_i64(hidden * dtype_bytes, 32) +
-                                align_i64(scale_bytes, 32);
-    const int64_t metadata_bytes =
-        align_i64(num_topk * (sizeof(int) + sizeof(float)) +
-                      (1 + num_topk) * sizeof(int),
-                  32);
+    const int64_t scale_bytes =
+        use_fp8_dispatch ? ceil_div_i64(hidden, 128) * 4 : 0;
+    const int64_t token_bytes =
+        align_i64(hidden * dtype_bytes, 32) + align_i64(scale_bytes, 32);
+    const int64_t metadata_bytes = align_i64(
+        num_topk * (sizeof(int) + sizeof(float)) + (1 + num_topk) * sizeof(int),
+        32);
     const int64_t per_slot_bytes = token_bytes + metadata_bytes;
-    const int64_t dispatch_bytes = num_ranks * num_max_tokens_per_rank *
-                                   num_topk * per_slot_bytes * 2;
+    const int64_t dispatch_bytes =
+        num_ranks * num_max_tokens_per_rank * num_topk * per_slot_bytes * 2;
     const int64_t combine_factor = allow_multiple_reduction ? 3 : 4;
     const int64_t combine_bytes = dispatch_bytes * combine_factor;
     const int64_t hybrid_factor = allow_hybrid_mode && num_ranks > 1 ? 2 : 1;
-    return elastic_workspace_num_bytes() +
-           elastic_atomic_scratch_num_bytes() +
+    return elastic_workspace_num_bytes() + elastic_atomic_scratch_num_bytes() +
            hybrid_factor * (dispatch_bytes + combine_bytes);
 }
 
@@ -210,9 +209,9 @@ int MooncakeElasticBuffer::get_theoretical_num_sms(int num_experts,
 ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     const torch::Tensor& x, const std::optional<torch::Tensor>& sf,
     const torch::Tensor& topk_idx,
-    const std::optional<torch::Tensor>& topk_weights, torch::Tensor& active_ranks,
-    int num_experts, int num_max_tokens_per_rank, int expert_alignment,
-    int num_sms, bool do_expand, bool do_cpu_sync,
+    const std::optional<torch::Tensor>& topk_weights,
+    torch::Tensor& active_ranks, int num_experts, int num_max_tokens_per_rank,
+    int expert_alignment, int num_sms, bool do_expand, bool do_cpu_sync,
     bool async_with_compute_stream,
     const std::optional<ElasticNativeHandle>& cached_handle) {
     EP_HOST_ASSERT(x.dim() == 2 && x.is_contiguous());
@@ -252,21 +251,26 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     const bool cached_mode = cached_handle.has_value();
     const bool use_hybrid = topology_.num_scaleout_ranks != 1;
     const int hybrid_channels = use_hybrid ? hybrid_num_channels(num_sms) : 0;
-    const int hybrid_max_tokens_per_channel = use_hybrid
-        ? hybrid_num_max_tokens_per_channel(num_max_tokens_per_rank, num_sms)
-        : 0;
+    const int hybrid_max_tokens_per_channel =
+        use_hybrid ? hybrid_num_max_tokens_per_channel(num_max_tokens_per_rank,
+                                                       num_sms)
+                   : 0;
     if (cached_mode) {
         const auto& handle = cached_handle.value();
         EP_HOST_ASSERT(!handle.do_expand && !do_expand);
         EP_HOST_ASSERT(handle.num_experts == num_experts);
         EP_HOST_ASSERT(handle.expert_alignment == expert_alignment);
-        EP_HOST_ASSERT(handle.num_max_tokens_per_rank == num_max_tokens_per_rank);
+        EP_HOST_ASSERT(handle.num_max_tokens_per_rank ==
+                       num_max_tokens_per_rank);
         EP_HOST_ASSERT(handle.num_sms == num_sms);
         if (use_hybrid) {
             EP_HOST_ASSERT(handle.dst_buffer_slot_idx.dim() == 4);
-            EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(0) == hybrid_channels);
-            EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(1) == topology_.num_scaleout_ranks);
-            EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(2) == hybrid_max_tokens_per_channel);
+            EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(0) ==
+                           hybrid_channels);
+            EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(1) ==
+                           topology_.num_scaleout_ranks);
+            EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(2) ==
+                           hybrid_max_tokens_per_channel);
             EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(3) == num_topk);
             EP_HOST_ASSERT(handle.token_metadata_at_forward.has_value());
             EP_HOST_ASSERT(handle.channel_linked_list.has_value());
@@ -286,43 +290,53 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
             ? -1
             : static_cast<int64_t>(native_buffer_->clock_rate_khz) *
                   static_cast<int64_t>(config_.num_gpu_timeout_secs) * 1000;
-    auto launch_ctx = make_launch_context(*native_buffer_, topology_,
-                                          mapped_host_workspace_, timeout_cycles);
+    auto launch_ctx = make_launch_context(
+        *native_buffer_, topology_, mapped_host_workspace_, timeout_cycles);
 
-    auto psum_num_recv_tokens_per_scaleup_rank = cached_mode
-        ? cached_handle->psum_num_recv_tokens_per_scaleup_rank
-        : torch::empty({topology_.num_scaleup_ranks},
-                       torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
-    auto psum_num_recv_tokens_per_expert = cached_mode
-        ? cached_handle->psum_num_recv_tokens_per_expert
-        : torch::empty({num_local_experts + 1},
-                       torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
-    auto dst_buffer_slot_idx = cached_mode
-        ? cached_handle->dst_buffer_slot_idx
-        : (use_hybrid
-               ? torch::empty(
-                     {hybrid_channels, topology_.num_scaleout_ranks,
-                      hybrid_max_tokens_per_channel, num_topk},
-                     torch::TensorOptions().dtype(torch::kInt32).device(x.device()))
-               : torch::empty(
-                     {num_tokens, num_topk},
-                     torch::TensorOptions().dtype(torch::kInt32).device(x.device())));
+    auto psum_num_recv_tokens_per_scaleup_rank =
+        cached_mode ? cached_handle->psum_num_recv_tokens_per_scaleup_rank
+                    : torch::empty({topology_.num_scaleup_ranks},
+                                   torch::TensorOptions()
+                                       .dtype(torch::kInt32)
+                                       .device(x.device()));
+    auto psum_num_recv_tokens_per_expert =
+        cached_mode
+            ? cached_handle->psum_num_recv_tokens_per_expert
+            : torch::empty({num_local_experts + 1}, torch::TensorOptions()
+                                                        .dtype(torch::kInt32)
+                                                        .device(x.device()));
+    auto dst_buffer_slot_idx =
+        cached_mode
+            ? cached_handle->dst_buffer_slot_idx
+            : (use_hybrid ? torch::empty(
+                                {hybrid_channels, topology_.num_scaleout_ranks,
+                                 hybrid_max_tokens_per_channel, num_topk},
+                                torch::TensorOptions()
+                                    .dtype(torch::kInt32)
+                                    .device(x.device()))
+                          : torch::empty({num_tokens, num_topk},
+                                         torch::TensorOptions()
+                                             .dtype(torch::kInt32)
+                                             .device(x.device())));
     std::optional<torch::Tensor> token_metadata_at_forward = std::nullopt;
     std::optional<torch::Tensor> channel_linked_list = std::nullopt;
     if (use_hybrid) {
         if (cached_mode) {
-            token_metadata_at_forward = cached_handle->token_metadata_at_forward;
+            token_metadata_at_forward =
+                cached_handle->token_metadata_at_forward;
             channel_linked_list = cached_handle->channel_linked_list;
         } else {
             const int forward_metadata_dims = 2 + num_topk * 2;
             token_metadata_at_forward = torch::empty(
                 {hybrid_channels,
-                 topology_.num_scaleout_ranks * hybrid_max_tokens_per_channel + 1,
+                 topology_.num_scaleout_ranks * hybrid_max_tokens_per_channel +
+                     1,
                  forward_metadata_dims},
                 torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
             channel_linked_list = torch::empty(
                 {hybrid_channels,
-                 topology_.num_scaleout_ranks * hybrid_max_tokens_per_channel + 1,
+                 topology_.num_scaleout_ranks * hybrid_max_tokens_per_channel +
+                     1,
                  topology_.num_scaleup_ranks},
                 torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
         }
@@ -333,33 +347,34 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
             {num_sms, topology_.num_scaleup_ranks},
             torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
         launch_elastic_dispatch_deterministic_prologue(
-            topk_idx, deterministic_rank_count_buffer.value(), dst_buffer_slot_idx,
-            num_tokens, num_max_tokens_per_rank, num_experts, num_topk,
-            topology_.scaleup_rank_idx, topology_.num_scaleup_ranks, num_sms,
-            num_smem_bytes, launch_stream.stream());
+            topk_idx, deterministic_rank_count_buffer.value(),
+            dst_buffer_slot_idx, num_tokens, num_max_tokens_per_rank,
+            num_experts, num_topk, topology_.scaleup_rank_idx,
+            topology_.num_scaleup_ranks, num_sms, num_smem_bytes,
+            launch_stream.stream());
     }
 
     launch_mooncake_elastic_dispatch(
         x.data_ptr(), use_sf ? const_cast<void*>(sf->data_ptr()) : nullptr,
         const_cast<int64_t*>(topk_idx.data_ptr<int64_t>()),
-        topk_weights.has_value() ? const_cast<float*>(topk_weights->data_ptr<float>()) : nullptr,
+        topk_weights.has_value()
+            ? const_cast<float*>(topk_weights->data_ptr<float>())
+            : nullptr,
         nullptr, nullptr, psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
         psum_num_recv_tokens_per_expert.data_ptr<int>(),
         dst_buffer_slot_idx.data_ptr<int>(),
         token_metadata_at_forward.has_value()
             ? token_metadata_at_forward->data_ptr<int>()
             : nullptr,
-        num_tokens,
-        num_max_tokens_per_rank, hidden, static_cast<int>(x.element_size()),
-        num_sf_packs, sf_token_stride, sf_hidden_stride, num_experts, num_topk,
-        expert_alignment, num_sms,
+        num_tokens, num_max_tokens_per_rank, hidden,
+        static_cast<int>(x.element_size()), num_sf_packs, sf_token_stride,
+        sf_hidden_stride, num_experts, num_topk, expert_alignment, num_sms,
         use_hybrid ? kElasticHybridChannelsPerSm : num_channels_per_sm,
-        num_smem_bytes, cached_mode, config_.deterministic,
-        false, launch_ctx, launch_stream.stream());
+        num_smem_bytes, cached_mode, config_.deterministic, false, launch_ctx,
+        launch_stream.stream());
 
-    const int num_recv_output_capacity = do_expand
-        ? num_recv_tokens * num_topk
-        : num_recv_tokens;
+    const int num_recv_output_capacity =
+        do_expand ? num_recv_tokens * num_topk : num_recv_tokens;
     auto recv_x = torch::empty({num_recv_output_capacity, hidden}, x.options());
     auto recv_x_scales = std::optional<torch::Tensor>();
     void* recv_x_scales_ptr = nullptr;
@@ -372,25 +387,29 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         recv_sf_token_stride = static_cast<int>(recv_x_scales->stride(0));
         recv_sf_hidden_stride = static_cast<int>(recv_x_scales->stride(1));
     }
-    auto recv_topk_idx = torch::empty(
-        {num_recv_tokens, num_topk}, topk_idx.options());
+    auto recv_topk_idx =
+        torch::empty({num_recv_tokens, num_topk}, topk_idx.options());
     auto recv_topk_weights = std::optional<torch::Tensor>();
     float* recv_topk_weights_ptr = nullptr;
     if (topk_weights.has_value()) {
         recv_topk_weights = do_expand
-            ? torch::empty({num_recv_output_capacity}, topk_weights->options())
-            : torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
+                                ? torch::empty({num_recv_output_capacity},
+                                               topk_weights->options())
+                                : torch::empty({num_recv_tokens, num_topk},
+                                               topk_weights->options());
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
     auto recv_src_metadata = torch::empty(
         {num_recv_tokens, num_topk + 2},
         torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
-    auto handle_psum_num_recv_tokens_per_expert = do_expand
-        ? psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts)
-        : psum_num_recv_tokens_per_expert.slice(0, 1, num_local_experts + 1);
-    auto epilogue_psum_num_recv_tokens_per_expert = do_expand
-        ? psum_num_recv_tokens_per_expert
-        : handle_psum_num_recv_tokens_per_expert;
+    auto handle_psum_num_recv_tokens_per_expert =
+        do_expand
+            ? psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts)
+            : psum_num_recv_tokens_per_expert.slice(0, 1,
+                                                    num_local_experts + 1);
+    auto epilogue_psum_num_recv_tokens_per_expert =
+        do_expand ? psum_num_recv_tokens_per_expert
+                  : handle_psum_num_recv_tokens_per_expert;
 
     launch_mooncake_elastic_dispatch_copy_epilogue(
         recv_x.data_ptr(), recv_x_scales_ptr, recv_topk_idx.data_ptr<int64_t>(),
@@ -399,10 +418,9 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
                                         : nullptr,
         num_recv_tokens, num_max_tokens_per_rank, hidden,
         static_cast<int>(x.element_size()), num_sf_packs, recv_sf_token_stride,
-        recv_sf_hidden_stride, num_experts, num_topk,
-        num_sms, num_smem_bytes, use_hybrid ? hybrid_channels : num_channels,
-        do_expand, cached_mode, launch_ctx,
-        psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+        recv_sf_hidden_stride, num_experts, num_topk, num_sms, num_smem_bytes,
+        use_hybrid ? hybrid_channels : num_channels, do_expand, cached_mode,
+        launch_ctx, psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
         epilogue_psum_num_recv_tokens_per_expert.data_ptr<int>(),
         launch_stream.stream());
 
@@ -454,14 +472,16 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
 
         recv_x = recv_x.slice(0, 0, actual_num_output_tokens);
         if (recv_x_scales.has_value()) {
-            recv_x_scales = recv_x_scales->slice(0, 0, actual_num_output_tokens);
+            recv_x_scales =
+                recv_x_scales->slice(0, 0, actual_num_output_tokens);
         }
         recv_topk_idx = recv_topk_idx.slice(0, 0, actual_num_recv_tokens);
         if (recv_topk_weights.has_value()) {
             recv_topk_weights =
                 recv_topk_weights->slice(0, 0, actual_num_output_tokens);
         }
-        recv_src_metadata = recv_src_metadata.slice(0, 0, actual_num_recv_tokens);
+        recv_src_metadata =
+            recv_src_metadata.slice(0, 0, actual_num_recv_tokens);
     }
 
     ElasticNativeHandle handle;
@@ -471,7 +491,8 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     handle.num_max_tokens_per_rank = num_max_tokens_per_rank;
     handle.num_sms = num_sms;
     handle.topk_idx = cached_mode ? cached_handle->topk_idx : topk_idx.clone();
-    handle.psum_num_recv_tokens_per_expert = handle_psum_num_recv_tokens_per_expert;
+    handle.psum_num_recv_tokens_per_expert =
+        handle_psum_num_recv_tokens_per_expert;
     handle.psum_num_recv_tokens_per_scaleup_rank =
         psum_num_recv_tokens_per_scaleup_rank;
     handle.recv_src_metadata = recv_src_metadata;
@@ -494,8 +515,8 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
 
 ElasticCombineOutput MooncakeElasticBuffer::combine(
     const torch::Tensor& x, const ElasticNativeHandle& handle,
-    const std::optional<torch::Tensor>& topk_weights, torch::Tensor& active_ranks,
-    int num_sms, bool async_with_compute_stream,
+    const std::optional<torch::Tensor>& topk_weights,
+    torch::Tensor& active_ranks, int num_sms, bool async_with_compute_stream,
     const std::optional<torch::Tensor>& out) {
     EP_HOST_ASSERT(x.dim() == 2 && x.is_contiguous());
     EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
@@ -520,8 +541,8 @@ ElasticCombineOutput MooncakeElasticBuffer::combine(
             ? -1
             : static_cast<int64_t>(native_buffer_->clock_rate_khz) *
                   static_cast<int64_t>(config_.num_gpu_timeout_secs) * 1000;
-    auto launch_ctx = make_launch_context(*native_buffer_, topology_,
-                                          mapped_host_workspace_, timeout_cycles);
+    auto launch_ctx = make_launch_context(
+        *native_buffer_, topology_, mapped_host_workspace_, timeout_cycles);
     auto psum_num_recv_tokens_per_scaleup_rank =
         handle.psum_num_recv_tokens_per_scaleup_rank;
     void* reduce_buffer = launch_mooncake_elastic_combine(
@@ -539,9 +560,10 @@ ElasticCombineOutput MooncakeElasticBuffer::combine(
         use_hybrid ? hybrid_channels : num_channels, handle.do_expand,
         config_.allow_multiple_reduction, launch_ctx, launch_stream.stream());
 
-    torch::Tensor combined_x = out.has_value()
-        ? out.value()
-        : torch::empty({num_combined_tokens, hidden}, x.options());
+    torch::Tensor combined_x =
+        out.has_value()
+            ? out.value()
+            : torch::empty({num_combined_tokens, hidden}, x.options());
     launch_mooncake_elastic_combine_reduce_epilogue(
         combined_x.data_ptr(), weights.data_ptr<float>(),
         const_cast<int64_t*>(handle.topk_idx.data_ptr<int64_t>()),
@@ -568,14 +590,16 @@ ElasticTopology MooncakeElasticBuffer::discover_topology(
     int rank, int num_ranks, bool allow_hybrid_mode) {
     int device_count = 1;
     cudaGetDeviceCount(&device_count);
-    int num_local_ranks = getenv_int(
-        "MOONCAKE_EP_NUM_LOCAL_RANKS", std::max(1, std::min(num_ranks, device_count)));
+    int num_local_ranks =
+        getenv_int("MOONCAKE_EP_NUM_LOCAL_RANKS",
+                   std::max(1, std::min(num_ranks, device_count)));
     num_local_ranks = std::max(1, std::min(num_local_ranks, num_ranks));
 
     ElasticTopology topology;
     topology.rank_idx = rank;
     topology.num_ranks = num_ranks;
-    topology.num_rdma_ranks = static_cast<int>(ceil_div_i64(num_ranks, num_local_ranks));
+    topology.num_rdma_ranks =
+        static_cast<int>(ceil_div_i64(num_ranks, num_local_ranks));
     topology.num_nvlink_ranks = num_local_ranks;
     if (allow_hybrid_mode && topology.num_rdma_ranks > 1) {
         topology.num_scaleout_ranks = topology.num_rdma_ranks;

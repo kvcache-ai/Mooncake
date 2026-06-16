@@ -25,7 +25,8 @@ constexpr int kRedAddReleaseLowWordLast = 1 << 0;
 //   get_sym_ptr  -> mc_route_put, returning local/P2P peer VA or nullptr
 //   put          -> local/P2P warp copy, otherwise mc_rdma_put
 //   put_value    -> local/P2P release store, otherwise mc_rdma_put/mc_signal
-//   flush        -> no-op; Device API operations are ordered by release/fence and
+//   flush        -> no-op; Device API operations are ordered by release/fence
+//   and
 //                   explicit kernel barriers in the imported elastic kernels
 //
 // Team tags are kept as types so official DeepEP template code can remain close
@@ -39,14 +40,10 @@ struct MooncakeGin {
     int scaleup_rank_idx = 0;
     int num_scaleup_ranks = 0;
 
-    __device__ __forceinline__ MooncakeGin(const device::CommCtx& ctx,
-                                           int qp_idx,
-                                           int sharing_mode,
-                                           int num_qps,
-                                           int scaleout_rank_idx = 0,
-                                           int scaleup_rank_idx = 0,
-                                           int num_scaleup_ranks = 0,
-                                           int num_ranks = 1)
+    __device__ __forceinline__ MooncakeGin(
+        const device::CommCtx& ctx, int qp_idx, int sharing_mode, int num_qps,
+        int scaleout_rank_idx = 0, int scaleup_rank_idx = 0,
+        int num_scaleup_ranks = 0, int num_ranks = 1)
         : ctx(ctx),
           qp_idx(qp_idx),
           sharing_mode(sharing_mode),
@@ -70,17 +67,20 @@ struct MooncakeGin {
     template <typename team_t>
     __device__ __forceinline__ bool is_nvlink_accessible(int dst_rank) const {
         dst_rank = world_rank<team_t>(dst_rank);
-        return dst_rank == ctx.rank || device::mc_comm_p2p_available(ctx, dst_rank);
+        return dst_rank == ctx.rank ||
+               device::mc_comm_p2p_available(ctx, dst_rank);
     }
 
     template <typename team_t>
-    __device__ __forceinline__ void* get_sym_ptr(void* ptr, int dst_rank) const {
+    __device__ __forceinline__ void* get_sym_ptr(void* ptr,
+                                                 int dst_rank) const {
         dst_rank = world_rank<team_t>(dst_rank);
         return device::mc_route_put(ctx, dst_rank, ptr);
     }
 
     template <typename team_t>
-    __device__ __forceinline__ const void* get_sym_ptr(const void* ptr, int dst_rank) const {
+    __device__ __forceinline__ const void* get_sym_ptr(const void* ptr,
+                                                       int dst_rank) const {
         dst_rank = world_rank<team_t>(dst_rank);
         return device::mc_route_put(ctx, dst_rank, const_cast<void*>(ptr));
     }
@@ -104,7 +104,8 @@ struct MooncakeGin {
                 }
             } else {
                 auto* dst_bytes = reinterpret_cast<uint8_t*>(routed);
-                const auto* src_bytes = reinterpret_cast<const uint8_t*>(src_ptr);
+                const auto* src_bytes =
+                    reinterpret_cast<const uint8_t*>(src_ptr);
                 for (int i = 0; i < num_bytes; ++i) {
                     dst_bytes[i] = src_bytes[i];
                 }
@@ -123,9 +124,11 @@ struct MooncakeGin {
 
     template <typename team_t, typename value_t>
     __device__ __forceinline__ void put_value(value_t* dst_ptr, value_t value,
-                                              int dst_rank, int flags = 0) const {
+                                              int dst_rank,
+                                              int flags = 0) const {
         dst_rank = world_rank<team_t>(dst_rank);
-        auto* routed = static_cast<value_t*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
+        auto* routed =
+            static_cast<value_t*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
         if (routed != nullptr) {
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
                 device::mc_st_release(reinterpret_cast<int*>(routed),
@@ -144,7 +147,8 @@ struct MooncakeGin {
                 // a by-value scalar lives in thread-local storage and is not a
                 // valid IBGDA source.  Current elastic uses remote int64
                 // put_value only for single-writer, zeroed notify slots, so a
-                // split 32-bit RED add is equivalent to writing the packed word.
+                // split 32-bit RED add is equivalent to writing the packed
+                // word.
                 auto* words = reinterpret_cast<int32_t*>(dst_ptr);
                 const auto signed_value = static_cast<int64_t>(value);
                 const auto low = static_cast<int32_t>(
@@ -175,15 +179,18 @@ struct MooncakeGin {
 
     template <typename team_t, typename value_t>
     __device__ __forceinline__ void red_add_rel(value_t* dst_ptr, value_t value,
-                                                int dst_rank, int flags = 0) const {
+                                                int dst_rank,
+                                                int flags = 0) const {
         if constexpr (sizeof(value_t) == sizeof(int32_t)) {
             dst_rank = world_rank<team_t>(dst_rank);
-            auto* routed = static_cast<int*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
+            auto* routed =
+                static_cast<int*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
             if (routed != nullptr) {
                 device::mc_atomic_add_release(routed, static_cast<int>(value));
             } else {
                 device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                   reinterpret_cast<int*>(dst_ptr), static_cast<int32_t>(value));
+                                   reinterpret_cast<int*>(dst_ptr),
+                                   static_cast<int32_t>(value));
             }
         } else if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
                              sizeof(value_t) == sizeof(int64_t)) {
@@ -193,11 +200,11 @@ struct MooncakeGin {
             if (routed != nullptr) {
                 // Some official elastic paths use the high 32 bits as the
                 // readiness word (notify counters), while others use the low 32
-                // bits as the terminal flag (hybrid channel tails).  Splitting a
-                // 64-bit RED into two 32-bit atomics can therefore publish the
-                // wrong half first for one of the protocols.  Use one system-
-                // scope 64-bit RED on the routed local/P2P VA so the packed
-                // value is updated atomically with release ordering.
+                // bits as the terminal flag (hybrid channel tails).  Splitting
+                // a 64-bit RED into two 32-bit atomics can therefore publish
+                // the wrong half first for one of the protocols.  Use one
+                // system- scope 64-bit RED on the routed local/P2P VA so the
+                // packed value is updated atomically with release ordering.
                 ptx::red_add_rel_sys(routed, static_cast<int64_t>(value));
             } else {
                 // Mooncake's current Device API only exposes 32-bit remote
@@ -205,9 +212,10 @@ struct MooncakeGin {
                 // from a thread-local scalar: IBGDA WQEs use the registered GDR
                 // buffer lkey, so a stack/local address is not a valid DMA
                 // source on true cross-node runs.  Split the packed signal into
-                // two 32-bit remote reductions instead, publishing the readiness
-                // word last.  Most notify counters use high word as the ready
-                // count; hybrid channel tails use low word as the finish flag.
+                // two 32-bit remote reductions instead, publishing the
+                // readiness word last.  Most notify counters use high word as
+                // the ready count; hybrid channel tails use low word as the
+                // finish flag.
                 auto* words = reinterpret_cast<int32_t*>(dst_ptr);
                 const auto signed_value = static_cast<int64_t>(value);
                 const auto low = static_cast<int32_t>(

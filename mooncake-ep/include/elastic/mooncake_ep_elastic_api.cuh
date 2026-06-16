@@ -3,8 +3,8 @@
 // Official DeepEP elastic source import surface for Mooncake.
 //
 // This umbrella intentionally lives under include/elastic, not in the legacy EP
-// include root.  It keeps the imported elastic implementation discoverable while
-// allowing the host launch/runtime glue to opt in file-by-file without
+// include root.  It keeps the imported elastic implementation discoverable
+// while allowing the host launch/runtime glue to opt in file-by-file without
 // perturbing legacy Buffer dispatch/combine symbols.
 
 #include <elastic/mooncake_ep_elastic_comm.cuh>

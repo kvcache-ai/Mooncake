@@ -35,7 +35,8 @@ __device__ __forceinline__ void timeout_while(const bool& condition,
         if (func(timeout)) break;
         if (timeout) {
             const auto timeout_start = clock64();
-            while (clock64() - timeout_start < kNumOneSecCycles) {}
+            while (clock64() - timeout_start < kNumOneSecCycles) {
+            }
             ptx::trap();
         }
     }
@@ -64,20 +65,22 @@ __device__ __forceinline__ std::pair<int, int> get_qp_mode(
                     (channel_in_sm_idx % max(1, num_qps_in_sm)) * kNumSMs,
                 0};
     } else {
-        const auto global_channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
-        return {kQPStartIdx + (global_channel_idx % max(1, kNumAvailableQPs)), 1};
+        const auto global_channel_idx =
+            sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+        return {kQPStartIdx + (global_channel_idx % max(1, kNumAvailableQPs)),
+                1};
     }
 }
 
 template <typename team_t, int kNumRanks, int kNumSMs, int kNumThreads,
           int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
 __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
-    const transport::MooncakeGin& gin,
-    const layout::WorkspaceLayout& workspace,
+    const transport::MooncakeGin& gin, const layout::WorkspaceLayout& workspace,
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
     if (kNumSMs > 1 && sm_idx > 0) return;
 
-    const int status = static_cast<int>((*workspace.get_nvl_barrier_counter_ptr(kTag)) & 3);
+    const int status =
+        static_cast<int>((*workspace.get_nvl_barrier_counter_ptr(kTag)) & 3);
     const int phase = status & 1;
     const int sign = status >> 1;
     const int* base_signal = workspace.get_nvl_barrier_signal_ptr(kTag, phase);
@@ -88,68 +91,73 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
     }
     __syncthreads();
 
-    if (thread_idx == 0) atomicAdd(workspace.get_nvl_barrier_counter_ptr(kTag), 1ULL);
+    if (thread_idx == 0)
+        atomicAdd(workspace.get_nvl_barrier_counter_ptr(kTag), 1ULL);
 
-    timeout_while<kNumTimeoutCycles>(thread_idx == 0, [=](const bool& is_last_check) {
-        int sum = 0;
-        #pragma unroll
-        for (int i = 0; i < kNumRanks; ++i) {
-            sum += ptx::ld_acquire_sys<int>(const_cast<int*>(base_signal) + i);
-        }
-        // Mooncake's portable barrier uses one additive slot per source rank.
-        // Each positive phase adds +1 into a zeroed phase slot; the matching
-        // negative phase later adds -1 into the same phase slot.  This matches
-        // RDMA atomic-add semantics and avoids relying on a remote store
-        // primitive for non-P2P peers.
-        const auto target = sign ? 0 : kNumRanks;
-        if (sum == target) return true;
-        if (is_last_check) {
-            printf("Mooncake elastic barrier timeout, tag: %d, rank: %d, signal-sum: %d, target: %d\n",
-                   kTag, rank_idx, sum, target);
-        }
-        return false;
-    });
+    timeout_while<kNumTimeoutCycles>(
+        thread_idx == 0, [=](const bool& is_last_check) {
+            int sum = 0;
+#pragma unroll
+            for (int i = 0; i < kNumRanks; ++i) {
+                sum +=
+                    ptx::ld_acquire_sys<int>(const_cast<int*>(base_signal) + i);
+            }
+            // Mooncake's portable barrier uses one additive slot per source
+            // rank. Each positive phase adds +1 into a zeroed phase slot; the
+            // matching negative phase later adds -1 into the same phase slot.
+            // This matches RDMA atomic-add semantics and avoids relying on a
+            // remote store primitive for non-P2P peers.
+            const auto target = sign ? 0 : kNumRanks;
+            if (sum == target) return true;
+            if (is_last_check) {
+                printf(
+                    "Mooncake elastic barrier timeout, tag: %d, rank: %d, "
+                    "signal-sum: %d, target: %d\n",
+                    kTag, rank_idx, sum, target);
+            }
+            return false;
+        });
 }
 
-template <bool kIsScaleupNVLink,
-          int kNumScaleoutRanks, int kNumScaleupRanks,
-          int kNumSMs, int kNumThreads, int kNumQPs,
-          int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag,
-          bool kFlushStores = true, bool kSyncAtStart = true, bool kSyncAtEnd = true>
+template <bool kIsScaleupNVLink, int kNumScaleoutRanks, int kNumScaleupRanks,
+          int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles,
+          int kTag = kDeviceBarrierTag, bool kFlushStores = true,
+          bool kSyncAtStart = true, bool kSyncAtEnd = true>
 __forceinline__ __device__ void gpu_barrier(
-    const transport::MooncakeGin& gin,
-    const layout::WorkspaceLayout& workspace,
+    const transport::MooncakeGin& gin, const layout::WorkspaceLayout& workspace,
     const int& scaleout_rank_idx, const int& scaleup_rank_idx,
-    const int& sm_idx, const int& thread_idx,
-    bool do_scaleout = true, bool do_scaleup = true) {
+    const int& sm_idx, const int& thread_idx, bool do_scaleout = true,
+    bool do_scaleup = true) {
     if constexpr (kFlushStores) gin.flush();
     if constexpr (kSyncAtStart) {
-        (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
+        (gridDim.x > 1) ? cooperative_groups::this_grid().sync()
+                        : __syncthreads();
     }
 
     do_scaleout &= kNumScaleoutRanks > 1;
     do_scaleup &= kNumScaleupRanks > 1;
     if (do_scaleup && !do_scaleout) {
-        mooncake_barrier_wo_local_sync<transport::ScaleupTeam,
-                                       kNumScaleupRanks, kNumSMs, kNumThreads,
-                                       kNumTimeoutCycles, kTag>(
-            gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
+        mooncake_barrier_wo_local_sync<transport::ScaleupTeam, kNumScaleupRanks,
+                                       kNumSMs, kNumThreads, kNumTimeoutCycles,
+                                       kTag>(gin, workspace, scaleup_rank_idx,
+                                             sm_idx, thread_idx);
     } else if (do_scaleout && !do_scaleup) {
         mooncake_barrier_wo_local_sync<transport::ScaleoutTeam,
                                        kNumScaleoutRanks, kNumSMs, kNumThreads,
                                        kNumTimeoutCycles, kTag>(
             gin, workspace, scaleout_rank_idx, sm_idx, thread_idx);
     } else {
-        const int global_rank = scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
-        mooncake_barrier_wo_local_sync<transport::WorldTeam,
-                                       kNumScaleoutRanks * kNumScaleupRanks,
-                                       kNumSMs, kNumThreads,
-                                       kNumTimeoutCycles, kTag>(
-            gin, workspace, global_rank, sm_idx, thread_idx);
+        const int global_rank =
+            scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
+        mooncake_barrier_wo_local_sync<
+            transport::WorldTeam, kNumScaleoutRanks * kNumScaleupRanks, kNumSMs,
+            kNumThreads, kNumTimeoutCycles, kTag>(gin, workspace, global_rank,
+                                                  sm_idx, thread_idx);
     }
 
     if constexpr (kSyncAtEnd) {
-        (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
+        (gridDim.x > 1) ? cooperative_groups::this_grid().sync()
+                        : __syncthreads();
     }
 }
 

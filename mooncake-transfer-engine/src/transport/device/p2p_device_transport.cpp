@@ -94,7 +94,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
         CHECK_GT(device_count, 0) << "No CUDA/MUSA devices found";
 
         int local_group_size = device_count;
-        const char* local_world_size = std::getenv("MOONCAKE_EP_NUM_LOCAL_RANKS");
+        const char* local_world_size =
+            std::getenv("MOONCAKE_EP_NUM_LOCAL_RANKS");
         if (local_world_size == nullptr || local_world_size[0] == '\0') {
             local_world_size = std::getenv("LOCAL_WORLD_SIZE");
         }
