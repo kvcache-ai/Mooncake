@@ -115,11 +115,9 @@ Status NVLinkTransport::freeSubBatch(SubBatchRef& batch) {
     auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
     if (!shm_batch)
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
-    // Destroy completion events created in startTransfer (each pushed exactly
-    // once, so no double-destroy). Streams are pool-managed and not destroyed.
-    for (auto event : shm_batch->completion_events) {
-        cudaEventDestroy(event);
-    }
+    // Completion events are destroyed by ~NVLinkSubBatch(), which Slab's
+    // deallocate() invokes before returning the storage. Streams are
+    // pool-managed and not destroyed here.
     Slab<NVLinkSubBatch>::Get().deallocate(shm_batch);
     batch = nullptr;
     return Status::OK();
@@ -232,7 +230,14 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
         return;
     }
-    cudaEventRecord(event, batch->async_stream.get());
+    auto record_err = cudaEventRecord(event, batch->async_stream.get());
+    if (record_err != cudaSuccess) {
+        LOG(ERROR) << "NVLinkTransport: cudaEventRecord failed: "
+                   << cudaGetErrorString(record_err);
+        cudaEventDestroy(event);
+        for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
     batch->completion_events.push_back(event);
     for (auto* task : tasks) task->completion_event = event;
 }

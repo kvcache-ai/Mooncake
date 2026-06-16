@@ -49,9 +49,13 @@ struct NVLinkSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
-    // Completion events created in startTransfer (one per submit). Owned here
-    // and destroyed in freeSubBatch so they are not leaked.
+    // Completion events created in startTransfer (one per submit). Destroyed by
+    // the destructor (RAII); Slab<T>::deallocate() invokes ~NVLinkSubBatch()
+    // before reusing the storage, so this runs on every free.
     std::vector<cudaEvent_t> completion_events;
+    ~NVLinkSubBatch() {
+        for (auto event : completion_events) cudaEventDestroy(event);
+    }
     virtual size_t size() const { return task_list.size(); }
 };
 
