@@ -27,5 +27,6 @@
   "kv_events_backend_id": "",
   "kv_events_tenant_id": "default",
   "kv_events_block_size": 0,
-  "kv_events_dp_rank": 0
+  "kv_events_dp_rank": 0,
+  "kv_events_emit_object_key": true
 }

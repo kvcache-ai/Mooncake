@@ -7316,6 +7316,7 @@ KvEventConfig MasterService::BuildKvEventConfig(
     kv_config.block_size = config.kv_events_block_size;
     kv_config.dp_rank = config.kv_events_dp_rank;
     kv_config.emit_legacy_compat_fields = config.kv_events_emit_legacy_compat;
+    kv_config.emit_object_key = config.kv_events_emit_object_key;
     return kv_config;
 }
 

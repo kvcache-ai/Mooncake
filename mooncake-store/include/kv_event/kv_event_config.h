@@ -19,6 +19,8 @@ struct KvEventConfig {
     uint32_t dp_rank{0};
     // Emit legacy vLLM/SGLang field names alongside RFC #1527 fields.
     bool emit_legacy_compat_fields{true};
+    // Emit Mooncake object_key for consumers that match on store key format.
+    bool emit_object_key{true};
 };
 
 }  // namespace mooncake

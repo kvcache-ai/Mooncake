@@ -127,6 +127,7 @@ struct MasterConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
 };
 
@@ -212,6 +213,7 @@ class MasterServiceSupervisorConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
     MasterServiceSupervisorConfig() = default;
 
@@ -251,6 +253,7 @@ class MasterServiceSupervisorConfig {
         kv_events_block_size = config.kv_events_block_size;
         kv_events_dp_rank = config.kv_events_dp_rank;
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
@@ -404,6 +407,7 @@ class WrappedMasterServiceConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
@@ -483,6 +487,7 @@ class WrappedMasterServiceConfig {
         kv_events_block_size = config.kv_events_block_size;
         kv_events_dp_rank = config.kv_events_dp_rank;
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
@@ -580,6 +585,7 @@ class WrappedMasterServiceConfig {
         kv_events_block_size = config.kv_events_block_size;
         kv_events_dp_rank = config.kv_events_dp_rank;
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
@@ -976,6 +982,7 @@ class MasterServiceConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
@@ -1051,6 +1058,7 @@ class MasterServiceConfig {
         kv_events_block_size = config.kv_events_block_size;
         kv_events_dp_rank = config.kv_events_dp_rank;
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;

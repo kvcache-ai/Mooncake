@@ -370,16 +370,20 @@ vLLM/SGLang: empty topic, big-endian sequence number, and a msgpack payload
 `[timestamp, [events], dp_rank]`.
 
 Each event map uses RFC #1527 field names (`event_type`, `seq_hashes`,
-`backend_id`, `medium`, and so on). When `kv_events_emit_legacy_compat` is
-enabled (default), the map also includes vLLM-compatible aliases such as
+`backend_id`, `medium`, and so on). When `kv_events_emit_object_key` is enabled
+(default), the map also includes `object_key` with the Mooncake store key so
+Dynamo and other consumers can match on `sha256` + Mooncake key format without
+requiring decimal/`0x` `seq_hash` encoding. When `kv_events_emit_legacy_compat`
+is enabled (default), the map also includes vLLM-compatible aliases such as
 `type` and `block_hashes` so Dynamo relay mode can forward events without an
 adapter.
 
-Object keys must encode the rolling `seq_hash` as a decimal or `0x`-prefixed
-hex string. Keys that cannot be parsed are skipped to avoid emitting invalid
-`removed` events. Configure `backend_id` to identify the cache owner (for
-example a per-node storage daemon) and register the bind endpoint with the
-indexer using publisher type `Mooncake`.
+Object keys may encode the rolling `seq_hash` as a decimal or `0x`-prefixed
+hex string; when `seq_hash` cannot be parsed, events are still published if
+`kv_events_emit_object_key=true` (with an empty `seq_hashes` array). Configure
+`backend_id` to identify the cache owner (for example a per-node storage
+daemon) and register the bind endpoint with the indexer using publisher type
+`Mooncake`.
 
 ### Field provenance matrix (SGLang vs master vs indexer registration)
 
@@ -417,7 +421,8 @@ splitting publishers or writing PR/integration notes.
 
 | Field | SGLang | Master | Register | Notes |
 |---|---|---|---|---|
-| `seq_hashes` | Yes | Conditional | — | **Required from SGLang** for correct prefix index. Master: single hash parsed from object key only; no rolling chain; one hash per event. |
+| `seq_hashes` | Yes | Conditional | — | **Required from SGLang** for correct prefix index. Master: single hash when key is decimal/`0x` u64; empty array when only `object_key` is used. |
+| `object_key` | — | Yes | — | Mooncake store key (`kv_events_emit_object_key`, default on). Used by Dynamo for sha256+key matching. |
 | `block_hashes` (legacy) | Yes | Conditional | — | Alias of `seq_hashes` when `kv_events_emit_legacy_compat` is enabled on master. |
 | `parent_hash` | Yes | — | — | Radix parent link; master has no sequence tree. |
 | `parent_block_hash` (legacy) | Yes | — | — | Same as `parent_hash`. |
@@ -429,7 +434,7 @@ splitting publishers or writing PR/integration notes.
 
 | Field | SGLang | Master | Register | Notes |
 |---|---|---|---|---|
-| `seq_hashes` | Yes | Conditional | — | **Required** on wire. Master skips keys that are not decimal/hex u64. |
+| `seq_hashes` | Yes | Conditional | — | **Required** on wire for strict RFC consumers. Master emits one hash when parseable, else empty with `object_key`. |
 | `base_block_idx` | Yes | — | — | Optional but recommended for observability. |
 
 #### `cleared` payload

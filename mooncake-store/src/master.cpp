@@ -159,6 +159,8 @@ DEFINE_uint32(kv_events_block_size, 0,
 DEFINE_uint32(kv_events_dp_rank, 0, "dp_rank for published KV events");
 DEFINE_bool(kv_events_emit_legacy_compat, true,
             "Include vLLM/SGLang-compatible type/block_hashes fields");
+DEFINE_bool(kv_events_emit_object_key, true,
+            "Include Mooncake object_key in published KV events");
 DEFINE_uint32(kv_events_queue_capacity, 65536,
               "Deprecated; ignored (event queue is unbounded)");
 DEFINE_string(ha_backend_type, "etcd",
@@ -417,6 +419,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("kv_events_emit_legacy_compat",
                            &master_config.kv_events_emit_legacy_compat,
                            FLAGS_kv_events_emit_legacy_compat);
+    default_config.GetBool("kv_events_emit_object_key",
+                           &master_config.kv_events_emit_object_key,
+                           FLAGS_kv_events_emit_object_key);
     default_config.GetUInt32("kv_events_queue_capacity",
                              &master_config.kv_events_queue_capacity,
                              FLAGS_kv_events_queue_capacity);
@@ -758,6 +763,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.kv_events_emit_legacy_compat =
             FLAGS_kv_events_emit_legacy_compat;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_emit_object_key", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_emit_object_key =
+            FLAGS_kv_events_emit_object_key;
     }
     if ((google::GetCommandLineFlagInfo("kv_events_queue_capacity", &info) &&
          !info.is_default) ||

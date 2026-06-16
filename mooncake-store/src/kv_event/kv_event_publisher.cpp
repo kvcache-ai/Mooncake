@@ -41,7 +41,8 @@ void PackOptionalU32(msgpack::packer<msgpack::sbuffer>& packer, uint32_t value,
     }
 }
 
-size_t ComputeEventMapSize(bool is_stored, bool emit_legacy) {
+size_t ComputeEventMapSize(bool is_stored, bool emit_legacy,
+                           bool emit_object_key) {
     // Base envelope: event_id, timestamp, event_type, model_name, block_size,
     // additional_salt, lora_name, tenant_id, backend_id, medium, dp_rank,
     // seq_hashes.
@@ -49,6 +50,9 @@ size_t ComputeEventMapSize(bool is_stored, bool emit_legacy) {
     size_t map_size = kBaseFields;
     if (emit_legacy) {
         map_size += 2;  // type, block_hashes
+    }
+    if (emit_object_key) {
+        map_size += 1;  // object_key
     }
     if (is_stored) {
         map_size += 3;  // base_block_idx, parent_hash, token_ids
@@ -216,7 +220,7 @@ void KvEventPublisher::WorkerLoop() {
 void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     struct EncodedEvent {
         PendingEvent pending;
-        uint64_t seq_hash{0};
+        std::optional<uint64_t> seq_hash;
         uint64_t event_id{0};
     };
     std::vector<EncodedEvent> encoded;
@@ -224,11 +228,14 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     for (const auto& pending : batch) {
         const auto seq_hash = ParseSeqHashFromObjectKey(pending.object_key);
         if (!seq_hash.has_value()) {
+            if (!config_.emit_object_key || pending.object_key.empty()) {
+                skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
-            continue;
         }
         encoded.push_back(EncodedEvent{
-            pending, seq_hash.value(),
+            pending, seq_hash,
             next_event_id_.fetch_add(1, std::memory_order_relaxed)});
     }
     if (encoded.empty()) {
@@ -255,7 +262,8 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
                                            : item.pending.tenant_id;
 
         const size_t map_size =
-            ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields);
+            ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields,
+                                config_.emit_object_key);
 
         packer.pack_map(map_size);
         packer.pack("event_id");
@@ -285,14 +293,26 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         packer.pack("dp_rank");
         PackOptionalU32(packer, config_.dp_rank, has_dp_rank);
 
-        packer.pack("seq_hashes");
-        packer.pack_array(1);
-        packer.pack(item.seq_hash);
+        if (config_.emit_object_key) {
+            packer.pack("object_key");
+            packer.pack(item.pending.object_key);
+        }
 
-        if (config_.emit_legacy_compat_fields) {
+        packer.pack("seq_hashes");
+        if (item.seq_hash.has_value()) {
+            packer.pack_array(1);
+            packer.pack(item.seq_hash.value());
+        } else {
+            packer.pack_array(0);
+        }
+
+        if (config_.emit_legacy_compat_fields && item.seq_hash.has_value()) {
             packer.pack("block_hashes");
             packer.pack_array(1);
-            packer.pack(static_cast<int64_t>(item.seq_hash));
+            packer.pack(static_cast<int64_t>(item.seq_hash.value()));
+        } else if (config_.emit_legacy_compat_fields) {
+            packer.pack("block_hashes");
+            packer.pack_array(0);
         }
 
         if (is_stored) {

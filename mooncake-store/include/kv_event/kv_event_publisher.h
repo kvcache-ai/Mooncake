@@ -31,8 +31,7 @@ class KvEventPublisher {
 
     // Non-blocking enqueue; never drops events (unbounded queue).
     // tenant_id empty uses config_.tenant_id (RFC envelope default).
-    void PublishStored(const std::string& object_key,
-                       const std::string& medium,
+    void PublishStored(const std::string& object_key, const std::string& medium,
                        const std::string& tenant_id = "");
     void PublishRemoved(const std::string& object_key,
                         const std::string& medium,
