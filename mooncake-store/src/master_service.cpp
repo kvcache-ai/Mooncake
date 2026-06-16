@@ -1262,7 +1262,8 @@ void MasterService::ClearInvalidHandles(
                     tenant_state.processing_keys.erase(it->first);
                     tenant_state.replication_tasks.erase(it->first);
                     tenant_state.offloading_tasks.erase(it->first);
-                    ErasePromotionTaskIfPresent(tenant_state, it->first);
+                    ErasePromotionTaskIfPresent(tenant_state, it->first,
+                                                tenant_it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first);
                 } else {
                     ++it;
@@ -2267,7 +2268,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 tenant_state.processing_keys.erase(key);
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
-                ErasePromotionTaskIfPresent(tenant_state, key);
+                ErasePromotionTaskIfPresent(tenant_state, key,
+                                            object_id.tenant_id);
                 EraseMetadata(tenant_state, it, object_id.tenant_id);
                 it = tenant_state.metadata.end();
             } else {
@@ -2637,7 +2639,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         if (it != tenant_state.metadata.end() &&
             CleanupStaleHandles(it->second, alive_clients)) {
             tenant_state.processing_keys.erase(key);
-            ErasePromotionTaskIfPresent(tenant_state, key);
+            ErasePromotionTaskIfPresent(tenant_state, key, object_id.tenant_id);
             EraseMetadata(tenant_state, it, object_id.tenant_id);
             it = tenant_state.metadata.end();
         }
@@ -2690,7 +2692,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // If no COMPLETE replicas survive the preemption, this key
                 // effectively does not exist — fall through to Case A.
                 if (!metadata.HasReplica(&Replica::fn_is_completed)) {
-                    ErasePromotionTaskIfPresent(tenant_state, key);
+                    ErasePromotionTaskIfPresent(tenant_state, key,
+                                                object_id.tenant_id);
                     EraseMetadata(tenant_state, it, object_id.tenant_id);
                     it = tenant_state.metadata.end();
                 }
@@ -3455,7 +3458,7 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     }
 
     auto& tenant_state = accessor.GetTenantState();
-    ErasePromotionTaskIfPresent(tenant_state, key);
+    ErasePromotionTaskIfPresent(tenant_state, key, object_id.tenant_id);
     accessor.Erase();
     return {};
 }
@@ -3518,7 +3521,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
-                ErasePromotionTaskIfPresent(tenant_state, it->first);
+                ErasePromotionTaskIfPresent(tenant_state, it->first,
+                                            normalized_tenant);
                 it = EraseMetadata(tenant_state, it, normalized_tenant);
                 removed_count++;
             } else {
@@ -3554,7 +3558,8 @@ long MasterService::RemoveAll(bool force) {
                     auto mem_rep_count = it->second.CountReplicas(
                         &Replica::fn_is_memory_replica);
                     total_freed_size += it->second.size * mem_rep_count;
-                    ErasePromotionTaskIfPresent(tenant_state, it->first);
+                    ErasePromotionTaskIfPresent(tenant_state, it->first,
+                                                tenant_it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first);
                     removed_count++;
                 } else {
@@ -3599,7 +3604,8 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
-                ErasePromotionTaskIfPresent(tenant_state, it->first);
+                ErasePromotionTaskIfPresent(tenant_state, it->first,
+                                            normalized_tenant);
                 it = EraseMetadata(tenant_state, it, normalized_tenant);
                 removed_count++;
             } else {
@@ -3669,7 +3675,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 tenant_state.processing_keys.erase(key);
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
-                ErasePromotionTaskIfPresent(tenant_state, key);
+                ErasePromotionTaskIfPresent(tenant_state, key,
+                                            normalized_tenant);
                 EraseMetadata(tenant_state, it, normalized_tenant);
                 if (tenant_state.Empty()) {
                     shard->tenants.erase(tenant_it);
@@ -3709,7 +3716,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Remove object metadata
-            ErasePromotionTaskIfPresent(tenant_state, key);
+            ErasePromotionTaskIfPresent(tenant_state, key, normalized_tenant);
             EraseMetadata(tenant_state, it, normalized_tenant);
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
@@ -4236,6 +4243,23 @@ auto MasterService::PromotionAllocStart(
     if (task_it->second.object_size != size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    if (task_it->second.alloc_id != 0 ||
+        task_it->second.reserved_quota_charge_bytes != 0) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    const uint64_t reserved_quota_charge = size;
+    auto quota_result =
+        ReserveTenantQuota(object_id.tenant_id, reserved_quota_charge);
+    if (!quota_result) {
+        return tl::make_unexpected(quota_result.error());
+    }
+    auto abort_reserved_quota = [&] {
+        AbortTenantQuota(object_id.tenant_id, reserved_quota_charge);
+    };
 
     // Allocate a single MEMORY replica via the existing strategy, biased to
     // the holder's mem segment when possible.
@@ -4253,11 +4277,13 @@ auto MasterService::PromotionAllocStart(
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, size, config.replica_num, preferred_segments);
         if (!allocation_result) {
+            abort_reserved_quota();
             return tl::make_unexpected(allocation_result.error());
         }
         staged_replicas = std::move(allocation_result.value());
     }
     if (staged_replicas.empty()) {
+        abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
@@ -4285,6 +4311,7 @@ auto MasterService::PromotionAllocStart(
     // (alloc_id == 0) is bounded by its own original start_time window
     // during which the reaper's EraseReplicaByID branch is a no-op.
     task_it->second.alloc_id = new_id;
+    task_it->second.reserved_quota_charge_bytes = reserved_quota_charge;
     task_it->second.start_time = std::chrono::system_clock::now();
     return PromotionAllocStartResponse{std::move(desc)};
 }
@@ -4332,6 +4359,25 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         source->dec_refcnt();
     }
     const uint64_t completed_bytes = task_it->second.object_size;
+    const uint64_t reserved_quota_charge =
+        task_it->second.reserved_quota_charge_bytes;
+    if (committed) {
+        const uint64_t actual_charge = CompletedMemoryQuotaCharge(metadata);
+        const uint64_t commit_charge =
+            actual_charge > metadata.committed_quota_charge_bytes
+                ? actual_charge - metadata.committed_quota_charge_bytes
+                : 0;
+        const uint64_t abort_charge =
+            reserved_quota_charge > commit_charge
+                ? reserved_quota_charge - commit_charge
+                : 0;
+        CommitTenantQuota(object_id.tenant_id, commit_charge);
+        AbortTenantQuota(object_id.tenant_id, abort_charge);
+        metadata.committed_quota_charge_bytes = actual_charge;
+    } else {
+        AbortTenantQuota(object_id.tenant_id, reserved_quota_charge);
+    }
+    task_it->second.reserved_quota_charge_bytes = 0;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
@@ -4405,6 +4451,9 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                 return replica.id() == alloc_id;
             });
     }
+    AbortTenantQuota(object_id.tenant_id,
+                     task_it->second.reserved_quota_charge_bytes);
+    task_it->second.reserved_quota_charge_bytes = 0;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
@@ -4620,6 +4669,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         });
                 }
             }
+            AbortTenantQuota(tenant_it->first,
+                             task_it->second.reserved_quota_charge_bytes);
+            task_it->second.reserved_quota_charge_bytes = 0;
             LOG(WARNING) << "Promotion task expired for key: "
                          << task_it->first;
             task_it = tenant_state.promotion_tasks.erase(task_it);
@@ -5749,15 +5801,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     auto evict_replicas =
-        [&](ObjectMetadata& metadata,
-            std::vector<std::vector<Replica>>& deferred_replicas) {
+        [&, this](ObjectMetadata& metadata,
+                  std::vector<std::vector<Replica>>& deferred_replicas) {
+            const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
             auto replicas = PopReplicasWithCacheTotalAccounting(
                 metadata, is_evictable_memory_replica);
             const size_t replica_count = replicas.size();
             if (!replicas.empty()) {
                 deferred_replicas.emplace_back(std::move(replicas));
             }
-            return replica_count;
+            const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
+            if (before_charge > after_charge) {
+                ReleaseCommittedQuotaCharge(metadata,
+                                            before_charge - after_charge);
+            }
+            return metadata.size * replica_count;
         };
 
     // --- Offload-on-evict support ---
@@ -5783,12 +5841,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
             std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
         if (!offload_on_evict_) {
             // Original behavior
-            return metadata.size * evict_replicas(metadata, deferred_replicas);
+            return evict_replicas(metadata, deferred_replicas);
         }
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
         if (has_local_disk_replica(metadata)) {
-            return metadata.size * evict_replicas(metadata, deferred_replicas);
+            return evict_replicas(metadata, deferred_replicas);
         }
 
         // Force-evict cap: if force_evict enabled and cap reached, force
@@ -5796,7 +5854,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // flooding.
         if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
             offload_cap_forced_count++;
-            return metadata.size * evict_replicas(metadata, deferred_replicas);
+            return evict_replicas(metadata, deferred_replicas);
         }
 
         // Queue one MEMORY replica for offload; others will be evicted below.
@@ -5825,7 +5883,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
-            return metadata.size * evict_replicas(metadata, deferred_replicas);
+            return evict_replicas(metadata, deferred_replicas);
         }
 
         // PushOffloadingQueue failed. Default (data-preserving) behavior is to
@@ -5834,7 +5892,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // prevent silent data loss when the queue is unavailable.
         if (offload_force_evict_) {
             offload_push_failed_forced++;
-            return metadata.size * evict_replicas(metadata, deferred_replicas);
+            return evict_replicas(metadata, deferred_replicas);
         }
         return 0;
     };

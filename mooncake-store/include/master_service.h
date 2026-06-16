@@ -1153,6 +1153,7 @@ class MasterService {
         ReplicaID source_id;    // the LOCAL_DISK replica being promoted
         ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
         uint64_t object_size;
+        uint64_t reserved_quota_charge_bytes{0};
         std::chrono::system_clock::time_point start_time;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     };
@@ -1408,12 +1409,17 @@ class MasterService {
      */
     void TryPushPromotionQueue(const ObjectIdentity& object_id);
 
-    // Erase any in-flight PromotionTask for `key` and decrement the
-    // cluster-wide in-flight counter. Safe no-op if no task exists.
-    void ErasePromotionTaskIfPresent(TenantState& tenant_state,
-                                     const std::string& key)
-        NO_THREAD_SAFETY_ANALYSIS {
-        if (tenant_state.promotion_tasks.erase(key) > 0) {
+    // Erase any in-flight PromotionTask for `key`, abort any staged promotion
+    // quota reservation, and decrement the cluster-wide in-flight counter. Safe
+    // no-op if no task exists.
+    void ErasePromotionTaskIfPresent(
+        TenantState& tenant_state, const std::string& key,
+        const std::string& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
+        auto task_it = tenant_state.promotion_tasks.find(key);
+        if (task_it != tenant_state.promotion_tasks.end()) {
+            AbortTenantQuota(tenant_id,
+                             task_it->second.reserved_quota_charge_bytes);
+            tenant_state.promotion_tasks.erase(task_it);
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
             MasterMetricManager::instance().dec_promotion_in_flight();
             MasterMetricManager::instance().inc_promotion_cancelled();
@@ -1510,7 +1516,8 @@ class MasterService {
                     }
                     if (tenant_state_ != nullptr) {
                         service_->ErasePromotionTaskIfPresent(
-                            *tenant_state_, object_id_.user_key);
+                            *tenant_state_, object_id_.user_key,
+                            object_id_.tenant_id);
                         MaybeEraseEmptyTenant();
                     }
                 }

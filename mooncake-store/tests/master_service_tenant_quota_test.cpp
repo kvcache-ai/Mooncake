@@ -3,6 +3,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -48,6 +49,17 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         return config;
     }
 
+    MasterServiceConfig MakeOffloadConfig(uint64_t default_quota,
+                                          uint64_t pool_capacity) {
+        auto config = MakeConfig(default_quota, pool_capacity);
+        config.enable_offload = true;
+        config.offload_on_evict = true;
+        config.promotion_on_hit = true;
+        config.promotion_admission_threshold = 1;
+        config.default_kv_lease_ttl = 0;
+        return config;
+    }
+
     void PutComplete(MasterService& service, const UUID& client_id,
                      const std::string& key, const std::string& tenant_id,
                      uint64_t size) {
@@ -57,6 +69,28 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         auto end =
             service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY);
         ASSERT_TRUE(end.has_value()) << toString(end.error());
+    }
+
+    void MountLocalDiskSegment(MasterService& service, const UUID& client_id) {
+        auto mount = service.MountLocalDiskSegment(client_id, true);
+        ASSERT_TRUE(mount.has_value()) << toString(mount.error());
+    }
+
+    void InjectLocalDiskReplica(MasterService& service, const UUID& client_id,
+                                const std::string& key,
+                                const std::string& tenant_id, int64_t size,
+                                const std::string& transport_endpoint) {
+        std::vector<OffloadTaskItem> tasks{
+            OffloadTaskItem{.tenant_id = tenant_id, .key = key, .size = size}};
+        StorageObjectMetadata metadata;
+        metadata.bucket_id = 0;
+        metadata.offset = 0;
+        metadata.key_size = static_cast<int64_t>(key.size());
+        metadata.data_size = size;
+        metadata.transport_endpoint = transport_endpoint;
+        std::vector<StorageObjectMetadata> metadatas{metadata};
+        auto result = service.NotifyOffloadSuccess(client_id, tasks, metadatas);
+        ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
     TenantQuotaSnapshot Snapshot(MasterService& service,
@@ -94,6 +128,11 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     void RecomputeTenantQuotas(MasterService& service) {
         service.RecomputeTenantEffectiveQuotas();
+    }
+
+    void BatchEvict(MasterService& service) {
+        service.BatchEvict(/*evict_ratio_target=*/1.0,
+                           /*evict_ratio_lowerbound=*/1.0);
     }
 
     void SetExplicitTenantPolicy(MasterService& service,
@@ -315,6 +354,79 @@ TEST_F(MasterServiceTenantQuotaTest, RemoveReleasesCommittedCharge) {
     ASSERT_TRUE(service.Remove("key", "tenant-a", /*force=*/true).has_value());
     EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
     EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       BatchEvictReleasesEvictedMemoryReplicaCharge) {
+    MasterService service(MakeOffloadConfig(/*default_quota=*/1000,
+                                            /*pool_capacity=*/1000));
+    UUID client_id =
+        MountSegment(service, /*size=*/4096, "quota_evict_segment");
+    MountLocalDiskSegment(service, client_id);
+
+    PutComplete(service, client_id, "key", "tenant-a", 400);
+    InjectLocalDiskReplica(service, client_id, "key", "tenant-a", 400,
+                           "quota_evict_segment");
+    ASSERT_EQ(Snapshot(service, "tenant-a").used_bytes, 400);
+
+    BatchEvict(service);
+
+    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
+    EXPECT_EQ(Snapshot(service, "tenant-a").committed_count, 0);
+    auto reserve = service.PutStart(client_id, "after-evict", "tenant-a", 1000,
+                                    MemoryConfig());
+    ASSERT_TRUE(reserve.has_value()) << toString(reserve.error());
+    auto revoke = service.PutRevoke(client_id, "after-evict", "tenant-a",
+                                    ReplicaType::MEMORY);
+    ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
+}
+
+TEST_F(MasterServiceTenantQuotaTest, PromotionSuccessCommitsTenantQuota) {
+    MasterService service(MakeOffloadConfig(/*default_quota=*/1000,
+                                            /*pool_capacity=*/1000));
+    UUID client_id =
+        MountSegment(service, /*size=*/4096, "quota_promotion_segment");
+    MountLocalDiskSegment(service, client_id);
+    InjectLocalDiskReplica(service, client_id, "cold", "tenant-a", 400,
+                           "quota_promotion_segment");
+
+    auto replicas = service.GetReplicaList("cold", "tenant-a");
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    auto alloc = service.PromotionAllocStart(client_id, "cold", "tenant-a", 400,
+                                             {"quota_promotion_segment"});
+    ASSERT_TRUE(alloc.has_value()) << toString(alloc.error());
+    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
+    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 400);
+
+    auto notify = service.NotifyPromotionSuccess(client_id, "cold", "tenant-a");
+    ASSERT_TRUE(notify.has_value()) << toString(notify.error());
+
+    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 400);
+    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
+    auto over_quota = service.PutStart(client_id, "too-much", "tenant-a", 700,
+                                       MemoryConfig());
+    ASSERT_FALSE(over_quota.has_value());
+    EXPECT_EQ(over_quota.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, PromotionAllocStartRejectsOverQuota) {
+    MasterService service(MakeOffloadConfig(/*default_quota=*/300,
+                                            /*pool_capacity=*/300));
+    UUID client_id =
+        MountSegment(service, /*size=*/4096, "quota_promotion_reject_segment");
+    MountLocalDiskSegment(service, client_id);
+    InjectLocalDiskReplica(service, client_id, "cold", "tenant-a", 400,
+                           "quota_promotion_reject_segment");
+
+    auto replicas = service.GetReplicaList("cold", "tenant-a");
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    auto alloc = service.PromotionAllocStart(
+        client_id, "cold", "tenant-a", 400, {"quota_promotion_reject_segment"});
+
+    ASSERT_FALSE(alloc.has_value());
+    EXPECT_EQ(alloc.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
