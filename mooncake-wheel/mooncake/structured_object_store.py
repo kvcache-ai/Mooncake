@@ -1415,7 +1415,10 @@ def _can_numeric_sequence(values: list[Any]) -> _CodecDecision:
         if arr.dtype == object or not np.issubdtype(arr.dtype, np.number):
             return _CodecDecision(False, "typed_ragged", f"non-numeric dtype: {arr.dtype}", "numeric sequence")
         dtypes.append(arr.dtype)
-    dtype = np.result_type(*dtypes)
+    try:
+        dtype = np.result_type(*dtypes)
+    except (TypeError, ValueError, OverflowError):
+        return _CodecDecision(False, "typed_ragged", "cannot determine common dtype", "numeric sequence")
     return _CodecDecision(True, "typed_ragged", "all rows promote to common numeric dtype", "numeric sequence", {"dtype": str(dtype)})
 
 
@@ -1442,7 +1445,7 @@ def _can_json(values: list[Any]) -> _CodecDecision:
     for v in nn[:_INFER_MAX_SAMPLE_ROWS]:
         try:
             total_bytes += len(json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError, RecursionError):
             return _CodecDecision(False, "json_ragged", "serialization failed", "json")
     if total_bytes > _INFER_MAX_JSON_BYTES:
         return _CodecDecision(False, "json_ragged", "sampled payload too large", "json")
