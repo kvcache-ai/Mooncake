@@ -1172,7 +1172,6 @@ class MasterService {
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     void RebuildCacheTotalAccounting();
-    static void RefreshCacheTotalAfterReplicaRemoval(ObjectMetadata& metadata);
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,

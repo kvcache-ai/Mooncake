@@ -722,20 +722,6 @@ void MasterService::SyncCacheTotalAccounting(ObjectMetadata& metadata) {
     }
 }
 
-void MasterService::RefreshCacheTotalAfterReplicaRemoval(
-    ObjectMetadata& metadata) {
-    if (metadata.memory_cache_total_accounted &&
-        !HasCompletedMemoryCacheReplica(metadata)) {
-        MasterMetricManager::instance().dec_mem_cache_nums();
-        metadata.memory_cache_total_accounted = false;
-    }
-    if (metadata.disk_cache_total_accounted &&
-        !HasCompletedDiskCacheReplica(metadata)) {
-        MasterMetricManager::instance().dec_file_cache_nums();
-        metadata.disk_cache_total_accounted = false;
-    }
-}
-
 void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
     if (metadata.memory_cache_total_accounted) {
         MasterMetricManager::instance().dec_mem_cache_nums();
@@ -762,14 +748,14 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn) {
     auto replicas = metadata.PopReplicas(pred_fn);
-    RefreshCacheTotalAfterReplicaRemoval(metadata);
+    SyncCacheTotalAccounting(metadata);
     return replicas;
 }
 
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata) {
     auto replicas = metadata.PopReplicas();
-    RefreshCacheTotalAfterReplicaRemoval(metadata);
+    SyncCacheTotalAccounting(metadata);
     return replicas;
 }
 
