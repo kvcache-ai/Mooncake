@@ -1,8 +1,13 @@
 #include <glog/logging.h>
-#include <numa.h>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+
+#ifdef USE_ASCEND_DRAM_TIER
+#include "acl/acl.h"
+#else
+#include <numa.h>
+#endif
 
 #include "tiered_cache/tiers/dram_tier.h"
 #include "utils.h"
@@ -70,15 +75,44 @@ DramCacheTier::~DramCacheTier() {
     }
 }
 
-tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
-                                                  TransferEngine* engine) {
+#ifdef USE_ASCEND_DRAM_TIER
+tl::expected<std::string, ErrorCode> DramCacheTier::AllocateMemory() {
+    int current_device = -1;
+    aclError acl_ret = aclrtGetDevice(&current_device);
+    if (acl_ret != ACL_SUCCESS) {
+        LOG(ERROR) << "USE_ASCEND_DRAM_TIER enabled but no ACL Device Context "
+                   << "on current thread (aclrtGetDevice returned " << acl_ret
+                   << "). Ensure aclInit and aclrtSetDevice/aclrtCreateContext "
+                   << "have been called before DramCacheTier::Init().";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    LOG(INFO) << "ACL Device Context found (device " << current_device
+              << "), using aclrtMallocHost for DRAM tier " << tier_id_;
+
+    void* host_ptr = nullptr;
+    acl_ret = aclrtMallocHost(&host_ptr, capacity_);
+    if (acl_ret != ACL_SUCCESS || host_ptr == nullptr) {
+        LOG(ERROR) << "aclrtMallocHost failed for " << capacity_
+                   << " bytes, ACL error: " << acl_ret;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    memory_buffer_ = std::unique_ptr<char[], std::function<void(char*)>>(
+        static_cast<char*>(host_ptr), [current_device](char* p) {
+            int dev = -1;
+            if (aclrtGetDevice(&dev) != ACL_SUCCESS) {
+                aclrtSetDevice(current_device);
+            }
+            aclrtFreeHost(static_cast<void*>(p));
+        });
+    LOG(INFO) << "Allocated " << capacity_ << " bytes (ACL Host Pinned) "
+              << "for DramCacheTier " << tier_id_;
+
+    return std::string(kWildcardLocation);
+}
+#else
+tl::expected<std::string, ErrorCode> DramCacheTier::AllocateMemory() {
     int node = -1;
-    std::string location;
 
-    backend_ = backend;
-    if (engine != nullptr) engine_ = engine;
-
-    // Allocate a contiguous memory block.
     const bool use_hugepage = (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr);
     if (use_hugepage) {
         const size_t hugepage_size = get_hugepage_size_from_env();
@@ -157,55 +191,87 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
         LOG(INFO) << "Allocated " << capacity_ << " bytes for DramCacheTier "
                   << tier_id_;
     }
-    char* mem_ptr = memory_buffer_.get();
 
-    // Register this newly allocated memory with the TransferEngine.
-    if (engine_) {
-        if (node != -1) {
-            location = "cpu:" + std::to_string(node);
-        } else {
-            location = kWildcardLocation;
-        }
-        int rc = engine_->registerLocalMemory(mem_ptr, capacity_, location);
-        if (rc != 0) {
-            LOG(ERROR) << "Failed to register memory with TransferEngine for "
-                          "DramCacheTier "
-                       << tier_id_ << ", engine ret is " << rc;
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        } else {
-            LOG(INFO)
-                << "registered memory with TransferEngine for DramCacheTier "
-                << tier_id_ << " at " << static_cast<void*>(mem_ptr);
-        }
+    if (node != -1) {
+        return "cpu:" + std::to_string(node);
     }
+    return std::string(kWildcardLocation);
+}
+#endif
 
-    // Use the address of this registered block as the base_address for the
-    // allocator.
-    const uintptr_t base_address = reinterpret_cast<uintptr_t>(mem_ptr);
+tl::expected<void, ErrorCode> DramCacheTier::RegisterWithEngine(
+    const std::string& location) {
+    char* mem_ptr = memory_buffer_.get();
+    int rc = engine_->registerLocalMemory(mem_ptr, capacity_, location);
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to register memory with TransferEngine for "
+                      "DramCacheTier "
+                   << tier_id_ << ", engine ret is " << rc;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    LOG(INFO) << "registered memory with TransferEngine for DramCacheTier "
+              << tier_id_ << " at " << static_cast<void*>(mem_ptr);
+    return {};
+}
+
+tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
+DramCacheTier::CreateAllocator() {
+    const uintptr_t base_address =
+        reinterpret_cast<uintptr_t>(memory_buffer_.get());
     std::string segment_name = "dram_tier_" + std::to_string(tier_id_.first) +
                                "-" + std::to_string(tier_id_.second);
 
+    std::shared_ptr<BufferAllocatorBase> allocator;
     switch (allocator_type_) {
         case BufferAllocatorType::OFFSET:
-            allocator_ = std::make_shared<OffsetBufferAllocator>(
+            allocator = std::make_shared<OffsetBufferAllocator>(
                 segment_name, base_address, capacity_, segment_name, tier_id_);
             break;
         case BufferAllocatorType::CACHELIB:
-            allocator_ = std::make_shared<CachelibBufferAllocator>(
+            allocator = std::make_shared<CachelibBufferAllocator>(
                 segment_name, base_address, capacity_, segment_name, tier_id_);
             break;
         default:
             LOG(ERROR) << "Unsupported allocator type for DramCacheTier";
-            if (engine_) {
-                engine_->unregisterLocalMemory(mem_ptr);
-            }
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    return allocator;
+}
+
+tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
+                                                  TransferEngine* engine) {
+    backend_ = backend;
+    if (engine != nullptr) engine_ = engine;
+
+    auto alloc_result = AllocateMemory();
+    if (!alloc_result) {
+        LOG(ERROR) << "DramCacheTier " << tier_id_
+                   << " Init failed: AllocateMemory error";
+        return tl::unexpected(alloc_result.error());
+    }
+
+    if (engine_) {
+        auto reg = RegisterWithEngine(*alloc_result);
+        if (!reg) {
+            LOG(ERROR) << "DramCacheTier " << tier_id_
+                       << " Init failed: RegisterWithEngine error";
+            return tl::unexpected(reg.error());
+        }
+    }
+
+    auto alloc = CreateAllocator();
+    if (!alloc) {
+        LOG(ERROR) << "DramCacheTier " << tier_id_
+                   << " Init failed: CreateAllocator error, rolling back";
+        if (engine_) engine_->unregisterLocalMemory(memory_buffer_.get());
+        return tl::unexpected(alloc.error());
+    }
+    allocator_ = std::move(*alloc);
 
     LOG(INFO) << "DramCacheTier " << tier_id_ << " initialized and registered "
               << capacity_ << " bytes at base address 0x" << std::hex
-              << base_address;
-    return tl::expected<void, ErrorCode>{};
+              << reinterpret_cast<uintptr_t>(memory_buffer_.get());
+    return {};
 }
 
 size_t DramCacheTier::GetUsage() const {

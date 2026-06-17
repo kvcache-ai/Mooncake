@@ -111,6 +111,11 @@ if(USE_ASCEND_CACHE_TIER)
   message(STATUS "Ascend Cache Tier enabled")
 endif()
 
+# Ascend DRAM Tier support (aclrtMallocHost-based DRAM allocation)
+if(USE_ASCEND_DRAM_TIER)
+  message(STATUS "Ascend DRAM Tier enabled")
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
@@ -158,6 +163,36 @@ if(USE_ASCEND_CACHE_TIER)
 
     # Only define USE_ASCEND_CACHE_TIER when library is found
     target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_CACHE_TIER)
+  endif()
+endif()
+
+# Link Ascend ACL library if USE_ASCEND_DRAM_TIER is enabled
+if(USE_ASCEND_DRAM_TIER)
+  set(NEED_LINK_ASCEND FALSE)
+  if(NOT ASCENDCL_LIB)
+    set(NEED_LINK_ASCEND TRUE)
+    set(ASCEND_SEARCH_PATHS
+        $ENV{ASCEND_HOME}/lib64
+        /usr/local/Ascend/ascend-toolkit/latest/lib64
+        /usr/local/Ascend/nnrt/latest/lib64
+    )
+    find_library(ASCENDCL_LIB ascendcl PATHS ${ASCEND_SEARCH_PATHS} NO_DEFAULT_PATH)
+  endif()
+
+  if(NOT ASCENDCL_LIB)
+    message(FATAL_ERROR "ascendcl library not found, USE_ASCEND_DRAM_TIER requires it")
+  else()
+    message(STATUS "Found ascendcl library for DRAM tier: ${ASCENDCL_LIB}")
+    if(NEED_LINK_ASCEND)
+      target_link_libraries(mooncake_store PUBLIC ${ASCENDCL_LIB})
+      set(ASCEND_INCLUDE_PATHS
+          $ENV{ASCEND_HOME}/include
+          /usr/local/Ascend/ascend-toolkit/latest/include
+          /usr/local/Ascend/nnrt/latest/include
+      )
+      target_include_directories(mooncake_store PUBLIC ${ASCEND_INCLUDE_PATHS})
+    endif()
+    target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_DRAM_TIER)
   endif()
 endif()
 if (STORE_USE_ETCD)
