@@ -5305,8 +5305,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 for (auto it = tenant_state.metadata.begin();
                      it != tenant_state.metadata.end(); ++it) {
                     if (it->second.IsHardPinned()) continue;
-                    if (can_evict_replicas(it->second))
-                        shard_evictable_count++;
+                    if (can_evict_replicas(it->second)) shard_evictable_count++;
                 }
             }
             object_count += shard_object_count;
@@ -5330,12 +5329,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (ideal_evict_num > 0) {
                             candidates.push_back(it->second.lease_timeout);
                         } else {
-                            no_pin_objects.push_back(
-                                it->second.lease_timeout);
+                            no_pin_objects.push_back(it->second.lease_timeout);
                         }
                     } else if (allow_evict_soft_pinned_objects_) {
-                        soft_pin_objects.push_back(
-                            it->second.lease_timeout);
+                        soft_pin_objects.push_back(it->second.lease_timeout);
                     }
                 }
             }
@@ -5445,8 +5442,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     /*allow_soft_pinned=*/false);
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
-                                    it = EraseMetadata(tenant_state, it,
-                                                       tenant_it->first, &shard);
+                                    it =
+                                        EraseMetadata(tenant_state, it,
+                                                      tenant_it->first, &shard);
                                 } else {
                                     ++it;
                                 }
@@ -5504,8 +5502,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     /*allow_soft_pinned=*/true);
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
-                                    it = EraseMetadata(tenant_state, it,
-                                                       tenant_it->first, &shard);
+                                    it =
+                                        EraseMetadata(tenant_state, it,
+                                                      tenant_it->first, &shard);
                                 } else {
                                     ++it;
                                 }
