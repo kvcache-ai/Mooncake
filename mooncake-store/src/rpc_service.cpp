@@ -856,11 +856,7 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     timer.LogRequest("keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_exist_key_requests(total_keys);
 
-    std::vector<tl::expected<bool, ErrorCode>> result;
-    result.reserve(keys.size());
-    for (const auto& key : keys) {
-        result.emplace_back(master_service_.ExistKey(key, tenant_id));
-    }
+    auto result = master_service_.BatchExistKey(keys, tenant_id);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < result.size(); ++i) {
