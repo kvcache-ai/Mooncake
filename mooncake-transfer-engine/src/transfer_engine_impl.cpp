@@ -270,12 +270,40 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #elif defined(USE_MACA)
 
-        Transport* t = multi_transports_->installTransport("maca", nullptr);
-        if (!t) {
-            LOG(ERROR) << "Failed to install MACA transport";
-            return -1;
+        if (getenv("MC_MACA_HOST_TRANSPORT")) {
+            if ((local_topology_->getHcaList().size() > 0 &&
+                 !getenv("MC_FORCE_TCP")) ||
+                getenv("MC_FORCE_HCA")) {
+                Transport* t = multi_transports_->installTransport(
+                    "rdma", local_topology_);
+                if (!t) {
+                    LOG(ERROR) << "Failed to install RDMA transport for MACA";
+                    return -1;
+                }
+                LOG(INFO) << "Using RDMA host transport for MACA";
+            } else {
+#ifdef USE_TCP
+                Transport* t =
+                    multi_transports_->installTransport("tcp", nullptr);
+                if (!t) {
+                    LOG(ERROR) << "Failed to install TCP transport for MACA";
+                    return -1;
+                }
+                LOG(INFO) << "Using TCP host transport for MACA";
+#else
+                LOG(ERROR)
+                    << "MC_MACA_HOST_TRANSPORT requires RDMA HCAs or USE_TCP";
+                return -1;
+#endif
+            }
+        } else {
+            Transport* t = multi_transports_->installTransport("maca", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install MACA transport";
+                return -1;
+            }
+            LOG(INFO) << "Using MACA transport";
         }
-        LOG(INFO) << "Using MACA transport";
 
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
@@ -310,7 +338,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
         }
 
-#else
+#elif !defined(USE_SUNRISE)
+        // Sunrise classic installs its transport explicitly from tebench after
+        // benchmark-specific setup, so it skips the default auto transport
+        // path.
         if ((local_topology_->getHcaList().size() > 0 &&
              !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {

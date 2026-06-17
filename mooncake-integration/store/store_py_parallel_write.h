@@ -58,9 +58,11 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
             char *dst = static_cast<char *>(alloc_result->ptr());
             std::memcpy(dst, &infos[i].metadata,
                         infos[i].metadata.header.data_offset);
-            std::memcpy(dst + infos[i].metadata.header.data_offset,
-                        reinterpret_cast<void *>(infos[i].data_ptr),
-                        infos[i].tensor_size);
+            if (infos[i].tensor_size > 0) {
+                std::memcpy(dst + infos[i].metadata.header.data_offset,
+                            reinterpret_cast<void *>(infos[i].data_ptr),
+                            infos[i].tensor_size);
+            }
 
             valid_keys.push_back(keys[i]);
             buffer_ptrs.push_back(alloc_result->ptr());
@@ -620,9 +622,11 @@ int execute_direct_parallelism_shard_write_from(
     std::vector<std::span<const char>> values;
     values.emplace_back(reinterpret_cast<const char *>(&*metadata),
                         metadata->header.data_offset);
-    values.emplace_back(
-        reinterpret_cast<const char *>(buffer_ptr + parsed->data_offset),
-        parsed->data_bytes);
+    if (parsed->data_bytes > 0) {
+        values.emplace_back(
+            reinterpret_cast<const char *>(buffer_ptr + parsed->data_offset),
+            parsed->data_bytes);
+    }
     return execute_tensor_parts_write(shard_key, values, config, ops,
                                       std::forward<WriteShardFn>(write_shard));
 }

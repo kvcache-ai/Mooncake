@@ -384,8 +384,9 @@ Client::~Client() {
         }
     }
 
-    // Stop hot cache handler and hot cache
+    // Stop hot cache handler before unregistering/freeing its backing memory.
     hot_cache_handler_.reset();
+    UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
 }
 
@@ -1489,6 +1490,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         client_cfg.preferred_segment = local_hostname_;
     }
 
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     // Start put operation
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result) {
@@ -1595,6 +1600,10 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         client_cfg.preferred_segment = local_hostname_;
     }
 
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     // Start upsert operation
     auto start_result =
         master_client_.UpsertStart(key, slice_lengths, client_cfg);
@@ -1655,6 +1664,14 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
         return tl::unexpected(err);
+    }
+
+    // Success-side invalidation: a concurrent read between the pre-upsert
+    // RemoveHotKey() and UpsertEnd could have read the old value and submitted
+    // an async hot-cache fill with a still-valid token. Invalidate again now
+    // that the new value is committed so that stale fill cannot publish.
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
     }
 
     return {};
@@ -1823,6 +1840,13 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
 
+    if (hot_cache_) {
+        std::vector<std::string> hot_keys;
+        hot_keys.reserve(ops.size());
+        for (const auto& op : ops) hot_keys.emplace_back(op.key);
+        hot_cache_->RemoveHotKeys(hot_keys);
+    }
+
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
 
@@ -1881,6 +1905,13 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
+
+    if (hot_cache_) {
+        std::vector<std::string> hot_keys;
+        hot_keys.reserve(ops.size());
+        for (const auto& op : ops) hot_keys.emplace_back(op.key);
+        hot_cache_->RemoveHotKeys(hot_keys);
+    }
 
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
@@ -2260,7 +2291,9 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     }
 
     // Process successful operations
+    std::vector<std::string> finalized_keys;
     if (!successful_keys.empty()) {
+        finalized_keys.reserve(successful_keys.size());
         auto end_responses = master_client_.BatchUpsertEnd(successful_keys);
         if (end_responses.size() != successful_keys.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
@@ -2281,11 +2314,21 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                                          "BatchUpsertEnd failed");
                 } else {
                     ops[op_idx].SetSuccess();
+                    finalized_keys.emplace_back(successful_keys[i]);
                     VLOG(1) << "Successfully completed upsert for key "
                             << successful_keys[i];
                 }
             }
         }
+    }
+
+    // Success-side invalidation for finalized upserts only: a concurrent read
+    // between StartBatchUpsert()'s pre-invalidation and BatchUpsertEnd could
+    // have read the old value and submitted an async hot-cache fill with a
+    // still-valid token. Invalidate again now that the new values are
+    // committed so those stale fills cannot publish.
+    if (hot_cache_ && !finalized_keys.empty()) {
+        hot_cache_->RemoveHotKeys(finalized_keys);
     }
 
     // Process failed operations that need cleanup
@@ -2512,6 +2555,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpKeyGeneration(key);
+    }
+
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
@@ -2519,11 +2566,20 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (!result) {
         return tl::unexpected(result.error());
     }
+
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     return {};
 }
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+    }
+
     auto result = master_client_.RemoveByRegex(str, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveByRegex(str);
@@ -2531,10 +2587,18 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
     if (!result) {
         return tl::unexpected(result.error());
     }
+    if (result.value() > 0 && hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+        hot_cache_->RemoveHotKeysByRegex(str);
+    }
     return result.value();
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+    }
+
     auto result = master_client_.RemoveAll(force);
     if (result) {
         if (storage_backend_) {
@@ -2544,12 +2608,34 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
             on_remove_all_cleanup_();
         }
     }
+    if (result && result.value() > 0 && hot_cache_) {
+        hot_cache_->RemoveAllHotKeys();
+    }
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
-    return master_client_.BatchRemove(keys, force);
+    if (hot_cache_) {
+        hot_cache_->BumpKeyGenerations(keys);
+    }
+
+    auto results = master_client_.BatchRemove(keys, force);
+
+    if (hot_cache_) {
+        std::vector<std::string> removed_keys;
+        removed_keys.reserve(std::min(keys.size(), results.size()));
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i < results.size() && results[i].has_value()) {
+                removed_keys.emplace_back(keys[i]);
+            }
+        }
+        if (!removed_keys.empty()) {
+            hot_cache_->RemoveHotKeys(removed_keys);
+        }
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
@@ -3862,6 +3948,11 @@ size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
 }
 
 ErrorCode Client::InitLocalHotCache() {
+    hot_cache_handler_.reset();
+    UnregisterLocalHotCacheMemory();
+    hot_cache_.reset();
+    admission_sketch_.reset();
+
     // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
     // set to a positive value; when enabled, default block size is 16MB and
     // thread_num is 2.
@@ -3872,9 +3963,6 @@ ErrorCode Client::InitLocalHotCache() {
     size_t total_cache = GetLocalHotCacheSizeFromEnv();
     if (total_cache == 0) {
         // Environment variable not set or invalid, disable cache
-        hot_cache_.reset();
-        hot_cache_handler_.reset();
-        admission_sketch_.reset();
         return ErrorCode::OK;
     }
 
@@ -3902,10 +3990,29 @@ ErrorCode Client::InitLocalHotCache() {
             admission_sketch_.reset();
             return ErrorCode::INVALID_PARAMS;
         }
+
+        int rc = transfer_engine_->registerLocalMemory(
+            hot_cache_->GetBaseAddress(), hot_cache_->GetTotalSize(),
+            kWildcardLocation, true, true);
+        if (rc != 0) {
+            LOG(ERROR)
+                << "Failed to register local hot cache memory with transfer "
+                   "engine, base="
+                << hot_cache_->GetBaseAddress()
+                << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+            hot_cache_.reset();
+            hot_cache_handler_.reset();
+            admission_sketch_.reset();
+            hot_cache_memory_registered_ = false;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        hot_cache_memory_registered_ = true;
+
         LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
                   << ", block size=" << block_size
                   << ", block amount=" << hot_cache_->GetCacheSize()
-                  << ", shm=" << (use_shm ? "on" : "off");
+                  << ", shm=" << (use_shm ? "on" : "off")
+                  << ", transfer engine registered=on";
         // Create async handler with 2 worker threads
         hot_cache_handler_ =
             std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
@@ -3932,6 +4039,27 @@ ErrorCode Client::InitLocalHotCache() {
         }
     }
     return ErrorCode::OK;
+}
+
+void Client::UnregisterLocalHotCacheMemory() {
+    if (!(hot_cache_ && hot_cache_memory_registered_)) {
+        return;
+    }
+    if (!transfer_engine_) {
+        hot_cache_memory_registered_ = false;
+        return;
+    }
+
+    int rc = transfer_engine_->unregisterLocalMemory(
+        hot_cache_->GetBaseAddress(), true);
+    if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+        LOG(ERROR)
+            << "Failed to unregister local hot cache memory from transfer "
+               "engine, base="
+            << hot_cache_->GetBaseAddress()
+            << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+    }
+    hot_cache_memory_registered_ = false;
 }
 
 void Client::ProcessSlicesAsync(const std::string& key,

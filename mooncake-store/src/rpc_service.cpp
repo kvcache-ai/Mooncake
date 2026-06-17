@@ -463,10 +463,11 @@ void MasterAdminServer::InitHttpServer() {
             auto key = req.get_query_value("key");
             auto get_result =
                 service->GetReplicaList(std::string(key), "default");
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
             if (get_result) {
-                std::string ss;
+                std::string ss = "{\"success\":true,\"data\":[";
                 const auto& replicas = get_result.value().replicas;
+                bool first = true;
                 for (const auto& replica : replicas) {
                     if (!replica.is_memory_replica()) {
                         continue;
@@ -474,15 +475,23 @@ void MasterAdminServer::InitHttpServer() {
                     std::string tmp;
                     struct_json::to_json(
                         replica.get_memory_descriptor().buffer_descriptor, tmp);
+                    if (!first) {
+                        ss += ",";
+                    }
                     ss += tmp;
-                    ss += "\n";
+                    first = false;
                 }
+                ss += "]}";
                 resp.set_status_and_content(status_type::ok, std::move(ss));
                 return;
             }
 
-            resp.set_status_and_content(status_type::not_found,
-                                        toString(get_result.error()));
+            resp.set_status_and_content(
+                status_type::not_found,
+                std::string("{\"success\":false,\"error_code\":") +
+                    std::to_string(toInt(get_result.error())) +
+                    ",\"error_message\":\"" +
+                    EscapeJson(toString(get_result.error())) + "\"}");
         });
 
     http_server_.set_http_handler<GET>(
@@ -847,11 +856,7 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     timer.LogRequest("keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_exist_key_requests(total_keys);
 
-    std::vector<tl::expected<bool, ErrorCode>> result;
-    result.reserve(keys.size());
-    for (const auto& key : keys) {
-        result.emplace_back(master_service_.ExistKey(key, tenant_id));
-    }
+    auto result = master_service_.BatchExistKey(keys, tenant_id);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < result.size(); ++i) {

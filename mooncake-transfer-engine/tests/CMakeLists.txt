@@ -134,6 +134,23 @@ if (USE_UB)
     # add_test(NAME ub_transport_test COMMAND ub_transport_test)
 endif()
 
+if (USE_SUNRISE)
+    add_executable(sunrise_link_transport_test ${WORKSPACE}/sunrise_link_transport_test.cpp)
+    target_include_directories(sunrise_link_transport_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_link_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_link_transport_test COMMAND sunrise_link_transport_test)
+
+    add_executable(sunrise_link_transport_runtime_test ${WORKSPACE}/sunrise_link_transport_runtime_test.cpp)
+    target_include_directories(sunrise_link_transport_runtime_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_link_transport_runtime_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_link_transport_runtime_test COMMAND sunrise_link_transport_runtime_test)
+
+    add_executable(sunrise_link_transport_unit_test ${WORKSPACE}/sunrise_link_transport_unit_test.cpp)
+    target_include_directories(sunrise_link_transport_unit_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_link_transport_unit_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_link_transport_unit_test COMMAND sunrise_link_transport_unit_test)
+endif()
+
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)

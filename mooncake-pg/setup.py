@@ -34,6 +34,7 @@ cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
+use_maca = hasattr(torch.version, "maca") and torch.version.maca is not None
 
 if use_musa:
     musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
@@ -48,6 +49,8 @@ if use_musa:
         "-O3",
     ]
 else:
+    if use_maca:
+        cxx_args.append("-DUSE_MACA")
     device_args = [
         abi_define,
         "-std=c++20",
@@ -56,6 +59,8 @@ else:
         "-Xcompiler",
         "-g0",
     ]
+    if use_maca:
+        device_args.append("-DUSE_MACA")
     # Link against the CUDA driver stub library if available.
     # Same approach as mooncake-ep/setup.py.
     if CUDA_HOME is not None:

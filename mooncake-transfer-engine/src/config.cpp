@@ -258,6 +258,17 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* handshake_connect_timeout =
+        std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
+    if (handshake_connect_timeout) {
+        int val = atoi(handshake_connect_timeout);
+        if (val > 0 && val < 3600)
+            config.handshake_connect_timeout = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_HANDSHAKE_CONNECT_TIMEOUT";
+    }
+
     const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {

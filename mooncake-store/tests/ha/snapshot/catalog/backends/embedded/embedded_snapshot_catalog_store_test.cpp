@@ -109,7 +109,7 @@ class EmbeddedSnapshotCatalogStoreTest : public ::testing::Test {
     }
 
     FakeSnapshotObjectStore backend_;
-    ha::backends::embedded::EmbeddedSnapshotCatalogStore store_{&backend_};
+    ha::backends::embedded::EmbeddedSnapshotCatalogStore store_{&backend_, ""};
 };
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest, PublishAndGetLatestRoundTrip) {
@@ -205,7 +205,7 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest,
 
 TEST(EmbeddedSnapshotCatalogStoreStandaloneTest,
      ListReturnsInvalidParamsWhenObjectStoreMissing) {
-    ha::backends::embedded::EmbeddedSnapshotCatalogStore store(nullptr);
+    ha::backends::embedded::EmbeddedSnapshotCatalogStore store(nullptr, "");
 
     auto snapshots = store.List(0);
     ASSERT_FALSE(snapshots.has_value());
