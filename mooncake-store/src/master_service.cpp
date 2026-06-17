@@ -5270,7 +5270,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 result.evicted_objects++;
             }
             if (member_key != key && !member_metadata.IsValid()) {
-                EraseMetadata(tenant_state, member_it, tenant_id);
+                EraseMetadata(tenant_state, member_it, tenant_id, &shard);
             }
         }
         return result;
@@ -5280,6 +5280,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // shards.
     size_t start_idx = RandomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+
+    long evicted_count = 0;
+    long object_count = 0;
+    long total_eviction_base = 0;
+    uint64_t total_freed_size = 0;
+    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
+    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
 
     // First pass: evict objects without soft pin and lease expired
     std::vector<std::vector<Replica>> deferred_replicas;
@@ -5292,36 +5299,43 @@ void MasterService::BatchEvict(double evict_ratio_target,
             DiscardExpiredProcessingReplicas(shard, now);
 
             size_t shard_object_count = 0;
+            size_t shard_evictable_count = 0;
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 shard_object_count += tenant_state.metadata.size();
+                for (auto it = tenant_state.metadata.begin();
+                     it != tenant_state.metadata.end(); ++it) {
+                    if (it->second.IsHardPinned()) continue;
+                    if (can_evict_replicas(it->second))
+                        shard_evictable_count++;
+                }
             }
             object_count += shard_object_count;
+            total_eviction_base += shard_evictable_count;
 
-            // To achieve evicted_count / object_count = evict_ratio_target,
-            // ideally how many object should be evicted in this shard
+            // To achieve evicted_count / eviction_base = evict_ratio_target,
+            // ideally how many objects should be evicted in this shard
             const long ideal_evict_num =
-                std::ceil(object_count * evict_ratio_target) - evicted_count;
+                std::ceil(total_eviction_base * evict_ratio_target) -
+                evicted_count;
 
-            std::vector<std::chrono::system_clock::time_point>
-                candidates;  // can be removed
+            std::vector<std::chrono::system_clock::time_point> candidates;
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (auto it = tenant_state.metadata.begin();
-                     it != tenant_state.metadata.end(); it++) {
-                    if (it->second.IsHardPinned()) {
+                     it != tenant_state.metadata.end(); ++it) {
+                    if (it->second.IsHardPinned()) continue;
+                    bool has_evictable = can_evict_replicas(it->second);
+                    if (!it->second.IsLeaseExpired(now) || !has_evictable)
                         continue;
-                    }
-                    if (!it->second.IsLeaseExpired(now) ||
-                        !can_evict_replicas(it->second)) {
-                        continue;
-                    }
                     if (!it->second.IsSoftPinned(now)) {
                         if (ideal_evict_num > 0) {
                             candidates.push_back(it->second.lease_timeout);
                         } else {
-                            no_pin_objects.push_back(it->second.lease_timeout);
+                            no_pin_objects.push_back(
+                                it->second.lease_timeout);
                         }
                     } else if (allow_evict_soft_pinned_objects_) {
-                        soft_pin_objects.push_back(it->second.lease_timeout);
+                        soft_pin_objects.push_back(
+                            it->second.lease_timeout);
                     }
                 }
             }
@@ -5355,7 +5369,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             total_freed_size += evict_result.freed_bytes;
                             if (it->second.IsValid() == false) {
                                 it = EraseMetadata(tenant_state, it,
-                                                   tenant_it->first);
+                                                   tenant_it->first, &shard);
                             } else {
                                 ++it;
                             }
@@ -5375,6 +5389,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
         }
         deferred_replicas.clear();
+    }
+
+    if (total_eviction_base == 0) {
+        need_mem_eviction_ = false;
+        VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
+                << " eviction_base=0 (no evictable memory objects)";
+        return;
     }
 
     // Try releasing discarded replicas before we decide whether to do the
@@ -5425,7 +5446,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
                                     it = EraseMetadata(tenant_state, it,
-                                                       tenant_it->first);
+                                                       tenant_it->first, &shard);
                                 } else {
                                     ++it;
                                 }
@@ -5484,7 +5505,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
                                     it = EraseMetadata(tenant_state, it,
-                                                       tenant_it->first);
+                                                       tenant_it->first, &shard);
                                 } else {
                                     ++it;
                                 }
