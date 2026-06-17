@@ -102,10 +102,6 @@ RpcHandlerMetric::RpcHandlerMetric(
     const std::map<std::string, std::string>& labels)
     : requests(metric_prefix + "_" + rpc_name + "_requests_total",
                "Total incoming " + rpc_name + " RPC requests", labels),
-      hits(metric_prefix + "_" + rpc_name + "_hits_total",
-           "Total successful " + rpc_name + " RPC requests", labels),
-      misses(metric_prefix + "_" + rpc_name + "_misses_total",
-             "Total " + rpc_name + " RPC misses (not found)", labels),
       failures(metric_prefix + "_" + rpc_name + "_failures_total",
                "Total failed " + rpc_name + " RPC requests", labels),
       latency_success(metric_prefix + "_" + rpc_name + "_latency_success_us",
@@ -117,14 +113,35 @@ RpcHandlerMetric::RpcHandlerMetric(
 
 void RpcHandlerMetric::serialize(std::string& str) {
     requests.serialize(str);
-    hits.serialize(str);
-    misses.serialize(str);
     failures.serialize(str);
     latency_success.serialize(str);
     latency_failure.serialize(str);
 }
 
 std::string RpcHandlerMetric::summary_line(const std::string& display_name) {
+    std::stringstream ss;
+    ss << display_name << ": " << requests.value() << " requests, "
+       << failures.value() << " failures\n";
+    return ss.str();
+}
+
+ReadRpcHandlerMetric::ReadRpcHandlerMetric(
+    const std::string& metric_prefix, const std::string& rpc_name,
+    const std::map<std::string, std::string>& labels)
+    : RpcHandlerMetric(metric_prefix, rpc_name, labels),
+      hits(metric_prefix + "_" + rpc_name + "_hits_total",
+           "Total successful " + rpc_name + " RPC requests", labels),
+      misses(metric_prefix + "_" + rpc_name + "_misses_total",
+             "Total " + rpc_name + " RPC misses (not found)", labels) {}
+
+void ReadRpcHandlerMetric::serialize(std::string& str) {
+    RpcHandlerMetric::serialize(str);
+    hits.serialize(str);
+    misses.serialize(str);
+}
+
+std::string ReadRpcHandlerMetric::summary_line(
+    const std::string& display_name) {
     std::stringstream ss;
     ss << display_name << ": " << requests.value() << " requests, "
        << hits.value() << " hits, " << misses.value() << " misses, "

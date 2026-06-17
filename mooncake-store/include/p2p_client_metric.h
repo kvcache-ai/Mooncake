@@ -44,8 +44,6 @@ struct RequestMetric {
 // Per-RPC metrics for peer incoming handlers.
 struct RpcHandlerMetric {
     ylt::metric::counter_t requests;
-    ylt::metric::counter_t hits;
-    ylt::metric::counter_t misses;
     ylt::metric::counter_t failures;
     ylt::metric::histogram_t latency_success;
     ylt::metric::histogram_t latency_failure;
@@ -58,13 +56,26 @@ struct RpcHandlerMetric {
     std::string summary_line(const std::string& display_name);
 };
 
+// Read-semantics peer RPC metrics (ReadRemoteData, PinKey).
+struct ReadRpcHandlerMetric : RpcHandlerMetric {
+    ylt::metric::counter_t hits;
+    ylt::metric::counter_t misses;
+
+    ReadRpcHandlerMetric(const std::string& metric_prefix,
+                         const std::string& rpc_name,
+                         const std::map<std::string, std::string>& labels = {});
+
+    void serialize(std::string& str);
+    std::string summary_line(const std::string& display_name);
+};
+
 struct PeerRequestMetrics {
-    RpcHandlerMetric read_remote_data;
+    ReadRpcHandlerMetric read_remote_data;
     RpcHandlerMetric write_remote_data;
     RpcHandlerMetric prewrite;
     RpcHandlerMetric write_commit;
     RpcHandlerMetric write_revoke;
-    RpcHandlerMetric pin_key;
+    ReadRpcHandlerMetric pin_key;
     RpcHandlerMetric unpin_key;
 
     explicit PeerRequestMetrics(
