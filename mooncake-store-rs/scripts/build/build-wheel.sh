@@ -408,8 +408,16 @@ require_glob() {
   fi
 }
 
+detect_classic_te_lib() {
+  local base="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src"
+  if [[ -f "${base}/libtransfer_engine.a" ]]; then
+    printf '%s\n' "${base}/libtransfer_engine.a"
+  elif [[ -f "${base}/libtransfer_engine.so" ]]; then
+    printf '%s\n' "${base}/libtransfer_engine.so"
+  fi
+}
+
 require_reusable_native_artifacts() {
-  require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.a"
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so"
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-asio/libasio.so"
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench"
@@ -426,7 +434,7 @@ require_reusable_native_artifacts() {
 if is_truthy "${MOONCAKE_REUSE_NATIVE_ARTIFACTS:-0}"; then
   require_reusable_native_artifacts
   export MOONCAKE_SKIP_NATIVE_BUILD="${MOONCAKE_SKIP_NATIVE_BUILD:-1}"
-  export MOONCAKE_CLASSIC_TE_LIB_PATH="${MOONCAKE_CLASSIC_TE_LIB_PATH:-${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.a}"
+  export MOONCAKE_CLASSIC_TE_LIB_PATH="${MOONCAKE_CLASSIC_TE_LIB_PATH:-$(detect_classic_te_lib)}"
   export MOONCAKE_TENT_SHARED_LIB_PATH="${MOONCAKE_TENT_SHARED_LIB_PATH:-${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so}"
   _timer_elapsed $_WHEEL_GLOBAL_START "setup (reused native artifacts)"
 else
