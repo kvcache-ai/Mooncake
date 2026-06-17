@@ -20,6 +20,13 @@ reads before later pressure arrives. Existence checks stay boolean probes and do
 
 With tenant quota policy configured, single-object `put` uses metadata-backed reserve/finalize/abort semantics and `remove` applies the matching refund when the delete becomes authoritative. This gives create, overwrite, and delete a tenant-root quota state that survives concurrent writers better than the older best-effort namespace scan.
 
+When an operator shrinks a tenant's strict quota below its current usage, quota admission only
+rejects further positive growth on the constrained dimensions. Non-growing updates and same-tenant
+deletes stay admissible while the tenant is already over limit, so follow-up writes can still
+recover by deleting older objects within that same tenant and converge the namespace back under
+the new `max_bytes` / `max_objects` boundary instead of deadlocking on the already-over-limit
+state.
+
 `remove` and `batch_remove` also retry when route delete CAS observes a fresher still-active
 current route that metadata can prove is the same hot-upgrade or standby-promotion successor
 lineage. Cleanup traffic that races with rollout-era route migration therefore converges onto the

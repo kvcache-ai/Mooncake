@@ -896,7 +896,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         let positive_bytes = non_negative_i64_to_u64(request.delta_bytes.max(0), "delta_bytes")?;
         let positive_objects =
             non_negative_i64_to_u64(request.delta_objects.max(0), "delta_objects")?;
-        if let Some(limit) = request.limit.max_bytes {
+        if let Some(limit) = request.limit.max_bytes.filter(|_| positive_bytes > 0) {
             let admitted = quota
                 .used_bytes
                 .checked_add(quota.pending_reserved_bytes)
@@ -921,7 +921,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                 });
             }
         }
-        if let Some(limit) = request.limit.max_objects {
+        if let Some(limit) = request.limit.max_objects.filter(|_| positive_objects > 0) {
             let limit = u64::try_from(limit).map_err(|_| {
                 StoreError::InvalidState(format!(
                     "tenant object limit overflow for {}",
@@ -1835,6 +1835,103 @@ mod tests {
             .get_tenant_object_accounting(&key)
             .expect("object accounting lookup should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn tenant_quota_reservation_allows_non_positive_deltas_when_usage_is_already_over_limit() {
+        let metadata = InMemoryMetadataBackend::new();
+        let scope = TenantPolicyScope::new("tenant-nonpositive", None::<String>, None::<String>);
+        let key = ObjectKey::new("tenant-nonpositive::alpha");
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        metadata
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-seed".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: None,
+                delta_bytes: 32,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 100,
+                created_at_ms: 10,
+                writer_runtime: writer.clone(),
+            })
+            .expect("seed reservation should succeed");
+        metadata
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-seed".to_string(),
+                expected_object_version: None,
+                committed_length: Some(32),
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 20,
+                updated_by: "writer".to_string(),
+            })
+            .expect("seed finalize should succeed");
+
+        let zero_delta = metadata
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-zero".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(1),
+                delta_bytes: 0,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(16),
+                    max_objects: Some(0),
+                },
+                expires_at_ms: 200,
+                created_at_ms: 30,
+                writer_runtime: writer.clone(),
+            })
+            .expect("zero-delta reservation should stay admissible while over limit");
+        assert_eq!(zero_delta.quota.used_bytes, 32);
+        assert_eq!(zero_delta.quota.used_objects, 1);
+        assert_eq!(zero_delta.quota.pending_reserved_bytes, 0);
+        assert_eq!(zero_delta.quota.pending_reserved_objects, 0);
+        metadata
+            .abort_tenant_quota("resv-zero")
+            .expect("zero-delta abort should succeed");
+
+        let negative_delta = metadata
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-delete".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(1),
+                delta_bytes: -32,
+                delta_objects: -1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(16),
+                    max_objects: Some(0),
+                },
+                expires_at_ms: 260,
+                created_at_ms: 40,
+                writer_runtime: writer,
+            })
+            .expect("negative-delta reservation should stay admissible while over limit");
+        assert_eq!(negative_delta.quota.used_bytes, 32);
+        assert_eq!(negative_delta.quota.used_objects, 1);
+        assert_eq!(negative_delta.quota.pending_reserved_bytes, 0);
+        assert_eq!(negative_delta.quota.pending_reserved_objects, 0);
+        let deleted = metadata
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-delete".to_string(),
+                expected_object_version: Some(1),
+                committed_length: None,
+                route_version: None,
+                state: TenantObjectAccountingState::Deleted,
+                updated_at_ms: 50,
+                updated_by: "writer".to_string(),
+            })
+            .expect("negative-delta finalize should succeed");
+        assert_eq!(deleted.quota.used_bytes, 0);
+        assert_eq!(deleted.quota.used_objects, 0);
     }
 
     #[test]

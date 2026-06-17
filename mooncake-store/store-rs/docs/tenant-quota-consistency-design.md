@@ -402,7 +402,8 @@ used_bytes + pending_reserved_bytes + requested_positive_bytes_delta <= max_byte
 used_objects + pending_reserved_objects + requested_positive_objects_delta <= max_objects
 ```
 
-Negative deltas from shrink / overwrite-smaller / delete should not require quota headroom.
+Non-positive deltas from shrink / overwrite-same / overwrite-smaller / delete should not require
+quota headroom on that dimension.
 
 ### Why include pending reservations in admission
 
