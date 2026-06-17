@@ -11,12 +11,6 @@ namespace mooncake {
 
 namespace {
 
-size_t CalculateBufferSize(const std::vector<RemoteBufferDesc>& buffers) {
-    size_t total = 0;
-    for (const auto& buf : buffers) total += buf.size;
-    return total;
-}
-
 bool IsValidRequest(const RemoteReadRequest& request) {
     if (request.key.empty()) {
         LOG(ERROR) << "RemoteReadRequest: empty key";
@@ -68,15 +62,16 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
                      "buffer_count=", request.dest_buffers.size());
 
     if (metrics_) {
-        metrics_->peer_request.get_requests.inc();
+        metrics_->peer_request_metrics.read_remote_data.requests.inc();
     }
     Stopwatch sw;
 
     if (!IsValidRequest(request)) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
-            metrics_->peer_request.get_failures.inc();
-            metrics_->peer_request.get_latency_failure.observe(sw.elapsed_us());
+            metrics_->peer_request_metrics.read_remote_data.failures.inc();
+            metrics_->peer_request_metrics.read_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -94,21 +89,21 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         }
         if (metrics_) {
             if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                metrics_->peer_request.get_misses.inc();
+                metrics_->peer_request_metrics.read_remote_data.misses.inc();
             } else {
-                metrics_->peer_request.get_failures.inc();
+                metrics_->peer_request_metrics.read_remote_data.failures.inc();
             }
-            metrics_->peer_request.get_latency_failure.observe(sw.elapsed_us());
+            metrics_->peer_request_metrics.read_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return result;
     }
 
-    // Record successful get: hits + bytes + latency
+    // Record successful get: latency
     if (metrics_) {
-        metrics_->peer_request.get_hits.inc();
-        metrics_->peer_request.get_bytes.inc(
-            CalculateBufferSize(request.dest_buffers));
-        metrics_->peer_request.get_latency_success.observe(sw.elapsed_us());
+        metrics_->peer_request_metrics.read_remote_data.hits.inc();
+        metrics_->peer_request_metrics.read_remote_data.latency_success.observe(
+            sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
@@ -122,15 +117,16 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
                      "buffer_count=", request.src_buffers.size());
 
     if (metrics_) {
-        metrics_->peer_request.put_requests.inc();
+        metrics_->peer_request_metrics.write_remote_data.requests.inc();
     }
     Stopwatch sw;
 
     if (!IsValidRequest(request)) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
-            metrics_->peer_request.put_failures.inc();
-            metrics_->peer_request.put_latency_failure.observe(sw.elapsed_us());
+            metrics_->peer_request_metrics.write_remote_data.failures.inc();
+            metrics_->peer_request_metrics.write_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -144,36 +140,40 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
         if (metrics_) {
-            metrics_->peer_request.put_failures.inc();
-            metrics_->peer_request.put_latency_failure.observe(sw.elapsed_us());
+            metrics_->peer_request_metrics.write_remote_data.failures.inc();
+            metrics_->peer_request_metrics.write_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return result;
     }
 
-    // Record successful put: bytes + latency
     if (metrics_) {
-        metrics_->peer_request.put_bytes.inc(
-            CalculateBufferSize(request.src_buffers));
-        metrics_->peer_request.put_latency_success.observe(sw.elapsed_us());
+        metrics_->peer_request_metrics.write_remote_data.latency_success
+            .observe(sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
 }
 
-// TODO(metrics): Add peer_request metrics for forward TE control-plane RPCs
-// below (PreWrite, WriteCommit, WriteRevoke, PinKey, UnPinKey), following the
-// same pattern as WriteRemoteData/ReadRemoteData (Stopwatch, requests/failures/
-// bytes, latency histograms). Follow-up PR.
-
 tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(
     const PreWriteRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::PreWrite");
     timer.LogRequest("key=", request.key, "size_bytes=", request.size_bytes);
 
+    if (metrics_) {
+        metrics_->peer_request_metrics.prewrite.requests.inc();
+    }
+    Stopwatch sw;
+
     if (request.key.empty() || request.size_bytes == 0) {
         LOG(ERROR) << "PreWriteRequest: invalid key or size";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request_metrics.prewrite.failures.inc();
+            metrics_->peer_request_metrics.prewrite.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -183,7 +183,17 @@ tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(
         LOG(ERROR) << "PreWrite failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
+        if (metrics_) {
+            metrics_->peer_request_metrics.prewrite.failures.inc();
+            metrics_->peer_request_metrics.prewrite.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return tl::make_unexpected(result.error());
+    }
+
+    if (metrics_) {
+        metrics_->peer_request_metrics.prewrite.latency_success.observe(
+            sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
@@ -195,9 +205,19 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
     ScopedVLogTimer timer(1, "ClientRpcService::WriteCommit");
     timer.LogRequest("key=", request.key);
 
+    if (metrics_) {
+        metrics_->peer_request_metrics.write_commit.requests.inc();
+    }
+    Stopwatch sw;
+
     if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
         LOG(ERROR) << "WriteCommitRequest: invalid key or token";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request_metrics.write_commit.failures.inc();
+            metrics_->peer_request_metrics.write_commit.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -207,7 +227,17 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
         LOG(ERROR) << "WriteCommit failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
+        if (metrics_) {
+            metrics_->peer_request_metrics.write_commit.failures.inc();
+            metrics_->peer_request_metrics.write_commit.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return result;
+    }
+
+    if (metrics_) {
+        metrics_->peer_request_metrics.write_commit.latency_success.observe(
+            sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
@@ -219,9 +249,19 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
     ScopedVLogTimer timer(1, "ClientRpcService::WriteRevoke");
     timer.LogRequest("key=", request.key);
 
+    if (metrics_) {
+        metrics_->peer_request_metrics.write_revoke.requests.inc();
+    }
+    Stopwatch sw;
+
     if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
         LOG(ERROR) << "WriteRevokeRequest: invalid key or token";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request_metrics.write_revoke.failures.inc();
+            metrics_->peer_request_metrics.write_revoke.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -231,7 +271,17 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
         LOG(ERROR) << "WriteRevoke failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
+        if (metrics_) {
+            metrics_->peer_request_metrics.write_revoke.failures.inc();
+            metrics_->peer_request_metrics.write_revoke.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return result;
+    }
+
+    if (metrics_) {
+        metrics_->peer_request_metrics.write_revoke.latency_success.observe(
+            sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
@@ -243,9 +293,19 @@ tl::expected<PinKeyResponse, ErrorCode> ClientRpcService::PinKey(
     ScopedVLogTimer timer(1, "ClientRpcService::PinKey");
     timer.LogRequest("key=", request.key);
 
+    if (metrics_) {
+        metrics_->peer_request_metrics.pin_key.requests.inc();
+    }
+    Stopwatch sw;
+
     if (request.key.empty()) {
         LOG(ERROR) << "PinKeyRequest: empty key";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request_metrics.pin_key.failures.inc();
+            metrics_->peer_request_metrics.pin_key.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -254,7 +314,22 @@ tl::expected<PinKeyResponse, ErrorCode> ClientRpcService::PinKey(
         LOG(ERROR) << "PinKey failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
+        if (metrics_) {
+            if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                metrics_->peer_request_metrics.pin_key.misses.inc();
+            } else {
+                metrics_->peer_request_metrics.pin_key.failures.inc();
+            }
+            metrics_->peer_request_metrics.pin_key.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return tl::make_unexpected(result.error());
+    }
+
+    if (metrics_) {
+        metrics_->peer_request_metrics.pin_key.hits.inc();
+        metrics_->peer_request_metrics.pin_key.latency_success.observe(
+            sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
@@ -266,9 +341,19 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
     ScopedVLogTimer timer(1, "ClientRpcService::UnPinKey");
     timer.LogRequest("key=", request.key);
 
+    if (metrics_) {
+        metrics_->peer_request_metrics.unpin_key.requests.inc();
+    }
+    Stopwatch sw;
+
     if (request.key.empty() || IsZeroUUID(request.read_operation_id)) {
         LOG(ERROR) << "UnPinKeyRequest: invalid key or token";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request_metrics.unpin_key.failures.inc();
+            metrics_->peer_request_metrics.unpin_key.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -278,7 +363,17 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
         LOG(ERROR) << "UnPinKey failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
+        if (metrics_) {
+            metrics_->peer_request_metrics.unpin_key.failures.inc();
+            metrics_->peer_request_metrics.unpin_key.latency_failure.observe(
+                sw.elapsed_us());
+        }
         return result;
+    }
+
+    if (metrics_) {
+        metrics_->peer_request_metrics.unpin_key.latency_success.observe(
+            sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);

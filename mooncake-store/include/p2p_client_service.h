@@ -320,16 +320,18 @@ class P2PClientService final : public ClientService {
             const std::vector<RemoteBufferDesc>& dest_buffers)>;
 
         PeerClient* peer_ptr;
+        P2PClientMetric* metrics;
         std::shared_ptr<RemoteWriteRequest> write_req;
         std::string endpoint;
         std::vector<Slice>* slices;
         TeTransferFn te_transfer;
 
-        RemoteForwardWriteOp(PeerClient* p,
+        RemoteForwardWriteOp(PeerClient* p, P2PClientMetric* m,
                              std::shared_ptr<RemoteWriteRequest> wr,
                              std::string ep, std::vector<Slice>* s,
                              TeTransferFn transfer)
             : peer_ptr(p),
+              metrics(m),
               write_req(std::move(wr)),
               endpoint(std::move(ep)),
               slices(s),
@@ -341,7 +343,7 @@ class P2PClientService final : public ClientService {
        private:
         static async_simple::coro::Lazy<void> RunForwardRemotePut(
             std::shared_ptr<WritePromise> promise, PeerClient* peer,
-            TeTransferFn te_transfer,
+            P2PClientMetric* metrics, TeTransferFn te_transfer,
             std::shared_ptr<RemoteWriteRequest> write_req,
             std::vector<Slice>* slices);
     };
