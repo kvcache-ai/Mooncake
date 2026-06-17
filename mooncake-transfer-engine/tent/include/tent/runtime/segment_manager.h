@@ -31,9 +31,9 @@
 
 #include "tent/runtime/segment.h"
 
-// Fallback refresh interval for cached remote SegmentDesc. Invalidation normally
-// comes from the best-effort SegmentUpdate push; this TTL only bounds staleness
-// if a push is lost.
+// Fallback refresh interval for cached remote SegmentDesc. Invalidation
+// normally comes from the best-effort SegmentUpdate push; this TTL only bounds
+// staleness if a push is lost.
 #define TENT_SEGMENT_DESC_TTL_MS (60 * 60 * 1000)  // 1h
 
 namespace mooncake {
