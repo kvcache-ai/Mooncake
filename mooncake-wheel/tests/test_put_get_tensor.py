@@ -235,5 +235,115 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.store.remove(f"{key}_tp_{rank}")
 
 
+from mooncake.structured_object_store import (
+    _choose_leaf_codec,
+    infer_structure,
+)
+
+
+class TestCodecInference(unittest.TestCase):
+
+    def test_tensor(self):
+        import torch
+        d = _choose_leaf_codec([torch.tensor([1, 2]), torch.tensor([3])])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "ragged_tensor")
+
+    def test_tensor_mixed_dtype_rejected(self):
+        import torch
+        d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
+        self.assertFalse(d.accepted)
+
+    def test_numeric_sequence(self):
+        d = _choose_leaf_codec([[1, 2, 3], [4, 5]])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "typed_ragged")
+
+    def test_bytes(self):
+        d = _choose_leaf_codec([b"hello", b"world"])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "bytes_ragged")
+
+    def test_text(self):
+        d = _choose_leaf_codec(["hello", "world"])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "utf8_ragged")
+
+    def test_json(self):
+        d = _choose_leaf_codec([{"a": 1}, {"b": 2}])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "json_ragged")
+
+    def test_scalar(self):
+        d = _choose_leaf_codec([1, 2.0, 3])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "ndarray")
+
+    def test_fallback(self):
+        d = _choose_leaf_codec([object(), object()])
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.codec, "pickle_ragged_fallback")
+
+    def test_with_nulls(self):
+        d = _choose_leaf_codec(["hello", None, "world"])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "utf8_ragged")
+
+    def test_empty_values(self):
+        d = _choose_leaf_codec([])
+        self.assertFalse(d.accepted)
+
+    def test_all_none(self):
+        d = _choose_leaf_codec([None, None, None])
+        self.assertFalse(d.accepted)
+
+    def test_infer_flat(self):
+        leaves, nodes = [], []
+        infer_structure("root", ["a", "b", "c"], leaves, nodes)
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(len(nodes), 0)
+        self.assertEqual(leaves[0].decision.codec, "utf8_ragged")
+
+    def test_infer_dict(self):
+        leaves, nodes = [], []
+        infer_structure("root", [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}], leaves, nodes)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].node_type, "dict")
+        self.assertEqual(sorted(nodes[0].children), ["x", "y"])
+        self.assertEqual(sorted(l.path for l in leaves), ["root.x", "root.y"])
+
+    def test_infer_dict_with_none_rows(self):
+        leaves, nodes = [], []
+        infer_structure("r", [{"x": 1}, None, {"x": 3}], leaves, nodes)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(leaves[0].path, "r.x")
+
+    def test_infer_nested(self):
+        leaves, nodes = [], []
+        infer_structure("r", [{"a": {"b": 1}}, {"a": {"b": 2}}], leaves, nodes)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(leaves[0].path, "r.a.b")
+        self.assertEqual(leaves[0].decision.codec, "ndarray")
+
+    def test_infer_list(self):
+        leaves, nodes = [], []
+        infer_structure("r", [[{"k": 1}], [{"k": 2}]], leaves, nodes)
+        list_nodes = [n for n in nodes if n.node_type == "list"]
+        self.assertEqual(len(list_nodes), 1)
+        self.assertEqual(list_nodes[0].lengths, [1, 1])
+        dict_nodes = [n for n in nodes if n.node_type == "dict"]
+        self.assertEqual(len(dict_nodes), 1)
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(leaves[0].path, "r[0].k")
+
+    def test_depth_limit(self):
+        deep = 1
+        for _ in range(40):
+            deep = {"a": deep}
+        with self.assertRaises(ValueError):
+            infer_structure("r", [deep, deep], [], [])
+
+
 if __name__ == '__main__':
     unittest.main()
