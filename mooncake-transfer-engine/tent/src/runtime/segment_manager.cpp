@@ -64,7 +64,8 @@ Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
     auto &cache = tl_remote_cache_.get();
     auto current_ts = getCurrentTimeInNano();
     auto current_version = version_.load(std::memory_order_relaxed);
-    if (current_ts - cache.last_refresh > ttl_ms_ * 1000000 ||
+    if (current_ts - cache.last_refresh >
+            static_cast<uint64_t>(TENT_SEGMENT_DESC_TTL_MS) * 1000000 ||
         cache.version != current_version) {
         cache.id_to_desc_map.clear();
         cache.last_refresh = current_ts;

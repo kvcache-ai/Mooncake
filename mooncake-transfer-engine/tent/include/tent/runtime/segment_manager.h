@@ -31,6 +31,10 @@
 
 #include "tent/runtime/segment.h"
 
+// TTL for cached remote SegmentDesc. Remote SegmentUpdate push handles
+// invalidation, so this is only a fallback refresh interval.
+#define TENT_SEGMENT_DESC_TTL_MS (60 * 60 * 1000)  // 1h
+
 namespace mooncake {
 namespace tent {
 class SegmentRegistry;
@@ -154,8 +158,6 @@ class SegmentManager {
     std::unique_ptr<SegmentRegistry> registry_;
 
     std::string file_desc_basepath_;
-    uint64_t ttl_ms_ =
-        60 * 60 * 1000;  // 1h; remote SegmentUpdate push handles invalidation
 
     // shared_ptr to prevent UAF in async callbacks
     std::shared_ptr<RWSpinlock> subscribers_lock_;
