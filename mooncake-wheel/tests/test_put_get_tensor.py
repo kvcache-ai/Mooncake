@@ -153,5 +153,87 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_3d)
 
              
+    def _assert_empty_tensor_equal(self, expected, actual):
+        import torch
+
+        self.assertIsNotNone(actual)
+        self.assertEqual(tuple(actual.shape), tuple(expected.shape))
+        self.assertEqual(actual.dtype, expected.dtype)
+        self.assertEqual(actual.numel(), 0)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_put_get_zero_tensor(self):
+        """Test storing and retrieving zero-sized PyTorch tensors."""
+        import torch
+
+        tensors = [
+            torch.empty((0,), dtype=torch.float32),
+            torch.empty((0, 4096), dtype=torch.float16),
+            torch.empty((2, 0, 3), dtype=torch.bfloat16),
+            torch.empty((1, 0), dtype=torch.int64),
+        ]
+        keys = [f"test_zero_tensor_{os.getpid()}_{i}" for i in range(len(tensors))]
+
+        for key, tensor in zip(keys, tensors):
+            self.assertEqual(self.store.put_tensor(key, tensor), 0)
+            self._assert_empty_tensor_equal(tensor, self.store.get_tensor(key))
+
+        batch_results = self.store.batch_get_tensor(keys)
+        self.assertEqual(len(batch_results), len(tensors))
+        for tensor, retrieved in zip(tensors, batch_results):
+            self._assert_empty_tensor_equal(tensor, retrieved)
+
+        for key in keys:
+            self.store.remove(key)
+
+    def test_zero_tensor_into_and_from(self):
+        """Test metadata-only zero tensor get_into and put_tensor_from."""
+        import torch
+
+        tensor = torch.empty((2, 0, 3), dtype=torch.float32)
+        key = f"test_zero_tensor_into_{os.getpid()}"
+        key_from = f"test_zero_tensor_from_{os.getpid()}"
+        self.assertEqual(self.store.put_tensor(key, tensor), 0)
+
+        buffer_size = 4096
+        buffer = (ctypes.c_ubyte * buffer_size)()
+        buffer_ptr = ctypes.addressof(buffer)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
+        try:
+            total_length = self.store.get_size(key)
+            self.assertGreater(total_length, 0)
+            self.assertLess(total_length, buffer_size)
+            retrieved = self.store.get_tensor_into(key, buffer_ptr, buffer_size)
+            self._assert_empty_tensor_equal(tensor, retrieved)
+
+            self.assertEqual(self.store.put_tensor_from(key_from, buffer_ptr, total_length), 0)
+            self._assert_empty_tensor_equal(tensor, self.store.get_tensor(key_from))
+        finally:
+            self.store.unregister_buffer(buffer_ptr)
+            self.store.remove(key)
+            self.store.remove(key_from)
+
+    def test_zero_tensor_with_tp(self):
+        """Test zero-sized tensors through legacy tensor-parallel APIs."""
+        import torch
+
+        tensor = torch.empty((2, 0, 3), dtype=torch.float32)
+        key = f"test_zero_tensor_tp_{os.getpid()}"
+        tp_size = 2
+        split_dim = 0
+
+        self.assertEqual(
+            self.store.put_tensor_with_tp(key, tensor, tp_size=tp_size, split_dim=split_dim),
+            0,
+        )
+        for rank in range(tp_size):
+            shard = self.store.get_tensor_with_tp(key, tp_rank=rank, tp_size=tp_size)
+            expected = tensor.narrow(split_dim, rank, 1).contiguous()
+            self._assert_empty_tensor_equal(expected, shard)
+
+        for rank in range(tp_size):
+            self.store.remove(f"{key}_tp_{rank}")
+
+
 if __name__ == '__main__':
     unittest.main()
