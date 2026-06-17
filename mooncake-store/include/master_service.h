@@ -23,6 +23,7 @@
 
 #include "allocation_strategy.h"
 #include "count_min_sketch.h"
+#include "deadline_scheduler.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -1316,35 +1317,13 @@ class MasterService {
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica);
 
-    // Graceful unmount scheduler
-    class GracefulUnmountScheduler {
-       public:
-        explicit GracefulUnmountScheduler(MasterService* service);
-        ~GracefulUnmountScheduler();
-        void Schedule(const UUID& segment_id, const UUID& client_id,
-                      std::chrono::steady_clock::time_point expire_time);
-        void RemoveClientRecords(const UUID& client_id);
-        void Stop();
+    struct GracefulUnmountDeadlineRecord {
+        UUID segment_id;
+        UUID client_id;
+    };
 
-       private:
-        void TimerLoop();
-        struct Record {
-            UUID segment_id;
-            UUID client_id;
-            std::chrono::steady_clock::time_point expire_time;
-            bool operator>(const Record& other) const {
-                return expire_time > other.expire_time;
-            }
-        };
-        MasterService* service_;
-        std::mutex mutex_;
-        std::priority_queue<Record, std::vector<Record>, std::greater<Record>>
-            queue_;
-        std::thread timer_thread_;
-        std::atomic<bool> timer_running_{false};
-        bool stopping_{false};
-        std::condition_variable timer_cv_;
-    } graceful_unmount_scheduler_;
+    DeadlineScheduler<GracefulUnmountDeadlineRecord>
+        graceful_unmount_scheduler_;
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an

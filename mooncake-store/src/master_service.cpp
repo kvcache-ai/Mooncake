@@ -124,7 +124,17 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    : graceful_unmount_scheduler_(this),
+    : graceful_unmount_scheduler_(
+          [this](const GracefulUnmountDeadlineRecord& record) {
+              auto result =
+                  this->UnmountSegment(record.segment_id, record.client_id);
+              if (!result.has_value()) {
+                  LOG(WARNING)
+                      << "Failed to complete graceful unmount, segment_id="
+                      << record.segment_id << ", client_id=" << record.client_id
+                      << ", error=" << toString(result.error());
+              }
+          }),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
@@ -880,7 +890,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
 
     auto expire_time = std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(grace_period_ms);
-    graceful_unmount_scheduler_.Schedule(segment_id, client_id, expire_time);
+    graceful_unmount_scheduler_.Schedule({segment_id, client_id}, expire_time);
     return {};
 }
 
@@ -5549,7 +5559,10 @@ void MasterService::ClientMonitorFunc() {
             // Notify graceful unmount scheduler to drop pending records
             // for expired clients. The actual unmount is handled below.
             for (auto& cid : expired_clients) {
-                graceful_unmount_scheduler_.RemoveClientRecords(cid);
+                graceful_unmount_scheduler_.RemoveIf(
+                    [&cid](const GracefulUnmountDeadlineRecord& record) {
+                        return record.client_id == cid;
+                    });
             }
 
             // Record which segments are unmounted, will be used in the commit
@@ -7171,111 +7184,6 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
-}
-
-// ---------------------------------------------------------------------------
-// GracefulUnmountScheduler implementation
-// ---------------------------------------------------------------------------
-
-MasterService::GracefulUnmountScheduler::GracefulUnmountScheduler(
-    MasterService* service)
-    : service_(service) {}
-
-MasterService::GracefulUnmountScheduler::~GracefulUnmountScheduler() { Stop(); }
-
-void MasterService::GracefulUnmountScheduler::Schedule(
-    const UUID& segment_id, const UUID& client_id,
-    std::chrono::steady_clock::time_point expire_time) {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_) {
-            return;
-        }
-        queue_.push(Record{segment_id, client_id, expire_time});
-        if (!timer_running_.load()) {
-            timer_running_.store(true);
-            timer_thread_ = std::thread([this]() { this->TimerLoop(); });
-        }
-    }
-    timer_cv_.notify_one();
-}
-
-void MasterService::GracefulUnmountScheduler::RemoveClientRecords(
-    const UUID& client_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<Record> remaining;
-    remaining.reserve(queue_.size());
-    while (!queue_.empty()) {
-        auto rec = queue_.top();
-        queue_.pop();
-        if (rec.client_id != client_id) {
-            remaining.push_back(rec);
-        }
-    }
-    for (auto& rec : remaining) {
-        queue_.push(rec);
-    }
-    timer_cv_.notify_one();
-}
-
-void MasterService::GracefulUnmountScheduler::Stop() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stopping_ = true;
-        timer_running_.store(false);
-    }
-    timer_cv_.notify_all();
-    if (timer_thread_.joinable()) {
-        timer_thread_.join();
-    }
-}
-
-void MasterService::GracefulUnmountScheduler::TimerLoop() {
-    while (timer_running_.load()) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (queue_.empty()) {
-            timer_cv_.wait(lock, [this]() {
-                return !timer_running_.load() || !queue_.empty();
-            });
-            if (!timer_running_.load()) break;
-            continue;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        auto next_expire = queue_.top().expire_time;
-        if (next_expire > now) {
-            timer_cv_.wait_until(lock, next_expire, [this, next_expire]() {
-                return !timer_running_.load() || queue_.empty() ||
-                       queue_.top().expire_time < next_expire;
-            });
-            if (!timer_running_.load()) break;
-            continue;
-        }
-
-        // Collect all expired records
-        std::vector<Record> expired;
-        while (!queue_.empty() && queue_.top().expire_time <= now) {
-            expired.push_back(queue_.top());
-            queue_.pop();
-        }
-
-        // Release the scheduler mutex before UnmountSegment (which takes
-        // snapshot_mutex_) to avoid a lock-order inversion deadlock.
-        lock.unlock();
-
-        for (auto& rec : expired) {
-            if (service_) {
-                auto result =
-                    service_->UnmountSegment(rec.segment_id, rec.client_id);
-                if (!result.has_value()) {
-                    LOG(WARNING)
-                        << "Failed to complete graceful unmount, segment_id="
-                        << rec.segment_id << ", client_id=" << rec.client_id
-                        << ", error=" << toString(result.error());
-                }
-            }
-        }
-    }
 }
 
 }  // namespace mooncake
