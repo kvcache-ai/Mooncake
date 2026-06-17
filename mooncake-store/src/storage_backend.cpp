@@ -1497,7 +1497,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                      plan.dest_slice.size});
             }
 
-            // Build descs, skipping zero-length entries (clamped to EOF)
+            // Build descs for batch_read
             std::vector<UringFile::ReadDesc> descs;
             descs.reserve(entries.size());
             for (const auto& e : entries) {
@@ -1561,7 +1561,21 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 LOG(ERROR) << "batch_read short read for bucket_id="
                            << bucket_id << ", expected=" << expected_total
                            << ", got=" << batch_res.value()
-                           << ", num_keys=" << entries.size();
+                           << ", num_keys=" << entries.size()
+                           << ", file_size=" << file_size;
+                size_t log_limit =
+                    std::min(entries.size(), static_cast<size_t>(5));
+                for (size_t i = 0; i < log_limit; ++i) {
+                    const auto& e = entries[i];
+                    LOG(ERROR) << "  entry[" << i << "] key=" << e.key
+                               << " off=" << e.desc.off
+                               << " aligned_len=" << e.desc.len
+                               << " data_size=" << e.actual_size;
+                }
+                if (entries.size() > log_limit) {
+                    LOG(ERROR) << "  ... and " << (entries.size() - log_limit)
+                               << " more entries";
+                }
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
 
