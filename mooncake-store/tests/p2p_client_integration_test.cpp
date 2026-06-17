@@ -34,9 +34,9 @@ class P2PClientIntegrationTest : public ::testing::Test {
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
             /*local_buffer_size=*/0, nullptr, "", rpc_port);
-        config.local_transfer_mode =
-            local_transfer_mode == "te" ? LocalTransferMode::TE
-                                        : LocalTransferMode::MEMCPY;
+        config.local_transfer_mode = local_transfer_mode == "te"
+                                         ? LocalTransferMode::TE
+                                         : LocalTransferMode::MEMCPY;
         config.transfer_direction_mode = transfer_direction_mode;
         config.enable_http_server = false;
         config.http_port = 0;
@@ -260,8 +260,8 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
             payloads.push_back(key_prefix + "payload_" + std::to_string(i));
         }
         for (int i = 0; i < batch_size; ++i) {
-            batched_slices.push_back(
-                {Slice{const_cast<char*>(payloads[i].data()), payloads[i].size()}});
+            batched_slices.push_back({Slice{
+                const_cast<char*>(payloads[i].data()), payloads[i].size()}});
         }
 
         WriteRouteRequestConfig remote_put_config;
@@ -501,8 +501,10 @@ TEST_F(P2PClientIntegrationTest, LocalPutGetWithTeTransferMode) {
     EXPECT_EQ(0, std::memcmp(read_buf.data() + part1.size(), part2.data(),
                              part2.size()));
 
-    EXPECT_TRUE(te_client->unregisterLocalMemory(part1.data(), false).has_value());
-    EXPECT_TRUE(te_client->unregisterLocalMemory(part2.data(), false).has_value());
+    EXPECT_TRUE(
+        te_client->unregisterLocalMemory(part1.data(), false).has_value());
+    EXPECT_TRUE(
+        te_client->unregisterLocalMemory(part2.data(), false).has_value());
     EXPECT_TRUE(
         te_client->unregisterLocalMemory(read_buf.data(), false).has_value());
 }
@@ -541,9 +543,10 @@ TEST_F(P2PClientIntegrationTest, LocalGetBufferHandleWithTeTransferMode) {
     EXPECT_EQ(
         0, std::memcmp(buffer_handle->ptr(), payload.data(), payload.size()));
 
+    EXPECT_TRUE(te_client->unregisterLocalMemory(allocator->getBase(), false)
+                    .has_value());
     EXPECT_TRUE(
-        te_client->unregisterLocalMemory(allocator->getBase(), false).has_value());
-    EXPECT_TRUE(te_client->unregisterLocalMemory(payload.data(), false).has_value());
+        te_client->unregisterLocalMemory(payload.data(), false).has_value());
 }
 
 TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
@@ -607,8 +610,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
             payloads.push_back(key_prefix + "payload_" + std::to_string(i));
         }
         for (int i = 0; i < batch_size; ++i) {
-            batched_slices.push_back(
-                {Slice{const_cast<char*>(payloads[i].data()), payloads[i].size()}});
+            batched_slices.push_back({Slice{
+                const_cast<char*>(payloads[i].data()), payloads[i].size()}});
         }
 
         WriteRouteRequestConfig remote_put_config;

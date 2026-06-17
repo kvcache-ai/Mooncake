@@ -211,9 +211,8 @@ inline int RunRpcServerChildProcess(int argc, char** argv) {
     google::InitGoogleLogging("PeerClientRpcServerChild");
     FLAGS_logtostderr = 1;
 
-    const int rpc_port =
-        std::stoi(FindArgValue(argc, argv, "--mooncake-rpc-port=").value_or(
-            "0"));
+    const int rpc_port = std::stoi(
+        FindArgValue(argc, argv, "--mooncake-rpc-port=").value_or("0"));
     if (rpc_port <= 0) {
         google::ShutdownGoogleLogging();
         return 2;
@@ -380,9 +379,9 @@ class ScopedPeerClientRpcServerProcess {
                const std::optional<std::string>& pre_put_data = std::nullopt,
                const std::optional<std::string>& state_file = std::nullopt) {
         port_ = static_cast<uint16_t>(getFreeTcpPort());
-        std::vector<std::string> args = {"--mooncake-child-mode=rpc-server",
-                                         "--mooncake-rpc-port=" +
-                                             std::to_string(port_)};
+        std::vector<std::string> args = {
+            "--mooncake-child-mode=rpc-server",
+            "--mooncake-rpc-port=" + std::to_string(port_)};
         if (pre_put_key.has_value()) {
             args.push_back("--mooncake-pre-put-key=" + *pre_put_key);
             args.push_back("--mooncake-pre-put-data=" +

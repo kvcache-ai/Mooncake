@@ -3,6 +3,7 @@
 
 #include <future>
 #include <memory>
+#include <csignal>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -12,6 +13,7 @@
 #include <async_simple/coro/SyncAwait.h>
 
 #include "peer_client_process_test_helper.h"
+#include "peer_client.h"
 
 namespace mooncake {
 
@@ -93,8 +95,7 @@ class PeerClientTest : public ::testing::Test {
         return req;
     }
 
-    UnPinKeyRequest MakeUnpinRequest(const std::string& key,
-                                     UUID token) const {
+    UnPinKeyRequest MakeUnpinRequest(const std::string& key, UUID token) const {
         UnPinKeyRequest req;
         req.key = key;
         req.read_operation_id = token;
@@ -153,8 +154,9 @@ TEST_F(PeerClientTest, ConnectSuccess) {
 // ============================================================================
 
 TEST_F(PeerClientTest, AsyncReadRemoteDataKeyNotFound) {
-    auto result = async_simple::coro::syncAwait(peer_client_->AsyncReadRemoteData(
-        MakeReadRequest("non_existent_key", 0x1000, 100)));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncReadRemoteData(
+            MakeReadRequest("non_existent_key", 0x1000, 100)));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -169,15 +171,16 @@ TEST_F(PeerClientTest, AsyncReadRemoteDataEmptyKey) {
 TEST_F(PeerClientTest, AsyncReadRemoteDataEmptyBuffers) {
     RemoteReadRequest request;
     request.key = "test_key";
-    auto result =
-        async_simple::coro::syncAwait(peer_client_->AsyncReadRemoteData(request));
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncReadRemoteData(request));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(PeerClientTest, AsyncReadRemoteDataInvalidBufferZeroSize) {
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncReadRemoteData(MakeReadRequest("test_key", 0x1000, 0)));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncReadRemoteData(
+            MakeReadRequest("test_key", 0x1000, 0)));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -194,8 +197,9 @@ TEST_F(PeerClientTest, AsyncReadRemoteDataWithExistingKey) {
     const std::string data = "Hello, Async!";
     RestartServerWithPrePut(key, data);
 
-    auto result = async_simple::coro::syncAwait(peer_client_->AsyncReadRemoteData(
-        MakeReadRequest(key, 0x1000, data.size())));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncReadRemoteData(
+            MakeReadRequest(key, 0x1000, data.size())));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
 }
@@ -205,15 +209,15 @@ TEST_F(PeerClientTest, AsyncReadRemoteDataWithExistingKey) {
 // ============================================================================
 
 TEST_F(PeerClientTest, AsyncPinKeyEmptyKey) {
-    auto result =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest("")));
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncPinKey(MakePinRequest("")));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(PeerClientTest, AsyncPinKeyKeyNotFound) {
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncPinKey(MakePinRequest("peer_async_pin_missing_key")));
+    auto result = async_simple::coro::syncAwait(peer_client_->AsyncPinKey(
+        MakePinRequest("peer_async_pin_missing_key")));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -222,8 +226,8 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterPut) {
     const std::string key = "peer_async_pin_after_put";
     RestartServerWithPrePut(key, "payload");
 
-    auto pin_res =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest(key)));
+    auto pin_res = async_simple::coro::syncAwait(
+        peer_client_->AsyncPinKey(MakePinRequest(key)));
     ASSERT_TRUE(pin_res.has_value())
         << "AsyncPinKey failed: " << static_cast<int>(pin_res.error());
     EXPECT_GT(pin_res->remote_buffer.size, 0u);
@@ -240,12 +244,12 @@ TEST_F(PeerClientTest, AsyncPinKeyTwiceSameTokenThenUnpinTwice) {
     const std::string key = "peer_async_pin_twice_ref";
     RestartServerWithPrePut(key, "ref");
 
-    auto first =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest(key)));
+    auto first = async_simple::coro::syncAwait(
+        peer_client_->AsyncPinKey(MakePinRequest(key)));
     ASSERT_TRUE(first.has_value())
         << "first AsyncPinKey failed: " << static_cast<int>(first.error());
-    auto second =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest(key)));
+    auto second = async_simple::coro::syncAwait(
+        peer_client_->AsyncPinKey(MakePinRequest(key)));
     ASSERT_TRUE(second.has_value())
         << "second AsyncPinKey failed: " << static_cast<int>(second.error());
     EXPECT_EQ(first->read_operation_id, second->read_operation_id);
@@ -271,8 +275,8 @@ TEST_F(PeerClientTest, ConcurrentAsyncPinKeySameKey) {
 
     auto run_pin = [&](size_t index) {
         start_future.wait();
-        auto result =
-            async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest(key)));
+        auto result = async_simple::coro::syncAwait(
+            peer_client_->AsyncPinKey(MakePinRequest(key)));
         std::lock_guard<std::mutex> lock(results_mutex);
         results[index] = std::move(result);
     };
@@ -304,8 +308,8 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
     const std::string key = "peer_async_pin_new_token_after_unpin";
     RestartServerWithPrePut(key, "tok");
 
-    auto pin1 =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest(key)));
+    auto pin1 = async_simple::coro::syncAwait(
+        peer_client_->AsyncPinKey(MakePinRequest(key)));
     ASSERT_TRUE(pin1.has_value())
         << "first AsyncPinKey failed: " << static_cast<int>(pin1.error());
 
@@ -314,8 +318,8 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
     ASSERT_TRUE(un1.has_value())
         << "first AsyncUnPinKey failed: " << static_cast<int>(un1.error());
 
-    auto pin2 =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest(key)));
+    auto pin2 = async_simple::coro::syncAwait(
+        peer_client_->AsyncPinKey(MakePinRequest(key)));
     ASSERT_TRUE(pin2.has_value()) << "second AsyncPinKey after unpin failed: "
                                   << static_cast<int>(pin2.error());
     EXPECT_NE(pin1->read_operation_id, pin2->read_operation_id);
@@ -344,8 +348,8 @@ TEST_F(PeerClientTest, AsyncUnPinKeyWrongTokenAfterPin) {
     const std::string key = "peer_async_unpin_wrong_token";
     RestartServerWithPrePut(key, "x");
 
-    auto pin_res =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(MakePinRequest(key)));
+    auto pin_res = async_simple::coro::syncAwait(
+        peer_client_->AsyncPinKey(MakePinRequest(key)));
     ASSERT_TRUE(pin_res.has_value());
 
     auto bad_token = pin_res->read_operation_id;
@@ -376,22 +380,24 @@ TEST_F(PeerClientTest, AsyncWriteRemoteDataEmptyKey) {
 TEST_F(PeerClientTest, AsyncWriteRemoteDataEmptyBuffers) {
     RemoteWriteRequest request;
     request.key = "test_key";
-    auto result =
-        async_simple::coro::syncAwait(peer_client_->AsyncWriteRemoteData(request));
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRemoteData(request));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(PeerClientTest, AsyncWriteRemoteDataInvalidBufferZeroSize) {
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteRemoteData(MakeWriteRequest("test_key", 0x1000, 0)));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRemoteData(
+            MakeWriteRequest("test_key", 0x1000, 0)));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(PeerClientTest, AsyncWriteRemoteDataInvalidBufferNullAddr) {
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteRemoteData(MakeWriteRequest("test_key", 0, 100)));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRemoteData(
+            MakeWriteRequest("test_key", 0, 100)));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -399,8 +405,8 @@ TEST_F(PeerClientTest, AsyncWriteRemoteDataInvalidBufferNullAddr) {
 TEST_F(PeerClientTest, AsyncWriteRemoteDataValidRequest) {
     auto request = MakeWriteRequest("async_write_key", 0x1000, 100);
     request.target_tier_id = std::nullopt;
-    auto result =
-        async_simple::coro::syncAwait(peer_client_->AsyncWriteRemoteData(request));
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRemoteData(request));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
 }
@@ -411,8 +417,8 @@ TEST_F(PeerClientTest, AsyncWriteRemoteDataWithTierId) {
 
     auto request = MakeWriteRequest("async_write_key_with_tier", 0x1000, 100);
     request.target_tier_id = tier_id;
-    auto result =
-        async_simple::coro::syncAwait(peer_client_->AsyncWriteRemoteData(request));
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRemoteData(request));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
 }
@@ -514,8 +520,8 @@ TEST_F(PeerClientTest, ConcurrentAsyncPreWriteSameKey) {
     commit.write_operation_id = winner->write_operation_id;
     auto commit_res =
         async_simple::coro::syncAwait(peer_client_->AsyncWriteCommit(commit));
-    ASSERT_TRUE(commit_res.has_value())
-        << "Winner WriteCommit failed: " << static_cast<int>(commit_res.error());
+    ASSERT_TRUE(commit_res.has_value()) << "Winner WriteCommit failed: "
+                                        << static_cast<int>(commit_res.error());
 }
 
 TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
@@ -650,14 +656,15 @@ TEST_F(PeerClientTest, AsyncWriteRevokeClearsPending) {
 // ============================================================================
 
 TEST_F(PeerClientTest, SyncReadRemoteDataKeyNotFound) {
-    auto result =
-        peer_client_->ReadRemoteData(MakeReadRequest("non_existent_key", 0x1000, 100));
+    auto result = peer_client_->ReadRemoteData(
+        MakeReadRequest("non_existent_key", 0x1000, 100));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST_F(PeerClientTest, SyncReadRemoteDataEmptyKey) {
-    auto result = peer_client_->ReadRemoteData(MakeReadRequest("", 0x1000, 100));
+    auto result =
+        peer_client_->ReadRemoteData(MakeReadRequest("", 0x1000, 100));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -753,8 +760,8 @@ TEST_F(PeerClientTest, SyncPinKeyAfterUnpinNewToken) {
 }
 
 TEST_F(PeerClientTest, SyncUnPinKeyZeroToken) {
-    auto result =
-        peer_client_->UnPinKey(MakeUnpinRequest("peer_sync_unpin_zero", {0, 0}));
+    auto result = peer_client_->UnPinKey(
+        MakeUnpinRequest("peer_sync_unpin_zero", {0, 0}));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -764,7 +771,8 @@ TEST_F(PeerClientTest, SyncUnPinKeyZeroToken) {
 // ============================================================================
 
 TEST_F(PeerClientTest, SyncWriteRemoteDataEmptyKey) {
-    auto result = peer_client_->WriteRemoteData(MakeWriteRequest("", 0x1000, 100));
+    auto result =
+        peer_client_->WriteRemoteData(MakeWriteRequest("", 0x1000, 100));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -809,7 +817,8 @@ TEST_F(PeerClientTest, SyncWriteCommitAfterPreWrite) {
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
 
     const std::string key = "peer_sync_commit_after_pre";
-    auto pre_res = peer_client_->PreWrite(MakePreWriteRequest(key, 128, tier_id));
+    auto pre_res =
+        peer_client_->PreWrite(MakePreWriteRequest(key, 128, tier_id));
     ASSERT_TRUE(pre_res.has_value())
         << "PreWrite failed: " << static_cast<int>(pre_res.error());
 
@@ -872,40 +881,42 @@ TEST_F(PeerClientTest, SyncWriteRevokeClearsPending) {
 
 TEST_F(PeerClientTest, AsyncReadWithoutConnect) {
     PeerClient unconnected_client;
-    auto result = async_simple::coro::syncAwait(unconnected_client.AsyncReadRemoteData(
-        MakeReadRequest("test_key", 0x1000, 100)));
+    auto result =
+        async_simple::coro::syncAwait(unconnected_client.AsyncReadRemoteData(
+            MakeReadRequest("test_key", 0x1000, 100)));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
 
 TEST_F(PeerClientTest, AsyncWriteWithoutConnect) {
     PeerClient unconnected_client;
-    auto result = async_simple::coro::syncAwait(unconnected_client.AsyncWriteRemoteData(
-        MakeWriteRequest("test_key", 0x1000, 100)));
+    auto result =
+        async_simple::coro::syncAwait(unconnected_client.AsyncWriteRemoteData(
+            MakeWriteRequest("test_key", 0x1000, 100)));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
 
 TEST_F(PeerClientTest, SyncReadWithoutConnect) {
     PeerClient unconnected_client;
-    auto result =
-        unconnected_client.ReadRemoteData(MakeReadRequest("test_key", 0x1000, 100));
+    auto result = unconnected_client.ReadRemoteData(
+        MakeReadRequest("test_key", 0x1000, 100));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
 
 TEST_F(PeerClientTest, SyncWriteWithoutConnect) {
     PeerClient unconnected_client;
-    auto result =
-        unconnected_client.WriteRemoteData(MakeWriteRequest("test_key", 0x1000, 100));
+    auto result = unconnected_client.WriteRemoteData(
+        MakeWriteRequest("test_key", 0x1000, 100));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
 
 TEST_F(PeerClientTest, AsyncPinKeyWithoutConnect) {
     PeerClient unconnected_client;
-    auto result =
-        async_simple::coro::syncAwait(unconnected_client.AsyncPinKey(MakePinRequest("k")));
+    auto result = async_simple::coro::syncAwait(
+        unconnected_client.AsyncPinKey(MakePinRequest("k")));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
@@ -945,8 +956,8 @@ TEST_F(PeerClientTest, AsyncWriteCommitWithoutConnect) {
     WriteCommitRequest commit;
     commit.key = "test_key";
     commit.write_operation_id = {1, 1};
-    auto result =
-        async_simple::coro::syncAwait(unconnected_client.AsyncWriteCommit(commit));
+    auto result = async_simple::coro::syncAwait(
+        unconnected_client.AsyncWriteCommit(commit));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
@@ -956,15 +967,16 @@ TEST_F(PeerClientTest, AsyncWriteRevokeWithoutConnect) {
     WriteRevokeRequest request;
     request.key = "test_key";
     request.write_operation_id = {1, 1};
-    auto result =
-        async_simple::coro::syncAwait(unconnected_client.AsyncWriteRevoke(request));
+    auto result = async_simple::coro::syncAwait(
+        unconnected_client.AsyncWriteRevoke(request));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
 
 TEST_F(PeerClientTest, SyncPreWriteWithoutConnect) {
     PeerClient unconnected_client;
-    auto result = unconnected_client.PreWrite(MakePreWriteRequest("test_key", 256));
+    auto result =
+        unconnected_client.PreWrite(MakePreWriteRequest("test_key", 256));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }

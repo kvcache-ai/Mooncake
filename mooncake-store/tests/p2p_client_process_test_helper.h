@@ -78,9 +78,9 @@ inline bool WriteReadyStateFile(const std::string& path) {
     return true;
 }
 
-inline bool WaitForReadyStateFile(const std::string& path,
-                                  std::chrono::milliseconds timeout =
-                                      std::chrono::milliseconds(3000)) {
+inline bool WaitForReadyStateFile(
+    const std::string& path,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         std::ifstream in(path);
@@ -145,13 +145,14 @@ class P2PClientChildProcess {
         if (pid_ == 0) {
             std::vector<char*> argv_ptrs;
             argv_ptrs.reserve(args.size() + 2);
-            argv_ptrs.push_back(
-                const_cast<char*>(P2PClientIntegrationTestBinaryPath().c_str()));
+            argv_ptrs.push_back(const_cast<char*>(
+                P2PClientIntegrationTestBinaryPath().c_str()));
             for (const auto& arg : args) {
                 argv_ptrs.push_back(const_cast<char*>(arg.c_str()));
             }
             argv_ptrs.push_back(nullptr);
-            execv(P2PClientIntegrationTestBinaryPath().c_str(), argv_ptrs.data());
+            execv(P2PClientIntegrationTestBinaryPath().c_str(),
+                  argv_ptrs.data());
             std::_Exit(127);
         }
         owns_process_ = true;
@@ -211,8 +212,9 @@ inline int RunP2PMasterChildProcess(int argc, char** argv) {
     google::InitGoogleLogging("P2PMasterChild");
     FLAGS_logtostderr = 1;
 
-    const int rpc_port = std::stoi(
-        FindP2PArgValue(argc, argv, "--mooncake-master-rpc-port=").value_or("0"));
+    const int rpc_port =
+        std::stoi(FindP2PArgValue(argc, argv, "--mooncake-master-rpc-port=")
+                      .value_or("0"));
     if (rpc_port <= 0) {
         google::ShutdownGoogleLogging();
         return 2;
@@ -252,9 +254,9 @@ class P2PPeerProcessStack {
 
         config.enable_http_server = false;
         config.http_port = 0;
-        config.local_transfer_mode =
-            local_transfer_mode == "te" ? LocalTransferMode::TE
-                                        : LocalTransferMode::MEMCPY;
+        config.local_transfer_mode = local_transfer_mode == "te"
+                                         ? LocalTransferMode::TE
+                                         : LocalTransferMode::MEMCPY;
         config.transfer_direction_mode = transfer_direction_mode;
 
         client_ = std::make_shared<P2PClientService>(
@@ -276,16 +278,18 @@ inline int RunP2PPeerChildProcess(int argc, char** argv) {
     auto master_address =
         FindP2PArgValue(argc, argv, "--mooncake-master-address=");
     auto host_name = FindP2PArgValue(argc, argv, "--mooncake-host-name=");
-    const int rpc_port = std::stoi(
-        FindP2PArgValue(argc, argv, "--mooncake-client-rpc-port=").value_or("0"));
-    const std::string local_transfer_mode = FindP2PArgValue(
-        argc, argv, "--mooncake-local-transfer-mode=")
-                                                .value_or("te");
-    const std::string transfer_direction = FindP2PArgValue(
-        argc, argv, "--mooncake-transfer-direction-mode=")
-                                                 .value_or("reverse");
+    const int rpc_port =
+        std::stoi(FindP2PArgValue(argc, argv, "--mooncake-client-rpc-port=")
+                      .value_or("0"));
+    const std::string local_transfer_mode =
+        FindP2PArgValue(argc, argv, "--mooncake-local-transfer-mode=")
+            .value_or("te");
+    const std::string transfer_direction =
+        FindP2PArgValue(argc, argv, "--mooncake-transfer-direction-mode=")
+            .value_or("reverse");
 
-    if (!master_address.has_value() || !host_name.has_value() || rpc_port <= 0) {
+    if (!master_address.has_value() || !host_name.has_value() ||
+        rpc_port <= 0) {
         google::ShutdownGoogleLogging();
         return 2;
     }
@@ -294,8 +298,9 @@ inline int RunP2PPeerChildProcess(int argc, char** argv) {
     const auto direction = transfer_direction == "forward"
                                ? TransferDirectionMode::FORWARD
                                : TransferDirectionMode::REVERSE;
-    if (!peer.Start(*master_address, *host_name, static_cast<uint16_t>(rpc_port),
-                    local_transfer_mode, direction)) {
+    if (!peer.Start(*master_address, *host_name,
+                    static_cast<uint16_t>(rpc_port), local_transfer_mode,
+                    direction)) {
         google::ShutdownGoogleLogging();
         return 3;
     }
@@ -338,11 +343,10 @@ class ScopedP2PMasterProcess {
 
         rpc_port_ = static_cast<uint16_t>(getFreeTcpPort());
         state_file_path_ = MakeP2PTempStateFilePath("p2p_master_ready");
-        std::vector<std::string> args = {"--mooncake-child-mode=p2p-master",
-                                         "--mooncake-master-rpc-port=" +
-                                             std::to_string(rpc_port_),
-                                         "--mooncake-state-file=" +
-                                             *state_file_path_};
+        std::vector<std::string> args = {
+            "--mooncake-child-mode=p2p-master",
+            "--mooncake-master-rpc-port=" + std::to_string(rpc_port_),
+            "--mooncake-state-file=" + *state_file_path_};
         if (!process_.Start(args)) {
             CleanupStateFile();
             return false;
@@ -386,22 +390,18 @@ class ScopedP2PRemotePeerProcess {
         host_name_ = "localhost:" + std::to_string(getFreeTcpPort());
         rpc_port_ = static_cast<uint16_t>(getFreeTcpPort());
         state_file_path_ = MakeP2PTempStateFilePath("p2p_peer_ready");
-        std::vector<std::string> args = {"--mooncake-child-mode=p2p-peer",
-                                         "--mooncake-master-address=" +
-                                             master_address,
-                                         "--mooncake-host-name=" + host_name_,
-                                         "--mooncake-client-rpc-port=" +
-                                             std::to_string(rpc_port_),
-                                         "--mooncake-local-transfer-mode=" +
-                                             local_transfer_mode,
-                                         "--mooncake-transfer-direction-mode=" +
-                                             std::string(
-                                                 transfer_direction_mode ==
-                                                         TransferDirectionMode::FORWARD
-                                                     ? "forward"
-                                                     : "reverse"),
-                                         "--mooncake-state-file=" +
-                                             *state_file_path_};
+        std::vector<std::string> args = {
+            "--mooncake-child-mode=p2p-peer",
+            "--mooncake-master-address=" + master_address,
+            "--mooncake-host-name=" + host_name_,
+            "--mooncake-client-rpc-port=" + std::to_string(rpc_port_),
+            "--mooncake-local-transfer-mode=" + local_transfer_mode,
+            "--mooncake-transfer-direction-mode=" +
+                std::string(transfer_direction_mode ==
+                                    TransferDirectionMode::FORWARD
+                                ? "forward"
+                                : "reverse"),
+            "--mooncake-state-file=" + *state_file_path_};
         if (!process_.Start(args)) {
             CleanupStateFile();
             return false;
