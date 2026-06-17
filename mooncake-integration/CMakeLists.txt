@@ -60,7 +60,9 @@ if(WITH_TE)
 
   target_link_libraries(engine PRIVATE $<TARGET_OBJECTS:rpc_communicator>)
 
-  target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
+  if(WIN32)
+    target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
+  endif()
   target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
   if(USE_ASCEND_DIRECT)
     target_link_libraries(engine PUBLIC ascendcl transfer_engine glog::glog

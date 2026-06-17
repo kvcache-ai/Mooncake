@@ -10,8 +10,10 @@ target_link_libraries(rpc_communicator
     yalantinglibs::yalantinglibs 
     glog::glog 
     pthread 
-    ${Python3_LIBRARIES}
 )
+if(WIN32)
+    target_link_libraries(rpc_communicator PRIVATE ${Python3_LIBRARIES})
+endif()
 
 target_include_directories(rpc_communicator 
     PRIVATE 

@@ -25,6 +25,8 @@ find_package(
   Python3
   COMPONENTS Interpreter Development
   REQUIRED)
-target_link_libraries(tentpy PRIVATE ${Python3_LIBRARIES})
+if(WIN32)
+  target_link_libraries(tentpy PRIVATE ${Python3_LIBRARIES})
+endif()
 target_include_directories(tentpy PRIVATE ${Python3_INCLUDE_DIRS})
 target_link_libraries(tentpy PUBLIC tent_link_group)
