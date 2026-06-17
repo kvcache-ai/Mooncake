@@ -11982,6 +11982,201 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
 }
 
 #[test]
+fn dynamic_max_objects_shrink_evicts_until_tenant_fits_new_limit() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+    let initial_policy = metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: scope.clone(),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(1_024),
+                        max_objects: Some(32),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("initial tenant quota policy should store");
+    let transport = Arc::new(TestTransport::new("dynamic-shrink-quota-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "dynamic-shrink-quota-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .live_client_sync_interval(Duration::ZERO)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    for index in 0..20 {
+        let key = format!("seed-{index:02}");
+        client
+            .put(key.as_str(), b"x")
+            .expect("seed object should fit initial quota");
+    }
+
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: scope.clone(),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(1_024),
+                        max_objects: Some(10),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: initial_policy.version + 1,
+                updated_at_ms: 20,
+                updated_by: "admin".to_string(),
+            },
+            Some(initial_policy.version),
+        )
+        .expect("shrunk tenant quota policy should store");
+
+    {
+        let mut cache = client.live_client_cache.lock();
+        cache.store_tenant_quota_policy(
+            "tenant-a".to_string(),
+            initial_policy
+                .spec
+                .quota
+                .as_ref()
+                .map(|_| initial_policy.version),
+            initial_policy.spec.quota.clone(),
+            0,
+        );
+    }
+
+    client
+        .put("after-shrink", b"x")
+        .expect("write after shrinking max_objects should evict until the tenant fits");
+
+    assert_eq!(
+        client
+            .get("after-shrink")
+            .expect("replacement object should remain readable"),
+        b"x"
+    );
+
+    let quota_after_shrink = metadata
+        .get_tenant_quota_state(&scope)
+        .expect("quota state should load after dynamic shrink write")
+        .expect("quota state should exist after dynamic shrink write");
+    assert_eq!(
+        quota_after_shrink.used_objects, 10,
+        "dynamic shrink should evict enough objects to fit the new max_objects limit"
+    );
+    assert_eq!(quota_after_shrink.pending_reserved_objects, 0);
+    assert_eq!(quota_after_shrink.pending_reserved_bytes, 0);
+}
+
+#[test]
+fn dynamic_max_objects_shrink_allows_non_worsening_overwrite() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+    let initial_policy = metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: scope.clone(),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(1_024),
+                        max_objects: Some(32),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("initial tenant quota policy should store");
+    let transport = Arc::new(TestTransport::new("dynamic-shrink-overwrite-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "dynamic-shrink-overwrite-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .live_client_sync_interval(Duration::ZERO)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    for index in 0..20 {
+        let key = format!("seed-{index:02}");
+        client
+            .put(key.as_str(), b"x")
+            .expect("seed object should fit initial quota");
+    }
+
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: scope.clone(),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(1_024),
+                        max_objects: Some(10),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: initial_policy.version + 1,
+                updated_at_ms: 20,
+                updated_by: "admin".to_string(),
+            },
+            Some(initial_policy.version),
+        )
+        .expect("shrunk tenant quota policy should store");
+
+    {
+        let mut cache = client.live_client_cache.lock();
+        cache.store_tenant_quota_policy(
+            "tenant-a".to_string(),
+            initial_policy
+                .spec
+                .quota
+                .as_ref()
+                .map(|_| initial_policy.version),
+            initial_policy.spec.quota.clone(),
+            0,
+        );
+    }
+
+    client
+        .put("seed-00", b"x")
+        .expect("overwriting an existing object should remain admissible after shrink");
+
+    let quota_after_overwrite = metadata
+        .get_tenant_quota_state(&scope)
+        .expect("quota state should load after overwrite")
+        .expect("quota state should exist after overwrite");
+    assert_eq!(quota_after_overwrite.used_objects, 20);
+    assert_eq!(quota_after_overwrite.used_bytes, 20);
+    assert_eq!(quota_after_overwrite.pending_reserved_objects, 0);
+    assert_eq!(quota_after_overwrite.pending_reserved_bytes, 0);
+}
+
+#[test]
 fn non_default_tenant_without_policy_inherits_namespace_quota() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("inherited-namespace-quota-segment"));

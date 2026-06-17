@@ -112,6 +112,12 @@ mooncake-store-admin \
 
 Use `--keyspace <prefix>` when the deployment keeps multiple environments or tenants in separate metadata namespaces.
 
+If `policy set` shrinks `max_bytes` or `max_objects` below the tenant's current usage, the runtime
+does not require a separate manual quota-repair step before future writes can proceed. The next
+write may evict older objects inside that tenant first. Admission only blocks further positive
+growth on the dimensions that are over limit, so non-growing overwrites and delete-side quota
+accounting stay admissible even while the tenant is temporarily above the new limit.
+
 ## 2. Start runtimes with tenant identity
 
 A runtime should still declare its tenant identity even when policy lives in metadata.

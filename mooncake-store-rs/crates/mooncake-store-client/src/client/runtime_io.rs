@@ -1,4 +1,4 @@
-const MAX_TENANT_LOCAL_EVICTION_ATTEMPTS: usize = 8;
+const TENANT_LOCAL_EVICTION_CANDIDATE_BATCH_SIZE: usize = 32;
 const PARALLEL_CHECKSUM_MIN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARALLEL_CHECKSUM_WORKERS: usize = 16;
 
@@ -141,8 +141,10 @@ impl StoreClient {
             created_at_ms,
             writer_runtime: self.lease.runtime.clone(),
         };
-        let mut eviction_candidates = None;
-        for _ in 0..MAX_TENANT_LOCAL_EVICTION_ATTEMPTS {
+        let mut eviction_candidates = VecDeque::new();
+        let mut attempted_victims = BTreeSet::new();
+        let max_evictions = self.tenant_local_eviction_budget(&request)?;
+        for _ in 0..max_evictions {
             let reserve_result = self.metadata.reserve_tenant_quota(&request);
             registry::record_tenant_quota_reservation(match &reserve_result {
                 Ok(_) => "ok",
@@ -159,6 +161,7 @@ impl StoreClient {
                         object_id,
                         scoped_key,
                         &mut eviction_candidates,
+                        &mut attempted_victims,
                     )? {
                         registry::record_tenant_local_eviction("miss");
                         return Err(StoreError::QuotaExceeded { kind, message });
@@ -180,6 +183,7 @@ impl StoreClient {
                         object_id,
                         scoped_key,
                         &mut eviction_candidates,
+                        &mut attempted_victims,
                     )? {
                         registry::record_tenant_local_eviction("miss");
                         return Err(StoreError::Conflict(message));
@@ -199,42 +203,69 @@ impl StoreClient {
         )))
     }
 
+    fn tenant_local_eviction_budget(
+        &self,
+        request: &TenantQuotaReservationRequest,
+    ) -> Result<usize> {
+        let state = self.metadata.get_tenant_quota_state(&request.scope)?;
+        let active_objects = state
+            .map(|state| {
+                state
+                    .used_objects
+                    .saturating_add(state.pending_reserved_objects)
+                    .saturating_add(request.delta_objects.max(0) as u64)
+            })
+            .unwrap_or_else(|| request.delta_objects.max(0) as u64);
+        Ok(active_objects.max(1).min(usize::MAX as u64) as usize)
+    }
+
     fn try_evict_one_object_in_tenant(
         &self,
         object_id: &LogicalObjectId,
         scoped_key: &ObjectKey,
-        eviction_candidates: &mut Option<VecDeque<LogicalObjectId>>,
+        eviction_candidates: &mut VecDeque<LogicalObjectId>,
+        attempted_victims: &mut BTreeSet<ObjectKey>,
     ) -> Result<bool> {
-        if eviction_candidates.is_none() {
-            let scope = self.tenant_quota_scope(object_id);
-            let candidates = self
-                .metadata
-                .list_tenant_eviction_candidates(&scope, MAX_TENANT_LOCAL_EVICTION_ATTEMPTS)?
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.key != *scoped_key
-                        && candidate.state == TenantObjectAccountingState::Active
-                })
-                .filter_map(|candidate| {
-                    mooncake_store_core::parse_legacy_scoped_key(&candidate.key)
-                        .ok()
-                        .filter(|victim| victim.scope.tenant == object_id.scope.tenant)
-                })
-                .collect();
-            *eviction_candidates = Some(candidates);
-        }
-        let Some(candidates) = eviction_candidates.as_mut() else {
-            return Ok(false);
-        };
-        while let Some(victim) = candidates.pop_front() {
-            if self
-                .remove_in_tenant(victim.scope.tenant.as_str(), victim.logical_key.as_str(), true)
-                .is_ok()
-            {
-                return Ok(true);
+        loop {
+            if eviction_candidates.is_empty() {
+                let scope = self.tenant_quota_scope(object_id);
+                let candidates = self
+                    .metadata
+                    .list_tenant_eviction_candidates(
+                        &scope,
+                        TENANT_LOCAL_EVICTION_CANDIDATE_BATCH_SIZE,
+                    )?
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.key != *scoped_key
+                            && candidate.state == TenantObjectAccountingState::Active
+                            && !attempted_victims.contains(&candidate.key)
+                    })
+                    .filter_map(|candidate| {
+                        mooncake_store_core::parse_legacy_scoped_key(&candidate.key)
+                            .ok()
+                            .filter(|victim| victim.scope.tenant == object_id.scope.tenant)
+                    })
+                    .collect::<VecDeque<_>>();
+                if candidates.is_empty() {
+                    return Ok(false);
+                }
+                *eviction_candidates = candidates;
+            }
+            while let Some(victim) = eviction_candidates.pop_front() {
+                attempted_victims.insert(ObjectKey::from_logical_id(&victim));
+                if self
+                    .remove_in_tenant(
+                        victim.scope.tenant.as_str(),
+                        victim.logical_key.as_str(),
+                        false,
+                    )
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
             }
         }
-        Ok(false)
     }
 
     fn reserve_tenant_quota_for_delete(
