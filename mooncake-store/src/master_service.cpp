@@ -747,6 +747,17 @@ void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
     }
 }
 
+void MasterService::RebuildCacheTotalAccounting() {
+    MasterMetricManager::instance().reset_cache_total_nums();
+    for (auto& shard : metadata_shards_) {
+        for (auto& tenant_entry : shard.tenants) {
+            for (auto& metadata_entry : tenant_entry.second.metadata) {
+                SyncCacheTotalAccounting(metadata_entry.second);
+            }
+        }
+    }
+}
+
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn) {
@@ -5035,6 +5046,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
 
             MasterMetricManager::instance().reset_allocated_mem_size();
+            RebuildCacheTotalAccounting();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
                     .reset_segment_allocated_mem_size(segment_name);
@@ -5142,6 +5154,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_cache_total_nums();
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
