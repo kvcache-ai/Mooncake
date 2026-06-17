@@ -5265,13 +5265,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 DiscardExpiredProcessingReplicas(shard, now);
 
                 size_t shard_metadata_count = 0;
+                size_t shard_evictable_count = 0;
                 for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                     shard_metadata_count += tenant_state.metadata.size();
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
                         if (it->second.IsHardPinned()) continue;
-                        if (!it->second.IsLeaseExpired(now) ||
-                            !can_evict_replicas(it->second))
+                        bool has_evictable = can_evict_replicas(it->second);
+                        if (has_evictable) shard_evictable_count++;
+                        if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
                             local_candidates[t].push_back(
@@ -5284,10 +5286,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     }
                 }
                 local_object_count[t] += shard_metadata_count;
-                long eviction_base =
-                    shard_metadata_count - shard->disk_object_count;
-                if (eviction_base <= 0) continue;
-                local_eviction_base[t] += eviction_base;
+                local_eviction_base[t] += shard_evictable_count;
             }
         });
     }
@@ -5358,8 +5357,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              return a.lease_timeout < b.lease_timeout;
                          });
         auto target_timeout = candidates[evict_num - 1].lease_timeout;
+        // Treat evict_num as a minimum: if re-validation skips a candidate,
+        // continue trying the next one (including those beyond target_timeout)
+        // so that actual evicted count reaches evict_num. This matches the old
+        // per-shard over-eviction behavior.
+        long evicted_this_pass = 0;
         for (auto& c : candidates) {
-            if (c.lease_timeout > target_timeout) {
+            if (evicted_this_pass >= evict_num) {
                 no_pin_objects.push_back(c.lease_timeout);
                 continue;
             }
@@ -5385,6 +5389,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 EraseMetadata(tenant_state, it, c.tenant_id, &shard);
             }
             evicted_count += evict_result.evicted_objects;
+            evicted_this_pass += evict_result.evicted_objects;
         }
     }
 
