@@ -24,6 +24,7 @@ constexpr OpType OpType_MOUNT_SEGMENT = static_cast<OpType>(12);
 constexpr OpType OpType_UNMOUNT_SEGMENT = static_cast<OpType>(13);
 constexpr OpType OpType_REMOVE_ALL = static_cast<OpType>(14);
 constexpr OpType OpType_REGISTER_CLIENT = static_cast<OpType>(15);
+constexpr OpType OpType_UNREGISTER_CLIENT = static_cast<OpType>(16);
 
 // ============================================================================
 // P2P Payload structures for OpLog entries
@@ -47,6 +48,14 @@ struct RegisterClientPayload {
     YLT_REFL(RegisterClientPayload, client_id, ip_address, rpc_port, segments);
 };
 
+/// Payload for UNREGISTER_CLIENT (OpType=16, sync).
+/// Records that a client was proactively unregistered.
+struct UnregisterClientPayload {
+    UUID client_id{0, 0};
+
+    YLT_REFL(UnregisterClientPayload, client_id);
+};
+
 /// Payload for ADD_REPLICA (OpType=10, async).
 /// Records that a replica was added to an object.
 struct AddReplicaPayload {
@@ -54,12 +63,8 @@ struct AddReplicaPayload {
     UUID client_id{0, 0};
     UUID segment_id{0, 0};
     size_t size = 0;
-    int priority = 0;
-    std::vector<std::string> tags;
-    MemoryType memory_type = MemoryType::DRAM;
 
-    YLT_REFL(AddReplicaPayload, object_key, client_id, segment_id, size,
-             priority, tags, memory_type);
+    YLT_REFL(AddReplicaPayload, object_key, client_id, segment_id, size);
 };
 
 /// Payload for REMOVE_REPLICA (OpType=11, async).
@@ -100,6 +105,7 @@ struct UnmountSegmentPayload {
 
 /// Serialize a P2P payload to binary (struct_pack format).
 std::string SerializeP2PPayload(const RegisterClientPayload& payload);
+std::string SerializeP2PPayload(const UnregisterClientPayload& payload);
 std::string SerializeP2PPayload(const AddReplicaPayload& payload);
 std::string SerializeP2PPayload(const RemoveReplicaPayload& payload);
 std::string SerializeP2PPayload(const MountSegmentPayload& payload);
@@ -109,6 +115,8 @@ std::string SerializeP2PPayload(const UnmountSegmentPayload& payload);
 /// Returns true on success, false on deserialization error.
 bool DeserializeP2PPayload(const std::string& data,
                            RegisterClientPayload& payload);
+bool DeserializeP2PPayload(const std::string& data,
+                           UnregisterClientPayload& payload);
 bool DeserializeP2PPayload(const std::string& data, AddReplicaPayload& payload);
 bool DeserializeP2PPayload(const std::string& data,
                            RemoveReplicaPayload& payload);

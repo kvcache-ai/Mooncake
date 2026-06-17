@@ -48,28 +48,12 @@ size_t P2PStandbyMetadataStore::GetKeyCount() const { return objects_.size(); }
 
 void P2PStandbyMetadataStore::AddReplica(const std::string& object_key,
                                          const UUID& client_id,
-                                         const UUID& segment_id, size_t size,
-                                         int priority,
-                                         const std::vector<std::string>& tags,
-                                         MemoryType memory_type) {
+                                         const UUID& segment_id, size_t size) {
     auto& metadata = objects_[object_key];
     metadata.size = size;
     metadata.last_sequence_id = 0;  // Will be set by Applier
 
     auto client_it = clients_.find(client_id);
-    if (client_it != clients_.end()) {
-        for (auto& segment : client_it->second.segments) {
-            if (segment.id != segment_id) {
-                continue;
-            }
-            auto& extra = segment.GetP2PExtra();
-            extra.priority = priority;
-            extra.tags = tags;
-            extra.memory_type = memory_type;
-            break;
-        }
-    }
-
     for (const auto& desc : metadata.replicas) {
         if (!std::holds_alternative<P2PProxyDescriptor>(
                 desc.descriptor_variant)) {

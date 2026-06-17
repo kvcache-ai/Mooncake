@@ -21,6 +21,7 @@ TEST(P2POpLogTypesTest, OpTypeValuesDoNotConflictWithMain) {
     EXPECT_EQ(static_cast<int>(OpType_UNMOUNT_SEGMENT), 13);
     EXPECT_EQ(static_cast<int>(OpType_REMOVE_ALL), 14);
     EXPECT_EQ(static_cast<int>(OpType_REGISTER_CLIENT), 15);
+    EXPECT_EQ(static_cast<int>(OpType_UNREGISTER_CLIENT), 16);
 }
 
 TEST(P2POpLogTypesTest, OpTypeValuesAreDistinct) {
@@ -31,6 +32,7 @@ TEST(P2POpLogTypesTest, OpTypeValuesAreDistinct) {
         static_cast<int>(OpType_UNMOUNT_SEGMENT),
         static_cast<int>(OpType_REMOVE_ALL),
         static_cast<int>(OpType_REGISTER_CLIENT),
+        static_cast<int>(OpType_UNREGISTER_CLIENT),
     };
     std::sort(values.begin(), values.end());
     for (size_t i = 1; i < values.size(); ++i) {
@@ -123,6 +125,18 @@ TEST(P2POpLogTypesTest, RoundTrip_RegisterClientPayload_MultipleSegments) {
     EXPECT_EQ(decoded.segments[1].size, 8192u);
 }
 
+TEST(P2POpLogTypesTest, RoundTrip_UnregisterClientPayload) {
+    UnregisterClientPayload original;
+    original.client_id = {100, 200};
+
+    std::string data = SerializeP2PPayload(original);
+    UnregisterClientPayload decoded;
+    ASSERT_TRUE(DeserializeP2PPayload(data, decoded));
+
+    EXPECT_EQ(decoded.client_id.first, 100u);
+    EXPECT_EQ(decoded.client_id.second, 200u);
+}
+
 // ============================================================================
 // AddReplicaPayload round-trip
 // ============================================================================
@@ -133,9 +147,6 @@ TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload) {
     original.client_id = {10, 20};
     original.segment_id = {30, 40};
     original.size = 4096;
-    original.priority = 1;
-    original.tags = {"tag1", "tag2"};
-    original.memory_type = MemoryType::DRAM;
 
     std::string data = SerializeP2PPayload(original);
     AddReplicaPayload decoded;
@@ -147,28 +158,25 @@ TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload) {
     EXPECT_EQ(decoded.segment_id.first, 30u);
     EXPECT_EQ(decoded.segment_id.second, 40u);
     EXPECT_EQ(decoded.size, 4096u);
-    EXPECT_EQ(decoded.priority, 1);
-    ASSERT_EQ(decoded.tags.size(), 2u);
-    EXPECT_EQ(decoded.tags[0], "tag1");
-    EXPECT_EQ(decoded.tags[1], "tag2");
-    EXPECT_EQ(decoded.memory_type, MemoryType::DRAM);
 }
 
-TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload_EmptyTags) {
+TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload_MinimalFields) {
     AddReplicaPayload original;
-    original.object_key = "obj_empty_tags";
+    original.object_key = "obj_minimal_fields";
     original.client_id = {1, 2};
     original.segment_id = {3, 4};
     original.size = 1024;
-    original.priority = 0;
-    // tags intentionally left empty
-    original.memory_type = MemoryType::DRAM;
 
     std::string data = SerializeP2PPayload(original);
     AddReplicaPayload decoded;
     ASSERT_TRUE(DeserializeP2PPayload(data, decoded));
 
-    EXPECT_EQ(decoded.tags.size(), 0u);
+    EXPECT_EQ(decoded.object_key, "obj_minimal_fields");
+    EXPECT_EQ(decoded.client_id.first, 1u);
+    EXPECT_EQ(decoded.client_id.second, 2u);
+    EXPECT_EQ(decoded.segment_id.first, 3u);
+    EXPECT_EQ(decoded.segment_id.second, 4u);
+    EXPECT_EQ(decoded.size, 1024u);
 }
 
 // ============================================================================

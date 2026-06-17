@@ -10,6 +10,10 @@ std::string SerializeP2PPayload(const RegisterClientPayload& payload) {
     return struct_pack::serialize<std::string>(payload);
 }
 
+std::string SerializeP2PPayload(const UnregisterClientPayload& payload) {
+    return struct_pack::serialize<std::string>(payload);
+}
+
 std::string SerializeP2PPayload(const AddReplicaPayload& payload) {
     return struct_pack::serialize<std::string>(payload);
 }
@@ -32,6 +36,13 @@ std::string SerializeP2PPayload(const UnmountSegmentPayload& payload) {
 
 bool DeserializeP2PPayload(const std::string& data,
                            RegisterClientPayload& payload) {
+    auto result =
+        struct_pack::deserialize_to(payload, data.data(), data.size());
+    return result == struct_pack::errc::ok;
+}
+
+bool DeserializeP2PPayload(const std::string& data,
+                           UnregisterClientPayload& payload) {
     auto result =
         struct_pack::deserialize_to(payload, data.data(), data.size());
     return result == struct_pack::errc::ok;
