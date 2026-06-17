@@ -1391,6 +1391,9 @@ def _can_tensor(values: list[Any]) -> _CodecDecision:
     dtypes = sorted({str(v.dtype) for v in nn})
     if len(dtypes) != 1:
         return _CodecDecision(False, "ragged_tensor", f"mixed dtypes: {dtypes}", "torch.Tensor")
+    ndims = {v.ndim for v in nn}
+    if len(ndims) != 1:
+        return _CodecDecision(False, "ragged_tensor", f"mixed dimensions: {ndims}", "torch.Tensor")
     return _CodecDecision(True, "ragged_tensor", "all non-null rows are Tensor", "torch.Tensor", {"dtype": dtypes[0]})
 
 
@@ -1424,7 +1427,7 @@ def _can_numeric_scalar(values: list[Any]) -> _CodecDecision:
         return _CodecDecision(False, "ndarray", "not all rows are numeric scalar", "numeric scalar")
     try:
         dtype = np.result_type(*nn)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _CodecDecision(False, "ndarray", "cannot determine common dtype", "numeric scalar")
     if not np.issubdtype(dtype, np.number) and not np.issubdtype(dtype, np.bool_):
         return _CodecDecision(False, "ndarray", f"non-numeric dtype: {dtype}", "numeric scalar")
@@ -1483,7 +1486,7 @@ def _try_expand_list(values: list[Any]) -> tuple[int, list[int]] | None:
     max_len = max(len(v) for v in nn)
     if max_len > _INFER_MAX_LIST_LEN:
         return None
-    if not all(isinstance(item, (dict, list, tuple)) for v in nn for item in v):
+    if not all(item is None or isinstance(item, (dict, list, tuple)) for v in nn for item in v):
         return None
     lengths = [len(v) if isinstance(v, (list, tuple)) else 0 for v in values]
     return max_len, lengths

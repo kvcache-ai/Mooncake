@@ -254,6 +254,11 @@ class TestCodecInference(unittest.TestCase):
         d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
         self.assertFalse(d.accepted)
 
+    def test_tensor_mixed_ndim_rejected(self):
+        import torch
+        d = _choose_leaf_codec([torch.tensor([1]), torch.tensor([[1, 2]])])
+        self.assertFalse(d.accepted)
+
     def test_numeric_sequence(self):
         d = _choose_leaf_codec([[1, 2, 3], [4, 5]])
         self.assertTrue(d.accepted)
@@ -336,6 +341,12 @@ class TestCodecInference(unittest.TestCase):
         self.assertEqual(len(dict_nodes), 1)
         self.assertEqual(len(leaves), 1)
         self.assertEqual(leaves[0].path, "r[0].k")
+
+    def test_infer_list_with_none_items(self):
+        leaves, nodes = [], []
+        infer_structure("r", [[{"k": 1}, None], [{"k": 2}, None]], leaves, nodes)
+        list_nodes = [n for n in nodes if n.node_type == "list"]
+        self.assertEqual(len(list_nodes), 1)
 
     def test_depth_limit(self):
         deep = 1
