@@ -22,7 +22,7 @@ namespace mooncake {
 // Lowercase a single byte safely. Passing a (possibly signed) char straight
 // to std::tolower is UB when the byte is > 0x7F; the argument must be
 // representable as unsigned char or equal EOF.
-static inline char te_lower(char c) {
+static inline char to_lower(char c) {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 }
 

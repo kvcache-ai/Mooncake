@@ -182,7 +182,7 @@ static void discoverRocmTopology(std::vector<Topology::NicEntry>& nic_list,
         char pci_bus_id[20];
         snprintf(pci_bus_id, sizeof(pci_bus_id), "%04x:%02x:%02x.%x",
                  prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, 0);
-        for (char* ch = pci_bus_id; *ch; ch++) *ch = te_lower(*ch);
+        for (char* ch = pci_bus_id; *ch; ch++) *ch = to_lower(*ch);
 
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;

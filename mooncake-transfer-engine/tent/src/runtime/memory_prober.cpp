@@ -375,7 +375,7 @@ void MemoryProber::probeDeviceMemory(
                                                      sizeof(pci_bus_id));
         if (err) continue;
 
-        for (char* ch = pci_bus_id; (*ch = te_lower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;

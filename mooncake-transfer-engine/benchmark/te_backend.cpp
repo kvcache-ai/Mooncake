@@ -51,7 +51,7 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = te_lower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #elif defined(USE_SUNRISE)
@@ -64,7 +64,7 @@ static inline int getSunriseDeviceNumaID(int dev_id) {
                      << tangGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = te_lower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
     std::string sysfs_path =
         "/sys/bus/pci/devices/" + std::string(pci_bus_id) + "/numa_node";
     std::ifstream numa_file(sysfs_path);
