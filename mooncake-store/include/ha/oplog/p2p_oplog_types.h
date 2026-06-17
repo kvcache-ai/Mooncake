@@ -44,8 +44,7 @@ struct RegisterClientPayload {
     // Segments registered by this client at registration time.
     std::vector<Segment> segments;
 
-    YLT_REFL(RegisterClientPayload, client_id, ip_address, rpc_port,
-              segments);
+    YLT_REFL(RegisterClientPayload, client_id, ip_address, rpc_port, segments);
 };
 
 /// Payload for ADD_REPLICA (OpType=10, async).
@@ -60,7 +59,7 @@ struct AddReplicaPayload {
     MemoryType memory_type = MemoryType::DRAM;
 
     YLT_REFL(AddReplicaPayload, object_key, client_id, segment_id, size,
-              priority, tags, memory_type);
+             priority, tags, memory_type);
 };
 
 /// Payload for REMOVE_REPLICA (OpType=11, async).
@@ -110,8 +109,7 @@ std::string SerializeP2PPayload(const UnmountSegmentPayload& payload);
 /// Returns true on success, false on deserialization error.
 bool DeserializeP2PPayload(const std::string& data,
                            RegisterClientPayload& payload);
-bool DeserializeP2PPayload(const std::string& data,
-                           AddReplicaPayload& payload);
+bool DeserializeP2PPayload(const std::string& data, AddReplicaPayload& payload);
 bool DeserializeP2PPayload(const std::string& data,
                            RemoveReplicaPayload& payload);
 bool DeserializeP2PPayload(const std::string& data,

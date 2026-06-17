@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -201,7 +202,8 @@ TEST(P2POpLogTypesTest, RoundTrip_MountSegmentPayload) {
     original.segment.id = {70, 80};
     original.segment.name = "test_segment";
     original.segment.size = 2048;
-    original.segment.extra = P2PSegmentExtraData{1, {"tag1"}, MemoryType::DRAM, 0};
+    original.segment.extra =
+        P2PSegmentExtraData{1, {"tag1"}, MemoryType::DRAM, 0};
 
     std::string data = SerializeP2PPayload(original);
     MountSegmentPayload decoded;
@@ -275,7 +277,8 @@ TEST(P2POpLogTypesTest, Deserialize_EmptyData_ReturnsFalse) {
 }
 
 TEST(P2POpLogTypesTest, Deserialize_WrongType_ReturnsFalse) {
-    // Serialize an AddReplicaPayload, try to deserialize as RemoveReplicaPayload
+    // Serialize an AddReplicaPayload, try to deserialize as
+    // RemoveReplicaPayload
     AddReplicaPayload original;
     original.object_key = "cross_type_test";
     original.client_id = {1, 2};
