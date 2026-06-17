@@ -755,10 +755,12 @@ impl StoreClient {
                 policy_rank,
                 tenant: object_id.scope.tenant.clone(),
                 qos_tier: qos_tier.clone(),
+                route_key: route.key.clone(),
                 storage_runtime: replica.owner.clone(),
                 segment_name: replica.segment_name.clone(),
                 offset_bytes: replica.segment_offset,
                 length_bytes: replica.length,
+                cold_backing: route.cold_backing.clone(),
             });
         }
         Ok(())

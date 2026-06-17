@@ -15,6 +15,7 @@ impl MembershipSyncHandle {
         runtime: &ClientRuntimeId,
         metadata: Arc<dyn MetadataBackend>,
         live_client_cache: SharedLiveClientCache,
+        cold_tier_device_cache: SharedColdTierDeviceCache,
         interval: Duration,
         namespace: String,
         suspect_runtime_cache: SharedSuspectRuntimeCache,
@@ -29,10 +30,13 @@ impl MembershipSyncHandle {
             .name(format!("mooncake-membership-sync-{stable_id}"))
             .spawn(move || {
                 let mut wait = initial_delay;
+                let mut consecutive_failures: u32 = 0;
+                const MAX_BACKOFF_MULTIPLIER: u32 = 6; // caps at interval * 2^6 = 64x
                 loop {
                     match shutdown_rx.recv_timeout(wait) {
                         Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let mut any_failed = false;
                             match refresh_live_client_cache(
                                 metadata.as_ref(),
                                 &live_client_cache,
@@ -55,8 +59,10 @@ impl MembershipSyncHandle {
                                     );
                                 }
                                 Err(error) => {
+                                    any_failed = true;
                                     tracing::warn!(
                                         error = %error,
+                                        consecutive_failures,
                                         "background live-client refresh failed"
                                     );
                                 }
@@ -65,12 +71,40 @@ impl MembershipSyncHandle {
                                 metadata.as_ref(),
                                 &live_client_cache,
                             ) {
+                                any_failed = true;
                                 tracing::warn!(
                                     error = %error,
                                     "background tenant policy cache refresh failed"
                                 );
                             }
-                            wait = interval;
+                            if let Err(error) = refresh_cold_tier_device_cache(
+                                metadata.as_ref(),
+                                &cold_tier_device_cache,
+                                "cold_tier_device_snapshot_refresh",
+                            ) {
+                                any_failed = true;
+                                tracing::warn!(
+                                    error = %error,
+                                    "background cold tier device cache refresh failed"
+                                );
+                            }
+                            if any_failed {
+                                consecutive_failures = consecutive_failures
+                                    .saturating_add(1)
+                                    .min(MAX_BACKOFF_MULTIPLIER);
+                                let backoff = interval
+                                    .saturating_mul(1u32 << consecutive_failures)
+                                    .min(Duration::from_secs(120));
+                                tracing::debug!(
+                                    consecutive_failures,
+                                    backoff_ms = backoff.as_millis() as u64,
+                                    "membership sync backing off after failure"
+                                );
+                                wait = backoff;
+                            } else {
+                                consecutive_failures = 0;
+                                wait = interval;
+                            }
                         }
                     }
                 }
@@ -125,7 +159,8 @@ impl AsyncEvictionHandle {
                 .endpoints
                 .labels
                 .get("storage")
-                .is_none_or(|value| value != "true")
+                .map(|value| value != "true")
+                .unwrap_or(true)
         {
             return Ok(Self::disabled());
         }
@@ -617,6 +652,29 @@ pub(crate) fn refresh_due_tenant_quota_policy_cache(
         cache.store_tenant_quota_policy(tenant, version, quota, now);
     }
     Ok(())
+}
+
+pub(crate) fn refresh_cold_tier_device_cache(
+    metadata: &dyn MetadataBackend,
+    cold_tier_device_cache: &SharedColdTierDeviceCache,
+    operation: &'static str,
+) -> Result<Vec<ColdTierDeviceRecord>> {
+    let tracker = OperationTracker::new(operation);
+    let result =
+        metadata.list_cold_tier_devices(&mooncake_store_core::ColdTierDeviceFilter::default());
+    tracker.finish(&result, 0);
+    match result {
+        Ok(devices) => {
+            let cached_devices = devices
+                .iter()
+                .filter(|device| cold_tier_device_visible_in_cache(device))
+                .cloned()
+                .collect::<Vec<_>>();
+            cold_tier_device_cache.lock().store(cached_devices.clone());
+            Ok(cached_devices)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn membership_initial_refresh_delay(runtime: &ClientRuntimeId, interval: Duration) -> Duration {

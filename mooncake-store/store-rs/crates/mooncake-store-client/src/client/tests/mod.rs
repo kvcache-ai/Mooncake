@@ -25,11 +25,13 @@ use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, effective_route_policy, encode_lifecycle_state,
     flatten_slices, now_ms, payload_checksum, record_success_metric, route_topk_from_tenant_spec,
-    run_bounded_parallel_jobs, scatter_into_buffers, shared_suspect_runtime_cache,
-    stable_debug_log_sample, startup_prewarm_delay, AllocationSpan, ColdTierBackendResolver,
-    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
-    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
-    StoreState, SuspectRuntimeCache,
+    run_bounded_parallel_jobs, scatter_into_buffers, shared_cold_tier_device_cache,
+    shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
+    ColdTierBackendResolver, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
+    ColdTierRateLimitConfig, ColdTierWatermarkConfig, LiveClientCache, LocalAllocatorAdapter,
+    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, ResolvedObject,
+    RouteWriteGate, SegmentAllocator, StorageOwnerColdTierConfig, StorageOwnerState, StoreState,
+    SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -51,8 +53,8 @@ fn test_lifecycle_state(state: ClientLifecycleState) -> Arc<AtomicU8> {
     Arc::new(AtomicU8::new(encode_lifecycle_state(state)))
 }
 
-fn test_route_write_gate() -> Arc<Mutex<()>> {
-    Arc::new(Mutex::new(()))
+fn test_route_write_gate() -> Arc<RouteWriteGate> {
+    Arc::new(RouteWriteGate::default())
 }
 
 struct NoHotPathMetadataBackend {
@@ -796,6 +798,13 @@ impl MetadataBackend for RecoverableMetadataBackend {
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
         self.inner.get_handoff(stable_id)
     }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &mooncake_store_core::ColdTierDeviceFilter,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+        self.inner.list_cold_tier_devices(filter)
+    }
 }
 
 impl MetadataBackend for NoHotPathMetadataBackend {
@@ -1075,6 +1084,13 @@ impl MetadataBackend for NoHotPathMetadataBackend {
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
         self.inner.get_handoff(stable_id)
     }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &mooncake_store_core::ColdTierDeviceFilter,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+        self.inner.list_cold_tier_devices(filter)
+    }
 }
 
 impl MetadataBackend for HotPathBlockedMetadataBackend {
@@ -1327,6 +1343,13 @@ impl MetadataBackend for HotPathBlockedMetadataBackend {
         stable_id: &mooncake_store_core::ClientStableId,
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
         self.inner.get_handoff(stable_id)
+    }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &mooncake_store_core::ColdTierDeviceFilter,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+        self.inner.list_cold_tier_devices(filter)
     }
 }
 
@@ -1586,6 +1609,13 @@ impl MetadataBackend for CountingMetadataBackend {
         stable_id: &mooncake_store_core::ClientStableId,
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
         self.inner.get_handoff(stable_id)
+    }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &mooncake_store_core::ColdTierDeviceFilter,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+        self.inner.list_cold_tier_devices(filter)
     }
 }
 
@@ -2093,6 +2123,13 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
         self.inner.get_handoff(stable_id)
     }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &mooncake_store_core::ColdTierDeviceFilter,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+        self.inner.list_cold_tier_devices(filter)
+    }
 }
 
 impl MetadataBackend for BlockingCasMetadataBackend {
@@ -2374,6 +2411,13 @@ impl MetadataBackend for BlockingCasMetadataBackend {
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
         self.inner.get_handoff(stable_id)
     }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &mooncake_store_core::ColdTierDeviceFilter,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+        self.inner.list_cold_tier_devices(filter)
+    }
 }
 
 fn storage_config() -> LocalMemoryConfig {
@@ -2494,10 +2538,19 @@ fn test_storage_owner_state(
     );
     Arc::new(StorageOwnerState::new(
         runtime.clone(),
-        lease,
-        route_directory,
+        mooncake_store_route::RouteOperations::new(route_directory, lease),
+        metadata.clone(),
         allocator,
-        ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
+        Arc::new(Mutex::new(StoreState::default())),
+        StorageOwnerColdTierConfig {
+            resolver: ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
+            devices: shared_cold_tier_device_cache("test"),
+            watermarks: ColdTierWatermarkConfig::default(),
+            rate_limits: ColdTierRateLimitConfig::default(),
+            offload_mode: ColdTierOffloadMode::default(),
+            offload_priority: ColdTierOffloadPriorityConfig::default(),
+            runtime: runtime.clone(),
+        },
     ))
 }
 
@@ -2667,7 +2720,7 @@ fn wait_for_storage_clock_route(storage: &StoreClient, route: &ObjectRoute, requ
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let found = {
-            let clock = storage.storage_owner.clock.lock();
+            let clock = storage.storage_owner.hot_replicas.clock.lock();
             clock
                 .entries
                 .iter()
@@ -13612,6 +13665,8 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             segment_name: SegmentName::new("stale-segment"),
             offset_bytes: 0,
             length_bytes: 16,
+            route_key: ObjectKey(String::new()),
+            cold_backing: None,
         });
         state.pending_reclaims.push_back(PendingReclaim {
             due_at_ms: 0,
@@ -13622,6 +13677,8 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             segment_name: reclaim_reservation.segment_name.clone(),
             offset_bytes: reclaim_reservation.offset_bytes,
             length_bytes: reclaim_reservation.length_bytes,
+            route_key: ObjectKey(String::new()),
+            cold_backing: None,
         });
         state.pending_reclaims.push_back(PendingReclaim {
             due_at_ms: 0,
@@ -13632,6 +13689,8 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             segment_name: reclaim_reservation.segment_name.clone(),
             offset_bytes: reclaim_reservation.offset_bytes,
             length_bytes: reclaim_reservation.length_bytes,
+            route_key: ObjectKey(String::new()),
+            cold_backing: None,
         });
     }
     assert_eq!(client.allocator.lock().usage_bytes().0, 16);
@@ -13663,6 +13722,8 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
                 segment_name: reclaim_all_reservation.segment_name.clone(),
                 offset_bytes: reclaim_all_reservation.offset_bytes,
                 length_bytes: reclaim_all_reservation.length_bytes,
+                route_key: ObjectKey(String::new()),
+                cold_backing: None,
             });
         }
     }
@@ -13762,6 +13823,8 @@ fn flush_due_reclaims_skips_duplicate_remote_release() {
                 segment_name: reservation.segment_name.clone(),
                 offset_bytes: reservation.offset_bytes,
                 length_bytes: reservation.length_bytes,
+                route_key: ObjectKey(String::new()),
+                cold_backing: None,
             });
         }
     }
@@ -15837,6 +15900,8 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         segment_name: SegmentName::new("seg-a"),
         offset_bytes: 0,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 50,
@@ -15847,6 +15912,8 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         segment_name: SegmentName::new("seg-b"),
         offset_bytes: 16,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
     assert_eq!(state.take_due_reclaims(10).len(), 1);
     assert_eq!(state.pending_reclaims.len(), 1);
@@ -15994,6 +16061,8 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-critical"),
         offset_bytes: 0,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 5,
@@ -16004,6 +16073,8 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-gold"),
         offset_bytes: 8,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 5,
@@ -16014,6 +16085,8 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-bronze"),
         offset_bytes: 16,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 5,
@@ -16024,6 +16097,8 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-default"),
         offset_bytes: 24,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
 
     let due = state.take_due_reclaims(10);
@@ -16047,6 +16122,8 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
         segment_name: SegmentName::new("seg-a"),
         offset_bytes: 0,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 5,
@@ -16057,6 +16134,8 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
         segment_name: SegmentName::new("seg-b"),
         offset_bytes: 8,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 5,
@@ -16067,6 +16146,8 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
         segment_name: SegmentName::new("seg-c"),
         offset_bytes: 16,
         length_bytes: 8,
+        route_key: ObjectKey(String::new()),
+        cold_backing: None,
     });
 
     let due = state.take_due_reclaims(10);

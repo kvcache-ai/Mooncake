@@ -803,6 +803,9 @@ impl StoreClient {
                         owner, segment_name.0, current.key.0
                     ))
                 }),
+            ReplicaReadSelector::ColdBacking => Err(StoreError::InvalidState(
+                "cold backing read source is not supported in this context".to_string(),
+            )),
         }
     }
 

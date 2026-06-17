@@ -1,5 +1,6 @@
 pub(crate) type SharedLiveClientCache = Arc<Mutex<LiveClientCache>>;
 pub(crate) type SharedSuspectRuntimeCache = Arc<Mutex<SuspectRuntimeCache>>;
+include!("cold_tier_state.rs");
 
 #[derive(Default)]
 pub(crate) struct LiveClientCache {
@@ -322,15 +323,38 @@ struct SegmentTransportMetadata {
     transport_segment_descriptor: Option<String>,
 }
 
+#[allow(dead_code)]
 struct StorageOwnerState {
     runtime: ClientRuntimeId,
     route_ops: RouteOperations,
+    metadata: Arc<dyn MetadataBackend>,
     allocator: Arc<Mutex<LocalAllocatorState>>,
+    state: Arc<Mutex<StoreState>>,
+    cold_tier_devices: ColdTierDeviceManager,
+    hot_replicas: HotReplicaTracker,
+    offload_mode: ColdTierOffloadMode,
+    offload_priority: ColdTierOffloadPriorityConfig,
+}
+
+#[derive(Default)]
+struct HotReplicaTracker {
     clock: Mutex<StorageClockState>,
-    /// Cold tier backend resolver. Constructed at startup from configured targets.
-    /// Used by offload/restore paths added in later PRs.
-    #[allow(dead_code)]
-    resolver: ColdTierBackendResolver,
+}
+
+#[derive(Default)]
+struct RouteWriteGate {
+    state: Mutex<()>,
+}
+
+impl RouteWriteGate {
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.state.lock()
+    }
+}
+
+#[allow(dead_code)]
+struct RouteWritePermit<'a> {
+    guard: Option<parking_lot::MutexGuard<'a, ()>>,
 }
 
 #[derive(Default)]
@@ -887,16 +911,31 @@ struct ReplicaPlacementCandidate {
     soft: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ReclaimQueueSnapshot {
+    total_pending: usize,
+    due: usize,
+    cold_backing_reclaims: usize,
+    hot_segment_reclaims: usize,
+    by_qos_tier: BTreeMap<String, usize>,
+    by_policy_rank: BTreeMap<u8, usize>,
+}
+
 #[derive(Clone, Debug)]
 struct PendingReclaim {
     due_at_ms: u64,
     policy_rank: u8,
     tenant: String,
     qos_tier: String,
+    #[allow(dead_code)]
+    route_key: ObjectKey,
     storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
     offset_bytes: u64,
     length_bytes: u64,
+    #[allow(dead_code)]
+    cold_backing: Option<mooncake_store_core::ColdBackingRoute>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

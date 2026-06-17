@@ -76,8 +76,6 @@ const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
 const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 
 type SharedLifecycleState = Arc<AtomicU8>;
-type SharedRouteWriteGate = Arc<Mutex<()>>;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchPutRouteConflictPolicy {
     Strict,
@@ -93,7 +91,6 @@ struct TenantQuotaPolicyCacheEntry {
 }
 
 include!("types.rs");
-include!("cold_tier_types.rs");
 include!("builder.rs");
 include!("state_core.rs");
 include!("membership_sync.rs");
@@ -102,14 +99,15 @@ include!("state_store.rs");
 include!("helpers.rs");
 
 /// Cold tier persistent storage backend abstraction.
-///
-/// Contains the `PersistentStorageBackend` trait, the LocalDir binary-only backend,
-/// `ColdTierBackendResolver`, target resolution, and mount/directory validation helpers.
-/// Consumers (offload, restore, GC) are added by later PRs.
 #[allow(dead_code)]
 #[path = "cold_tier_storage_backend.rs"]
 mod cold_tier_storage_backend;
 use cold_tier_storage_backend::*;
+
+#[allow(dead_code)]
+mod cold_tier;
+
+type SharedRouteWriteGate = Arc<RouteWriteGate>;
 
 pub struct StoreClient {
     metadata: Arc<dyn MetadataBackend>,
@@ -139,12 +137,16 @@ pub struct StoreClient {
     route_write_gate: SharedRouteWriteGate,
     startup_activation_pending: AtomicBool,
     heartbeat_repair_pending: AtomicUsize,
-    tenant_quota_reservation_counter: AtomicU64,
+    tenant_quota_reservation_counter: Arc<AtomicU64>,
     namespace_quota: Option<NamespaceQuota>,
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,
     placement_policy: Option<TenantPlacementPolicy>,
-    state: Mutex<StoreState>,
+    state: Arc<Mutex<StoreState>>,
+    #[allow(dead_code)]
+    owns_cold_tier_lifecycle: bool,
+    #[allow(dead_code)]
+    cold_tier_shutdown_mode: ColdTierShutdownMode,
 }
 
 enum HealthUpdateKind {

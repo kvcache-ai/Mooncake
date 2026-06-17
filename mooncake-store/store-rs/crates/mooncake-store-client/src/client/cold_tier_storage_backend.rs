@@ -703,19 +703,23 @@ impl ColdTierBackendResolver {
         Self::local_dirs(cold_tier_id.clone(), backend, [cold_tier_id])
     }
 
-    fn has_backend(&self, cold_tier_id: &str) -> bool {
+    pub(super) fn has_backend(&self, cold_tier_id: &str) -> bool {
         self.backends.contains_key(cold_tier_id)
     }
 
-    fn backend_ids(&self) -> Vec<String> {
+    pub(super) fn backend_ids(&self) -> Vec<String> {
         self.backends.keys().cloned().collect()
     }
 
-    fn insert_backend(&mut self, cold_tier_id: String, backend: Arc<dyn PersistentStorageBackend>) {
+    pub(super) fn insert_backend(
+        &mut self,
+        cold_tier_id: String,
+        backend: Arc<dyn PersistentStorageBackend>,
+    ) {
         self.backends.insert(cold_tier_id, backend);
     }
 
-    fn backend_for(
+    pub(super) fn backend_for(
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<Arc<dyn PersistentStorageBackend>> {
@@ -731,7 +735,7 @@ impl ColdTierBackendResolver {
     }
 }
 
-fn cold_tier_backend_from_device_record(
+pub(super) fn cold_tier_backend_from_device_record(
     device: &ColdTierDeviceRecord,
 ) -> Result<Arc<dyn PersistentStorageBackend>> {
     let root_dir = match &device.target {
@@ -786,8 +790,7 @@ pub(super) fn resolve_cold_tier_target(
 ) -> Result<ResolvedColdTierTarget> {
     validate_cold_tier_id(&config.cold_tier_id)?;
     let (target, root_dir) = match &config.target {
-        mooncake_store_core::ColdTierTargetSpec::Directory { path } => {
-            let directory = std::path::Path::new(path);
+        ColdTierTarget::Directory(directory) => {
             let root_dir = ensure_backend_directory(directory, &config.cold_tier_id)?;
             (
                 mooncake_store_core::ColdTierTargetSpec::Directory {
@@ -796,7 +799,7 @@ pub(super) fn resolve_cold_tier_target(
                 root_dir,
             )
         }
-        mooncake_store_core::ColdTierTargetSpec::Uuid { uuid } => {
+        ColdTierTarget::Uuid(uuid) => {
             let resolved = resolve_mount_point_from_uuid(uuid, &config.cold_tier_id)?;
             let root_dir = ensure_backend_directory(&resolved, &config.cold_tier_id)?;
             (
@@ -836,6 +839,65 @@ fn cold_tier_kind_name(kind: ColdTierKind) -> &'static str {
     match kind {
         ColdTierKind::Ssd => "ssd",
         ColdTierKind::Nfs => "nfs",
+    }
+}
+
+pub(super) fn find_existing_device_by_target(
+    metadata: &dyn MetadataBackend,
+    resolved: &ResolvedColdTierTarget,
+) -> Result<Option<mooncake_store_core::ColdTierDeviceRecord>> {
+    let devices =
+        metadata.list_cold_tier_devices(&mooncake_store_core::ColdTierDeviceFilter::default())?;
+    Ok(devices
+        .into_iter()
+        .find(|d| d.target == resolved.target && d.device_id != resolved.cold_tier_id))
+}
+
+pub(super) fn bootstrap_cold_tier_device(
+    metadata: &dyn MetadataBackend,
+    runtime: &ClientRuntimeId,
+    resolved: &ResolvedColdTierTarget,
+) -> Result<()> {
+    let device_id = resolved.cold_tier_id.clone();
+    let record = mooncake_store_core::ColdTierDeviceRecord {
+        device_id: device_id.clone(),
+        stable_id: runtime.stable_id.0.clone(),
+        epoch: Some(runtime.epoch.0),
+        cold_tier_id: resolved.cold_tier_id.clone(),
+        kind: cold_tier_kind_name(resolved.kind).to_string(),
+        target: resolved.target.clone(),
+        root_dir: Some(resolved.root_dir.display().to_string()),
+        state: mooncake_store_core::ColdTierDeviceState::Healthy,
+        capacity_bytes: resolved.capacity_override_bytes,
+        used_bytes: 0,
+        reserved_bytes: 0,
+        failure_count: 0,
+        last_error: None,
+        tags: resolved.tags.clone(),
+        updated_at_ms: super::current_time_ms(),
+    };
+    match metadata.put_cold_tier_device_if_absent(&record)? {
+        mooncake_store_core::ColdTierPutDeviceResult::Created(_) => Ok(()),
+        mooncake_store_core::ColdTierPutDeviceResult::Existing(existing) => {
+            if existing.kind != record.kind || existing.target != record.target {
+                return Err(StoreError::Conflict(format!(
+                    "cold tier bootstrap device {} already exists with a different definition",
+                    resolved.cold_tier_id
+                )));
+            }
+            let mut update =
+                mooncake_store_core::ColdTierDeviceUpdate::new(super::current_time_ms());
+            update.expected_updated_at_ms = Some(existing.updated_at_ms);
+            update.stable_id = Some(runtime.stable_id.0.clone());
+            update.epoch = Some(Some(runtime.epoch.0));
+            update.root_dir = Some(Some(resolved.root_dir.display().to_string()));
+            update.state = Some(mooncake_store_core::ColdTierDeviceState::Healthy);
+            update.capacity_bytes = Some(resolved.capacity_override_bytes);
+            update.tags = Some(resolved.tags.clone());
+            update.last_error = Some(None);
+            metadata.update_cold_tier_device(&device_id, update)?;
+            Ok(())
+        }
     }
 }
 
@@ -1415,7 +1477,7 @@ mod cold_tier_storage_backend_tests {
         assert_eq!(config.cold_tier_id, "dev2");
         assert!(matches!(
             config.target,
-            mooncake_store_core::ColdTierTargetSpec::Uuid { ref uuid } if uuid == "abc-123-def"
+            ColdTierTarget::Uuid(ref uuid) if uuid == "abc-123-def"
         ));
     }
 

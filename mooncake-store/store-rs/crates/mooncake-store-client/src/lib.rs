@@ -7,10 +7,11 @@ mod route_directory;
 mod transport;
 
 pub use client::{
-    stable_phase_spread_ms, BandwidthShaping, ExecutionFairness, GetRequest, HealthChannel,
-    HealthUpdate, HeartbeatLease, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, NamespaceQuota, ObjectRef, PutFromRequest, PutRequest,
-    ReadQueryResultCache, ReplicationPolicy, StoreClient, StoreClientBuilder,
+    stable_phase_spread_ms, BandwidthShaping, ColdTierOffloadMode, ColdTierShutdownMode,
+    ColdTierSsdEngine, ColdTierTarget, ColdTierTargetConfig, ExecutionFairness, GetRequest,
+    HealthChannel, HealthUpdate, HeartbeatLease, MooncakeCompatibilityFacade,
+    MultiBufferGetRequest, MultiBufferPutRequest, NamespaceQuota, ObjectRef, PutFromRequest,
+    PutRequest, ReadQueryResultCache, ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
 pub use memory::LocalMemoryConfig;

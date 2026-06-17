@@ -782,24 +782,8 @@ mod state_store_tests {
 }
 
 impl StorageOwnerState {
-    fn new(
-        runtime: ClientRuntimeId,
-        observer: ClientLease,
-        route_directory: Arc<dyn RouteDirectory>,
-        allocator: Arc<Mutex<LocalAllocatorState>>,
-        resolver: ColdTierBackendResolver,
-    ) -> Self {
-        Self {
-            runtime,
-            route_ops: RouteOperations::new(route_directory, observer),
-            allocator,
-            clock: Mutex::new(StorageClockState::default()),
-            resolver,
-        }
-    }
-
     fn report_route_hits(&self, keys: &[ObjectKey]) -> RouteTrafficReport {
-        self.clock.lock().mark_hot_keys(keys)
+        self.hot_replicas.clock.lock().mark_hot_keys(keys)
     }
 
     fn track_routes(&self, routes: &[ObjectRoute]) -> RouteTrafficReport {
@@ -813,7 +797,7 @@ impl StorageOwnerState {
                 allocator.clear_pending_route(route, &self.runtime);
             }
         }
-        let mut clock = self.clock.lock();
+        let mut clock = self.hot_replicas.clock.lock();
         for route in routes {
             clock.sync_fresh_route(route, &self.runtime);
         }
@@ -824,18 +808,18 @@ impl StorageOwnerState {
         self.allocator
             .lock()
             .clear_pending_route(route, &self.runtime);
-        self.clock.lock().track_fresh_route(route, &self.runtime);
+        self.hot_replicas.clock.lock().track_fresh_route(route, &self.runtime);
     }
 
     fn untrack_route(&self, route: &ObjectRoute) {
-        self.clock.lock().untrack_route(route, &self.runtime);
+        self.hot_replicas.clock.lock().untrack_route(route, &self.runtime);
     }
 
     fn sync_route(&self, route: &ObjectRoute) {
         self.allocator
             .lock()
             .clear_pending_route(route, &self.runtime);
-        self.clock.lock().sync_route(route, &self.runtime);
+        self.hot_replicas.clock.lock().sync_route(route, &self.runtime);
     }
 
     fn evict_until_low_watermark(&self, high_percent: u8, low_percent: u8) -> Result<usize> {
@@ -908,12 +892,12 @@ impl StorageOwnerState {
         let result = (|| {
             for rebuild in 0..=1usize {
                 let budget = {
-                    let clock = self.clock.lock();
+                    let clock = self.hot_replicas.clock.lock();
                     clock.eviction_budget()
                 };
                 for _ in 0..budget.max(1) {
                     let victim = {
-                        let mut clock = self.clock.lock();
+                        let mut clock = self.hot_replicas.clock.lock();
                         clock.pick_victim(preferred_segment)
                     };
                     let Some(victim) = victim else {
@@ -938,11 +922,11 @@ impl StorageOwnerState {
             .route_ops
             .load_route(&victim.route_key)?
         else {
-            self.clock.lock().remove_id(victim);
+            self.hot_replicas.clock.lock().remove_id(victim);
             return Ok(false);
         };
         if route.state != RouteState::Active {
-            self.clock.lock().remove_id(victim);
+            self.hot_replicas.clock.lock().remove_id(victim);
             return Ok(false);
         }
         let Some(replica_index) = route.replicas.iter().position(|replica| {
@@ -988,12 +972,12 @@ impl StorageOwnerState {
         if !cas.applied {
             match cas.current.as_ref() {
                 Some(current) => self.sync_route(current),
-                None => self.clock.lock().remove_id(victim),
+                None => self.hot_replicas.clock.lock().remove_id(victim),
             }
             return Ok(false);
         }
 
-        self.clock.lock().remove_id(victim);
+        self.hot_replicas.clock.lock().remove_id(victim);
         self.allocator.lock().release(
             &self.runtime,
             &evicted_replica.segment_name,
@@ -1035,7 +1019,7 @@ impl StorageOwnerState {
             for route in &routes {
                 clock.track_route(route, &self.runtime);
             }
-            *self.clock.lock() = clock;
+            *self.hot_replicas.clock.lock() = clock;
             debug!(
                 runtime = %self.runtime,
                 routes = routes.len(),
