@@ -569,7 +569,6 @@ library_assets = {
     "engine.so": sorted((upstream_build_dir / "mooncake-integration").glob("engine*.so")),
     "libasio.so": [upstream_build_dir / "mooncake-asio" / "libasio.so"],
     "libtransfer_engine.so": [
-        *env_candidate("MOONCAKE_CLASSIC_TE_LIB_PATH"),
         upstream_build_dir / "mooncake-transfer-engine" / "src" / "libtransfer_engine.so",
     ],
     "libtent_shared.so": [
@@ -648,14 +647,8 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
         target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         set_relative_rpath(target)
 
-    optional_libraries = {"libtransfer_engine.so"}
     for name, candidates in library_assets.items():
-        if name in optional_libraries:
-            source = first_existing_or_none(candidates)
-            if source is None:
-                continue
-        else:
-            source = first_existing(candidates)
+        source = first_existing(candidates)
         target = package_root / name
         shutil.copy2(source, target)
         if name in relative_rpath_assets:
