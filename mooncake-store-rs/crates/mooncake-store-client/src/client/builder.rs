@@ -133,6 +133,13 @@ pub struct StoreClientBuilder {
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,
     cold_tier_targets: Vec<ColdTierTargetConfig>,
+    cold_tier_watermarks: ColdTierWatermarkConfig,
+    cold_tier_rate_limits: ColdTierRateLimitConfig,
+    cold_tier_offload_mode: ColdTierOffloadMode,
+    cold_tier_offload_priority: ColdTierOffloadPriorityConfig,
+    cold_tier_shutdown_mode: ColdTierShutdownMode,
+    #[cfg(test)]
+    cold_tier_backend_overrides: BTreeMap<String, Arc<dyn PersistentStorageBackend>>,
 }
 
 impl StoreClientBuilder {
@@ -160,6 +167,13 @@ impl StoreClientBuilder {
             execution_fairness: None,
             bandwidth_shaping: None,
             cold_tier_targets: Vec::new(),
+            cold_tier_watermarks: ColdTierWatermarkConfig::default(),
+            cold_tier_rate_limits: ColdTierRateLimitConfig::default(),
+            cold_tier_offload_mode: ColdTierOffloadMode::default(),
+            cold_tier_offload_priority: ColdTierOffloadPriorityConfig::default(),
+            cold_tier_shutdown_mode: ColdTierShutdownMode::default(),
+            #[cfg(test)]
+            cold_tier_backend_overrides: BTreeMap::new(),
         }
     }
 
@@ -313,6 +327,43 @@ impl StoreClientBuilder {
         self
     }
 
+    pub fn cold_tier_watermarks(mut self, watermarks: ColdTierWatermarkConfig) -> Self {
+        self.cold_tier_watermarks = watermarks;
+        self
+    }
+
+    pub fn cold_tier_rate_limits(mut self, rate_limits: ColdTierRateLimitConfig) -> Self {
+        self.cold_tier_rate_limits = rate_limits;
+        self
+    }
+
+    pub fn cold_tier_offload_mode(mut self, mode: ColdTierOffloadMode) -> Self {
+        self.cold_tier_offload_mode = mode;
+        self
+    }
+
+    pub fn cold_tier_offload_priority(mut self, priority: ColdTierOffloadPriorityConfig) -> Self {
+        self.cold_tier_offload_priority = priority;
+        self
+    }
+
+    pub fn cold_tier_shutdown_mode(mut self, mode: ColdTierShutdownMode) -> Self {
+        self.cold_tier_shutdown_mode = mode;
+        self
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn cold_tier_backend_override(
+        mut self,
+        cold_tier_id: impl Into<String>,
+        backend: Arc<dyn PersistentStorageBackend>,
+    ) -> Self {
+        self.cold_tier_backend_overrides
+            .insert(cold_tier_id.into(), backend);
+        self
+    }
+
     pub fn build(self, expires_at_ms: u64) -> Result<StoreClient> {
         if self.default_tenant.is_empty() {
             return Err(StoreError::InvalidState(
@@ -370,15 +421,16 @@ impl StoreClientBuilder {
         let effective_route_control = self.route_control;
         let effective_route_topk = route_topk_from_tenant_spec(&effective_tenant_policy)
             .unwrap_or(self.route_topk);
-        let state = Mutex::new(StoreState::default());
+        let state = Arc::new(Mutex::new(StoreState::default()));
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
         let lifecycle_state = Arc::new(AtomicU8::new(encode_lifecycle_state(
             published_initial_state,
         )));
-        let route_write_gate = Arc::new(Mutex::new(()));
+        let route_write_gate = Arc::new(RouteWriteGate::default());
         let route_namespace = runtime_metadata.route_namespace();
         let live_client_cache = shared_live_client_cache(&route_namespace);
         let suspect_runtime_cache = shared_suspect_runtime_cache(&route_namespace);
+        let cold_tier_device_cache = shared_cold_tier_device_cache(&route_namespace);
         let control_client = Arc::new(ControlPlaneClient::new()?);
 
         let template = ClientLease {
@@ -411,6 +463,11 @@ impl StoreClientBuilder {
             lifecycle_state: lifecycle_state.clone(),
             route_write_gate: route_write_gate.clone(),
         });
+        let resolved_cold_tier = self
+            .cold_tier_targets
+            .iter()
+            .map(resolve_cold_tier_target)
+            .collect::<Result<Vec<_>>>()?;
         let route_directory = build_route_directory(
             effective_route_control,
             effective_route_topk,
@@ -420,44 +477,88 @@ impl StoreClientBuilder {
             live_client_cache.clone(),
             suspect_runtime_cache.clone(),
         );
-        // Resolve cold tier targets and construct backends.
-        let resolved_cold_tier = self
-            .cold_tier_targets
-            .iter()
-            .map(resolve_cold_tier_target)
-            .collect::<Result<Vec<_>>>()?;
+        // Pre-populate the live client cache before cold tier bootstrap so that
+        // route_directory queries (which call cached_live_client_snapshot) do not
+        // fail with "snapshot not initialized".
+        if !resolved_cold_tier.is_empty() {
+            prewarm_live_client_cache(
+                runtime_metadata.as_ref(),
+                &live_client_cache,
+                &provisional_lease,
+            )?;
+        }
+        // Detect if any configured device was previously registered under a
+        // different cold_tier_id (same physical target). Track old IDs so we
+        // can register aliases in the backend resolver for route compatibility.
+        let mut cold_tier_aliases: Vec<(String, String)> = Vec::new(); // (old_id, new_id)
+        for resolved in &resolved_cold_tier {
+            if let Some(existing) =
+                find_existing_device_by_target(runtime_metadata.as_ref(), resolved)?
+            {
+                tracing::info!(
+                    old_device_id = %existing.device_id,
+                    new_cold_tier_id = %resolved.cold_tier_id,
+                    target = ?resolved.target,
+                    "cold tier device previously registered under different ID, will register alias"
+                );
+                cold_tier_aliases.push((existing.device_id.clone(), resolved.cold_tier_id.clone()));
+            }
+            bootstrap_cold_tier_device(runtime_metadata.as_ref(), &runtime, resolved)?;
+        }
         let default_cold_tier_id = resolved_cold_tier
             .first()
             .map(|r| r.cold_tier_id.clone())
             .unwrap_or_else(|| runtime.stable_id.to_string());
         let mut cold_tier_handles = BTreeMap::new();
         for resolved in &resolved_cold_tier {
+            #[cfg(test)]
+            if let Some(backend) = self
+                .cold_tier_backend_overrides
+                .get(&resolved.cold_tier_id)
+                .cloned()
+            {
+                cold_tier_handles.insert(resolved.cold_tier_id.clone(), backend);
+                continue;
+            }
             let backend: Arc<dyn PersistentStorageBackend> =
                 Arc::new(LocalDirPersistentStorageBackend::new_with_root(
                     resolved.root_dir.clone(),
                 ));
             cold_tier_handles.insert(resolved.cold_tier_id.clone(), backend);
         }
+        // Register aliases so routes referencing old cold_tier_ids still resolve.
+        for (old_id, new_id) in &cold_tier_aliases {
+            if let Some(backend) = cold_tier_handles.get(new_id).cloned() {
+                cold_tier_handles.entry(old_id.clone()).or_insert(backend);
+            }
+        }
         cold_tier_handles
             .entry(default_cold_tier_id.clone())
             .or_insert_with(|| {
-                let fallback_root = default_cold_tier_root();
-                warn!(
-                    path = %fallback_root.display(),
-                    "no cold tier target configured for default device, using ephemeral PID-based path"
-                );
                 Arc::new(LocalDirPersistentStorageBackend::new_with_root(
-                    fallback_root,
+                    default_cold_tier_root(),
                 ))
             });
         let cold_tier_resolver =
             ColdTierBackendResolver::from_handles(default_cold_tier_id, cold_tier_handles);
         let storage_owner = Arc::new(StorageOwnerState::new(
             runtime.clone(),
-            provisional_lease.clone(),
-            route_directory.clone(),
+            mooncake_store_route::RouteOperations::new(
+                route_directory.clone(),
+                provisional_lease.clone(),
+            ),
+            runtime_metadata.clone(),
             allocator.clone(),
-            cold_tier_resolver,
+            state.clone(),
+            StorageOwnerColdTierConfig {
+                resolver: cold_tier_resolver,
+                devices: cold_tier_device_cache.clone(),
+                watermarks: self.cold_tier_watermarks,
+                rate_limits: self.cold_tier_rate_limits,
+                offload_mode: self.cold_tier_offload_mode,
+                offload_priority: self.cold_tier_offload_priority,
+                runtime: runtime.clone(),
+            },
         ));
         let storage_adapter = Arc::new(LocalAllocatorAdapter {
             runtime: runtime.clone(),
@@ -536,10 +637,16 @@ impl StoreClientBuilder {
                 .unwrap_or_default()
                 .as_millis() as u64,
         );
+        refresh_cold_tier_device_cache(
+            runtime_metadata.as_ref(),
+            &cold_tier_device_cache,
+            "cold_tier_device_snapshot_prewarm",
+        )?;
         let membership_sync = MembershipSyncHandle::spawn(
             &runtime,
             runtime_metadata.clone(),
             live_client_cache.clone(),
+            cold_tier_device_cache.clone(),
             self.live_client_sync_interval,
             route_namespace.clone(),
             suspect_runtime_cache.clone(),
@@ -588,7 +695,7 @@ impl StoreClientBuilder {
             route_write_gate,
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
             heartbeat_repair_pending: AtomicUsize::new(0),
-            tenant_quota_reservation_counter: AtomicU64::new(1),
+            tenant_quota_reservation_counter: Arc::new(AtomicU64::new(1)),
             route_control: effective_route_control,
             route_topk: effective_route_topk,
             namespace_quota: effective_namespace_quota,
@@ -598,6 +705,8 @@ impl StoreClientBuilder {
                 .or(self.bandwidth_shaping),
             placement_policy: resolved_placement_policy(&effective_tenant_policy),
             state,
+            owns_cold_tier_lifecycle: true,
+            cold_tier_shutdown_mode: self.cold_tier_shutdown_mode,
         })
     }
 }
