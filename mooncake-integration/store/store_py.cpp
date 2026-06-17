@@ -237,28 +237,24 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         return pybind11::none();
     }
 
+    std::unique_ptr<char[]> exported_data_guard(take_ownership ? exported_data
+                                                               : nullptr);
     try {
         if (tensor_size == 0) {
             py::object dtype = tensor_dtype_to_torch_dtype(dtype_enum);
             if (dtype.is_none()) {
-                if (take_ownership) {
-                    delete[] exported_data;
-                }
                 LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
                 return pybind11::none();
             }
             py::object tensor = torch_module().attr("empty")(
                 tensor_shape_tuple(metadata), py::arg("dtype") = dtype);
-            if (take_ownership) {
-                delete[] exported_data;
-            }
             return tensor;
         }
 
         // Construct numpy array
-        bool take_ownership = !!buffer_handle;
         py::object np_array = array_creators[dtype_index](
             exported_data, data_offset, tensor_size, take_ownership);
+        exported_data_guard.release();
 
         // Reshape
         if (ndim > 0) {
@@ -282,9 +278,6 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
 
     } catch (const std::exception &e) {
         LOG(ERROR) << "Failed to convert buffer to tensor: " << e.what();
-        if (take_ownership) {
-            delete[] exported_data;
-        }
         return pybind11::none();
     }
 }
