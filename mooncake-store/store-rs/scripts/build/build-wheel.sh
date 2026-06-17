@@ -409,7 +409,7 @@ require_glob() {
 }
 
 require_reusable_native_artifacts() {
-  require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so"
+  require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.a"
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so"
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-asio/libasio.so"
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench"
@@ -426,7 +426,7 @@ require_reusable_native_artifacts() {
 if is_truthy "${MOONCAKE_REUSE_NATIVE_ARTIFACTS:-0}"; then
   require_reusable_native_artifacts
   export MOONCAKE_SKIP_NATIVE_BUILD="${MOONCAKE_SKIP_NATIVE_BUILD:-1}"
-  export MOONCAKE_CLASSIC_TE_LIB_PATH="${MOONCAKE_CLASSIC_TE_LIB_PATH:-${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so}"
+  export MOONCAKE_CLASSIC_TE_LIB_PATH="${MOONCAKE_CLASSIC_TE_LIB_PATH:-${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.a}"
   export MOONCAKE_TENT_SHARED_LIB_PATH="${MOONCAKE_TENT_SHARED_LIB_PATH:-${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so}"
   _timer_elapsed $_WHEEL_GLOBAL_START "setup (reused native artifacts)"
 else
@@ -456,7 +456,7 @@ else
     -DUSE_REDIS=ON \
     -DUSE_HTTP=ON \
     -DUSE_ETCD=OFF \
-    -DBUILD_SHARED_LIBS=ON
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 
   _timer_elapsed $_CMAKE_CONF_START "cmake configure"
 
@@ -539,6 +539,7 @@ build_git_branch = sys.argv[8]
 build_git_commit = sys.argv[9]
 build_time = sys.argv[10]
 upstream_py_dir = repo_root / "third_party" / "Mooncake" / "mooncake-wheel" / "mooncake"
+rl_py_dir = repo_root / "python" / "mooncake_rl"
 transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))
 
 
@@ -561,7 +562,7 @@ library_assets = {
     "libasio.so": [upstream_build_dir / "mooncake-asio" / "libasio.so"],
     "libtransfer_engine.so": [
         *env_candidate("MOONCAKE_CLASSIC_TE_LIB_PATH"),
-        upstream_build_dir / "mooncake-transfer-engine" / "src" / "libtransfer_engine.so"
+        upstream_build_dir / "mooncake-transfer-engine" / "src" / "libtransfer_engine.so",
     ],
     "libtent_shared.so": [
         *env_candidate("MOONCAKE_TENT_SHARED_LIB_PATH"),
@@ -611,6 +612,13 @@ def first_existing(paths):
     raise FileNotFoundError(", ".join(str(path) for path in paths))
 
 
+def first_existing_or_none(paths):
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
 def set_relative_rpath(path):
     subprocess.run(
         ["patchelf", "--set-rpath", "$ORIGIN", str(path)],
@@ -632,8 +640,14 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
         target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         set_relative_rpath(target)
 
+    optional_libraries = {"libtransfer_engine.so"}
     for name, candidates in library_assets.items():
-        source = first_existing(candidates)
+        if name in optional_libraries:
+            source = first_existing_or_none(candidates)
+            if source is None:
+                continue
+        else:
+            source = first_existing(candidates)
         target = package_root / name
         shutil.copy2(source, target)
         if name in relative_rpath_assets:
@@ -641,6 +655,15 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
 
     for name in python_assets:
         shutil.copy2(upstream_py_dir / name, package_root / name)
+
+    rl_package_root = root / "mooncake_rl"
+    if rl_package_root.exists():
+        shutil.rmtree(rl_package_root)
+    shutil.copytree(
+        rl_py_dir,
+        rl_package_root,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
 
     (package_root / "build-info.json").write_text(
         json.dumps(

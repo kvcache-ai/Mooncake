@@ -315,7 +315,7 @@ fn ensure_upstream_native_artifacts(
 
     let tent_shared = build_dir.join("mooncake-transfer-engine/tent/src/libtent_shared.so");
     let skip_classic = skip_classic_te();
-    let transfer_engine = build_dir.join("mooncake-transfer-engine/src/libtransfer_engine.so");
+    let transfer_engine = build_dir.join("mooncake-transfer-engine/src/libtransfer_engine.a");
     let artifacts = if skip_classic {
         vec![tent_shared.as_path()]
     } else {
@@ -403,7 +403,7 @@ fn ensure_upstream_native_artifacts(
             .arg("-DUSE_REDIS=ON")
             .arg("-DUSE_HTTP=OFF")
             .arg("-DUSE_ETCD=OFF")
-            .arg("-DBUILD_SHARED_LIBS=ON"),
+            .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON"),
         "configure upstream Mooncake TE/TENT",
     );
 
