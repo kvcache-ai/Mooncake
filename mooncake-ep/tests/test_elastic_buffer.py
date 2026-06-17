@@ -2,8 +2,9 @@
 """Correctness smoke for the public Mooncake ElasticBuffer API.
 
 This test is intentionally self-contained: it exercises the PR's elastic
-dispatch/combine path through ``mooncake.ElasticBuffer`` and checks the result
-against a deterministic PyTorch reference derived from the routing metadata.
+dispatch/combine path through the public ElasticBuffer wrapper and checks the
+result against a deterministic PyTorch reference derived from the routing
+metadata.
 
 Typical single-node usage:
 
@@ -26,7 +27,7 @@ import torch
 import torch.distributed as dist
 import torch.testing as testing
 
-from mooncake import ElasticBuffer
+from mooncake.mooncake_elastic_buffer import ElasticBuffer
 
 
 @dataclass(frozen=True)

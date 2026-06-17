@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.testing as testing
 
-from mooncake import ElasticBuffer
+from mooncake.mooncake_elastic_buffer import ElasticBuffer
 
 
 @dataclass(frozen=True)
