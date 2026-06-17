@@ -1474,7 +1474,6 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const size_t start_shard = RandomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
@@ -1484,6 +1483,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
 
         std::vector<ObjectIdentity> promotion_candidates;
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         {
             MetadataShardAccessorRO shard(this, shard_idx);
             const auto tenant_it = shard->tenants.find(normalized_tenant);
