@@ -774,18 +774,10 @@ MasterService::EraseMetadata(
     const std::string& tenant_id) {
     const std::string key = it->first;
     const std::string group_id = it->second.group_id;
+    AccountCacheTotalRemoval(it->second);
     auto next = tenant_state.metadata.erase(it);
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
     return next;
-}
-
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
-MasterService::EraseMetadataWithCacheTotalAccounting(
-    TenantState& tenant_state,
-    std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const std::string& tenant_id) {
-    AccountCacheTotalRemoval(it->second);
-    return EraseMetadata(tenant_state, it, tenant_id);
 }
 
 void MasterService::RebuildGroupRoutingIndex() {
@@ -875,8 +867,7 @@ void MasterService::ClearInvalidHandles(
                     tenant_state.replication_tasks.erase(it->first);
                     tenant_state.offloading_tasks.erase(it->first);
                     ErasePromotionTaskIfPresent(tenant_state, it->first);
-                    it = EraseMetadataWithCacheTotalAccounting(
-                        tenant_state, it, tenant_it->first);
+                    it = EraseMetadata(tenant_state, it, tenant_it->first);
                 } else {
                     ++it;
                 }
@@ -1744,8 +1735,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key);
-                EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                      object_id.tenant_id);
+                EraseMetadata(tenant_state, it, object_id.tenant_id);
                 it = tenant_state.metadata.end();
             } else {
                 auto& metadata = it->second;
@@ -1767,8 +1757,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             put_start_release_timeout_sec_);
                 }
                 tenant_state.processing_keys.erase(key);
-                EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                      object_id.tenant_id);
+                EraseMetadata(tenant_state, it, object_id.tenant_id);
                 it = tenant_state.metadata.end();
             }
         }
@@ -2080,8 +2069,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             CleanupStaleHandles(it->second, alive_clients)) {
             tenant_state.processing_keys.erase(key);
             ErasePromotionTaskIfPresent(tenant_state, key);
-            EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                  object_id.tenant_id);
+            EraseMetadata(tenant_state, it, object_id.tenant_id);
             it = tenant_state.metadata.end();
         }
 
@@ -2134,8 +2122,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // effectively does not exist — fall through to Case A.
                 if (!metadata.HasReplica(&Replica::fn_is_completed)) {
                     ErasePromotionTaskIfPresent(tenant_state, key);
-                    EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                          object_id.tenant_id);
+                    EraseMetadata(tenant_state, it, object_id.tenant_id);
                     it = tenant_state.metadata.end();
                 }
             }
@@ -2243,8 +2230,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     std::move(old_replicas),
                     now + put_start_release_timeout_sec_);
             }
-            EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                  object_id.tenant_id);
+            EraseMetadata(tenant_state, it, object_id.tenant_id);
 
             VLOG(1) << "key=" << key
                     << ", action=upsert_start_case_c_reallocate";
@@ -2943,8 +2929,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
                 ErasePromotionTaskIfPresent(tenant_state, it->first);
-                it = EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                           normalized_tenant);
+                it = EraseMetadata(tenant_state, it, normalized_tenant);
                 removed_count++;
             } else {
                 ++it;
@@ -2980,8 +2965,7 @@ long MasterService::RemoveAll(bool force) {
                         &Replica::fn_is_memory_replica);
                     total_freed_size += it->second.size * mem_rep_count;
                     ErasePromotionTaskIfPresent(tenant_state, it->first);
-                    it = EraseMetadataWithCacheTotalAccounting(
-                        tenant_state, it, tenant_it->first);
+                    it = EraseMetadata(tenant_state, it, tenant_it->first);
                     removed_count++;
                 } else {
                     ++it;
@@ -3026,8 +3010,7 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
                 ErasePromotionTaskIfPresent(tenant_state, it->first);
-                it = EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                           normalized_tenant);
+                it = EraseMetadata(tenant_state, it, normalized_tenant);
                 removed_count++;
             } else {
                 ++it;
@@ -3097,8 +3080,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key);
-                EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                      normalized_tenant);
+                EraseMetadata(tenant_state, it, normalized_tenant);
                 if (tenant_state.Empty()) {
                     shard->tenants.erase(tenant_it);
                 }
@@ -3138,8 +3120,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Remove object metadata
             ErasePromotionTaskIfPresent(tenant_state, key);
-            EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                  normalized_tenant);
+            EraseMetadata(tenant_state, it, normalized_tenant);
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
@@ -3937,8 +3918,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 if (!metadata.IsValid()) {
-                    EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                          tenant_it->first);
+                    EraseMetadata(tenant_state, it, tenant_it->first);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
@@ -3953,8 +3933,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
-                    EraseMetadataWithCacheTotalAccounting(tenant_state, it,
-                                                          tenant_it->first);
+                    EraseMetadata(tenant_state, it, tenant_it->first);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
@@ -3996,8 +3975,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
-                EraseMetadataWithCacheTotalAccounting(tenant_state, metadata_it,
-                                                      tenant_it->first);
+                EraseMetadata(tenant_state, metadata_it, tenant_it->first);
             }
             task_it = tenant_state.replication_tasks.erase(task_it);
         }
@@ -5016,8 +4994,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                 (it->second.IsLeaseExpired(cleanup_now) &&
                                  !it->second.IsSoftPinned(cleanup_now))) {
                                 VLOG(1) << "clear metadata key=" << it->first;
-                                it = EraseMetadataWithCacheTotalAccounting(
-                                    tenant_state, it, tenant_it->first);
+                                it = EraseMetadata(tenant_state, it,
+                                                   tenant_it->first);
                             } else {
                                 ++it;
                             }
@@ -5321,8 +5299,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 result.evicted_objects++;
             }
             if (member_key != key && !member_metadata.IsValid()) {
-                EraseMetadataWithCacheTotalAccounting(tenant_state, member_it,
-                                                      tenant_id);
+                EraseMetadata(tenant_state, member_it, tenant_id);
             }
         }
         return result;
@@ -5406,8 +5383,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 /*allow_soft_pinned=*/false);
                             total_freed_size += evict_result.freed_bytes;
                             if (it->second.IsValid() == false) {
-                                it = EraseMetadataWithCacheTotalAccounting(
-                                    tenant_state, it, tenant_it->first);
+                                it = EraseMetadata(tenant_state, it,
+                                                   tenant_it->first);
                             } else {
                                 ++it;
                             }
@@ -5482,8 +5459,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     /*allow_soft_pinned=*/false);
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
-                                    it = EraseMetadataWithCacheTotalAccounting(
-                                        tenant_state, it, tenant_it->first);
+                                    it = EraseMetadata(tenant_state, it,
+                                                       tenant_it->first);
                                 } else {
                                     ++it;
                                 }
@@ -5548,8 +5525,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     /*allow_soft_pinned=*/true);
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
-                                    it = EraseMetadataWithCacheTotalAccounting(
-                                        tenant_state, it, tenant_it->first);
+                                    it = EraseMetadata(tenant_state, it,
+                                                       tenant_it->first);
                                 } else {
                                     ++it;
                                 }
@@ -5684,8 +5661,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 total_freed_size += metadata.size * erased;
                 shard_evicted_count++;
                 if (!metadata.IsValid()) {
-                    it = EraseMetadataWithCacheTotalAccounting(
-                        tenant_state, it, tenant_it->first);
+                    it = EraseMetadata(tenant_state, it, tenant_it->first);
                 } else {
                     ++it;
                 }

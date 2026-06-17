@@ -1181,11 +1181,6 @@ class MasterService {
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
-    std::unordered_map<std::string, ObjectMetadata>::iterator
-    EraseMetadataWithCacheTotalAccounting(
-        TenantState& tenant_state,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id);
 
     std::unordered_map<std::string, std::string> object_group_ids_
         GUARDED_BY(group_routing_mutex_);
@@ -1502,8 +1497,7 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            service_->EraseMetadataWithCacheTotalAccounting(
-                *tenant_state_, it_, object_id_.tenant_id);
+            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id);
             it_ = tenant_state_->metadata.end();
             MaybeEraseEmptyTenant();
         }
