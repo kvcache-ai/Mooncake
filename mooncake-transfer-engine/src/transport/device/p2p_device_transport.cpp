@@ -21,7 +21,6 @@
 
 #include <glog/logging.h>
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 
 #include "cuda_alike.h"
@@ -93,30 +92,19 @@ class P2pDeviceTransportImpl : public P2pTransport {
         cudaGetDeviceCount(&device_count);
         CHECK_GT(device_count, 0) << "No CUDA/MUSA devices found";
 
-        int local_group_size = device_count;
-        const char* local_world_size =
-            std::getenv("MOONCAKE_EP_NUM_LOCAL_RANKS");
-        if (local_world_size == nullptr || local_world_size[0] == '\0') {
-            local_world_size = std::getenv("LOCAL_WORLD_SIZE");
-        }
-        if (local_world_size != nullptr) {
-            const int parsed = std::atoi(local_world_size);
-            if (parsed > 0) local_group_size = std::min(device_count, parsed);
-        }
-
         std::vector<int32_t> available(num_ranks_, 0);
         available[rank] = 1;
         peer_ptrs_host_[rank] = local_ptr;
 
-        int node_id = rank / local_group_size;
-        int group_start = node_id * local_group_size;
-        int group_end = std::min(group_start + local_group_size, num_ranks_);
+        int node_id = rank / device_count;
+        int group_start = node_id * device_count;
+        int group_end = std::min(group_start + device_count, num_ranks_);
 
         for (int dst = group_start; dst < group_end; ++dst) {
             if (active_ranks_mask[dst] == 0) continue;
             if (dst == rank) continue;
 
-            int dst_device = dst % local_group_size;
+            int dst_device = dst % device_count;
             int can_access = 0;
             cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
             LOG(INFO) << "[EP P2P] rank " << rank << " (device " << device_id
@@ -153,7 +141,6 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 LOG(WARNING) << "[EP P2P] rank " << rank
                              << " failed to open IPC handle for rank " << dst
                              << ": " << cudaGetErrorString(err);
-                cudaGetLastError();
                 continue;
             }
             LOG(INFO) << "[EP P2P] rank " << rank
@@ -174,8 +161,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
         }
         // Multi-node: P2P only within a node
         if (all_peers_accessible_ && num_ranks_ > 1) {
-            int first_node = 0 / local_group_size;
-            int last_node = (num_ranks_ - 1) / local_group_size;
+            int first_node = 0 / device_count;
+            int last_node = (num_ranks_ - 1) / device_count;
             if (first_node != last_node) all_peers_accessible_ = false;
         }
 
