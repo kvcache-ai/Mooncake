@@ -1263,7 +1263,6 @@ def _is_duplicate_buffer_registration(status: Any) -> bool:
 
 
 def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None:
-    errors = []
     pending_keys = list(dict.fromkeys(keys))
     batch_remove = getattr(store, "batch_remove", None)
     if callable(batch_remove) and pending_keys:
@@ -1283,7 +1282,6 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
             ]
             if not failed_results:
                 return
-            errors.extend(failed_results)
             pending_keys = [key for key, _status in failed_results]
         except Exception:
             if strict:
@@ -1301,9 +1299,7 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
             continue
         if status not in (None, 0, MISSING_OBJECT_ERROR):
             retry_errors.append((key, status))
-    if retry_errors:
-        errors = retry_errors
-    if errors and strict:
+    if retry_errors and strict:
         raise RuntimeError(
-            f"failed to remove {len(errors)} Mooncake keys: {errors[:3]}"
+            f"failed to remove {len(retry_errors)} Mooncake keys: {retry_errors[:3]}"
         )
