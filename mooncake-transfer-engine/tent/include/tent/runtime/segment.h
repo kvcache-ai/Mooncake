@@ -228,6 +228,17 @@ using SegmentDescRef = std::shared_ptr<SegmentDesc>;
 // Coalesce a contiguous per-page NUMA probe into a small list of
 // routing-hint Regions. Each bucket emits one Region carrying the bucket's
 // majority NUMA label; receivers consume Region as a max-overlap NIC hint.
+//
+// Precondition: `entries` must tile the buffer as a gap-free, address-ordered
+// sequence (as produced by Platform::getLocation). Passing a non-contiguous or
+// unsorted vector still yields a monotonic byte offset and therefore mislabels
+// the address space; sort/validate at the call site if a producer cannot
+// guarantee this.
+//
+// Invariants: sum(out[i].size) == sum(entries[i].len), and ordering is
+// preserved. The per-bucket NUMA label is the byte-weighted majority, so
+// sub-bucket labels are deliberately lost -- this is a lossy routing hint, not
+// a faithful copy of the fine-grained probe.
 inline std::vector<Region> coalesceRegions(
     const std::vector<RangeLocation>& entries, size_t max_buckets = 128,
     size_t min_bucket_bytes = static_cast<size_t>(1) << 20) {
