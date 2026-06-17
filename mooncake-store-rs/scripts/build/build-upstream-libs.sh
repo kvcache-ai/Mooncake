@@ -128,14 +128,14 @@ cmake \
   -DUSE_REDIS=ON \
   -DUSE_HTTP=ON \
   -DUSE_ETCD=OFF \
-  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  -DBUILD_SHARED_LIBS=ON
 
 cmake --build "${UPSTREAM_BUILD_DIR}" \
   --target "${BUILD_TARGETS[@]}" \
   -j"${BUILD_JOBS}"
 
 echo "Upstream libraries built successfully:"
-echo "  libtransfer_engine.a:  ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.a"
+echo "  libtransfer_engine.so: ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so"
 echo "  libtent_shared.so:     ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so"
 if is_truthy "${BUILD_WHEEL_NATIVE_ASSETS}"; then
   echo "  engine*.so:            ${UPSTREAM_BUILD_DIR}/mooncake-integration/"
