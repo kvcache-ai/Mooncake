@@ -5265,15 +5265,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 DiscardExpiredProcessingReplicas(shard, now);
 
                 size_t shard_metadata_count = 0;
-                size_t shard_evictable_count = 0;
                 for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                     shard_metadata_count += tenant_state.metadata.size();
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
                         if (it->second.IsHardPinned()) continue;
-                        bool has_evictable = can_evict_replicas(it->second);
-                        if (has_evictable) shard_evictable_count++;
-                        if (!it->second.IsLeaseExpired(now) || !has_evictable)
+                        if (!it->second.IsLeaseExpired(now) ||
+                            !can_evict_replicas(it->second))
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
                             local_candidates[t].push_back(
@@ -5286,7 +5284,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     }
                 }
                 local_object_count[t] += shard_metadata_count;
-                local_eviction_base[t] += shard_evictable_count;
+                long eviction_base =
+                    shard_metadata_count - shard->disk_object_count;
+                if (eviction_base <= 0) continue;
+                local_eviction_base[t] += eviction_base;
             }
         });
     }
@@ -5357,26 +5358,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              return a.lease_timeout < b.lease_timeout;
                          });
         auto target_timeout = candidates[evict_num - 1].lease_timeout;
-
-        // Try candidates up to target_timeout, skipping re-validation
-        // failures and continuing to the next candidate so that actual
-        // evicted count reaches evict_num (treat evict_num as a minimum).
-        long evicted_this_pass = 0;
-        size_t candidate_idx = 0;
-        while (evicted_this_pass < evict_num &&
-               candidate_idx < candidates.size()) {
-            auto& c = candidates[candidate_idx];
-            candidate_idx++;
+        for (auto& c : candidates) {
             if (c.lease_timeout > target_timeout) {
                 no_pin_objects.push_back(c.lease_timeout);
                 continue;
             }
+            // Re-acquire shard lock and look up by key
             MetadataShardAccessorRW shard(this, c.shard_idx);
             auto tenant_it = shard->tenants.find(c.tenant_id);
             if (tenant_it == shard->tenants.end()) continue;
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.find(c.key);
             if (it == tenant_state.metadata.end()) continue;
+            // Re-validate: state may have changed since Phase 1
             if (!it->second.IsLeaseExpired(now) ||
                 it->second.IsSoftPinned(now) ||
                 !can_evict_replicas(it->second)) {
@@ -5391,12 +5385,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 EraseMetadata(tenant_state, it, c.tenant_id, &shard);
             }
             evicted_count += evict_result.evicted_objects;
-            evicted_this_pass += evict_result.evicted_objects;
-        }
-        // Any remaining candidates beyond what we processed go to
-        // no_pin_objects
-        for (; candidate_idx < candidates.size(); candidate_idx++) {
-            no_pin_objects.push_back(candidates[candidate_idx].lease_timeout);
         }
     }
 
