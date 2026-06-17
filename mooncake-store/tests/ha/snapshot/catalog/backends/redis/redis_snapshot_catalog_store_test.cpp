@@ -78,12 +78,12 @@ class FakeObjectStore final : public SnapshotObjectStore {
     std::unordered_map<std::string, std::string> objects_;
 };
 
-ha::SnapshotDescriptor MakeDescriptor(const std::string& snapshot_id) {
+ha::SnapshotDescriptor MakeDescriptor(const std::string& snapshot_root,
+                                      const std::string& snapshot_id) {
     ha::SnapshotDescriptor descriptor;
     descriptor.snapshot_id = snapshot_id;
-    descriptor.manifest_key =
-        "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
-    descriptor.object_prefix = "mooncake_master_snapshot/" + snapshot_id + "/";
+    descriptor.manifest_key = snapshot_root + snapshot_id + "/manifest.txt";
+    descriptor.object_prefix = snapshot_root + snapshot_id + "/";
     descriptor.last_included_seq = 42;
     descriptor.producer_view_version = 7;
     descriptor.created_at_ms = 1700000000000;
@@ -122,6 +122,15 @@ class RedisSnapshotCatalogStoreTest : public ::testing::Test {
         ASSERT_NE(reply->type, REDIS_REPLY_ERROR);
     }
 
+    ha::SnapshotDescriptor MakeDesc(const std::string& snapshot_id) {
+        return MakeDescriptor(store_->GetSnapshotRoot(), snapshot_id);
+    }
+
+    std::string DescriptorKey(const std::string& snapshot_id) {
+        return ha::snapshot_catalog_store_detail::BuildDescriptorKey(
+            store_->GetSnapshotRoot(), snapshot_id);
+    }
+
     FakeObjectStore object_store_;
     std::string cluster_namespace_;
     std::unique_ptr<ha::backends::redis::RedisSnapshotCatalogStore> store_;
@@ -134,17 +143,15 @@ TEST_F(RedisSnapshotCatalogStoreTest, GetLatestReturnsEmptyWhenCatalogMissing) {
 }
 
 TEST_F(RedisSnapshotCatalogStoreTest, PublishListAndGetLatestRoundTrip) {
-    ASSERT_EQ(store_->Publish(MakeDescriptor("20240301_120000_001")),
-              ErrorCode::OK);
-    ASSERT_EQ(store_->Publish(MakeDescriptor("20240302_120000_001")),
-              ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc("20240301_120000_001")), ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc("20240302_120000_001")), ErrorCode::OK);
 
     auto latest = store_->GetLatest();
     ASSERT_TRUE(latest.has_value());
     ASSERT_TRUE(latest->has_value());
     EXPECT_EQ(latest->value().snapshot_id, "20240302_120000_001");
     EXPECT_EQ(latest->value().manifest_key,
-              "mooncake_master_snapshot/20240302_120000_001/manifest.txt");
+              store_->GetSnapshotRoot() + "20240302_120000_001/manifest.txt");
     EXPECT_EQ(latest->value().last_included_seq, 42u);
     EXPECT_EQ(latest->value().producer_view_version, 7u);
     EXPECT_EQ(latest->value().created_at_ms, 1700000000000);
@@ -161,10 +168,9 @@ TEST_F(RedisSnapshotCatalogStoreTest, PublishListAndGetLatestRoundTrip) {
 TEST_F(RedisSnapshotCatalogStoreTest,
        GetLatestReturnsErrorWhenDescriptorMissing) {
     const std::string snapshot_id = "20240302_120000_001";
-    ASSERT_EQ(store_->Publish(MakeDescriptor(snapshot_id)), ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc(snapshot_id)), ErrorCode::OK);
 
-    object_store_.objects_.erase(
-        ha::snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id));
+    object_store_.objects_.erase(DescriptorKey(snapshot_id));
 
     auto latest = store_->GetLatest();
     ASSERT_FALSE(latest.has_value());
@@ -173,10 +179,9 @@ TEST_F(RedisSnapshotCatalogStoreTest,
 
 TEST_F(RedisSnapshotCatalogStoreTest, ListSkipsSnapshotsWhenDescriptorMissing) {
     const std::string snapshot_id = "20240302_120000_001";
-    ASSERT_EQ(store_->Publish(MakeDescriptor(snapshot_id)), ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc(snapshot_id)), ErrorCode::OK);
 
-    object_store_.objects_.erase(
-        ha::snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id));
+    object_store_.objects_.erase(DescriptorKey(snapshot_id));
 
     auto snapshots = store_->List(0);
     ASSERT_TRUE(snapshots.has_value());
@@ -195,14 +200,10 @@ TEST(RedisSnapshotCatalogStoreStandaloneTest,
 
 TEST_F(RedisSnapshotCatalogStoreTest,
        ListSkipsUnreadableSnapshotsAndKeepsHealthyEntries) {
-    ASSERT_EQ(store_->Publish(MakeDescriptor("20240301_120000_001")),
-              ErrorCode::OK);
-    ASSERT_EQ(store_->Publish(MakeDescriptor("20240302_120000_001")),
-              ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc("20240301_120000_001")), ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc("20240302_120000_001")), ErrorCode::OK);
 
-    object_store_.objects_.erase(
-        ha::snapshot_catalog_store_detail::BuildDescriptorKey(
-            "20240302_120000_001"));
+    object_store_.objects_.erase(DescriptorKey("20240302_120000_001"));
 
     auto snapshots = store_->List(0);
     ASSERT_TRUE(snapshots.has_value());
@@ -212,10 +213,8 @@ TEST_F(RedisSnapshotCatalogStoreTest,
 
 TEST_F(RedisSnapshotCatalogStoreTest,
        DeleteUpdatesLatestAndDeletesPayloadPrefix) {
-    ASSERT_EQ(store_->Publish(MakeDescriptor("20240301_120000_001")),
-              ErrorCode::OK);
-    ASSERT_EQ(store_->Publish(MakeDescriptor("20240302_120000_001")),
-              ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc("20240301_120000_001")), ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDesc("20240302_120000_001")), ErrorCode::OK);
 
     ASSERT_EQ(store_->Delete("20240302_120000_001"), ErrorCode::OK);
 

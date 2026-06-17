@@ -73,6 +73,12 @@ def temporary_env(updates: dict[str, str]):
                 os.environ[key] = value
 
 
+def musa_runtime_available(min_devices: int = 1) -> bool:
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        return False
+    return torch.musa.device_count() >= min_devices
+
+
 def cuda_runtime_available(min_devices: int = 1) -> bool:
     if not torch.cuda.is_available():
         return False
@@ -80,6 +86,18 @@ def cuda_runtime_available(min_devices: int = 1) -> bool:
 
 
 def require_test_device(rank: int, device_type: str) -> torch.device:
+    if device_type == "musa":
+        device_count = torch.musa.device_count()
+        if device_count <= 0:
+            raise RuntimeError(
+                "MUSA backend requested but no MUSA devices are available"
+            )
+        if rank >= device_count:
+            raise RuntimeError(
+                f"rank {rank} requires a dedicated MUSA device but only {device_count} are visible"
+            )
+        torch.musa.set_device(rank)
+        return torch.device("musa", rank)
     if device_type == "cuda":
         device_count = torch.cuda.device_count()
         if device_count <= 0:
@@ -508,9 +526,16 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
             raise RuntimeError(
                 f"{cls.__name__} must inherit a concrete Mooncake PG backend test base class"
             )
+        if cls.device_type == "musa":
+            device_count = torch.musa.device_count() if hasattr(torch, "musa") and torch.musa.is_available() else 0
+            cls.configure_for_cuda_device_count(device_count)
         if cls.device_type == "cuda":
             device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
             cls.configure_for_cuda_device_count(device_count)
+        if cls.device_type == "musa" and not musa_runtime_available(cls.world_size):
+            raise unittest.SkipTest(
+                f"{cls.__name__} requires {cls.world_size} visible MUSA devices"
+            )
         if cls.device_type == "cuda" and not cuda_runtime_available(cls.world_size):
             raise unittest.SkipTest(
                 f"{cls.__name__} requires {cls.world_size} visible CUDA devices"
@@ -582,3 +607,8 @@ class MooncakePGCPUBackendTestCase(BackendMultiProcessTestCase):
 class MooncakePGCUDABackendTestCase(BackendMultiProcessTestCase):
     backend_name = "mooncake"
     device_type = "cuda"
+
+
+class MooncakePGMUSABackendTestCase(BackendMultiProcessTestCase):
+    backend_name = "mooncake"
+    device_type = "musa"

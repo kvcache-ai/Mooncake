@@ -49,19 +49,44 @@ Retrieve replica information for a specific key, including memory locations and 
 
 **Method**: `GET`
 **Parameters**: `key` (query parameter) - The object key to query
-**Content-Type**: `text/plain; version=0.0.4`
-**Response**: JSON-formatted replica descriptors for memory replicas
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with success status and replica data array
 
 **Example**:
 ```bash
 curl "http://localhost:8080/query_key?key=my_object"
 ```
 
-**Response Format**:
-```text
+**Success Response** (HTTP 200):
+```json
 {
-  "transport_endpoint_": "hostname:port",
-  "buffer_descriptors": [...]
+  "success": true,
+  "data": [
+    {
+      "size_": 1073741824,
+      "buffer_address_": 140732000000000,
+      "protocol_": "rdma",
+      "transport_endpoint_": "192.168.1.100:12345"
+    }
+  ]
+}
+```
+
+**Error Response** (key not found, HTTP 404):
+```json
+{
+  "success": false,
+  "error_code": -704,
+  "error_message": "OBJECT_NOT_FOUND"
+}
+```
+
+**Error Response** (service unavailable, HTTP 503):
+```json
+{
+  "success": false,
+  "error_code": -1011,
+  "error_message": "service plane is not active"
 }
 ```
 
@@ -146,6 +171,57 @@ Used(bytes): 1073741824
 Capacity(bytes): 4294967296
 ```
 
+#### `/get_segments_detail`
+Get detailed information of all segments in JSON format, including segment metadata, allocator usage, and status.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object containing an array of segment details
+
+**Example**:
+```bash
+curl http://localhost:8080/get_segments_detail
+```
+
+**Response Format**:
+```json
+{
+  "total_segments": 2,
+  "segments": [
+    {
+      "segment_name": "segment_0",
+      "segment_id": "00000000-0000-0000-0000-000000000001",
+      "client_id": "00000000-0000-0000-0000-000000000002",
+      "base_address": "0x300000000",
+      "size_bytes": 17179869184,
+      "size_human": "16 GiB",
+      "te_endpoint": "192.168.1.1:12345",
+      "protocol": "rdma",
+      "status": "MOUNTED",
+      "allocator_used_bytes": 1073741824,
+      "allocator_capacity_bytes": 17179869184,
+      "allocator_usage_percent": 6.25
+    }
+  ]
+}
+```
+
+**Fields**:
+- `total_segments` (integer): Total number of segments in the cluster
+- `segments` (array): Array of segment detail objects
+  - `segment_name` (string): Name of the segment
+  - `segment_id` (string): UUID of the segment
+  - `client_id` (string): UUID of the client that owns the segment
+  - `base_address` (string): Base memory address in hex
+  - `size_bytes` (integer): Segment size in bytes
+  - `size_human` (string): Human-readable segment size
+  - `te_endpoint` (string): Transport endpoint address
+  - `protocol` (string): Transfer protocol (e.g., rdma, tcp)
+  - `status` (string): Current segment status
+  - `allocator_used_bytes` (integer): Bytes currently allocated
+  - `allocator_capacity_bytes` (integer): Total allocator capacity in bytes
+  - `allocator_usage_percent` (number): Percentage of allocator capacity used
+
 ### Health Check Endpoints
 
 #### `/health`
@@ -154,7 +230,7 @@ Basic health check endpoint for service availability verification.
 **Method**: `GET`
 **Content-Type**: `text/plain; version=0.0.4`
 **Response**: `OK` when service is healthy
-**Status Codes**: 
+**Status Codes**:
 - `200 OK`: Service is healthy
 - Other: Service may be experiencing issues
 

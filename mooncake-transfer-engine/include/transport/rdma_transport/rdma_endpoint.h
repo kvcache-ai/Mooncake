@@ -148,15 +148,31 @@ class RdmaEndPoint {
     size_t getQPNumber() const;
 
    private:
+    enum class SetupConnectionFailureStage {
+        kNone,
+        kPeerValidation,
+        kReset,
+        kInit,
+        kRtr,
+        kRts,
+    };
+
+    struct SetupConnectionFailureInfo {
+        SetupConnectionFailureStage stage = SetupConnectionFailureStage::kNone;
+        int sys_errno = 0;
+    };
+
     std::vector<uint32_t> qpNum() const;
 
     int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
-                          std::string *reply_msg = nullptr);
+                          std::string *reply_msg = nullptr,
+                          SetupConnectionFailureInfo *failure_info = nullptr);
 
     int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
-                          std::string *reply_msg = nullptr);
+                          int local_gid_index, std::string *reply_msg = nullptr,
+                          SetupConnectionFailureInfo *failure_info = nullptr);
 
    private:
     static constexpr uint64_t kWaitExistingHandshakeTimeoutNano =

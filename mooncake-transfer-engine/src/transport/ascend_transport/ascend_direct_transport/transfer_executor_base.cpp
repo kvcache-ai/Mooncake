@@ -98,9 +98,18 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
     char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
     if (auto_connect) {
         auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
-        if (auto_connect_opt.has_value() && *auto_connect_opt == 1) {
-            params.auto_connect = true;
+        if (!auto_connect_opt.has_value()) {
+            LOG(WARNING) << "ASCEND_AUTO_CONNECT is not valid, value:"
+                         << auto_connect << ", defaulting to disabled";
+            params.auto_connect = false;
+        } else {
+            params.auto_connect = (*auto_connect_opt == 1);
+            LOG(INFO) << "Set auto_connect from ASCEND_AUTO_CONNECT to: "
+                      << *auto_connect_opt;
         }
+    } else if (adxl::IsAdxlFeatureSupported(adxl::AUTO_CONNECT)) {
+        params.auto_connect = true;
+        LOG(INFO) << "AutoConnect enabled by capability probe";
     }
     char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool && std::strcmp(buffer_pool, "0:0") != 0) {
@@ -166,15 +175,8 @@ int TransferExecutorBase::initEngines() {
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
     }
 
-    char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
-    if (auto_connect) {
-        auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
-        if (auto_connect_opt.has_value()) {
-            options[kAutoConnect] =
-                (*auto_connect_opt == 1) ? kEnabled : kDisabled;
-            LOG(INFO) << "Set AutoConnect to: " << auto_connect;
-        }
-    }
+    options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;
+    LOG(INFO) << "Set AutoConnect to: " << (params_.auto_connect ? "1" : "0");
 
     options["adxl.BufferPool"] = "0:0";
     char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
@@ -270,17 +272,34 @@ int TransferExecutorBase::checkAndConnect(
     return 0;
 }
 
+void TransferExecutorBase::recordConnectedSegment(size_t engine_idx,
+                                                  const std::string& remote) {
+    if (!params_.auto_connect) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+    connected_segments_[engine_idx].insert(remote);
+}
+
 int TransferExecutorBase::disconnect(size_t engine_idx,
                                      const std::string& target_adxl_engine_name,
                                      int32_t timeout_in_millis) {
     if (params_.auto_connect) {
         auto status = adxl_engines_[engine_idx]->Disconnect(
             target_adxl_engine_name.c_str(), timeout_in_millis);
-        if (status != adxl::SUCCESS) {
+        if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
             LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
                        << ", status: " << status
                        << ", errmsg: " << aclGetRecentErrMsg();
             return -1;
+        }
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        auto it = connected_segments_.find(engine_idx);
+        if (it != connected_segments_.end()) {
+            it->second.erase(target_adxl_engine_name);
+            if (it->second.empty()) {
+                connected_segments_.erase(it);
+            }
         }
         return 0;
     }
@@ -319,7 +338,7 @@ void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
     for (const auto& connected_segment : it->second) {
         auto status = adxl_engines_[engine_idx]->Disconnect(
             connected_segment.c_str(), params_.connect_timeout);
-        if (status != adxl::SUCCESS) {
+        if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
             LOG(ERROR) << "Failed to disconnect AdxlEngine: "
                        << connected_segment
                        << ", errmsg: " << aclGetRecentErrMsg();
@@ -475,23 +494,31 @@ int TransferExecutorBase::deregisterMem(void* addr) {
         return 0;
     }
 
-    if (params_.dummy_real_mode) {
-        std::set<size_t> engine_indices;
-        for (const auto& [engine_idx, mem_handle] : it->second) {
-            (void)mem_handle;
-            engine_indices.insert(engine_idx);
-        }
-        for (size_t engine_idx : engine_indices) {
-            disconnectAllForEngine(engine_idx);
-        }
+    std::set<size_t> engine_indices;
+    for (const auto& [engine_idx, mem_handle] : it->second) {
+        (void)mem_handle;
+        engine_indices.insert(engine_idx);
+    }
+    for (size_t engine_idx : engine_indices) {
+        disconnectAllForEngine(engine_idx);
     }
 
+    bool deregister_failed = false;
     for (const auto& [engine_idx, mem_handle] : it->second) {
         if (engine_idx >= local_engine_contexts_.size()) {
             continue;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[engine_idx]));
-        (void)adxl_engines_[engine_idx]->DeregisterMem(mem_handle);
+        auto status = adxl_engines_[engine_idx]->DeregisterMem(mem_handle);
+        if (status != adxl::SUCCESS) {
+            LOG(ERROR) << "DeregisterMem failed, engine_idx: " << engine_idx
+                       << ", status: " << status
+                       << ", errmsg: " << aclGetRecentErrMsg();
+            deregister_failed = true;
+        }
+    }
+    if (deregister_failed) {
+        return -1;
     }
     addr_to_mem_handles_.erase(it);
     return 0;
@@ -501,16 +528,74 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
     size_t engine_idx) const {
     const auto& endpoints = segment_desc->rank_info.endpoints;
+    if (endpoints.empty()) return {};
+
+    // Standard dummy-real RoCE: same-index pairing (unchanged)
     if (params_.dummy_real_mode && params_.roce_mode) {
-        if (engine_idx >= endpoints.size()) {
-            return {};
-        }
+        if (engine_idx >= endpoints.size()) return {};
         return endpoints[engine_idx];
     }
-    if (!endpoints.empty()) {
-        return endpoints.front();
+
+    // Standalone mode: non-dummy-real thin client without fabric mem.
+    // RoCE/HCCS all use phy_dev mapping; same-host offset +1 avoids
+    // connecting to the same physical device across processes.
+    if (!params_.dummy_real_mode && !globalConfig().ascend_use_fabric_mem) {
+        aclrtContext saved_ctx = nullptr;
+        if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtGetCurrentContext failed in standalone resolve";
+            return endpoints.front();
+        }
+        MAKE_GUARD(ctx_restore,
+                   [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+
+        int32_t logic_dev = 0;
+        if (engine_idx < local_engine_contexts_.size() &&
+            local_engine_contexts_[engine_idx] != nullptr) {
+            if (aclrtSetCurrentContext(local_engine_contexts_[engine_idx]) !=
+                ACL_ERROR_NONE) {
+                LOG(ERROR) << "aclrtSetCurrentContext failed in standalone "
+                              "resolve, engine_idx="
+                           << engine_idx;
+                return endpoints.front();
+            }
+        }
+        if (aclrtGetDevice(&logic_dev) != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtGetDevice failed in standalone resolve";
+            return endpoints.front();
+        }
+        if (logic_dev < 0) {
+            LOG(ERROR) << "Invalid logic device ID: " << logic_dev;
+            return endpoints.front();
+        }
+
+        int32_t phy_dev = logic_dev;
+        auto acl_ret = aclrtGetPhyDevIdByLogicDevId(logic_dev, &phy_dev);
+        if (acl_ret != ACL_ERROR_NONE) {
+            LOG(WARNING)
+                << "aclrtGetPhyDevIdByLogicDevId failed, using logic dev id";
+        }
+        if (phy_dev < 0) {
+            LOG(ERROR) << "Invalid physical device ID: " << phy_dev;
+            return endpoints.front();
+        }
+        size_t base_idx = static_cast<size_t>(phy_dev);
+
+        auto local_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        const auto& remote_host_ip = segment_desc->rank_info.hostIp;
+        if (local_desc && !local_desc->rank_info.hostIp.empty() &&
+            !remote_host_ip.empty() &&
+            local_desc->rank_info.hostIp == remote_host_ip &&
+            endpoints.size() > 1) {
+            base_idx = (base_idx + 1) % endpoints.size();
+            VLOG(1) << "Standalone same-host offset: phy_dev=" << phy_dev
+                    << " -> target_idx=" << base_idx;
+        }
+        if (base_idx >= endpoints.size()) return endpoints.front();
+        return endpoints[base_idx];
     }
-    return {};
+
+    // Default: dummy-real non-RoCE or fabric-mem standalone
+    return endpoints.front();
 }
 
 void TransferExecutorBase::processSliceList(

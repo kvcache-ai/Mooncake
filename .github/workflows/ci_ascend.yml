@@ -163,7 +163,9 @@ jobs:
         cmake .. \
           -DUSE_ASCEND_DIRECT=ON \
           -DBUILD_EXAMPLES=OFF \
-          -DBUILD_UNIT_TESTS=OFF
+          -DBUILD_UNIT_TESTS=OFF \
+          -DENABLE_DEBUG_SYMBOLS=OFF \
+          -DBUILD_BENCHMARK=OFF
 
     - name: Build
       shell: bash
@@ -171,7 +173,7 @@ jobs:
         source /usr/local/Ascend/cann-9.0.0/set_env.sh
         echo "Building..."
         cd build
-        cmake --build . -j$(nproc)
+        cmake --build . -j48
         cmake --install .
         echo "Mooncake installed successfully."
 

@@ -80,6 +80,8 @@ struct SelectionContext {
         buffer_transports;  // Pointer to transports in buffer
     size_t transfer_size;   // Transfer size in bytes
     int priority_level;     // Request priority level (lower = more urgent)
+    std::optional<std::string>
+        policy_name;  // Optional: bind to specific policy by name
 };
 
 /**
@@ -145,13 +147,15 @@ class TransportSelector {
      * @param available_transports Array of available transports
      * @param transport_index Transport selection index (0 = first choice, 1 =
      * second, ...)
+     * @param hint The caller's preferred transport for this request;
+     * UNSPEC means no hint.
      * @return Selection result with transport type and device mask
      */
     SelectionResult select(
         const SelectionContext& context,
         const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
             available_transports,
-        int transport_index = 0);
+        int transport_index = 0, TransportType hint = UNSPEC);
 
     /**
      * @brief Enable legacy mode (skip TransportSelector, use original logic)
@@ -165,6 +169,8 @@ class TransportSelector {
 
     static std::string transportTypeName(TransportType type);
     static TransportType parseTransportType(const std::string& str);
+    static std::optional<std::vector<TransportType>> reorderWithHint(
+        const std::vector<TransportType>& raw, TransportType hint);
 
    private:
     std::vector<SelectionPolicy> getDefaultPolicies();

@@ -50,7 +50,14 @@ struct GlobalConfig {
     int workers_per_ctx = 2;
     size_t slice_size = 65536;
     int retry_cnt = 9;
+    int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Connect timeout (seconds) for outbound handshake-port RPCs (QP
+    // handshake, probe, notify, metadata exchange). A plain blocking
+    // connect() has no deadline: to an unroutable address (e.g. a
+    // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
+    // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
+    int handshake_connect_timeout = 5;
     bool metacache = true;
     int log_level = google::INFO;
     bool trace = false;

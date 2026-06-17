@@ -15,7 +15,7 @@
 if(USE_SUNRISE)
   add_library(tent_xport_sunrise_link STATIC sunrise_link_transport.cpp)
   target_include_directories(tent_xport_sunrise_link
-                             PUBLIC /usr/local/tangrt/include/)
+                              PUBLIC ${MC_TANGRT_ROOT}/include/)
   target_link_libraries(tent_xport_sunrise_link
                         PUBLIC tent_common glog glog::glog ${SUNRISE_LIBRARIES})
 endif()

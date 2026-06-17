@@ -54,7 +54,7 @@ class TransferExecutorBase {
         int32_t connect_timeout = 10000;
         int32_t transfer_timeout = 10000;
         bool use_async_transfer = false;
-        bool auto_connect = false;
+        bool auto_connect = true;
         bool use_short_connection = false;
         bool use_buffer_pool = false;
         bool dummy_real_mode = false;
@@ -93,6 +93,7 @@ class TransferExecutorBase {
     void cleanupConnections();
     void finalizeEngines();
     void disconnectAllForEngine(size_t engine_idx);
+    void recordConnectedSegment(size_t engine_idx, const std::string& remote);
 
     int checkAndConnect(size_t engine_idx,
                         const std::string& target_adxl_engine_name);

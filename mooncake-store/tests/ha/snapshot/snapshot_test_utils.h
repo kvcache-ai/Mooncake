@@ -44,6 +44,24 @@ struct CatalogBackendParam {
     bool requires_redis{false};
 };
 
+// On-wire shapes the master snapshot writer has emitted over time. The standby
+// restore reader must tolerate all of them. See
+// MasterService::MetadataSerializer in master_service.cpp.
+//   kLegacy:         7 + replica_count, no data_type, no trailing hard_pinned
+//   kDataTypeOnly:   8 + replica_count, data_type after replica_count
+//   kHardPinnedOnly: 8 + replica_count, trailing hard_pinned, no data_type
+//   kDataTypeAndHardPinned:
+//                    9 + replica_count, data_type plus trailing hard_pinned
+//   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
+//                    (the current writer format)
+enum class SnapshotMetadataFormat {
+    kLegacy,
+    kDataTypeOnly,
+    kHardPinnedOnly,
+    kDataTypeAndHardPinned,
+    kWithGroupId,
+};
+
 class ScopedEnvVar {
    public:
     ScopedEnvVar(std::string name, std::string value) : name_(std::move(name)) {
@@ -128,30 +146,10 @@ inline std::vector<uint8_t> BuildSegmentsPayload() {
     return serialized.value();
 }
 
-inline std::vector<uint8_t> BuildMetadataPayload(
-    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
-    std::string_view disk_file_path = kDefaultTestDiskFilePath,
-    uint64_t object_size = kDefaultTestObjectSize,
-    uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
-    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs) {
-    msgpack::sbuffer shard_buffer;
-    MsgpackPacker shard_packer(&shard_buffer);
-    shard_packer.pack_map(1);
-    shard_packer.pack(std::string("metadata"));
-    shard_packer.pack_array(1);
-    shard_packer.pack_array(2);
-    shard_packer.pack(std::string(object_key));
-
-    shard_packer.pack_array(8);
-    shard_packer.pack(UuidToString(client_id));
-    shard_packer.pack(put_start_time_ms);
-    shard_packer.pack(object_size);
-    shard_packer.pack(lease_timeout_ms);
-    shard_packer.pack(false);
-    shard_packer.pack(uint64_t{0});
-    shard_packer.pack(uint32_t{1});
-    PackDiskReplica(shard_packer, disk_file_path, object_size);
-
+// Compresses a packed shard buffer and wraps it in the {"shards": {"0": ...}}
+// root map that the snapshot metadata payload expects.
+inline std::vector<uint8_t> WrapShardIntoMetadataRoot(
+    const msgpack::sbuffer& shard_buffer) {
     auto compressed_shard =
         zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
                       shard_buffer.size(), 3);
@@ -169,12 +167,95 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     return ToByteVector(root_buffer);
 }
 
+inline std::vector<uint8_t> BuildMetadataPayload(
+    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
+    std::string_view disk_file_path = kDefaultTestDiskFilePath,
+    uint64_t object_size = kDefaultTestObjectSize,
+    uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+    const bool include_data_type =
+        format == SnapshotMetadataFormat::kDataTypeOnly ||
+        format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
+        format == SnapshotMetadataFormat::kWithGroupId;
+    const bool include_hard_pinned =
+        format == SnapshotMetadataFormat::kHardPinnedOnly ||
+        format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
+        format == SnapshotMetadataFormat::kWithGroupId;
+    const bool include_group_id =
+        format == SnapshotMetadataFormat::kWithGroupId;
+    constexpr uint32_t kReplicaCount = 1;
+    // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
+    const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
+                              (include_hard_pinned ? 1 : 0) +
+                              (include_group_id ? 1 : 0);
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(std::string(object_key));
+
+    shard_packer.pack_array(array_size);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(put_start_time_ms);
+    shard_packer.pack(object_size);
+    shard_packer.pack(lease_timeout_ms);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(kReplicaCount);
+    if (include_data_type) {
+        shard_packer.pack(static_cast<uint8_t>(ObjectDataType::TENSOR));
+    }
+    PackDiskReplica(shard_packer, disk_file_path, object_size);
+    if (include_hard_pinned) {
+        shard_packer.pack(true);
+    }
+    if (include_group_id) {
+        shard_packer.pack(std::string("test-group"));
+    }
+
+    return WrapShardIntoMetadataRoot(shard_buffer);
+}
+
+// Builds a metadata payload whose declared replica_count field is set to
+// `declared_replica_count` while no replicas are actually packed (the entry
+// array stays at the 7 leading fields). Used to verify the deserializer
+// rejects a hostile count instead of overflowing into an out-of-bounds read.
+inline std::vector<uint8_t> BuildMetadataPayloadWithDeclaredReplicaCount(
+    uint32_t declared_replica_count,
+    std::string_view object_key = kDefaultTestObjectKey) {
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(std::string(object_key));
+
+    // Exactly the 7 leading fields, zero trailing replicas.
+    shard_packer.pack_array(7);
+    shard_packer.pack(UuidToString(UUID{1, 2}));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(declared_replica_count);
+
+    return WrapShardIntoMetadataRoot(shard_buffer);
+}
+
 inline ha::SnapshotDescriptor MakeTestSnapshotDescriptor(
+    const std::string& cluster_id = "",
     std::string_view snapshot_id = kDefaultTestSnapshotId,
     uint64_t last_included_seq = kDefaultTestSnapshotSeq,
     uint64_t producer_view_version = kDefaultTestProducerViewVersion,
     int64_t created_at_ms = kDefaultTestCreatedAtMs) {
     auto descriptor = ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(
+        ha::snapshot_catalog_store_detail::BuildSnapshotRoot(cluster_id),
         std::string(snapshot_id));
     descriptor.last_included_seq = last_included_seq;
     descriptor.producer_view_version = producer_view_version;
@@ -201,7 +282,8 @@ inline std::unique_ptr<ha::SnapshotCatalogStore> CreateCatalogStoreForTest(
     const std::string& cluster_id, const std::string& redis_endpoint) {
     if (param.catalog_store_type == "embedded") {
         return std::make_unique<
-            ha::backends::embedded::EmbeddedSnapshotCatalogStore>(object_store);
+            ha::backends::embedded::EmbeddedSnapshotCatalogStore>(object_store,
+                                                                  cluster_id);
     }
 
 #ifdef STORE_USE_REDIS
@@ -216,13 +298,12 @@ inline std::unique_ptr<ha::SnapshotCatalogStore> CreateCatalogStoreForTest(
     return nullptr;
 }
 
-inline tl::expected<void, std::string> PublishSnapshotPayload(
+// Uploads the manifest/segments/metadata objects (using the caller-provided
+// metadata payload) and publishes the descriptor.
+inline tl::expected<void, std::string> PublishSnapshotPayloadBytes(
     SnapshotObjectStore& object_store, ha::SnapshotCatalogStore& catalog_store,
     const ha::SnapshotDescriptor& descriptor,
-    const UUID& client_id = UUID{1, 2},
-    std::string_view object_key = kDefaultTestObjectKey,
-    std::string_view disk_file_path = kDefaultTestDiskFilePath,
-    uint64_t object_size = kDefaultTestObjectSize) {
+    const std::vector<uint8_t>& metadata_payload) {
     auto manifest = object_store.UploadString(descriptor.manifest_key,
                                               "messagepack|1.0.0|standby-test");
     if (!manifest) {
@@ -236,9 +317,7 @@ inline tl::expected<void, std::string> PublishSnapshotPayload(
     }
 
     auto metadata = object_store.UploadBuffer(
-        descriptor.object_prefix + "metadata",
-        BuildMetadataPayload(client_id, object_key, disk_file_path,
-                             object_size));
+        descriptor.object_prefix + "metadata", metadata_payload);
     if (!metadata) {
         return tl::make_unexpected(metadata.error());
     }
@@ -249,6 +328,21 @@ inline tl::expected<void, std::string> PublishSnapshotPayload(
     }
 
     return {};
+}
+
+inline tl::expected<void, std::string> PublishSnapshotPayload(
+    SnapshotObjectStore& object_store, ha::SnapshotCatalogStore& catalog_store,
+    const ha::SnapshotDescriptor& descriptor,
+    const UUID& client_id = UUID{1, 2},
+    std::string_view object_key = kDefaultTestObjectKey,
+    std::string_view disk_file_path = kDefaultTestDiskFilePath,
+    uint64_t object_size = kDefaultTestObjectSize,
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+    return PublishSnapshotPayloadBytes(
+        object_store, catalog_store, descriptor,
+        BuildMetadataPayload(client_id, object_key, disk_file_path, object_size,
+                             kDefaultTestPutStartTimeMs,
+                             kDefaultTestLeaseTimeoutMs, format));
 }
 
 }  // namespace mooncake::test

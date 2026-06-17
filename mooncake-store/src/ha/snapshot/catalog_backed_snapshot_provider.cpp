@@ -131,12 +131,37 @@ DeserializeStandbyObjectMetadata(
         const auto soft_pin_timestamp_ms = array[index++].as<uint64_t>();
         const auto replica_count = array[index++].as<uint32_t>();
 
-        if (object.via.array.size != 7 + replica_count &&
-            object.via.array.size != 8 + replica_count) {
+        // Optional fields are decoded by type for backward/forward
+        // compatibility with MasterService::MetadataSerializer, which appends
+        // them over time:
+        //   data_type (positive int) appears before the replicas;
+        //   hard_pinned (bool) and group_id (str) trail them.
+        //   v1: 7 + replica_count, no optional fields
+        //   v2: 8 + replica_count, either data_type or hard_pinned
+        //   v3: 9 + replica_count, data_type + hard_pinned or
+        //       hard_pinned + group_id
+        //   v4: 10 + replica_count, data_type + hard_pinned + group_id
+        // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
+        // replica_count from wrapping the bounds and slipping an out-of-bounds
+        // index through.
+        constexpr uint64_t kBaseFieldCount = 7;
+        constexpr uint64_t kMaxOptionalFieldCount = 3;
+        const uint64_t total_elements = object.via.array.size;
+        const uint64_t min_elements = kBaseFieldCount + replica_count;
+        if (total_elements < min_elements ||
+            total_elements > min_elements + kMaxOptionalFieldCount) {
             LOG(ERROR) << "Snapshot metadata entry replica count mismatch, "
                        << "replicas=" << replica_count
-                       << ", total_fields=" << object.via.array.size;
+                       << ", total_fields=" << total_elements;
             return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+
+        // Skip the optional data_type; the standby restore path does not use
+        // it. A leading positive integer is data_type, whereas a replica is
+        // serialized as an array.
+        if (index < total_elements &&
+            array[index].type == msgpack::type::POSITIVE_INTEGER) {
+            ++index;  // data_type
         }
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
@@ -156,6 +181,14 @@ DeserializeStandbyObjectMetadata(
         std::vector<Replica::Descriptor> replicas;
         replicas.reserve(replica_count);
         for (uint32_t i = 0; i < replica_count; ++i) {
+            // Defensive bound: a corrupt entry whose first post-count field
+            // looks like a data_type could otherwise read past the array.
+            if (index >= total_elements) {
+                LOG(ERROR) << "Snapshot metadata entry truncated, "
+                           << "replicas=" << replica_count
+                           << ", total_fields=" << total_elements;
+                return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+            }
             auto replica_result =
                 Serializer<Replica>::deserialize(array[index++], segment_view);
             if (!replica_result) {
@@ -302,7 +335,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
             case SnapshotCatalogBackendKind::kEmbedded:
                 catalog_store_ = std::make_unique<
                     ha::backends::embedded::EmbeddedSnapshotCatalogStore>(
-                    object_store_.get());
+                    object_store_.get(), cluster_id_);
                 break;
             case SnapshotCatalogBackendKind::kRedis: {
 #ifndef STORE_USE_REDIS
@@ -352,7 +385,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         if (object_prefix.empty()) {
             object_prefix =
                 ha::snapshot_catalog_store_detail::BuildSnapshotPrefix(
-                    descriptor.snapshot_id);
+                    catalog_store_->GetSnapshotRoot(), descriptor.snapshot_id);
         }
 
         std::string manifest_path = descriptor.manifest_key;

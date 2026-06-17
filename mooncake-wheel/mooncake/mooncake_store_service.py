@@ -128,7 +128,10 @@ class MooncakeStoreService:
                     self.config.local_buffer_size,
                     self.config.protocol,
                     self.config.device_name,
-                    self.config.master_server_address
+                    self.config.master_server_address,
+                    None,
+                    self.config.enable_ssd_offload,
+                    self.config.ssd_offload_path
                 )
 
                 if ret != 0:
@@ -458,15 +461,16 @@ class MooncakeStoreService:
         try:
             data = await request.json()
             key = data.get('key')
-            value = data.get('value').encode()
+            raw_value = data.get('value')
 
-            if not key or not value:
+            if not key or raw_value is None:
                 return web.Response(
                     status=400,
                     text=json.dumps({'error': 'Missing key or value'}),
                     content_type='application/json'
                 )
 
+            value = raw_value.encode()
             ret = self.store.put(key, value)
             if ret != 0:
                 return web.Response(
@@ -636,5 +640,11 @@ async def main():
         await service.stop()
         raise
 
+
+def sync_main():
+    """Synchronous entry point for ``mc_store_rest_server`` CLI."""
+    return asyncio.run(main())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    sync_main()

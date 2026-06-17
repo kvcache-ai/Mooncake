@@ -57,7 +57,7 @@ TEST_F(MasterServiceSSDSnapshotTest, PutEndBothReplica) {
     config.replica_num = 1;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto replicas = put_start_result.value();
     ASSERT_EQ(2, replicas.size());
@@ -70,17 +70,17 @@ TEST_F(MasterServiceSSDSnapshotTest, PutEndBothReplica) {
     EXPECT_TRUE(has_mem);
     EXPECT_TRUE(has_disk);
 
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
     // PutEnd for both memory and disk
-    EXPECT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
-    EXPECT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::DISK).has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
+                    .has_value());
 
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(2, get_result.value().replicas.size());
 
@@ -112,19 +112,21 @@ TEST_F(MasterServiceSSDSnapshotTest, PutRevokeDiskReplica) {
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_length, config).has_value());
-    EXPECT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        service_->PutStart(client_id, key, "default", slice_length, config)
+            .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
 
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
 
     EXPECT_TRUE(
-        service_->PutRevoke(client_id, key, ReplicaType::DISK).has_value());
+        service_->PutRevoke(client_id, key, "default", ReplicaType::DISK)
+            .has_value());
 
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
@@ -153,17 +155,19 @@ TEST_F(MasterServiceSSDSnapshotTest, PutRevokeMemoryReplica) {
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_length, config).has_value());
+        service_->PutStart(client_id, key, "default", slice_length, config)
+            .has_value());
     EXPECT_TRUE(
-        service_->PutRevoke(client_id, key, ReplicaType::MEMORY).has_value());
+        service_->PutRevoke(client_id, key, "default", ReplicaType::MEMORY)
+            .has_value());
 
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
-    EXPECT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::DISK).has_value());
-    get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
+                    .has_value());
+    get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     ASSERT_TRUE(get_result.value().replicas[0].is_disk_replica());
@@ -192,17 +196,20 @@ TEST_F(MasterServiceSSDSnapshotTest, PutRevokeBothReplica) {
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_length, config).has_value());
+        service_->PutStart(client_id, key, "default", slice_length, config)
+            .has_value());
     EXPECT_TRUE(
-        service_->PutRevoke(client_id, key, ReplicaType::DISK).has_value());
+        service_->PutRevoke(client_id, key, "default", ReplicaType::DISK)
+            .has_value());
 
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
     EXPECT_TRUE(
-        service_->PutRevoke(client_id, key, ReplicaType::MEMORY).has_value());
-    get_result = service_->GetReplicaList(key);
+        service_->PutRevoke(client_id, key, "default", ReplicaType::MEMORY)
+            .has_value());
+    get_result = service_->GetReplicaList(key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
@@ -230,15 +237,16 @@ TEST_F(MasterServiceSSDSnapshotTest, RemoveKey) {
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_length, config).has_value());
-    EXPECT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
-    EXPECT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::DISK).has_value());
+        service_->PutStart(client_id, key, "default", slice_length, config)
+            .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
+                    .has_value());
 
-    EXPECT_TRUE(service_->Remove(key).has_value());
+    EXPECT_TRUE(service_->Remove(key, "default").has_value());
 
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
@@ -271,12 +279,12 @@ TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         if (put_start_result.has_value()) {
-            auto put_end_mem_result =
-                service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            auto put_end_mem_result = service_->PutEnd(
+                client_id, key, "default", ReplicaType::MEMORY);
             auto put_end_disk_result =
-                service_->PutEnd(client_id, key, ReplicaType::DISK);
+                service_->PutEnd(client_id, key, "default", ReplicaType::DISK);
             ASSERT_TRUE(put_end_mem_result.has_value());
             ASSERT_TRUE(put_end_disk_result.has_value());
             success_puts++;
@@ -291,7 +299,7 @@ TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
     int success_gets = 0;
     for (int i = 0; i < 1024 * 16 + 50; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        auto get_result = service_->GetReplicaList(key);
+        auto get_result = service_->GetReplicaList(key, "default");
         if (get_result.has_value()) {
             success_gets++;
         }
@@ -342,7 +350,7 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
 
         // Put key, should success.
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         EXPECT_TRUE(put_start_result.has_value());
         auto replica_list = put_start_result.value();
         EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -351,7 +359,8 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
         }
 
         // Complete the reserved replica.
-        auto put_end_result = service_->PutEnd(client_id, key, reserve_type);
+        auto put_end_result =
+            service_->PutEnd(client_id, key, "default", reserve_type);
         EXPECT_TRUE(put_end_result.has_value());
 
         // Wait for a while until the put-start expired.
@@ -361,7 +370,7 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
             auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key);
+            auto get_result = service_->GetReplicaList(key, "default");
             EXPECT_TRUE(get_result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -369,7 +378,7 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
         // Put key again, should fail because the object has had an completed
         // replica.
         put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         EXPECT_FALSE(put_start_result.has_value());
         EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
@@ -380,17 +389,18 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
             auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key);
+            auto get_result = service_->GetReplicaList(key, "default");
             EXPECT_TRUE(get_result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
         // Try PutEnd the discarded replica.
-        put_end_result = service_->PutEnd(client_id, key, discard_type);
+        put_end_result =
+            service_->PutEnd(client_id, key, "default", discard_type);
         EXPECT_TRUE(put_end_result.has_value());
 
         // Check that the key has only one replica.
-        auto get_result = service_->GetReplicaList(key);
+        auto get_result = service_->GetReplicaList(key, "default");
         EXPECT_TRUE(get_result.has_value());
         EXPECT_EQ(get_result.value().replicas.size(), 1);
         if (reserve_type == ReplicaType::MEMORY) {

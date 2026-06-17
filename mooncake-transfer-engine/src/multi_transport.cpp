@@ -59,6 +59,9 @@
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
 #endif
+#ifdef USE_SUNRISE
+#include "transport/sunrise_link_transport/sunrise_link_transport.h"
+#endif
 #ifdef USE_UB
 #include "transport/kunpeng_transport/ub_transport.h"
 #endif
@@ -167,6 +170,7 @@ Status MultiTransport::mp_submitTransfer(
         assert(transport);
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -380,6 +384,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new EfaTransport();
     }
 #endif
+#ifdef USE_SUNRISE
+    else if (std::string(proto) == "sunrise_link") {
+        transport = new SunriseLinkTransport();
+    }
+#endif
 
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto
@@ -422,6 +431,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     if (transport->install(local_server_name_, metadata_, topo)) {
+        delete transport;
         return nullptr;
     }
 
