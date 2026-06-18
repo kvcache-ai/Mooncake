@@ -1,7 +1,7 @@
 """Python-binding test for the L2->L1 promotion-on-hit feature.
 
 Mirror of ``test_offload_on_eviction.py``: that test asserts data flows
-DRAM -> SSD on eviction; this test asserts the reverse — once an object
+DRAM -> SSD on eviction; this test asserts the reverse - once an object
 exists only on LOCAL_DISK and a client reads it enough times to clear the
 admission threshold, the master enqueues a promotion task and the client's
 next heartbeat tick stages a fresh MEMORY replica.
@@ -45,7 +45,7 @@ default_kv_lease_ttl = int(
 )
 
 # Keep the segment small so we can overflow it cheaply in CI.
-# 32 MB — small enough that the 96 x 1 MB workload reliably overflows past
+# 32 MB - small enough that the 96 x 1 MB workload reliably overflows past
 # the eviction high watermark even with OffsetAllocator block padding.
 # Larger values (e.g. 64 MB) sometimes fit the full workload because the
 # allocator's effective capacity exceeds the nominal segment size.
@@ -73,7 +73,7 @@ def get_client(store):
         device_name,
         master_server_address,
         None,  # engine
-        True,  # enable_ssd_offload — required for FileStorage / LOCAL_DISK
+        True,  # enable_ssd_offload - required for FileStorage / LOCAL_DISK
     )
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
@@ -180,13 +180,13 @@ class TestPromotionOnHit(unittest.TestCase):
                 value = os.urandom(VALUE_SIZE)
                 retcode = self.store.put(key, value)
                 # NO_AVAILABLE_HANDLE-style failures (-200) under pressure
-                # are expected and not fatal — we just need *some* keys to
+                # are expected and not fatal - we just need *some* keys to
                 # successfully land on LOCAL_DISK.
                 if retcode == 0:
                     reference[key] = value
 
             self.assertGreater(
-                len(reference), 0, "No PUTs succeeded — cannot run promotion test"
+                len(reference), 0, "No PUTs succeeded - cannot run promotion test"
             )
 
             # Phase 2: wait long enough for offload heartbeat to flush the
@@ -211,14 +211,14 @@ class TestPromotionOnHit(unittest.TestCase):
 
             self.assertIsNotNone(
                 cold_key,
-                "No LOCAL_DISK-only key found after eviction — is "
+                "No LOCAL_DISK-only key found after eviction - is "
                 "offload_on_evict=true and the segment small enough to "
                 "overflow? master config / SEGMENT_SIZE_BYTES env may need "
                 "tuning. Histogram above shows the actual replica state.",
             )
 
             # Phase 3: clear the admission threshold via per-key reads.
-            # ``store.get`` goes through ``Client::Query`` → master's
+            # ``store.get`` goes through ``Client::Query`` -> master's
             # ``GetReplicaList``, so each call fires the promotion gate
             # once; 4 calls comfortably clear any reasonable admission
             # threshold. We also assert bit-exact bytes back, exercising
@@ -236,7 +236,7 @@ class TestPromotionOnHit(unittest.TestCase):
                     f"store.get on LOCAL_DISK-only key {cold_key} returned "
                     f"wrong/empty bytes (got len={len(got) if got else 0}, "
                     f"expected len={len(expected_bytes)}). The LOCAL_DISK "
-                    f"read path is broken — promotion cannot be tested.",
+                    f"read path is broken - promotion cannot be tested.",
                 )
 
             # Phase 4: wait for the master to enqueue the promotion task and
@@ -261,7 +261,7 @@ class TestPromotionOnHit(unittest.TestCase):
             # it does, no offload-RPC call is issued for this read.
             #
             # offload_rpc_read_count counts every invocation of
-            # batch_get_into_offload_object_internal — the single
+            # batch_get_into_offload_object_internal - the single
             # chokepoint for LOCAL_DISK reads served via peer offload-RPC.
             # We snapshot the counter, do a read, then assert the counter
             # didn't move. Bytes-back alone wouldn't distinguish MEMORY
@@ -360,14 +360,14 @@ class TestPromotionDoesNotFire(unittest.TestCase):
 
 @unittest.skipUnless(
     os.getenv("MC_BENCH_PROMOTION_LATENCY"),
-    "opt-in benchmark — set MC_BENCH_PROMOTION_LATENCY=1 to run. "
+    "opt-in benchmark - set MC_BENCH_PROMOTION_LATENCY=1 to run. "
     "Not part of CI; gives p50/p95/p99 latency comparison of LOCAL_DISK "
     "reads (pre-promotion) vs MEMORY reads (post-promotion).",
 )
 class BenchPromotionLatency(unittest.TestCase):
     """Ad-hoc latency benchmark for the L2->L1 promotion feature.
 
-    Runs the same overflow → eviction → promote workflow as
+    Runs the same overflow -> eviction -> promote workflow as
     ``TestPromotionOnHit`` but:
       - times every read with ``time.perf_counter``;
       - aborts the pre-promotion sample loop the moment a read serves
@@ -447,7 +447,7 @@ class BenchPromotionLatency(unittest.TestCase):
             self.assertGreater(
                 len(pre_latencies_ms),
                 1,
-                "collected <2 pre-promotion samples — promotion fired "
+                "collected <2 pre-promotion samples - promotion fired "
                 "before measurement could capture LOCAL_DISK latency. "
                 "Bump MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS or "
                 "lower LATENCY_SAMPLES.",
@@ -523,7 +523,7 @@ class BenchPromotionLatency(unittest.TestCase):
                 f"post-promotion p50 latency ({post[50]:.2f} ms) is not "
                 f"meaningfully lower than pre-promotion p50 "
                 f"({pre[50]:.2f} ms). Real-hardware speedup is typically "
-                f"10–50x; failing this 1.3x check means MEMORY likely "
+                f"10-50x; failing this 1.3x check means MEMORY likely "
                 f"isn't being preferred.",
             )
         finally:
@@ -537,7 +537,7 @@ class BenchPromotionLatency(unittest.TestCase):
 
 @unittest.skipUnless(
     os.getenv("MC_BENCH_PROMOTION_DRAIN"),
-    "opt-in benchmark 鈥?set MC_BENCH_PROMOTION_DRAIN=1 to run. "
+    "opt-in benchmark - set MC_BENCH_PROMOTION_DRAIN=1 to run. "
     "Measures how quickly a batch of LOCAL_DISK-only keys regain MEMORY "
     "replicas after promotion admission fires.",
 )
@@ -578,7 +578,7 @@ class BenchPromotionDrain(unittest.TestCase):
                     reference[key] = value
 
             self.assertGreater(
-                len(reference), 0, "No PUTs succeeded 鈥?cannot run drain benchmark"
+                len(reference), 0, "No PUTs succeeded - cannot run drain benchmark"
             )
 
             time.sleep(PROMOTION_WAIT_SECONDS)
