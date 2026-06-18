@@ -19,8 +19,8 @@
 
 namespace mooncake {
 
-class TieredBackend;    // Forward declaration
-class ClientScheduler;  // Forward declaration
+class TieredBackend;     // Forward declaration
+class IClientScheduler;  // Forward declaration
 
 /**
  * @struct TieredLocation
@@ -262,9 +262,15 @@ class TieredBackend {
         const;
 
     /**
-     * @brief Get hot key statistics from the scheduler's StatsCollector.
+     * @brief Get hot key statistics from the scheduler (e.g. for HA recovery
+     *        prioritization).
+     * @param hot_key_num see IClientScheduler::GetHotKeyStats. Defaults to
+     *        nullopt, which resolves to the startup config scheduler.hot_key_num
+     *        (default 64); set scheduler.hot_key_num=0 to return all tracked
+     *        keys (the historical no-arg behavior).
      */
-    AccessStats GetHotKeyStats() const;
+    AccessStats GetHotKeyStats(
+        std::optional<size_t> hot_key_num = std::nullopt) const;
 
    private:
     tl::expected<void, ErrorCode> MountSegment(
@@ -335,7 +341,7 @@ class TieredBackend {
     SegmentSyncCallback segment_sync_callback_;
 
     // Scheduler
-    std::unique_ptr<ClientScheduler> scheduler_;
+    std::unique_ptr<IClientScheduler> scheduler_;
 
     // Shutdown flag — once set, all public APIs reject new requests.
     std::atomic<bool> is_shutting_down_{false};

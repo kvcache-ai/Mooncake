@@ -51,6 +51,7 @@ inline size_t DefaultSnapshotLimit() { return 4096; }
 enum class AccessStatMetric {
     kRecentHeat,
     kRecencyRank,
+    kFrequency,
 };
 
 /**
@@ -61,6 +62,9 @@ struct AccessStatEntry {
     std::string key;
     double recent_heat_score = 0.0;
     size_t recency_rank = 0;
+    // Estimated access frequency (e.g. TinyLFU count). Defaults to 0 so that
+    // existing heat/recency-based collectors remain source-compatible.
+    uint64_t estimated_frequency = 0;
 };
 
 /**

@@ -13,6 +13,7 @@
 #include <string_view>
 #include <boost/functional/hash.hpp>
 #include "mutex.h"
+#include "tiered_cache/scheduler/client_scheduler_interface.h"
 #include "tiered_cache/scheduler/scheduler_policy.h"
 #include "tiered_cache/scheduler/stats_collector.h"
 #include "types.h"
@@ -26,40 +27,43 @@ class TieredBackend;  // Forward declaration
 class CacheTier;
 
 /**
- * @class ClientScheduler
+ * @class LegacyClientScheduler
  * @brief Coordinates statistics collection, policy execution, and action
- * application.
+ * application. This is the original (SIMPLE/LRU) scheduler implementation,
+ * preserved behind the IClientScheduler interface.
  */
-class ClientScheduler {
+class LegacyClientScheduler : public IClientScheduler {
    public:
-    ClientScheduler(TieredBackend* backend, const Json::Value& config);
-    ~ClientScheduler();
+    LegacyClientScheduler(TieredBackend* backend, const Json::Value& config);
+    ~LegacyClientScheduler() override;
 
     // Lifecycle management
-    void Start();
-    void Stop();
+    void Start() override;
+    void Stop() override;
 
     // Register a managed tier
-    void RegisterTier(CacheTier* tier);
+    void RegisterTier(CacheTier* tier) override;
 
-    // Incoming event hook (thread-safe)
-    void OnAccess(std::string_view key);
+    // Incoming event hooks (thread-safe), Context-carrying.
+    void OnAccess(const AccessContext& ctx) override;
+    // OnCommit tracks the replica and, when ctx.record_access is set,
+    // additionally records the access — preserving the historical behavior
+    // where TieredBackend::Commit issued a separate record_access-guarded
+    // OnAccess(key) right after OnCommit.
+    void OnCommit(const CommitContext& ctx) override;
+    void OnDelete(const DeleteContext& ctx) override;
+
+    // Called when allocation fails due to insufficient space.
+    // Returns true if reclaim freed enough space for an immediate retry.
+    bool OnAllocationFailure(const AllocationFailureContext& ctx) override;
 
     /**
      * @brief Get current hot key statistics for HA recovery prioritization.
+     * @param hot_key_num see IClientScheduler::GetHotKeyStats. nullopt resolves
+     *        to `scheduler.hot_key_num` (default 64); 0 means return all.
      */
-    AccessStats GetHotKeyStats() const;
-
-    // Called when a replica is committed or updated
-    void OnCommit(std::string_view key, UUID tier_id, size_t size_bytes);
-
-    // Called when a key or a replica is deleted
-    void OnDelete(std::string_view key,
-                  std::optional<UUID> tier_id = std::nullopt);
-
-    // Called when allocation fails due to insufficient space
-    // Returns true if reclaim freed enough space for an immediate retry
-    bool OnAllocationFailure(UUID tier_id, size_t required_bytes);
+    AccessStats GetHotKeyStats(
+        std::optional<size_t> hot_key_num = std::nullopt) const override;
 
    private:
     struct PlannedReclaim {
@@ -162,6 +166,8 @@ class ClientScheduler {
     // Configuration
     int loop_interval_ms_ = 1000;
     size_t stats_snapshot_limit_ = detail::DefaultSnapshotLimit();
+    // Default count returned by GetHotKeyStats(nullopt). 0 => return all.
+    size_t hot_key_num_ = 64;
     enum class EvictionMode { SYNC, ASYNC };
     EvictionMode eviction_mode_ = EvictionMode::ASYNC;
 

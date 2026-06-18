@@ -60,6 +60,10 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/scheduler/simple_policy.cpp
     tiered_cache/scheduler/lru_policy.cpp
     tiered_cache/scheduler/client_scheduler.cpp
+    tiered_cache/scheduler/scheduler_factory.cpp
+    tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
+    tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
+    tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
     task_manager.cpp
 )
 

@@ -11,6 +11,7 @@
 #endif
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/scheduler/client_scheduler.h"
+#include "tiered_cache/scheduler/scheduler_factory.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -311,8 +312,8 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         }
     }
 
-    // Initialize and Start Scheduler
-    scheduler_ = std::make_unique<ClientScheduler>(this, root);
+    // Initialize and Start Scheduler (legacy / event_driven, by config).
+    scheduler_ = MakeClientScheduler(this, root);
     for (const auto& [id, tier] : tiers_) {
         scheduler_->RegisterTier(tier.get());
     }
@@ -432,7 +433,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         if (scheduler_ &&
             alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
             bool evicted =
-                scheduler_->OnAllocationFailure(*preferred_tier, size);
+                scheduler_->OnAllocationFailure(
+                    AllocationFailureContext{*preferred_tier, size});
             if (evicted) {
                 // Retry after eviction
                 alloc_result = it->second->Allocate(size, loc.data);
@@ -474,7 +476,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
             evict_tier_id = sorted[0];
         }
 
-        bool evicted = scheduler_->OnAllocationFailure(evict_tier_id, size);
+        bool evicted = scheduler_->OnAllocationFailure(
+            AllocationFailureContext{evict_tier_id, size});
         if (evicted) {
             // Retry allocation after eviction
             alloc_result = AllocateInternalRaw(size, preferred_tier, &loc);
@@ -568,6 +571,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     UUID current_tier_id = handle->loc.tier->GetTierId();
     size_t handle_size =
         handle->loc.data.buffer ? handle->loc.data.buffer->size() : 0;
+    uint64_t committed_version = 0;
 
     // Update Entry (Entry Write Lock)
     {
@@ -602,13 +606,18 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
 
         // Increment Version on modification
         entry->version++;
+        committed_version = entry->version;
     }
 
     if (scheduler_) {
-        scheduler_->OnCommit(key, current_tier_id, handle_size);
-        if (record_access) {
-            scheduler_->OnAccess(key);
-        }
+        // Single Context-carrying hook. EventDriven uses the tier
+        // id + size to place the key in the fast-tier MultiLRU and to track
+        // write load, and deliberately does NOT count the commit as a frequency
+        // hit. Legacy's OnCommit(CommitContext) reproduces the old
+        // behavior (track replica + a record_access-guarded RecordAccess),
+        // which is why the previously separate OnAccess(key) call here is gone.
+        scheduler_->OnCommit(CommitContext{key, current_tier_id, handle_size,
+                                           committed_version, record_access});
     }
 
     if (add_replica_callback_) {
@@ -648,35 +657,55 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
         entry = it->second;
     }
 
-    if (record_access && scheduler_) {
-        scheduler_->OnAccess(key);
-    }
+    // Select the served replica under the entry read lock, copy out what the
+    // scheduler needs, then RELEASE the lock before notifying it. The OnAccess
+    // hook may re-enter the backend (e.g. GetReplicaTierIds), which would
+    // deadlock on a recursive shared_mutex if we still held entry->mutex here.
+    // Moving OnAccess after selection also gives it the served tier id, which
+    // the event-driven scheduler needs to route offload/onboard.
+    AllocationHandle served_handle;
+    UUID served_tier{};
+    size_t served_size = 0;
+    {
+        std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
 
-    // Read Entry (Entry Read Lock)
-    std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
-
-    // Return current version if requested
-    if (out_version) {
-        *out_version = entry->version;
-    }
-
-    if (entry->replicas.empty()) {
-        LOG(ERROR) << "Empty replicas for key: " << key;
-        return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
-    }
-
-    if (tier_id.has_value()) {
-        for (const auto& replica : entry->replicas) {
-            if (replica.first == *tier_id) {
-                return replica.second;
-            }
+        // Return current version if requested
+        if (out_version) {
+            *out_version = entry->version;
         }
-        LOG(ERROR) << "Tier not found: " << *tier_id;
-        return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+
+        if (entry->replicas.empty()) {
+            LOG(ERROR) << "Empty replicas for key: " << key;
+            return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
+        }
+
+        if (tier_id.has_value()) {
+            const auto match = std::find_if(
+                entry->replicas.begin(), entry->replicas.end(),
+                [&](const std::pair<UUID, AllocationHandle>& replica) {
+                    return replica.first == *tier_id;
+                });
+            if (match == entry->replicas.end()) {
+                LOG(ERROR) << "Tier not found: " << *tier_id;
+                return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+            }
+            served_handle = match->second;
+            served_tier = match->first;
+        } else {
+            // Fallback: highest priority replica (replicas sorted at commit).
+            served_handle = entry->replicas.begin()->second;
+            served_tier = entry->replicas.begin()->first;
+        }
+        served_size = (served_handle && served_handle->loc.data.buffer)
+                          ? served_handle->loc.data.buffer->size()
+                          : 0;
+    }  // entry_read_lock released before the scheduler hook
+
+    if (record_access && scheduler_) {
+        scheduler_->OnAccess(AccessContext{key, served_tier, served_size});
     }
 
-    // Fallback: Return highest priority replica
-    return entry->replicas.begin()->second;
+    return served_handle;
 }
 
 bool TieredBackend::Exist(std::string_view key,
@@ -773,7 +802,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
 
         if (found_tier) {
             if (scheduler_) {
-                scheduler_->OnDelete(key, *tier_id);
+                scheduler_->OnDelete(DeleteContext{key, *tier_id});
             }
             return tl::expected<void, ErrorCode>{};
         } else {
@@ -820,7 +849,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
     if (scheduler_) {
-        scheduler_->OnDelete(key, std::nullopt);
+        scheduler_->OnDelete(DeleteContext{key, std::nullopt});
     }
     return tl::expected<void, ErrorCode>{};
 }
@@ -874,7 +903,7 @@ tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
             }
 
             if (scheduler_) {
-                scheduler_->OnDelete(key, std::nullopt);
+                scheduler_->OnDelete(DeleteContext{key, std::nullopt});
             }
 
             ++total_removed;
@@ -1038,9 +1067,10 @@ void TieredBackend::ForEachKeyBatch(
     }
 }
 
-AccessStats TieredBackend::GetHotKeyStats() const {
+AccessStats TieredBackend::GetHotKeyStats(
+    std::optional<size_t> hot_key_num) const {
     if (scheduler_) {
-        return scheduler_->GetHotKeyStats();
+        return scheduler_->GetHotKeyStats(hot_key_num);
     }
     return {};
 }

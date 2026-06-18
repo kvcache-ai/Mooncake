@@ -30,6 +30,9 @@ struct KeyContext {
     size_t recency_rank = 0;
     std::vector<UUID> current_locations;  // Which tiers currently hold this key
     size_t size_bytes = 0;                // Size of the key's data in bytes
+    // Estimated access frequency (e.g. TinyLFU count). Defaults to 0 so that
+    // existing policies that don't consult frequency remain unaffected.
+    uint64_t estimated_frequency = 0;
 };
 
 /**
