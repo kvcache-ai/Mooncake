@@ -1581,11 +1581,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             auto batch_res = uring_file->batch_read(
                 descs.data(), static_cast<int>(descs.size()));
 
-            // Copy actual data from aligned buffers to caller buffers.
-            // Must happen BEFORE checking batch_res, because we need to
-            // free the temp buffers regardless of success/failure.
-            for (const auto& e : entries) {
-                if (batch_res) {
+            // Copy actual data from aligned buffers to caller buffers
+            // only on full success. Avoids copying incomplete data on
+            // short reads. aligned_buf is freed regardless.
+            if (batch_res && batch_res.value() == expected_total) {
+                for (const auto& e : entries) {
                     std::memcpy(
                         e.caller_buf,
                         static_cast<char*>(e.desc.buf) + e.offset_in_buffer,
