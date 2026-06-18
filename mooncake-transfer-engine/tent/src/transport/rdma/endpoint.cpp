@@ -54,7 +54,8 @@ static inline const std::string statusToString(
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
                                    uint16_t peer_lid, uint32_t peer_qp_num,
-                                   uint16_t pkey_index);
+                                   uint16_t pkey_index, uint8_t service_level,
+                                   uint8_t traffic_class);
 
 RdmaEndPoint::RdmaEndPoint() : status_(EP_UNINIT) {}
 
@@ -424,9 +425,10 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-            rc = setupNotifyQpConnection(notify_qp_, context_, peer_gid,
-                                         peer_lid, peer_desc.notify_qp_num,
-                                         params_->pkey_index);
+            rc = setupNotifyQpConnection(
+                notify_qp_, context_, peer_gid, peer_lid,
+                peer_desc.notify_qp_num, params_->pkey_index,
+                params_->service_level, params_->traffic_class);
             if (rc) {
                 LOG(WARNING)
                     << "Failed to setup notification QP, notification disabled";
@@ -520,7 +522,8 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
         rc = setupNotifyQpConnection(
             notify_qp_, context_, peer_desc.local_gid, peer_desc.local_lid,
-            peer_desc.notify_qp_num, params_->pkey_index);
+            peer_desc.notify_qp_num, params_->pkey_index,
+            params_->service_level, params_->traffic_class);
         if (rc) {
             notify_connected_ = false;
         } else {
@@ -880,7 +883,8 @@ void RdmaEndPoint::repostAllNotifyRecvs() {
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
                                    uint16_t peer_lid, uint32_t peer_qp_num,
-                                   uint16_t pkey_index) {
+                                   uint16_t pkey_index, uint8_t service_level,
+                                   uint8_t traffic_class) {
     // Reconnect path may call this when QP is already in RTS; force a clean
     // state machine: RESET -> INIT -> RTR -> RTS.
     ibv_qp_attr qp_attr = {};
@@ -924,14 +928,14 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.min_rnr_timer = 0x12;
     qp_attr.ah_attr.is_global = 1;
     qp_attr.ah_attr.dlid = peer_lid;
-    qp_attr.ah_attr.sl = 0;
+    qp_attr.ah_attr.sl = service_level;
     qp_attr.ah_attr.src_path_bits = 0;
     qp_attr.ah_attr.port_num = ctx->portNum();
     memcpy(&qp_attr.ah_attr.grh.dgid, &peer_gid, 16);
     qp_attr.ah_attr.grh.flow_label = 0;
     qp_attr.ah_attr.grh.sgid_index = ctx->gidIndex();
     qp_attr.ah_attr.grh.hop_limit = 255;
-    qp_attr.ah_attr.grh.traffic_class = 0;
+    qp_attr.ah_attr.grh.traffic_class = traffic_class;
 
     ret = ibv_modify_qp(qp, &qp_attr,
                         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
