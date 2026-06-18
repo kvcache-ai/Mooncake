@@ -906,26 +906,40 @@ void MasterService::AbortTenantQuota(const std::string& tenant_id,
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(normalized_tenant);
-    if (it == shard.tenants.end()) {
-        LOG(ERROR) << "tenant quota abort mismatch tenant=" << normalized_tenant
-                   << ", bytes=" << bytes << ", reserved=0";
-        return;
+    bool recompute_needed = false;
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.tenants.find(normalized_tenant);
+        if (it == shard.tenants.end()) {
+            LOG(ERROR) << "tenant quota abort mismatch tenant="
+                       << normalized_tenant << ", bytes=" << bytes
+                       << ", reserved=0";
+            return;
+        }
+        auto& state = it->second;
+        if (state.reserved_bytes < bytes) {
+            LOG(ERROR) << "tenant quota abort mismatch tenant="
+                       << normalized_tenant << ", bytes=" << bytes
+                       << ", reserved=" << state.reserved_bytes;
+            return;
+        }
+        state.reserved_bytes -= bytes;
+        if (!state.has_explicit_policy && state.used_bytes == 0 &&
+            state.reserved_bytes == 0 && state.committed_count == 0) {
+            shard.tenants.erase(it);
+            recompute_needed = true;
+        } else {
+            state.over_quota =
+                state.effective_quota_bytes !=
+                    std::numeric_limits<uint64_t>::max() &&
+                static_cast<unsigned __int128>(state.used_bytes) +
+                        state.reserved_bytes >
+                    state.effective_quota_bytes;
+        }
     }
-    auto& state = it->second;
-    if (state.reserved_bytes < bytes) {
-        LOG(ERROR) << "tenant quota abort mismatch tenant=" << normalized_tenant
-                   << ", bytes=" << bytes
-                   << ", reserved=" << state.reserved_bytes;
-        return;
+    if (recompute_needed) {
+        RecomputeTenantEffectiveQuotas();
     }
-    state.reserved_bytes -= bytes;
-    state.over_quota =
-        state.effective_quota_bytes != std::numeric_limits<uint64_t>::max() &&
-        static_cast<unsigned __int128>(state.used_bytes) +
-                state.reserved_bytes >
-            state.effective_quota_bytes;
 }
 
 void MasterService::ReleaseTenantQuota(const std::string& tenant_id,
@@ -936,29 +950,43 @@ void MasterService::ReleaseTenantQuota(const std::string& tenant_id,
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(normalized_tenant);
-    if (it == shard.tenants.end()) {
-        LOG(ERROR) << "tenant quota release mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes << ", used=0";
-        return;
+    bool recompute_needed = false;
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.tenants.find(normalized_tenant);
+        if (it == shard.tenants.end()) {
+            LOG(ERROR) << "tenant quota release mismatch tenant="
+                       << normalized_tenant << ", bytes=" << bytes
+                       << ", used=0";
+            return;
+        }
+        auto& state = it->second;
+        if (state.used_bytes < bytes) {
+            LOG(ERROR) << "tenant quota release mismatch tenant="
+                       << normalized_tenant << ", bytes=" << bytes
+                       << ", used=" << state.used_bytes;
+            return;
+        }
+        state.used_bytes -= bytes;
+        if (state.committed_count > 0) {
+            --state.committed_count;
+        }
+        if (!state.has_explicit_policy && state.used_bytes == 0 &&
+            state.reserved_bytes == 0 && state.committed_count == 0) {
+            shard.tenants.erase(it);
+            recompute_needed = true;
+        } else {
+            state.over_quota =
+                state.effective_quota_bytes !=
+                    std::numeric_limits<uint64_t>::max() &&
+                static_cast<unsigned __int128>(state.used_bytes) +
+                        state.reserved_bytes >
+                    state.effective_quota_bytes;
+        }
     }
-    auto& state = it->second;
-    if (state.used_bytes < bytes) {
-        LOG(ERROR) << "tenant quota release mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes
-                   << ", used=" << state.used_bytes;
-        return;
+    if (recompute_needed) {
+        RecomputeTenantEffectiveQuotas();
     }
-    state.used_bytes -= bytes;
-    if (state.committed_count > 0) {
-        --state.committed_count;
-    }
-    state.over_quota =
-        state.effective_quota_bytes != std::numeric_limits<uint64_t>::max() &&
-        static_cast<unsigned __int128>(state.used_bytes) +
-                state.reserved_bytes >
-            state.effective_quota_bytes;
 }
 
 void MasterService::ReleaseTenantQuotaPartial(const std::string& tenant_id,

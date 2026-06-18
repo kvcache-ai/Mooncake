@@ -150,6 +150,20 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         state.over_quota = false;
     }
 
+    void SetEmptyInheritedTenantState(MasterService& service,
+                                      const std::string& tenant_id) {
+        const auto normalized_tenant = NormalizeTenantId(tenant_id);
+        const auto shard_idx =
+            service.getTenantQuotaShardIndex(normalized_tenant);
+        auto& shard = service.tenant_quota_shards_[shard_idx];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto& state = shard.tenants[normalized_tenant];
+        state.requested_quota_bytes = service.default_tenant_quota_bytes_;
+        state.effective_quota_bytes = service.default_tenant_quota_bytes_;
+        state.has_explicit_policy = false;
+        state.over_quota = false;
+    }
+
     void ExpectSameAccounting(const TenantQuotaSnapshot& before,
                               const TenantQuotaSnapshot& after) {
         EXPECT_EQ(after.requested_quota_bytes, before.requested_quota_bytes);
@@ -274,8 +288,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest, RecomputePrunesEmptyInheritedTenantState) {
     MasterService service(MakeConfig(/*default_quota=*/100,
                                      /*pool_capacity=*/1000));
-    ASSERT_TRUE(ReserveQuota(service, "tenant-a", 40).has_value());
-    AbortQuota(service, "tenant-a", 40);
+    SetEmptyInheritedTenantState(service, "tenant-a");
     ASSERT_TRUE(
         service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
     SetExplicitTenantPolicy(service, "tenant-explicit", 200);
@@ -287,6 +300,47 @@ TEST_F(MasterServiceTenantQuotaTest, RecomputePrunesEmptyInheritedTenantState) {
     auto explicit_snapshot = Snapshot(service, "tenant-explicit");
     EXPECT_TRUE(explicit_snapshot.has_explicit_policy);
     EXPECT_EQ(explicit_snapshot.requested_quota_bytes, 200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       AbortPrunesInactiveInheritedTenantAndRecomputesQuotas) {
+    MasterService service(MakeConfig(/*default_quota=*/1000,
+                                     /*pool_capacity=*/100));
+
+    ASSERT_TRUE(ReserveQuota(service, "tenant-a", 50).has_value());
+    ASSERT_TRUE(ReserveQuota(service, "tenant-b", 40).has_value());
+    EXPECT_EQ(Snapshot(service, "tenant-b").effective_quota_bytes, 50);
+
+    AbortQuota(service, "tenant-a", 50);
+
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
+    EXPECT_EQ(Snapshot(service, "tenant-b").effective_quota_bytes, 100);
+    ASSERT_TRUE(ReserveQuota(service, "tenant-b", 60).has_value());
+    EXPECT_EQ(Snapshot(service, "tenant-b").reserved_bytes, 100);
+    AbortQuota(service, "tenant-b", 100);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       FullReleasePrunesInactiveInheritedTenantAndRecomputesQuotas) {
+    MasterService service(MakeConfig(/*default_quota=*/1000,
+                                     /*pool_capacity=*/100));
+    UUID client_id = MountSegment(service);
+    PutComplete(service, client_id, "key-a", "tenant-a", 50);
+    PutComplete(service, client_id, "key-b", "tenant-b", 40);
+    EXPECT_EQ(Snapshot(service, "tenant-b").effective_quota_bytes, 50);
+
+    ASSERT_TRUE(
+        service.Remove("key-a", "tenant-a", /*force=*/true).has_value());
+
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
+    EXPECT_EQ(Snapshot(service, "tenant-b").effective_quota_bytes, 100);
+    auto reserve = service.PutStart(client_id, "key-b-extra", "tenant-b", 60,
+                                    MemoryConfig());
+    ASSERT_TRUE(reserve.has_value()) << toString(reserve.error());
+    EXPECT_EQ(Snapshot(service, "tenant-b").reserved_bytes, 60);
+    AbortQuota(service, "tenant-b", 60);
 }
 
 TEST_F(MasterServiceTenantQuotaTest, CommitMismatchDoesNotMutateAccounting) {
@@ -347,7 +401,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
-    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest, RemoveReleasesCommittedCharge) {
@@ -359,8 +414,8 @@ TEST_F(MasterServiceTenantQuotaTest, RemoveReleasesCommittedCharge) {
     ASSERT_EQ(Snapshot(service, "tenant-a").used_bytes, 400);
 
     ASSERT_TRUE(service.Remove("key", "tenant-a", /*force=*/true).has_value());
-    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
-    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -378,11 +433,12 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     BatchEvict(service);
 
-    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
-    EXPECT_EQ(Snapshot(service, "tenant-a").committed_count, 0);
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
     auto reserve = service.PutStart(client_id, "after-evict", "tenant-a", 1000,
                                     MemoryConfig());
     ASSERT_TRUE(reserve.has_value()) << toString(reserve.error());
+    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 1000);
     auto revoke = service.PutRevoke(client_id, "after-evict", "tenant-a",
                                     ReplicaType::MEMORY);
     ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
@@ -494,8 +550,8 @@ TEST_F(MasterServiceTenantQuotaTest, ChangedSizeUpsertRevokeReleasesOldAndNew) {
     auto revoke =
         service.UpsertRevoke(client_id, "key", "tenant-a", ReplicaType::MEMORY);
     ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
-    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 0);
-    EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
 }
 
 }  // namespace mooncake::test
