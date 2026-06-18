@@ -35,13 +35,10 @@ With P2P handshake the master needs no metadata-server flags:
 mooncake_master
 ```
 
-On success the log shows:
+On success the master logs a single line like:
 
 ```
-Starting Mooncake Master Service
-Port: 50051
-Max threads: 4
-Master service listening on 0.0.0.0:50051
+Master service started on port 50051, max_threads=4, ...
 ```
 
 The master's default RPC port is `50051`. (To embed an HTTP metadata server instead of using P2P, add `--enable_http_metadata_server=true --http_metadata_server_port=8080`.)
@@ -78,24 +75,25 @@ There are **three ways** to run a client — programmatic (above), a standalone 
 
 Mooncake Store includes sample programs for validating C++ and Python integrations. The [stress benchmark script](gh-file:mooncake-store/tests/stress_cluster_benchmark.py) can be used to verify a two-role prefill/decode setup.
 
-Configure the script for your network:
+Configure the script with command-line flags (run with `--help` for the full list):
 
-- `local_hostname`: the local machine's reachable IP address or hostname.
-- `metadata_server`: the Transfer Engine metadata service, for example `P2PHANDSHAKE`, `http://127.0.0.1:8080/metadata`, or an etcd address.
-- `master_server_address`: the Mooncake Store master address. Use `IP:Port` in default mode, or `etcd://IP:Port;IP:Port;...;IP:Port` in etcd-backed HA mode.
+- `--local-hostname`: the local machine's reachable IP address or hostname.
+- `--metadata-server`: the Transfer Engine metadata service, e.g. `P2PHANDSHAKE`, `http://127.0.0.1:8080/metadata`, or an etcd address.
+- `--master-server`: the Mooncake Store master address. Use `IP:Port` in default mode, or `etcd://IP:Port;IP:Port;...;IP:Port` in etcd-backed HA mode.
+- `--protocol`: transport, `tcp` / `rdma` / `cxl` / `ascend` (defaults to `rdma`).
 
 Then start the roles:
 
 ```bash
-ROLE=prefill python3 mooncake-store/tests/stress_cluster_benchmark.py
-ROLE=decode python3 mooncake-store/tests/stress_cluster_benchmark.py
+python3 mooncake-store/tests/stress_cluster_benchmark.py --role prefill
+python3 mooncake-store/tests/stress_cluster_benchmark.py --role decode
 ```
 
 For RDMA, topology auto-discovery and NIC filters can be passed through environment variables:
 
 ```bash
-ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/stress_cluster_benchmark.py
-ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/stress_cluster_benchmark.py
+MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/stress_cluster_benchmark.py --role prefill
+MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/stress_cluster_benchmark.py --role decode
 ```
 
 The absence of errors indicates successful data transfer.
@@ -147,7 +145,9 @@ mooncake_master \
   --rpc_address=10.0.0.1
 ```
 
-Each instance must specify its own reachable `--rpc-address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
+Each instance must specify its own reachable `--rpc_address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
+
+**Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
 ---
 
@@ -162,6 +162,8 @@ mooncake_master \
   --ha_backend_connstring="redis://127.0.0.1:6379" \
   --rpc_address=10.0.0.1
 ```
+
+**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`.
 
 
 ---
@@ -277,8 +279,8 @@ HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--rpc_port` | `50051` | RPC listen port |
-| `--rpc_thread_num` | `min(4, CPU cores)` | RPC worker threads |
+| `--rpc_port` | `0` → effective `50051` | RPC listen port. The literal default is `0`, which falls back to the deprecated `--port` (default `50051`) |
+| `--rpc_thread_num` | `0` → effective `min(4, CPU cores)` | RPC worker threads. The literal default is `0`, which falls back to the deprecated `--max_threads` → `min(4, CPU cores)` |
 | `--rpc_address` | `0.0.0.0` | RPC bind address |
 | `--rpc_interface` | empty | Network interface to resolve RPC address at startup (overrides `--rpc_address`) |
 | `--rpc_conn_timeout_seconds` | `0` | Idle connection timeout; `0` disables |
@@ -467,18 +469,18 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 |----------|------|---------|-------------|
 | `local_hostname` | str | required | This node's hostname / IP |
 | `metadata_server` | str | required | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
-| `global_segment_size` | int (bytes) | `16777216` (16 MB) | DRAM contributed to the cluster; set explicitly (the sample uses 3.2 GB) |
-| `local_buffer_size` | int (bytes) | `16777216` (16 MB) | Transfer Engine buffer |
-| `protocol` | str | `tcp` | `tcp` / `rdma` / `cxl` / `ascend` |
-| `rdma_devices` | str | empty | RDMA NIC(s), comma-separated (rdma only). **Keyword is `rdma_devices`, not `device_name`** |
-| `master_server_addr` | str | `127.0.0.1:50051` | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
+| `global_segment_size` | int (bytes) | required | DRAM contributed to the cluster (the sample uses 3.2 GB) |
+| `local_buffer_size` | int (bytes) | required | Transfer Engine buffer |
+| `protocol` | str | required | `tcp` / `rdma` / `cxl` / `ascend` |
+| `rdma_devices` | str | required | RDMA NIC(s), comma-separated (pass `""` for non-RDMA). **Keyword is `rdma_devices`, not `device_name`** |
+| `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
 | `enable_ssd_offload` | bool | `false` | *(advanced)* Enable client-side SSD offload |
 | `ssd_offload_path` | str | empty | *(advanced)* SSD offload directory |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 
 ```{note}
-In Method A, only the `MC_*` engine variables below have any effect — `MOONCAKE_*` are ignored. Configuration must be passed as explicit arguments.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A only the `MC_*` engine variables below have any effect — `MOONCAKE_*` are ignored.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
@@ -507,7 +509,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
 ```{note}
-Note the default-value difference: `MooncakeConfig` defaults `global_segment_size`/`local_buffer_size` to 3.125 GiB / 1 GiB, whereas a bare `setup()` (Method A) defaults them to 16 MB. Unlike `MC_STORE_LOCAL_HOT_CACHE_SIZE` (raw bytes only), `MOONCAKE_GLOBAL_SEGMENT_SIZE` / `MOONCAKE_LOCAL_BUFFER_SIZE` accept human-readable suffixes (`kb`/`mb`/`gb`/…) because they are parsed by `MooncakeConfig`.
+`MooncakeConfig` (Method B) defaults `global_segment_size`/`local_buffer_size` to 3.125 GiB / 1 GiB. A direct `setup()` (Method A) has **no** default for these — they are required arguments. Unlike `MC_STORE_LOCAL_HOT_CACHE_SIZE` (raw bytes only), `MOONCAKE_GLOBAL_SEGMENT_SIZE` / `MOONCAKE_LOCAL_BUFFER_SIZE` accept human-readable suffixes (`kb`/`mb`/`gb`/…) because they are parsed by `MooncakeConfig`.
 ```
 
 **Launch examples:**
