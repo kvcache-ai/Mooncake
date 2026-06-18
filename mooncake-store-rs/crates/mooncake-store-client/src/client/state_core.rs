@@ -323,7 +323,10 @@ struct SegmentTransportMetadata {
     transport_segment_descriptor: Option<String>,
 }
 
-#[allow(dead_code)]
+/// Central state for a storage-owner runtime.  Cold tier fields
+/// (cold_tier_devices, hot_replicas, offload_mode, offload_priority)
+/// are consumed by the offload/restore pipeline.
+#[allow(dead_code)] // cold tier fields consumed by offload/restore
 struct StorageOwnerState {
     runtime: ClientRuntimeId,
     route_ops: RouteOperations,
@@ -334,27 +337,6 @@ struct StorageOwnerState {
     hot_replicas: HotReplicaTracker,
     offload_mode: ColdTierOffloadMode,
     offload_priority: ColdTierOffloadPriorityConfig,
-}
-
-#[derive(Default)]
-struct HotReplicaTracker {
-    clock: Mutex<StorageClockState>,
-}
-
-#[derive(Default)]
-struct RouteWriteGate {
-    state: Mutex<()>,
-}
-
-impl RouteWriteGate {
-    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.state.lock()
-    }
-}
-
-#[allow(dead_code)]
-struct RouteWritePermit<'a> {
-    guard: Option<parking_lot::MutexGuard<'a, ()>>,
 }
 
 #[derive(Default)]
@@ -911,30 +893,19 @@ struct ReplicaPlacementCandidate {
     soft: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct ReclaimQueueSnapshot {
-    total_pending: usize,
-    due: usize,
-    cold_backing_reclaims: usize,
-    hot_segment_reclaims: usize,
-    by_qos_tier: BTreeMap<String, usize>,
-    by_policy_rank: BTreeMap<u8, usize>,
-}
-
 #[derive(Clone, Debug)]
 struct PendingReclaim {
     due_at_ms: u64,
     policy_rank: u8,
     tenant: String,
     qos_tier: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // cold tier cleanup resolves backing for SSD deletion
     route_key: ObjectKey,
     storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
     offset_bytes: u64,
     length_bytes: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // cold tier cleanup schedules SSD deletion after route removal
     cold_backing: Option<mooncake_store_core::ColdBackingRoute>,
 }
 

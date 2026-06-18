@@ -91,6 +91,7 @@ struct TenantQuotaPolicyCacheEntry {
 }
 
 include!("types.rs");
+include!("cold_tier_types.rs");
 include!("builder.rs");
 include!("state_core.rs");
 include!("membership_sync.rs");
@@ -99,12 +100,16 @@ include!("state_store.rs");
 include!("helpers.rs");
 
 /// Cold tier persistent storage backend abstraction.
-#[allow(dead_code)]
+/// Contains PersistentStorageBackend trait, LocalDir backend, and ColdTierBackendResolver.
+/// Consumers (offload, restore, GC) are added by later modules.
+#[allow(dead_code)] // consumed by offload/restore/GC
 #[path = "cold_tier_storage_backend.rs"]
 mod cold_tier_storage_backend;
 use cold_tier_storage_backend::*;
 
-#[allow(dead_code)]
+/// Cold tier device management and admission control.
+/// Contains device selection, bootstrap, probe, and rate limiting.
+#[allow(dead_code)] // cold_tier::device consumed by offload/restore
 mod cold_tier;
 
 type SharedRouteWriteGate = Arc<RouteWriteGate>;
@@ -143,9 +148,12 @@ pub struct StoreClient {
     bandwidth_shaping: Option<BandwidthShaping>,
     placement_policy: Option<TenantPlacementPolicy>,
     state: Arc<Mutex<StoreState>>,
-    #[allow(dead_code)]
+    /// True if this client owns the cold tier device lifecycle (bootstrap,
+    /// heartbeat, shutdown cleanup).  False for cloned/shared clients.
+    #[allow(dead_code)] // used in Drop impl for shutdown cleanup
     owns_cold_tier_lifecycle: bool,
-    #[allow(dead_code)]
+    /// Controls cleanup behavior during client shutdown (Restart vs Decommission).
+    #[allow(dead_code)] // used in Drop impl for shutdown cleanup
     cold_tier_shutdown_mode: ColdTierShutdownMode,
 }
 
