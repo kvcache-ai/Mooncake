@@ -27,6 +27,15 @@ class EtcdHelper {
         const std::string& etcd_endpoints);
 
     /*
+     * @brief Reset the global store etcd client and reconnect to the given
+     *        endpoints. This cancels active store watches/keepalives in the Go
+     *        wrapper and creates a fresh clientv3.Client.
+     * @param etcd_endpoints: The endpoints of the etcd store client.
+     * @return: Error code.
+     */
+    static ErrorCode ResetEtcdStoreClient(const std::string& etcd_endpoints);
+
+    /*
      * @brief Get the value of a key from the etcd.
      * @param key: The key to get the value of.
      * @param key_size: The size of the key in bytes.
