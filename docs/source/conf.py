@@ -27,9 +27,9 @@ sys.path.append(os.path.abspath(REPO_ROOT))
 
 # -- Project information -----------------------------------------------------
 
-project = 'Mooncake'
-copyright = f'{datetime.datetime.now().year}, Mooncake Team'
-author = 'the Mooncake Team'
+project = "Mooncake"
+copyright = f"{datetime.datetime.now().year}, Mooncake Team"
+author = "the Mooncake Team"
 
 # -- General configuration ---------------------------------------------------
 
@@ -42,6 +42,7 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx_copybutton",
     "myst_parser",
+    "sphinx_dynamic_command_builder",
     "sphinxarg.ext",
     "sphinx_design",
     "sphinx_togglebutton",
@@ -53,7 +54,7 @@ myst_enable_extensions = [
 ]
 myst_fence_as_directive = ["mermaid"]
 # Add any paths that contain templates here, relative to this directory.
-templates_path = ['_templates']
+templates_path = ["_templates"]
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -74,19 +75,19 @@ copybutton_prompt_is_regexp = True
 # a list of builtin themes.
 #
 html_title = project
-html_theme = 'sphinx_book_theme'
-html_logo = 'image/mooncake-icon.png'
-html_favicon = 'image/moonshot.ico'
+html_theme = "sphinx_book_theme"
+html_logo = "image/mooncake-icon.png"
+html_favicon = "image/moonshot.ico"
 html_theme_options = {
-    'path_to_docs': 'docs/source',
-    'repository_url': 'https://github.com/kvcache-ai/Mooncake',
-    'use_repository_button': True,
-    'use_edit_page_button': True,
+    "path_to_docs": "docs/source",
+    "repository_url": "https://github.com/kvcache-ai/Mooncake",
+    "use_repository_button": True,
+    "use_edit_page_button": True,
     # Prevents the full API being added to the left sidebar of every page.
     # Reduces build time by 2.5x and reduces build size from ~225MB to ~95MB.
-    'collapse_navbar': True,
+    "collapse_navbar": True,
     # Makes API visible in the right sidebar on API reference pages.
-    'show_toc_level': 3,
+    "show_toc_level": 3,
 }
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -97,19 +98,17 @@ html_css_files = ["custom.css"]
 
 myst_heading_anchors = 2
 myst_url_schemes = {
-    'http': None,
-    'https': None,
-    'mailto': None,
-    'ftp': None,
+    "http": None,
+    "https": None,
+    "mailto": None,
+    "ftp": None,
     "gh-issue": {
-        "url":
-        "https://github.com/kvcache-ai/Mooncake/issues/{{path}}#{{fragment}}",
+        "url": "https://github.com/kvcache-ai/Mooncake/issues/{{path}}#{{fragment}}",
         "title": "Issue #{{path}}",
         "classes": ["github"],
     },
     "gh-pr": {
-        "url":
-        "https://github.com/kvcache-ai/Mooncake/pull/{{path}}#{{fragment}}",
+        "url": "https://github.com/kvcache-ai/Mooncake/pull/{{path}}#{{fragment}}",
         "title": "Pull Request #{{path}}",
         "classes": ["github"],
     },
@@ -131,8 +130,7 @@ myst_url_schemes = {
 }
 
 # Always remove the warning banner
-header_file = os.path.join(os.path.dirname(__file__),
-                           "_templates/sections/header.html")
+header_file = os.path.join(os.path.dirname(__file__), "_templates/sections/header.html")
 if os.path.exists(header_file):
     os.remove(header_file)
 
@@ -156,8 +154,8 @@ def get_repo_base_and_branch(pr_number):
     response = requests.get(url)
     if response.status_code == 200:
         data = response.json()
-        _cached_base = data['head']['repo']['full_name']
-        _cached_branch = data['head']['ref']
+        _cached_base = data["head"]["repo"]["full_name"]
+        _cached_branch = data["head"]["ref"]
         return _cached_base, _cached_branch
     else:
         logger.error("Failed to fetch PR details: %s", response)
@@ -165,9 +163,9 @@ def get_repo_base_and_branch(pr_number):
 
 
 def linkcode_resolve(domain, info):
-    if domain != 'py':
+    if domain != "py":
         return None
-    if not info['module']:
+    if not info["module"]:
         return None
 
     # Get path from module name
@@ -181,8 +179,8 @@ def linkcode_resolve(domain, info):
     # Get the line number of the object
     with open(path) as f:
         lines = f.readlines()
-    name = info['fullname'].split(".")[-1]
-    pattern = fr"^( {{4}})*((def|class) )?{name}\b.*"
+    name = info["fullname"].split(".")[-1]
+    pattern = rf"^( {{4}})*((def|class) )?{name}\b.*"
     for lineno, line in enumerate(lines, 1):
         if not line or line.startswith("#"):
             continue
@@ -235,12 +233,12 @@ for mock_target in autodoc_mock_imports:
             "Potentially problematic mock target (%s) found; "
             "autodoc_mock_imports cannot mock modules that have already "
             "been loaded into sys.modules when the sphinx build starts.",
-            mock_target)
+            mock_target,
+        )
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
-    "typing_extensions":
-    ("https://typing-extensions.readthedocs.io/en/latest", None),
+    "typing_extensions": ("https://typing-extensions.readthedocs.io/en/latest", None),
     "aiohttp": ("https://docs.aiohttp.org/en/stable", None),
     "pillow": ("https://pillow.readthedocs.io/en/stable", None),
     "numpy": ("https://numpy.org/doc/stable", None),

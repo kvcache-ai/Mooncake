@@ -246,7 +246,7 @@ store.close()
 
 ### More Examples and Documentation
 
-Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md) and [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
+Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md), and [Mooncake Store Deployment Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
 
 ## Skills for AI Coding Assistants
 
