@@ -1442,6 +1442,122 @@ auto MasterService::GetReplicaList(const std::string& key,
     return resp;
 }
 
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const std::string& tenant_id) {
+    using GetResult = tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    std::vector<GetResult> results(
+        keys.size(), tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    if (keys.empty()) {
+        return results;
+    }
+
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
+    std::array<size_t, kNumShards> key_list_heads;
+    key_list_heads.fill(kInvalidKeyIndex);
+    std::vector<size_t> next_key_indexes(keys.size(), kInvalidKeyIndex);
+    {
+        std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
+        for (size_t i = keys.size(); i > 0; --i) {
+            const size_t original_idx = i - 1;
+            const auto scoped_key =
+                MakeTenantScopedKey(normalized_tenant, keys[original_idx]);
+            const auto route_it = object_group_ids_.find(scoped_key);
+            const size_t shard_idx =
+                route_it == object_group_ids_.end()
+                    ? getShardIndex(normalized_tenant, keys[original_idx])
+                    : getShardIndex(route_it->second);
+            next_key_indexes[original_idx] = key_list_heads[shard_idx];
+            key_list_heads[shard_idx] = original_idx;
+        }
+    }
+
+    const size_t start_shard = RandomIndex(kNumShards);
+    for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
+        const size_t shard_idx =
+            (start_shard + kNumShards - scanned) % kNumShards;
+        if (key_list_heads[shard_idx] == kInvalidKeyIndex) {
+            continue;
+        }
+
+        std::vector<ObjectIdentity> promotion_candidates;
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        {
+            MetadataShardAccessorRO shard(this, shard_idx);
+            const auto tenant_it = shard->tenants.find(normalized_tenant);
+            for (size_t original_idx = key_list_heads[shard_idx];
+                 original_idx != kInvalidKeyIndex;
+                 original_idx = next_key_indexes[original_idx]) {
+                const std::string& key = keys[original_idx];
+                MasterMetricManager::instance().inc_total_get_nums();
+
+                if (tenant_it == shard->tenants.end()) {
+                    VLOG(1) << "key=" << key << ", info=object_not_found";
+                    results[original_idx] =
+                        tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                    continue;
+                }
+
+                const auto& tenant_state = tenant_it->second;
+                const auto metadata_it = tenant_state.metadata.find(key);
+                if (metadata_it == tenant_state.metadata.end() ||
+                    !metadata_it->second.IsValid()) {
+                    VLOG(1) << "key=" << key << ", info=object_not_found";
+                    results[original_idx] =
+                        tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                    continue;
+                }
+
+                const auto& metadata = metadata_it->second;
+                std::vector<Replica::Descriptor> replica_list;
+                metadata.VisitReplicas(
+                    &Replica::fn_is_completed,
+                    [&replica_list](const Replica& replica) {
+                        replica_list.emplace_back(replica.get_descriptor());
+                    });
+
+                if (replica_list.empty()) {
+                    LOG(WARNING)
+                        << "key=" << key << ", error=replica_not_ready";
+                    results[original_idx] =
+                        tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+                    continue;
+                }
+
+                if (replica_list[0].is_memory_replica()) {
+                    MasterMetricManager::instance().inc_mem_cache_hit_nums();
+                } else if (replica_list[0].is_disk_replica()) {
+                    MasterMetricManager::instance().inc_file_cache_hit_nums();
+                }
+                MasterMetricManager::instance().inc_valid_get_nums();
+                GrantLeaseForGroup(tenant_state, key, metadata);
+
+                if (promotion_on_hit_) {
+                    const bool any_memory =
+                        metadata.HasReplica(&Replica::fn_is_memory_replica);
+                    const bool any_local_disk =
+                        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+                    if (!any_memory && any_local_disk) {
+                        promotion_candidates.push_back(
+                            MakeObjectIdentity(key, normalized_tenant));
+                    }
+                }
+
+                results[original_idx] = GetReplicaListResponse(
+                    std::move(replica_list), default_kv_lease_ttl_);
+            }
+        }
+
+        for (const auto& object_id : promotion_candidates) {
+            TryPushPromotionQueue(object_id);
+        }
+    }
+
+    return results;
+}
+
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,

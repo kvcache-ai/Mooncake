@@ -1004,9 +1004,7 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     results.reserve(keys.size());
 
-    for (const auto& key : keys) {
-        results.emplace_back(master_service_.GetReplicaList(key, tenant_id));
-    }
+    results = master_service_.BatchGetReplicaList(keys, tenant_id);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {

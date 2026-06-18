@@ -299,6 +299,13 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Get replica lists for a batch of objects.
+     */
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys,
+                        const std::string& tenant_id);
+
+    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
      * slice
