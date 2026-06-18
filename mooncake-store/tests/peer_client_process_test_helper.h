@@ -70,6 +70,8 @@ inline bool ParseJsonString(const std::string& json_str, Json::Value& value) {
 
 class PeerClientRpcServerStack {
    public:
+    ~PeerClientRpcServerStack() { Stop(); }
+
     bool Start(uint16_t port) {
         port_ = port;
         transfer_engine_ = std::make_shared<TransferEngine>(false);
@@ -189,10 +191,27 @@ inline std::optional<UUID> ReadTierIdFromStateFile(const std::string& path) {
     if (comma == std::string::npos) {
         return std::nullopt;
     }
-    UUID tier_id;
-    tier_id.first = std::stoull(line.substr(0, comma));
-    tier_id.second = std::stoull(line.substr(comma + 1));
-    return tier_id;
+    try {
+        UUID tier_id;
+        tier_id.first = std::stoull(line.substr(0, comma));
+        tier_id.second = std::stoull(line.substr(comma + 1));
+        return tier_id;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+inline bool WaitForStateFile(
+    const std::string& path,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (ReadTierIdFromStateFile(path).has_value()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false;
 }
 
 inline std::string MakeTempStateFilePath() {
@@ -392,6 +411,9 @@ class ScopedPeerClientRpcServerProcess {
         }
         if (!process_.Start(args)) {
             return false;
+        }
+        if (state_file.has_value()) {
+            return WaitForStateFile(*state_file);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         return true;

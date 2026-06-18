@@ -306,7 +306,7 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
         auto batch_get_handles =
             remote_writer->BatchGet(keys, allocator, ReadRouteConfig{});
         ASSERT_EQ(batch_get_handles.size(), static_cast<size_t>(batch_size));
-        for (int i = 0; i < batch_get_handles.size(); ++i) {
+        for (size_t i = 0; i < batch_get_handles.size(); ++i) {
             ASSERT_TRUE(batch_get_handles[i].has_value())
                 << "Remote BatchGet(allocator) failed for key " << keys[i]
                 << ", error: "
