@@ -31,6 +31,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/common/concurrent/thread_local_storage.h"
+#include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport_selector.h"
 
 namespace mooncake {
@@ -213,6 +214,8 @@ class TransferEngineImpl {
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 
+    uint64_t nextBatchToken();
+
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
 
@@ -253,6 +256,13 @@ class TransferEngineImpl {
         std::vector<Batch*> freelist;
     };
 
+    struct RuntimeQueueConfig {
+        bool enabled{false};
+        QueueLimits limits{};
+        size_t max_dispatch_owners{0};
+        size_t max_dispatch_bytes{0};
+    };
+
    private:
     std::shared_ptr<Config> conf_;
     std::shared_ptr<ControlService> metadata_;
@@ -279,6 +289,9 @@ class TransferEngineImpl {
     int max_failover_attempts_{3};
     bool enable_auto_failover_on_poll_{true};
     bool enable_progress_worker_{false};
+    RuntimeQueueConfig runtime_queue_config_;
+    std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
+    uint64_t next_batch_token_{1};
 
     // Guards alive_batches_ and serializes pollTaskStatus /
     // updateTaskStatusAfterPoll / lazyFreeBatch against the optional

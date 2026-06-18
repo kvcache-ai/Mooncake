@@ -288,6 +288,21 @@ Status TransferEngineImpl::construct() {
     enable_auto_failover_on_poll_ =
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
+    runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
+    runtime_queue_config_.limits.max_outstanding_owners =
+        conf_->get("runtime_queue/max_outstanding_owners", 1024UL);
+    runtime_queue_config_.limits.max_outstanding_bytes =
+        conf_->get("runtime_queue/max_outstanding_bytes", 1UL << 30);
+    runtime_queue_config_.limits.staging_owner_reserve =
+        conf_->get("runtime_queue/staging_owner_reserve", 0UL);
+    runtime_queue_config_.limits.staging_byte_reserve =
+        conf_->get("runtime_queue/staging_byte_reserve", 0UL);
+    runtime_queue_config_.max_dispatch_owners =
+        conf_->get("runtime_queue/max_dispatch_owners", 64UL);
+    runtime_queue_config_.max_dispatch_bytes =
+        conf_->get("runtime_queue/max_dispatch_bytes", 64UL << 20);
+    runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
+        runtime_queue_config_.limits);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -1041,6 +1056,9 @@ struct TransferEngineImpl::PreparedSubmit {
     };
 
     struct Owner {
+        size_t owner_task_id{0};
+        bool has_owner_task_id{false};
+        std::vector<size_t> derived_task_ids;
         Request request{};
         SelectionResult route{};
         bool staging{false};
@@ -1317,11 +1335,20 @@ Status TransferEngineImpl::prepareSubmit(
     for (const auto& kv : merged.task_lookup) {
         const size_t public_task_index = kv.first;
         const size_t merged_task_index = kv.second;
+        auto& owner = prepared.owners[merged_task_index];
+        if (!owner.has_owner_task_id) {
+            owner.owner_task_id = public_task_index;
+            owner.has_owner_task_id = true;
+        } else {
+            owner.derived_task_ids.push_back(public_task_index);
+        }
         prepared.tasks.push_back(
             {merged_task_index, start_task_id + public_task_index});
     }
     return Status::OK();
 }
+
+uint64_t TransferEngineImpl::nextBatchToken() { return next_batch_token_++; }
 
 Status TransferEngineImpl::commitPreparedSubmit(
     Batch* batch, const PreparedSubmit& prepared) {
