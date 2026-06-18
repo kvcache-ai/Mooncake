@@ -741,7 +741,10 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (!alive_batches_.count(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
-    if (batch->free_requested) return Status::OK();
+    if (batch->free_requested) {
+        CHECK_STATUS(lazyFreeBatch());
+        return Status::OK();
+    }
     batch->free_requested = true;
     batch_set_.get().freelist.push_back(batch);
     lazyFreeBatch();
@@ -803,6 +806,37 @@ Status TransferEngineImpl::releaseBatch(Batch* batch) {
     }
     return Status::OK();
 }
+
+class TransferEngineImpl::BatchRef {
+   public:
+    BatchRef(TransferEngineImpl& engine, Batch* batch)
+        : engine_(engine), batch_(batch) {}
+
+    ~BatchRef() {
+        if (!batch_) return;
+        auto status = engine_.releaseBatch(batch_);
+        if (!status.ok()) {
+            LOG(WARNING) << "failed to release batch ref: "
+                         << status.ToString();
+        }
+    }
+
+    BatchRef(const BatchRef&) = delete;
+    BatchRef& operator=(const BatchRef&) = delete;
+
+    Batch* get() const { return batch_; }
+
+    Status release() {
+        if (!batch_) return Status::OK();
+        auto status = engine_.releaseBatch(batch_);
+        batch_ = nullptr;
+        return status;
+    }
+
+   private:
+    TransferEngineImpl& engine_;
+    Batch* batch_{nullptr};
+};
 
 static bool isGpuType(MemoryType t) {
     return t == MTYPE_CUDA || t == MTYPE_ROCM;
@@ -1398,9 +1432,9 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
-    auto status = submitTransferToBatch(batch, request_list);
-    auto release_status = releaseBatch(batch);
-    return status.ok() ? release_status : status;
+    BatchRef batch_ref(*this, batch);
+    CHECK_STATUS(submitTransferToBatch(batch_ref.get(), request_list));
+    return batch_ref.release();
 }
 
 Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
@@ -1440,21 +1474,19 @@ Status TransferEngineImpl::submitTransfer(
     const Notification& notifi) {
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
-    const size_t start_task_id = batch->task_list.size();
-    auto status = submitTransferToBatch(batch, request_list);
-    if (status.ok()) {
-        Batch::SubmitHook hook;
-        hook.start_task_id = start_task_id;
-        hook.end_task_id = start_task_id + request_list.size();
-        hook.notifi = notifi;
-        hook.fired = false;
-        for (const auto& request : request_list)
-            hook.targets.insert(request.target_id);
-        batch->submit_hooks.emplace_back(std::move(hook));
-    }
+    BatchRef batch_ref(*this, batch);
+    const size_t start_task_id = batch_ref.get()->task_list.size();
+    CHECK_STATUS(submitTransferToBatch(batch_ref.get(), request_list));
 
-    auto release_status = releaseBatch(batch);
-    return status.ok() ? release_status : status;
+    Batch::SubmitHook hook;
+    hook.start_task_id = start_task_id;
+    hook.end_task_id = start_task_id + request_list.size();
+    hook.notifi = notifi;
+    hook.fired = false;
+    for (const auto& request : request_list)
+        hook.targets.insert(request.target_id);
+    batch_ref.get()->submit_hooks.emplace_back(std::move(hook));
+    return batch_ref.release();
 }
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {

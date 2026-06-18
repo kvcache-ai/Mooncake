@@ -201,6 +201,8 @@ class TransferEngineImpl {
 
     Status releaseBatch(Batch* batch);
 
+    class BatchRef;
+
     struct PreparedSubmit;
 
     Status submitTransferToBatch(Batch* batch,
