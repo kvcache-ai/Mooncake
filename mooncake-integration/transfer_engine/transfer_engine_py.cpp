@@ -360,18 +360,18 @@ int TransferEnginePy::transferSyncRead(const char* target_hostname,
 }
 
 int TransferEnginePy::batchTransferSyncWrite(
-    const char* target_hostname, std::vector<uintptr_t> buffers,
-    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-    const std::string& transport_hint) {
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, const std::string& transport_hint) {
     return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
                              lengths, TransferOpcode::WRITE, nullptr,
                              transport_hint);
 }
 
 int TransferEnginePy::batchTransferSyncRead(
-    const char* target_hostname, std::vector<uintptr_t> buffers,
-    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-    const std::string& transport_hint) {
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, const std::string& transport_hint) {
     return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
                              lengths, TransferOpcode::READ, nullptr,
                              transport_hint);
@@ -489,10 +489,10 @@ int TransferEnginePy::transferSync(const char* target_hostname,
 }
 
 int TransferEnginePy::batchTransferSync(
-    const char* target_hostname, std::vector<uintptr_t> buffers,
-    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-    TransferOpcode opcode, TransferNotify* notify,
-    const std::string& transport_hint) {
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, TransferOpcode opcode,
+    TransferNotify* notify, const std::string& transport_hint) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -518,6 +518,7 @@ int TransferEnginePy::batchTransferSync(
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
     auto batch_size = buffers.size();
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
         if (opcode == TransferOpcode::WRITE) {
@@ -623,6 +624,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const int max_retry = engine_->numContexts() + 1;
     auto batch_size = buffers.size();
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     batch_id_t batch_id = 0;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
@@ -923,6 +925,7 @@ void TransferEnginePy::batchTransferOnCuda(
 
     size_t batch_size = buffers.size();
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     uint64_t total_bytes = 0;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
