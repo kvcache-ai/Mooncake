@@ -542,7 +542,13 @@ class BenchPromotionLatency(unittest.TestCase):
     "replicas after promotion admission fires.",
 )
 class BenchPromotionDrain(unittest.TestCase):
-    """Promotion backlog-drain benchmark for fair main-vs-PR comparison."""
+    """Promotion backlog-drain benchmark for fair main-vs-PR comparison.
+
+    Assumes the master runs with ``--promotion_admission_threshold=2``:
+    the replica-descriptor scan used to discover LOCAL_DISK-only keys
+    provides the first hit, and the timed ``selected_keys`` query provides
+    the second hit that actually admits promotion.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -564,6 +570,9 @@ class BenchPromotionDrain(unittest.TestCase):
                 str(max(PROMOTION_WAIT_SECONDS * 3, 60)),
             )
         )
+        expected_admission_threshold = int(
+            os.getenv("PROMOTION_DRAIN_EXPECT_ADMISSION_THRESHOLD", "2")
+        )
         post_read_samples = int(os.getenv("PROMOTION_DRAIN_POST_READ_SAMPLES", "64"))
         fail_on_timeout = os.getenv("PROMOTION_DRAIN_FAIL_ON_TIMEOUT", "1") != "0"
 
@@ -579,6 +588,15 @@ class BenchPromotionDrain(unittest.TestCase):
 
             self.assertGreater(
                 len(reference), 0, "No PUTs succeeded - cannot run drain benchmark"
+            )
+            self.assertEqual(
+                expected_admission_threshold,
+                2,
+                "BenchPromotionDrain assumes promotion_admission_threshold=2: "
+                "the cold-key discovery scan contributes hit #1 and the timed "
+                "selected-keys query contributes hit #2. Use "
+                "PROMOTION_DRAIN_EXPECT_ADMISSION_THRESHOLD=2 and run the "
+                "master with --promotion_admission_threshold=2 for fair data.",
             )
 
             time.sleep(PROMOTION_WAIT_SECONDS)
@@ -606,7 +624,8 @@ class BenchPromotionDrain(unittest.TestCase):
             print(
                 "promotion admission batch_get_replica_desc: "
                 f"keys={len(selected_keys)}, "
-                f"elapsed_ms={(admission_t1 - admission_t0) * 1000.0:.2f}"
+                f"elapsed_ms={(admission_t1 - admission_t0) * 1000.0:.2f}, "
+                f"assumed_threshold={expected_admission_threshold}"
             )
 
             for key in selected_keys:
@@ -616,7 +635,7 @@ class BenchPromotionDrain(unittest.TestCase):
                     f"selected key {key} lost LOCAL_DISK state before benchmark started",
                 )
 
-            start = time.perf_counter()
+            start = admission_t0
             promoted_at = {}
             poll_count = 0
             while len(promoted_at) < len(selected_keys):

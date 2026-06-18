@@ -97,28 +97,24 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
-     * 4. Pulls and processes any pending L2->L1 promotion tasks queued by the
-     *    master (mirror of step 1+2 in the reverse direction).
+     * 4. Pulls any pending L2->L1 promotion tasks queued by the master and
+     *    dispatches them for execution (mirror of step 1+2 in the reverse
+     *    direction).
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
 
     /**
      * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
-
-     * * Pulls promotion work from the master, stages a MEMORY replica for each
-
-     * * key, copies the bytes from local SSD into that replica, and notifies
-     * the
-     * master on success. A failure on any single key is logged and
-     * skipped;
-     * FileStorage eagerly notifies the master to release the
-     * promotion slot,
-     * with the master-side reaper acting as the
-     * long-stop on missed failures.
      *
-     * @return tl::expected<void,
-     * ErrorCode> indicating operation status.
+     * Pulls promotion work from the master and either processes it
+     * synchronously or enqueues it for background workers. Each task stages a
+     * MEMORY replica, copies the bytes from local SSD into that replica, and
+     * notifies the master on success. FileStorage eagerly reports per-key
+     * failures so the master can release the promotion slot immediately, with
+     * the reaper acting as a long-stop.
+     *
+     * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 

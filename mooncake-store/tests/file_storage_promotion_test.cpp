@@ -473,6 +473,7 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     // will fail because no SSD file exists for this key in data_path.
     // k_notify_fail: AllocStart and BatchLoad and TransferWrite all
     // succeed; Notify is overridden to fail.
+    SeedPromotionObject("k_notify_fail", 1024);
     fake->notify_overrides["k_notify_fail"] = ErrorCode::OBJECT_NOT_FOUND;
 
     auto res = DrainAllPromotionTasks({
@@ -482,6 +483,10 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     });
     EXPECT_TRUE(res.has_value());
     EXPECT_EQ(fake->alloc_calls.load(), 3);
+    EXPECT_EQ(fake->notify_calls.load(), 1)
+        << "Exactly one key should reach NotifyPromotionSuccess: "
+        << "k_notify_fail must pass BatchLoad/TransferWrite before its "
+        << "overridden notify failure path releases the master slot.";
 
     // Every failed key must have its slot released via Notify-Failure.
     // k_notify_fail also counts: Notify-Success failed, so we still
