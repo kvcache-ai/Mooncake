@@ -14,6 +14,7 @@
 
 #include "tent_backend.h"
 #include "utils.h"
+#include "char_util.h"
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -257,7 +258,7 @@ static inline int getGpuDeviceNumaID(int gpu_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #elif defined(USE_HIP)
