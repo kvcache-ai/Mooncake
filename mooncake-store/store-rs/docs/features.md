@@ -176,6 +176,16 @@ When local storage cannot satisfy the request, the client can spill over to remo
 Router nodes can place data onto storage nodes selected by the placement planner.
 
 The planner filters candidate nodes by labels and compatibility.
+Replica owner ranking uses stable rendezvous input from the object scope and the
+storage runtime's stable identity, so a storage-node epoch change does not
+reshuffle placement by itself.
+
+### Multi-replica reads
+
+When an object route has multiple readable remote replicas and no local replica,
+readers choose a remote replica with a stable score over the scoped route key,
+reader identity, and replica identity. This spreads one reader's multi-key read
+traffic across replicas while keeping selection deterministic for a given key.
 
 ### Request-level replication policy
 

@@ -418,24 +418,14 @@ fn stable_phase_hash64(identity: &str, salt: &str) -> u64 {
 }
 
 fn stable_debug_log_sample(parts: &[&str]) -> bool {
-    is_debug_sample(stable_joined_hash64(parts), DEBUG_PER_KEY_SAMPLE_MODULUS)
+    is_debug_sample(
+        crate::stable_hash::stable_hash(parts),
+        DEBUG_PER_KEY_SAMPLE_MODULUS,
+    )
 }
 
 fn is_debug_sample(hash: u64, modulus: u64) -> bool {
     matches!(hash.checked_rem(modulus), Some(0))
-}
-
-fn stable_joined_hash64(parts: &[&str]) -> u64 {
-    let mut hash = STABLE_PHASE_HASH_OFFSET;
-    for part in parts {
-        for byte in part.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
-        }
-        hash ^= u64::from(b'|');
-        hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
-    }
-    hash
 }
 
 fn log_route_publish_sample(
@@ -454,7 +444,7 @@ fn log_route_publish_sample(
         replicas = ?route.replicas,
         "route publish completed"
     );
-    if stable_debug_log_sample(&["route_publish", operation, &route.key.0]) {
+    if stable_debug_log_sample(&["route_publish", operation, route.key.0.as_str()]) {
         debug!(
             runtime = %runtime,
             key = %route.key.0,

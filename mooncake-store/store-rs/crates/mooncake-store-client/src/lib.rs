@@ -4,6 +4,7 @@ mod memory;
 mod observability;
 mod placement;
 mod route_directory;
+mod stable_hash;
 mod transport;
 
 pub use client::{
