@@ -1373,11 +1373,13 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
                 size_t measured_op = op - warmup_operations;
                 if (ShouldVerify(measured_op, is_warmup)) {
                     for (size_t i = 0; i < batch_size; ++i) {
-                        const std::string& vkey = keys.Get(batch.key_indices[i]);
+                        const std::string& vkey =
+                            keys.Get(batch.key_indices[i]);
                         auto vit = batch.load_batch.find(vkey);
-                        const char* vptr = (vit != batch.load_batch.end())
-                                               ? static_cast<const char*>(vit->second.ptr)
-                                               : read_buffers.Get(i);
+                        const char* vptr =
+                            (vit != batch.load_batch.end())
+                                ? static_cast<const char*>(vit->second.ptr)
+                                : read_buffers.Get(i);
                         if (!gen.VerifyBuffer(vptr, value_size,
                                               batch.key_indices[i])) {
                             thread_stats.RecordChecksumFailure();
@@ -1398,9 +1400,10 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
                 for (size_t i = 0; i < batch_size; ++i) {
                     const std::string& vkey = keys.Get(batch.key_indices[i]);
                     auto vit = batch.load_batch.find(vkey);
-                    const char* vptr = (vit != batch.load_batch.end())
-                                           ? static_cast<const char*>(vit->second.ptr)
-                                           : read_buffers.Get(i);
+                    const char* vptr =
+                        (vit != batch.load_batch.end())
+                            ? static_cast<const char*>(vit->second.ptr)
+                            : read_buffers.Get(i);
                     if (!gen.VerifyBuffer(vptr, value_size,
                                           batch.key_indices[i])) {
                         LOG(ERROR) << "Warmup verification failed for key "
