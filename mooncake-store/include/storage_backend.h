@@ -226,6 +226,11 @@ struct FileStorageConfig {
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
+    // Background worker settings for L2->L1 promotion-on-hit execution.
+    uint32_t promotion_worker_threads = 1;
+    uint32_t promotion_queue_capacity = 1024;
+    uint32_t promotion_drain_batch_size = 64;
+
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 

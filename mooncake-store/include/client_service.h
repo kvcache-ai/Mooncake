@@ -421,7 +421,7 @@ class Client {
      * @param offloading_objects On return, contains the tenant-scoped object
      * tasks that require offload.
      */
-    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
+    virtual tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
