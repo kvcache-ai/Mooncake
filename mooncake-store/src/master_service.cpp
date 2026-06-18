@@ -794,7 +794,7 @@ void MasterService::ClearInvalidHandles(
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
-                if (CleanupStaleHandles(it->second, alive_clients)) {
+                if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
                     tenant_state.processing_keys.erase(it->first);
                     tenant_state.replication_tasks.erase(it->first);
                     tenant_state.offloading_tasks.erase(it->first);
@@ -1702,7 +1702,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
         auto it = tenant_state.metadata.find(key);
         if (it != tenant_state.metadata.end()) {
-            if (CleanupStaleHandles(it->second, alive_clients)) {
+            if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
                 tenant_state.processing_keys.erase(key);
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
@@ -2050,7 +2050,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
         // --- Step 0: stale handle cleanup ---
         if (it != tenant_state.metadata.end() &&
-            CleanupStaleHandles(it->second, alive_clients)) {
+            CleanupStaleHandles(it->second, alive_clients, &shard)) {
             tenant_state.processing_keys.erase(key);
             ErasePromotionTaskIfPresent(tenant_state, key);
             EraseMetadata(tenant_state, it, object_id.tenant_id, &shard);
@@ -3055,7 +3055,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove)
-            if (CleanupStaleHandles(it->second, alive_clients)) {
+            if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
                 tenant_state.processing_keys.erase(key);
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
