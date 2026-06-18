@@ -2846,6 +2846,13 @@ mod tests {
         ) -> mooncake_store_core::Result<Option<HandoffPlan>> {
             self.inner.get_handoff(stable_id)
         }
+
+        fn list_cold_tier_devices(
+            &self,
+            filter: &mooncake_store_core::ColdTierDeviceFilter,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+            self.inner.list_cold_tier_devices(filter)
+        }
     }
 
     impl MetadataBackend for RecoveryCountingMetadata {
@@ -3109,6 +3116,13 @@ mod tests {
             stable_id: &ClientStableId,
         ) -> mooncake_store_core::Result<Option<HandoffPlan>> {
             self.inner.get_handoff(stable_id)
+        }
+
+        fn list_cold_tier_devices(
+            &self,
+            filter: &mooncake_store_core::ColdTierDeviceFilter,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+            self.inner.list_cold_tier_devices(filter)
         }
     }
 

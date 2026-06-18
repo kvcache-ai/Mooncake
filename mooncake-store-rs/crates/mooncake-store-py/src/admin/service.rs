@@ -2357,6 +2357,13 @@ mod tests {
         ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
             self.inner.get_handoff(stable_id)
         }
+
+        fn list_cold_tier_devices(
+            &self,
+            filter: &mooncake_store_core::ColdTierDeviceFilter,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+            self.inner.list_cold_tier_devices(filter)
+        }
     }
 
     fn test_service() -> AdminService {
