@@ -1337,16 +1337,26 @@ class _InferredLeaf:
     decision: _CodecDecision
 
 
+class _Missing:
+    """Sentinel for dict keys absent from a row (distinct from value-is-None)."""
+    __slots__ = ()
+    def __repr__(self) -> str:
+        return "<MISSING>"
+
+MISSING = _Missing()
+
+
 @dataclass
 class _InferredNode:
     path: str
     node_type: str
     children: list[Any]
     lengths: list[int] | None = None
+    row_mask: list[bool] | None = None
 
 
 def _non_null(values: list[Any]) -> list[Any]:
-    return [v for v in values if v is not None]
+    return [v for v in values if v is not None and not isinstance(v, _Missing)]
 
 
 def _is_pil_image(value: Any) -> bool:
@@ -1495,6 +1505,10 @@ def _try_expand_list(values: list[Any]) -> tuple[int, list[int]] | None:
     return max_len, lengths
 
 
+def _escape_key(key: str) -> str:
+    return key.replace("\\", "\\\\").replace(".", "\\.").replace("[", "\\[")
+
+
 def infer_structure(
     path: str,
     values: list[Any],
@@ -1506,23 +1520,29 @@ def infer_structure(
     """Recursively expand *values* into leaves and interior nodes.
 
     *leaves* and *nodes* are output accumulators populated during recursion.
+    Absent dict keys are represented as ``MISSING`` in child columns
+    (distinct from ``None`` values).  Each interior node carries a
+    ``row_mask`` that records which rows had a real parent container.
     """
     if _depth > _INFER_MAX_DEPTH:
         raise ValueError(f"infer_structure exceeded max depth {_INFER_MAX_DEPTH} at {path!r}")
     dict_keys = _try_expand_dict(values)
     if dict_keys is not None:
-        nodes.append(_InferredNode(path, "dict", dict_keys))
+        row_mask = [isinstance(v, dict) for v in values]
+        nodes.append(_InferredNode(path, "dict", dict_keys, row_mask=row_mask))
         for key in dict_keys:
-            child = [v.get(key) if isinstance(v, dict) else None for v in values]
-            infer_structure(f"{path}.{key}", child, leaves, nodes, _depth=_depth + 1)
+            child = [v.get(key, MISSING) if isinstance(v, dict) else None for v in values]
+            infer_structure(f"{path}.{_escape_key(key)}", child, leaves, nodes, _depth=_depth + 1)
         return
     list_result = _try_expand_list(values)
     if list_result is not None:
         max_len, lengths = list_result
-        nodes.append(_InferredNode(path, "list", list(range(max_len)), lengths))
+        row_mask = [isinstance(v, (list, tuple)) for v in values]
+        nodes.append(_InferredNode(path, "list", list(range(max_len)), lengths, row_mask=row_mask))
         for index in range(max_len):
             child = [
-                v[index] if isinstance(v, (list, tuple)) and index < len(v) else None
+                v[index] if isinstance(v, (list, tuple)) and index < len(v) else
+                (MISSING if isinstance(v, (list, tuple)) else None)
                 for v in values
             ]
             infer_structure(f"{path}[{index}]", child, leaves, nodes, _depth=_depth + 1)

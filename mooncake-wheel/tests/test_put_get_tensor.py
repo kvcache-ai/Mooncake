@@ -236,7 +236,9 @@ class TestDistributedObjectStore(unittest.TestCase):
 
 
 from mooncake.structured_object_store import (
+    MISSING,
     _choose_leaf_codec,
+    _escape_key,
     infer_structure,
 )
 
@@ -347,6 +349,27 @@ class TestCodecInference(unittest.TestCase):
         infer_structure("r", [[{"k": 1}, None], [{"k": 2}, None]], leaves, nodes)
         list_nodes = [n for n in nodes if n.node_type == "list"]
         self.assertEqual(len(list_nodes), 1)
+
+    def test_dict_missing_key_vs_none_value(self):
+        leaves, nodes = [], []
+        infer_structure("r", [{"x": None}, {"y": 2}, None], leaves, nodes)
+        self.assertIsNotNone(nodes[0].row_mask)
+        self.assertEqual(nodes[0].row_mask, [True, True, False])
+        x_leaf = next(l for l in leaves if l.path == "r.x")
+        self.assertIsNone(x_leaf.values[0])
+        self.assertIsInstance(x_leaf.values[1], type(MISSING))
+        self.assertIsNone(x_leaf.values[2])
+
+    def test_escape_key_in_path(self):
+        self.assertEqual(_escape_key("simple"), "simple")
+        self.assertEqual(_escape_key("a.b"), "a\\.b")
+        self.assertEqual(_escape_key("a[0]"), "a\\[0]")
+        self.assertEqual(_escape_key("a\\b"), "a\\\\b")
+
+    def test_dict_with_dot_key(self):
+        leaves, nodes = [], []
+        infer_structure("r", [{"a.b": 1}, {"a.b": 2}], leaves, nodes)
+        self.assertEqual(leaves[0].path, "r.a\\.b")
 
     def test_depth_limit(self):
         deep = 1
