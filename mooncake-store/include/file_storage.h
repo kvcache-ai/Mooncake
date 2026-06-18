@@ -1,9 +1,13 @@
 #pragma once
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+
 #include "client_service.h"
 #include "client_buffer.hpp"
-#include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "storage_backend.h"
 
 namespace mooncake {
 
@@ -52,6 +56,16 @@ class FileStorage {
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
+
+    struct PromotionExecutionResult {
+        bool alloc_attempted = false;
+        bool write_attempted = false;
+        bool notify_success_attempted = false;
+        bool notify_failure_attempted = false;
+        bool completed = false;
+        ErrorCode terminal_error = ErrorCode::OK;
+    };
+
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -97,9 +111,21 @@ class FileStorage {
      * the master-side reaper decrements the source replica's refcnt and
      * erases the task entry on TTL expiry, and any orphaned PROCESSING
      * MEMORY replica is reaped via the standard discarded-replicas path.
+     *
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
+
+    PromotionExecutionResult ProcessPromotionTask(
+        const PromotionTaskItem& task,
+        const std::vector<std::string>& preferred_segments);
+
+    bool EnqueuePromotionTask(const PromotionTaskItem& task);
+
+    void ReleasePromotionTask(const std::string& key,
+                              const std::string& tenant_id);
+
+    void PromotionWorkerThreadFunc();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
@@ -143,6 +169,11 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::atomic<bool> promotion_workers_running_{false};
+    std::vector<std::thread> promotion_worker_threads_;
+    std::mutex promotion_queue_mutex_;
+    std::condition_variable promotion_queue_cv_;
+    std::deque<PromotionTaskItem> promotion_task_queue_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
 };

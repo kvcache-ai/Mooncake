@@ -280,6 +280,9 @@ TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
+    EXPECT_EQ(config.promotion_worker_threads, 1u);
+    EXPECT_EQ(config.promotion_queue_capacity, 1024u);
+    EXPECT_EQ(config.promotion_drain_batch_size, 64u);
 }
 
 TEST_F(FileStorageTest, ReadStringFromEnv) {
@@ -304,15 +307,24 @@ TEST_F(FileStorageTest, ReadInt64FromEnv) {
 
 TEST_F(FileStorageTest, ReadUint32FromEnv) {
     SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "5");
+    SetEnv("MOONCAKE_OFFLOAD_PROMOTION_WORKER_THREADS", "3");
+    SetEnv("MOONCAKE_OFFLOAD_PROMOTION_QUEUE_CAPACITY", "2048");
+    SetEnv("MOONCAKE_OFFLOAD_PROMOTION_DRAIN_BATCH_SIZE", "16");
 
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
+    EXPECT_EQ(config.promotion_worker_threads, 3u);
+    EXPECT_EQ(config.promotion_queue_capacity, 2048u);
+    EXPECT_EQ(config.promotion_drain_batch_size, 16u);
 }
 
 TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "abc");
     SetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "sdfsdf");
     SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-1");
+    SetEnv("MOONCAKE_OFFLOAD_PROMOTION_WORKER_THREADS", "-5");
+    SetEnv("MOONCAKE_OFFLOAD_PROMOTION_QUEUE_CAPACITY", "bad");
+    SetEnv("MOONCAKE_OFFLOAD_PROMOTION_DRAIN_BATCH_SIZE", "-1");
 
     auto config = FileStorageConfig::FromEnvironment();
     auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
@@ -320,6 +332,9 @@ TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
     EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
+    EXPECT_EQ(config.promotion_worker_threads, 1u);
+    EXPECT_EQ(config.promotion_queue_capacity, 1024u);
+    EXPECT_EQ(config.promotion_drain_batch_size, 64u);
 }
 
 TEST_F(FileStorageTest, OutOfRangeValueUsesDefault) {
