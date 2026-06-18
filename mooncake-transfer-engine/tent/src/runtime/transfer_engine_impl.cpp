@@ -1442,20 +1442,19 @@ Status TransferEngineImpl::submitTransfer(
     CHECK_STATUS(retainBatch(batch_id, batch));
     const size_t start_task_id = batch->task_list.size();
     auto status = submitTransferToBatch(batch, request_list);
-    if (!status.ok()) {
-        auto release_status = releaseBatch(batch);
-        return release_status.ok() ? status : release_status;
+    if (status.ok()) {
+        Batch::SubmitHook hook;
+        hook.start_task_id = start_task_id;
+        hook.end_task_id = start_task_id + request_list.size();
+        hook.notifi = notifi;
+        hook.fired = false;
+        for (const auto& request : request_list)
+            hook.targets.insert(request.target_id);
+        batch->submit_hooks.emplace_back(std::move(hook));
     }
-    const size_t end_task_id = start_task_id + request_list.size();
-    Batch::SubmitHook hook;
-    hook.start_task_id = start_task_id;
-    hook.end_task_id = end_task_id;
-    hook.notifi = notifi;
-    hook.fired = false;
-    for (const auto& request : request_list)
-        hook.targets.insert(request.target_id);
-    batch->submit_hooks.emplace_back(std::move(hook));
-    return releaseBatch(batch);
+
+    auto release_status = releaseBatch(batch);
+    return status.ok() ? release_status : status;
 }
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
