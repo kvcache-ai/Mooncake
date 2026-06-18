@@ -296,7 +296,14 @@ fn main() {
     // list", since a late-loaded plugin can never be first. Default to NOT
     // linking it; sanitized builds opt in with `MOONCAKE_LINK_ASAN=1` (and run
     // with `LD_PRELOAD=$(gcc -print-file-name=libasan.so)`).
-    let want_asan = env::var_os("MOONCAKE_LINK_ASAN").is_some();
+    let want_asan = env::var("MOONCAKE_LINK_ASAN")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(false);
     let has_asan_runtime = if want_asan {
         let asan_runtime_so = compiler_runtime_library("libasan.so");
         if let Some(path) = asan_runtime_so.as_ref() {
