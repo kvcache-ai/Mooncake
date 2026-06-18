@@ -12,6 +12,7 @@
 #include <ylt/struct_json/json_writer.h>
 
 #include "ha/ha_types.h"
+#include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
 #include "types.h"
