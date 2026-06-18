@@ -4,6 +4,210 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef MOONCAKE_EP_USE_MUSA
+
+#include <cstdint>
+
+#include <cuda_runtime.h>
+
+namespace torch {
+class Tensor;
+}  // namespace torch
+
+namespace mooncake {
+
+struct ElasticLaunchContext {
+    void* gdr_buffer = nullptr;
+    const int32_t* nvlink_available = nullptr;
+    void* const* ipc_peer_ptrs = nullptr;
+    void* raddrs = nullptr;
+    void* rkeys = nullptr;
+    void* qp_devctxs = nullptr;
+    const void* rdma_send_signal_buffer = nullptr;
+    const void* rdma_recv_signal_buffer = nullptr;
+    void* buffer = nullptr;
+    void* workspace = nullptr;
+    void* mapped_host_workspace = nullptr;
+    int rank = 0;
+    int num_ranks = 1;
+    int scaleout_rank_idx = 0;
+    int scaleup_rank_idx = 0;
+    int num_scaleout_ranks = 1;
+    int num_scaleup_ranks = 1;
+    bool is_scaleup_nvlink = true;
+    int num_qps = 1;
+    int64_t timeout_cycles = -1;
+};
+
+namespace {
+
+[[noreturn]] void unsupported_elastic_musa() {
+    throw std::runtime_error(
+        "Mooncake elastic EP kernels are only supported on CUDA SM90+; "
+        "MUSA builds provide the legacy EP kernels only");
+}
+
+}  // namespace
+
+void launch_elastic_dispatch_deterministic_prologue(
+    const torch::Tensor& topk_idx, torch::Tensor& rank_count_buffer,
+    torch::Tensor& dst_buffer_slot_idx, int num_tokens,
+    int num_max_tokens_per_rank, int num_experts, int num_topk,
+    int scaleup_rank_idx, int num_scaleup_ranks, int num_sms,
+    int num_smem_bytes, cudaStream_t stream) {
+    (void)topk_idx;
+    (void)rank_count_buffer;
+    (void)dst_buffer_slot_idx;
+    (void)num_tokens;
+    (void)num_max_tokens_per_rank;
+    (void)num_experts;
+    (void)num_topk;
+    (void)scaleup_rank_idx;
+    (void)num_scaleup_ranks;
+    (void)num_sms;
+    (void)num_smem_bytes;
+    (void)stream;
+    unsupported_elastic_musa();
+}
+
+void launch_mooncake_elastic_dispatch(
+    void* x, void* sf, int64_t* topk_idx, float* topk_weights,
+    int64_t* copied_topk_idx, int* cumulative_local_expert_recv_stats,
+    int* psum_num_recv_tokens_per_scaleup_rank,
+    int* psum_num_recv_tokens_per_expert, int* dst_buffer_slot_idx,
+    int* token_metadata_at_forward, int num_tokens, int num_max_tokens_per_rank,
+    int hidden, int elem_size, int num_sf_packs, int sf_token_stride,
+    int sf_hidden_stride, int num_experts, int num_topk, int expert_alignment,
+    int num_sms, int num_channels_per_sm, int num_smem_bytes, bool cached_mode,
+    bool deterministic, bool do_cpu_sync, const ElasticLaunchContext& ctx,
+    cudaStream_t stream) {
+    (void)x;
+    (void)sf;
+    (void)topk_idx;
+    (void)topk_weights;
+    (void)copied_topk_idx;
+    (void)cumulative_local_expert_recv_stats;
+    (void)psum_num_recv_tokens_per_scaleup_rank;
+    (void)psum_num_recv_tokens_per_expert;
+    (void)dst_buffer_slot_idx;
+    (void)token_metadata_at_forward;
+    (void)num_tokens;
+    (void)num_max_tokens_per_rank;
+    (void)hidden;
+    (void)elem_size;
+    (void)num_sf_packs;
+    (void)sf_token_stride;
+    (void)sf_hidden_stride;
+    (void)num_experts;
+    (void)num_topk;
+    (void)expert_alignment;
+    (void)num_sms;
+    (void)num_channels_per_sm;
+    (void)num_smem_bytes;
+    (void)cached_mode;
+    (void)deterministic;
+    (void)do_cpu_sync;
+    (void)ctx;
+    (void)stream;
+    unsupported_elastic_musa();
+}
+
+void launch_mooncake_elastic_dispatch_copy_epilogue(
+    void* recv_x, void* recv_sf, int64_t* recv_topk_idx,
+    float* recv_topk_weights, int* recv_src_metadata, int* channel_linked_list,
+    int num_recv_tokens, int num_max_tokens_per_rank, int hidden, int elem_size,
+    int num_sf_packs, int recv_sf_token_stride, int recv_sf_hidden_stride,
+    int num_experts, int num_topk, int num_sms, int num_smem_bytes,
+    int num_channels, bool do_expand, bool cached_mode,
+    const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
+    int* psum_num_recv_tokens_per_expert, cudaStream_t stream) {
+    (void)recv_x;
+    (void)recv_sf;
+    (void)recv_topk_idx;
+    (void)recv_topk_weights;
+    (void)recv_src_metadata;
+    (void)channel_linked_list;
+    (void)num_recv_tokens;
+    (void)num_max_tokens_per_rank;
+    (void)hidden;
+    (void)elem_size;
+    (void)num_sf_packs;
+    (void)recv_sf_token_stride;
+    (void)recv_sf_hidden_stride;
+    (void)num_experts;
+    (void)num_topk;
+    (void)num_sms;
+    (void)num_smem_bytes;
+    (void)num_channels;
+    (void)do_expand;
+    (void)cached_mode;
+    (void)ctx;
+    (void)psum_num_recv_tokens_per_scaleup_rank;
+    (void)psum_num_recv_tokens_per_expert;
+    (void)stream;
+    unsupported_elastic_musa();
+}
+
+void* launch_mooncake_elastic_combine(
+    void* x, float* topk_weights, int* src_metadata,
+    int* psum_num_recv_tokens_per_scaleup_rank, int* token_metadata_at_forward,
+    int* channel_linked_list, int num_reduced_tokens,
+    int num_max_tokens_per_rank, int hidden, int num_experts, int num_topk,
+    int num_sms, int num_smem_bytes, int num_channels, bool use_expanded_layout,
+    bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
+    cudaStream_t stream) {
+    (void)x;
+    (void)topk_weights;
+    (void)src_metadata;
+    (void)psum_num_recv_tokens_per_scaleup_rank;
+    (void)token_metadata_at_forward;
+    (void)channel_linked_list;
+    (void)num_reduced_tokens;
+    (void)num_max_tokens_per_rank;
+    (void)hidden;
+    (void)num_experts;
+    (void)num_topk;
+    (void)num_sms;
+    (void)num_smem_bytes;
+    (void)num_channels;
+    (void)use_expanded_layout;
+    (void)allow_multiple_reduction;
+    (void)ctx;
+    (void)stream;
+    unsupported_elastic_musa();
+}
+
+void launch_mooncake_elastic_combine_reduce_epilogue(
+    void* combined_x, float* combined_topk_weights, int64_t* combined_topk_idx,
+    int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
+    int num_experts, int num_topk, void* reduce_buffer, void* bias_0,
+    void* bias_1, int num_sms, int num_smem_bytes, bool use_expanded_layout,
+    bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
+    cudaStream_t stream) {
+    (void)combined_x;
+    (void)combined_topk_weights;
+    (void)combined_topk_idx;
+    (void)num_combined_tokens;
+    (void)num_max_tokens_per_rank;
+    (void)hidden;
+    (void)num_experts;
+    (void)num_topk;
+    (void)reduce_buffer;
+    (void)bias_0;
+    (void)bias_1;
+    (void)num_sms;
+    (void)num_smem_bytes;
+    (void)use_expanded_layout;
+    (void)allow_multiple_reduction;
+    (void)ctx;
+    (void)stream;
+    unsupported_elastic_musa();
+}
+
+}  // namespace mooncake
+
+#else
+
 #include <mooncake_ep_configs.cuh>
 #include <elastic/mooncake_ep_elastic_api.cuh>
 #include <elastic/mooncake_ep_elastic_exception.cuh>
@@ -740,3 +944,5 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
 }
 
 }  // namespace mooncake
+
+#endif  // MOONCAKE_EP_USE_MUSA
