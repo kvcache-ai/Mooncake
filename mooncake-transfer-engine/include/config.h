@@ -71,6 +71,10 @@ struct GlobalConfig {
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
+    // InfiniBand Service Level (SL), 0-15. -1 = use default (0).
+    // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to
+    // steer KV-cache traffic into a different VL than EP all-to-all.
+    int ib_service_level = -1;
     // mlx5 QP UDP source ports for ECMP path diversification.
     // Empty = no modification. QP at index i uses
     // mlx5_qp_udp_sports[i % size]. Requires mlx5 device + RoCEv2,

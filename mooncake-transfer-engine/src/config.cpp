@@ -390,6 +390,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* service_level_env = std::getenv("MC_IB_SL");
+    if (service_level_env) {
+        try {
+            int val = std::stoi(service_level_env);
+            if (val >= 0 && val <= 15) {
+                config.ib_service_level = val;
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_IB_SL, "
+                    << "value " << service_level_env
+                    << " out of range (should be 0-15)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_IB_SL environment value: "
+                         << service_level_env << ". Error: " << e.what();
+        }
+    }
+
     const char* ib_relaxed_ordering_env =
         std::getenv("MC_IB_PCI_RELAXED_ORDERING");
     if (ib_relaxed_ordering_env) {
@@ -507,6 +525,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {

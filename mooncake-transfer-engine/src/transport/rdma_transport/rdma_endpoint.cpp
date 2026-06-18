@@ -955,7 +955,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
     attr.ah_attr.dlid = peer_lid;
+    // Set service level if configured (-1 means use default)
     attr.ah_attr.sl = 0;
+    if (globalConfig().ib_service_level >= 0) {
+        attr.ah_attr.sl = static_cast<uint8_t>(globalConfig().ib_service_level);
+    }
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.static_rate = 0;
     attr.ah_attr.is_global = 1;
