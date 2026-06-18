@@ -764,9 +764,10 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT for both reads and writes.
-    // WriteBucket already handles alignment and padding.
-    if (use_uring_) {
+    // Use O_DIRECT only for reads: write latency is not sensitive in this
+    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
+    // corrupts meta file parsing and wastes disk space on data files.
+    if (use_uring_ && mode == FileMode::Read) {
         flags |= O_DIRECT;
     }
 #endif
@@ -778,8 +779,7 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
 
 #ifdef USE_URING
     if (use_uring_) {
-        // use_direct_io: enables O_DIRECT for both reads and writes.
-        bool use_direct_io = true;
+        bool use_direct_io = (mode == FileMode::Read);
         return std::make_unique<UringFile>(path, fd, 32, use_direct_io);
     }
 #endif
@@ -2639,9 +2639,15 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT for both reads and writes.
-    // WriteBucket already handles alignment and padding.
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    // Use O_DIRECT for reads and for .bucket data file writes.
+    // .meta files must NOT use O_DIRECT: write_aligned pads to 4096 bytes,
+    // which corrupts metadata parsing on restart (trailing zero bytes).
+    // .bucket files use O_DIRECT because WriteBucket handles alignment
+    // via write_aligned + datasync.
+    bool is_bucket_file =
+        (path.size() >= 7 && path.compare(path.size() - 7, 7, ".bucket") == 0);
+    if (file_storage_config_.use_uring &&
+        (mode == FileMode::Read || is_bucket_file)) {
         flags |= O_DIRECT;
     }
 #endif
@@ -2653,8 +2659,10 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
-        return std::make_unique<UringFile>(path, fd, 32, true);
+    if (file_storage_config_.use_uring &&
+        (mode == FileMode::Read || is_bucket_file)) {
+        bool use_direct_io = (mode == FileMode::Read || is_bucket_file);
+        return std::make_unique<UringFile>(path, fd, 32, use_direct_io);
     }
 #endif
     return std::make_unique<PosixFile>(path, fd);
