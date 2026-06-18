@@ -1000,7 +1000,7 @@ struct MergeResult {
     std::map<size_t, size_t> task_lookup;
 };
 
-struct TransferEngineImpl::SubmitPlan {
+struct TransferEngineImpl::PreparedSubmit {
     struct Task {
         size_t merged_task_index{0};
         size_t task_id{0};
@@ -1248,17 +1248,18 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
     return result;
 }
 
-Status TransferEngineImpl::buildSubmitPlan(
-    Batch* batch, const std::vector<Request>& request_list, SubmitPlan& plan) {
+Status TransferEngineImpl::prepareSubmit(
+    Batch* batch, const std::vector<Request>& request_list,
+    PreparedSubmit& prepared) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
     for (size_t i = 0; i < request_list.size(); ++i) {
         auto st = validateTransportHint(request_list[i], i);
         if (!st.ok()) return st;
     }
 
-    plan = SubmitPlan{};
+    prepared = PreparedSubmit{};
     const size_t start_task_id = batch->task_list.size();
-    plan.submit_time = std::chrono::steady_clock::now();
+    prepared.submit_time = std::chrono::steady_clock::now();
     auto merge_boundaries =
         merge_requests_
             ? resolveRequestBoundaries(metadata_.get(), request_list)
@@ -1266,46 +1267,46 @@ Status TransferEngineImpl::buildSubmitPlan(
     auto merged =
         mergeRequests(request_list, merge_boundaries, merge_requests_);
 
-    plan.owners.reserve(merged.request_list.size());
+    prepared.owners.reserve(merged.request_list.size());
     for (const auto& request : merged.request_list) {
-        SubmitPlan::Owner owner;
+        PreparedSubmit::Owner owner;
         owner.request = request;
         owner.route = resolveTransport(owner.request, 0);
         if (owner.route.transport == TCP) {
             findStagingPolicy(owner.request, owner.staging_params);
             owner.staging = !owner.staging_params.empty() && staging_proxy_;
         }
-        plan.owners.push_back(std::move(owner));
+        prepared.owners.push_back(std::move(owner));
     }
 
-    plan.tasks.reserve(merged.task_lookup.size());
+    prepared.tasks.reserve(merged.task_lookup.size());
     for (const auto& kv : merged.task_lookup) {
         const size_t public_task_index = kv.first;
         const size_t merged_task_index = kv.second;
-        plan.tasks.push_back(
+        prepared.tasks.push_back(
             {merged_task_index, start_task_id + public_task_index});
     }
     return Status::OK();
 }
 
-Status TransferEngineImpl::commitSubmitPlan(Batch* batch,
-                                            const SubmitPlan& plan) {
+Status TransferEngineImpl::commitPreparedSubmit(
+    Batch* batch, const PreparedSubmit& prepared) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
-    batch->task_list.insert(batch->task_list.end(), plan.tasks.size(),
+    batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
 
     std::unordered_map<TransportType, size_t> next_sub_task_id;
-    for (const auto& task_plan : plan.tasks) {
+    for (const auto& task_plan : prepared.tasks) {
         size_t task_id = task_plan.task_id;
         size_t merged_task_id = task_plan.merged_task_index;
         auto& task = batch->task_list[task_id];
-        const auto& owner_plan = plan.owners[merged_task_id];
-        auto& merged_request = owner_plan.request;
+        const auto& owner = prepared.owners[merged_task_id];
+        auto& merged_request = owner.request;
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
@@ -1319,9 +1320,9 @@ Status TransferEngineImpl::commitSubmitPlan(Batch* batch,
         task.request = merged_request;
         task.staging = false;
         task.start_time =
-            plan.submit_time;  // Record start time for latency tracking
-        task.type = owner_plan.route.transport;
-        task.device_mask = owner_plan.route.device_mask;
+            prepared.submit_time;  // Record start time for latency tracking
+        task.type = owner.route.transport;
+        task.device_mask = owner.route.device_mask;
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1329,9 +1330,9 @@ Status TransferEngineImpl::commitSubmitPlan(Batch* batch,
             continue;
         }
 
-        if (owner_plan.staging) {
+        if (owner.staging) {
             task.staging = true;
-            staging_proxy_->submit(&task, owner_plan.staging_params);
+            staging_proxy_->submit(&task, owner.staging_params);
             continue;
         }
 
@@ -1387,9 +1388,9 @@ Status TransferEngineImpl::commitSubmitPlan(Batch* batch,
 
 Status TransferEngineImpl::submitTransferToBatch(
     Batch* batch, const std::vector<Request>& request_list) {
-    SubmitPlan plan;
-    CHECK_STATUS(buildSubmitPlan(batch, request_list, plan));
-    CHECK_STATUS(commitSubmitPlan(batch, plan));
+    PreparedSubmit prepared;
+    CHECK_STATUS(prepareSubmit(batch, request_list, prepared));
+    CHECK_STATUS(commitPreparedSubmit(batch, prepared));
     return Status::OK();
 }
 

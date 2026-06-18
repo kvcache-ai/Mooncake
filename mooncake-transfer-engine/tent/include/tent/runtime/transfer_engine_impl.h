@@ -201,16 +201,15 @@ class TransferEngineImpl {
 
     Status releaseBatch(Batch* batch);
 
-    struct SubmitPlan;
+    struct PreparedSubmit;
 
     Status submitTransferToBatch(Batch* batch,
                                  const std::vector<Request>& request_list);
 
-    Status buildSubmitPlan(Batch* batch,
-                           const std::vector<Request>& request_list,
-                           SubmitPlan& plan);
+    Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
+                         PreparedSubmit& prepared);
 
-    Status commitSubmitPlan(Batch* batch, const SubmitPlan& plan);
+    Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
