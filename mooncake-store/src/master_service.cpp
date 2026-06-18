@@ -773,35 +773,92 @@ tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
         return {};
     }
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    auto exceeds_effective_quota = [](const TenantQuotaState& state,
+                                      uint64_t additional_bytes) {
+        return static_cast<unsigned __int128>(state.used_bytes) +
+                   state.reserved_bytes + additional_bytes >
+               state.effective_quota_bytes;
+    };
+    auto refresh_over_quota = [](TenantQuotaState& state) {
+        state.over_quota = state.effective_quota_bytes !=
+                               std::numeric_limits<uint64_t>::max() &&
+                           static_cast<unsigned __int128>(state.used_bytes) +
+                                   state.reserved_bytes >
+                               state.effective_quota_bytes;
+    };
+
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto [it, did_insert] = shard.tenants.try_emplace(normalized_tenant);
-    auto& state = it->second;
-    if (did_insert) {
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.tenants.find(normalized_tenant);
+        if (it != shard.tenants.end()) {
+            auto& state = it->second;
+            if (exceeds_effective_quota(state, bytes)) {
+                return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+            }
+
+            state.reserved_bytes += bytes;
+            refresh_over_quota(state);
+            return {};
+        }
+
+        auto [insert_it, _] = shard.tenants.try_emplace(normalized_tenant);
+        auto& state = insert_it->second;
         state.requested_quota_bytes = default_tenant_quota_bytes_;
         state.effective_quota_bytes = default_tenant_quota_bytes_ == 0
                                           ? std::numeric_limits<uint64_t>::max()
-                                          : default_tenant_quota_bytes_;
+                                          : 0;
         state.over_quota = false;
-    }
 
-    if (static_cast<unsigned __int128>(state.used_bytes) +
-            state.reserved_bytes + bytes >
-        state.effective_quota_bytes) {
-        if (did_insert) {
-            shard.tenants.erase(it);
+        if (default_tenant_quota_bytes_ == 0) {
+            if (exceeds_effective_quota(state, bytes)) {
+                shard.tenants.erase(insert_it);
+                return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+            }
+            state.reserved_bytes += bytes;
+            return {};
         }
-        return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+
+        state.reserved_bytes = bytes;
     }
 
-    state.reserved_bytes += bytes;
-    state.over_quota =
-        state.effective_quota_bytes != std::numeric_limits<uint64_t>::max() &&
-        static_cast<unsigned __int128>(state.used_bytes) +
-                state.reserved_bytes >
-            state.effective_quota_bytes;
-    return {};
+    RecomputeTenantEffectiveQuotas();
+
+    bool rollback_needs_recompute = false;
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.tenants.find(normalized_tenant);
+        if (it == shard.tenants.end()) {
+            return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+        }
+
+        auto& state = it->second;
+        if (!exceeds_effective_quota(state, 0)) {
+            refresh_over_quota(state);
+            return {};
+        }
+
+        if (state.reserved_bytes < bytes) {
+            LOG(ERROR) << "tenant quota reserve rollback mismatch tenant="
+                       << normalized_tenant << ", bytes=" << bytes
+                       << ", reserved=" << state.reserved_bytes;
+            return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+        }
+        state.reserved_bytes -= bytes;
+        if (!state.has_explicit_policy && state.used_bytes == 0 &&
+            state.reserved_bytes == 0 && state.committed_count == 0) {
+            shard.tenants.erase(it);
+            rollback_needs_recompute = true;
+        } else {
+            refresh_over_quota(state);
+        }
+    }
+
+    if (rollback_needs_recompute) {
+        RecomputeTenantEffectiveQuotas();
+    }
+    return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
 void MasterService::CommitTenantQuota(const std::string& tenant_id,

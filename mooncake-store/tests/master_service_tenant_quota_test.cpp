@@ -204,22 +204,29 @@ TEST_F(MasterServiceTenantQuotaTest, SameTenantSharesQuotaAcrossKeys) {
     EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
 }
 
-TEST_F(MasterServiceTenantQuotaTest,
-       FirstTenantPutStartUsesInlineDefaultWithoutRecompute) {
+TEST_F(MasterServiceTenantQuotaTest, FirstTenantPutStartUsesPoolCapacity) {
     MasterService service(MakeConfig(/*default_quota=*/1000,
                                      /*pool_capacity=*/100));
     UUID client_id = MountSegment(service);
 
+    auto over_quota =
+        service.PutStart(client_id, "large", "tenant-a", 800, MemoryConfig());
+
+    ASSERT_FALSE(over_quota.has_value());
+    EXPECT_EQ(over_quota.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
+
     auto start =
-        service.PutStart(client_id, "key", "tenant-a", 800, MemoryConfig());
+        service.PutStart(client_id, "small", "tenant-a", 80, MemoryConfig());
 
     ASSERT_TRUE(start.has_value()) << toString(start.error());
     auto snapshot = Snapshot(service, "tenant-a");
     EXPECT_EQ(snapshot.requested_quota_bytes, 1000);
-    EXPECT_EQ(snapshot.effective_quota_bytes, 1000);
+    EXPECT_EQ(snapshot.effective_quota_bytes, 100);
     EXPECT_EQ(snapshot.used_bytes, 0);
-    EXPECT_EQ(snapshot.reserved_bytes, 800);
-    AbortQuota(service, "tenant-a", 800);
+    EXPECT_EQ(snapshot.reserved_bytes, 80);
+    AbortQuota(service, "tenant-a", 80);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
