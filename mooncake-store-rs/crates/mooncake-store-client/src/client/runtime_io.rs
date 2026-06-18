@@ -1631,11 +1631,18 @@ impl StoreClient {
         match remote_readable.len() {
             0 => None,
             1 => Some(remote_readable[0].clone()),
-            n => {
-                remote_readable.sort_by_key(|r| r.priority);
-                let hash = replica_balance_hash(&local_runtime.stable_id.0) as usize;
-                Some(remote_readable[hash % n].clone())
-            }
+            _ => remote_readable
+                .into_iter()
+                .max_by(|left, right| {
+                    replica_balance_score(route, local_runtime, left)
+                        .cmp(&replica_balance_score(route, local_runtime, right))
+                        // Higher rendezvous score wins. On score collisions,
+                        // keep route priority semantics: lower priority wins.
+                        .then_with(|| left.priority.cmp(&right.priority).reverse())
+                        .then_with(|| left.owner.cmp(&right.owner).reverse())
+                        .then_with(|| left.segment_name.cmp(&right.segment_name).reverse())
+                })
+                .cloned(),
         }
     }
 
@@ -3998,12 +4005,17 @@ impl StoreClient {
     }
 }
 
-fn replica_balance_hash(reader_id: &str) -> u64 {
-    let mut h = 0u64;
-    for b in reader_id.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(u64::from(b));
-    }
-    h
+fn replica_balance_score(
+    route: &ObjectRoute,
+    local_runtime: &ClientRuntimeId,
+    replica: &ReplicaRoute,
+) -> u64 {
+    crate::stable_hash::stable_hash(&[
+        route.key.0.as_str(),
+        local_runtime.stable_id.0.as_str(),
+        replica.owner.stable_id.0.as_str(),
+        replica.segment_name.0.as_str(),
+    ])
 }
 
 #[cfg(test)]
@@ -4023,6 +4035,119 @@ mod runtime_io_tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn readable_remote_replica_selection_balances_by_route_key() {
+        let reader = ClientRuntimeId::new("reader-a", ClientEpoch(1));
+        let storage_a = ClientRuntimeId::new("storage-a", ClientEpoch(1));
+        let storage_b = ClientRuntimeId::new("storage-b", ClientEpoch(1));
+        let replicas = vec![
+            (storage_a.clone(), SegmentName::new("storage-a-segment"), 0),
+            (storage_b.clone(), SegmentName::new("storage-b-segment"), 1),
+        ];
+        let local_segments = BTreeSet::new();
+        let mut readable = BTreeSet::new();
+        readable.insert(storage_a.clone());
+        readable.insert(storage_b.clone());
+        let route_for_key = |key: &str| {
+            let scope = NamespaceScope::with_defaults(Some("tenant-a"), None, None);
+            let object_id = LogicalObjectId::new(scope.clone(), key);
+            ObjectRoute {
+                key: ObjectKey::from_logical_id(&object_id),
+                namespace: Some(scope),
+                logical_key: Some(key.to_string()),
+                canonical_key: Some(object_id.canonical_key()),
+                sharing_scope: Some("tenant-a".to_string()),
+                qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+                version: RouteVersion(1),
+                state: RouteState::Active,
+                compatibility: CompatibilityDescriptor::default(),
+                replicas: replicas
+                    .iter()
+                    .map(|(owner, segment_name, priority)| ReplicaRoute {
+                        owner: owner.clone(),
+                        segment_name: segment_name.clone(),
+                        offset: Some(0),
+                        segment_offset: 0,
+                        length: 16,
+                        checksum: None,
+                        tier: ReplicaTier::Dram,
+                        priority: *priority,
+                    })
+                    .collect(),
+                cold_backing: None,
+            }
+        };
+
+        const NUM_KEYS: usize = 512;
+        const MAX_IMBALANCE: usize = NUM_KEYS / 5;
+        let mut storage_a_selected = 0usize;
+        let mut storage_b_selected = 0usize;
+        for index in 0..NUM_KEYS {
+            let key = format!("balance-key-{index}");
+            let route = route_for_key(&key);
+            let selected =
+                StoreClient::select_readable_replica(&route, &reader, &local_segments, &readable)
+                    .expect("route should have a readable replica");
+            match selected.owner.stable_id.0.as_str() {
+                "storage-a" => storage_a_selected = storage_a_selected.saturating_add(1),
+                "storage-b" => storage_b_selected = storage_b_selected.saturating_add(1),
+                owner => panic!("unexpected selected owner {owner}"),
+            }
+        }
+
+        let imbalance = storage_a_selected.abs_diff(storage_b_selected);
+        assert!(
+            imbalance <= MAX_IMBALANCE,
+            "same reader should spread remote reads across replicas: storage-a={storage_a_selected} storage-b={storage_b_selected} imbalance={imbalance} max={MAX_IMBALANCE}"
+        );
+    }
+
+    #[test]
+    fn readable_remote_replica_score_tie_prefers_lower_priority() {
+        let reader = ClientRuntimeId::new("reader-a", ClientEpoch(1));
+        let storage = ClientRuntimeId::new("storage-a", ClientEpoch(1));
+        let segment = SegmentName::new("storage-a-segment");
+        let local_segments = BTreeSet::new();
+        let mut readable = BTreeSet::new();
+        readable.insert(storage.clone());
+        let scope = NamespaceScope::with_defaults(Some("tenant-a"), None, None);
+        let object_id = LogicalObjectId::new(scope.clone(), "tie-key");
+        let route = ObjectRoute {
+            key: ObjectKey::from_logical_id(&object_id),
+            namespace: Some(scope),
+            logical_key: Some("tie-key".to_string()),
+            canonical_key: Some(object_id.canonical_key()),
+            sharing_scope: Some("tenant-a".to_string()),
+            qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: [9, 1]
+                .into_iter()
+                .map(|priority| ReplicaRoute {
+                    owner: storage.clone(),
+                    segment_name: segment.clone(),
+                    offset: Some(0),
+                    segment_offset: 0,
+                    length: 16,
+                    checksum: None,
+                    tier: ReplicaTier::Dram,
+                    priority,
+                })
+                .collect(),
+            cold_backing: None,
+        };
+
+        let selected =
+            StoreClient::select_readable_replica(&route, &reader, &local_segments, &readable)
+                .expect("route should have a readable replica");
+
+        assert_eq!(
+            selected.priority, 1,
+            "score ties must preserve lower-priority replica preference"
+        );
     }
 
     #[test]
