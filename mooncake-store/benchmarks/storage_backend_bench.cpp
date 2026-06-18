@@ -128,6 +128,8 @@ DEFINE_uint64(verify_rate, 1,
               "Verify 1 in N operations (default: 1 = verify all)");
 DEFINE_bool(verify_warmup_all, true, "Always verify all warmup operations");
 DEFINE_bool(fail_fast, true, "Exit immediately on first corruption detected");
+DEFINE_bool(use_uring, false,
+            "Use io_uring + O_DIRECT for I/O (tests batch_read path)");
 DEFINE_double(fill_ratio, 0.1,
               "Pre-populate to this fraction of capacity (0.0-1.0)");
 
@@ -815,6 +817,7 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
                 config);
         }
         case BackendType::BUCKET: {
+            config.use_uring = FLAGS_use_uring;
             config.storage_backend_type = mooncake::StorageBackendType::kBucket;
             mooncake::BucketBackendConfig bucket_config;
             bucket_config.bucket_size_limit = 256 * MB;
@@ -1254,9 +1257,11 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
     KeySet keys;
     keys.Init(total_keys);
 
+    // Allocate extra kAlignment per buffer for O_DIRECT aligned read padding
+    size_t buf_alloc_size = aligned_size + kAlignment;
     BufferPool write_buffers, read_buffers;
-    write_buffers.Init(batch_size, value_size);
-    read_buffers.Init(batch_size, value_size);
+    write_buffers.Init(batch_size, buf_alloc_size);
+    read_buffers.Init(batch_size, buf_alloc_size);
 
     // Reusable containers
     BatchContainers batch;
@@ -1368,7 +1373,12 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
                 size_t measured_op = op - warmup_operations;
                 if (ShouldVerify(measured_op, is_warmup)) {
                     for (size_t i = 0; i < batch_size; ++i) {
-                        if (!gen.VerifyBuffer(read_buffers.Get(i), value_size,
+                        const std::string& vkey = keys.Get(batch.key_indices[i]);
+                        auto vit = batch.load_batch.find(vkey);
+                        const char* vptr = (vit != batch.load_batch.end())
+                                               ? static_cast<const char*>(vit->second.ptr)
+                                               : read_buffers.Get(i);
+                        if (!gen.VerifyBuffer(vptr, value_size,
                                               batch.key_indices[i])) {
                             thread_stats.RecordChecksumFailure();
                             LOG(ERROR) << "Checksum mismatch for key "
@@ -1386,7 +1396,12 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
             // Verify all warmup ops
             if (result) {
                 for (size_t i = 0; i < batch_size; ++i) {
-                    if (!gen.VerifyBuffer(read_buffers.Get(i), value_size,
+                    const std::string& vkey = keys.Get(batch.key_indices[i]);
+                    auto vit = batch.load_batch.find(vkey);
+                    const char* vptr = (vit != batch.load_batch.end())
+                                           ? static_cast<const char*>(vit->second.ptr)
+                                           : read_buffers.Get(i);
+                    if (!gen.VerifyBuffer(vptr, value_size,
                                           batch.key_indices[i])) {
                         LOG(ERROR) << "Warmup verification failed for key "
                                    << batch.key_indices[i];

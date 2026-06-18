@@ -764,10 +764,9 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
-    if (use_uring_ && mode == FileMode::Read) {
+    // Use O_DIRECT for both reads and writes.
+    // WriteBucket already handles alignment and padding.
+    if (use_uring_) {
         flags |= O_DIRECT;
     }
 #endif
@@ -779,10 +778,8 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
 
 #ifdef USE_URING
     if (use_uring_) {
-        // use_direct_io mirrors the O_DIRECT flag: true for reads, false for
-        // writes. This avoids unnecessary bounce-buffer allocation on the write
-        // path while keeping correct alignment enforcement on the read path.
-        bool use_direct_io = (mode == FileMode::Read);
+        // use_direct_io: enables O_DIRECT for both reads and writes.
+        bool use_direct_io = true;
         return std::make_unique<UringFile>(path, fd, 32, use_direct_io);
     }
 #endif
@@ -1468,16 +1465,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             // ---- Batch submission path ----
             // Collect all key read requests into ReadDesc array, then submit
             // them in one batch_read call for NVMe queue depth > 1.
+            //
+            // O_DIRECT requires offset, size, and buffer to be aligned to
+            // kDirectIOAlignment (4096).  The data offset (offset + key_size)
+            // is generally NOT aligned, so we read the aligned range into a
+            // temporary buffer, then memcpy the actual data to the caller.
 
             struct ReadEntry {
                 UringFile::ReadDesc desc;
                 std::string key;
                 int64_t offset_in_buffer;
                 size_t actual_size;
+                void* caller_buf;  // original destination buffer
             };
             std::vector<ReadEntry> entries;
             entries.reserve(read_plans.size());
 
+            // Pre-compute total aligned buffer size needed, then allocate once.
+            // This avoids per-entry posix_memalign overhead.
+            size_t total_aligned = 0;
+            std::vector<size_t> aligned_sizes;
+            aligned_sizes.reserve(read_plans.size());
             for (const auto& plan : read_plans) {
                 int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
@@ -1486,17 +1494,36 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     actual_offset + static_cast<int64_t>(plan.dest_slice.size);
                 int64_t aligned_end = static_cast<int64_t>(align_up(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
-                size_t aligned_size =
-                    static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
-
-                entries.push_back(
-                    {{plan.dest_slice.ptr, aligned_size, aligned_offset},
-                     plan.key,
-                     offset_in_buffer,
-                     plan.dest_slice.size});
+                size_t asz = static_cast<size_t>(aligned_end - aligned_offset);
+                aligned_sizes.push_back(asz);
+                total_aligned += asz;
             }
 
+            void* aligned_buf = nullptr;
+            if (posix_memalign(&aligned_buf, kDirectIOAlignment,
+                               total_aligned) != 0) {
+                LOG(ERROR) << "posix_memalign failed for batch read buffer ("
+                           << total_aligned << " bytes)";
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            char* buf_ptr = static_cast<char*>(aligned_buf);
+
+            size_t idx = 0;
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                int64_t aligned_offset =
+                    align_down(actual_offset, kDirectIOAlignment);
+                size_t aligned_size = aligned_sizes[idx];
+                int64_t offset_in_buffer = actual_offset - aligned_offset;
+
+                entries.push_back({{buf_ptr, aligned_size, aligned_offset},
+                                   plan.key,
+                                   offset_in_buffer,
+                                   plan.dest_slice.size,
+                                   plan.dest_slice.ptr});
+                buf_ptr += aligned_size;
+                ++idx;
+            }
             // Build descs for batch_read
             std::vector<UringFile::ReadDesc> descs;
             descs.reserve(entries.size());
@@ -1515,6 +1542,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             if (size_ec) {
                 LOG(ERROR) << "Failed to get file size for bucket_id="
                            << bucket_id << ": " << size_ec.message();
+                // Free temp buffers before returning error
+                free(aligned_buf);
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
 
@@ -1530,6 +1559,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                         << ", bucket_id=" << bucket_id
                         << ", data_end=" << (actual_offset + e.actual_size)
                         << ", file_size=" << file_size;
+                    free(aligned_buf);
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
 
@@ -1550,6 +1580,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             // The kernel returns fewer bytes at EOF (short read).
             auto batch_res = uring_file->batch_read(
                 descs.data(), static_cast<int>(descs.size()));
+
+            // Copy actual data from aligned buffers to caller buffers.
+            // Must happen BEFORE checking batch_res, because we need to
+            // free the temp buffers regardless of success/failure.
+            for (const auto& e : entries) {
+                if (batch_res) {
+                    std::memcpy(
+                        e.caller_buf,
+                        static_cast<char*>(e.desc.buf) + e.offset_in_buffer,
+                        e.actual_size);
+                }
+            }
+            free(aligned_buf);
+
             if (!batch_res) {
                 LOG(ERROR) << "batch_read failed for bucket_id=" << bucket_id
                            << ", error=" << static_cast<int>(batch_res.error());
@@ -1577,12 +1621,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                                << " more entries";
                 }
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-
-            // Adjust each key's data pointer to actual data start
-            for (const auto& e : entries) {
-                batch_object.at(e.key).ptr =
-                    static_cast<char*>(e.desc.buf) + e.offset_in_buffer;
             }
         } else
 #endif
@@ -2601,9 +2639,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
+    // Use O_DIRECT for both reads and writes.
+    // WriteBucket already handles alignment and padding.
     if (file_storage_config_.use_uring && mode == FileMode::Read) {
         flags |= O_DIRECT;
     }

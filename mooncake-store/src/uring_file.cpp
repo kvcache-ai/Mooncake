@@ -241,9 +241,18 @@ class SharedUringRing {
         s = next_pow2(s);
         return std::max(s, MIN_CHUNK);
     }
-
     // Drain exactly @expected CQEs and accumulate bytes.
     tl::expected<size_t, ErrorCode> collect(int expected) {
+        // Drain any stale CQEs left from a previous failed batch_read.
+        // Without this, stale CQEs get counted in the current batch's
+        // total, inflating the byte count and causing short-read errors.
+        {
+            struct io_uring_cqe* stale;
+            while (io_uring_peek_cqe(&ring_, &stale) == 0) {
+                io_uring_cq_advance(&ring_, 1);
+            }
+        }
+
         int ret = io_uring_submit_and_wait(&ring_, expected);
         if (ret < 0) {
             LOG(ERROR) << "[SharedUringRing] io_uring_submit_and_wait: "
@@ -252,9 +261,19 @@ class SharedUringRing {
         }
         size_t total = 0;
         bool err = false;
-        unsigned head, cnt = 0;
-        struct io_uring_cqe* cqe;
-        io_uring_for_each_cqe(&ring_, head, cqe) {
+        int processed = 0;
+
+        // Process exactly 'expected' CQEs, not all available.
+        // io_uring_submit_and_wait may return more CQEs than expected
+        // if stale entries are in the ring; we must not count them.
+        while (processed < expected) {
+            struct io_uring_cqe* cqe;
+            int wait_ret = io_uring_wait_cqe(&ring_, &cqe);
+            if (wait_ret < 0) {
+                LOG(ERROR) << "[SharedUringRing] io_uring_wait_cqe: "
+                           << strerror(-wait_ret);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
             if (cqe->res < 0) {
                 LOG(ERROR) << "[SharedUringRing] CQE error: "
                            << strerror(-cqe->res);
@@ -262,9 +281,9 @@ class SharedUringRing {
             } else {
                 total += static_cast<size_t>(cqe->res);
             }
-            ++cnt;
+            io_uring_cq_advance(&ring_, 1);
+            ++processed;
         }
-        io_uring_cq_advance(&ring_, cnt);
         if (err) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         return total;
     }
