@@ -281,6 +281,11 @@ class TestCodecInference(unittest.TestCase):
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "json_ragged")
 
+    def test_json_rejects_late_non_serializable(self):
+        values = [{"ok": i} for i in range(200)] + [object()]
+        d = _choose_leaf_codec(values)
+        self.assertFalse(d.accepted)
+
     def test_scalar(self):
         d = _choose_leaf_codec([1, 2.0, 3])
         self.assertTrue(d.accepted)
@@ -317,7 +322,7 @@ class TestCodecInference(unittest.TestCase):
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0].node_type, "dict")
         self.assertEqual(sorted(nodes[0].children), ["x", "y"])
-        self.assertEqual(sorted(l.path for l in leaves), ["root.x", "root.y"])
+        self.assertEqual(sorted(leaf.path for leaf in leaves), ["root.x", "root.y"])
 
     def test_infer_dict_with_none_rows(self):
         leaves, nodes = [], []
@@ -355,7 +360,7 @@ class TestCodecInference(unittest.TestCase):
         infer_structure("r", [{"x": None}, {"y": 2}, None], leaves, nodes)
         self.assertIsNotNone(nodes[0].row_mask)
         self.assertEqual(nodes[0].row_mask, [True, True, False])
-        x_leaf = next(l for l in leaves if l.path == "r.x")
+        x_leaf = next(leaf for leaf in leaves if leaf.path == "r.x")
         self.assertIsNone(x_leaf.values[0])
         self.assertIsInstance(x_leaf.values[1], type(MISSING))
         self.assertIsNone(x_leaf.values[2])

@@ -1451,15 +1451,17 @@ def _can_json(values: list[Any]) -> _CodecDecision:
     nn = _non_null(values)
     if not nn:
         return _CodecDecision(False, "json_ragged", "all rows are null", "json")
-    total_bytes = 0
-    for v in nn[:_INFER_MAX_SAMPLE_ROWS]:
+    sampled_bytes = 0
+    for i, v in enumerate(nn):
         try:
-            total_bytes += len(json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            encoded = json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         except (TypeError, ValueError, OverflowError, RecursionError):
             return _CodecDecision(False, "json_ragged", "serialization failed", "json")
-    if total_bytes > _INFER_MAX_JSON_BYTES:
+        if i < _INFER_MAX_SAMPLE_ROWS:
+            sampled_bytes += len(encoded)
+    if sampled_bytes > _INFER_MAX_JSON_BYTES:
         return _CodecDecision(False, "json_ragged", "sampled payload too large", "json")
-    return _CodecDecision(True, "json_ragged", "sampled rows pass JSON serialization", "json")
+    return _CodecDecision(True, "json_ragged", "all rows pass JSON serialization", "json")
 
 
 _CODEC_PREDICATES: tuple[Any, ...] = (
