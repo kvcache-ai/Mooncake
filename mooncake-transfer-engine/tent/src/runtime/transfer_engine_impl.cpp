@@ -657,8 +657,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             desc.location = entries[0].location;
         } else {
             desc.location = entries[0].location;
-            for (auto& entry : entries)
-                desc.regions.push_back(Region{entry.len, entry.location});
+            desc.regions = coalesceRegions(entries);
         }
         desc.ref_count = 1;
         if (options.location != kWildcardLocation)
@@ -1082,43 +1081,61 @@ std::optional<BufferKey> toBufferKey(BufferDesc* buffer) {
     return BufferKey{buffer->addr, buffer->length};
 }
 
-RequestBoundaryInfo resolveRequestBoundary(ControlService* metadata,
-                                           SegmentDesc* local_desc,
-                                           const Request& request) {
-    RequestBoundaryInfo boundary;
-
-    if (local_desc) {
-        auto source_addr =
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(request.source));
-        boundary.source_key =
-            toBufferKey(local_desc->findBuffer(source_addr, request.length));
-    }
-
-    metadata->segmentManager().withCachedSegment(
-        request.target_id, [&](SegmentDesc* target_desc) {
-            auto buffer =
-                target_desc->findBuffer(request.target_offset, request.length);
-
-            if (!buffer) {
-                boundary.target_key = std::nullopt;
-                return Status::NeedsRefreshCache(
-                    "Requested address is not in registered buffer" LOC_MARK);
-            }
-
-            boundary.target_key = toBufferKey(buffer);
-            return Status::OK();
-        });
-    return boundary;
-}
-
 std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     ControlService* metadata, const std::vector<Request>& requests) {
-    std::vector<RequestBoundaryInfo> boundaries;
-    boundaries.reserve(requests.size());
+    // Group requests by target_id so withCachedSegment fires at most once per
+    // peer.
+    std::vector<RequestBoundaryInfo> boundaries(requests.size());
     auto* local_desc = metadata->segmentManager().getLocal().get();
-    for (const auto& request : requests) {
-        boundaries.push_back(
-            resolveRequestBoundary(metadata, local_desc, request));
+
+    if (local_desc) {
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto source_addr = static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(requests[i].source));
+            boundaries[i].source_key = toBufferKey(
+                local_desc->findBuffer(source_addr, requests[i].length));
+        }
+    }
+
+    std::unordered_map<SegmentID, std::vector<size_t>> by_target;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        by_target[requests[i].target_id].push_back(i);
+    }
+
+    for (auto& [target_id, idxs] : by_target) {
+        metadata->segmentManager().withCachedSegment(
+            target_id, [&](SegmentDesc* target_desc) {
+                bool any_missing = false;
+                for (size_t i : idxs) {
+                    const auto& r = requests[i];
+                    auto* buffer =
+                        target_desc->findBuffer(r.target_offset, r.length);
+                    if (!buffer) {
+                        any_missing = true;
+                        boundaries[i].target_key = std::nullopt;
+                    } else {
+                        boundaries[i].target_key = toBufferKey(buffer);
+                    }
+                }
+                // Invariant: when this lambda returns NeedsRefreshCache, all
+                // writes it made in this pass are wiped before it returns.
+                // Reason: withCachedSegment will invalidate the cache and try
+                // ONE refetch; if that refetch fails (e.g. peer RPC down) the
+                // retry pass never runs, and any tentative writes from this
+                // (stale) pass would leak downstream into mergeRequests. By
+                // clearing here we leave a clean nullopt state for the group,
+                // and the retry pass (if it does run) repopulates from the
+                // fresh desc so the wipe is harmless.
+                if (any_missing) {
+                    for (size_t i : idxs) {
+                        boundaries[i].target_key = std::nullopt;
+                    }
+                    return Status::NeedsRefreshCache(
+                        "Requested address is not in registered "
+                        "buffer" LOC_MARK);
+                }
+                return Status::OK();
+            });
     }
     return boundaries;
 }

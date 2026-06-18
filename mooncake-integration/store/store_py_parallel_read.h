@@ -224,30 +224,21 @@ std::optional<size_t> extract_reconstruction_element_size(
     const std::vector<ReconstructedShardSource> &sources,
     const std::string &context) {
     for (const auto &source : sources) {
-        const auto local_shape =
-            TensorShapeToVector(source.metadata.metadata.layout.local_shape,
-                                source.metadata.metadata.header.ndim);
-        int64_t shard_numel = 1;
-        for (auto dim : local_shape) {
-            shard_numel *= dim;
-        }
-        if (shard_numel < 0) {
-            LOG(ERROR) << context << ": invalid shard tensor numel";
+        auto element_size =
+            TensorDtypeElementSize(source.metadata.metadata.header.dtype);
+        if (!element_size.has_value()) {
+            LOG(ERROR) << context << ": invalid shard tensor dtype";
             return std::nullopt;
         }
-        if (shard_numel == 0) {
-            if (source.metadata.data_bytes != 0) {
-                LOG(ERROR) << context << ": invalid empty shard byte size";
-                return std::nullopt;
-            }
-            continue;
-        }
-        if (source.metadata.data_bytes % static_cast<size_t>(shard_numel) !=
-            0) {
+
+        const auto expected_data_bytes =
+            TensorMetadataExpectedDataBytes(source.metadata.metadata);
+        if (!expected_data_bytes.has_value() ||
+            source.metadata.data_bytes != *expected_data_bytes) {
             LOG(ERROR) << context << ": invalid shard tensor byte size";
             return std::nullopt;
         }
-        return source.metadata.data_bytes / static_cast<size_t>(shard_numel);
+        return *element_size;
     }
     return size_t{0};
 }
@@ -422,8 +413,7 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
             return std::nullopt;
         }
     }
-    if (plan.fragments.empty() &&
-        !(allow_empty_fragments && target_tensor_bytes == 0)) {
+    if (plan.fragments.empty() && target_tensor_bytes != 0) {
         LOG(ERROR) << context << ": no fragments planned for reconstruction";
         return std::nullopt;
     }
@@ -478,31 +468,14 @@ pybind11::object get_tensor_with_writer_shard_full(const std::string &key,
         total_tensor_numel *= static_cast<size_t>(dim);
     }
 
-    size_t element_size = 0;
-    for (const auto &source : reconstruction->sources) {
-        if (source.metadata.data_bytes == 0) {
-            continue;
-        }
-        int64_t shard_numel = 1;
-        const auto local_shape =
-            TensorShapeToVector(source.metadata.metadata.layout.local_shape,
-                                source.metadata.metadata.header.ndim);
-        for (auto dim : local_shape) {
-            shard_numel *= dim;
-        }
-        if (shard_numel <= 0 ||
-            source.metadata.data_bytes % static_cast<size_t>(shard_numel) !=
-                0) {
-            LOG(ERROR) << context << ": invalid writer shard tensor byte size";
-            return py::none();
-        }
-        element_size =
-            source.metadata.data_bytes / static_cast<size_t>(shard_numel);
-        break;
+    auto element_size =
+        extract_reconstruction_element_size(reconstruction->sources, context);
+    if (!element_size.has_value()) {
+        return py::none();
     }
 
     const size_t total_length =
-        sizeof(TensorMetadata) + total_tensor_numel * element_size;
+        sizeof(TensorMetadata) + total_tensor_numel * *element_size;
     char *owned_buffer = new char[total_length];
     if (store_->register_buffer(owned_buffer, total_length) != 0) {
         LOG(ERROR) << context << ": failed to register reconstruction buffer";
@@ -573,30 +546,13 @@ pybind11::object get_tensor_with_tp_full(
         std::accumulate(reconstruction->global_shape.begin(),
                         reconstruction->global_shape.end(),
                         static_cast<size_t>(1), std::multiplies<size_t>());
-    size_t element_size = 0;
-    for (const auto &source : reconstruction->sources) {
-        if (source.metadata.data_bytes == 0) {
-            continue;
-        }
-        int64_t shard_numel = 1;
-        const auto local_shape =
-            TensorShapeToVector(source.metadata.metadata.layout.local_shape,
-                                source.metadata.metadata.header.ndim);
-        for (auto dim : local_shape) {
-            shard_numel *= dim;
-        }
-        if (shard_numel <= 0 ||
-            source.metadata.data_bytes % static_cast<size_t>(shard_numel) !=
-                0) {
-            LOG(ERROR) << context << ": invalid shard tensor byte size";
-            return pybind11::none();
-        }
-        element_size =
-            source.metadata.data_bytes / static_cast<size_t>(shard_numel);
-        break;
+    auto element_size =
+        extract_reconstruction_element_size(reconstruction->sources, context);
+    if (!element_size.has_value()) {
+        return pybind11::none();
     }
     const size_t total_length =
-        sizeof(TensorMetadata) + total_tensor_numel * element_size;
+        sizeof(TensorMetadata) + total_tensor_numel * *element_size;
 
     char *owned_buffer = new char[total_length];
     if (store_->register_buffer(owned_buffer, total_length) != 0) {
@@ -1143,7 +1099,7 @@ std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_formula_plan(
 
     size_t tensor_numel = 1;
     for (auto dim : global_shape) {
-        if (dim <= 0) {
+        if (dim < 0) {
             return std::nullopt;
         }
         tensor_numel *= static_cast<size_t>(dim);
@@ -1344,9 +1300,11 @@ std::vector<bool> execute_tensor_into_plan_transfers(
     all_src_offsets.reserve(plans.size());
     all_sizes.reserve(plans.size());
 
-    for (const auto &plan : plans) {
-        buffers.push_back(reinterpret_cast<void *>(plan.registered_buffer_ptr));
+    std::vector<size_t> transfer_plan_indices;
+    transfer_plan_indices.reserve(plans.size());
 
+    for (size_t plan_idx = 0; plan_idx < plans.size(); ++plan_idx) {
+        const auto &plan = plans[plan_idx];
         std::unordered_map<std::string, size_t> key_to_index;
         std::vector<std::string> keys;
         std::vector<std::vector<size_t>> dst_offsets;
@@ -1384,6 +1342,9 @@ std::vector<bool> execute_tensor_into_plan_transfers(
                 const size_t row_bytes = static_cast<size_t>(shard_extent) *
                                          static_cast<size_t>(elements_after) *
                                          formula.element_size;
+                if (row_bytes == 0) {
+                    continue;
+                }
                 dst_offsets[shard_rank].reserve(
                     static_cast<size_t>(elements_before));
                 src_offsets[shard_rank].reserve(
@@ -1431,10 +1392,26 @@ std::vector<bool> execute_tensor_into_plan_transfers(
             }
         }
 
+        if (keys.empty()) {
+            if (plan.materialized_metadata.has_value()) {
+                std::memcpy(reinterpret_cast<void *>(plan.user_buffer_ptr),
+                            &*plan.materialized_metadata,
+                            sizeof(TensorMetadata));
+                success[plan_idx] = true;
+            }
+            continue;
+        }
+
+        buffers.push_back(reinterpret_cast<void *>(plan.registered_buffer_ptr));
+        transfer_plan_indices.push_back(plan_idx);
         all_keys.push_back(std::move(keys));
         all_dst_offsets.push_back(std::move(dst_offsets));
         all_src_offsets.push_back(std::move(src_offsets));
         all_sizes.push_back(std::move(sizes));
+    }
+
+    if (transfer_plan_indices.empty()) {
+        return success;
     }
 
     std::vector<std::vector<std::vector<int64_t>>> range_results;
@@ -1462,36 +1439,38 @@ std::vector<bool> execute_tensor_into_plan_transfers(
                                               : &merged_query_result_cache);
     }
 
-    for (size_t i = 0; i < plans.size(); ++i) {
+    for (size_t i = 0; i < transfer_plan_indices.size(); ++i) {
+        const size_t plan_idx = transfer_plan_indices[i];
         if (i >= range_results.size() ||
             range_results[i].size() != all_sizes[i].size()) {
             continue;
         }
 
-        success[i] = true;
-        for (size_t key_idx = 0; key_idx < all_sizes[i].size() && success[i];
-             ++key_idx) {
+        success[plan_idx] = true;
+        for (size_t key_idx = 0;
+             key_idx < all_sizes[i].size() && success[plan_idx]; ++key_idx) {
             if (range_results[i][key_idx].size() !=
                 all_sizes[i][key_idx].size()) {
-                success[i] = false;
+                success[plan_idx] = false;
                 break;
             }
             for (size_t frag_idx = 0; frag_idx < all_sizes[i][key_idx].size();
                  ++frag_idx) {
                 if (range_results[i][key_idx][frag_idx] !=
                     static_cast<int64_t>(all_sizes[i][key_idx][frag_idx])) {
-                    success[i] = false;
+                    success[plan_idx] = false;
                     break;
                 }
             }
         }
-        if (!success[i]) {
+        if (!success[plan_idx]) {
             continue;
         }
-        if (plans[i].materialized_metadata.has_value()) {
-            std::memcpy(reinterpret_cast<void *>(plans[i].user_buffer_ptr),
-                        &*plans[i].materialized_metadata,
-                        sizeof(TensorMetadata));
+        if (plans[plan_idx].materialized_metadata.has_value()) {
+            std::memcpy(
+                reinterpret_cast<void *>(plans[plan_idx].user_buffer_ptr),
+                &*plans[plan_idx].materialized_metadata,
+                sizeof(TensorMetadata));
         }
     }
     return success;

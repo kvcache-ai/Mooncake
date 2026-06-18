@@ -23,6 +23,7 @@
 
 #include "allocation_strategy.h"
 #include "count_min_sketch.h"
+#include "deadline_scheduler.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -296,6 +297,13 @@ class MasterService {
      */
     auto GetReplicaList(const std::string& key, const std::string& tenant_id)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
+     * @brief Get replica lists for a batch of objects.
+     */
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys,
+                        const std::string& tenant_id);
 
     /**
      * @brief Start a put operation for an object
@@ -854,6 +862,8 @@ class MasterService {
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
         const bool hard_pinned{false};          // immutable, set at creation
+        bool memory_cache_total_accounted{false};
+        bool disk_cache_total_accounted{false};
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -1165,6 +1175,20 @@ class MasterService {
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
+    static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
+    static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
+    static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
+    void RebuildCacheTotalAccounting();
+    static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
+    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn);
+    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata);
+    size_t EraseReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn);
+
     std::unordered_map<std::string, std::string> object_group_ids_
         GUARDED_BY(group_routing_mutex_);
     mutable std::unordered_set<std::string> groups_needing_lease_refresh_
@@ -1316,35 +1340,13 @@ class MasterService {
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica);
 
-    // Graceful unmount scheduler
-    class GracefulUnmountScheduler {
-       public:
-        explicit GracefulUnmountScheduler(MasterService* service);
-        ~GracefulUnmountScheduler();
-        void Schedule(const UUID& segment_id, const UUID& client_id,
-                      std::chrono::steady_clock::time_point expire_time);
-        void RemoveClientRecords(const UUID& client_id);
-        void Stop();
+    struct GracefulUnmountDeadlineRecord {
+        UUID segment_id;
+        UUID client_id;
+    };
 
-       private:
-        void TimerLoop();
-        struct Record {
-            UUID segment_id;
-            UUID client_id;
-            std::chrono::steady_clock::time_point expire_time;
-            bool operator>(const Record& other) const {
-                return expire_time > other.expire_time;
-            }
-        };
-        MasterService* service_;
-        std::mutex mutex_;
-        std::priority_queue<Record, std::vector<Record>, std::greater<Record>>
-            queue_;
-        std::thread timer_thread_;
-        std::atomic<bool> timer_running_{false};
-        bool stopping_{false};
-        std::condition_variable timer_cv_;
-    } graceful_unmount_scheduler_;
+    DeadlineScheduler<GracefulUnmountDeadlineRecord>
+        graceful_unmount_scheduler_;
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
@@ -1445,9 +1447,10 @@ class MasterService {
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
                 // replicas.
-                it_->second.EraseReplicas([](const Replica& replica) {
-                    return replica.has_invalid_mem_handle();
-                });
+                service_->EraseReplicasWithCacheTotalAccounting(
+                    it_->second, [](const Replica& replica) {
+                        return replica.has_invalid_mem_handle();
+                    });
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
                     const bool had_processing =

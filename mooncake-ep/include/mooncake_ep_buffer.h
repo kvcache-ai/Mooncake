@@ -43,7 +43,7 @@ struct BufferPair {
         size_t signaling_buffer_bytes = num_experts * sizeof(int);
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
-            (2 * sizeof(int4) + hidden * sizeof(nv_bfloat16));
+            (2 * sizeof(int4) + hidden * EP_BF16_SIZE);
         for (int i = 0; i < 2; ++i) {
             size_t rdma_base_offset = total_bytes +
                                       2 * i * signaling_buffer_bytes +
@@ -74,6 +74,7 @@ struct MooncakeEpBuffer {
 
     // GDR buffer — owned by p2p_transport_
     int buffer_idx{};
+    int phase_epochs[2]{};
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 

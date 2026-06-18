@@ -635,6 +635,7 @@ The Transfer Engine respects the following environment variables:
 - `MC_TCP_BIND_ADDRESS`: Specifies the TCP bind address
 - `MC_RDMA_BIND_ADDRESS`: Specifies the RDMA bind address for NIC path construction in dual-NIC environments. When set, RDMA NIC paths use this address while TCP handshake uses the address from `local_hostname`. This is useful when TCP and RDMA traffic use separate network interfaces (e.g., `eth0` for TCP and `rdma-net1` for RDMA).
 - `MC_CUSTOM_TOPO_JSON`: Path to custom topology JSON file
+- `MC_TE_FILTERS`: Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on"). **Note:** Not supported when using Transfer Engine TENT.
 - `MC_TE_METRIC_INTERVAL_SECONDS`: Sets metrics reporting interval in seconds
 
