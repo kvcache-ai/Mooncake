@@ -342,34 +342,26 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
-                                              int access,
-                                              MemoryRegionMeta &mrMeta) {
-    if (length > (size_t)globalConfig().max_mr_size) {
-        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
-                      << "shrink it to " << globalConfig().max_mr_size;
-        length = (size_t)globalConfig().max_mr_size;
-    }
+int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
+    out = DmabufExport{};
+    (void)addr;  // unused on the host-only (#else) build
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA)
-    // Implement register memory in a way that does not assume the presence of
-    // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
-    // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
-    // nvidia-peermem.
+    // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
+    // memory uses the plain ibv_reg_mr() path. GPU memory is exported once as a
+    // dma_buf fd that every NIC then imports, so the driver keeps a single
+    // BAR1 window for the buffer instead of one per NIC.
     CUmemorytype memType;
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
-    // Register memory depending on whether memory is on host or GPU.
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                Environ::Get().GetWithNvidiaPeermem()) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
 #endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
 #if defined(USE_CUDA)
@@ -406,6 +398,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         }
 
         int dmabuf_fd;
+        // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
+        // on some GPU/driver combinations (e.g. B200).
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, allocBase, allocSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
@@ -420,17 +414,9 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #endif
             return ERR_CONTEXT;
         }
-        mrMeta.addr = addr;
-        uint64_t dmabuf_offset = (uintptr_t)addr - (uintptr_t)allocBase;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, dmabuf_offset, length,
-                                      (uintptr_t)addr, dmabuf_fd, access);
-        const int regErrno = errno;
-        if (close(dmabuf_fd) != 0) {
-            PLOG(WARNING) << "Failed to close dmabuf fd";
-        }
-        if (!mrMeta.mr) {
-            errno = regErrno;
-        }
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = dmabuf_fd;
+        out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
 #if defined(USE_CUDA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -442,8 +428,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     if (hipRes != hipSuccess || hipAttr.type == hipMemoryTypeHost ||
         hipAttr.type == hipMemoryTypeUnregistered) {
         // Host memory — standard ibv_reg_mr() path.
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
     } else if (hipAttr.type == hipMemoryTypeManaged) {
         // Managed (unified) memory pages can migrate between host and device;
         // hsa_amd_portable_export_dmabuf captures the device-side handle at
@@ -452,17 +437,15 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         LOG(WARNING) << "HIP managed memory at " << (uintptr_t)addr
                      << " — dmabuf export skipped (pages may migrate); "
                         "falling back to ibv_reg_mr";
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
     } else if (hipAttr.type == hipMemoryTypeDevice &&
                !isKernelDmabufSupported()) {
         // Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY —
         // ibv_reg_dmabuf_mr may succeed but transfers will silently fail.
-        // Fail at registration time instead.
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        // Fall back to ibv_reg_mr() instead.
+        out.method = DmabufExport::Method::kHostReg;
     } else if (hipAttr.type == hipMemoryTypeDevice) {
-        // Device memory + kernel support — export dmabuf fd and register.
+        // Device memory + kernel support — export the dmabuf fd.
         // Pin to the owning device for the duration of the export calls.
         struct HipDeviceGuard {
             int prev_device = 0;
@@ -513,23 +496,52 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
             return ERR_CONTEXT;
         }
 
-        mrMeta.addr = addr;
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = dmabuf_fd;
         // Offset within the dmabuf-backed region: distance from the
         // allocation base, plus any offset hsa returned for the export.
-        uint64_t reg_offset =
+        out.offset =
             (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, reg_offset, length, (uintptr_t)addr,
-                                      dmabuf_fd, access);
-        const int regErrno = errno;
-        if (close(dmabuf_fd) != 0) {
-            PLOG(WARNING) << "Failed to close dmabuf fd";
-        }
-        if (!mrMeta.mr) {
-            errno = regErrno;
-        }
     }
 #else
+    out.method = DmabufExport::Method::kHostReg;
+#endif
+    return 0;
+}
+
+void RdmaContext::closeDmabufExport(DmabufExport &exp) {
+    if (exp.fd >= 0) {
+        if (close(exp.fd) != 0) {
+            PLOG(WARNING) << "Failed to close dmabuf fd";
+        }
+        exp.fd = -1;
+    }
+}
+
+int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
+                                              int access,
+                                              const DmabufExport &exp,
+                                              MemoryRegionMeta &mrMeta) {
+    if (length > (size_t)globalConfig().max_mr_size) {
+        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
+                      << "shrink it to " << globalConfig().max_mr_size;
+        length = (size_t)globalConfig().max_mr_size;
+    }
     mrMeta.addr = addr;
+#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
+    defined(USE_HIP_DMABUF)
+    if (exp.method == DmabufExport::Method::kDmabufReg) {
+        // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
+        // by the caller until every NIC has registered; this MR takes its own
+        // reference, so all NICs share one dma_buf object (and one BAR1
+        // window).
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, exp.offset, length, (uintptr_t)addr,
+                                      exp.fd, access);
+    } else {
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    }
+#else
+    (void)exp;
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
@@ -539,15 +551,30 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     return 0;
 }
 
-int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
+                                      const DmabufExport &exp) {
     MemoryRegionMeta mrMeta;
-    int ret = registerMemoryRegionInternal(addr, length, access, mrMeta);
+    int ret = registerMemoryRegionInternal(addr, length, access, exp, mrMeta);
     if (ret != 0) {
         return ret;
     }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
     memory_region_map_[reinterpret_cast<uintptr_t>(mrMeta.addr)] = mrMeta;
     return 0;
+}
+
+int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    // Single-NIC convenience path: export, register, and close the fd here.
+    // The shared-fd benefit only matters when a buffer is registered against
+    // multiple NICs (see RdmaTransport::registerLocalMemoryInternal).
+    DmabufExport exp;
+    int ret = exportDmabuf(addr, exp);
+    if (ret != 0) {
+        return ret;
+    }
+    ret = registerMemoryRegion(addr, length, access, exp);
+    closeDmabufExport(exp);
+    return ret;
 }
 
 int RdmaContext::unregisterMemoryRegion(void *addr) {
@@ -565,9 +592,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
 }
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
+    DmabufExport exp;
+    int ret = exportDmabuf(addr, exp);
+    if (ret != 0) {
+        return ret;
+    }
     MemoryRegionMeta mrMeta;
-    int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
-                                           mrMeta);
+    ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
+                                       exp, mrMeta);
+    // The MR (if created) holds its own reference, so closing the fd now is
+    // safe and does not affect the subsequent dereg.
+    closeDmabufExport(exp);
     if (ret != 0) {
         return ret;
     }
