@@ -240,12 +240,24 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    std::vector<PromotionTaskItem> queued_tasks_to_release;
+    {
+        std::lock_guard<std::mutex> lock(promotion_queue_mutex_);
+        while (!promotion_task_queue_.empty()) {
+            queued_tasks_to_release.push_back(
+                std::move(promotion_task_queue_.front()));
+            promotion_task_queue_.pop_front();
+        }
+    }
     promotion_workers_running_.store(false);
     promotion_queue_cv_.notify_all();
     for (auto& worker : promotion_worker_threads_) {
         if (worker.joinable()) {
             worker.join();
         }
+    }
+    for (const auto& task : queued_tasks_to_release) {
+        ReleasePromotionTask(task.key, task.tenant_id);
     }
 }
 
@@ -321,6 +333,14 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return scan_meta_result;
     }
 
+    if (config_.promotion_worker_threads > 0) {
+        promotion_workers_running_.store(true);
+        promotion_worker_threads_.reserve(config_.promotion_worker_threads);
+        for (uint32_t i = 0; i < config_.promotion_worker_threads; ++i) {
+            promotion_worker_threads_.emplace_back(
+                &FileStorage::PromotionWorkerThreadFunc, this);
+        }
+    }
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
@@ -335,14 +355,6 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     client_buffer_gc_running_.store(true);
     client_buffer_gc_thread_ =
         std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
-    promotion_workers_running_.store(true);
-    const uint32_t worker_count =
-        std::max<uint32_t>(1, config_.promotion_worker_threads);
-    promotion_worker_threads_.reserve(worker_count);
-    for (uint32_t i = 0; i < worker_count; ++i) {
-        promotion_worker_threads_.emplace_back(
-            &FileStorage::PromotionWorkerThreadFunc, this);
-    }
     return {};
 }
 
@@ -714,29 +726,29 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<PromotionTaskItem> promotion_objects;
-    auto heartbeat_result =
-        client_->PromotionObjectHeartbeat(promotion_objects);
-    if (!heartbeat_result) {
-        // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
-        // first heartbeat tick if the master forgets us (e.g. across a master
-        // restart): benign no-op until next ReMount.
-        if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
-            return {};
-        }
-        LOG(WARNING) << "PromotionObjectHeartbeat failed: "
-                     << heartbeat_result.error();
-        return tl::make_unexpected(heartbeat_result.error());
-    }
-    if (promotion_objects.empty()) {
-        return {};
-    }
-
-    VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
-            << " promotion candidate(s) from master";
-
     const std::vector<std::string> sync_preferred_segments;
     if (!promotion_workers_running_.load()) {
+        std::vector<PromotionTaskItem> promotion_objects;
+        auto heartbeat_result =
+            client_->PromotionObjectHeartbeat(promotion_objects);
+        if (!heartbeat_result) {
+            // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
+            // first heartbeat tick if the master forgets us (e.g. across a
+            // master restart): benign no-op until next ReMount.
+            if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+                return {};
+            }
+            LOG(WARNING) << "PromotionObjectHeartbeat failed: "
+                         << heartbeat_result.error();
+            return tl::make_unexpected(heartbeat_result.error());
+        }
+        if (promotion_objects.empty()) {
+            return {};
+        }
+
+        VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
+                << " promotion candidate(s) from master";
+
         // Preserve pre-worker semantics for tests and pre-Init callers.
         for (const auto& task : promotion_objects) {
             (void)ProcessPromotionTask(task, sync_preferred_segments);
@@ -744,89 +756,81 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         return {};
     }
 
-    // Hand off execution to background workers. Keep pulling from the master
-    // until the local queue reaches its soft budget so backlog drain is no
-    // longer gated by one PromotionObjectHeartbeat call per client tick.
-    size_t queue_depth = 0;
+    // Hand off execution to background workers. The capacity is a soft pull
+    // budget: once the master extracts a task, keep it locally instead of
+    // cancelling promotion because of transient client-side backlog.
+    size_t available_queue_slots = 0;
     {
         std::lock_guard<std::mutex> lock(promotion_queue_mutex_);
-        queue_depth = promotion_task_queue_.size();
+        if (config_.promotion_queue_capacity > 0) {
+            if (promotion_task_queue_.size() >=
+                config_.promotion_queue_capacity) {
+                VLOG(1) << "ProcessPromotionTasks skipped master pull because "
+                        << "local promotion queue is full: queue_depth="
+                        << promotion_task_queue_.size() << ", queue_capacity="
+                        << config_.promotion_queue_capacity;
+                return {};
+            }
+            available_queue_slots =
+                config_.promotion_queue_capacity - promotion_task_queue_.size();
+        }
     }
 
     const size_t worker_count =
-        std::max<size_t>(1, config_.promotion_worker_threads);
+        std::max<size_t>(1, promotion_worker_threads_.size());
     const size_t drain_batch_size =
         std::max<size_t>(1, config_.promotion_drain_batch_size);
     size_t remaining_pull_budget = worker_count * drain_batch_size;
-
     if (config_.promotion_queue_capacity > 0) {
-        if (queue_depth >= config_.promotion_queue_capacity) {
-            VLOG(1) << "ProcessPromotionTasks skipped master pull because "
-                    << "local promotion queue is full: queue_depth="
-                    << queue_depth
-                    << ", queue_capacity=" << config_.promotion_queue_capacity;
-            return {};
-        }
         remaining_pull_budget =
-            std::min<size_t>(remaining_pull_budget,
-                             config_.promotion_queue_capacity - queue_depth);
+            std::min<size_t>(remaining_pull_budget, available_queue_slots);
+    }
+    if (remaining_pull_budget == 0) {
+        return {};
     }
 
     size_t pulled_tasks = 0;
     size_t enqueued_tasks = 0;
-    size_t released_tasks = 0;
     size_t heartbeat_rounds = 0;
-    auto enqueue_batch = [this, &enqueued_tasks,
-                          &released_tasks](const auto& tasks) {
+    auto enqueue_batch = [this, &enqueued_tasks](const auto& tasks) {
         for (const auto& task : tasks) {
-            if (EnqueuePromotionTask(task)) {
-                ++enqueued_tasks;
-            } else {
-                ReleasePromotionTask(task.key, task.tenant_id);
-                ++released_tasks;
-            }
+            const bool enqueued = EnqueuePromotionTask(
+                task, /*allow_over_capacity_for_pulled_task=*/
+                config_.promotion_queue_capacity > 0);
+            CHECK(enqueued)
+                << "Promotion queue capacity changed after pull planning";
+            ++enqueued_tasks;
         }
     };
 
-    enqueue_batch(promotion_objects);
-    pulled_tasks += promotion_objects.size();
-    ++heartbeat_rounds;
-
     while (pulled_tasks < remaining_pull_budget) {
-        std::vector<PromotionTaskItem> extra_promotion_objects;
-        auto extra_heartbeat_result =
-            client_->PromotionObjectHeartbeat(extra_promotion_objects);
+        std::vector<PromotionTaskItem> promotion_objects;
+        auto heartbeat_result =
+            client_->PromotionObjectHeartbeat(promotion_objects);
         ++heartbeat_rounds;
-        if (!extra_heartbeat_result) {
-            if (extra_heartbeat_result.error() ==
-                ErrorCode::SEGMENT_NOT_FOUND) {
+        if (!heartbeat_result) {
+            if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
                 return {};
             }
             LOG(WARNING) << "PromotionObjectHeartbeat failed after pulling "
                          << pulled_tasks << " promotion candidate(s): "
-                         << extra_heartbeat_result.error();
-            return tl::make_unexpected(extra_heartbeat_result.error());
+                         << heartbeat_result.error();
+            return tl::make_unexpected(heartbeat_result.error());
         }
-        if (extra_promotion_objects.empty()) {
+        if (promotion_objects.empty()) {
             break;
         }
 
-        pulled_tasks += extra_promotion_objects.size();
-        enqueue_batch(extra_promotion_objects);
-
-        if (config_.promotion_queue_capacity > 0) {
-            std::lock_guard<std::mutex> lock(promotion_queue_mutex_);
-            if (promotion_task_queue_.size() >=
-                config_.promotion_queue_capacity) {
-                break;
-            }
-        }
+        pulled_tasks += promotion_objects.size();
+        VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
+                << " promotion candidate(s) from master";
+        enqueue_batch(promotion_objects);
     }
 
     VLOG(1) << "ProcessPromotionTasks pulled " << pulled_tasks
             << " promotion candidate(s) from master in " << heartbeat_rounds
             << " heartbeat round(s), enqueued " << enqueued_tasks
-            << ", released " << released_tasks;
+            << ", queue_capacity=" << config_.promotion_queue_capacity;
     return {};
 }
 
@@ -842,6 +846,8 @@ FileStorage::PromotionExecutionResult FileStorage::ProcessPromotionTask(
     if (size <= 0) {
         LOG(WARNING) << "Skipping promotion for key=" << key
                      << " with non-positive size=" << size;
+        ReleasePromotionTask(key, tenant_id);
+        result.notify_failure_attempted = true;
         result.terminal_error = ErrorCode::INVALID_PARAMS;
         return result;
     }
@@ -920,14 +926,16 @@ FileStorage::PromotionExecutionResult FileStorage::ProcessPromotionTask(
     return result;
 }
 
-bool FileStorage::EnqueuePromotionTask(const PromotionTaskItem& task) {
+bool FileStorage::EnqueuePromotionTask(
+    const PromotionTaskItem& task, bool allow_over_capacity_for_pulled_task) {
     std::lock_guard<std::mutex> lock(promotion_queue_mutex_);
     if (!promotion_workers_running_.load()) {
         LOG(WARNING) << "Promotion workers are not running, rejecting key="
                      << task.key;
         return false;
     }
-    if (config_.promotion_queue_capacity > 0 &&
+    if (!allow_over_capacity_for_pulled_task &&
+        config_.promotion_queue_capacity > 0 &&
         promotion_task_queue_.size() >= config_.promotion_queue_capacity) {
         LOG(WARNING) << "Promotion queue full (" << promotion_task_queue_.size()
                      << "), rejecting key=" << task.key;

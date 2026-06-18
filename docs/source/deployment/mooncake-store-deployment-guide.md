@@ -292,9 +292,11 @@ mooncake_master \
 
 ---
 
-### Tiered Storage with SSD Offload — Cost-Effective Capacity
+### Tiered Storage with SSD Offload - Cost-Effective Capacity
 
 Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`.
+
+Promotion execution runs on the FileStorage holder client. By default one background worker drains promotion tasks outside the heartbeat thread. Increase `MOONCAKE_OFFLOAD_PROMOTION_WORKER_THREADS` only when SSD bandwidth, network bandwidth, and DRAM allocation headroom can absorb more concurrent L2-to-L1 copies.
 
 ```bash
 mooncake_master \
@@ -502,6 +504,16 @@ Flags for controlling data movement between DRAM and SSD.
 | `--enable_disk_eviction` | `true` | Enable disk eviction |
 
 Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued.
+
+FileStorage holder clients also accept the following environment variables:
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `MOONCAKE_OFFLOAD_PROMOTION_WORKER_THREADS` | `1` | Background workers used to execute L2-to-L1 promotion tasks; `0` falls back to synchronous heartbeat execution |
+| `MOONCAKE_OFFLOAD_PROMOTION_QUEUE_CAPACITY` | `1024` | Soft local backlog cap used to limit additional promotion pulls from the master |
+| `MOONCAKE_OFFLOAD_PROMOTION_DRAIN_BATCH_SIZE` | `64` | Max promotion heartbeat pulls per worker per FileStorage heartbeat tick |
+
+Keep the default worker count for latency-sensitive deployments. Raising it can drain bursty HiCache prefix-hit promotion backlogs faster, but it also increases SSD reads, transfer writes, and memory allocation pressure.
 
 ### CXL Memory
 

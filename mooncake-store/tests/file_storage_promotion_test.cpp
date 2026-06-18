@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <set>
 #include <thread>
 
@@ -41,21 +42,6 @@ class FakeClient : public Client {
     tl::expected<void, ErrorCode> heartbeat_result =
         tl::expected<void, ErrorCode>{};
     size_t heartbeat_batch_limit = 1;
-    std::vector<OffloadTaskItem> offload_heartbeat_queue;
-    tl::expected<void, ErrorCode> offload_heartbeat_result =
-        tl::expected<void, ErrorCode>{};
-
-    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
-        bool enable_offloading,
-        std::vector<OffloadTaskItem>& offloading_objects) override {
-        (void)enable_offloading;
-        offload_heartbeat_calls.fetch_add(1);
-        if (!offload_heartbeat_result.has_value()) {
-            return tl::make_unexpected(offload_heartbeat_result.error());
-        }
-        offloading_objects = offload_heartbeat_queue;
-        return {};
-    }
 
     tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects) override {
@@ -149,6 +135,7 @@ class FakeClient : public Client {
         const std::string& key, const std::string& tenant_id) override {
         (void)tenant_id;
         notify_calls.fetch_add(1);
+        std::lock_guard<std::mutex> lock(record_mutex);
         notify_keys.push_back(key);
         auto it = notify_overrides.find(key);
         if (it != notify_overrides.end()) {
@@ -172,16 +159,17 @@ class FakeClient : public Client {
         const std::string& key, const std::string& tenant_id) override {
         (void)tenant_id;
         notify_failure_calls.fetch_add(1);
+        std::lock_guard<std::mutex> lock(record_mutex);
         notify_failure_keys.push_back(key);
         return {};
     }
 
     std::atomic<int> heartbeat_calls{0};
-    std::atomic<int> offload_heartbeat_calls{0};
     std::atomic<int> alloc_calls{0};
     std::atomic<int> write_calls{0};
     std::atomic<int> notify_calls{0};
     std::atomic<int> notify_failure_calls{0};
+    std::mutex record_mutex;
     std::vector<std::string> notify_keys;
     std::vector<std::string> notify_failure_keys;
     std::string last_alloc_key;
@@ -229,14 +217,6 @@ class FileStoragePromotionTest : public ::testing::Test {
 
     tl::expected<void, ErrorCode> CallProcessPromotionTasks() {
         return file_storage->ProcessPromotionTasks();
-    }
-
-    tl::expected<void, ErrorCode> CallHeartbeat() {
-        return file_storage->Heartbeat();
-    }
-
-    void SetEnableOffloadingForHeartbeat(bool enabled) {
-        file_storage->enable_offloading_ = enabled;
     }
 
     void StartPromotionWorkers(size_t worker_count = 1) {
@@ -353,21 +333,6 @@ TEST_F(FileStoragePromotionTest, EmptyQueueDoesNotEnqueueWorkerTask) {
     EXPECT_TRUE(PromotionQueueEmpty());
 }
 
-TEST_F(FileStoragePromotionTest,
-       HeartbeatStillProcessesPromotionWithoutOffloadWork) {
-    SetEnableOffloadingForHeartbeat(true);
-    SeedPromotionObject("k_heartbeat", 1024);
-    fake->offload_heartbeat_queue = {};
-    fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_heartbeat", .size = 1024}};
-
-    auto res = CallHeartbeat();
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->offload_heartbeat_calls.load(), 1);
-    EXPECT_EQ(fake->heartbeat_calls.load(), 1);
-    EXPECT_EQ(fake->alloc_calls.load(), 1);
-}
-
 // Heartbeat returns SEGMENT_NOT_FOUND (transient post-restart):
 // swallow silently, no error to caller.
 TEST_F(FileStoragePromotionTest, HeartbeatSegmentNotFoundIsBenign) {
@@ -386,20 +351,25 @@ TEST_F(FileStoragePromotionTest, HeartbeatHardErrorPropagates) {
     EXPECT_EQ(fake->alloc_calls.load(), 0);
 }
 
-// Non-positive size in queue: skip that key, continue.
-TEST_F(FileStoragePromotionTest, NonPositiveSizeSkipped) {
+// Non-positive size in queue: release the master slot and continue.
+TEST_F(FileStoragePromotionTest, NonPositiveSizeNotifiesMasterAndContinues) {
+    SeedPromotionObject("k_good", 1024);
+    fake->heartbeat_batch_limit = 2;
     fake->heartbeat_queue = {
         {.tenant_id = "default", .key = "k_bad", .size = 0},
         {.tenant_id = "default", .key = "k_good", .size = 1024}};
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());
-    // Only k_good should reach AllocStart.
     EXPECT_EQ(fake->alloc_calls.load(), 1);
     EXPECT_EQ(fake->last_alloc_key, "k_good");
+    EXPECT_EQ(fake->notify_calls.load(), 1);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+    ASSERT_EQ(fake->notify_failure_keys.size(), 1u);
+    EXPECT_EQ(fake->notify_failure_keys[0], "k_bad");
 }
 
 // PromotionAllocStart fails (e.g. master out of DRAM): skip key, no
-// write, no notify, advance to next.
+// write, no success notify, release the master slot, and advance to next.
 TEST_F(FileStoragePromotionTest, AllocStartFailureSkipsKey) {
     fake->alloc_overrides["k1"] = ErrorCode::NO_AVAILABLE_HANDLE;
     auto res = DrainAllPromotionTasks({{"k1", 1024}, {"k2", 1024}});
@@ -411,8 +381,8 @@ TEST_F(FileStoragePromotionTest, AllocStartFailureSkipsKey) {
     EXPECT_LE(fake->notify_calls.load(), 1);
 }
 
-// BatchLoad failure (SSD file missing): no PromotionWrite, no Notify.
-// Master-side reaper handles the orphaned PROCESSING replica.
+// BatchLoad failure (SSD file missing): no PromotionWrite or success notify.
+// FileStorage reports failure so the master can release the slot immediately.
 TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
     fake->heartbeat_queue = {
         {.tenant_id = "default", .key = "k_missing", .size = 1024}};
@@ -428,7 +398,7 @@ TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
         << "NotifyPromotionSuccess must not run if BatchLoad failed";
 }
 
-// PromotionWrite failure: no Notify.
+// PromotionWrite failure: no success notify.
 TEST_F(FileStoragePromotionTest, TransferWriteFailureLeavesNoNotify) {
     fake->heartbeat_queue = {
         {.tenant_id = "default", .key = "k_te_fail", .size = 1024}};
@@ -527,12 +497,33 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     EXPECT_EQ(got.count("k_notify_fail"), 1u);
 }
 
-TEST_F(FileStoragePromotionTest, QueueFullReleasesMasterSlotImmediately) {
+TEST_F(FileStoragePromotionTest, QueueFullStopsAdditionalMasterPulls) {
     file_storage->config_.promotion_queue_capacity = 1;
     StartPromotionWorkers();
     SeedPromotionObject("k1", 1024);
     SeedPromotionObject("k2", 1024);
     fake->write_delay = std::chrono::milliseconds(150);
+    fake->heartbeat_batch_limit = 1;
+    fake->heartbeat_queue = {
+        {.tenant_id = "default", .key = "k2", .size = 1024},
+        {.tenant_id = "default", .key = "k1", .size = 1024}};
+
+    auto res = CallProcessPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    WaitForCondition([this]() { return fake->alloc_calls.load() >= 1; },
+                     std::chrono::milliseconds(500));
+    EXPECT_EQ(fake->heartbeat_calls.load(), 1);
+    EXPECT_EQ(fake->alloc_calls.load(), 1);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 0);
+    EXPECT_EQ(fake->heartbeat_queue.size(), 1u);
+}
+
+TEST_F(FileStoragePromotionTest, PulledBatchCanExceedSoftQueueCapacity) {
+    file_storage->config_.promotion_queue_capacity = 1;
+    file_storage->config_.promotion_drain_batch_size = 4;
+    StartPromotionWorkers();
+    SeedPromotionObject("k1", 1024);
+    SeedPromotionObject("k2", 1024);
     fake->heartbeat_batch_limit = 2;
     fake->heartbeat_queue = {
         {.tenant_id = "default", .key = "k2", .size = 1024},
@@ -540,10 +531,11 @@ TEST_F(FileStoragePromotionTest, QueueFullReleasesMasterSlotImmediately) {
 
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());
-    WaitForCondition(
-        [this]() { return fake->notify_failure_calls.load() >= 1; },
-        std::chrono::milliseconds(500));
-    EXPECT_GE(fake->notify_failure_calls.load(), 1);
+    WaitForCondition([this]() { return fake->alloc_calls.load() == 2; },
+                     std::chrono::milliseconds(500));
+    EXPECT_EQ(fake->heartbeat_calls.load(), 1);
+    EXPECT_EQ(fake->alloc_calls.load(), 2);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 0);
 }
 
 TEST_F(FileStoragePromotionTest, WorkerDrainsQueuedTasks) {

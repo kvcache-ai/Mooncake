@@ -33,6 +33,9 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_PROMOTION_WORKER_THREADS");
+        UnsetEnv("MOONCAKE_OFFLOAD_PROMOTION_QUEUE_CAPACITY");
+        UnsetEnv("MOONCAKE_OFFLOAD_PROMOTION_DRAIN_BATCH_SIZE");
         data_path = std::filesystem::current_path().string() + "/data";
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
@@ -316,6 +319,13 @@ TEST_F(FileStorageTest, ReadUint32FromEnv) {
     EXPECT_EQ(config.promotion_worker_threads, 3u);
     EXPECT_EQ(config.promotion_queue_capacity, 2048u);
     EXPECT_EQ(config.promotion_drain_batch_size, 16u);
+}
+
+TEST_F(FileStorageTest, ZeroPromotionWorkersDisablesAsyncMode) {
+    SetEnv("MOONCAKE_OFFLOAD_PROMOTION_WORKER_THREADS", "0");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_EQ(config.promotion_worker_threads, 0u);
 }
 
 TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {

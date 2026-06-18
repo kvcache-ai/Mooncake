@@ -105,14 +105,20 @@ class FileStorage {
 
     /**
      * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
-     * Pulls promotion work from the master, stages a MEMORY replica for each
-     * key, copies the bytes from local SSD into that replica, and notifies the
-     * master on success. A failure on any single key is logged and skipped;
-     * the master-side reaper decrements the source replica's refcnt and
-     * erases the task entry on TTL expiry, and any orphaned PROCESSING
-     * MEMORY replica is reaped via the standard discarded-replicas path.
+
+     * * Pulls promotion work from the master, stages a MEMORY replica for each
+
+     * * key, copies the bytes from local SSD into that replica, and notifies
+     * the
+     * master on success. A failure on any single key is logged and
+     * skipped;
+     * FileStorage eagerly notifies the master to release the
+     * promotion slot,
+     * with the master-side reaper acting as the
+     * long-stop on missed failures.
      *
-     * @return tl::expected<void, ErrorCode> indicating operation status.
+     * @return tl::expected<void,
+     * ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
@@ -120,7 +126,8 @@ class FileStorage {
         const PromotionTaskItem& task,
         const std::vector<std::string>& preferred_segments);
 
-    bool EnqueuePromotionTask(const PromotionTaskItem& task);
+    bool EnqueuePromotionTask(const PromotionTaskItem& task,
+                              bool allow_over_capacity_for_pulled_task = false);
 
     void ReleasePromotionTask(const std::string& key,
                               const std::string& tenant_id);

@@ -227,7 +227,10 @@ struct FileStorageConfig {
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
     // Background worker settings for L2->L1 promotion-on-hit execution.
+    // Set promotion_worker_threads to 0 to disable async workers and fall back
+    // to the synchronous heartbeat path.
     uint32_t promotion_worker_threads = 1;
+    // Soft local backlog cap used to limit additional master pulls.
     uint32_t promotion_queue_capacity = 1024;
     uint32_t promotion_drain_batch_size = 64;
 
