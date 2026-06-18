@@ -1126,7 +1126,7 @@ int main(int argc, char* argv[]) {
                 mooncake::WrappedMasterServiceConfig(master_config, version));
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting);
+            master_config.enable_metric_reporting, master_config.rpc_address);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

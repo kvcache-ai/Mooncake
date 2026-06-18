@@ -221,3 +221,25 @@ TEST(UtilsTest, AutoPortBinderCustomRange) {
     EXPECT_GE(port, 50000);
     EXPECT_LE(port, 50100);
 }
+
+TEST(UtilsTest, StripBrackets_IPv6WithBrackets) {
+    EXPECT_EQ(stripBrackets("[::1]"), "::1");
+    EXPECT_EQ(stripBrackets("[2401:db00::1]"), "2401:db00::1");
+    EXPECT_EQ(stripBrackets("[fe80::a236:bcff:fecb:a1be%eno2]"),
+              "fe80::a236:bcff:fecb:a1be%eno2");
+    // Exactly two characters "[]" strips to empty string
+    EXPECT_EQ(stripBrackets("[]"), "");
+}
+
+TEST(UtilsTest, StripBrackets_NoBrackets) {
+    // IPv4 and hostnames are returned unchanged
+    EXPECT_EQ(stripBrackets("192.168.1.1"), "192.168.1.1");
+    EXPECT_EQ(stripBrackets("localhost"), "localhost");
+    EXPECT_EQ(stripBrackets("::1"), "::1");
+    // Address with port: trailing char is not ']'
+    EXPECT_EQ(stripBrackets("[::1]:8080"), "[::1]:8080");
+    // Empty string is returned unchanged
+    EXPECT_EQ(stripBrackets(""), "");
+    // Single character is returned unchanged
+    EXPECT_EQ(stripBrackets("["), "[");
+}

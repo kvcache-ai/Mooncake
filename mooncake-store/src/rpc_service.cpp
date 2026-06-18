@@ -20,6 +20,7 @@
 #include "master_service.h"
 #include "rpc_helper.h"
 #include "types.h"
+#include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
 
@@ -244,10 +245,11 @@ WrappedMasterService::WrappedMasterService(
 WrappedMasterService::~WrappedMasterService() = default;
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
-                                     bool enable_metric_reporting)
+                                     bool enable_metric_reporting,
+                                     const std::string& http_host)
     : http_port_(http_port),
       enable_metric_reporting_(enable_metric_reporting),
-      http_server_(4, http_port) {}
+      http_server_(4, http_port, stripBrackets(http_host)) {}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
 

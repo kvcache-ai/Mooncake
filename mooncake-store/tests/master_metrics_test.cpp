@@ -16,6 +16,7 @@
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
+#include "ha/leadership/master_service_supervisor.h"
 
 namespace mooncake::test {
 
@@ -594,6 +595,141 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_items(), 7);
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 3);
+}
+
+// Verify the 3-argument MasterAdminServer constructor with an explicit
+// http_host (covers rpc_service.cpp constructor + stripBrackets path).
+TEST_F(MasterMetricsTest, AdminServerWithExplicitHttpHost) {
+    const int http_port = getFreeTcpPort();
+    // Explicitly pass "0.0.0.0" to exercise the 3-argument constructor and
+    // the stripBrackets() code path inside rpc_service.cpp.
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false,
+                                   "0.0.0.0");
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
+
+    auto health_resp = FetchUrl(http_port, "/health");
+    EXPECT_EQ(health_resp.http_status, 200);
+    EXPECT_NE(health_resp.body.find("\"status\":\"ok\""), std::string::npos);
+
+    admin_server.Stop();
+}
+
+// Verify the 3-argument constructor with a bracketed address, simulating the
+// master.cpp code path: MasterAdminServer(port, enable_metric_reporting,
+// master_config.rpc_address) where rpc_address may be "[<ipv6>]".
+TEST_F(MasterMetricsTest, AdminServerWithBracketedAddress) {
+    const int http_port = getFreeTcpPort();
+    // Bracketed IPv4 exercises the same stripBrackets + 3-arg constructor path
+    // that master.cpp line 959 uses with master_config.rpc_address.
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false,
+                                   "[127.0.0.1]");
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
+
+    auto health_resp = FetchUrl(http_port, "/health");
+    EXPECT_EQ(health_resp.http_status, 200);
+    EXPECT_NE(health_resp.body.find("\"status\":\"ok\""), std::string::npos);
+
+    admin_server.Stop();
+}
+
+// Cover BuildMetricsText() and BuildMetricsSummaryText() via their HTTP
+// endpoints (/metrics and /metrics/summary).
+TEST_F(MasterMetricsTest, AdminServerMetricsEndpoints) {
+    const int http_port = getFreeTcpPort();
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false);
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+    admin_server.SetObservedLeader(ha::MasterView{
+        .leader_address = "10.0.0.1:19000",
+        .view_version = 42,
+    });
+
+    // Hit /metrics → exercises BuildMetricsText()
+    auto metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    // Response should be non-empty Prometheus-style text
+    EXPECT_FALSE(metrics_resp.body.empty());
+
+    // Hit /metrics/summary → exercises BuildMetricsSummaryText()
+    auto summary_resp = FetchUrl(http_port, "/metrics/summary");
+    EXPECT_EQ(summary_resp.http_status, 200);
+    // The summary includes role, state, service_ready, and leader info
+    EXPECT_NE(summary_resp.body.find("role="), std::string::npos);
+    EXPECT_NE(summary_resp.body.find("service_ready="), std::string::npos);
+    EXPECT_NE(summary_resp.body.find("view_version=42"), std::string::npos);
+
+    admin_server.Stop();
+}
+
+// Verify that WrappedMasterServiceConfig constructed from
+// MasterServiceSupervisorConfig correctly propagates rpc_address → http_host
+// (coverage for master_config.h line added in ipv6 commit).
+TEST_F(MasterMetricsTest, WrappedConfigFromSupervisorConfigHttpHost) {
+    MasterServiceSupervisorConfig supervisor_config;
+    // Fill all RequiredParam fields
+    supervisor_config.enable_metric_reporting = true;
+    supervisor_config.metrics_port = 9003;
+    supervisor_config.default_kv_lease_ttl = 10000;
+    supervisor_config.default_kv_soft_pin_ttl = 5000;
+    supervisor_config.allow_evict_soft_pinned_objects = false;
+    supervisor_config.eviction_ratio = 0.9;
+    supervisor_config.eviction_high_watermark_ratio = 0.95;
+    supervisor_config.client_live_ttl_sec = 30;
+    supervisor_config.enable_offload = false;
+    supervisor_config.rpc_port = 50051;
+    supervisor_config.rpc_thread_num = 4;
+
+    // IPv6 bracketed address is forwarded verbatim to http_host
+    supervisor_config.rpc_address = "[::1]";
+    WrappedMasterServiceConfig wrapped_ipv6(supervisor_config,
+                                            /*view_version=*/1);
+    EXPECT_EQ(wrapped_ipv6.http_host, "[::1]");
+    EXPECT_EQ(wrapped_ipv6.http_port, static_cast<uint16_t>(9003));
+    EXPECT_TRUE(wrapped_ipv6.enable_ha);
+
+    // Plain IPv4 address is also forwarded correctly
+    supervisor_config.rpc_address = "192.168.1.1";
+    WrappedMasterServiceConfig wrapped_ipv4(supervisor_config,
+                                            /*view_version=*/2);
+    EXPECT_EQ(wrapped_ipv4.http_host, "192.168.1.1");
+}
+
+// Cover the MasterAdminServer constructor call inside
+// MasterServiceSupervisor::Start() (master_service_supervisor.cpp lines
+// 463-469). We pre-bind the metrics port so admin_server.Start() fails with
+// EADDRINUSE, which is deterministic regardless of privileges.
+TEST_F(MasterMetricsTest, SupervisorStartCoversAdminServerCreation) {
+    // Pre-bind a port so the supervisor's admin server cannot bind to it.
+    AutoPortBinder port_holder;
+    const int occupied_port = port_holder.getPort();
+
+    MasterServiceSupervisorConfig config;
+    config.ha_backend_type = "etcd";
+    config.ha_backend_connstring = "http://127.0.0.1:1";
+    config.cluster_id = "test-cluster";
+    config.metrics_port = occupied_port;  // already bound → EADDRINUSE
+    config.enable_metric_reporting = false;
+    config.rpc_address = "[::1]";
+    config.rpc_port = 50051;
+    config.rpc_thread_num = 1;
+    config.default_kv_lease_ttl = 10000;
+    config.default_kv_soft_pin_ttl = 5000;
+    config.allow_evict_soft_pinned_objects = false;
+    config.eviction_ratio = 0.9;
+    config.eviction_high_watermark_ratio = 0.95;
+    config.client_live_ttl_sec = 30;
+    config.enable_offload = false;
+
+    ha::MasterServiceSupervisor supervisor(config);
+    // Start() should return -1 because the metrics port is already in use.
+    // The MasterAdminServer constructor with rpc_address is executed before
+    // the failure, covering the changed lines.
+    EXPECT_EQ(supervisor.Start(), -1);
 }
 
 // ---------------------------------------------------------------------------
