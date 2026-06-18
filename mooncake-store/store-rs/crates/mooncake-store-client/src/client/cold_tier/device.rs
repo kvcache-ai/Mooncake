@@ -1,3 +1,13 @@
+// Cold tier device management and admission control.
+//
+// Implements:
+// - StorageOwnerState::new() — cold tier runtime construction
+// - Device bootstrap, register, probe, reconcile lifecycle
+// - Device selection for offload (watermark + capacity checks)
+// - Two-tier admission control (ColdTierAdmission: runtime + per-device)
+// - Usage delta tracking (apply_cold_tier_usage_delta)
+// - Backend resolution (backend_for, backend_for_with_refresh)
+
 use super::super::{
     cold_tier_device_visible_in_cache, current_time_ms, refresh_cold_tier_device_cache,
     ClientRuntimeId, ColdTierAdmission, ColdTierAdmissionBucket, ColdTierAdmissionOp,
@@ -13,11 +23,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-/// Returns true if offload writes should be deferred when restore reads are
-/// active on the same device. This prevents write bandwidth from competing
-/// with latency-sensitive cold reads on the same SSD.
 /// Number of cold-tier replicas to write per object.  Default 1 (no extra
 /// replicas).  Set to 2 or 3 to spread read load across multiple devices.
+/// Controlled by env var `MC_STORE_RS_COLD_TIER_REPLICAS`.
 fn cold_tier_replica_count() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -29,6 +37,10 @@ fn cold_tier_replica_count() -> usize {
     })
 }
 
+/// Returns true if offload writes should be deferred when restore reads are
+/// active on the same device.  Prevents write bandwidth from competing with
+/// latency-sensitive cold reads on the same SSD.
+/// Controlled by env var `MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE`.
 fn throttle_offload_on_restore() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -81,6 +93,13 @@ impl StorageOwnerState {
         self.cold_tier_devices.crosses_critical(device, length)
     }
 
+    /// Conditionally assign cold backing metadata to a route at write time.
+    ///
+    /// In `Passthrough` mode, cold backing is assigned eagerly so the
+    /// background offload pipeline can begin materializing the SSD payload
+    /// immediately.  In `EvictTriggered` mode, returns `None` — cold
+    /// backing is deferred until eviction pressure forces the hot replica
+    /// out of DRAM.
     pub(in super::super) fn cold_backing_for_route(
         &self,
         route: &ObjectRoute,
@@ -96,6 +115,10 @@ impl StorageOwnerState {
         }
     }
 
+    /// Unconditionally create cold backing metadata in PendingOffload state.
+    /// Selects device(s) and constructs the object locator.  Called by
+    /// `cold_backing_for_route` in Passthrough mode; also called directly
+    /// during eviction-triggered offload.
     pub(in super::super) fn pending_cold_backing_for_route(
         &self,
         route: &ObjectRoute,
@@ -118,6 +141,9 @@ impl StorageOwnerState {
             );
             return Ok(None);
         };
+        // Object locator format: "<canonical_key>@v<version>".
+        // Encodes the route key and version so the SSD filename is unique
+        // per object version and decodable for restart recovery.
         let object_locator = format!(
             "{}@v{}",
             route
@@ -804,6 +830,13 @@ impl ColdTierDeviceManager {
         }
     }
 
+    /// Resolve a backend for the given cold backing, using a device snapshot
+    /// to lazily register backends not yet in the resolver.
+    ///
+    /// A device may have two IDs (device_id and cold_tier_id) when the
+    /// admin-assigned cold_tier_id differs from the internal device_id.
+    /// Both are registered as resolver aliases so that cold backing routes
+    /// referencing either ID resolve to the same backend.
     fn backend_for_from_snapshot(
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
@@ -834,6 +867,9 @@ impl ColdTierDeviceManager {
         if !resolver.has_backend(&device.device_id) {
             resolver.insert_backend(device.device_id.clone(), backend.clone());
         }
+        // Register alias: cold_tier_id may differ from device_id when the
+        // admin assigns a user-facing cold_tier_id distinct from the internal
+        // device_id.  Both must resolve to the same backend.
         if device.cold_tier_id != device.device_id && !resolver.has_backend(&device.cold_tier_id) {
             resolver.insert_backend(device.cold_tier_id.clone(), backend.clone());
         }
@@ -844,7 +880,7 @@ impl ColdTierDeviceManager {
         self.devices.lock().upsert(device);
     }
 
-    pub(in super::super) fn observability_snapshot(&self) -> super::super::ColdTierDeviceSnapshot {
+    pub(in super::super) fn observability_snapshot(&self) -> super::super::ColdTierDeviceCacheSummary {
         self.devices.lock().observability_snapshot()
     }
 

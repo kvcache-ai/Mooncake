@@ -1,5 +1,27 @@
 // Cold tier state types and admission control.
 // Included via `include!()` at module level in state_core.rs.
+//
+// Component hierarchy:
+//
+//   StorageOwnerState
+//     +-- ColdTierDeviceManager        device selection, backend resolution
+//     |     +-- ColdTierBackendResolver   backend I/O dispatch
+//     |     +-- SharedColdTierDeviceCache  process-global device state
+//     |     +-- ColdTierAdmission         two-tier rate limiting
+//     |           +-- OffloadPressureTracker  adaptive throttle
+//     +-- HotReplicaTracker             clock-based eviction tracking
+//
+// Types below are grouped into:
+//   1. Active — fully implemented, consumed by device.rs / builder.rs
+//   2. Forward-declared for offload pipeline
+//   3. Forward-declared for restore
+//   4. Forward-declared for cleanup / GC / compaction
+
+const DEFAULT_RESTORE_PROMOTION_QUEUE_LIMIT: usize = 1024;
+
+// ---------------------------------------------------------------------------
+// Active: device cache, device manager, admission control
+// ---------------------------------------------------------------------------
 
 /// Controls what happens to cold-tier routes and SSD data during `StoreClient::drop`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -23,9 +45,11 @@ pub(crate) struct ColdTierDeviceCache {
     devices: Vec<ColdTierDeviceRecord>,
 }
 
-#[allow(dead_code)]
+/// Aggregated observability summary of cached cold tier devices.
+/// Used by metrics export and diagnostic endpoints.
+#[allow(dead_code)] // consumed by observability/metrics export
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct ColdTierDeviceSnapshot {
+struct ColdTierDeviceCacheSummary {
     cache_initialized: bool,
     total_devices: usize,
     schedulable_devices: usize,
@@ -41,18 +65,18 @@ pub(crate) fn cold_tier_device_visible_in_cache(device: &ColdTierDeviceRecord) -
         && device.root_dir.is_some()
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // observability_snapshot called by metrics export
 impl ColdTierDeviceCache {
-    fn observability_snapshot(&self) -> ColdTierDeviceSnapshot {
+    fn observability_snapshot(&self) -> ColdTierDeviceCacheSummary {
         let visible_devices = self
             .devices
             .iter()
             .filter(|device| cold_tier_device_visible_in_cache(device))
             .collect::<Vec<_>>();
-        let mut snapshot = ColdTierDeviceSnapshot {
+        let mut snapshot = ColdTierDeviceCacheSummary {
             cache_initialized: self.refreshed_at.is_some(),
             total_devices: visible_devices.len(),
-            ..ColdTierDeviceSnapshot::default()
+            ..ColdTierDeviceCacheSummary::default()
         };
         let mut total_capacity = 0u64;
         let mut has_unknown_capacity = false;
@@ -115,6 +139,12 @@ impl ColdTierDeviceCache {
     }
 }
 
+/// Returns a process-global device cache for the given namespace.
+///
+/// Shared across all StoreClient instances in the same namespace so that
+/// background membership sync refreshes are visible to all clients without
+/// per-client polling.  Keyed by route namespace to isolate multi-tenant
+/// deployments within a single process.
 pub(crate) fn shared_cold_tier_device_cache(namespace: &str) -> SharedColdTierDeviceCache {
     static COLD_TIER_DEVICE_CACHES: OnceLock<Mutex<BTreeMap<String, SharedColdTierDeviceCache>>> =
         OnceLock::new();
@@ -126,7 +156,9 @@ pub(crate) fn shared_cold_tier_device_cache(namespace: &str) -> SharedColdTierDe
         .clone()
 }
 
-#[allow(dead_code)]
+/// Builder-to-runtime parameter bag for cold tier configuration.
+/// Consumed once by `StorageOwnerState::new()` to construct the device manager.
+#[allow(dead_code)] // fields consumed in StorageOwnerState::new (cold_tier/device.rs)
 struct StorageOwnerColdTierConfig {
     resolver: ColdTierBackendResolver,
     devices: SharedColdTierDeviceCache,
@@ -137,7 +169,8 @@ struct StorageOwnerColdTierConfig {
     runtime: ClientRuntimeId,
 }
 
-#[allow(dead_code)]
+/// Manages cold tier device selection, backend resolution, and watermark enforcement.
+#[allow(dead_code)] // StorageOwnerState field, consumed by offload/restore paths
 struct ColdTierDeviceManager {
     resolver: Mutex<ColdTierBackendResolver>,
     devices: SharedColdTierDeviceCache,
@@ -146,72 +179,64 @@ struct ColdTierDeviceManager {
     runtime: ClientRuntimeId,
 }
 
-#[allow(dead_code)]
-struct ColdTierOffloadManager {
-    queue: Mutex<PendingOffloadQueue>,
-    materializing: AtomicBool,
+/// Two-tier admission controller for cold tier I/O operations.
+///
+/// Architecture:
+/// - Offload (write): full token-bucket rate limiting at both runtime and
+///   device level, with health-based pause/probe after consecutive errors.
+/// - Restore (read): tracking only, no rejection.  Natural backpressure comes
+///   from the fixed-size staging pool and io_uring queue depth, which are
+///   more effective than algorithmic limits for read workloads.
+///
+/// When the offload queue grows, OffloadPressureTracker boosts offload
+/// concurrency to drain the backlog faster.
+#[allow(dead_code)] // constructed in device.rs, used by offload/restore admission
+struct ColdTierAdmission {
+    config: ColdTierRateLimitConfig,
+    runtime_offload: Mutex<ColdTierAdmissionBucket>,
+    runtime_restore: Mutex<ColdTierAdmissionBucket>,
+    devices: Mutex<BTreeMap<String, ColdTierDeviceAdmissionState>>,
+    pressure: OffloadPressureTracker,
 }
 
-#[allow(dead_code)]
-#[derive(Default)]
-struct ColdTierCleanupManager {
-    scheduler: Arc<Mutex<FreeSchedulerState>>,
+#[allow(dead_code)] // per-device admission state inside ColdTierAdmission
+struct ColdTierDeviceAdmissionState {
+    offload: ColdTierAdmissionBucket,
+    restore: ColdTierAdmissionBucket,
+    consecutive_errors: u32,
+    paused_until: Option<Instant>,
+    probe_in_flight: usize,
 }
 
-#[allow(dead_code)]
-struct ColdTierCleanupGuard {
-    scheduler: Arc<Mutex<FreeSchedulerState>>,
+/// Token-bucket rate limiter for a single resource (runtime or device).
+#[allow(dead_code)] // constructed in device.rs admission control
+struct ColdTierAdmissionBucket {
+    max_in_flight: usize,
+    ops_per_sec: u32,
+    tokens: f64,
+    last_refill: Instant,
+    in_flight: usize,
+}
+
+/// RAII permit returned by ColdTierAdmission::try_acquire.
+/// Decrements in-flight counters on drop.
+#[allow(dead_code)] // returned by try_acquire, consumed by offload/restore callers
+struct ColdTierAdmissionPermit {
+    admission: Arc<ColdTierAdmission>,
     device_id: String,
+    op: ColdTierAdmissionOp,
+    probe: bool,
+    released: AtomicBool,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct PendingOffloadQueueSnapshot {
-    total_pending: usize,
-    ready: usize,
-    delayed: usize,
-    max_attempts: u32,
-    total_attempts: u64,
-}
-
-#[allow(dead_code)]
-struct PendingOffloadQueue {
-    entries: VecDeque<PendingOffloadEntry>,
-    keys: BTreeSet<PendingOffloadKey>,
-    in_flight: BTreeSet<PendingOffloadKey>,
-    priority: ColdTierOffloadPriorityConfig,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct PendingOffloadKey {
-    route_key: ObjectKey,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct PendingOffloadEntry {
-    key: PendingOffloadKey,
-    route_version: RouteVersion,
-    attempts: u32,
-    not_before: Instant,
-    enqueued_at: Instant,
-    length_bytes: Option<u64>,
-}
-
-#[allow(dead_code)]
-struct ColdTierOffloadRunGuard<'a> {
-    manager: &'a ColdTierOffloadManager,
-}
-
-#[allow(dead_code)]
+#[allow(dead_code)] // discriminant for offload vs restore admission
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ColdTierAdmissionOp {
     Offload,
     Restore,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // rejection reason from try_acquire
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ColdTierAdmissionRejection {
     RuntimeLimit,
@@ -219,14 +244,13 @@ enum ColdTierAdmissionRejection {
     DevicePaused,
 }
 
-/// Tracks offload queue pressure to enable adaptive restore throttling.
+/// Tracks offload queue pressure to enable adaptive offload throttling.
 /// When the pending offload queue grows (indicating SSD write starvation),
-/// the effective restore concurrency limit is reduced proportionally,
-/// freeing SSD bandwidth for offload to catch up.
+/// offload concurrency is boosted to drain the backlog faster.
 ///
 /// Inspired by Linux balance_dirty_pages (throttle producers when consumer
 /// falls behind) and RocksDB write stall (linear slowdown based on backlog).
-#[allow(dead_code)]
+#[allow(dead_code)] // constructed in ColdTierAdmission, queried by offload scheduler
 pub(super) struct OffloadPressureTracker {
     /// Current pending offload queue depth.
     pending_depth: AtomicUsize,
@@ -237,13 +261,11 @@ pub(super) struct OffloadPressureTracker {
     /// Configuration thresholds.
     soft_threshold: usize,
     hard_threshold: usize,
-    restore_floor: usize,
-    restore_ceiling: usize,
     offload_boost: usize,
     stall_timeout_ms: u64,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // impl methods called by offload scheduler and admission
 impl OffloadPressureTracker {
     fn new(config: &ColdTierRateLimitConfig) -> Self {
         Self {
@@ -252,42 +274,9 @@ impl OffloadPressureTracker {
             epoch: Instant::now(),
             soft_threshold: config.pressure_soft_threshold.max(1),
             hard_threshold: config.pressure_hard_threshold.max(config.pressure_soft_threshold + 1),
-            restore_floor: config.pressure_restore_floor.max(1),
-            restore_ceiling: config.restore_device_max_in_flight.max(1),
             offload_boost: config.pressure_offload_boost.max(config.offload_device_max_in_flight),
             stall_timeout_ms: config.pressure_stall_timeout_ms.max(100),
         }
-    }
-
-    /// Compute effective restore device concurrency limit.
-    /// Linear ramp-down between soft and hard thresholds.
-    /// Also drops to floor immediately if offload is stalled (SSD write starvation).
-    ///
-    /// NOTE: No longer used in the admission path — restore admission is now
-    /// unconditional (track-only).  Kept for diagnostics / metrics export.
-    #[allow(dead_code)]
-    pub(super) fn effective_restore_limit(&self) -> usize {
-        let depth = self.pending_depth.load(Ordering::Relaxed);
-        // If offload is stalled AND there's any pending work, SSD reads are
-        // starving writes. Drop to floor immediately — don't wait for depth
-        // to grow past soft threshold. This catches the burst scenario where
-        // many concurrent reads saturate the disk before depth accumulates.
-        if depth > 0 && self.is_offload_stalled() {
-            return self.restore_floor;
-        }
-        if depth <= self.soft_threshold {
-            return self.restore_ceiling;
-        }
-        if depth >= self.hard_threshold {
-            return self.restore_floor;
-        }
-        // Linear interpolation between ceiling and floor
-        let range = self.hard_threshold - self.soft_threshold;
-        let excess = depth - self.soft_threshold;
-        let scale = (range - excess) as f64 / range as f64;
-        let effective = self.restore_floor as f64
-            + (self.restore_ceiling - self.restore_floor) as f64 * scale;
-        (effective as usize).max(self.restore_floor).min(self.restore_ceiling)
     }
 
     /// Compute effective offload device concurrency limit.
@@ -334,49 +323,132 @@ impl OffloadPressureTracker {
     }
 }
 
-#[allow(dead_code)]
-struct ColdTierAdmission {
-    config: ColdTierRateLimitConfig,
-    runtime_offload: Mutex<ColdTierAdmissionBucket>,
-    runtime_restore: Mutex<ColdTierAdmissionBucket>,
-    devices: Mutex<BTreeMap<String, ColdTierDeviceAdmissionState>>,
-    pressure: OffloadPressureTracker,
+/// Tracks hot replica access patterns for clock-based eviction.
+/// Wraps StorageClockState; eviction priority decisions use the
+/// access recency tracked here.
+#[derive(Default)]
+struct HotReplicaTracker {
+    clock: Mutex<StorageClockState>,
 }
 
-#[allow(dead_code)]
-struct ColdTierDeviceAdmissionState {
-    offload: ColdTierAdmissionBucket,
-    restore: ColdTierAdmissionBucket,
-    consecutive_errors: u32,
-    paused_until: Option<Instant>,
-    probe_in_flight: usize,
+/// Serializes route mutations during cold-tier state transitions.
+/// Coordinates offload CAS operations with concurrent route updates.
+#[derive(Default)]
+struct RouteWriteGate {
+    state: Mutex<()>,
 }
 
-#[allow(dead_code)]
-struct ColdTierAdmissionBucket {
-    max_in_flight: usize,
-    ops_per_sec: u32,
-    tokens: f64,
-    last_refill: Instant,
-    in_flight: usize,
+impl RouteWriteGate {
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.state.lock()
+    }
 }
 
-#[allow(dead_code)]
-struct ColdTierAdmissionPermit {
-    admission: Arc<ColdTierAdmission>,
+/// RAII guard from RouteWriteGate::lock().
+#[allow(dead_code)] // held during offload route CAS
+struct RouteWritePermit<'a> {
+    guard: Option<parking_lot::MutexGuard<'a, ()>>,
+}
+
+// ---------------------------------------------------------------------------
+// Forward-declared for offload pipeline
+// ---------------------------------------------------------------------------
+
+/// Orchestrates background offload writes from DRAM to SSD.
+/// Type definition only; impl and integration added with the offload pipeline.
+#[allow(dead_code)] // offload pipeline
+struct ColdTierOffloadManager {
+    queue: Mutex<PendingOffloadQueue>,
+    materializing: AtomicBool,
+}
+
+/// Exclusion guard for a single offload materialization run.
+#[allow(dead_code)] // offload pipeline
+struct ColdTierOffloadRunGuard<'a> {
+    manager: &'a ColdTierOffloadManager,
+}
+
+/// Queue of objects awaiting offload to SSD.
+#[allow(dead_code)] // offload pipeline
+struct PendingOffloadQueue {
+    entries: VecDeque<PendingOffloadEntry>,
+    keys: BTreeSet<PendingOffloadKey>,
+    in_flight: BTreeSet<PendingOffloadKey>,
+    priority: ColdTierOffloadPriorityConfig,
+}
+
+#[allow(dead_code)] // offload pipeline
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PendingOffloadKey {
+    route_key: ObjectKey,
+}
+
+#[allow(dead_code)] // offload pipeline
+#[derive(Clone, Debug)]
+struct PendingOffloadEntry {
+    key: PendingOffloadKey,
+    route_version: RouteVersion,
+    attempts: u32,
+    not_before: Instant,
+    enqueued_at: Instant,
+    length_bytes: Option<u64>,
+}
+
+/// Observability snapshot of the pending offload queue.
+#[allow(dead_code)] // offload metrics
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PendingOffloadQueueSnapshot {
+    total_pending: usize,
+    ready: usize,
+    delayed: usize,
+    max_attempts: u32,
+    total_attempts: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Forward-declared for restore
+// ---------------------------------------------------------------------------
+
+/// Observability snapshot of the pending reclaim queue.
+#[allow(dead_code)] // reclaim queue diagnostics
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ReclaimQueueSnapshot {
+    total_pending: usize,
+    due: usize,
+    cold_backing_reclaims: usize,
+    hot_segment_reclaims: usize,
+    by_qos_tier: BTreeMap<String, usize>,
+    by_policy_rank: BTreeMap<u8, usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Forward-declared for cleanup / GC / compaction
+// ---------------------------------------------------------------------------
+
+/// Manages background cleanup of cold tier devices (eviction, GC, compaction).
+/// Type definition only; impl added with the cleanup module.
+#[allow(dead_code)] // cleanup lifecycle
+#[derive(Default)]
+struct ColdTierCleanupManager {
+    scheduler: Arc<Mutex<FreeSchedulerState>>,
+}
+
+/// RAII guard preventing concurrent cleanup on the same device.
+#[allow(dead_code)] // cleanup lifecycle
+struct ColdTierCleanupGuard {
+    scheduler: Arc<Mutex<FreeSchedulerState>>,
     device_id: String,
-    op: ColdTierAdmissionOp,
-    probe: bool,
-    released: AtomicBool,
 }
 
-#[allow(dead_code)]
+/// Tracks which devices are actively running cleanup operations.
+#[allow(dead_code)] // cleanup scheduling
 #[derive(Default)]
 struct FreeSchedulerState {
     active_devices: BTreeSet<String>,
 }
 
-#[allow(dead_code)]
+/// Result of a single cold tier cleanup pass.
+#[allow(dead_code)] // cleanup result
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ColdTierCleanupResult {
     scanned_devices: usize,
@@ -387,7 +459,8 @@ struct ColdTierCleanupResult {
     reached_low_watermark: bool,
 }
 
-#[allow(dead_code)]
+/// Result of backend compaction (dead byte reclamation).
+#[allow(dead_code)] // compaction result
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ColdTierCompactionResult {
     pub(crate) scanned_devices: usize,
@@ -399,7 +472,8 @@ pub(crate) struct ColdTierCompactionResult {
     pub(crate) reclaimed_bytes: u64,
 }
 
-#[allow(dead_code)]
+/// Result of pending-delete route garbage collection.
+#[allow(dead_code)] // GC result
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PendingDeleteGcResult {
     scanned_routes: usize,
@@ -412,9 +486,9 @@ struct PendingDeleteGcResult {
     used_bytes_released: u64,
 }
 
-#[allow(dead_code)]
+/// Aggregated per-device maintenance statistics.
+#[allow(dead_code)] // maintenance tick stats
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ColdTierMaintenanceStats {
     pub(crate) devices: BTreeMap<String, BackendMaintenanceStats>,
 }
-
