@@ -10,9 +10,9 @@
 
 #include <cuda_runtime.h>
 
-namespace torch {
+namespace at {
 class Tensor;
-}  // namespace torch
+}  // namespace at
 
 namespace mooncake {
 
@@ -50,8 +50,8 @@ namespace {
 }  // namespace
 
 void launch_elastic_dispatch_deterministic_prologue(
-    const torch::Tensor& topk_idx, torch::Tensor& rank_count_buffer,
-    torch::Tensor& dst_buffer_slot_idx, int num_tokens,
+    const at::Tensor& topk_idx, at::Tensor& rank_count_buffer,
+    at::Tensor& dst_buffer_slot_idx, int num_tokens,
     int num_max_tokens_per_rank, int num_experts, int num_topk,
     int scaleup_rank_idx, int num_scaleup_ranks, int num_sms,
     int num_smem_bytes, cudaStream_t stream) {

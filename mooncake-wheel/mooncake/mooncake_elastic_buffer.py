@@ -8,6 +8,22 @@ import torch.distributed as dist
 from .mooncake_ep_buffer import EventOverlap
 
 
+def _using_musa_backend() -> bool:
+    return os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    }
+
+
+def _dist_barrier(group: dist.ProcessGroup) -> None:
+    if _using_musa_backend():
+        dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    else:
+        group.barrier()
+
+
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
@@ -118,6 +134,7 @@ class ElasticBuffer:
         self.num_cpu_timeout_secs = num_cpu_timeout_secs
         self.num_gpu_timeout_secs = num_gpu_timeout_secs
         self.explicitly_destroy = explicitly_destroy
+        self._musa_fallback = _using_musa_backend()
 
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.hidden = hidden
@@ -144,32 +161,40 @@ class ElasticBuffer:
         self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
         self.num_rdma_ranks, self.num_nvlink_ranks = self._calculate_physical_domain_size(group)
 
-        # Native Mooncake transport/runtime.  This keeps the legacy Buffer ABI
-        # untouched while giving ElasticBuffer users a dedicated native entrypoint.
-        from mooncake import ep
-
-        self.runtime = ep.ElasticBuffer(
-            self.rank_idx,
-            self.num_ranks,
-            num_bytes,
-            num_max_tokens_per_rank,
-            hidden,
-            num_topk,
-            use_fp8_dispatch,
-            deterministic,
-            allow_hybrid_mode,
-            allow_multiple_reduction,
-            prefer_overlap_with_compute,
-            self.sl_idx,
-            num_allocated_qps,
-            num_cpu_timeout_secs,
-            num_gpu_timeout_secs,
-        )
         self.backend = group
-        self._connect_native()
+
+        if self._musa_fallback:
+            # MUSA does not support the imported SM90 elastic kernels.  Use a
+            # correctness-oriented distributed fallback so the public elastic API
+            # remains usable while the CUDA path keeps using native Device API
+            # kernels.
+            self.runtime = None
+        else:
+            # Native Mooncake transport/runtime.  This keeps the legacy Buffer ABI
+            # untouched while giving ElasticBuffer users a dedicated native entrypoint.
+            from mooncake import ep
+
+            self.runtime = ep.ElasticBuffer(
+                self.rank_idx,
+                self.num_ranks,
+                num_bytes,
+                num_max_tokens_per_rank,
+                hidden,
+                num_topk,
+                use_fp8_dispatch,
+                deterministic,
+                allow_hybrid_mode,
+                allow_multiple_reduction,
+                prefer_overlap_with_compute,
+                self.sl_idx,
+                num_allocated_qps,
+                num_cpu_timeout_secs,
+                num_gpu_timeout_secs,
+            )
+            self._connect_native()
 
         torch.cuda.synchronize()
-        group.barrier()
+        _dist_barrier(group)
         torch.cuda.synchronize()
 
     def _active_ranks_mask(self) -> list:
@@ -388,7 +413,7 @@ class ElasticBuffer:
     def barrier(self, use_comm_stream: bool = True, with_cpu_sync: bool = False) -> None:
         if with_cpu_sync:
             torch.cuda.synchronize()
-        self.group.barrier()
+        _dist_barrier(self.group)
         if with_cpu_sync:
             torch.cuda.synchronize()
 
@@ -419,6 +444,20 @@ class ElasticBuffer:
         num_sms: Optional[int] = None,
         async_with_compute_stream: bool = False,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], Optional[torch.Tensor], EPHandle, EventOverlap]:
+        if self._musa_fallback:
+            return self._dispatch_musa_fallback(
+                x,
+                topk_idx,
+                topk_weights,
+                num_experts,
+                num_max_tokens_per_rank,
+                expert_alignment,
+                handle,
+                do_expand,
+                do_cpu_sync,
+                num_sms,
+                async_with_compute_stream,
+            )
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
         if handle is not None:
@@ -525,6 +564,8 @@ class ElasticBuffer:
         num_sms: Optional[int] = None,
         async_with_compute_stream: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        if self._musa_fallback:
+            return self._combine_musa_fallback(x, handle, topk_weights, async_with_compute_stream)
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
         if handle.native_handle is None:
@@ -559,6 +600,269 @@ class ElasticBuffer:
             output.combined_x,
             output.combined_topk_weights,
             EventOverlap(output.event, tensors_to_record if async_with_compute_stream else None),
+        )
+
+    def _all_gather_tensor(self, tensor: torch.Tensor) -> List[torch.Tensor]:
+        gathered = [torch.empty_like(tensor) for _ in range(self.num_ranks)]
+        dist.all_gather(gathered, tensor, self.group)
+        return gathered
+
+    @staticmethod
+    def _capture_event() -> Any:
+        class _NoopEvent:
+            def current_stream_wait(self) -> None:
+                return None
+
+        return _NoopEvent()
+
+    def _dispatch_musa_fallback(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_idx: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor],
+        num_experts: Optional[int],
+        num_max_tokens_per_rank: Optional[int],
+        expert_alignment: Optional[int],
+        handle: Optional[EPHandle],
+        do_expand: bool,
+        do_cpu_sync: Optional[bool],
+        num_sms: Optional[int],
+        async_with_compute_stream: bool,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], Optional[torch.Tensor], EPHandle, EventOverlap]:
+        if isinstance(x, tuple):
+            raise NotImplementedError("MUSA elastic fallback currently supports BF16 dispatch only")
+        if handle is not None:
+            if topk_idx is not None or topk_weights is not None:
+                raise AssertionError("topk_idx and topk_weights must be None when cached handle is provided")
+            topk_idx = handle.topk_idx
+            num_max_tokens_per_rank = num_max_tokens_per_rank or handle.num_max_tokens_per_rank
+            num_experts = num_experts or handle.num_experts
+            expert_alignment = handle.expert_alignment if expert_alignment is None else expert_alignment
+            num_sms = handle.num_sms if num_sms is None else num_sms
+            do_cpu_sync = False
+        else:
+            if topk_idx is None:
+                raise AssertionError("topk_idx must be provided when cached handle is not provided")
+            expert_alignment = 1 if expert_alignment is None else expert_alignment
+            do_cpu_sync = True if do_cpu_sync is None else do_cpu_sync
+        if num_experts is None:
+            num_experts = int(torch.max(topk_idx).item()) + 1
+        if num_max_tokens_per_rank is None:
+            num_max_tokens_per_rank = self.num_max_tokens_per_rank or x.shape[0]
+        if num_sms is None:
+            num_sms = self.get_theoretical_num_sms(num_experts, topk_idx.shape[1])
+
+        x = x.contiguous()
+        topk_idx = topk_idx.contiguous()
+        if topk_weights is not None:
+            topk_weights = topk_weights.contiguous()
+
+        if x.dtype != torch.bfloat16:
+            raise AssertionError("MUSA elastic fallback expects BF16 input")
+        if topk_idx.dtype != torch.int64:
+            raise AssertionError("topk_idx must be int64")
+        if num_experts % self.num_ranks != 0:
+            raise AssertionError("num_experts must be divisible by world size")
+
+        num_tokens = int(x.shape[0])
+        hidden = int(x.shape[1])
+        num_topk = int(topk_idx.shape[1])
+        local_experts = num_experts // self.num_ranks
+        local_begin = self.rank_idx * local_experts
+        local_end = local_begin + local_experts
+
+        gathered_x = self._all_gather_tensor(x)
+        gathered_topk = self._all_gather_tensor(topk_idx)
+        gathered_weights = self._all_gather_tensor(topk_weights) if topk_weights is not None else None
+
+        recv_rows: List[torch.Tensor] = []
+        recv_idx_rows: List[torch.Tensor] = []
+        recv_weight_rows: List[torch.Tensor] = []
+        expanded_rows: List[torch.Tensor] = []
+        expanded_weight_rows: List[torch.Tensor] = []
+        metadata_rows: List[List[int]] = []
+        per_expert_counts = [0 for _ in range(local_experts)]
+
+        for src_rank in range(self.num_ranks):
+            route_cpu = gathered_topk[src_rank].detach().cpu()
+            for token_idx in range(num_tokens):
+                local_slots = [
+                    slot
+                    for slot, expert in enumerate(route_cpu[token_idx].tolist())
+                    if local_begin <= int(expert) < local_end
+                ]
+                if not local_slots:
+                    continue
+
+                recv_rows.append(gathered_x[src_rank][token_idx])
+                recv_idx_rows.append(gathered_topk[src_rank][token_idx])
+                if gathered_weights is not None:
+                    recv_weight_rows.append(gathered_weights[src_rank][token_idx])
+                metadata_rows.append([src_rank * int(num_max_tokens_per_rank) + token_idx] + [0] * (num_topk + 1))
+
+                for slot in local_slots:
+                    local_expert = int(route_cpu[token_idx, slot].item()) - local_begin
+                    per_expert_counts[local_expert] += 1
+                    if do_expand:
+                        expanded_rows.append(gathered_x[src_rank][token_idx])
+                        if gathered_weights is not None:
+                            expanded_weight_rows.append(gathered_weights[src_rank][token_idx, slot])
+
+        actual_recv_tokens = len(recv_rows)
+        recv_capacity = int(num_max_tokens_per_rank) * self.num_ranks
+        if do_expand:
+            output_tokens = len(expanded_rows)
+            recv_x_actual = (
+                torch.stack(expanded_rows, dim=0)
+                if expanded_rows
+                else torch.empty((0, hidden), dtype=x.dtype, device=x.device)
+            )
+        else:
+            output_tokens = actual_recv_tokens
+            recv_x_actual = (
+                torch.stack(recv_rows, dim=0)
+                if recv_rows
+                else torch.empty((0, hidden), dtype=x.dtype, device=x.device)
+            )
+
+        recv_topk_idx_actual = (
+            torch.stack(recv_idx_rows, dim=0)
+            if recv_idx_rows
+            else torch.empty((0, num_topk), dtype=topk_idx.dtype, device=topk_idx.device)
+        )
+        metadata_actual = torch.tensor(
+            metadata_rows,
+            dtype=torch.int32,
+            device=x.device,
+        ).view(actual_recv_tokens, num_topk + 2)
+
+        recv_topk_weights_actual: Optional[torch.Tensor]
+        if gathered_weights is None:
+            recv_topk_weights_actual = None
+        elif do_expand:
+            recv_topk_weights_actual = (
+                torch.stack(expanded_weight_rows, dim=0)
+                if expanded_weight_rows
+                else torch.empty((0,), dtype=topk_weights.dtype, device=topk_weights.device)
+            )
+        else:
+            recv_topk_weights_actual = (
+                torch.stack(recv_weight_rows, dim=0)
+                if recv_weight_rows
+                else torch.empty((0, num_topk), dtype=topk_weights.dtype, device=topk_weights.device)
+            )
+
+        recv_x = recv_x_actual
+        recv_topk_idx = recv_topk_idx_actual
+        recv_src_metadata = metadata_actual
+        recv_topk_weights = recv_topk_weights_actual
+        if not do_cpu_sync:
+            pad_rows = max(0, recv_capacity - recv_x_actual.shape[0])
+            if pad_rows:
+                recv_x = torch.cat(
+                    [recv_x_actual, torch.empty((pad_rows, hidden), dtype=x.dtype, device=x.device)], dim=0
+                )
+            idx_pad_rows = max(0, recv_capacity - recv_topk_idx_actual.shape[0])
+            if idx_pad_rows:
+                recv_topk_idx = torch.cat(
+                    [
+                        recv_topk_idx_actual,
+                        torch.empty((idx_pad_rows, num_topk), dtype=topk_idx.dtype, device=topk_idx.device),
+                    ],
+                    dim=0,
+                )
+                recv_src_metadata = torch.cat(
+                    [
+                        metadata_actual,
+                        torch.empty((idx_pad_rows, num_topk + 2), dtype=torch.int32, device=x.device),
+                    ],
+                    dim=0,
+                )
+            if recv_topk_weights_actual is not None:
+                weight_pad_rows = max(0, recv_capacity - recv_topk_weights_actual.shape[0])
+                if weight_pad_rows:
+                    pad_shape = (weight_pad_rows, *recv_topk_weights_actual.shape[1:])
+                    recv_topk_weights = torch.cat(
+                        [
+                            recv_topk_weights_actual,
+                            torch.empty(pad_shape, dtype=recv_topk_weights_actual.dtype, device=recv_topk_weights_actual.device),
+                        ],
+                        dim=0,
+                    )
+
+        psum_scaleup = torch.zeros(self.num_scaleup_ranks, dtype=torch.int32, device=x.device)
+        psum_scaleup[-1] = actual_recv_tokens
+        per_expert = torch.tensor(per_expert_counts, dtype=torch.int32, device=x.device)
+        psum_expert = torch.cumsum(per_expert, dim=0) if local_experts else per_expert
+        num_recv_tokens_per_expert_list = per_expert_counts if do_cpu_sync else []
+
+        elastic_handle = EPHandle(
+            do_expand=do_expand,
+            num_experts=num_experts,
+            expert_alignment=int(expert_alignment),
+            num_max_tokens_per_rank=int(num_max_tokens_per_rank),
+            num_sms=int(num_sms),
+            topk_idx=topk_idx.clone() if handle is None else handle.topk_idx,
+            num_recv_tokens_per_expert_list=num_recv_tokens_per_expert_list,
+            psum_num_recv_tokens_per_scaleup_rank=psum_scaleup,
+            psum_num_recv_tokens_per_expert=psum_expert,
+            recv_src_metadata=recv_src_metadata,
+            dst_buffer_slot_idx=torch.empty((0,), dtype=torch.int32, device=x.device),
+            token_metadata_at_forward=None,
+            channel_linked_list=None,
+            native_handle=("musa_fallback",),
+        )
+        tensors_to_record = (x, topk_idx, recv_x, recv_topk_idx, recv_src_metadata, psum_scaleup, psum_expert)
+        return recv_x, recv_topk_idx, recv_topk_weights, elastic_handle, EventOverlap(
+            self._capture_event() if async_with_compute_stream else None,
+            tensors_to_record if async_with_compute_stream else None,
+        )
+
+    def _combine_musa_fallback(
+        self,
+        x: torch.Tensor,
+        handle: EPHandle,
+        topk_weights: Optional[torch.Tensor],
+        async_with_compute_stream: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        if handle.native_handle is None:
+            raise RuntimeError("Mooncake EPHandle does not contain a native handle")
+        if x.dim() != 2 or not x.is_contiguous():
+            raise AssertionError("combine input must be a contiguous 2D tensor")
+
+        actual = int(x.shape[0])
+        hidden = int(x.shape[1])
+        capacity = int(handle.num_max_tokens_per_rank) * self.num_ranks
+        meta_width = int(handle.recv_src_metadata.shape[1])
+        send_x = torch.empty((capacity, hidden), dtype=x.dtype, device=x.device)
+        send_meta = torch.empty((capacity, meta_width), dtype=torch.int32, device=x.device)
+        if actual:
+            send_x[:actual].copy_(x)
+            send_meta[:actual].copy_(handle.recv_src_metadata[:actual])
+        send_count = torch.tensor([actual], dtype=torch.int32, device=x.device)
+
+        gathered_counts = self._all_gather_tensor(send_count)
+        gathered_x = self._all_gather_tensor(send_x)
+        gathered_meta = self._all_gather_tensor(send_meta)
+
+        num_tokens = int(handle.topk_idx.shape[0])
+        combined = torch.zeros((num_tokens, hidden), dtype=x.dtype, device=x.device)
+        for peer_rank in range(self.num_ranks):
+            count = int(gathered_counts[peer_rank].item())
+            if count == 0:
+                continue
+            src_global = gathered_meta[peer_rank][:count, 0].long()
+            src_rank = torch.div(src_global, int(handle.num_max_tokens_per_rank), rounding_mode="floor")
+            local_mask = src_rank == self.rank_idx
+            if not bool(local_mask.any().item()):
+                continue
+            src_token = (src_global[local_mask] % int(handle.num_max_tokens_per_rank)).long()
+            combined.index_add_(0, src_token, gathered_x[peer_rank][:count][local_mask])
+
+        tensors_to_record = (x, combined, handle.recv_src_metadata, handle.topk_idx)
+        return combined, None, EventOverlap(
+            self._capture_event() if async_with_compute_stream else None,
+            tensors_to_record if async_with_compute_stream else None,
         )
 
 

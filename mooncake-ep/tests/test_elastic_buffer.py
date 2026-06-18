@@ -30,6 +30,28 @@ import torch.testing as testing
 from mooncake.mooncake_elastic_buffer import ElasticBuffer
 
 
+def using_musa_backend() -> bool:
+    return os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    }
+
+
+def import_torchada_if_needed() -> None:
+    if not using_musa_backend():
+        return
+    import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
+
+
+def distributed_barrier() -> None:
+    if using_musa_backend():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
 @dataclass(frozen=True)
 class RoutePlan:
     topk_idx: torch.Tensor
@@ -66,6 +88,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def init_distributed(seed: int) -> tuple[int, int, int]:
+    import_torchada_if_needed()
     if not dist.is_initialized():
         dist.init_process_group("nccl")
 
@@ -370,7 +393,7 @@ def main() -> None:
     if expanded_idx.shape[0] != expanded_actual:
         raise AssertionError(f"rank={rank}: expanded metadata extent mismatch")
 
-    dist.barrier()
+    distributed_barrier()
     if rank == 0:
         print(
             "MOONCAKE_ELASTIC_TEST_OK",
