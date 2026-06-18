@@ -4,12 +4,14 @@ const FNV_PRIME: u64 = 0x0000_0001_0000_01b3;
 pub(crate) fn stable_hash(parts: &[&str]) -> u64 {
     let mut hash = FNV_OFFSET;
     for part in parts {
+        for byte in (part.len() as u64).to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
         for byte in part.as_bytes() {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(FNV_PRIME);
         }
-        hash ^= u64::from(b'|');
-        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
 }
@@ -29,5 +31,6 @@ mod tests {
             stable_hash(&["beta", "alpha"])
         );
         assert_ne!(stable_hash(&["ab", "c"]), stable_hash(&["a", "bc"]));
+        assert_ne!(stable_hash(&["a|b", "c"]), stable_hash(&["a", "b|c"]));
     }
 }
