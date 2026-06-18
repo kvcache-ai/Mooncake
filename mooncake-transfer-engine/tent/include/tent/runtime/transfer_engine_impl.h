@@ -197,6 +197,17 @@ class TransferEngineImpl {
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
+    struct SubmitPlan;
+
+    Status submitTransferToBatch(Batch* batch,
+                                 const std::vector<Request>& request_list);
+
+    Status buildSubmitPlan(Batch* batch,
+                           const std::vector<Request>& request_list,
+                           SubmitPlan& plan);
+
+    Status commitSubmitPlan(Batch* batch, const SubmitPlan& plan);
+
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
 

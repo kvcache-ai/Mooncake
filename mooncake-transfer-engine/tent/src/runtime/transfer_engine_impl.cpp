@@ -968,6 +968,24 @@ struct MergeResult {
     std::map<size_t, size_t> task_lookup;
 };
 
+struct TransferEngineImpl::SubmitPlan {
+    struct Task {
+        size_t merged_task_index{0};
+        size_t task_id{0};
+    };
+
+    struct Owner {
+        Request request{};
+        SelectionResult route{};
+        bool staging{false};
+        std::vector<std::string> staging_params;
+    };
+
+    std::chrono::steady_clock::time_point submit_time{};
+    std::vector<Task> tasks;
+    std::vector<Owner> owners;
+};
+
 namespace {
 
 bool tryAddUint64(uint64_t lhs, uint64_t rhs, uint64_t& out) {
@@ -1198,39 +1216,64 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
     return result;
 }
 
-Status TransferEngineImpl::submitTransfer(
-    BatchID batch_id, const std::vector<Request>& request_list) {
-    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch* batch = (Batch*)(batch_id);
-
+Status TransferEngineImpl::buildSubmitPlan(
+    Batch* batch, const std::vector<Request>& request_list, SubmitPlan& plan) {
+    if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
     for (size_t i = 0; i < request_list.size(); ++i) {
         auto st = validateTransportHint(request_list[i], i);
         if (!st.ok()) return st;
     }
 
-    std::vector<Request> classified_request_list[kSupportedTransportTypes];
-    std::vector<size_t> task_id_list[kSupportedTransportTypes];
-    std::unordered_map<size_t, TaskInfo> merged_task_id_map;
-
-    size_t start_task_id = batch->task_list.size();
-    batch->task_list.insert(batch->task_list.end(), request_list.size(),
-                            TaskInfo{});
-
-    // Record start time for metrics tracking
-    auto submit_time = std::chrono::steady_clock::now();
-
+    plan = SubmitPlan{};
+    const size_t start_task_id = batch->task_list.size();
+    plan.submit_time = std::chrono::steady_clock::now();
     auto merge_boundaries =
         merge_requests_
             ? resolveRequestBoundaries(metadata_.get(), request_list)
             : std::vector<RequestBoundaryInfo>{};
     auto merged =
         mergeRequests(request_list, merge_boundaries, merge_requests_);
+
+    plan.owners.reserve(merged.request_list.size());
+    for (const auto& request : merged.request_list) {
+        SubmitPlan::Owner owner;
+        owner.request = request;
+        owner.route = resolveTransport(owner.request, 0);
+        if (owner.route.transport == TCP) {
+            findStagingPolicy(owner.request, owner.staging_params);
+            owner.staging = !owner.staging_params.empty() && staging_proxy_;
+        }
+        plan.owners.push_back(std::move(owner));
+    }
+
+    plan.tasks.reserve(merged.task_lookup.size());
+    for (const auto& kv : merged.task_lookup) {
+        const size_t public_task_index = kv.first;
+        const size_t merged_task_index = kv.second;
+        plan.tasks.push_back(
+            {merged_task_index, start_task_id + public_task_index});
+    }
+    return Status::OK();
+}
+
+Status TransferEngineImpl::commitSubmitPlan(Batch* batch,
+                                            const SubmitPlan& plan) {
+    if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
+
+    std::vector<Request> classified_request_list[kSupportedTransportTypes];
+    std::vector<size_t> task_id_list[kSupportedTransportTypes];
+    std::unordered_map<size_t, TaskInfo> merged_task_id_map;
+
+    batch->task_list.insert(batch->task_list.end(), plan.tasks.size(),
+                            TaskInfo{});
+
     std::unordered_map<TransportType, size_t> next_sub_task_id;
-    for (auto& kv : merged.task_lookup) {
-        size_t task_id = start_task_id + kv.first;
-        size_t merged_task_id = kv.second;
+    for (const auto& task_plan : plan.tasks) {
+        size_t task_id = task_plan.task_id;
+        size_t merged_task_id = task_plan.merged_task_index;
         auto& task = batch->task_list[task_id];
-        auto& merged_request = merged.request_list[merged_task_id];
+        const auto& owner_plan = plan.owners[merged_task_id];
+        auto& merged_request = owner_plan.request;
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
@@ -1244,10 +1287,9 @@ Status TransferEngineImpl::submitTransfer(
         task.request = merged_request;
         task.staging = false;
         task.start_time =
-            submit_time;  // Record start time for latency tracking
-        auto select_result = resolveTransport(merged_request, 0);
-        task.type = select_result.transport;
-        task.device_mask = select_result.device_mask;
+            plan.submit_time;  // Record start time for latency tracking
+        task.type = owner_plan.route.transport;
+        task.device_mask = owner_plan.route.device_mask;
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1255,14 +1297,10 @@ Status TransferEngineImpl::submitTransfer(
             continue;
         }
 
-        if (task.type == TCP) {
-            std::vector<std::string> staging_params;
-            findStagingPolicy(merged_request, staging_params);
-            if (!staging_params.empty() && staging_proxy_) {
-                task.staging = true;
-                staging_proxy_->submit(&task, staging_params);
-                continue;
-            }
+        if (owner_plan.staging) {
+            task.staging = true;
+            staging_proxy_->submit(&task, owner_plan.staging_params);
+            continue;
         }
 
         if (!batch->sub_batch[task.type]) {
@@ -1313,6 +1351,20 @@ Status TransferEngineImpl::submitTransfer(
     }
 
     return Status::OK();
+}
+
+Status TransferEngineImpl::submitTransferToBatch(
+    Batch* batch, const std::vector<Request>& request_list) {
+    SubmitPlan plan;
+    CHECK_STATUS(buildSubmitPlan(batch, request_list, plan));
+    CHECK_STATUS(commitSubmitPlan(batch, plan));
+    return Status::OK();
+}
+
+Status TransferEngineImpl::submitTransfer(
+    BatchID batch_id, const std::vector<Request>& request_list) {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    return submitTransferToBatch((Batch*)batch_id, request_list);
 }
 
 Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
