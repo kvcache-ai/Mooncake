@@ -746,8 +746,6 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .set_enable_snapshot_restore(true)
                 .set_snapshot_object_store_type("local")
                 .set_root_fs_dir(service->root_fs_dir_)
-                .set_eviction_ratio(0.0)
-                .set_eviction_high_watermark_ratio(1.0)
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
