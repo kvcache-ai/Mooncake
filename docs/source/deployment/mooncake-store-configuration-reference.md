@@ -237,10 +237,10 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 
 ```{caution}
-Metadata Snapshot And Restore is experimental feature.
+Metadata Snapshot and Restore is an experimental feature.
 ```
 
-**Metadata Snapshot And Restore**
+**Metadata Snapshot and Restore**
 
 | Flag | Default | Description |
 |------|---------|-------------|

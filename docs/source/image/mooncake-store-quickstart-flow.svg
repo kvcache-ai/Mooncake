@@ -61,11 +61,15 @@
   <rect x="28" y="62" width="904" height="414" rx="8" fill="url(#warm)"/>
   <rect x="28" y="62" width="904" height="414" rx="8" fill="url(#cool)"/>
 
-  <path class="line-base metadata" d="M246 177 C338 204 360 282 420 320" marker-end="url(#arrow-metadata)"/>
-  <path class="line-run metadata" d="M246 177 C338 204 360 282 420 320"/>
+  <path class="line-base metadata" d="M246 174 C334 198 356 282 420 320" marker-end="url(#arrow-metadata)"/>
+  <path class="line-run metadata" d="M246 174 C334 198 356 282 420 320"/>
+  <path class="line-base metadata" d="M246 198 C426 224 622 282 754 320" marker-end="url(#arrow-metadata)"/>
+  <path class="line-run metadata" d="M246 198 C426 224 622 282 754 320"/>
 
-  <path class="line-base control" d="M510 192 C510 238 510 278 510 315" marker-start="url(#arrow-control)" marker-end="url(#arrow-control)"/>
-  <path class="line-run control" d="M510 192 C510 238 510 278 510 315"/>
+  <path class="line-base control" d="M488 252 C488 276 488 296 488 315" marker-start="url(#arrow-control)" marker-end="url(#arrow-control)"/>
+  <path class="line-run control" d="M488 252 C488 276 488 296 488 315"/>
+  <path class="line-base control" d="M570 252 C642 272 760 288 822 315" marker-start="url(#arrow-control)" marker-end="url(#arrow-control)"/>
+  <path class="line-run control" d="M570 252 C642 272 760 288 822 315"/>
 
   <path class="line-base api" d="M246 350 C302 350 352 350 412 350" marker-end="url(#arrow-api)"/>
   <path class="line-run api" d="M246 350 C302 350 352 350 412 350"/>

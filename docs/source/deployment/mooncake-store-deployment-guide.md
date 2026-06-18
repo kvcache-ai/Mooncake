@@ -137,7 +137,7 @@ curl -s http://<master_host>:9003/metrics/summary
 
 ### Compose Commands and Runtime Modes
 
-Use the [Configuration Reference](mooncake-store-configuration-reference) for the
+Use the [Configuration Reference](mooncake-store-configuration-reference.md) for the
 master command builder, standalone Real Client deployment modes, startup flags,
 and client/engine environment variables. Common first adjustments are
 `--rpc_thread_num`, eviction watermarks, and storage-related flags.
@@ -146,22 +146,22 @@ and client/engine environment variables. Common first adjustments are
 
 Choose a storage guide when the in-memory quick start is not enough:
 
-- [SSD Offload](ssd-offload): local SSD capacity, eviction policy, and io_uring settings.
-- [NVMe-oF SSD Pool](nvmf-ssd-deployment-guide): remote NVMe-oF SSD pool deployment.
-- [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin): experimental 3FS-backed persistent storage.
+- [SSD Offload](ssd-offload.md): local SSD capacity, eviction policy, and io_uring settings.
+- [NVMe-oF SSD Pool](nvmf-ssd-deployment-guide.md): remote NVMe-oF SSD pool deployment.
+- [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md): experimental 3FS-backed persistent storage.
 
 ### Validate and Observe
 
 - Use [Stress Benchmark](#stress-benchmark) for two-role prefill/decode validation.
-- [Observability](../getting_started/observability): metrics collection and production monitoring.
+- [Observability](../getting_started/observability.md): metrics collection and production monitoring.
 
 :::{toctree}
 :maxdepth: 1
 :hidden:
 
-Mooncake Store Configuration Reference<mooncake-store-configuration-reference>
+Mooncake Store Configuration Reference <mooncake-store-configuration-reference>
 ssd-offload
-NvMe-Of SSD Pool<nvmf-ssd-deployment-guide>
-HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
+NvMe-Of SSD Pool <nvmf-ssd-deployment-guide>
+HF3FS Plugin (Experimental) <../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
 :::
