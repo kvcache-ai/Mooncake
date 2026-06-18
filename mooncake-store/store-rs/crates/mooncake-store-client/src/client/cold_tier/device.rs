@@ -880,7 +880,9 @@ impl ColdTierDeviceManager {
         self.devices.lock().upsert(device);
     }
 
-    pub(in super::super) fn observability_snapshot(&self) -> super::super::ColdTierDeviceCacheSummary {
+    pub(in super::super) fn observability_snapshot(
+        &self,
+    ) -> super::super::ColdTierDeviceCacheSummary {
         self.devices.lock().observability_snapshot()
     }
 
