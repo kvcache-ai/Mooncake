@@ -37,6 +37,7 @@ class MasterMetricManager {
     void inc_file_cache_nums(int64_t val = 1);
     void dec_mem_cache_nums(int64_t val = 1);
     void dec_file_cache_nums(int64_t val = 1);
+    void reset_cache_total_nums();
 
     void inc_valid_get_nums(int64_t val = 1);
     void inc_total_get_nums(int64_t val = 1);
