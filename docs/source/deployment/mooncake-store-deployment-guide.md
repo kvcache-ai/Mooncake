@@ -46,6 +46,7 @@ Master service listening on 0.0.0.0:50051
 
 The master's default RPC port is `50051`. (To embed an HTTP metadata server instead of using P2P, add `--enable_http_metadata_server=true --http_metadata_server_port=8080`.)
 
+(start-a-store-client)=
 ### 3. Start a Store Client
 
 A client contributes DRAM (and optionally SSD) to the cluster. The simplest way is to embed Mooncake in a Python process and call `store.setup(...)` with `metadata_server="P2PHANDSHAKE"`:
