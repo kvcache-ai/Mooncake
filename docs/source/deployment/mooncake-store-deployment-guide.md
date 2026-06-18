@@ -446,6 +446,7 @@ rpc_port: 50051
 
 ---
 
+(reference-client-configuration-tuning)=
 ## Reference: Client Configuration & Tuning
 
 A client is configured through one of the **methods** introduced in [Start a Store Client](#start-a-store-client), plus a shared family of engine-tuning variables:
