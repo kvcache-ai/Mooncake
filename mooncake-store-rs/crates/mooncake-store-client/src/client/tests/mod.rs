@@ -2509,6 +2509,67 @@ fn resolved_object_for_route(
     }
 }
 
+fn test_route_for_replicas(
+    key: &str,
+    compatibility: CompatibilityDescriptor,
+    replicas: &[(ClientRuntimeId, SegmentName, u16)],
+) -> ObjectRoute {
+    let scope = NamespaceScope::default();
+    let object_id = LogicalObjectId::new(scope.clone(), key);
+    ObjectRoute {
+        key: ObjectKey::from_logical_id(&object_id),
+        namespace: Some(scope),
+        logical_key: Some(key.to_string()),
+        canonical_key: Some(object_id.canonical_key()),
+        sharing_scope: Some("default".to_string()),
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility,
+        replicas: replicas
+            .iter()
+            .map(|(owner, segment_name, priority)| ReplicaRoute {
+                owner: owner.clone(),
+                segment_name: segment_name.clone(),
+                offset: Some(0),
+                segment_offset: 0,
+                length: 1,
+                checksum: None,
+                tier: mooncake_store_core::ReplicaTier::Dram,
+                priority: *priority,
+            })
+            .collect(),
+        cold_backing: None,
+    }
+}
+
+fn key_selecting_remote_owner(
+    reader: &StoreClient,
+    key_prefix: &str,
+    replicas: &[(ClientRuntimeId, SegmentName, u16)],
+    expected_owner: &ClientRuntimeId,
+) -> String {
+    let local_segments = reader.local_storage_segments();
+    let readable_runtimes = reader
+        .readable_runtime_set(true)
+        .expect("readable runtime refresh should succeed");
+    for index in 0..4096 {
+        let key = format!("{key_prefix}-{index}");
+        let route = test_route_for_replicas(&key, reader.lease().compatibility, replicas);
+        let selected = StoreClient::select_readable_replica(
+            &route,
+            reader.runtime_id(),
+            &local_segments,
+            &readable_runtimes,
+        )
+        .expect("route should expose a readable replica");
+        if selected.owner == *expected_owner {
+            return key;
+        }
+    }
+    panic!("could not find a test key selecting remote owner {expected_owner}");
+}
+
 fn test_future_expiry_ms() -> u64 {
     now_ms().saturating_add(30_000)
 }
@@ -5086,9 +5147,25 @@ fn routed_read_probes_cached_remote_segment_before_reuse() {
         .expect("reader memory should register");
     wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
 
+    let primary_segment = store_a
+        .segment_name()
+        .expect("store-a segment should exist");
+    let secondary_segment = store_b
+        .segment_name()
+        .expect("store-b segment should exist");
+    let key = key_selecting_remote_owner(
+        &reader,
+        "cached-probe-key",
+        &[
+            (store_a.runtime_id().clone(), primary_segment.clone(), 0),
+            (store_b.runtime_id().clone(), secondary_segment, 1),
+        ],
+        store_a.runtime_id(),
+    );
+
     writer
         .put_with_policy(
-            "cached-probe-key",
+            &key,
             b"cached-probe-payload",
             &ReplicationPolicy::new()
                 .replica_count(2)
@@ -5102,14 +5179,11 @@ fn routed_read_probes_cached_remote_segment_before_reuse() {
 
     assert_eq!(
         reader
-            .get("cached-probe-key")
+            .get(&key)
             .expect("first read should cache the primary remote segment"),
         b"cached-probe-payload"
     );
 
-    let primary_segment = store_a
-        .segment_name()
-        .expect("store-a segment should exist");
     {
         let mut state = store_a_transport.state.lock();
         let handle = state
@@ -5124,7 +5198,7 @@ fn routed_read_probes_cached_remote_segment_before_reuse() {
 
     assert_eq!(
         reader
-            .get("cached-probe-key")
+            .get(&key)
             .expect("second read should probe cached primary and fail over"),
         b"cached-probe-payload"
     );
@@ -5136,7 +5210,7 @@ fn routed_read_probes_cached_remote_segment_before_reuse() {
         "dead primary must be quarantined even when its segment handle is cached"
     );
     let repaired = reader
-        .query_route("cached-probe-key")
+        .query_route(&key)
         .expect("repaired route query should succeed")
         .expect("repaired route should exist");
     assert_eq!(repaired.replicas.len(), 1);
@@ -6016,9 +6090,25 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
         .expect("reader-b memory should register");
     wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader_a, &reader_b]);
 
+    let dead_segment = store_a
+        .segment_name()
+        .expect("store-a segment should exist");
+    let live_segment = store_b
+        .segment_name()
+        .expect("store-b segment should exist");
+    let key = key_selecting_remote_owner(
+        &reader_a,
+        "shared-suspect-key",
+        &[
+            (store_b.runtime_id().clone(), live_segment, 0),
+            (store_a.runtime_id().clone(), dead_segment, 1),
+        ],
+        store_a.runtime_id(),
+    );
+
     writer
         .put_with_policy(
-            "shared-suspect-key",
+            &key,
             b"shared-suspect-payload",
             &ReplicationPolicy::new()
                 .replica_count(2)
@@ -6040,7 +6130,7 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
     }
 
     let dead_runtime = store_a.runtime_id().clone();
-    let first = reader_a.get("shared-suspect-key");
+    let first = reader_a.get(&key);
     assert!(
         matches!(
             first,
@@ -6073,7 +6163,7 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
     );
     assert_eq!(
         reader_b
-            .get("shared-suspect-key")
+            .get(&key)
             .expect(
                 "second reader should reuse the shared quarantine and avoid a fresh dead-replica failure"
             ),
