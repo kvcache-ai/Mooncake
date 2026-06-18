@@ -6298,10 +6298,17 @@ MasterService::MetadataSerializer::Serialize() {
     // 1. Serialize metadata shards
     packer.pack("shards");
 
-    // First count non-empty shards
+    // First count shards that have actual metadata entries.
+    // A shard may have empty tenants left after eviction erased all
+    // metadata but didn't clean up the tenant map; using metadata_count
+    // (not tenants.empty()) ensures the count matches the skip logic below.
     size_t valid_shards = 0;
     for (size_t i = 0; i < kNumShards; ++i) {
-        if (!service_->metadata_shards_[i].tenants.empty()) {
+        size_t metadata_count = 0;
+        for (const auto& [tid, ts] : service_->metadata_shards_[i].tenants) {
+            metadata_count += ts.metadata.size();
+        }
+        if (metadata_count > 0) {
             valid_shards++;
         }
     }
