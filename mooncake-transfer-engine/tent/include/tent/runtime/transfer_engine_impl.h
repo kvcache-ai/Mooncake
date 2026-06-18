@@ -197,6 +197,10 @@ class TransferEngineImpl {
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
+    Status retainBatch(BatchID batch_id, Batch*& batch);
+
+    Status releaseBatch(Batch* batch);
+
     struct SubmitPlan;
 
     Status submitTransferToBatch(Batch* batch,

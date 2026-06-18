@@ -56,6 +56,8 @@ struct Batch {
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
     std::vector<TaskInfo> task_list;
     size_t max_size;
+    size_t runtime_refs{0};
+    bool free_requested{false};
 
     struct SubmitHook {
         size_t start_task_id{0};
@@ -416,7 +418,9 @@ Status TransferEngineImpl::deconstruct() {
     // Callers must ensure no transfers are in-flight before calling
     // deconstruct().
     batch_set_.forEach([&](BatchSet& entry) {
-        for (auto& batch : entry.active) {
+        std::unordered_set<Batch*> released_batches;
+        auto release_batch = [&](Batch* batch) {
+            if (!released_batches.insert(batch).second) return;
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 auto& transport = transport_list_[type];
                 auto& sub_batch = batch->sub_batch[type];
@@ -424,16 +428,9 @@ Status TransferEngineImpl::deconstruct() {
                 transport->freeSubBatch(sub_batch);
             }
             Slab<Batch>::Get().deallocate(batch);
-        }
-        for (auto& batch : entry.freelist) {
-            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                auto& transport = transport_list_[type];
-                auto& sub_batch = batch->sub_batch[type];
-                if (!transport || !sub_batch) continue;
-                transport->freeSubBatch(sub_batch);
-            }
-            Slab<Batch>::Get().deallocate(batch);
-        }
+        };
+        for (auto& batch : entry.active) release_batch(batch);
+        for (auto& batch : entry.freelist) release_batch(batch);
         entry.active.clear();
         entry.freelist.clear();
     });
@@ -742,6 +739,10 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batches_.count(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    if (batch->free_requested) return Status::OK();
+    batch->free_requested = true;
     batch_set_.get().freelist.push_back(batch);
     lazyFreeBatch();
     return Status::OK();
@@ -753,6 +754,10 @@ Status TransferEngineImpl::lazyFreeBatch() {
     for (auto it = batch_set.freelist.begin();
          it != batch_set.freelist.end();) {
         auto& batch = *it;
+        if (batch->runtime_refs > 0) {
+            it++;
+            continue;
+        }
         TransferStatus overall_status;
         CHECK_STATUS(getTransferStatus((BatchID)batch, overall_status));
         if (overall_status.s == PENDING) {
@@ -768,6 +773,33 @@ Status TransferEngineImpl::lazyFreeBatch() {
         alive_batches_.erase((BatchID)batch);
         Slab<Batch>::Get().deallocate(batch);
         it = batch_set.freelist.erase(it);
+    }
+    return Status::OK();
+}
+
+Status TransferEngineImpl::retainBatch(BatchID batch_id, Batch*& batch) {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batches_.count(batch_id)) {
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    }
+    batch = (Batch*)batch_id;
+    if (batch->free_requested) {
+        return Status::InvalidArgument("Batch is being freed" LOC_MARK);
+    }
+    ++batch->runtime_refs;
+    return Status::OK();
+}
+
+Status TransferEngineImpl::releaseBatch(Batch* batch) {
+    if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (batch->runtime_refs == 0) {
+        return Status::InternalError("Batch runtime ref underflow" LOC_MARK);
+    }
+    --batch->runtime_refs;
+    if (batch->runtime_refs == 0 && batch->free_requested) {
+        CHECK_STATUS(lazyFreeBatch());
     }
     return Status::OK();
 }
@@ -1363,8 +1395,11 @@ Status TransferEngineImpl::submitTransferToBatch(
 
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
-    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    return submitTransferToBatch((Batch*)batch_id, request_list);
+    Batch* batch = nullptr;
+    CHECK_STATUS(retainBatch(batch_id, batch));
+    auto status = submitTransferToBatch(batch, request_list);
+    auto release_status = releaseBatch(batch);
+    return status.ok() ? release_status : status;
 }
 
 Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
@@ -1402,10 +1437,14 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification& notifi) {
-    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch* batch = (Batch*)(batch_id);
+    Batch* batch = nullptr;
+    CHECK_STATUS(retainBatch(batch_id, batch));
     const size_t start_task_id = batch->task_list.size();
-    CHECK_STATUS(submitTransfer(batch_id, request_list));
+    auto status = submitTransferToBatch(batch, request_list);
+    if (!status.ok()) {
+        auto release_status = releaseBatch(batch);
+        return release_status.ok() ? status : release_status;
+    }
     const size_t end_task_id = start_task_id + request_list.size();
     Batch::SubmitHook hook;
     hook.start_task_id = start_task_id;
@@ -1415,7 +1454,7 @@ Status TransferEngineImpl::submitTransfer(
     for (const auto& request : request_list)
         hook.targets.insert(request.target_id);
     batch->submit_hooks.emplace_back(std::move(hook));
-    return Status::OK();
+    return releaseBatch(batch);
 }
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
