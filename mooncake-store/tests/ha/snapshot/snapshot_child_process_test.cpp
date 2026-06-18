@@ -360,6 +360,33 @@ TEST_F(SnapshotChildProcessTest, UploadSnapshotPayloadFile_Success) {
 
 // ========== Auto Snapshot Thread ==========
 
+TEST_F(SnapshotChildProcessTest, DestructorInterruptsSnapshotThreadSleep) {
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(true)
+                      .set_enable_snapshot_restore(false)
+                      .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                      .set_snapshot_interval_seconds(4)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+    auto auto_service = std::make_unique<MasterService>(config);
+
+    // Let the background thread enter its snapshot interval wait.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    const auto destroy_start = std::chrono::steady_clock::now();
+    auto_service.reset();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - destroy_start)
+            .count();
+
+    EXPECT_LT(elapsed_ms, 2500)
+        << "MasterService shutdown should not wait for the full snapshot "
+           "interval";
+}
+
 TEST_F(SnapshotChildProcessTest, AutoSnapshot_GeneratesFiles) {
     // Create a service with snapshot enabled and short interval
     auto config = MasterServiceConfigBuilder()
