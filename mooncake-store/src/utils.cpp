@@ -43,6 +43,9 @@ DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
 #endif
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
@@ -116,6 +119,13 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_allocate_memory(total_size, protocol);
+    }
+#endif
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_allocate_memory(
+            total_size, alignment,
+            mooncake::globalConfig().sunrise_use_device_mem);
     }
 #endif
 #if defined(USE_UB)
@@ -375,6 +385,11 @@ void free_memory(const std::string &protocol, void *ptr) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
+    }
+#endif
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_free_memory(ptr);
     }
 #endif
 #if defined(USE_UB)

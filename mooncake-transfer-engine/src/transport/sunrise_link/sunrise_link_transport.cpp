@@ -1,6 +1,7 @@
 // Copyright 2024 KVCache.AI
 
 #include "transport/sunrise_link_transport/sunrise_link_transport.h"
+#include "sunrise_allocator.h"
 
 #include <dlfcn.h>
 #include <glog/logging.h>
@@ -139,6 +140,13 @@ static tangError_t QueryPointerAttrsBestEffort(void* ptr,
                                                tangPointerAttributes* attr,
                                                int preferred_dev) {
     if (!ptr || !attr) return tangErrorInvalidValue;
+
+    if (!sunrise_is_device_memory_range(ptr)) {
+        attr->type = tangMemoryTypeHost;
+        attr->device = -1;
+        return tangSuccess;
+    }
+
     SavedTangDevice saved;
 
     if (preferred_dev >= 0) {
@@ -148,14 +156,22 @@ static tangError_t QueryPointerAttrsBestEffort(void* ptr,
     tangError_t ret = tangPointerGetAttributes(attr, ptr);
     if (ret == tangSuccess) return ret;
 
+    if (preferred_dev < 0) {
+        return ret;
+    }
+
     int dev_count = 0;
     if (tangGetDeviceCount(&dev_count) != tangSuccess || dev_count <= 0) {
         return ret;
     }
     for (int d = 0; d < dev_count; ++d) {
         if (d == preferred_dev) continue;
-        tangSetDevice(d);
-        ret = tangPointerGetAttributes(attr, ptr);
+        {
+            SavedTangDevice loop_saved;
+            tangError_t sd = tangSetDevice(d);
+            if (sd != tangSuccess) continue;
+            ret = tangPointerGetAttributes(attr, ptr);
+        }
         if (ret == tangSuccess) return ret;
     }
     return ret;
@@ -336,39 +352,42 @@ int SunriseLinkTransport::registerLocalMemory(void* addr, size_t length,
     int preferred_dev = ParseSunriseDeviceId(location);
     tangPointerAttributes attr = {};
     tangError_t err = QueryPointerAttrsBestEffort(addr, &attr, preferred_dev);
-    if (err != tangSuccess || attr.type != tangMemoryTypeDevice) {
-        LOG(ERROR) << "SunriseLinkTransport: unsupported memory for register"
-                   << " addr=" << addr << " location=" << location
-                   << " preferred_dev=" << preferred_dev << " err=" << err
-                   << " type=" << attr.type << " device=" << attr.device;
-        return -1;
-    }
 
-    tangIpcMemHandle_t handle;
-    int saved_dev = -1;
-    tangGetDevice(&saved_dev);
-    int handle_dev = preferred_dev >= 0 ? preferred_dev : attr.device;
-    if (handle_dev >= 0) {
-        tangError_t sd = tangSetDevice(handle_dev);
-        if (sd != tangSuccess) {
-            LOG(ERROR) << "SunriseLinkTransport: tangSetDevice before "
-                       << "tangIpcGetMemHandle failed: " << sd << " "
-                       << tangGetErrorString(sd) << " device=" << handle_dev;
-            if (saved_dev >= 0) tangSetDevice(saved_dev);
-            return -1;
-        }
-    }
-    err = tangIpcGetMemHandle(&handle, addr);
-    if (saved_dev >= 0) tangSetDevice(saved_dev);
+    bool is_device_mem =
+        (err == tangSuccess && attr.type == tangMemoryTypeDevice);
+    int mem_dev =
+        is_device_mem ? attr.device : (preferred_dev >= 0 ? preferred_dev : 0);
 
     std::string shm_name;
-    if (err == tangSuccess) {
-        shm_name = serializeBinaryData(&handle, sizeof(handle));
+    if (is_device_mem) {
+        tangIpcMemHandle_t handle;
+        int saved_dev = -1;
+        tangGetDevice(&saved_dev);
+        int handle_dev = preferred_dev >= 0 ? preferred_dev : attr.device;
+        if (handle_dev >= 0) {
+            tangError_t sd = tangSetDevice(handle_dev);
+            if (sd != tangSuccess) {
+                LOG(ERROR) << "SunriseLinkTransport: tangSetDevice before "
+                           << "tangIpcGetMemHandle failed: " << sd << " "
+                           << tangGetErrorString(sd)
+                           << " device=" << handle_dev;
+                if (saved_dev >= 0) tangSetDevice(saved_dev);
+                return -1;
+            }
+        }
+        err = tangIpcGetMemHandle(&handle, addr);
+        if (saved_dev >= 0) tangSetDevice(saved_dev);
+
+        if (err == tangSuccess) {
+            shm_name = serializeBinaryData(&handle, sizeof(handle));
+        } else {
+            LOG(WARNING) << "SunriseLinkTransport: tangIpcGetMemHandle failed: "
+                         << err << " " << tangGetErrorString(err)
+                         << ", falling back to RAW_ADDR";
+            shm_name = kRawAddrPrefix + std::to_string(attr.device);
+        }
     } else {
-        LOG(WARNING) << "SunriseLinkTransport: tangIpcGetMemHandle failed: "
-                     << err << " " << tangGetErrorString(err)
-                     << ", falling back to RAW_ADDR";
-        shm_name = kRawAddrPrefix + std::to_string(attr.device);
+        shm_name = kRawAddrPrefix + std::to_string(mem_dev);
     }
 
     {
@@ -376,7 +395,7 @@ int SunriseLinkTransport::registerLocalMemory(void* addr, size_t length,
         if (registered_regions_.count(addr)) {
             return 0;
         }
-        registered_regions_[addr] = RegisteredRegion{length, attr.device};
+        registered_regions_[addr] = RegisteredRegion{length, mem_dev};
     }
 
     BufferDesc desc;
@@ -501,35 +520,86 @@ int SunriseLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
 
 int SunriseLinkTransport::startCopy(void* src, void* dst, size_t length,
                                     int remote_dev, int local_dev) {
-    tangPointerAttributes src_attr = {};
-    tangPointerAttributes dst_attr = {};
-    tangError_t src_ret =
-        QueryPointerAttrsBestEffort(src, &src_attr, local_dev);
-    tangError_t dst_ret =
-        QueryPointerAttrsBestEffort(dst, &dst_attr, remote_dev);
-    NormalizeMappedHostPointer(&src, &src_attr);
-    NormalizeMappedHostPointer(&dst, &dst_attr);
+    bool src_is_host_alloc = sunrise_is_host_allocated(src);
+    bool dst_is_host_alloc = sunrise_is_host_allocated(dst);
+    bool src_is_dev = sunrise_is_device_memory_range(src);
+    bool dst_is_dev = sunrise_is_device_memory_range(dst);
 
-    int src_dev =
-        (src_ret == tangSuccess && src_attr.type == tangMemoryTypeDevice)
-            ? src_attr.device
-            : -1;
-    int dst_dev =
-        (dst_ret == tangSuccess && dst_attr.type == tangMemoryTypeDevice)
-            ? dst_attr.device
-            : -1;
+    VLOG(1) << "startCopy: src=" << src << " dst=" << dst << " len=" << length
+            << " src_is_dev=" << src_is_dev << " dst_is_dev=" << dst_is_dev
+            << " src_is_host_alloc=" << src_is_host_alloc
+            << " dst_is_host_alloc=" << dst_is_host_alloc;
 
-    tangMemoryType src_type =
-        src_ret == tangSuccess ? src_attr.type : tangMemoryTypeHost;
-    tangMemoryType dst_type =
-        dst_ret == tangSuccess ? dst_attr.type : tangMemoryTypeHost;
+    bool any_tang =
+        src_is_dev || dst_is_dev || src_is_host_alloc || dst_is_host_alloc;
+    if (!any_tang) {
+        memcpy(dst, src, length);
+        return 0;
+    }
 
-    tangError_t ret =
-        doTangCopy(dst, dst_dev, src, src_dev, length, src_type, dst_type);
+    if (src_is_dev && dst_is_host_alloc && !dst_is_dev) {
+        SavedTangDevice saved;
+        tangSetDevice(0);
+        std::vector<char> staging(length);
+        tangError_t ret =
+            tangMemcpy(staging.data(), src, length, tangMemcpyDeviceToHost);
+        if (ret != tangSuccess) {
+            LOG(ERROR) << "startCopy: tangMemcpy D2H staging failed";
+            return -1;
+        }
+        memcpy(dst, staging.data(), length);
+        return 0;
+    }
+
+    if (src_is_host_alloc && !src_is_dev && dst_is_dev) {
+        SavedTangDevice saved;
+        tangSetDevice(0);
+        std::vector<char> staging(length);
+        memcpy(staging.data(), src, length);
+        tangError_t ret =
+            tangMemcpy(dst, staging.data(), length, tangMemcpyHostToDevice);
+        if (ret != tangSuccess) {
+            LOG(ERROR) << "startCopy: tangMemcpy H2D staging failed";
+            return -1;
+        }
+        return 0;
+    }
+
+    if ((src_is_host_alloc || dst_is_host_alloc) && !src_is_dev &&
+        !dst_is_dev) {
+        memcpy(dst, src, length);
+        return 0;
+    }
+
+    SavedTangDevice saved;
+    tangSetDevice(0);
+
+    tangMemcpyKind kind = tangMemcpyHostToHost;
+    if ((src_is_dev || src_is_host_alloc) &&
+        (dst_is_dev || dst_is_host_alloc)) {
+        kind = tangMemcpyDeviceToDevice;
+    } else if (src_is_dev || src_is_host_alloc) {
+        kind = tangMemcpyDeviceToHost;
+    } else if (dst_is_dev || dst_is_host_alloc) {
+        kind = tangMemcpyHostToDevice;
+    }
+
+    if (kind == tangMemcpyHostToHost) {
+        memcpy(dst, src, length);
+        return 0;
+    }
+
+    tangError_t ret = tangMemcpy(dst, src, length, kind);
+    if (dst_is_host_alloc || (kind == tangMemcpyDeviceToHost)) {
+        tangDeviceSynchronize();
+    }
     if (ret != tangSuccess) {
-        LOG(ERROR) << "SunriseLinkTransport: tang copy failed: " << ret << " "
-                   << tangGetErrorString(ret) << " src_dev=" << src_dev
-                   << " dst_dev=" << dst_dev;
+        LOG(ERROR) << "SunriseLinkTransport: tangMemcpy failed: " << ret << " "
+                   << tangGetErrorString(ret) << " kind=" << kind
+                   << " src_is_dev=" << src_is_dev
+                   << " dst_is_dev=" << dst_is_dev
+                   << " src_is_host_alloc=" << src_is_host_alloc
+                   << " dst_is_host_alloc=" << dst_is_host_alloc;
         return -1;
     }
     return 0;

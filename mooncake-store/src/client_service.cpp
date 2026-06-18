@@ -677,6 +677,15 @@ ErrorCode Client::InitTransferEngine(
             globalConfig().ascend_use_fabric_mem = true;
         }
     }
+    if (protocol == "sunrise_link") {
+        const char* sunrise_use_device_mem_env =
+            std::getenv("SUNRISE_USE_DEVICE_MEM");
+        if (sunrise_use_device_mem_env) {
+            globalConfig().sunrise_use_device_mem = true;
+            LOG(INFO) << "SUNRISE_USE_DEVICE_MEM enabled: segments will be "
+                      << "allocated in device memory via tangMalloc";
+        }
+    }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
@@ -751,7 +760,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem") {
+        } else if (protocol == "ascend" || protocol == "ubshmem" ||
+                   protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
@@ -3327,11 +3337,18 @@ void Client::PutToLocalFile(const std::string& key,
         int device_id = -1;
         if (IsDevicePointer(slice.ptr, &device_id)) {
             SetDevice(device_id);
+#if defined(USE_SUNRISE)
+            std::vector<char> pageable_buf(slice.size);
+            if (!CopyDeviceToHost(pageable_buf.data(), slice.ptr, slice.size)) {
+#else
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
             if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+#endif
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
+#if !defined(USE_SUNRISE)
                 pinned_buffer_pool_->Release(buf);
+#endif
                 // Must revoke to avoid phantom replica in master
                 auto revoke_result =
                     master_client_.PutRevoke(key, ReplicaType::DISK);
@@ -3341,8 +3358,12 @@ void Client::PutToLocalFile(const std::string& key,
                 }
                 return;
             }
+#if defined(USE_SUNRISE)
+            value.append(pageable_buf.data(), slice.size);
+#else
             value.append(buf.data, slice.size);
             pinned_buffer_pool_->Release(buf);
+#endif
         } else {
             value.append(static_cast<char*>(slice.ptr), slice.size);
         }

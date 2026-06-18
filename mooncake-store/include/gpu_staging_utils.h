@@ -6,6 +6,23 @@
 #include <acl/acl_rt.h>
 #endif
 
+#if defined(USE_SUNRISE)
+#include <tang_runtime_api.h>
+#include "sunrise_allocator.h"
+
+#include <vector>
+
+struct SavedTangDevice {
+    int dev{-1};
+    SavedTangDevice() { tangGetDevice(&dev); }
+    ~SavedTangDevice() {
+        if (dev >= 0) tangSetDevice(dev);
+    }
+    SavedTangDevice(const SavedTangDevice&) = delete;
+    SavedTangDevice& operator=(const SavedTangDevice&) = delete;
+};
+#endif
+
 #include <cstddef>
 #include <glog/logging.h>
 
@@ -38,6 +55,11 @@ inline bool IsDevicePointer(const void* ptr, int* out_device_id) {
         if (out_device_id) *out_device_id = static_cast<int>(attr.location.id);
         return true;
     }
+#elif defined(USE_SUNRISE)
+    if (sunrise_is_device_memory_range(const_cast<void*>(ptr))) {
+        if (out_device_id) *out_device_id = 0;
+        return true;
+    }
 #endif
     (void)ptr;
     (void)out_device_id;
@@ -54,6 +76,8 @@ inline bool CopyDeviceToHost(void* dst, const void* src, size_t size) {
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     return aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_DEVICE_TO_HOST) ==
            ACL_SUCCESS;
+#elif defined(USE_SUNRISE)
+    return tangMemcpy(dst, src, size, tangMemcpyDeviceToHost) == tangSuccess;
 #else
     (void)dst;
     (void)src;
@@ -86,6 +110,62 @@ inline bool CopyAuto(void* dst, const void* src, size_t size) {
     else if (dst_dev)
         kind = ACL_MEMCPY_HOST_TO_DEVICE;
     return aclrtMemcpy(dst, size, src, size, kind) == ACL_SUCCESS;
+#elif defined(USE_SUNRISE)
+    bool src_dev = sunrise_is_device_memory_range(const_cast<void*>(src));
+    bool dst_dev = sunrise_is_device_memory_range(dst);
+    bool src_host_alloc = sunrise_is_host_allocated(const_cast<void*>(src));
+    bool dst_host_alloc = sunrise_is_host_allocated(dst);
+
+    if (!src_dev && !dst_dev && !src_host_alloc && !dst_host_alloc) {
+        memcpy(dst, src, size);
+        return true;
+    }
+
+    if (src_dev && dst_host_alloc && !dst_dev) {
+        SavedTangDevice saved;
+        tangSetDevice(0);
+        std::vector<char> staging(size);
+        if (tangMemcpy(staging.data(), src, size, tangMemcpyDeviceToHost) !=
+            tangSuccess)
+            return false;
+        tangDeviceSynchronize();
+        memcpy(dst, staging.data(), size);
+        return true;
+    }
+
+    if (src_host_alloc && !src_dev && dst_dev) {
+        SavedTangDevice saved;
+        tangSetDevice(0);
+        std::vector<char> staging(size);
+        memcpy(staging.data(), src, size);
+        return tangMemcpy(dst, staging.data(), size, tangMemcpyHostToDevice) ==
+               tangSuccess;
+    }
+
+    if ((src_host_alloc || dst_host_alloc) && !src_dev && !dst_dev) {
+        memcpy(dst, src, size);
+        return true;
+    }
+
+    enum tangMemcpyKind kind = tangMemcpyHostToHost;
+    if ((src_dev || src_host_alloc) && (dst_dev || dst_host_alloc))
+        kind = tangMemcpyDeviceToDevice;
+    else if (src_dev || src_host_alloc)
+        kind = tangMemcpyDeviceToHost;
+    else if (dst_dev || dst_host_alloc)
+        kind = tangMemcpyHostToDevice;
+
+    if (kind == tangMemcpyHostToHost) {
+        memcpy(dst, src, size);
+        return true;
+    }
+
+    SavedTangDevice saved;
+    tangSetDevice(0);
+    if (tangMemcpy(dst, src, size, kind) != tangSuccess) return false;
+    if (dst_host_alloc || kind == tangMemcpyDeviceToHost)
+        tangDeviceSynchronize();
+    return true;
 #else
     (void)dst;
     (void)src;
@@ -104,6 +184,8 @@ inline void SetDevice(int device_id) {
     hipSetDevice(device_id);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     aclrtSetDevice(device_id);
+#elif defined(USE_SUNRISE)
+    tangSetDevice(device_id);
 #endif
 }
 
@@ -117,6 +199,8 @@ inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     return aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_HOST_TO_DEVICE) ==
            ACL_SUCCESS;
+#elif defined(USE_SUNRISE)
+    return tangMemcpy(dst, src, size, tangMemcpyHostToDevice) == tangSuccess;
 #else
     (void)dst;
     (void)src;
@@ -153,10 +237,14 @@ inline bool IsHostPointer(const void* ptr) {
     aclrtPtrAttributes attr{};
     if (aclrtPointerGetAttributes(const_cast<void*>(ptr), &attr) !=
         ACL_SUCCESS) {
-        // Query failed: likely pageable host memory not tracked by the runtime.
         return true;
     }
     return attr.location.type != ACL_MEM_LOCATION_TYPE_DEVICE;
+#elif defined(USE_SUNRISE)
+    if (sunrise_is_device_memory_range(const_cast<void*>(ptr))) {
+        return false;
+    }
+    return true;
 #else
     (void)ptr;
     return true;  // CPU-only build: all pointers are host

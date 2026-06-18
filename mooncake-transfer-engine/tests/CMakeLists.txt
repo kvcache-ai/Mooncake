@@ -149,6 +149,16 @@ if (USE_SUNRISE)
     target_include_directories(sunrise_link_transport_unit_test PRIVATE ${MC_TANGRT_ROOT}/include)
     target_link_libraries(sunrise_link_transport_unit_test PUBLIC transfer_engine gtest gtest_main)
     add_test(NAME sunrise_link_transport_unit_test COMMAND sunrise_link_transport_unit_test)
+
+    add_executable(sunrise_allocator_test ${WORKSPACE}/sunrise_allocator_test.cpp)
+    target_include_directories(sunrise_allocator_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_allocator_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_allocator_test COMMAND sunrise_allocator_test)
+
+    add_executable(sunrise_link_copy_test ${WORKSPACE}/sunrise_link_copy_test.cpp)
+    target_include_directories(sunrise_link_copy_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_link_copy_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_link_copy_test COMMAND sunrise_link_copy_test)
 endif()
 
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)

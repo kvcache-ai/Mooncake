@@ -290,6 +290,9 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
+if(USE_SUNRISE)
+  target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
+endif()
 
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
@@ -353,4 +356,14 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
     target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
     target_link_libraries(mooncake_client PRIVATE ascendcl)
 endif()
+
+if(USE_SUNRISE)
+    target_link_libraries(mooncake_store PRIVATE
+        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+    target_link_libraries(mooncake_client PRIVATE
+        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
+
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

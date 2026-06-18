@@ -10,6 +10,10 @@
 #include <acl/acl_rt.h>
 #endif
 
+#if defined(USE_SUNRISE)
+#include <tang_runtime_api.h>
+#endif
+
 namespace mooncake {
 
 /**
@@ -19,6 +23,7 @@ namespace mooncake {
  *   CUDA / MUSA / MACA : cudaMallocHost   (mapped via cuda_alike.h)
  *   HIP                : hipHostMalloc     (not mapped in hip.h, native API)
  *   Ascend             : aclrtMallocHost
+ *   Sunrise (Tang)     : tangHostAlloc
  *   Other              : new char[]        (pageable fallback)
  *
  * Pinned memory provides 10x~100x higher D2H bandwidth than pageable memory.
@@ -108,6 +113,14 @@ class PinnedBufferPool {
             buf.data = new char[size];
         }
 
+#elif defined(USE_SUNRISE)
+        if (tangHostAlloc(reinterpret_cast<void**>(&buf.data), size,
+                          tangHostAllocDefault) == tangSuccess) {
+            buf.is_pinned = true;
+        } else {
+            buf.data = new char[size];
+        }
+
 #else
         buf.data = new char[size];
 #endif
@@ -127,6 +140,8 @@ class PinnedBufferPool {
         hipHostFree(buf.data);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
         aclrtFreeHost(buf.data);
+#elif defined(USE_SUNRISE)
+        tangFreeHost(buf.data);
 #else
         delete[] buf.data;
 #endif

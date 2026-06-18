@@ -85,6 +85,7 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
+    bool sunrise_use_device_mem = false;
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;

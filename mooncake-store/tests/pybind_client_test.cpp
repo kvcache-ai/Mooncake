@@ -1794,6 +1794,65 @@ TEST_F(RealClientTest, ErrUnmountAndFreeInvalidSegmentIds) {
         << "Unmount-and-free of non-existent segment ids should fail";
 }
 
+#if defined(USE_SUNRISE)
+TEST_F(RealClientTest, SetupWithConfigDictAcceptsSunriseLink) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config;
+    config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost:17813";
+    config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
+    config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_PROTOCOL] = "sunrise_link";
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "setup_internal(ConfigDict) should accept sunrise_link protocol";
+}
+
+TEST_F(RealClientTest, SetupAcceptsSunriseLink) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    int result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                        16 * 1024 * 1024, 16 * 1024 * 1024,
+                                        "sunrise_link", "", master_address_);
+    EXPECT_EQ(result, 0) << "sunrise_link should work with Classic TE";
+}
+
+TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     "sunrise_link", "", master_address_),
+              0);
+
+    const std::string key = "sunrise_link_host_key";
+    const std::string value = "sunrise_link_host_value";
+    std::span<const char> data_span(value.data(), value.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    {
+        auto buffer_handle = py_client_->get_buffer(key);
+        ASSERT_NE(buffer_handle, nullptr);
+        std::string actual(static_cast<const char*>(buffer_handle->ptr()),
+                           buffer_handle->size());
+        EXPECT_EQ(actual, value);
+    }
+
+    EXPECT_EQ(py_client_->remove(key, true), 0);
+    EXPECT_EQ(py_client_->isExist(key), 0);
+}
+#endif
+
 }  // namespace testing
 
 }  // namespace mooncake
