@@ -61,6 +61,16 @@ ErrorCode EtcdLeaderCoordinator::Connect() {
     return err;
 }
 
+ErrorCode EtcdLeaderCoordinator::ResetConnection() {
+    auto err = EtcdHelper::ResetEtcdStoreClient(spec_.connstring);
+    if (err != ErrorCode::OK) {
+        connected_ = false;
+        return err;
+    }
+    connected_ = true;
+    return ErrorCode::OK;
+}
+
 tl::expected<std::optional<MasterView>, ErrorCode>
 EtcdLeaderCoordinator::ReadCurrentView() {
     auto err = EnsureConnected();
@@ -94,6 +104,7 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     EtcdLeaseId lease_id = 0;
     err = EtcdHelper::GrantLease(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC, lease_id);
     if (err != ErrorCode::OK) {
+        (void)ResetConnection();
         return tl::make_unexpected(err);
     }
 
@@ -117,9 +128,13 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         };
     }
     if (err != ErrorCode::OK) {
+        (void)ResetConnection();  // Reset first to get off the stale client
+
         auto revoke_err = EtcdHelper::RevokeLease(lease_id);
         if (revoke_err != ErrorCode::OK) {
-            return tl::make_unexpected(revoke_err);
+            LOG(WARNING)
+                << "Failed to revoke lease after CreateWithLease failure: "
+                << static_cast<int>(revoke_err);
         }
         return tl::make_unexpected(err);
     }
@@ -194,6 +209,9 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
             started_keepalive = true;
             keepalive_thread_ = std::thread([this, lease = lease_id.value()]() {
                 auto rc = EtcdHelper::KeepAlive(lease);
+                if (rc == ErrorCode::ETCD_OPERATION_ERROR) {
+                    (void)EtcdHelper::ResetEtcdStoreClient(spec_.connstring);
+                }
                 std::shared_ptr<std::atomic<bool>> monitor_armed;
                 LeadershipLostCallback on_leadership_lost;
                 LeadershipLossReason loss_reason =
