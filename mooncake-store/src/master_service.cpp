@@ -5427,6 +5427,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (!it->second.IsValid()) {
                     EraseMetadata(tenant_state, it, c.tenant_id, &shard);
                 }
+                if (tenant_state.Empty()) {
+                    shard->tenants.erase(tenant_it);
+                }
                 evicted_count += evict_result.evicted_objects;
                 evicted_this_pass += evict_result.evicted_objects;
             }
@@ -6110,8 +6113,16 @@ MasterService::MetadataSerializer::Serialize() {
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         const auto& shard = service_->metadata_shards_[shard_idx];
 
-        // Skip if shard is empty
-        if (shard.tenants.empty()) {
+        // Skip shards with no actual metadata entries.
+        // A shard may have empty tenants left after eviction erased all
+        // metadata but didn't clean up the tenant map; serializing those
+        // would produce an entry that deserialization never recreates,
+        // breaking the snapshot round-trip comparison.
+        size_t metadata_count = 0;
+        for (const auto& [tid, ts] : shard.tenants) {
+            metadata_count += ts.metadata.size();
+        }
+        if (metadata_count == 0) {
             continue;
         }
 
