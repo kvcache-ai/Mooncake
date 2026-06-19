@@ -191,15 +191,24 @@ int TransferExecutorBase::initEngines() {
         }
     }
 
-    if (globalConfig().ascend_use_fabric_mem) {
+    if (params_.use_fabric_mem) {
         options["EnableUseFabricMem"] = "1";
         LOG(INFO) << "Fabric mem mode is enabled.";
     }
 
+    const char* store_te =
+        globalConfig().ascend_store_te_init ? "true" : "false";
     char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
-    if (global_resource_config) {
-        options["GlobalResourceConfig"] = global_resource_config;
-        LOG(INFO) << "Set GlobalResourceConfig to:" << global_resource_config;
+    std::string resolved_resource_config =
+        ResolveAscendGlobalResourceConfig(global_resource_config);
+    if (!resolved_resource_config.empty()) {
+        options["GlobalResourceConfig"] = resolved_resource_config.c_str();
+        LOG(INFO) << "[AscendTE] init adxl, te is created for store="
+                  << store_te
+                  << ", GlobalResourceConfig: " << resolved_resource_config;
+    } else {
+        LOG(INFO) << "[AscendTE] init adxl, te is created for store="
+                  << store_te << ", GlobalResourceConfig unset.";
     }
 
     if (params_.use_async_transfer) {
@@ -400,7 +409,7 @@ void TransferExecutorBase::rollbackRegisteredMem(
 int TransferExecutorBase::registerMem(void* addr, size_t length,
                                       adxl::MemType mem_type,
                                       bool use_buffer_pool, bool roce_mode,
-                                      bool dummy_real_mode) {
+                                      bool agent_mode) {
     if (mem_type == adxl::MEM_HOST && use_buffer_pool) {
         LOG(INFO) << "Ignore register host mem:" << addr
                   << " when buffer pool is enabled.";
@@ -422,7 +431,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
 
     std::vector<size_t> engine_indices;
     bool register_to_all =
-        (roce_mode && dummy_real_mode && ascend_is_store_memory(addr, length));
+        (roce_mode && agent_mode && ascend_is_store_memory(addr, length));
     if (register_to_all || adxl_engines_.size() == 1U) {
         engine_indices.resize(adxl_engines_.size());
         std::iota(engine_indices.begin(), engine_indices.end(), 0);
@@ -531,7 +540,7 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     if (endpoints.empty()) return {};
 
     // Standard dummy-real RoCE: same-index pairing (unchanged)
-    if (params_.dummy_real_mode && params_.roce_mode) {
+    if (params_.agent_mode && params_.roce_mode) {
         if (engine_idx >= endpoints.size()) return {};
         return endpoints[engine_idx];
     }
@@ -539,7 +548,7 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     // Standalone mode: non-dummy-real thin client without fabric mem.
     // RoCE/HCCS all use phy_dev mapping; same-host offset +1 avoids
     // connecting to the same physical device across processes.
-    if (!params_.dummy_real_mode && !globalConfig().ascend_use_fabric_mem) {
+    if (!params_.agent_mode && !params_.use_fabric_mem) {
         aclrtContext saved_ctx = nullptr;
         if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
             LOG(ERROR) << "aclrtGetCurrentContext failed in standalone resolve";
@@ -604,7 +613,7 @@ void TransferExecutorBase::processSliceList(
         return;
     }
     size_t local_engine_idx =
-        params_.dummy_real_mode ? slice_list[0]->ascend_direct.engine_id : 0;
+        params_.agent_mode ? slice_list[0]->ascend_direct.engine_id : 0;
     VLOG(1) << "processSliceList for dev:" << local_engine_idx;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (!local_segment_desc ||
@@ -649,7 +658,7 @@ void TransferExecutorBase::processSliceList(
             return;
         }
 
-        auto need_local_copy = !globalConfig().ascend_use_fabric_mem &&
+        auto need_local_copy = !params_.use_fabric_mem &&
                                (target_adxl_engine_name == local_engine_name);
         if (need_local_copy && local_copy_engine_) {
             auto start = std::chrono::steady_clock::now();

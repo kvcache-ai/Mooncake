@@ -836,6 +836,10 @@ void MasterMetricManager::dec_mem_cache_nums(int64_t val) {
 void MasterMetricManager::dec_file_cache_nums(int64_t val) {
     file_cache_nums_.dec(val);
 }
+void MasterMetricManager::reset_cache_total_nums() {
+    mem_cache_nums_.reset();
+    file_cache_nums_.reset();
+}
 void MasterMetricManager::inc_valid_get_nums(int64_t val) {
     valid_get_nums_.inc(val);
 }
