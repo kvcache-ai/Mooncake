@@ -228,7 +228,13 @@ static int runTarget(TransferEngine* engine) {
     LOG(INFO) << "Shutting down target...";
     for (auto* p : bufs) {
         engine->unregisterLocalMemory(p);
-        munmap(p, buf_bytes);
+        if (!FLAGS_use_device) {
+            munmap(p, buf_bytes);
+        } else {
+#if defined(USE_CUDA) || defined(USE_HIP)
+            freeDeviceMem(p, buf_bytes);
+#endif
+        }
     }
     return 0;
 }
@@ -530,6 +536,7 @@ static int runInitiator(TransferEngine* engine) {
             } else {
                 LOG(INFO) << "transfer was successful\n";
             }
+            engine->unregisterLocalMemory(recv_bufs[t]);
             freeDeviceMem(recv_bufs[t], t % 4);
 #endif
         }

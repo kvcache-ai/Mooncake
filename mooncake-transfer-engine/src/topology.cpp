@@ -252,11 +252,13 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     // actually work
     std::vector<std::string> device_names;
     std::vector<InfinibandDevice> devices;
-    const char *path = "/sys/class/cxi";
+    const char *nic_path = "/sys/class/cxi";
 
-    DIR *dir = opendir(path);
+    DIR *dir = opendir(nic_path);
     if (!dir) {
         perror("opendir");
+        LOG(WARNING) << "No CXI devices were found, check you system";
+        return {};
     }
 
     struct dirent *entry;
@@ -266,6 +268,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
             device_names.emplace_back(entry->d_name);
         }
     }
+    closedir(dir);
 
     for (auto &dv_name : device_names) {
         if (!filter.empty() &&
@@ -279,6 +282,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
                  dv_name.c_str());
         if (realpath(path, resolved_path) == NULL) {
             PLOG(ERROR) << "Can't resolve CXI device path for " << path;
+            continue;
         }
         std::string pci_bus_id = basename(resolved_path);
 

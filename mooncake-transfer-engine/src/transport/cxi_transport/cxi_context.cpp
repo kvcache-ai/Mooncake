@@ -367,6 +367,11 @@ int CxiContext::registerMemoryRegionInternal(void* addr, size_t length,
             LOG(ERROR) << "fi_mr_regattr failed for GPU memory " << addr
                        << " (device " << device_ordinal
                        << "): " << fi_strerror(-ret);
+#if defined(USE_CUDA)
+            cudaSetDevice(current_device);
+#elif defined(USE_HIP)
+            hipSetDevice(current_device);
+#endif
             return ERR_CONTEXT;
         }
 #if defined(USE_CUDA)

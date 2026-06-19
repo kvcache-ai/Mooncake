@@ -160,8 +160,9 @@ int CxiTransport::preTouchMemory(void* addr, size_t length) {
         return 0;
     }
 
-    auto hwc = std::thread::hardware_concurrency();
-    auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
+    unsigned int hwc = std::thread::hardware_concurrency();
+    unsigned int num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
+    num_threads = std::max(num_threads, 1u); // guard in case hardware_concurrency() returns 0
     size_t block_size = length / num_threads;
     if (block_size == 0) {
         return 0;
@@ -242,7 +243,8 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries = getMemoryLocation(
             addr, length, only_first_page);  // check only first page
-        if (entries.empty()) return -1;
+        if (entries.empty()) 
+            return ERR_DEVICE_NOT_FOUND;
         resolved_name = entries[0].location;
     } else {
         resolved_name = name;
@@ -255,6 +257,11 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
 
     std::vector<std::vector<size_t>> nic_assignments(num_chunks);
 
+    int selected_device = local_topology_->selectDevice(resolved_name);
+    if (selected_device == ERR_DEVICE_NOT_FOUND) {
+        LOG(ERROR) << "could not select a NIC for data, resolved_name=" << resolved_name;
+        return ERR_DEVICE_NOT_FOUND;
+    }
     std::string nic = local_topology_->getHcaList().at(
         local_topology_->selectDevice(resolved_name));
     LOG(INFO) << "for this allocation, selected NIC " << nic;

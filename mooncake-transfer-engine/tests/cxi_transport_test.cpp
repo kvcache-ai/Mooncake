@@ -61,11 +61,11 @@ static void freeMemoryPoolDevice(void *addr) {
 #endif
 
 // ---------------------------------------------------------------------------
-// EFA Transport Test Fixture
+// CXI Transport Test Fixture
 //
 // This test uses the P2PHANDSHAKE metadata backend and performs loopback
 // transfers (local_server_name == segment_id), similar to the TCP transport
-// tests. It requires EFA hardware to be present (fi_info -p efa must succeed).
+// tests. It requires CXI hardware to be present (fi_info -p cxi must succeed).
 //
 // Environment variables:
 //   MC_METADATA_SERVER  - metadata backend (default: P2PHANDSHAKE)
