@@ -232,13 +232,13 @@ ErrorCode K8sLeaseHelper::CancelWatch(const std::string&, const std::string&) {
 
 ErrorCode K8sLeaseHelper::SetPodLabel(const std::string&, const std::string&,
                                       const std::string&, const std::string&) {
-    LOG(FATAL) << "K8s Lease is not enabled in compilation";
+    LOG(ERROR) << "K8s Lease is not enabled in compilation";
     return ErrorCode::K8S_LEASE_OPERATION_ERROR;
 }
 
 ErrorCode K8sLeaseHelper::ClearPodLabel(const std::string&, const std::string&,
                                         const std::string&) {
-    LOG(FATAL) << "K8s Lease is not enabled in compilation";
+    LOG(ERROR) << "K8s Lease is not enabled in compilation";
     return ErrorCode::K8S_LEASE_OPERATION_ERROR;
 }
 
