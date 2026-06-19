@@ -428,6 +428,14 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_millis(wait_ms.min(100)));
     }
 
+    // Release listener ports before drain so a successor daemon can bind
+    // immediately.  The gRPC server and metrics HTTP server are not needed
+    // during the drain/shutdown sequence.
+    drop(dummy_server);
+    if metrics_addr.is_some() {
+        stop_metrics_http_server()?;
+    }
+
     if args.drain_on_exit {
         let shutdown_summary = graceful_shutdown(
             &client,
@@ -439,17 +447,8 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
         )?;
         eprintln!("{shutdown_summary}");
     }
-    if let Err(error) = client.enter_offline() {
-        eprintln!(
-            "mooncake-store-client offline publish failed stable_id={stable_id} error={error}"
-        );
-    }
-    drop(dummy_server);
+    let _ = client.enter_offline();
     client.shutdown();
-    if metrics_addr.is_some() {
-        stop_metrics_http_server()?;
-    }
-    eprintln!("{}", stopped_message(&stable_id));
     Ok(())
 }
 
