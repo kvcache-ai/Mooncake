@@ -35,8 +35,8 @@
 namespace mooncake {
 namespace {
 
-int32_t ResolveCurrentEngineId(bool dummy_real_mode) {
-    if (!dummy_real_mode) {
+int32_t ResolveCurrentEngineId(bool agent_mode) {
+    if (!agent_mode) {
         return 0;
     }
     int32_t current_device_id = 0;
@@ -105,8 +105,9 @@ int AscendDirectTransport::install(std::string &local_server_name,
     TransferExecutorBase::InitParams exec_params;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
-    exec_params.dummy_real_mode = dummy_real_mode_;
+    exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
+    exec_params.use_fabric_mem = use_fabric_mem_;
 
     transfer_executor_ = TransferExecutorBase::Create(exec_params);
     ret = transfer_executor_->initialize();
@@ -117,7 +118,7 @@ int AscendDirectTransport::install(std::string &local_server_name,
         return ret;
     }
 
-    if (dummy_real_mode_ && roce_mode_) {
+    if (agent_mode_ && roce_mode_) {
         dispatcher_ = std::make_unique<RoceDummyRealSliceDispatcher>(
             transfer_executor_.get(), local_engine_contexts_);
     } else {
@@ -148,11 +149,21 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->name = local_server_name_;
     desc->protocol = "ascend";
 
-    dummy_real_mode_ = globalConfig().ascend_agent_mode;
+    agent_mode_ = globalConfig().ascend_agent_mode;
     roce_mode_ = IsRoceModeEnabled();
-    if (roce_mode_) {
-        LOG(INFO) << "Roce mode is enabled.";
-    }
+    // Only a Store-init TE may use fabric mem; gate on ascend_store_te_init so
+    // a P2P/HCCS TE does not inherit a Store TE's fabric flag left in the
+    // process-global config.
+    use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
+                      globalConfig().ascend_store_te_init;
+    LOG(INFO) << "[AscendTE] init local segment, te is created for store="
+              << (globalConfig().ascend_store_te_init ? "true" : "false")
+              << ", roce_mode=" << (roce_mode_ ? "true" : "false")
+              << ", use_fabric_mem=" << (use_fabric_mem_ ? "true" : "false")
+              << (agent_mode_
+                      ? ", launched as standalone real client (manages all "
+                        "local NPU devices)"
+                      : "");
     char *adxl_base_port = std::getenv("ASCEND_BASE_PORT");
     if (adxl_base_port) {
         std::optional<int32_t> base_port =
@@ -170,7 +181,7 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->rank_info.hostIp = host_ip;
     uint32_t device_count = 0;
     CHECK_ACL(aclrtGetDeviceCount(&device_count));
-    if (dummy_real_mode_) {
+    if (agent_mode_) {
         auto &ctx_mgr = ContextManager::getInstance();
         if (!ctx_mgr.isInitialized()) {
             LOG(ERROR) << "ContextManager is not initialized.";
@@ -217,7 +228,7 @@ Status AscendDirectTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }
@@ -245,7 +256,7 @@ Status AscendDirectTransport::submitTransfer(
 
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }
@@ -349,7 +360,7 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
 
     const int register_ret = transfer_executor_->registerMem(
         addr, length, mem_type, transfer_executor_->getUseBufferPool(),
-        roce_mode_, dummy_real_mode_);
+        roce_mode_, agent_mode_);
     if (register_ret == 0) {
         return 0;
     }
