@@ -152,6 +152,10 @@ if(STORE_USE_K8S_LEASE)
     k8s_lease_helper.cpp
     ha/leadership/backends/k8s/k8s_leader_coordinator.cpp)
   list(APPEND EXTRA_LIBS ${K8S_LEASE_WRAPPER_LIB})
+  set_source_files_properties(
+    k8s_lease_helper.cpp
+    PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
 endif()
 
 if(USE_NOF)

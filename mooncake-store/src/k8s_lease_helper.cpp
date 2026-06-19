@@ -149,6 +149,38 @@ ErrorCode K8sLeaseHelper::CancelWatch(const std::string& ns,
     return ErrorCode::OK;
 }
 
+ErrorCode K8sLeaseHelper::SetPodLabel(const std::string& ns,
+                                      const std::string& pod,
+                                      const std::string& key,
+                                      const std::string& value) {
+    char* err_msg = nullptr;
+    int ret = K8sPatchPodLabel(const_cast<char*>(ns.c_str()),
+                               const_cast<char*>(pod.c_str()),
+                               const_cast<char*>(key.c_str()),
+                               const_cast<char*>(value.c_str()), &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "SetPodLabel failed: " << err_msg;
+        free(err_msg);
+        return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode K8sLeaseHelper::ClearPodLabel(const std::string& ns,
+                                        const std::string& pod,
+                                        const std::string& key) {
+    char* err_msg = nullptr;
+    int ret = K8sRemovePodLabel(const_cast<char*>(ns.c_str()),
+                                const_cast<char*>(pod.c_str()),
+                                const_cast<char*>(key.c_str()), &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "ClearPodLabel failed: " << err_msg;
+        free(err_msg);
+        return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 #else  // !STORE_USE_K8S_LEASE
 
 ErrorCode K8sLeaseHelper::Init() {
@@ -194,6 +226,18 @@ ErrorCode K8sLeaseHelper::WatchHolder(const std::string&, const std::string&,
 }
 
 ErrorCode K8sLeaseHelper::CancelWatch(const std::string&, const std::string&) {
+    LOG(FATAL) << "K8s Lease is not enabled in compilation";
+    return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+}
+
+ErrorCode K8sLeaseHelper::SetPodLabel(const std::string&, const std::string&,
+                                      const std::string&, const std::string&) {
+    LOG(FATAL) << "K8s Lease is not enabled in compilation";
+    return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+}
+
+ErrorCode K8sLeaseHelper::ClearPodLabel(const std::string&, const std::string&,
+                                        const std::string&) {
     LOG(FATAL) << "K8s Lease is not enabled in compilation";
     return ErrorCode::K8S_LEASE_OPERATION_ERROR;
 }
