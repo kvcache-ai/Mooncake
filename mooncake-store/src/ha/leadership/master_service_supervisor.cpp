@@ -2,11 +2,9 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -15,6 +13,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "ha/leadership/leader_coordinator_factory.h"
+#include "ha/leadership/leader_label_reconciler.h"
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
@@ -37,84 +36,18 @@ bool HasPodIdentity(const MasterServiceSupervisorConfig& config) {
            config.ha_backend_type == "k8s";
 }
 
-// Drives this pod's leader label toward a desired state on a background thread.
-// Leadership transitions only flip the desired flag (non-blocking); the worker
-// performs the synchronous K8s API call and retries until the actual label
-// converges, so a transient API failure cannot leave a stale leader label on a
-// pod that is no longer serving.
-class LeaderLabelReconciler {
-   public:
-    explicit LeaderLabelReconciler(const MasterServiceSupervisorConfig& config)
-        : enabled_(HasPodIdentity(config)),
-          ns_(config.pod_namespace),
-          pod_(config.pod_name) {
-        if (enabled_) {
-            worker_ = std::thread([this] { Run(); });
-        }
-    }
-
-    ~LeaderLabelReconciler() {
-        if (!enabled_) return;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        if (worker_.joinable()) worker_.join();
-    }
-
-    LeaderLabelReconciler(const LeaderLabelReconciler&) = delete;
-    LeaderLabelReconciler& operator=(const LeaderLabelReconciler&) = delete;
-
-    void SetLeader(bool desired) {
-        if (!enabled_) return;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            desired_leader_ = desired;
-        }
-        cv_.notify_all();
-    }
-
-   private:
-    void Run() {
-        std::optional<bool> applied;
-        std::unique_lock<std::mutex> lock(mutex_);
-        while (true) {
-            cv_.wait(lock, [&] { return stop_ || applied != desired_leader_; });
-            if (stop_) return;
-            bool target = desired_leader_;
-            lock.unlock();
-
-            ErrorCode err =
-                target
-                    ? K8sLeaseHelper::SetPodLabel(ns_, pod_, kLeaderLabelKey,
-                                                  kLeaderLabelValue)
-                    : K8sLeaseHelper::ClearPodLabel(ns_, pod_, kLeaderLabelKey);
-
-            lock.lock();
-            if (err == ErrorCode::OK) {
-                applied = target;
-                continue;
-            }
-            LOG(WARNING) << "Failed to " << (target ? "set" : "clear")
-                         << " leader label on pod " << pod_ << ": "
-                         << toString(err);
-            cv_.wait_for(lock, kLabelReconcileRetryInterval,
-                         [&] { return stop_ || desired_leader_ != target; });
-            if (stop_) return;
-        }
-    }
-
-    const bool enabled_;
-    const std::string ns_;
-    const std::string pod_;
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool desired_leader_ = false;
-    bool stop_ = false;
-    std::thread worker_;
-};
+LeaderLabelReconciler MakeLeaderLabelReconciler(
+    const MasterServiceSupervisorConfig& config) {
+    return LeaderLabelReconciler(
+        HasPodIdentity(config),
+        [ns = config.pod_namespace, pod = config.pod_name](bool desired) {
+            return desired ? K8sLeaseHelper::SetPodLabel(
+                                 ns, pod, kLeaderLabelKey, kLeaderLabelValue)
+                           : K8sLeaseHelper::ClearPodLabel(ns, pod,
+                                                           kLeaderLabelKey);
+        },
+        kLabelReconcileRetryInterval);
+}
 
 std::string ResolveHABackendConnstring(
     const MasterServiceSupervisorConfig& config) {
@@ -285,7 +218,7 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
 int RunSupervisorLoop(const HABackendSpec& spec,
                       const MasterServiceSupervisorConfig& config,
                       MasterAdminServer& admin_server) {
-    LeaderLabelReconciler label_reconciler(config);
+    auto label_reconciler = MakeLeaderLabelReconciler(config);
     label_reconciler.SetLeader(false);
     SetRuntimeState(admin_server, MasterRuntimeState::kStarting);
     auto standby_controller = CreateStandbyController(spec, config);
