@@ -865,7 +865,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 sunrise_segment_ptrs_.emplace_back(ptr,
                                                    SunriseSegmentDeleter{});
 #else
-                LOG(ERROR) << "sunrise_link protocol requires USE_SUNRISE build";
+                LOG(ERROR)
+                    << "sunrise_link protocol requires USE_SUNRISE build";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else if (this->protocol == "ub") {
