@@ -794,6 +794,13 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "cxi") {
+            try {
+                transport = transfer_engine_->installTransport("cxi", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxl_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+            }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
             LOG(ERROR) << "ub protocol entable device names is " << deviceName;

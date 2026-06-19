@@ -59,6 +59,9 @@
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
 #endif
+#ifdef USE_CXI
+#include "transport/cxi_transport/cxi_transport.h"
+#endif
 #ifdef USE_SUNRISE
 #include "transport/sunrise_link_transport/sunrise_link_transport.h"
 #endif
@@ -382,6 +385,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_EFA
     else if (std::string(proto) == "efa") {
         transport = new EfaTransport();
+    }
+#endif
+#ifdef USE_CXI
+    else if (std::string(proto) == "cxi") {
+        transport = new CxiTransport();
     }
 #endif
 #ifdef USE_SUNRISE

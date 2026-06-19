@@ -189,6 +189,7 @@ static std::set<std::string> getIbvDeviceWhitelist() {
 
 static std::vector<InfinibandDevice> listInfiniBandDevices(
     const std::vector<std::string> &filter) {
+#ifndef USE_CXI
     int num_devices = 0;
     std::vector<InfinibandDevice> devices;
     const auto whitelist = getIbvDeviceWhitelist();
@@ -246,6 +247,52 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     }
     ibv_free_device_list(device_list);
     return devices;
+#else
+    // assume devices available and working, later use libcxi to check if they
+    // actually work
+    std::vector<std::string> device_names;
+    std::vector<InfinibandDevice> devices;
+    const char *path = "/sys/class/cxi";
+
+    DIR *dir = opendir(path);
+    if (!dir) {
+        perror("opendir");
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type == DT_LNK && std::string(entry->d_name) != "." &&
+            std::string(entry->d_name) != "..") {
+            device_names.emplace_back(entry->d_name);
+        }
+    }
+
+    for (auto &dv_name : device_names) {
+        if (!filter.empty() &&
+            std::find(filter.begin(), filter.end(), dv_name) == filter.end())
+            continue;
+
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/class/cxi/%s/device",
+                 dv_name.c_str());
+        if (realpath(path, resolved_path) == NULL) {
+            PLOG(ERROR) << "Can't resolve CXI device path for " << path;
+        }
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+
+        snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
+        std::ifstream(path) >> numa_node;
+
+        devices.push_back(InfinibandDevice{.name = std::move(dv_name),
+                                           .pci_bus_id = std::move(pci_bus_id),
+                                           .numa_node = numa_node});
+    }
+    return devices;
+#endif
 }
 
 #ifdef USE_UB

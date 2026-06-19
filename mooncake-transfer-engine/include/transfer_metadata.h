@@ -56,8 +56,13 @@ class TransferMetadata {
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
-        std::vector<uint32_t> lkey;         // for rdma
-        std::vector<uint32_t> rkey;         // for rdma
+#ifdef USE_CXI
+        std::vector<uint64_t> lkey;  // CXI provider with FI_MR_PROD
+        std::vector<uint64_t> rkey;  // requires 64-bit MR keys
+#else
+        std::vector<uint32_t> lkey;  // for rdma
+        std::vector<uint32_t> rkey;  // for rdma
+#endif
         std::string shm_name;               // for nvlink and hip
         uint64_t offset;                    // for cxl
         std::vector<std::string> tseg;      // for ub/urma
@@ -144,6 +149,9 @@ class TransferMetadata {
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
+#endif
+#ifdef USE_CXI
+        std::string cxi_addr;
 #endif
     };
 
