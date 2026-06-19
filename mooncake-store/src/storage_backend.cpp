@@ -175,6 +175,58 @@ StorageBackendInterface::StorageBackendInterface(
     const FileStorageConfig& config)
     : file_storage_config_(config) {}
 
+void StorageBackendInterface::CleanStoragePath() {
+    namespace fs = std::filesystem;
+    const std::string& path = file_storage_config_.storage_filepath;
+    if (path.empty()) {
+        LOG(WARNING) << "CleanStoragePath: storage path is empty, skipping";
+        return;
+    }
+
+    // Refuse to wipe obviously unsafe roots to avoid catastrophic deletions
+    // from a misconfigured path.
+    fs::path normalized = fs::path(path).lexically_normal();
+    if (normalized == normalized.root_path()) {
+        LOG(ERROR) << "CleanStoragePath: refusing to clean filesystem root: "
+                   << path;
+        return;
+    }
+
+    std::error_code ec;
+    if (!fs::exists(path, ec) || ec) {
+        return;  // Nothing to clean.
+    }
+    if (!fs::is_directory(path, ec) || ec) {
+        LOG(WARNING) << "CleanStoragePath: not a directory, skipping: " << path;
+        return;
+    }
+
+    // Snapshot entries first so removal does not invalidate the iterator.
+    std::vector<fs::path> entries;
+    for (const auto& entry : fs::directory_iterator(path, ec)) {
+        if (ec) {
+            LOG(ERROR) << "CleanStoragePath: failed to iterate " << path
+                       << ", error: " << ec.message();
+            break;
+        }
+        entries.push_back(entry.path());
+    }
+
+    size_t removed = 0;
+    for (const auto& entry : entries) {
+        std::error_code rm_ec;
+        fs::remove_all(entry, rm_ec);
+        if (rm_ec) {
+            LOG(ERROR) << "CleanStoragePath: failed to remove " << entry
+                       << ", error: " << rm_ec.message();
+        } else {
+            ++removed;
+        }
+    }
+    LOG(INFO) << "CleanStoragePath: wiped storage path " << path << ", removed "
+              << removed << " top-level entries";
+}
+
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
     if (actual_fsdir.rfind("moon_", 0) == 0) {
