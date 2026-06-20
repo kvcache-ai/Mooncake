@@ -15,20 +15,12 @@ if use_musa:
         ) from e
 
 
-if use_musa:
-    import torchada.utils.cpp_extension as cpp_extension  # noqa: E402
-    from torchada.utils.cpp_extension import (  # noqa: E402
-        BuildExtension,
-        CUDAExtension,
-        CUDA_HOME,
-    )
-else:
-    import torch.utils.cpp_extension as cpp_extension  # noqa: E402
-    from torch.utils.cpp_extension import (  # noqa: E402
-        BuildExtension,
-        CUDAExtension,
-        CUDA_HOME,
-    )
+import torch.utils.cpp_extension as cpp_extension  # noqa: E402
+from torch.utils.cpp_extension import (  # noqa: E402
+    BuildExtension,
+    CUDAExtension,
+    CUDA_HOME,
+)
 
 if use_musa and CUDA_HOME is None and os.getenv("CUDA_HOME"):
     # MUSA PyTorch wheels may report torch.cuda as not compiled, causing

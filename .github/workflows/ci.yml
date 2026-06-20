@@ -304,6 +304,12 @@ jobs:
       run: |
         apt update -y
         apt install -y curl libopenblas0 python3-pip
+        curl -fsSL --retry 3 \
+          -o /tmp/cuda-keyring.deb \
+          https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+        dpkg -i /tmp/cuda-keyring.deb
+        apt update -y
+        apt install -y cuda-cudart-dev-12-4 cuda-driver-dev-12-4
         curl -L --retry 3 \
           -o /tmp/S80-v2.5.0-4.2.0.tar.gz \
           https://github.com/MooreThreads/torch_musa/releases/download/v2.5.0/S80-v2.5.0-4.2.0.tar.gz
@@ -317,6 +323,9 @@ jobs:
         rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
         ln -sfn /usr/local/musa /usr/local/cuda
         ln -sfn /usr/local/musa/bin/mcc /usr/local/musa/bin/nvcc
+        for header in /usr/local/cuda-12.4/include/*.h; do
+          ln -sfn "$header" "/usr/local/musa/include/$(basename "$header")"
+        done
         echo "MUSA_HOME=/usr/local/musa" >> $GITHUB_ENV
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
