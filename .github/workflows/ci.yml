@@ -495,6 +495,12 @@ jobs:
         #ifndef MUSART_THIRD
         #define MUSART_THIRD 0.33333333333333333333
         #endif
+        #ifndef MUSART_SQRT_HALF_HI
+        #define MUSART_SQRT_HALF_HI 0.70710678118654752440
+        #endif
+        #ifndef MUSART_SQRT_HALF_LO
+        #define MUSART_SQRT_HALF_LO 0.0
+        #endif
 
         typedef struct CUstream_st *musaStream_t;
         typedef struct CUevent_st *musaEvent_t;
@@ -512,7 +518,7 @@ jobs:
         typedef const struct CUarray_st *musaArray_const_t;
         typedef struct CUmipmappedArray_st *musaMipmappedArray_t;
         typedef const struct CUmipmappedArray_st *musaMipmappedArray_const_t;
-        typedef void (*musaHostFn_t)(void *userData);
+        typedef void (*musaHostFn_t)(void *userData, int reserved);
         typedef struct {
           char reserved[64];
         } musaIpcEventHandle_t;
@@ -528,7 +534,7 @@ jobs:
           char reserved[64];
         } musaStreamAttrValue;
         typedef struct musaGraphExecUpdateResultInfo {
-          int result;
+          enum musaGraphExecUpdateResult result;
           musaGraphNode_t errorNode;
         } musaGraphExecUpdateResultInfo;
 
