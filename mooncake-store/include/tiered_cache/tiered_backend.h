@@ -228,6 +228,31 @@ class TieredBackend {
         bool notify_master = true);
 
     /**
+     * @brief Reverse-notification hook for bottom-up (tier-initiated) eviction.
+     *
+     * When a tier autonomously evicts a bucket to reclaim space, it physically
+     * removes the underlying files for a batch of keys, bypassing the normal
+     * top-down Delete path. This method re-synchronizes the high-level state
+     * with that fact. For each evicted key whose replica lives on @p tier_id:
+     *   - removes that replica from the metadata index, releasing the owning
+     *     AllocationHandle OUTSIDE all locks so the tier's RAII Free path runs
+     *     exactly once (the single, symmetric per-key byte decrement);
+     *   - notifies the scheduler via OnDelete so LRU / fast-reclaim no longer
+     *     believe a backup exists on the evicted tier;
+     *   - best-effort notifies Master via the remove-replica callback.
+     *
+     * The physical eviction is irreversible, so this cleanup always runs to
+     * completion (it is never gated on shutdown or Master reachability).
+     *
+     * @param keys    Keys that lived in the evicted bucket (snapshot taken
+     *                before the physical eviction).
+     * @param tier_id The tier that performed the eviction.
+     * @return Number of replicas actually removed from the metadata index.
+     */
+    size_t NotifyBucketEviction(const std::vector<std::string>& keys,
+                                const UUID& tier_id);
+
+    /**
      * @brief Remove ALL keys (and all replicas) from the local tiered storage.
      * @return Number of distinct keys removed, or ErrorCode on shutdown.
      */

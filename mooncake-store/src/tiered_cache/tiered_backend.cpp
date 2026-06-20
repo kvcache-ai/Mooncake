@@ -858,6 +858,96 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     return tl::expected<void, ErrorCode>{};
 }
 
+size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
+                                           const UUID& tier_id) {
+    // Capture handle references locally so the actual resource release (and the
+    // owning tier's per-key Free accounting) happens OUTSIDE all metadata
+    // locks, mirroring Delete(). The physical bucket has already been removed
+    // by the tier, so this cleanup must run to completion regardless of
+    // shutdown or Master reachability — there is nothing to roll back.
+    std::vector<AllocationHandle> handles_to_free;
+    handles_to_free.reserve(keys.size());
+
+    size_t removed = 0;
+
+    for (const auto& key : keys) {
+        auto& shard = GetMetadataShard(key);
+        bool found_tier = false;
+        bool need_cleanup = false;
+
+        // Remove the replica on the evicting tier (Shard Read + Entry Write).
+        {
+            std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
+            auto it = shard.index.find(key);
+            if (it == shard.index.end()) {
+                // No metadata entry: key was uncommitted or already deleted.
+                continue;
+            }
+            auto entry = it->second;
+
+            std::unique_lock<std::shared_mutex> entry_write_lock(entry->mutex);
+            auto tier_it = entry->replicas.end();
+            for (auto rit = entry->replicas.begin();
+                 rit != entry->replicas.end(); ++rit) {
+                if (rit->first == tier_id) {
+                    tier_it = rit;
+                    break;
+                }
+            }
+            if (tier_it == entry->replicas.end()) {
+                // The key has no replica on the evicting tier; leave it alone.
+                continue;
+            }
+
+            handles_to_free.push_back(
+                tier_it->second);  // Capture reference (+1 ref count)
+            entry->replicas.erase(tier_it);
+            entry->version++;  // Increment version on replica deletion
+            found_tier = true;
+            need_cleanup = entry->replicas.empty();
+        }
+
+        // Remove an emptied entry under the shard write lock (zombie cleanup),
+        // double-checking that no replica was re-added concurrently.
+        if (need_cleanup) {
+            std::unique_lock<std::shared_mutex> write_lock(shard.mutex);
+            auto it = shard.index.find(key);
+            if (it != shard.index.end()) {
+                auto entry = it->second;
+                std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+                if (entry->replicas.empty()) {
+                    shard.index.erase(it);
+                }
+            }
+        }
+
+        if (found_tier) {
+            ++removed;
+            // Notify Master that the replica on this tier is gone. Best-effort:
+            // the eviction is irreversible, so log failures and continue.
+            if (remove_replica_callback_) {
+                auto result = remove_replica_callback_(key, tier_id);
+                if (!result.has_value()) {
+                    LOG(WARNING)
+                        << "NotifyBucketEviction: notify master failed, key="
+                        << key << ", tier_id=" << tier_id
+                        << ", error_code=" << result.error();
+                }
+            }
+            // Clear the scheduler snapshot so LRU / fast-reclaim no longer
+            // believe an evicted-tier backup exists for this key.
+            if (scheduler_) {
+                scheduler_->OnDelete(DeleteContext{key, tier_id});
+            }
+        }
+    }
+
+    // handles_to_free destructs here: ref count -> 0 -> ~AllocationEntry() ->
+    // tier->Free(), performing the single, symmetric per-key byte-accounting
+    // decrement. No locks are held during release.
+    return removed;
+}
+
 tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
