@@ -327,20 +327,6 @@ jobs:
          */
         #include <driver_types.h>
 
-        #ifndef MUSART_CB
-        #define MUSART_CB
-        #endif
-
-        enum {
-          musaMemAttachGlobal = 1,
-          musaMemAttachHost = 2,
-          musaMemAttachSingle = 4
-        };
-
-        enum {
-          musaOccupancyDefault = 0
-        };
-
         #ifndef MUSART_PI
         #define MUSART_PI 3.14159265358979323846
         #endif
