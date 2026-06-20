@@ -53,7 +53,11 @@ cuda_library_dirs = []
 use_maca = hasattr(torch.version, "maca") and torch.version.maca is not None
 
 if use_musa:
-    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    musa_defines = [
+        "-DUSE_MUSA",
+        "-DMOONCAKE_EP_USE_MUSA=1",
+        "-DC10_CUDA_NO_CMAKE_CONFIGURE_FILE",
+    ]
     cxx_args += musa_defines
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
