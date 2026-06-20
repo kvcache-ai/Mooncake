@@ -304,17 +304,6 @@ jobs:
       run: |
         apt update -y
         apt install -y curl libopenblas0 python3-pip
-        curl -fsSL --retry 3 \
-          -o /tmp/cuda-keyring.deb \
-          https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-        dpkg -i /tmp/cuda-keyring.deb
-        apt update -y
-        apt install -y \
-          cuda-cudart-dev-12-4 \
-          cuda-driver-dev-12-4 \
-          libcublas-dev-12-4 \
-          libcusolver-dev-12-4 \
-          libcusparse-dev-12-4
         curl -L --retry 3 \
           -o /tmp/S80-v2.5.0-4.2.0.tar.gz \
           https://github.com/MooreThreads/torch_musa/releases/download/v2.5.0/S80-v2.5.0-4.2.0.tar.gz
@@ -583,9 +572,28 @@ jobs:
 
         #endif  /* MOONCAKE_MUSA_CI_COMPAT_H */
         H
-        cat > /usr/local/cuda-12.4/include/musa_runtime.h <<'H'
-        #include </usr/local/musa/include/mooncake_musa_ci_compat.h>
-        #include_next <musa_runtime.h>
+        python3 - <<'PY'
+        from pathlib import Path
+        path = Path('/usr/local/musa/include/musa_runtime.h')
+        text = path.read_text()
+        include = '#include "mooncake_musa_ci_compat.h"\n'
+        if include not in text:
+            path.write_text(include + text)
+        PY
+        cat > /usr/local/musa/include/cuda_runtime_api.h <<'H'
+        #pragma once
+        #include "mooncake_musa_ci_compat.h"
+        #include <musa_runtime_api.h>
+        typedef musaError_t cudaError_t;
+        typedef musaStream_t cudaStream_t;
+        typedef musaEvent_t cudaEvent_t;
+        enum { cudaSuccess = musaSuccess };
+        static inline const char *cudaGetErrorString(cudaError_t) { return "MUSA build shim"; }
+        static inline cudaError_t cudaGetLastError(void) { return cudaSuccess; }
+        H
+        cat > /usr/local/musa/include/cuda_runtime.h <<'H'
+        #pragma once
+        #include <cuda_runtime_api.h>
         H
         rm -f /usr/local/musa/bin/nvcc
         cat > /usr/local/musa/bin/nvcc <<'SH'
@@ -624,7 +632,6 @@ jobs:
         chmod +x /usr/local/musa/bin/nvcc
         echo "MUSA_HOME=/usr/local/musa" >> $GITHUB_ENV
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
-        echo "CUDA_COMPAT_INCLUDE=/usr/local/cuda-12.4/include" >> $GITHUB_ENV
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
         # The public torch_musa wheel provides the build-time compatibility
