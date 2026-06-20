@@ -365,6 +365,12 @@ jobs:
         #pragma once
         #include <cuda_runtime_api.h>
         H
+        cat > /usr/local/musa/include/cuda.h <<'H'
+        #pragma once
+        #include <cuda_runtime_api.h>
+        typedef int CUresult;
+        #define CUDA_SUCCESS 0
+        H
         cat > /usr/local/musa/include/cusparse.h <<'H'
         #pragma once
         typedef struct cusparseContext *cusparseHandle_t;
