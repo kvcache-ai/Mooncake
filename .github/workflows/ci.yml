@@ -303,7 +303,7 @@ jobs:
     - name: Install MUSA PyTorch dependencies
       run: |
         apt update -y
-        apt install -y curl python3-pip
+        apt install -y curl libopenblas0 python3-pip
         curl -L --retry 3 \
           -o /tmp/S80-v2.5.0-4.2.0.tar.gz \
           https://github.com/MooreThreads/torch_musa/releases/download/v2.5.0/S80-v2.5.0-4.2.0.tar.gz
