@@ -365,6 +365,34 @@ jobs:
         #pragma once
         #include <cuda_runtime_api.h>
         H
+        cat > /usr/local/musa/include/cusparse.h <<'H'
+        #pragma once
+        typedef struct cusparseContext *cusparseHandle_t;
+        typedef struct cusparseMatDescr *cusparseMatDescr_t;
+        typedef int cusparseStatus_t;
+        #define CUSPARSE_STATUS_SUCCESS 0
+        H
+        cat > /usr/local/musa/include/cublas_v2.h <<'H'
+        #pragma once
+        typedef struct cublasContext *cublasHandle_t;
+        typedef int cublasStatus_t;
+        typedef int cublasPointerMode_t;
+        typedef int cublasSideMode_t;
+        typedef int cublasFillMode_t;
+        typedef int cublasOperation_t;
+        typedef int cublasDiagType_t;
+        #define CUBLAS_STATUS_SUCCESS 0
+        H
+        cat > /usr/local/musa/include/cublasLt.h <<'H'
+        #pragma once
+        typedef struct cublasLtContext *cublasLtHandle_t;
+        H
+        cat > /usr/local/musa/include/cusolverDn.h <<'H'
+        #pragma once
+        typedef struct cusolverDnContext *cusolverDnHandle_t;
+        typedef int cusolverStatus_t;
+        #define CUSOLVER_STATUS_SUCCESS 0
+        H
         rm -f /usr/local/musa/bin/nvcc
         cat > /usr/local/musa/bin/nvcc <<'SH'
         #!/usr/bin/env bash
