@@ -320,12 +320,18 @@ jobs:
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
+        # The public torch_musa wheel provides the build-time compatibility
+        # headers needed by torchada.  The SDK-only image intentionally does
+        # not ship all runtime DNN libraries, so keep PyTorch from eagerly
+        # loading the torch_musa runtime backend during extension builds.
+        echo "TORCH_DEVICE_BACKEND_AUTOLOAD=0" >> $GITHUB_ENV
+        export TORCH_DEVICE_BACKEND_AUTOLOAD=0
         python3 - <<'PY'
+        import importlib.metadata as metadata
         import torch
-        import torch_musa
         import torchada
         print("torch", torch.__version__)
-        print("torch_musa", torch_musa.__version__)
+        print("torch_musa", metadata.version("torch_musa"))
         print("torchada", getattr(torchada, "__version__", "unknown"))
         PY
       shell: bash
