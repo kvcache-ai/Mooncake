@@ -370,6 +370,10 @@ jobs:
 
         #endif  /* MOONCAKE_MUSA_CI_COMPAT_H */
         H
+        cat > /usr/local/cuda-12.4/include/musa_runtime.h <<'H'
+        #include </usr/local/musa/include/mooncake_musa_ci_compat.h>
+        #include_next <musa_runtime.h>
+        H
         rm -f /usr/local/musa/bin/nvcc
         cat > /usr/local/musa/bin/nvcc <<'SH'
         #!/usr/bin/env bash
