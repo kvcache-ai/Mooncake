@@ -15,11 +15,20 @@ if use_musa:
         ) from e
 
 
+import torch.utils.cpp_extension as cpp_extension  # noqa: E402
 from torch.utils.cpp_extension import (  # noqa: E402
     BuildExtension,
     CUDAExtension,
     CUDA_HOME,
 )
+
+if use_musa and CUDA_HOME is None and os.getenv("CUDA_HOME"):
+    # MUSA PyTorch wheels may report torch.cuda as not compiled, causing
+    # torch.utils.cpp_extension.CUDA_HOME to stay None even when CUDA_HOME is
+    # set to the MUSA SDK compatibility path.  CUDAExtension consults the
+    # module-level CUDA_HOME when resolving library paths, so patch it here.
+    cpp_extension.CUDA_HOME = os.getenv("CUDA_HOME")
+    CUDA_HOME = cpp_extension.CUDA_HOME
 
 
 torch_version = re.match(r"\d+(?:\.\d+)*", torch.__version__).group()
