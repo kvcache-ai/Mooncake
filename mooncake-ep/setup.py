@@ -58,7 +58,12 @@ if use_musa:
         "-DMOONCAKE_EP_USE_MUSA=1",
         "-DC10_CUDA_NO_CMAKE_CONFIGURE_FILE",
     ]
-    cxx_args += musa_defines
+    cxx_args += musa_defines + [
+        "-D__host__=",
+        "-D__device__=",
+        "-D__cudart_builtin__=",
+        "-DCUDARTAPI=",
+    ]
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
         abi_define,
