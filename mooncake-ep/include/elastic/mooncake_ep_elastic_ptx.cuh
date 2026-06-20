@@ -161,9 +161,42 @@ __forceinline__ __device__ void tma_load_1d(
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))), "l"(hint)
         : "memory");
 #else
-    auto* dst = static_cast<char*>(const_cast<void*>(dst_ptr));
-    const auto* src = static_cast<const char*>(src_ptr);
-    for (int i = 0; i < num_bytes; ++i) dst[i] = src[i];
+    const auto dst_addr = reinterpret_cast<uintptr_t>(dst_ptr);
+    const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
+    if (((dst_addr | src_addr | static_cast<uintptr_t>(num_bytes)) &
+         (sizeof(int4) - 1)) == 0) {
+        auto* dst = reinterpret_cast<int4*>(const_cast<void*>(dst_ptr));
+        const auto* src = reinterpret_cast<const int4*>(src_ptr);
+        const int num_vecs = num_bytes / static_cast<int>(sizeof(int4));
+        for (int i = 0; i < num_vecs; ++i) dst[i] = src[i];
+    } else {
+        auto* dst = static_cast<char*>(const_cast<void*>(dst_ptr));
+        const auto* src = static_cast<const char*>(src_ptr);
+        for (int i = 0; i < num_bytes; ++i) dst[i] = src[i];
+    }
+#endif
+}
+
+__forceinline__ __device__ void tma_load_1d_warp(
+    const void* dst_ptr, const void* src_ptr, mbarrier* ptr,
+    const int& num_bytes, const int& lane_idx,
+    const TMACacheHint& hint = TMACacheHint::kEvictFirst) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    const auto dst_addr = reinterpret_cast<uintptr_t>(dst_ptr);
+    const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
+    if (((dst_addr | src_addr | static_cast<uintptr_t>(num_bytes)) &
+         (sizeof(int4) - 1)) == 0) {
+        auto* dst = reinterpret_cast<int4*>(const_cast<void*>(dst_ptr));
+        const auto* src = reinterpret_cast<const int4*>(src_ptr);
+        const int num_vecs = num_bytes / static_cast<int>(sizeof(int4));
+        for (int i = lane_idx; i < num_vecs; i += 32) dst[i] = src[i];
+    } else {
+        auto* dst = static_cast<char*>(const_cast<void*>(dst_ptr));
+        const auto* src = static_cast<const char*>(src_ptr);
+        for (int i = lane_idx; i < num_bytes; i += 32) dst[i] = src[i];
+    }
+#else
+    if (elect_one_sync()) tma_load_1d(dst_ptr, src_ptr, ptr, num_bytes, hint);
 #endif
 }
 

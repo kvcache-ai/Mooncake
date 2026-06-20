@@ -436,9 +436,15 @@ void launch_elastic_dispatch_deterministic_prologue(
     // Keep the MUSA compile set intentionally small while validating the
     // native elastic scale-up path; MUSA non-hybrid dispatch prepares slots in
     // a separate kernel and does not call this CUDA cooperative prologue.
+    TRY_PROLOGUE(0, 256, 8, 128, 40, 2);
     TRY_PROLOGUE(0, 256, 8, 128, 24, 2);
+    TRY_PROLOGUE(0, 256, 8, 128, 32, 2);
+    TRY_PROLOGUE(0, 256, 8, 128, 24, 8);
     TRY_PROLOGUE(0, 256, 8, 256, 24, 2);
+    TRY_PROLOGUE(0, 256, 8, 512, 40, 2);
     TRY_PROLOGUE(0, 256, 8, 512, 24, 2);
+    TRY_PROLOGUE(0, 256, 8, 512, 32, 2);
+    TRY_PROLOGUE(0, 256, 8, 512, 24, 8);
     TRY_PROLOGUE(0, 256, 8, 1024, 24, 2);
 #else
     // Common production MoE shapes; hidden is irrelevant for this prologue.
@@ -694,11 +700,23 @@ void launch_mooncake_elastic_dispatch(
     TRY_DISPATCH_TYPED(H, E, K, M, S, R, 1, (H) / 128)
 
 #ifdef MOONCAKE_EP_USE_MUSA
+    TRY_DISPATCH_TYPED(4096, 256, 8, 128, 40, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_TYPED(4096, 256, 8, 128, 32, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_TYPED(4096, 256, 8, 128, 24, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_TYPED(4096, 256, 8, 128, 24, 8,
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_TYPED(4096, 256, 8, 256, 24, 2,
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_TYPED(4096, 256, 8, 512, 40, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_TYPED(4096, 256, 8, 512, 32, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_TYPED(4096, 256, 8, 512, 24, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_TYPED(4096, 256, 8, 512, 24, 8,
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_TYPED(4096, 256, 8, 1024, 24, 2,
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
@@ -853,11 +871,23 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
     TRY_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, R, 1, (H) / 128)
 
 #ifdef MOONCAKE_EP_USE_MUSA
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 128, 40, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 128, 32, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 128, 24, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 128, 24, 8,
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 256, 24, 2,
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 512, 40, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 512, 32, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 512, 24, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 512, 24, 8,
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 1024, 24, 2,
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
@@ -987,9 +1017,15 @@ void* launch_mooncake_elastic_combine(
     }
 
 #ifdef MOONCAKE_EP_USE_MUSA
+    TRY_COMBINE(4096, 256, 8, 128, 40, 2);
+    TRY_COMBINE(4096, 256, 8, 128, 32, 2);
     TRY_COMBINE(4096, 256, 8, 128, 24, 2);
+    TRY_COMBINE(4096, 256, 8, 128, 24, 8);
     TRY_COMBINE(4096, 256, 8, 256, 24, 2);
+    TRY_COMBINE(4096, 256, 8, 512, 40, 2);
+    TRY_COMBINE(4096, 256, 8, 512, 32, 2);
     TRY_COMBINE(4096, 256, 8, 512, 24, 2);
+    TRY_COMBINE(4096, 256, 8, 512, 24, 8);
     TRY_COMBINE(4096, 256, 8, 1024, 24, 2);
 #else
     TRY_COMBINE(4096, 256, 8, 128, 24, 8);
@@ -1049,9 +1085,15 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
     }
 
 #ifdef MOONCAKE_EP_USE_MUSA
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 40, 1, 2);
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 32, 1, 2);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 2);
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 8);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 256, 24, 1, 2);
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 512, 40, 1, 2);
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 512, 32, 1, 2);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 512, 24, 1, 2);
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 512, 24, 1, 8);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 1024, 24, 1, 2);
 #else
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 8);
