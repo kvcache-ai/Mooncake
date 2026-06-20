@@ -163,6 +163,19 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         __syncwarp();
 
         // Issue TMA copy
+#ifdef MOONCAKE_EP_USE_MUSA
+        {
+            const auto* src_ptr = static_cast<const combine_vec_t*>(
+                tma_buffer.get_base_ptr());
+            auto* dst_ptr = static_cast<combine_vec_t*>(
+                output_buffer.get_token_buffer(token_idx).get_base_ptr());
+#pragma unroll 1
+            for (int vec_idx = lane_idx; vec_idx < kHiddenVec; vec_idx += 32) {
+                dst_ptr[vec_idx] = src_ptr[vec_idx];
+            }
+            __syncwarp();
+        }
+#else
         if (ptx::elect_one_sync()) {
             ptx::tma_store_1d(
                 output_buffer.get_token_buffer(token_idx).get_base_ptr(),
@@ -170,6 +183,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             ptx::tma_store_commit();
         }
         __syncwarp();
+#endif
 
         // Write top-k weights
         if (combined_topk_weights != nullptr) {

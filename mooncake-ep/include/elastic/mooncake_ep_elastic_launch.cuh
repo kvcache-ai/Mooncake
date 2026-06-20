@@ -76,19 +76,4 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
     bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
     cudaStream_t stream);
 
-void launch_musa_elastic_combine_reduce_direct(
-    void* reduce_buffer, int64_t* combined_topk_idx, nv_bfloat16* combined_x,
-    int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
-    int num_experts, int num_topk, int num_scaleup_ranks,
-    cudaStream_t stream);
-
-void* launch_musa_elastic_combine_send_direct(
-    nv_bfloat16* x, int* src_metadata, int num_reduced_tokens,
-    int num_max_tokens_per_rank, int hidden, int num_topk,
-    const ElasticLaunchContext& ctx, cudaStream_t stream);
-
-void launch_musa_elastic_scaleup_barrier(const ElasticLaunchContext& ctx,
-                                         int num_experts,
-                                         cudaStream_t stream);
-
 }  // namespace mooncake

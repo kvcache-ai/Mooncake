@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cstdint>
 
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
 #include <elastic/mooncake_ep_elastic_exception.cuh>
@@ -179,9 +180,36 @@ __forceinline__ __device__ void tma_store_1d(
         "r"(num_bytes), "l"(hint)
         : "memory");
 #else
-    auto* dst = static_cast<char*>(const_cast<void*>(dst_ptr));
-    const auto* src = static_cast<const char*>(src_ptr);
-    for (int i = 0; i < num_bytes; ++i) dst[i] = src[i];
+    const auto dst_addr = reinterpret_cast<uintptr_t>(dst_ptr);
+    const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
+    if (((dst_addr | src_addr | static_cast<uintptr_t>(num_bytes)) &
+         (sizeof(int4) - 1)) == 0) {
+        auto* dst = reinterpret_cast<int4*>(const_cast<void*>(dst_ptr));
+        const auto* src = reinterpret_cast<const int4*>(src_ptr);
+        const int num_vecs = num_bytes / static_cast<int>(sizeof(int4));
+        for (int i = 0; i < num_vecs; ++i) {
+#ifdef MOONCAKE_EP_USE_MUSA
+            const volatile int* src_words =
+                reinterpret_cast<const volatile int*>(src + i);
+            volatile int* dst_words = reinterpret_cast<volatile int*>(dst + i);
+            dst_words[0] = src_words[0];
+            dst_words[1] = src_words[1];
+            dst_words[2] = src_words[2];
+            dst_words[3] = src_words[3];
+#else
+            dst[i] = src[i];
+#endif
+        }
+    } else {
+#ifdef MOONCAKE_EP_USE_MUSA
+        auto* dst = static_cast<volatile char*>(const_cast<void*>(dst_ptr));
+        const auto* src = static_cast<const volatile char*>(src_ptr);
+#else
+        auto* dst = static_cast<char*>(const_cast<void*>(dst_ptr));
+        const auto* src = static_cast<const char*>(src_ptr);
+#endif
+        for (int i = 0; i < num_bytes; ++i) dst[i] = src[i];
+    }
 #endif
 }
 
@@ -238,7 +266,13 @@ ldg_with_gez_pred(const int4* ptr, const int& value,
     int4 ret = make_int4(0, 0, 0, 0);
 #ifdef MOONCAKE_EP_USE_MUSA
     (void)cache_hint;
-    if (value >= 0) ret = *ptr;
+    if (value >= 0) {
+        const volatile int* words = reinterpret_cast<const volatile int*>(ptr);
+        ret.x = words[0];
+        ret.y = words[1];
+        ret.z = words[2];
+        ret.w = words[3];
+    }
 #else
     asm volatile(
         "{\n\t"
@@ -260,7 +294,13 @@ ldg_with_gtz_pred(const int4* ptr, const int& value,
     int4 ret = make_int4(0, 0, 0, 0);
 #ifdef MOONCAKE_EP_USE_MUSA
     (void)cache_hint;
-    if (value > 0) ret = *ptr;
+    if (value > 0) {
+        const volatile int* words = reinterpret_cast<const volatile int*>(ptr);
+        ret.x = words[0];
+        ret.y = words[1];
+        ret.z = words[2];
+        ret.w = words[3];
+    }
 #else
     asm volatile(
         "{\n\t"
@@ -282,7 +322,13 @@ ld_with_gez_pred(const int4* ptr, const int& value,
     int4 ret = make_int4(0, 0, 0, 0);
 #ifdef MOONCAKE_EP_USE_MUSA
     (void)cache_hint;
-    if (value >= 0) ret = *ptr;
+    if (value >= 0) {
+        const volatile int* words = reinterpret_cast<const volatile int*>(ptr);
+        ret.x = words[0];
+        ret.y = words[1];
+        ret.z = words[2];
+        ret.w = words[3];
+    }
 #else
     asm volatile(
         "{\n\t"
@@ -330,9 +376,27 @@ __forceinline__ __device__ longlong4_t ldg(const longlong4_t* ptr) {
 
 __forceinline__ __device__ int4 ldg(const int4* ptr) {
 #ifdef MOONCAKE_EP_USE_MUSA
-    return *ptr;
+    const volatile int* words = reinterpret_cast<const volatile int*>(ptr);
+    int4 ret;
+    ret.x = words[0];
+    ret.y = words[1];
+    ret.z = words[2];
+    ret.w = words[3];
+    return ret;
 #else
     return __ldg(ptr);
+#endif
+}
+
+__forceinline__ __device__ void st_na(int4* ptr, const int4& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    volatile int* words = reinterpret_cast<volatile int*>(ptr);
+    words[0] = value.x;
+    words[1] = value.y;
+    words[2] = value.z;
+    words[3] = value.w;
+#else
+    *ptr = value;
 #endif
 }
 
@@ -456,7 +520,7 @@ __forceinline__ __device__ dtype_t ld_acquire_sys(const dtype_t* ptr) {
 template <typename dtype_t>
 __forceinline__ __device__ void st_relaxed_sys(void* ptr, dtype_t value) {
 #ifdef MOONCAKE_EP_USE_MUSA
-    *static_cast<dtype_t*>(ptr) = value;
+    *static_cast<volatile dtype_t*>(ptr) = value;
 #else
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t int_value = reinterpret_cast<const uint32_t&>(value);
@@ -476,7 +540,8 @@ __forceinline__ __device__ void st_relaxed_sys(void* ptr, dtype_t value) {
 template <typename dtype_t>
 __forceinline__ __device__ void st_release_sys(void* ptr, dtype_t value) {
 #ifdef MOONCAKE_EP_USE_MUSA
-    *static_cast<dtype_t*>(ptr) = value;
+    __threadfence_system();
+    *static_cast<volatile dtype_t*>(ptr) = value;
     __threadfence_system();
 #else
     if constexpr (sizeof(dtype_t) == 4) {

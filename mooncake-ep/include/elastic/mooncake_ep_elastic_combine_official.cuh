@@ -155,6 +155,22 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                   ptx::get_master_lane_idx(reduce_valid_mask));
 
             // No reduce
+#ifdef MOONCAKE_EP_USE_MUSA
+            {
+                const auto src_ptr = math::advance_ptr<combine_vec_t>(
+                    x, static_cast<int64_t>(token_idx_in_tensor) *
+                           kNumHiddenBytes);
+                auto* dst_ptr = static_cast<combine_vec_t*>(
+                    master_token_buffer.get_base_ptr());
+#pragma unroll 1
+                for (int vec_idx = lane_idx; vec_idx < kHiddenVec;
+                     vec_idx += 32) {
+                    ptx::st_na(dst_ptr + vec_idx, src_ptr[vec_idx]);
+                }
+                __syncwarp();
+                __threadfence_system();
+            }
+#else
             if (ptx::elect_one_sync()) {
                 const auto load_ptr = math::advance_ptr(
                     x, static_cast<int64_t>(token_idx_in_tensor) *
@@ -169,6 +185,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 ptx::tma_store_commit();
             }
             __syncwarp();
+#endif
         } else if constexpr (kAllowMultipleReduction) {
             // Do local reduction
             // Sort valid top-k indices to front
@@ -199,12 +216,28 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             __syncwarp();
 
             // Issue TMA stores
+#ifdef MOONCAKE_EP_USE_MUSA
+            {
+                const auto* src_ptr = static_cast<const combine_vec_t*>(
+                    tma_buffer.get_base_ptr());
+                auto* dst_ptr = static_cast<combine_vec_t*>(
+                    master_token_buffer.get_base_ptr());
+#pragma unroll 1
+                for (int vec_idx = lane_idx; vec_idx < kHiddenVec;
+                     vec_idx += 32) {
+                    ptx::st_na(dst_ptr + vec_idx, src_ptr[vec_idx]);
+                }
+                __syncwarp();
+                __threadfence_system();
+            }
+#else
             if (ptx::elect_one_sync()) {
                 ptx::tma_store_1d(master_token_buffer.get_base_ptr(),
                                   tma_buffer.get_base_ptr(), kNumHiddenBytes);
                 ptx::tma_store_commit();
             }
             __syncwarp();
+#endif
         } else {
 // No local reduction, send all data (expanded send)
 #pragma unroll
@@ -216,6 +249,39 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     const auto token_buffer =
                         recv_buffer.get_rank_buffer(k).get_token_buffer(
                             src_token_idx);
+#ifdef MOONCAKE_EP_USE_MUSA
+                    if (nvlink_bypass) {
+                        auto* dst_ptr = static_cast<combine_vec_t*>(
+                            gin.get_sym_ptr<team_t>(
+                                token_buffer.get_base_ptr(), src_rank_idx));
+#pragma unroll 1
+                        for (int vec_idx = lane_idx; vec_idx < kHiddenVec;
+                             vec_idx += 32) {
+                            ptx::st_na(dst_ptr + vec_idx,
+                                       src_token_ptr[vec_idx]);
+                        }
+                    } else {
+                        const auto send_token_buffer =
+                            send_buffer.get_rank_buffer(src_rank_idx)
+                                .get_token_buffer(src_token_idx * kNumTopk + k);
+                        auto* dst_ptr = static_cast<combine_vec_t*>(
+                            send_token_buffer.get_base_ptr());
+#pragma unroll 1
+                        for (int vec_idx = lane_idx; vec_idx < kHiddenVec;
+                             vec_idx += 32) {
+                            ptx::st_na(dst_ptr + vec_idx,
+                                       src_token_ptr[vec_idx]);
+                        }
+                        __syncwarp();
+                        if (ptx::elect_one_sync()) {
+                            gin.put<team_t>(token_buffer.get_base_ptr(),
+                                            send_token_buffer.get_base_ptr(),
+                                            kNumHiddenBytes, src_rank_idx);
+                        }
+                    }
+                    __syncwarp();
+                    __threadfence_system();
+#else
                     if (ptx::elect_one_sync()) {
                         // Load
                         ptx::tma_store_wait();
@@ -252,6 +318,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         }
                     }
                     __syncwarp();
+#endif
                 }
             }
         }
@@ -260,9 +327,17 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         if (not kUseExpandedLayout and topk_weights != nullptr and
             lane_idx < kNumTopk) {
             const float value = __ldg(topk_weights + (i * kNumTopk + lane_idx));
+#ifdef MOONCAKE_EP_USE_MUSA
+            ptx::st_relaxed_sys<float>(
+                master_token_buffer.get_topk_weights_ptr() + lane_idx, value);
+#else
             master_token_buffer.get_topk_weights_ptr()[lane_idx] = value;
+#endif
         }
         __syncwarp();
+#ifdef MOONCAKE_EP_USE_MUSA
+        __threadfence_system();
+#endif
 
         // Wait send buffer's TMA store and issue RDMA send
         // NOTES: `kDoExpandedSend` mode has already issued

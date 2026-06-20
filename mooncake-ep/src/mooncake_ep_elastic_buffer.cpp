@@ -558,50 +558,25 @@ ElasticCombineOutput MooncakeElasticBuffer::combine(
         *native_buffer_, topology_, mapped_host_workspace_, timeout_cycles);
     auto psum_num_recv_tokens_per_scaleup_rank =
         handle.psum_num_recv_tokens_per_scaleup_rank;
-    void* reduce_buffer = nullptr;
-#ifdef MOONCAKE_EP_USE_MUSA
-    if (!use_hybrid && !handle.do_expand) {
-        reduce_buffer = launch_musa_elastic_combine_send_direct(
-            reinterpret_cast<nv_bfloat16*>(x.data_ptr()),
-            const_cast<int*>(handle.recv_src_metadata.data_ptr<int>()),
-            static_cast<int>(x.size(0)), handle.num_max_tokens_per_rank, hidden,
-            num_topk, launch_ctx, launch_stream.stream());
-    } else
-#endif
-    {
-        reduce_buffer = launch_mooncake_elastic_combine(
-            x.data_ptr(), weights.data_ptr<float>(),
-            const_cast<int*>(handle.recv_src_metadata.data_ptr<int>()),
-            psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-            handle.token_metadata_at_forward.has_value()
-                ? handle.token_metadata_at_forward->data_ptr<int>()
-                : nullptr,
-            handle.channel_linked_list.has_value()
-                ? handle.channel_linked_list->data_ptr<int>()
-                : nullptr,
-            static_cast<int>(x.size(0)), handle.num_max_tokens_per_rank,
-            hidden, handle.num_experts, num_topk, num_sms, num_smem_bytes,
-            use_hybrid ? hybrid_channels : num_channels, handle.do_expand,
-            config_.allow_multiple_reduction, launch_ctx,
-            launch_stream.stream());
-    }
+    void* reduce_buffer = launch_mooncake_elastic_combine(
+        x.data_ptr(), weights.data_ptr<float>(),
+        const_cast<int*>(handle.recv_src_metadata.data_ptr<int>()),
+        psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+        handle.token_metadata_at_forward.has_value()
+            ? handle.token_metadata_at_forward->data_ptr<int>()
+            : nullptr,
+        handle.channel_linked_list.has_value()
+            ? handle.channel_linked_list->data_ptr<int>()
+            : nullptr,
+        static_cast<int>(x.size(0)), handle.num_max_tokens_per_rank, hidden,
+        handle.num_experts, num_topk, num_sms, num_smem_bytes,
+        use_hybrid ? hybrid_channels : num_channels, handle.do_expand,
+        config_.allow_multiple_reduction, launch_ctx, launch_stream.stream());
 
     torch::Tensor combined_x =
         out.has_value()
             ? out.value()
             : torch::empty({num_combined_tokens, hidden}, x.options());
-#ifdef MOONCAKE_EP_USE_MUSA
-    if (!use_hybrid && !handle.do_expand) {
-        launch_musa_elastic_scaleup_barrier(launch_ctx, handle.num_experts,
-                                            launch_stream.stream());
-        launch_musa_elastic_combine_reduce_direct(
-            reduce_buffer, const_cast<int64_t*>(handle.topk_idx.data_ptr<int64_t>()),
-            reinterpret_cast<nv_bfloat16*>(combined_x.data_ptr()),
-            num_combined_tokens, handle.num_max_tokens_per_rank, hidden,
-            handle.num_experts, num_topk, topology_.num_scaleup_ranks,
-            launch_stream.stream());
-    } else
-#endif
     launch_mooncake_elastic_combine_reduce_epilogue(
         combined_x.data_ptr(), weights.data_ptr<float>(),
         const_cast<int64_t*>(handle.topk_idx.data_ptr<int64_t>()),

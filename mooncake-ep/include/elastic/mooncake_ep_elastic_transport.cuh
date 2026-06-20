@@ -100,14 +100,23 @@ struct MooncakeGin {
                 auto* dst = reinterpret_cast<int4*>(routed);
                 const int num_int4 = num_bytes / static_cast<int>(sizeof(int4));
                 for (int i = 0; i < num_int4; ++i) {
+#ifdef MOONCAKE_EP_USE_MUSA
+                    ptx::st_na(dst + i, device::mc_ld_nc(src + i));
+#else
                     dst[i] = device::mc_ld_nc(src + i);
+#endif
                 }
             } else {
                 auto* dst_bytes = reinterpret_cast<uint8_t*>(routed);
                 const auto* src_bytes =
                     reinterpret_cast<const uint8_t*>(src_ptr);
                 for (int i = 0; i < num_bytes; ++i) {
+#ifdef MOONCAKE_EP_USE_MUSA
+                    reinterpret_cast<volatile uint8_t*>(dst_bytes)[i] =
+                        reinterpret_cast<const volatile uint8_t*>(src_bytes)[i];
+#else
                     dst_bytes[i] = src_bytes[i];
+#endif
                 }
             }
             // `put` is used both by full data-moving warps and by individual

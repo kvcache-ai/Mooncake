@@ -351,80 +351,6 @@ void launch_musa_elastic_prepare_dispatch(
     CUDA_RUNTIME_CHECK(cudaGetLastError());
 }
 
-__global__ void musa_elastic_combine_reduce_direct_kernel(
-    void* reduce_buffer, int64_t* combined_topk_idx, nv_bfloat16* combined_x,
-    int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
-    int num_experts, int num_topk, int num_scaleup_ranks) {
-    const int token_idx = static_cast<int>(blockIdx.x);
-    if (token_idx >= num_combined_tokens) return;
-    const auto token_layout = elastic::layout::TokenLayout(
-        hidden * static_cast<int>(sizeof(nv_bfloat16)), 0, num_topk, false);
-    const auto recv_buffer = elastic::layout::BufferLayout<false>(
-        token_layout, num_scaleup_ranks, num_max_tokens_per_rank,
-        reduce_buffer);
-    const int num_experts_per_rank = num_experts / num_scaleup_ranks;
-    for (int hidden_idx = static_cast<int>(threadIdx.x); hidden_idx < hidden;
-         hidden_idx += static_cast<int>(blockDim.x)) {
-        float sum = 0.0f;
-        int seen_ranks[32];
-        int num_seen = 0;
-        for (int k = 0; k < num_topk; ++k) {
-            const int expert_idx = static_cast<int>(
-                combined_topk_idx[token_idx * num_topk + k]);
-            if (expert_idx < 0) continue;
-            const int rank_idx = expert_idx / num_experts_per_rank;
-            bool duplicate_rank = false;
-            for (int i = 0; i < num_seen; ++i) {
-                duplicate_rank |= (seen_ranks[i] == rank_idx);
-            }
-            if (!duplicate_rank) {
-                seen_ranks[num_seen++] = rank_idx;
-                const auto* src = static_cast<const nv_bfloat16*>(
-                    recv_buffer.get_rank_buffer(rank_idx)
-                        .get_token_buffer(token_idx)
-                        .get_base_ptr());
-                sum += __bfloat162float(
-                    src[static_cast<int64_t>(hidden_idx)]);
-            }
-        }
-        combined_x[static_cast<int64_t>(token_idx) * hidden + hidden_idx] =
-            __float2bfloat16(sum);
-    }
-}
-
-__global__ void musa_elastic_combine_send_direct_kernel(
-    device::CommCtx comm_ctx, nv_bfloat16* x, int* src_metadata,
-    void* reduce_buffer, int rank_idx, int num_reduced_tokens,
-    int num_max_tokens_per_rank, int hidden, int num_topk,
-    int num_scaleup_ranks) {
-    const int recv_idx = static_cast<int>(blockIdx.x);
-    if (recv_idx >= num_reduced_tokens) return;
-    const int metadata_stride = 2 + num_topk;
-    const int src_global = src_metadata[recv_idx * metadata_stride];
-    const int src_rank = src_global / num_max_tokens_per_rank;
-    const int src_token = src_global % num_max_tokens_per_rank;
-    const auto token_layout = elastic::layout::TokenLayout(
-        hidden * static_cast<int>(sizeof(nv_bfloat16)), 0, num_topk, false);
-    const auto recv_buffer = elastic::layout::BufferLayout<false>(
-        token_layout, num_scaleup_ranks, num_max_tokens_per_rank,
-        reduce_buffer);
-    auto* dst = static_cast<nv_bfloat16*>(
-        recv_buffer.get_rank_buffer(rank_idx)
-            .get_token_buffer(src_token)
-            .get_base_ptr());
-    const auto gin = elastic::transport::MooncakeGin(
-        comm_ctx, 0, 0, 1, 0, rank_idx, num_scaleup_ranks,
-        num_scaleup_ranks);
-    dst = static_cast<nv_bfloat16*>(
-        gin.get_sym_ptr<elastic::transport::ScaleupTeam>(dst, src_rank));
-    const auto* src = x + static_cast<int64_t>(recv_idx) * hidden;
-    for (int hidden_idx = static_cast<int>(threadIdx.x); hidden_idx < hidden;
-         hidden_idx += static_cast<int>(blockDim.x)) {
-        dst[hidden_idx] = src[hidden_idx];
-    }
-    __threadfence_system();
-}
-
 #endif
 
 template <typename Kernel, typename... Args>
@@ -466,48 +392,6 @@ void launch_cooperative(Kernel kernel, int num_sms, int num_threads,
 
 }  // namespace
 
-#ifdef MOONCAKE_EP_USE_MUSA
-void launch_musa_elastic_combine_reduce_direct(
-    void* reduce_buffer, int64_t* combined_topk_idx, nv_bfloat16* combined_x,
-    int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
-    int num_experts, int num_topk, int num_scaleup_ranks,
-    cudaStream_t stream) {
-    constexpr int kThreads = 256;
-    musa_elastic_combine_reduce_direct_kernel<<<num_combined_tokens, kThreads,
-                                                0, stream>>>(
-        reduce_buffer, combined_topk_idx, combined_x, num_combined_tokens,
-        num_max_tokens_per_rank, hidden, num_experts, num_topk,
-        num_scaleup_ranks);
-    CUDA_RUNTIME_CHECK(cudaGetLastError());
-}
-
-void* launch_musa_elastic_combine_send_direct(
-    nv_bfloat16* x, int* src_metadata, int num_reduced_tokens,
-    int num_max_tokens_per_rank, int hidden, int num_topk,
-    const ElasticLaunchContext& ctx, cudaStream_t stream) {
-    constexpr int kThreads = 256;
-    const auto comm_ctx = make_comm_ctx(ctx);
-    musa_elastic_combine_send_direct_kernel<<<num_reduced_tokens, kThreads, 0,
-                                              stream>>>(
-        comm_ctx, x, src_metadata, ctx.buffer, ctx.scaleup_rank_idx,
-        num_reduced_tokens, num_max_tokens_per_rank, hidden, num_topk,
-        ctx.num_scaleup_ranks);
-    CUDA_RUNTIME_CHECK(cudaGetLastError());
-    return ctx.buffer;
-}
-
-void launch_musa_elastic_scaleup_barrier(const ElasticLaunchContext& ctx,
-                                         int num_experts,
-                                         cudaStream_t stream) {
-    constexpr int kThreads = 256;
-    const auto comm_ctx = make_comm_ctx(ctx);
-    musa_elastic_prepare_clear_barrier_kernel<<<1, kThreads, 0, stream>>>(
-        comm_ctx, ctx.workspace, ctx.scaleup_rank_idx, ctx.num_scaleup_ranks,
-        num_experts, ctx.timeout_cycles);
-    CUDA_RUNTIME_CHECK(cudaGetLastError());
-}
-#endif
-
 void launch_elastic_dispatch_deterministic_prologue(
     const int64_t* topk_idx, int* rank_count_buffer, int* dst_buffer_slot_idx,
     int num_tokens,
@@ -544,6 +428,8 @@ void launch_elastic_dispatch_deterministic_prologue(
     // native elastic scale-up path; MUSA non-hybrid dispatch prepares slots in
     // a separate kernel and does not call this CUDA cooperative prologue.
     TRY_PROLOGUE(0, 256, 8, 128, 24, 2);
+    TRY_PROLOGUE(0, 256, 8, 256, 24, 2);
+    TRY_PROLOGUE(0, 256, 8, 512, 24, 2);
     TRY_PROLOGUE(0, 256, 8, 1024, 24, 2);
 #else
     // Common production MoE shapes; hidden is irrelevant for this prologue.
@@ -801,6 +687,10 @@ void launch_mooncake_elastic_dispatch(
 #ifdef MOONCAKE_EP_USE_MUSA
     TRY_DISPATCH_TYPED(4096, 256, 8, 128, 24, 2,
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_TYPED(4096, 256, 8, 256, 24, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_TYPED(4096, 256, 8, 512, 24, 2,
+                       static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_TYPED(4096, 256, 8, 1024, 24, 2,
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
 #else
@@ -956,6 +846,10 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
 #ifdef MOONCAKE_EP_USE_MUSA
     TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 128, 24, 2,
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 256, 24, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
+    TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 512, 24, 2,
+                                static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 1024, 24, 2,
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
 #else
@@ -999,7 +893,6 @@ void* launch_mooncake_elastic_combine(
     const auto comm_ctx = make_comm_ctx(ctx);
     (void)token_metadata_at_forward;
     (void)channel_linked_list;
-    (void)use_expanded_layout;
 
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
@@ -1078,13 +971,16 @@ void* launch_mooncake_elastic_combine(
 #define TRY_COMBINE(H, E, K, M, S, R)                                          \
     if (hidden == H && num_experts == E && num_topk == K &&                    \
         num_max_tokens_per_rank == M && num_sms == S &&                       \
-        ctx.num_scaleup_ranks == R && allow_multiple_reduction) {              \
+        ctx.num_scaleup_ranks == R && !use_expanded_layout &&                  \
+        allow_multiple_reduction) {                                            \
         LAUNCH_COMBINE(H, E, K, M, S, R);                                      \
         return ctx.buffer;                                                    \
     }
 
 #ifdef MOONCAKE_EP_USE_MUSA
     TRY_COMBINE(4096, 256, 8, 128, 24, 2);
+    TRY_COMBINE(4096, 256, 8, 256, 24, 2);
+    TRY_COMBINE(4096, 256, 8, 512, 24, 2);
     TRY_COMBINE(4096, 256, 8, 1024, 24, 2);
 #else
     TRY_COMBINE(4096, 256, 8, 128, 24, 8);
@@ -1145,6 +1041,8 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
 
 #ifdef MOONCAKE_EP_USE_MUSA
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 2);
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 256, 24, 1, 2);
+    TRY_COMBINE_EPILOGUE(4096, 256, 8, 512, 24, 1, 2);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 1024, 24, 1, 2);
 #else
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 8);
