@@ -352,11 +352,15 @@ jobs:
 
         typedef enum musaError {
           musaSuccess = 0,
+          musaErrorInvalidValue = 1,
           musaErrorUnknown = 999
         } musaError_t;
 
         enum musaDeviceAttr {
-          musaDevAttrMaxThreadsPerBlock = 1
+          musaDevAttrMaxThreadsPerBlock = 1,
+          musaDevAttrWarpSize = 10,
+          musaDevAttrMultiProcessorCount = 16,
+          musaDevAttrMaxThreadsPerMultiProcessor = 39
         };
 
         enum musaLimit {
@@ -444,6 +448,11 @@ jobs:
           musaGraphNodeTypeEventRecord = 7
         };
 
+        enum musaGraphExecUpdateResult {
+          musaGraphExecUpdateSuccess = 0,
+          musaGraphExecUpdateError = 1
+        };
+
         enum musaAtomicType {
           musaAtomicOperationAdd = 0,
           musaAtomicOperationMin = 1,
@@ -476,6 +485,17 @@ jobs:
           musaMemAttachSingle = 4
         };
 
+        enum {
+          musaOccupancyDefault = 0
+        };
+
+        #ifndef MUSART_PI
+        #define MUSART_PI 3.14159265358979323846
+        #endif
+        #ifndef MUSART_THIRD
+        #define MUSART_THIRD 0.33333333333333333333
+        #endif
+
         typedef struct CUstream_st *musaStream_t;
         typedef struct CUevent_st *musaEvent_t;
         typedef struct CUgraph_st *musaGraph_t;
@@ -485,7 +505,9 @@ jobs:
         typedef struct CUmemoryPool_st *musaMemPool_t;
         typedef struct musaGraphicsResource *musaGraphicsResource_t;
         typedef struct CUkernel_st *musaKernel_t;
+        typedef struct CUlibrary_st *musaLibrary_t;
         typedef struct CUmusaLaunchConfig_st musaLaunchConfig_t;
+        typedef unsigned int musaUserObjectFlags;
         typedef struct CUarray_st *musaArray_t;
         typedef const struct CUarray_st *musaArray_const_t;
         typedef struct CUmipmappedArray_st *musaMipmappedArray_t;
@@ -532,6 +554,10 @@ jobs:
         struct musaMemLocation {
           int type;
           int id;
+        };
+
+        struct musaMemcpyAttributes {
+          int dummy;
         };
 
         typedef struct musaFuncAttributes {
