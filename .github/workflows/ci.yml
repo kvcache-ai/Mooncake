@@ -345,7 +345,6 @@ jobs:
             --expt-relaxed-constexpr)
               ;;
             --cuda-gpu-arch=*)
-              args+=("--offload-arch=${arg#--cuda-gpu-arch=}")
               ;;
             --compiler-options)
               skip_compiler_options=1
