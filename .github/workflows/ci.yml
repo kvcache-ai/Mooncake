@@ -317,6 +317,7 @@ jobs:
         rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
         ln -sfn /usr/local/musa /usr/local/cuda
         ln -sfn /usr/local/musa/bin/mcc /usr/local/musa/bin/nvcc
+        echo "MUSA_HOME=/usr/local/musa" >> $GITHUB_ENV
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
@@ -325,7 +326,9 @@ jobs:
         # not ship all runtime DNN libraries, so keep PyTorch from eagerly
         # loading the torch_musa runtime backend during extension builds.
         echo "TORCH_DEVICE_BACKEND_AUTOLOAD=0" >> $GITHUB_ENV
+        echo "TORCHADA_PLATFORM=musa" >> $GITHUB_ENV
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        export TORCHADA_PLATFORM=musa
         python3 - <<'PY'
         import importlib.metadata as metadata
         import torch
@@ -333,15 +336,18 @@ jobs:
         print("torch", torch.__version__)
         print("torch_musa", metadata.version("torch_musa"))
         print("torchada", getattr(torchada, "__version__", "unknown"))
+        print("torchada platform", torchada.get_platform().value)
         PY
       shell: bash
 
     - name: Configure project
       run: |
+        export MUSA_HOME=/usr/local/musa
         export CUDA_HOME=/usr/local/cuda
         export PATH=/usr/local/cuda/bin:$PATH
         export LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        export TORCHADA_PLATFORM=musa
         apt update -y
         apt install -y ninja-build
         bash -x dependencies.sh -y
@@ -353,10 +359,12 @@ jobs:
     - name: Build project
       run: |
         source ~/.bashrc
+        export MUSA_HOME=/usr/local/musa
         export CUDA_HOME=/usr/local/cuda
         export PATH=/usr/local/cuda/bin:$PATH
         export LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        export TORCHADA_PLATFORM=musa
         cd build
         MAX_JOBS=1 cmake --build .
         cmake --install .
