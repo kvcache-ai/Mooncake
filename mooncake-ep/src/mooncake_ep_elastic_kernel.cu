@@ -106,6 +106,15 @@ inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
 
 #ifdef MOONCAKE_EP_USE_MUSA
 
+// MUSA currently cannot rely on CUDA-style cooperative grid synchronization for
+// the official elastic dispatch notify/prologue.  These prepare kernels keep the
+// dispatch algorithm semantics unchanged (slot assignment, count publication and
+// prefix-sum generation), but split that prologue into ordinary launches with an
+// explicit scale-up barrier so peer count writes cannot race with local clears.
+// Payload movement still goes through the common dispatch kernel and Mooncake
+// Device API transport primitives; this is only a no-cooperative-grid-sync
+// metadata preparation fallback.
+
 __global__ void musa_elastic_prepare_init_kernel(void* workspace,
                                                  int num_scaleup_ranks,
                                                  int num_experts) {
