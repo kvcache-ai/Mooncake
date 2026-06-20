@@ -287,7 +287,10 @@ jobs:
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
-    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+    # Match the public torch_musa v2.5.0 wheel bundle, which is built against
+    # MUSA 4.2.0.  Using the SDK-only image keeps the job small enough for
+    # GitHub-hosted runners, unlike the full MUSA PyTorch images.
+    container: mthreads/musa:rc4.2.0-devel-ubuntu22.04-amd64
     steps:
     - uses: actions/checkout@v4
       with:
@@ -297,6 +300,36 @@ jobs:
       run: git config --global --add safe.directory $GITHUB_WORKSPACE
       shell: bash
 
+    - name: Install MUSA PyTorch dependencies
+      run: |
+        apt update -y
+        apt install -y curl python3-pip
+        curl -L --retry 3 \
+          -o /tmp/S80-v2.5.0-4.2.0.tar.gz \
+          https://github.com/MooreThreads/torch_musa/releases/download/v2.5.0/S80-v2.5.0-4.2.0.tar.gz
+        tar -xzf /tmp/S80-v2.5.0-4.2.0.tar.gz -C /tmp
+        python3 -m pip install --no-cache-dir --upgrade pip
+        python3 -m pip install --no-cache-dir \
+          /tmp/4.2.0/torch-2.5.0-cp310-cp310-linux_x86_64.whl \
+          /tmp/4.2.0/torch_musa-2.5.0-cp310-cp310-linux_x86_64.whl \
+          'numpy<2' \
+          torchada==0.1.48
+        rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
+        ln -sfn /usr/local/musa /usr/local/cuda
+        ln -sfn /usr/local/musa/bin/mcc /usr/local/musa/bin/nvcc
+        echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
+        echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+        echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
+        python3 - <<'PY'
+        import torch
+        import torch_musa
+        import torchada
+        print("torch", torch.__version__)
+        print("torch_musa", torch_musa.__version__)
+        print("torchada", getattr(torchada, "__version__", "unknown"))
+        PY
+      shell: bash
+
     - name: Configure project
       run: |
         apt update -y
@@ -304,14 +337,14 @@ jobs:
         bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. -DUSE_MUSA=ON -DWITH_EP=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
       run: |
         cd build
         source ~/.bashrc
-        cmake --build .
+        MAX_JOBS=1 cmake --build .
         cmake --install .
       shell: bash
 
