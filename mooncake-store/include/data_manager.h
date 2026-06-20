@@ -196,9 +196,13 @@ class DataManager {
         const;
 
     /**
-     * @brief Get hot key statistics
+     * @brief Get hot key statistics.
+     * @param hot_key_num Forwarded to TieredBackend::GetHotKeyStats. nullopt
+     *        resolves to the scheduler default (scheduler.hot_key_num, 64); 0
+     *        returns all tracked keys (capped internally).
      */
-    AccessStats GetHotKeyStats() const;
+    AccessStats GetHotKeyStats(
+        std::optional<size_t> hot_key_num = std::nullopt) const;
 
     /**
      * @brief Get all tier IDs where a key has replicas.
@@ -338,9 +342,13 @@ class DataManager {
     PendingWriteShard& GetPendingWriteShard(const KeyCtx& ctx);
     PinnedKeyShard& GetPinnedKeyShard(const KeyCtx& ctx);
 
+    // When dram_only is true the local replica is pinned to a DRAM/fast tier
+    // (strict allocation with fast-tier eviction + retry; never spills to a
+    // slower tier). When false, allocation is best-effort starting from
+    // tier_id (used by the remote-write path, whose target may be non-DRAM).
     tl::expected<PreWriteResult, ErrorCode> PreWriteInternal(
         const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id,
-        bool enforce_dram_allocation);
+        bool dram_only);
     tl::expected<void, ErrorCode> WriteCommitInternal(
         const KeyCtx& ctx, const UUID& write_operation_id);
     tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(

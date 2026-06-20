@@ -67,6 +67,36 @@ TEST(TinyLFUSketchTest, IndependentRowsKeepUnrelatedKeysLow) {
     EXPECT_EQ(s.Estimate(0xC0FFEEULL), 15u);
 }
 
+// The fused hot-path method must be observably identical to Increment() then
+// Estimate() — same return value and same resulting table state.
+TEST(TinyLFUSketchTest, FusedIncrementAndEstimateMatchesSeparate) {
+    FrequencySketch fused(/*capacity=*/1000, /*sample_size=*/1'000'000);
+    FrequencySketch split(/*capacity=*/1000, /*sample_size=*/1'000'000);
+    for (uint64_t k = 0; k < 50; ++k) {
+        for (int i = 0; i < 5; ++i) {
+            split.Increment(k);
+            const uint32_t expect = split.Estimate(k);
+            EXPECT_EQ(fused.IncrementAndEstimate(k), expect)
+                << "key=" << k << " i=" << i;
+        }
+    }
+    for (uint64_t k = 0; k < 50; ++k) {
+        EXPECT_EQ(fused.Estimate(k), split.Estimate(k)) << "key=" << k;
+    }
+}
+
+// Equivalence must hold even when the fused increment trips the auto-reset:
+// the returned estimate must reflect the post-reset (halved) table.
+TEST(TinyLFUSketchTest, FusedIncrementAndEstimateAcrossAutoReset) {
+    FrequencySketch fused(/*capacity=*/64, /*sample_size=*/4);
+    FrequencySketch split(/*capacity=*/64, /*sample_size=*/4);
+    for (int i = 0; i < 8; ++i) {
+        split.Increment(9);
+        EXPECT_EQ(fused.IncrementAndEstimate(9), split.Estimate(9)) << "i=" << i;
+    }
+    EXPECT_EQ(fused.size(), split.size());
+}
+
 TEST(TinyLFUSketchTest, MemoryApproxCapacityOverFour) {
     FrequencySketch s(1u << 16);
     EXPECT_EQ(s.MemoryBytes(), 8u * ((1u << 16) / 4));  // 8 bytes/word

@@ -663,6 +663,10 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     // deadlock on a recursive shared_mutex if we still held entry->mutex here.
     // Moving OnAccess after selection also gives it the served tier id, which
     // the event-driven scheduler needs to route offload/onboard.
+    //
+    // Note: every early return below is a miss (empty replicas / tier not
+    // found) and intentionally skips OnAccess — a miss is not an access and
+    // must not bump a key's heat.
     AllocationHandle served_handle;
     UUID served_tier{};
     size_t served_size = 0;
@@ -917,7 +921,7 @@ tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
     std::string_view key, const DataSource& source, UUID dest_tier_id,
-    std::optional<uint64_t> expected_version, bool record_access) {
+    std::optional<uint64_t> expected_version, bool record_access, bool strict) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -926,7 +930,7 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
         LOG(ERROR) << "Invalid source buffer or size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto dest_handle = Allocate(source.buffer->size(), dest_tier_id);
+    auto dest_handle = Allocate(source.buffer->size(), dest_tier_id, strict);
     if (!dest_handle.has_value()) {
         LOG(ERROR) << "Failed to allocate memory for key: " << key
                    << " in Tier " << dest_tier_id;
@@ -999,7 +1003,8 @@ std::vector<TierView> TieredBackend::GetTierViews() const {
         const auto& info = tier_info_.at(id);
         size_t cap = tier->GetCapacity();
         size_t used = tier->GetUsage();
-        views.push_back({id, tier->GetMemoryType(), cap, used, cap - used,
+        size_t free = cap > used ? cap - used : 0;
+        views.push_back({id, tier->GetMemoryType(), cap, used, free,
                          info.priority, info.tags});
     }
     return views;
@@ -1025,6 +1030,22 @@ std::vector<UUID> TieredBackend::GetReplicaTierIds(std::string_view key) const {
 const CacheTier* TieredBackend::GetTier(UUID tier_id) const {
     auto it = tiers_.find(tier_id);
     return (it != tiers_.end()) ? it->second.get() : nullptr;
+}
+
+std::optional<UUID> TieredBackend::GetDramTierId() const {
+    std::optional<UUID> best;
+    int best_priority = std::numeric_limits<int>::min();
+    for (const auto& [id, tier] : tiers_) {
+        if (tier->GetMemoryType() != MemoryType::DRAM) {
+            continue;
+        }
+        const int priority = tier_info_.at(id).priority;
+        if (!best.has_value() || priority > best_priority) {
+            best = id;
+            best_priority = priority;
+        }
+    }
+    return best;
 }
 
 const DataCopier& TieredBackend::GetDataCopier() const {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -128,6 +130,19 @@ inline TierRoles ResolveTierRoles(const std::vector<TierView>& views,
         }
         if (slow == nullptr) {
             slow = tier_roles_detail::HighestExcept(sorted, fast->id);
+        }
+        // Sanity: the fast role must outrank the slow role. A tag set that
+        // lands 'fast' on a low-priority tier (and lets 'slow' fall back to a
+        // higher-priority one) would invert the roles and silently demote hot
+        // data to the higher-priority tier. Reject the manual mapping and use
+        // the priority-based auto roles instead.
+        if (slow != nullptr && slow->priority >= fast->priority) {
+            LOG(WARNING) << "Manual tier roles invert priority (fast role @"
+                         << fast->priority << " <= slow role @"
+                         << slow->priority
+                         << "); falling back to auto priority-based roles";
+            fast = sorted.front();
+            slow = sorted.size() >= 2 ? sorted[1] : nullptr;
         }
     }
 

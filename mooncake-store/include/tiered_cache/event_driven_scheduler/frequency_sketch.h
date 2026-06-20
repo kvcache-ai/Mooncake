@@ -88,6 +88,38 @@ class FrequencySketch {
         }
     }
 
+    // Fused Increment + Estimate: bump all 4 rows AND return the post-increment
+    // Count-Min estimate in a SINGLE pass — one Hash() per row instead of the
+    // two passes (8 hashes) that Increment() followed by Estimate() would do.
+    // Used on the hot access path. Semantically identical to calling
+    // Increment(key) then Estimate(key).
+    uint32_t IncrementAndEstimate(uint64_t key) {
+        if (table_.empty()) {
+            return 0;
+        }
+        bool added = false;
+        uint32_t min_count = std::numeric_limits<uint32_t>::max();
+        for (int row = 0; row < kDepth; ++row) {
+            const uint64_t h = Hash(key, row);
+            const size_t cell = static_cast<size_t>(h % table_.size());
+            const uint8_t nibble = static_cast<uint8_t>(h & 15);
+            if (IncrementAt(cell, nibble)) {
+                added = true;
+            }
+            min_count = std::min<uint32_t>(min_count, CountAt(cell, nibble));
+        }
+        if (added) {
+            ++size_;
+            if (sample_size_ != 0 && size_ >= sample_size_) {
+                Reset();
+                // The halving invalidated the counts read above; recompute the
+                // estimate against the decayed table to match Increment+Estimate.
+                return Estimate(key);
+            }
+        }
+        return min_count;
+    }
+
     // Count-Min estimate: min across the 4 rows. Range [0, 15].
     uint32_t Estimate(uint64_t key) const {
         if (table_.empty()) {

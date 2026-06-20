@@ -8,6 +8,8 @@
 #include <thread>
 #include <cstring>
 #include <atomic>
+#include <mutex>
+#include <vector>
 #include "tiered_cache/scheduler/lru_policy.h"
 #include "tiered_cache/tiers/cache_tier.h"  // Ensure TempDRAMBuffer is available
 #include "tiered_cache/scheduler/lru_stats_collector.h"
@@ -27,6 +29,31 @@ const AccessStatEntry* FindKeyStats(const AccessStats& stats,
     }
     return nullptr;
 }
+
+// Captures every emitted log line so tests can assert on diagnostics (e.g. the
+// scheduler-fallback WARNING). Content matching avoids depending on the glog
+// severity enum spelling across versions.
+class LogCaptureSink : public google::LogSink {
+   public:
+    void send(google::LogSeverity /*severity*/, const char* /*full_filename*/,
+              const char* /*base_filename*/, int /*line*/,
+              const struct ::tm* /*tm_time*/, const char* message,
+              size_t message_len) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        messages_.emplace_back(message, message_len);
+    }
+    bool Contains(const std::string& needle) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto& m : messages_) {
+            if (m.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+   private:
+    mutable std::mutex mu_;
+    std::vector<std::string> messages_;
+};
 
 }  // namespace
 
@@ -1269,6 +1296,25 @@ TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
     }
 
     LOG(INFO) << "Single-tier eviction test completed";
+}
+
+// P0-2: an unrecognized scheduler.type must WARN and fall back to legacy
+// rather than silently ignoring the misconfiguration.
+TEST_F(SchedulerIntegrationTest, UnknownSchedulerTypeWarnsAndFallsBackToLegacy) {
+    config_["scheduler"]["type"] = "definitely_not_a_real_type";
+
+    LogCaptureSink sink;
+    google::AddLogSink(&sink);
+    TieredBackend backend;
+    auto res = InitTieredBackendForTest(backend, config_);
+    google::RemoveLogSink(&sink);
+
+    // Fell back to a working (legacy) scheduler instead of failing init.
+    ASSERT_TRUE(res.has_value());
+    EXPECT_TRUE(sink.Contains("Unknown scheduler.type"))
+        << "expected a WARNING when scheduler.type is unrecognized";
+    EXPECT_TRUE(sink.Contains("Creating LegacyClientScheduler"))
+        << "expected fallback to the legacy scheduler";
 }
 
 }  // namespace mooncake

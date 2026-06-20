@@ -125,9 +125,22 @@ void EventDrivenClientScheduler::OnDelete(const DeleteContext& ctx) {
 
 bool EventDrivenClientScheduler::OnAllocationFailure(
     const AllocationFailureContext& ctx) {
+    // Unified synchronous-reclaim entry point for pressure on the FAST tier.
+    // Reached from any allocator path that runs out of fast-tier room:
+    //   1. external client writes (Put / PreWrite into DRAM),
+    //   2. promotion/onboard (migrating a hot key slow -> fast),
+    //   3. internal staging during data movement.
+    //
+    // Scope (D2-B): the event-driven scheduler force-reclaims ONLY the fast
+    // tier. Non-fast (slow) tiers are intentionally not reclaimed here — they
+    // own their own eviction inside CacheTier::Allocate (e.g. StorageTier
+    // triggers bucket eviction when capacity is exceeded), so a failed offload
+    // into a full slow tier has already attempted self-eviction by the time it
+    // surfaces. We therefore decline (return false) for non-fast tiers rather
+    // than double-managing their capacity.
     if (!running_.load() || !roles_resolved_.load() ||
         ctx.tier_id != fast_tier_id_) {
-        return false;  // we only manage the fast tier
+        return false;
     }
     // Nudge the periodic loop, then synchronously reclaim at least the requested
     // amount using the policy's eviction decision.
@@ -206,10 +219,13 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
             return true;
         }
         case MovementRequest::Kind::kMigrate: {
-            // Copy source -> dest, then delete source. Only delete once the dest
-            // replica is confirmed present: CopyData's allocation is non-strict
-            // and may fall back to another tier, so "CopyData ok" != "landed on
-            // dest" — deleting the source otherwise could lose the only copy.
+            // Copy source -> dest, then delete source. The copy is STRICT so it
+            // must land on dest (triggering dest's sync eviction if full) and
+            // can never fall back to another tier — a successful CopyData then
+            // means the new replica is genuinely on dest, so deleting the source
+            // cannot lose the only copy. (Strict also makes onboard actually
+            // evict-to-fit instead of silently re-landing the copy on the slow
+            // tier under fast-tier pressure.)
             uint64_t version = 0;
             auto src = backend_->Get(mv.key, mv.source_tier,
                                      /*record_access=*/false, &version);
@@ -218,12 +234,15 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
             }
             auto copy = backend_->CopyData(mv.key, src.value()->loc.data,
                                            mv.dest_tier, version,
-                                           /*record_access=*/false);
+                                           /*record_access=*/false,
+                                           /*strict=*/true);
             if (!copy.has_value()) {
                 VLOG(2) << "Migrate copy skipped for " << mv.key << ": "
                         << copy.error();
                 return false;
             }
+            // Defense-in-depth: confirm residency before dropping the source in
+            // case the fresh dest replica was evicted in the meantime.
             if (!backend_->Exist(mv.key, mv.dest_tier)) {
                 VLOG(2) << "Migrate of " << mv.key
                         << " did not land on dest; keeping source";

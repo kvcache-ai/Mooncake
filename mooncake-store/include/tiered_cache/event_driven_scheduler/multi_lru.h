@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -59,9 +60,12 @@ struct MultiLRUEntry {
  */
 class MultiLRU {
    public:
-    // Insert (or refresh) a key into `band` at MRU. If the key is already
-    // present, its size is updated and it is moved to `band`'s MRU position.
-    void Insert(std::string_view key, size_t size_bytes, HeatBand band) {
+    // Insert (or refresh) a key at the MRU of the band derived from `freq`. If
+    // the key is already present, its size is updated and it is moved to that
+    // band's MRU position. Takes a raw frequency and computes the band itself,
+    // mirroring Touch() (callers no longer hand-roll BandOf).
+    void Insert(std::string_view key, size_t size_bytes, uint64_t freq) {
+        const HeatBand band = BandOf(freq);
         auto it = index_.find(key);
         if (it != index_.end()) {
             it->second->size_bytes = size_bytes;

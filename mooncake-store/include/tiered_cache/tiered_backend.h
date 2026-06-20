@@ -235,10 +235,13 @@ class TieredBackend {
 
     // --- Composite Operations ---
 
+    // strict=true forces the copy onto dest_tier_id (triggering its sync
+    // eviction on a full tier) and never falls back to another tier, so a
+    // successful return guarantees the new replica landed on dest_tier_id.
     tl::expected<void, ErrorCode> CopyData(
         std::string_view key, const DataSource& source, UUID dest_tier_id,
         std::optional<uint64_t> expected_version = std::nullopt,
-        bool record_access = true);
+        bool record_access = true, bool strict = false);
 
     tl::expected<void, ErrorCode> Transfer(std::string_view key,
                                            UUID source_tier_id,
@@ -250,6 +253,15 @@ class TieredBackend {
     std::vector<TierView> GetTierViews() const;
     std::vector<UUID> GetReplicaTierIds(std::string_view key) const;
     const CacheTier* GetTier(UUID tier_id) const;
+
+    /**
+     * @brief Id of the DRAM (fast) tier, for DRAM-only local writes.
+     * @return The highest-priority MemoryType::DRAM tier (which coincides with
+     *         the event-driven 'fast' role when that role is DRAM), or nullopt
+     *         if the deployment has no DRAM tier — callers must then fall back
+     *         to best-effort allocation.
+     */
+    std::optional<UUID> GetDramTierId() const;
     const DataCopier& GetDataCopier() const;
 
     /**
@@ -273,6 +285,8 @@ class TieredBackend {
         std::optional<size_t> hot_key_num = std::nullopt) const;
 
    private:
+    friend class TieredBackendTest;  // for unit tests
+
     tl::expected<void, ErrorCode> MountSegment(
         UUID id, size_t capacity, int priority,
         const std::vector<std::string>& tags, MemoryType memory_type);

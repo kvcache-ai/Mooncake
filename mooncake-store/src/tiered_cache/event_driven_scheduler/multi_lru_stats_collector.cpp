@@ -19,10 +19,11 @@ void MultiLRUStatsCollector::OnAccess(std::string_view key,
     uint64_t freq = 0;
     {
         // Every access bumps the global frequency memory, regardless of which
-        // tier served it (separation of concerns).
+        // tier served it (separation of concerns). A single locked pass does
+        // both the increment and the post-increment estimate (one set of row
+        // hashes instead of two).
         std::lock_guard<std::mutex> lock(sketch_mutex_);
-        sketch_.Increment(h);
-        freq = sketch_.Estimate(h);
+        freq = sketch_.IncrementAndEstimate(h);
     }
     // Re-classify the key's band on every fast-tier hit. No-op if the
     // key isn't a fast-tier resident.
@@ -37,6 +38,11 @@ void MultiLRUStatsCollector::OnCommit(std::string_view key, UUID tier_id,
     if (!IsFastTier(tier_id)) {
         return;  // only fast-tier replicas enter the MultiLRU
     }
+    if (size_bytes == 0) {
+        // A zero-size entry contributes nothing to reclaim and cannot advance
+        // the eviction target; keep it out of the MultiLRU entirely.
+        return;
+    }
     // A commit is NOT a frequency hit: we only read the current estimate to
     // pick the initial band, we do NOT Increment the sketch (a commit must not
     // be double-counted as an access).
@@ -46,7 +52,7 @@ void MultiLRUStatsCollector::OnCommit(std::string_view key, UUID tier_id,
         freq = sketch_.Estimate(HashKey(key));
     }
     MutexLocker lock(&lru_mutex_);
-    fast_lru_.Insert(key, size_bytes, BandOf(freq));
+    fast_lru_.Insert(key, size_bytes, freq);  // MultiLRU derives the band
 }
 
 void MultiLRUStatsCollector::OnDelete(std::string_view key,
