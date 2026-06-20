@@ -190,7 +190,10 @@ static inline uint8_t fillData(void* addr, size_t length) {
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> ref_data(length, seed);
-        tangMemcpy(addr, ref_data.data(), length, tangMemcpyHostToDevice);
+        auto err =
+            cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyHostToDevice);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         return seed;
     }
 #endif
@@ -219,7 +222,10 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> act_data(length);
-        tangMemcpy(act_data.data(), addr, length, tangMemcpyDeviceToHost);
+        auto err =
+            cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDeviceToHost);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

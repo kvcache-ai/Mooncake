@@ -208,7 +208,7 @@ std::optional<ParsedWriterShardManifest> parse_writer_shard_manifest(
     parsed.global_shape = TensorShapeToVector(parsed.manifest.global_shape,
                                               parsed.manifest.header.ndim);
     for (auto dim : parsed.global_shape) {
-        if (dim <= 0) {
+        if (dim < 0) {
             return std::nullopt;
         }
     }
@@ -1428,7 +1428,7 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
     int64_t global_numel = 1;
     int64_t local_numel = 1;
     for (size_t dim = 0; dim < global_shape.size(); ++dim) {
-        if (global_shape[dim] <= 0 || local_shape[dim] < 0) {
+        if (global_shape[dim] < 0 || local_shape[dim] < 0) {
             LOG(ERROR) << operation_name << ": invalid tensor shape";
             return std::nullopt;
         }
@@ -1441,7 +1441,7 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
             return std::nullopt;
         }
     }
-    if (local_numel < 0 || global_numel <= 0) {
+    if (local_numel < 0 || global_numel < 0) {
         LOG(ERROR) << operation_name << ": invalid tensor numel";
         return std::nullopt;
     }
