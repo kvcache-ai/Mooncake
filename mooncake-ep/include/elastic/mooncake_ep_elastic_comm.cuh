@@ -48,6 +48,33 @@ __device__ __forceinline__ void timeout_while(const func_t& func,
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
+template <int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles>
+__forceinline__ __device__ void local_grid_sync(
+    const layout::WorkspaceLayout& workspace, const int& thread_idx) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    (void)kNumThreads;
+    __shared__ unsigned long long ticket;
+    __syncthreads();
+    if (thread_idx == 0) {
+        ticket = atomicAdd(
+            workspace.get_nvl_barrier_counter_ptr(kKernelBarrierTag), 1ULL);
+    }
+    __syncthreads();
+    const auto target = ((ticket / kNumSMs) + 1ULL) * kNumSMs;
+    timeout_while<kNumTimeoutCycles>(thread_idx == 0, [=](const bool&) {
+        return ptx::ld_volatile<unsigned long long>(
+                   workspace.get_nvl_barrier_counter_ptr(kKernelBarrierTag)) >=
+               target;
+    });
+    __syncthreads();
+#else
+    (void)workspace;
+    (void)thread_idx;
+    (gridDim.x > 1) ? cooperative_groups::this_grid().sync()
+                    : __syncthreads();
+#endif
+}
+
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM,
           bool kWithNotifyWarps = false>
 __device__ __forceinline__ std::pair<int, int> get_qp_mode(
@@ -130,8 +157,8 @@ __forceinline__ __device__ void gpu_barrier(
     bool do_scaleup = true) {
     if constexpr (kFlushStores) gin.flush();
     if constexpr (kSyncAtStart) {
-        (gridDim.x > 1) ? cooperative_groups::this_grid().sync()
-                        : __syncthreads();
+        local_grid_sync<kNumSMs, kNumThreads, kNumTimeoutCycles>(workspace,
+                                                                thread_idx);
     }
 
     do_scaleout &= kNumScaleoutRanks > 1;
@@ -156,8 +183,8 @@ __forceinline__ __device__ void gpu_barrier(
     }
 
     if constexpr (kSyncAtEnd) {
-        (gridDim.x > 1) ? cooperative_groups::this_grid().sync()
-                        : __syncthreads();
+        local_grid_sync<kNumSMs, kNumThreads, kNumTimeoutCycles>(workspace,
+                                                                thread_idx);
     }
 }
 

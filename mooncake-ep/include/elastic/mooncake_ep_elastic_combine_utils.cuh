@@ -24,14 +24,19 @@ template <int kLength, int kMaxUnrollFactor, int kWarpSize = 32>
 constexpr int get_max_unroll_factor() {
     for (int i = kMaxUnrollFactor; i >= 1; --i)
         if (kLength % (kWarpSize * i) == 0) return i;
+#ifdef MOONCAKE_EP_USE_MUSA
+    return 1;
+#else
     throw std::logic_error("Invalid length, cannot find unrolling factor");
+#endif
 }
 
 // Determine the vector type for combine loads/stores based on arch and hidden
 // size alignment
 template <int kHiddenBytes>
 struct CombineVecTraits {
-#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000)
     // On SM100+, use longlong4_t (32 bytes) if hidden is aligned, otherwise
     // fall back to int4 (16 bytes)
     static constexpr bool kUseLonglong4 =
@@ -113,9 +118,18 @@ __device__ __forceinline__ void combine_reduce(
 #pragma unroll
             for (int j = 0; j < kUnrollFactor; ++j) {
 #pragma unroll
-                for (int l = 0; l < kNumElemsPerVec / 2; ++l)
-                    bf162_view_0[j * (kNumElemsPerVec / 2) + l] +=
-                        bf162_view_1[j * (kNumElemsPerVec / 2) + l];
+                for (int l = 0; l < kNumElemsPerVec / 2; ++l) {
+                    const int idx = j * (kNumElemsPerVec / 2) + l;
+#ifdef MOONCAKE_EP_USE_MUSA
+                    bf162_view_0[idx] = __floats2bfloat162_rn(
+                        __low2float(bf162_view_0[idx]) +
+                            __low2float(bf162_view_1[idx]),
+                        __high2float(bf162_view_0[idx]) +
+                            __high2float(bf162_view_1[idx]));
+#else
+                    bf162_view_0[idx] += bf162_view_1[idx];
+#endif
+                }
                 dst_buffer_ptr[i * (kUnrollFactor * 32) + j * 32 + lane_idx] =
                     values_0[j];
             }
@@ -177,9 +191,15 @@ __device__ __forceinline__ void combine_reduce(
                 auto bf162_view =
                     reinterpret_cast<nv_bfloat162*>(&casted_value);
 #pragma unroll
-                for (int l = 0; l < kNumElemsPerVec / 2; ++l)
+                for (int l = 0; l < kNumElemsPerVec / 2; ++l) {
+                    const auto value = reduced[j * (kNumElemsPerVec / 2) + l];
+#ifdef MOONCAKE_EP_USE_MUSA
+                    bf162_view[l] = __floats2bfloat162_rn(value.x, value.y);
+#else
                     bf162_view[l] = __float22bfloat162_rn(
-                        reduced[j * (kNumElemsPerVec / 2) + l]);
+                        value);
+#endif
+                }
                 dst_buffer_ptr[i * (kUnrollFactor * 32) + j * 32 + lane_idx] =
                     casted_value;
             }

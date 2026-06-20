@@ -873,7 +873,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         thread_idx, /* do not scale-out */ false, true);
 
     // Trigger the copy epilogue kernel
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 

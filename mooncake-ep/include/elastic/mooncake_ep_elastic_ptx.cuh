@@ -24,7 +24,13 @@ static constexpr int kNumTMAAlignBytes = 32;
 #ifdef __CUDACC__
 
 /// Exceptions
-__forceinline__ __device__ void trap() { asm volatile("trap;"); }
+__forceinline__ __device__ void trap() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return;
+#else
+    asm volatile("trap;");
+#endif
+}
 
 /// Thread layout
 __forceinline__ __device__ int get_warp_idx() {
@@ -32,14 +38,19 @@ __forceinline__ __device__ int get_warp_idx() {
 }
 
 __forceinline__ __device__ int get_lane_idx() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return static_cast<int>(threadIdx.x) & 31;
+#else
     int lane_idx;
     asm volatile("mov.s32 %0, %laneid;" : "=r"(lane_idx));
     return lane_idx;
+#endif
 }
 
 /// Election
 __forceinline__ __device__ int elect_one_sync() {
-#if !defined(DISABLE_SM90_FEATURES) && defined(__CUDA_ARCH__) && \
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(DISABLE_SM90_FEATURES) && \
+    defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 900)
     int pred = 0;
     asm volatile(
@@ -60,7 +71,8 @@ __forceinline__ __device__ int elect_one_sync() {
 /// TMA and `cp.async`
 __forceinline__ __device__ void mbarrier_init_with_fence(
     mbarrier* ptr, const int& arrive_count = 1) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::"r"(arrive_count),
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
     asm volatile("fence.mbarrier_init.release.cluster;" ::);
@@ -68,14 +80,16 @@ __forceinline__ __device__ void mbarrier_init_with_fence(
 }
 
 __forceinline__ __device__ void mbarrier_invalidate(mbarrier* ptr) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(
         static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 #endif
 }
 
 __forceinline__ __device__ void mbarrier_arrive(mbarrier* ptr) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0]; \n\t" ::"r"(
         static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 #endif
@@ -83,7 +97,8 @@ __forceinline__ __device__ void mbarrier_arrive(mbarrier* ptr) {
 
 __forceinline__ __device__ void mbarrier_arrive_and_set_tx(
     mbarrier* ptr, const int& num_bytes) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile(
         "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" ::"r"(
             num_bytes),
@@ -93,7 +108,8 @@ __forceinline__ __device__ void mbarrier_arrive_and_set_tx(
 
 __forceinline__ __device__ void mbarrier_wait_and_flip_phase(
     mbarrier* ptr, arrival_phase& phase) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile(
         "{\n\t"
         ".reg .pred       P1; \n\t"
@@ -109,14 +125,16 @@ __forceinline__ __device__ void mbarrier_wait_and_flip_phase(
 }
 
 __forceinline__ __device__ void tma_store_fence() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile("fence.proxy.async.shared::cta;");
 #endif
 }
 
 template <int kNumRemainingWaits = 0>
 __forceinline__ __device__ void tma_store_wait() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits)
                  : "memory");
 #endif
@@ -131,7 +149,8 @@ __forceinline__ __device__ void tma_load_1d(
     const void* dst_ptr, const void* src_ptr, mbarrier* ptr,
     const int& num_bytes,
     const TMACacheHint& hint = TMACacheHint::kEvictFirst) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     // NOTES: normally, the loaded part will be evicted soon
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::"
@@ -150,7 +169,8 @@ __forceinline__ __device__ void tma_load_1d(
 __forceinline__ __device__ void tma_store_1d(
     const void* dst_ptr, const void* src_ptr, const int& num_bytes,
     const TMACacheHint& hint = TMACacheHint::kEvictNormal) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     // NOTES: normally, the stored part will be used soon
     asm volatile(
         "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], "
@@ -166,7 +186,8 @@ __forceinline__ __device__ void tma_store_1d(
 }
 
 __forceinline__ __device__ void tma_store_commit() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
     asm volatile("cp.async.bulk.commit_group;");
 #endif
 }
@@ -177,23 +198,37 @@ __forceinline__ __device__ void cp_async_ca(const dtype_t* gmem_src,
     EP_STATIC_ASSERT(
         sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8 or sizeof(dtype_t) == 16,
         "Invalid dtype bytes");
+#ifdef MOONCAKE_EP_USE_MUSA
+    *const_cast<dtype_t*>(smem_dst) = *gmem_src;
+#else
     asm volatile(
         "cp.async.ca.shared::cta.global.L2::128B [%0], [%1], %2;\n" ::"r"(
             static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst))),
         "l"(gmem_src), "n"(sizeof(dtype_t)));
+#endif
 }
 
 __forceinline__ __device__ void cp_async_mbarrier_arrive(mbarrier* ptr) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    (void)ptr;
+#else
     asm volatile("cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n" ::"r"(
         static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 /// Barriers
 template <int kNumThreads>
 __forceinline__ __device__ void named_barrier(const int& idx) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    (void)idx;
+    __threadfence_block();
+    __syncwarp();
+#else
     // Equivalent to `barrier.sync.aligned`, which requires all threads run the
     // same location of code
     asm volatile("bar.sync %0, %1;" ::"r"(idx), "r"(kNumThreads));
+#endif
 }
 
 /// LD/ST instructions
@@ -201,6 +236,10 @@ __forceinline__ __device__ int4
 ldg_with_gez_pred(const int4* ptr, const int& value,
                   const TMACacheHint& cache_hint = TMACacheHint::kEvictFirst) {
     int4 ret = make_int4(0, 0, 0, 0);
+#ifdef MOONCAKE_EP_USE_MUSA
+    (void)cache_hint;
+    if (value >= 0) ret = *ptr;
+#else
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
@@ -211,6 +250,7 @@ ldg_with_gez_pred(const int4* ptr, const int& value,
         : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
         : "l"(ptr), "r"(value), "l"(cache_hint)
         : "memory");
+#endif
     return ret;
 }
 
@@ -218,6 +258,10 @@ __forceinline__ __device__ int4
 ldg_with_gtz_pred(const int4* ptr, const int& value,
                   const TMACacheHint& cache_hint = TMACacheHint::kEvictFirst) {
     int4 ret = make_int4(0, 0, 0, 0);
+#ifdef MOONCAKE_EP_USE_MUSA
+    (void)cache_hint;
+    if (value > 0) ret = *ptr;
+#else
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
@@ -228,6 +272,7 @@ ldg_with_gtz_pred(const int4* ptr, const int& value,
         : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
         : "l"(ptr), "r"(value), "l"(cache_hint)
         : "memory");
+#endif
     return ret;
 }
 
@@ -235,6 +280,10 @@ __forceinline__ __device__ int4
 ld_with_gez_pred(const int4* ptr, const int& value,
                  const TMACacheHint& cache_hint = TMACacheHint::kEvictFirst) {
     int4 ret = make_int4(0, 0, 0, 0);
+#ifdef MOONCAKE_EP_USE_MUSA
+    (void)cache_hint;
+    if (value >= 0) ret = *ptr;
+#else
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
@@ -245,10 +294,12 @@ ld_with_gez_pred(const int4* ptr, const int& value,
         : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
         : "l"(ptr), "r"(value), "l"(cache_hint)
         : "memory");
+#endif
     return ret;
 }
 
-#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000)
 __forceinline__ __device__ longlong4_t
 ldg_with_gez_pred(const longlong4_t* ptr, const int& value,
                   const TMACacheHint& cache_hint = TMACacheHint::kEvictFirst) {
@@ -277,13 +328,22 @@ __forceinline__ __device__ longlong4_t ldg(const longlong4_t* ptr) {
 }
 #endif
 
-__forceinline__ __device__ int4 ldg(const int4* ptr) { return __ldg(ptr); }
+__forceinline__ __device__ int4 ldg(const int4* ptr) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return *ptr;
+#else
+    return __ldg(ptr);
+#endif
+}
 
 template <typename dtype_t>
 __forceinline__ __device__ void st_with_gez_pred(dtype_t* ptr, dtype_t value,
                                                  const int& condition) {
     EP_STATIC_ASSERT(sizeof(dtype_t) == 4, "Invalid data type");
     auto view = *reinterpret_cast<int*>(&value);
+#ifdef MOONCAKE_EP_USE_MUSA
+    if (condition >= 0) *ptr = value;
+#else
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
@@ -292,10 +352,16 @@ __forceinline__ __device__ void st_with_gez_pred(dtype_t* ptr, dtype_t value,
         "}" ::"l"(ptr),
         "r"(view), "r"(condition)
         : "memory");
+#endif
 }
 
 template <typename dtype_t>
 __forceinline__ __device__ dtype_t ld_volatile(const void* ptr) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    const volatile dtype_t* typed =
+        reinterpret_cast<const volatile dtype_t*>(ptr);
+    return *typed;
+#else
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t value;
         asm volatile("ld.volatile.global.u32 %0, [%1];"
@@ -312,10 +378,17 @@ __forceinline__ __device__ dtype_t ld_volatile(const void* ptr) {
         EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8,
                          "Invalid data type length");
     }
+#endif
 }
 
 __forceinline__ __device__ void red_add(const int64_t* ptr,
                                         const int64_t& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    atomicAdd(const_cast<unsigned long long*>(
+                  reinterpret_cast<const unsigned long long*>(ptr)),
+              static_cast<unsigned long long>(value));
+    __threadfence_system();
+#else
     // TODO(NVCC): why don't NVCC support `s64`?
     // Mooncake elastic consumers can poll these counters from a different CTA
     // immediately after the RED producer issues the update.  Keep the update as
@@ -325,22 +398,42 @@ __forceinline__ __device__ void red_add(const int64_t* ptr,
     asm volatile("red.release.gpu.global.add.u64 [%0], %1;" ::"l"(ptr),
                  "l"(value)
                  : "memory");
+#endif
 }
 
 __forceinline__ __device__ void red_add_rel_sys(const int* ptr,
                                                 const int& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    atomicAdd(const_cast<int*>(ptr), value);
+    __threadfence_system();
+#else
     asm volatile("red.release.sys.global.add.s32 [%0], %1;" ::"l"(ptr),
                  "r"(value));
+#endif
 }
 
 __forceinline__ __device__ void red_add_rel_sys(const int64_t* ptr,
                                                 const int64_t& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    atomicAdd(const_cast<unsigned long long*>(
+                  reinterpret_cast<const unsigned long long*>(ptr)),
+              static_cast<unsigned long long>(value));
+    __threadfence_system();
+#else
     asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(ptr),
                  "l"(value));
+#endif
 }
 
 template <typename dtype_t>
 __forceinline__ __device__ dtype_t ld_acquire_sys(const dtype_t* ptr) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    const volatile dtype_t* typed =
+        reinterpret_cast<const volatile dtype_t*>(ptr);
+    const dtype_t value = *typed;
+    __threadfence_system();
+    return value;
+#else
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t value;
         asm volatile("ld.acquire.sys.L1::no_allocate.global.u32 %0, [%1];"
@@ -357,10 +450,14 @@ __forceinline__ __device__ dtype_t ld_acquire_sys(const dtype_t* ptr) {
         EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8,
                          "Invalid data type length");
     }
+#endif
 }
 
 template <typename dtype_t>
 __forceinline__ __device__ void st_relaxed_sys(void* ptr, dtype_t value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    *static_cast<dtype_t*>(ptr) = value;
+#else
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t int_value = reinterpret_cast<const uint32_t&>(value);
         asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::"l"(ptr),
@@ -373,10 +470,15 @@ __forceinline__ __device__ void st_relaxed_sys(void* ptr, dtype_t value) {
         EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8,
                          "Invalid data type length");
     }
+#endif
 }
 
 template <typename dtype_t>
 __forceinline__ __device__ void st_release_sys(void* ptr, dtype_t value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    *static_cast<dtype_t*>(ptr) = value;
+    __threadfence_system();
+#else
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t int_value = reinterpret_cast<const uint32_t&>(value);
         asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(ptr),
@@ -389,22 +491,31 @@ __forceinline__ __device__ void st_release_sys(void* ptr, dtype_t value) {
         EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8,
                          "Invalid data type length");
     }
+#endif
 }
 
 // Adjust registers
 template <int kNumRegs>
 __device__ __forceinline__ void warpgroup_reg_alloc() {
+#ifndef MOONCAKE_EP_USE_MUSA
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(kNumRegs));
+#endif
 }
 
 template <int kNumRegs>
 __device__ __forceinline__ void warpgroup_reg_dealloc() {
+#ifndef MOONCAKE_EP_USE_MUSA
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(kNumRegs));
+#endif
 }
 
 /// General fences
 __device__ __forceinline__ void fence_acq_rel_sys() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    __threadfence_system();
+#else
     asm volatile("fence.acq_rel.sys;" ::: "memory");
+#endif
 }
 
 /// Intrinsics
@@ -469,10 +580,14 @@ __device__ __forceinline__ auto ffs(const dtype_t& value) {
 }
 
 __device__ __forceinline__ int get_master_lane_idx(const unsigned& mask) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return 31 - __clz(mask);
+#else
     // Equivalent to `31 - __clz(mask)`
     int highest_idx;
     asm volatile("bfind.u32 %0, %1;" : "=r"(highest_idx) : "r"(mask));
     return highest_idx;
+#endif
 }
 
 __device__ __forceinline__ bool deduplicate(const int& value,
@@ -491,7 +606,8 @@ __device__ __forceinline__ int warp_inclusive_sum(int value,
 }
 
 __device__ __forceinline__ float2 fadd2(const float2& a, const float2& b) {
-#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+#if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000)
     return __fadd2_rn(a, b);
 #else
     return {a.x + b.x, a.y + b.y};
@@ -499,7 +615,11 @@ __device__ __forceinline__ float2 fadd2(const float2& a, const float2& b) {
 }
 
 __device__ __forceinline__ void accumulate(float2& a, nv_bfloat162 b) {
-#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+#ifdef MOONCAKE_EP_USE_MUSA
+    a.x += __low2float(b);
+    a.y += __high2float(b);
+#elif defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000)
     // Use `add.rn.f32.bf16` instruction to perform fused (cast + add) operation
     // on SM100
     asm("add.rn.f32.bf16 %0, %1, %0;\n"

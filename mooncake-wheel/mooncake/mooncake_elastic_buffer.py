@@ -164,12 +164,11 @@ class ElasticBuffer:
         self.backend = group
 
         if self._musa_fallback:
-            # MUSA does not support the imported SM90 elastic kernels.  Use a
-            # correctness-oriented distributed fallback so the public elastic API
-            # remains usable while the CUDA path keeps using native Device API
-            # kernels.
-            self.runtime = None
-        else:
+            self._musa_fallback = os.getenv(
+                "MOONCAKE_EP_MUSA_ELASTIC_FALLBACK", ""
+            ).upper() in {"1", "ON", "TRUE", "YES"}
+
+        if not self._musa_fallback:
             # Native Mooncake transport/runtime.  This keeps the legacy Buffer ABI
             # untouched while giving ElasticBuffer users a dedicated native entrypoint.
             from mooncake import ep
@@ -192,6 +191,10 @@ class ElasticBuffer:
                 num_gpu_timeout_secs,
             )
             self._connect_native()
+        else:
+            # Debug-only correctness fallback. Production MUSA elastic should use
+            # the native Device API kernels rather than the distributed Python path.
+            self.runtime = None
 
         torch.cuda.synchronize()
         _dist_barrier(group)

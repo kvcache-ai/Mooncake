@@ -20,8 +20,13 @@ __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
 #endif
 
 // -- Device intrinsics (MUSA doesn't have __ldg / __activemask) --------------
-#ifndef __ldg
-#define __ldg(ptr) (*(ptr))
+#if (defined(__CUDACC__) || defined(__MCC__)) && \
+    !defined(MOONCAKE_EP_MUSA_LDG_DEFINED)
+#define MOONCAKE_EP_MUSA_LDG_DEFINED
+template <typename dtype_t>
+__device__ __forceinline__ dtype_t __ldg(const dtype_t* ptr) {
+    return *ptr;
+}
 #endif
 #ifndef __activemask
 #define __activemask() (0xffffffff)

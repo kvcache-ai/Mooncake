@@ -63,12 +63,16 @@ int64_t elastic_atomic_scratch_num_bytes() {
 }
 
 int device_smem_bytes() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return 0;
+#else
     int device = 0;
     cudaGetDevice(&device);
     int value = 0;
     cudaDeviceGetAttribute(&value, cudaDevAttrMaxSharedMemoryPerBlockOptin,
                            device);
     return value > 0 ? value : 98304;
+#endif
 }
 
 }  // namespace
@@ -342,14 +346,23 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         }
     }
     std::optional<torch::Tensor> deterministic_rank_count_buffer = std::nullopt;
-    if (config_.deterministic && !cached_mode && !use_hybrid) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA non-hybrid dispatch always runs launch_musa_elastic_prepare_dispatch(),
+    // which assigns slots and publishes counts without cooperative grid sync.
+    const bool run_deterministic_prologue = false;
+#else
+    const bool run_deterministic_prologue =
+        config_.deterministic && !cached_mode && !use_hybrid;
+#endif
+    if (run_deterministic_prologue) {
         deterministic_rank_count_buffer = torch::empty(
             {num_sms, topology_.num_scaleup_ranks},
             torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
         launch_elastic_dispatch_deterministic_prologue(
-            topk_idx, deterministic_rank_count_buffer.value(),
-            dst_buffer_slot_idx, num_tokens, num_max_tokens_per_rank,
-            num_experts, num_topk, topology_.scaleup_rank_idx,
+            topk_idx.data_ptr<int64_t>(),
+            deterministic_rank_count_buffer.value().data_ptr<int>(),
+            dst_buffer_slot_idx.data_ptr<int>(), num_tokens,
+            num_max_tokens_per_rank, num_experts, num_topk, topology_.scaleup_rank_idx,
             topology_.num_scaleup_ranks, num_sms, num_smem_bytes,
             launch_stream.stream());
     }
@@ -545,25 +558,50 @@ ElasticCombineOutput MooncakeElasticBuffer::combine(
         *native_buffer_, topology_, mapped_host_workspace_, timeout_cycles);
     auto psum_num_recv_tokens_per_scaleup_rank =
         handle.psum_num_recv_tokens_per_scaleup_rank;
-    void* reduce_buffer = launch_mooncake_elastic_combine(
-        x.data_ptr(), weights.data_ptr<float>(),
-        const_cast<int*>(handle.recv_src_metadata.data_ptr<int>()),
-        psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-        handle.token_metadata_at_forward.has_value()
-            ? handle.token_metadata_at_forward->data_ptr<int>()
-            : nullptr,
-        handle.channel_linked_list.has_value()
-            ? handle.channel_linked_list->data_ptr<int>()
-            : nullptr,
-        static_cast<int>(x.size(0)), handle.num_max_tokens_per_rank, hidden,
-        handle.num_experts, num_topk, num_sms, num_smem_bytes,
-        use_hybrid ? hybrid_channels : num_channels, handle.do_expand,
-        config_.allow_multiple_reduction, launch_ctx, launch_stream.stream());
+    void* reduce_buffer = nullptr;
+#ifdef MOONCAKE_EP_USE_MUSA
+    if (!use_hybrid && !handle.do_expand) {
+        reduce_buffer = launch_musa_elastic_combine_send_direct(
+            reinterpret_cast<nv_bfloat16*>(x.data_ptr()),
+            const_cast<int*>(handle.recv_src_metadata.data_ptr<int>()),
+            static_cast<int>(x.size(0)), handle.num_max_tokens_per_rank, hidden,
+            num_topk, launch_ctx, launch_stream.stream());
+    } else
+#endif
+    {
+        reduce_buffer = launch_mooncake_elastic_combine(
+            x.data_ptr(), weights.data_ptr<float>(),
+            const_cast<int*>(handle.recv_src_metadata.data_ptr<int>()),
+            psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+            handle.token_metadata_at_forward.has_value()
+                ? handle.token_metadata_at_forward->data_ptr<int>()
+                : nullptr,
+            handle.channel_linked_list.has_value()
+                ? handle.channel_linked_list->data_ptr<int>()
+                : nullptr,
+            static_cast<int>(x.size(0)), handle.num_max_tokens_per_rank,
+            hidden, handle.num_experts, num_topk, num_sms, num_smem_bytes,
+            use_hybrid ? hybrid_channels : num_channels, handle.do_expand,
+            config_.allow_multiple_reduction, launch_ctx,
+            launch_stream.stream());
+    }
 
     torch::Tensor combined_x =
         out.has_value()
             ? out.value()
             : torch::empty({num_combined_tokens, hidden}, x.options());
+#ifdef MOONCAKE_EP_USE_MUSA
+    if (!use_hybrid && !handle.do_expand) {
+        launch_musa_elastic_scaleup_barrier(launch_ctx, handle.num_experts,
+                                            launch_stream.stream());
+        launch_musa_elastic_combine_reduce_direct(
+            reduce_buffer, const_cast<int64_t*>(handle.topk_idx.data_ptr<int64_t>()),
+            reinterpret_cast<nv_bfloat16*>(combined_x.data_ptr()),
+            num_combined_tokens, handle.num_max_tokens_per_rank, hidden,
+            handle.num_experts, num_topk, topology_.num_scaleup_ranks,
+            launch_stream.stream());
+    } else
+#endif
     launch_mooncake_elastic_combine_reduce_epilogue(
         combined_x.data_ptr(), weights.data_ptr<float>(),
         const_cast<int64_t*>(handle.topk_idx.data_ptr<int64_t>()),
