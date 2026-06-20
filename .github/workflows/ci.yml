@@ -326,7 +326,8 @@ jobs:
           'numpy<2' \
           torchada==0.1.48
         rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
-        ln -sfn /usr/local/musa /usr/local/cuda
+        rm -rf /usr/local/cuda
+        ln -s /usr/local/musa /usr/local/cuda
         ln -sfn /usr/local/musa/bin/mcc /usr/local/musa/bin/nvcc
         echo "MUSA_HOME=/usr/local/musa" >> $GITHUB_ENV
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
