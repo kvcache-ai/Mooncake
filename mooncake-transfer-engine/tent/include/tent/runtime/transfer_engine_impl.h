@@ -211,6 +211,9 @@ class TransferEngineImpl {
                           const Notification* notifi,
                           QueueOwnerKind owner_kind);
 
+    Status submitStagingTransfer(BatchID batch_id,
+                                 const std::vector<Request>& request_list);
+
     Status enqueuePreparedSubmit(Batch* batch, const PreparedSubmit& prepared,
                                  QueueOwnerKind owner_kind);
 

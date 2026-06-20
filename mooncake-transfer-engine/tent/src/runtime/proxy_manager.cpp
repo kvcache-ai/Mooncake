@@ -58,7 +58,13 @@ BatchID ProxyManager::submitCrossStage(const Request& request,
     inter_stage.target_id = request.target_id;
     inter_stage.target_offset = remote_stage_buffer;
     auto batch = impl_->allocateBatch(1);
-    impl_->submitTransfer(batch, {inter_stage});
+    auto status = impl_->submitStagingTransfer(batch, {inter_stage});
+    if (!status.ok()) {
+        LOG(WARNING) << "failed to submit cross-stage transfer: "
+                     << status.ToString();
+        if (batch) impl_->freeBatch(batch);
+        return 0;
+    }
     return batch;
 }
 
@@ -72,7 +78,13 @@ BatchID ProxyManager::submitLocalStage(const Request& request,
     local_stage.target_id = LOCAL_SEGMENT_ID;
     local_stage.target_offset = local_stage_buffer;
     auto batch = impl_->allocateBatch(1);
-    impl_->submitTransfer(batch, {local_stage});
+    auto status = impl_->submitStagingTransfer(batch, {local_stage});
+    if (!status.ok()) {
+        LOG(WARNING) << "failed to submit local-stage transfer: "
+                     << status.ToString();
+        if (batch) impl_->freeBatch(batch);
+        return 0;
+    }
     return batch;
 }
 
@@ -81,6 +93,7 @@ Status ProxyManager::waitLocalStage(const Request& request,
                                     uint64_t chunk_length, uint64_t offset) {
     auto batch =
         submitLocalStage(request, local_stage_buffer, chunk_length, offset);
+    if (!batch) return Status::TooManyRequests("submit local stage failed");
     return impl_->waitTransferCompletion(batch);
 }
 
@@ -119,6 +132,7 @@ Status ProxyManager::waitCrossStage(const Request& request,
                                     uint64_t chunk_length) {
     auto batch = submitCrossStage(request, local_stage_buffer,
                                   remote_stage_buffer, chunk_length);
+    if (!batch) return Status::TooManyRequests("submit cross stage failed");
     return impl_->waitTransferCompletion(batch);
 }
 
@@ -317,6 +331,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                     local_locked.insert(chunk.local_buf);
                     chunk.batch = submitLocalStage(request, chunk.local_buf,
                                                    chunk.length, chunk.offset);
+                    if (!chunk.batch) {
+                        chunk.state = StageState::FAILED;
+                        event_queue.push(id);
+                        break;
+                    }
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT;
                     event_queue.push(id);
@@ -356,6 +375,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                 }
                 chunk.batch = submitCrossStage(request, chunk.local_buf,
                                                chunk.remote_buf, chunk.length);
+                if (!chunk.batch) {
+                    chunk.state = StageState::FAILED;
+                    event_queue.push(id);
+                    break;
+                }
                 chunk.prev_state = chunk.state;
                 chunk.state = StageState::INFLIGHT;
                 event_queue.push(id);
@@ -373,6 +397,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                 } else if (request.opcode == Request::READ && local_staging) {
                     chunk.batch = submitLocalStage(request, chunk.local_buf,
                                                    chunk.length, chunk.offset);
+                    if (!chunk.batch) {
+                        chunk.state = StageState::FAILED;
+                        event_queue.push(id);
+                        break;
+                    }
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT;
                     event_queue.push(id);

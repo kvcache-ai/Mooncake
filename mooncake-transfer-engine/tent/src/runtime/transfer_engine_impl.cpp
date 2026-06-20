@@ -1642,6 +1642,12 @@ Status TransferEngineImpl::submitTransfer(
                           QueueOwnerKind::User);
 }
 
+Status TransferEngineImpl::submitStagingTransfer(
+    BatchID batch_id, const std::vector<Request>& request_list) {
+    return submitTransfer(batch_id, request_list, nullptr,
+                          QueueOwnerKind::StagingInternal);
+}
+
 void TransferEngineImpl::addSubmitHook(Batch* batch, size_t start_task_id,
                                        const std::vector<Request>& request_list,
                                        const Notification& notifi) {
