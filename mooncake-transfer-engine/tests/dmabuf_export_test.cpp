@@ -38,13 +38,13 @@ using mooncake::RdmaContext;
 namespace {
 
 // Open a real fd via pipe() (POSIX, no _GNU_SOURCE required).
-// We return the read end and immediately close the write end so the fd
-// is a valid but inert file descriptor suitable for testing closeDmabufExport.
-static int make_test_fd() {
+// Returns via reference so ASSERT_EQ can abort the test on failure, avoiding
+// undefined behaviour from an uninitialized pipefd if pipe() fails.
+static void make_test_fd(int &out_fd) {
     int pipefd[2];
-    EXPECT_EQ(pipe(pipefd), 0) << "pipe() failed: " << strerror(errno);
+    ASSERT_EQ(pipe(pipefd), 0) << "pipe() failed: " << strerror(errno);
     close(pipefd[1]);   // write end not needed
-    return pipefd[0];
+    out_fd = pipefd[0];
 }
 
 static bool fd_is_closed(int fd) {
@@ -69,7 +69,8 @@ TEST(CloseDmabufExport, NoOpWhenFdIsNegative) {
 }
 
 TEST(CloseDmabufExport, ClosesLiveFdAndClearsIt) {
-    int fd = make_test_fd();
+    int fd = -1;
+    make_test_fd(fd);
     ASSERT_GE(fd, 0);
 
     DmabufExport exp;
@@ -83,7 +84,8 @@ TEST(CloseDmabufExport, ClosesLiveFdAndClearsIt) {
 }
 
 TEST(CloseDmabufExport, Idempotent) {
-    int fd = make_test_fd();
+    int fd = -1;
+    make_test_fd(fd);
     ASSERT_GE(fd, 0);
 
     DmabufExport exp;
