@@ -58,6 +58,7 @@ struct Batch {
     size_t max_size;
     size_t runtime_refs{0};
     bool free_requested{false};
+    uint64_t queue_token{0};
 
     struct SubmitHook {
         size_t start_task_id{0};
@@ -756,6 +757,12 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (!alive_batches_.count(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+        auto retire_status = retireQueueForBatch(batch);
+        if (!retire_status.ok() && !retire_status.IsInvalidEntry()) {
+            return retire_status;
+        }
+    }
     if (batch->free_requested) {
         CHECK_STATUS(lazyFreeBatch());
         return Status::OK();
@@ -781,6 +788,9 @@ Status TransferEngineImpl::lazyFreeBatch() {
         if (overall_status.s == PENDING) {
             it++;
             continue;
+        }
+        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+            CHECK_STATUS(retireQueueForBatch(batch));
         }
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             auto& transport = transport_list_[type];
@@ -1335,15 +1345,15 @@ Status TransferEngineImpl::prepareSubmit(
     for (const auto& kv : merged.task_lookup) {
         const size_t public_task_index = kv.first;
         const size_t merged_task_index = kv.second;
+        const size_t task_id = start_task_id + public_task_index;
         auto& owner = prepared.owners[merged_task_index];
         if (!owner.has_owner_task_id) {
-            owner.owner_task_id = public_task_index;
+            owner.owner_task_id = task_id;
             owner.has_owner_task_id = true;
         } else {
-            owner.derived_task_ids.push_back(public_task_index);
+            owner.derived_task_ids.push_back(task_id);
         }
-        prepared.tasks.push_back(
-            {merged_task_index, start_task_id + public_task_index});
+        prepared.tasks.push_back({merged_task_index, task_id});
     }
     return Status::OK();
 }
@@ -1447,21 +1457,202 @@ Status TransferEngineImpl::commitPreparedSubmit(
     return Status::OK();
 }
 
-Status TransferEngineImpl::submitTransferToBatch(
-    Batch* batch, const std::vector<Request>& request_list) {
-    PreparedSubmit prepared;
-    CHECK_STATUS(prepareSubmit(batch, request_list, prepared));
-    CHECK_STATUS(commitPreparedSubmit(batch, prepared));
+Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
+                                                 const PreparedSubmit& prepared,
+                                                 QueueOwnerKind owner_kind) {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (prepared.tasks.empty()) return Status::OK();
+    if (prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
+        return Status::TooManyRequests(
+            "batch public task capacity exceeded" LOC_MARK);
+    }
+
+    const uint64_t batch_token =
+        batch->queue_token != 0 ? batch->queue_token : nextBatchToken();
+    QueueSubmit submit;
+    submit.batch_token = batch_token;
+    submit.batch_slots_left = batch->max_size - batch->task_list.size();
+    submit.owners.reserve(prepared.owners.size());
+    for (const auto& owner : prepared.owners) {
+        QueueOwnerInput input;
+        input.owner_task_id = owner.owner_task_id;
+        input.derived_task_ids = owner.derived_task_ids;
+        input.request = owner.request;
+        input.kind = owner_kind;
+        submit.owners.push_back(std::move(input));
+    }
+
+    std::vector<QueueOwnerId> admitted_owner_ids;
+    CHECK_STATUS(runtime_queue_->tryAdmit(submit, admitted_owner_ids));
+    batch->queue_token = batch_token;
+
+    batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
+                            TaskInfo{});
+    for (const auto& task_plan : prepared.tasks) {
+        auto& task = batch->task_list[task_plan.task_id];
+        const auto& owner = prepared.owners[task_plan.merged_task_index];
+        task.failover_count = 0;
+        task.xport_priority = 0;
+        task.status = PENDING;
+        task.request = owner.request;
+        task.staging = false;
+        task.start_time = prepared.submit_time;
+        task.type = UNSPEC;
+        task.sub_task_id = -1;
+        task.device_mask = owner.route.device_mask;
+        task.derived = task_plan.task_id != owner.owner_task_id;
+    }
+
+    for (size_t i = 0; i < admitted_owner_ids.size(); ++i) {
+        QueuedOwnerState queued;
+        queued.batch = batch;
+        queued.owner_task_id = prepared.owners[i].owner_task_id;
+        queued.public_task_ids.push_back(prepared.owners[i].owner_task_id);
+        queued.public_task_ids.insert(
+            queued.public_task_ids.end(),
+            prepared.owners[i].derived_task_ids.begin(),
+            prepared.owners[i].derived_task_ids.end());
+        queued_owners_.emplace(admitted_owner_ids[i], queued);
+    }
     return Status::OK();
+}
+
+Status TransferEngineImpl::finishQueuedOwner(
+    QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
+    auto queued_it = queued_owners_.find(owner_id);
+    if (queued_it == queued_owners_.end()) {
+        return Status::InvalidEntry("queued owner not found" LOC_MARK);
+    }
+    auto& queued = queued_it->second;
+    CHECK_STATUS(runtime_queue_->complete(owner_id, terminal_status));
+    for (const auto task_id : queued.public_task_ids) {
+        queued.batch->task_list[task_id].status = terminal_status;
+    }
+    queued_owners_.erase(queued_it);
+    return Status::OK();
+}
+
+Status TransferEngineImpl::retireQueueForBatch(Batch* batch) {
+    if (!batch || batch->queue_token == 0) return Status::OK();
+    auto status = runtime_queue_->retireBatch(batch->queue_token);
+    if (!status.ok()) return status;
+    batch->queue_token = 0;
+    return Status::OK();
+}
+
+Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
+    auto queued_it = queued_owners_.find(owner_id);
+    if (queued_it == queued_owners_.end()) {
+        return Status::InternalError("queued owner metadata missing" LOC_MARK);
+    }
+    const auto queued = queued_it->second;
+    auto* batch = queued.batch;
+    auto& task = batch->task_list[queued.owner_task_id];
+    auto route = resolveTransport(task.request, 0);
+    task.type = route.transport;
+    task.device_mask = route.device_mask;
+    if (task.type == UNSPEC) {
+        return finishQueuedOwner(owner_id, FAILED);
+    }
+
+    if (task.type == TCP) {
+        std::vector<std::string> staging_params;
+        findStagingPolicy(task.request, staging_params);
+        if (!staging_params.empty() && staging_proxy_) {
+            task.staging = true;
+            auto status = staging_proxy_->submit(&task, staging_params);
+            if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+            queued_it->second.submitted = true;
+            return Status::OK();
+        }
+    }
+
+    if (!batch->sub_batch[task.type]) {
+        auto& transport = transport_list_[task.type];
+        if (!transport) return finishQueuedOwner(owner_id, FAILED);
+        auto status = transport->allocateSubBatch(batch->sub_batch[task.type],
+                                                  batch->max_size);
+        if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+    }
+
+    auto& transport = transport_list_[task.type];
+    if (!transport) return finishQueuedOwner(owner_id, FAILED);
+    auto& sub_batch = batch->sub_batch[task.type];
+    task.sub_task_id = sub_batch->size();
+    auto status = transport->submitTransferTasks(sub_batch, {task.request});
+    if (!status.ok()) {
+        task.type = UNSPEC;
+        return finishQueuedOwner(owner_id, FAILED);
+    }
+    queued_it->second.submitted = true;
+    return Status::OK();
+}
+
+Status TransferEngineImpl::dispatchQueuedTransfers() {
+    if (!runtime_queue_config_.enabled) return Status::OK();
+    auto picked = runtime_queue_->pickForDispatch(
+        runtime_queue_config_.max_dispatch_owners,
+        runtime_queue_config_.max_dispatch_bytes);
+    for (const auto owner_id : picked) {
+        CHECK_STATUS(dispatchQueuedOwner(owner_id));
+    }
+    return Status::OK();
+}
+
+bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
+                                           QueueOwnerKind owner_kind) const {
+    if (!runtime_queue_config_.enabled) return false;
+    if (owner_kind == QueueOwnerKind::StagingInternal) return true;
+    return std::none_of(
+        prepared.owners.begin(), prepared.owners.end(),
+        [](const PreparedSubmit::Owner& owner) { return owner.staging; });
+}
+
+Status TransferEngineImpl::submitTransfer(
+    BatchID batch_id, const std::vector<Request>& request_list,
+    const Notification* notifi, QueueOwnerKind owner_kind) {
+    Batch* batch = nullptr;
+    CHECK_STATUS(retainBatch(batch_id, batch));
+    BatchRef batch_ref(*this, batch);
+    const size_t start_task_id = batch_ref.get()->task_list.size();
+    PreparedSubmit prepared;
+    CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared));
+
+    if (shouldQueueSubmit(prepared, owner_kind)) {
+        CHECK_STATUS(
+            enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind));
+        auto dispatch_status = dispatchQueuedTransfers();
+        if (!dispatch_status.ok()) {
+            LOG(WARNING) << "runtime queue dispatch failed after admission: "
+                         << dispatch_status.ToString();
+        }
+    } else {
+        CHECK_STATUS(commitPreparedSubmit(batch_ref.get(), prepared));
+    }
+
+    if (notifi) {
+        addSubmitHook(batch_ref.get(), start_task_id, request_list, *notifi);
+    }
+    return batch_ref.release();
 }
 
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
-    Batch* batch = nullptr;
-    CHECK_STATUS(retainBatch(batch_id, batch));
-    BatchRef batch_ref(*this, batch);
-    CHECK_STATUS(submitTransferToBatch(batch_ref.get(), request_list));
-    return batch_ref.release();
+    return submitTransfer(batch_id, request_list, nullptr,
+                          QueueOwnerKind::User);
+}
+
+void TransferEngineImpl::addSubmitHook(Batch* batch, size_t start_task_id,
+                                       const std::vector<Request>& request_list,
+                                       const Notification& notifi) {
+    Batch::SubmitHook hook;
+    hook.start_task_id = start_task_id;
+    hook.end_task_id = start_task_id + request_list.size();
+    hook.notifi = notifi;
+    hook.fired = false;
+    for (const auto& request : request_list)
+        hook.targets.insert(request.target_id);
+    batch->submit_hooks.emplace_back(std::move(hook));
 }
 
 Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
@@ -1499,21 +1690,8 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification& notifi) {
-    Batch* batch = nullptr;
-    CHECK_STATUS(retainBatch(batch_id, batch));
-    BatchRef batch_ref(*this, batch);
-    const size_t start_task_id = batch_ref.get()->task_list.size();
-    CHECK_STATUS(submitTransferToBatch(batch_ref.get(), request_list));
-
-    Batch::SubmitHook hook;
-    hook.start_task_id = start_task_id;
-    hook.end_task_id = start_task_id + request_list.size();
-    hook.notifi = notifi;
-    hook.fired = false;
-    for (const auto& request : request_list)
-        hook.targets.insert(request.target_id);
-    batch_ref.get()->submit_hooks.emplace_back(std::move(hook));
-    return batch_ref.release();
+    return submitTransfer(batch_id, request_list, &notifi,
+                          QueueOwnerKind::User);
 }
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
@@ -1640,11 +1818,42 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    CHECK_STATUS(dispatchQueuedTransfers());
+    if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+        QueueOwnerId owner_id = 0;
+        auto resolve_status =
+            runtime_queue_->resolveOwner(batch->queue_token, task_id, owner_id);
+        if (resolve_status.ok()) {
+            TransferStatusEnum public_status = PENDING;
+            CHECK_STATUS(runtime_queue_->getPublicStatus(
+                batch->queue_token, task_id, public_status));
+            auto queued_it = queued_owners_.find(owner_id);
+            if (public_status != PENDING || batch->task_list[task_id].derived ||
+                (queued_it != queued_owners_.end() &&
+                 !queued_it->second.submitted)) {
+                task_status.s = public_status;
+                task_status.transferred_bytes =
+                    public_status == COMPLETED
+                        ? batch->task_list[task_id].request.length
+                        : 0;
+                return Status::OK();
+            }
+        }
+    }
     auto& task = batch->task_list[task_id];
     auto prev_status = task.status;
     CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
     updateTaskStatusAfterPoll(batch, task_id, task_status,
                               enable_auto_failover_on_poll_);
+    if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
+        task_status.s != PENDING) {
+        QueueOwnerId owner_id = 0;
+        auto resolve_status =
+            runtime_queue_->resolveOwner(batch->queue_token, task_id, owner_id);
+        if (resolve_status.ok()) {
+            CHECK_STATUS(finishQueuedOwner(owner_id, task_status.s));
+        }
+    }
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1677,6 +1886,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (!alive_batches_.count(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    CHECK_STATUS(dispatchQueuedTransfers());
     Batch* batch = (Batch*)(batch_id);
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
@@ -1695,6 +1905,34 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         auto& task = batch->task_list[task_id];
         if (task.derived) continue;  // This task is performed by other tasks
         total_tasks++;
+        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+            QueueOwnerId owner_id = 0;
+            auto resolve_status = runtime_queue_->resolveOwner(
+                batch->queue_token, task_id, owner_id);
+            if (resolve_status.ok()) {
+                TransferStatusEnum public_status = PENDING;
+                CHECK_STATUS(runtime_queue_->getPublicStatus(
+                    batch->queue_token, task_id, public_status));
+                auto queued_it = queued_owners_.find(owner_id);
+                if (public_status == PENDING) {
+                    if (queued_it != queued_owners_.end() &&
+                        !queued_it->second.submitted) {
+                        continue;
+                    }
+                }
+                if (public_status == COMPLETED) {
+                    success_tasks++;
+                    overall_status.transferred_bytes += task.request.length;
+                    continue;
+                }
+                if (public_status != PENDING) {
+                    failed_tasks++;
+                    if (isWorse(public_status, worst_failure))
+                        worst_failure = public_status;
+                    continue;
+                }
+            }
+        }
         TransferStatus task_status;
         if (task.status != PENDING) {
             if (task.status == COMPLETED) {
@@ -1710,6 +1948,15 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         auto prev_status = task.status;
         CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
         updateTaskStatusAfterPoll(batch, task_id, task_status, allow_failover);
+        if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
+            task_status.s != PENDING) {
+            QueueOwnerId owner_id = 0;
+            auto resolve_status = runtime_queue_->resolveOwner(
+                batch->queue_token, task_id, owner_id);
+            if (resolve_status.ok()) {
+                CHECK_STATUS(finishQueuedOwner(owner_id, task_status.s));
+            }
+        }
 
         if (task_status.s == COMPLETED) {
             success_tasks++;

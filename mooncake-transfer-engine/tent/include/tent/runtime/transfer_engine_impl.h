@@ -206,8 +206,16 @@ class TransferEngineImpl {
 
     struct PreparedSubmit;
 
-    Status submitTransferToBatch(Batch* batch,
-                                 const std::vector<Request>& request_list);
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<Request>& request_list,
+                          const Notification* notifi,
+                          QueueOwnerKind owner_kind);
+
+    Status enqueuePreparedSubmit(Batch* batch, const PreparedSubmit& prepared,
+                                 QueueOwnerKind owner_kind);
+
+    bool shouldQueueSubmit(const PreparedSubmit& prepared,
+                           QueueOwnerKind owner_kind) const;
 
     Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
                          PreparedSubmit& prepared);
@@ -215,6 +223,15 @@ class TransferEngineImpl {
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 
     uint64_t nextBatchToken();
+
+    Status dispatchQueuedTransfers();
+
+    Status dispatchQueuedOwner(QueueOwnerId owner_id);
+
+    Status finishQueuedOwner(QueueOwnerId owner_id,
+                             TransferStatusEnum terminal_status);
+
+    Status retireQueueForBatch(Batch* batch);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
@@ -239,6 +256,10 @@ class TransferEngineImpl {
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
+    void addSubmitHook(Batch* batch, size_t start_task_id,
+                       const std::vector<Request>& request_list,
+                       const Notification& notifi);
+
     void recordTaskCompletionMetrics(TaskInfo& task,
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);
@@ -261,6 +282,13 @@ class TransferEngineImpl {
         QueueLimits limits{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
+    };
+
+    struct QueuedOwnerState {
+        Batch* batch{nullptr};
+        size_t owner_task_id{0};
+        std::vector<size_t> public_task_ids;
+        bool submitted{false};
     };
 
    private:
@@ -291,6 +319,7 @@ class TransferEngineImpl {
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
+    std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     uint64_t next_batch_token_{1};
 
     // Guards alive_batches_ and serializes pollTaskStatus /
