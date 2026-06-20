@@ -43,7 +43,7 @@ namespace {
 static void make_test_fd(int &out_fd) {
     int pipefd[2];
     ASSERT_EQ(pipe(pipefd), 0) << "pipe() failed: " << strerror(errno);
-    close(pipefd[1]);   // write end not needed
+    close(pipefd[1]);  // write end not needed
     out_fd = pipefd[0];
 }
 
@@ -93,7 +93,8 @@ TEST(CloseDmabufExport, Idempotent) {
     exp.fd = fd;
 
     RdmaContext::closeDmabufExport(exp);  // first close
-    RdmaContext::closeDmabufExport(exp);  // second call: fd == -1, must not crash
+    RdmaContext::closeDmabufExport(
+        exp);  // second call: fd == -1, must not crash
     EXPECT_EQ(exp.fd, -1);
 }
 
