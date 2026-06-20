@@ -345,9 +345,15 @@ jobs:
             --expt-relaxed-constexpr)
               ;;
             --cuda-gpu-arch=*)
+              args+=("--offload-arch=${arg#--cuda-gpu-arch=}")
               ;;
             --compiler-options)
               skip_compiler_options=1
+              ;;
+            *.cu)
+              mu_source="${TMPDIR:-/tmp}/$(basename "${arg%.cu}").mu"
+              cp "${arg}" "${mu_source}"
+              args+=("${mu_source}")
               ;;
             *)
               args+=("${arg}")
