@@ -338,7 +338,8 @@ jobs:
           musaChannelFormatKindSigned = 0,
           musaChannelFormatKindUnsigned = 1,
           musaChannelFormatKindFloat = 2,
-          musaChannelFormatKindNone = 3
+          musaChannelFormatKindNone = 3,
+          musaChannelFormatKindNV12 = 4
         };
 
         typedef struct musaChannelFormatDesc {
@@ -443,6 +444,28 @@ jobs:
           musaGraphNodeTypeEventRecord = 7
         };
 
+        enum musaAtomicType {
+          musaAtomicOperationAdd = 0,
+          musaAtomicOperationMin = 1,
+          musaAtomicOperationMax = 2,
+          musaAtomicOperationInc = 3,
+          musaAtomicOperationDec = 4,
+          musaAtomicOperationAnd = 5,
+          musaAtomicOperationOr = 6,
+          musaAtomicOperationXor = 7
+        };
+
+        enum musaAtomicValueType {
+          musaAtomicValueOperationAdd = 0,
+          musaAtomicValueOperationMin = 1,
+          musaAtomicValueOperationMax = 2,
+          musaAtomicValueOperationInc = 3,
+          musaAtomicValueOperationDec = 4,
+          musaAtomicValueOperationAnd = 5,
+          musaAtomicValueOperationOr = 6,
+          musaAtomicValueOperationXor = 7
+        };
+
         #ifndef MUSART_CB
         #define MUSART_CB
         #endif
@@ -458,8 +481,10 @@ jobs:
         typedef struct CUgraph_st *musaGraph_t;
         typedef struct CUgraphNode_st *musaGraphNode_t;
         typedef struct CUgraphExec_st *musaGraphExec_t;
+        typedef struct CUuserObject_st *musaUserObject_t;
         typedef struct CUmemoryPool_st *musaMemPool_t;
         typedef struct musaGraphicsResource *musaGraphicsResource_t;
+        typedef struct CUkernel_st *musaKernel_t;
         typedef struct CUmusaLaunchConfig_st musaLaunchConfig_t;
         typedef struct CUarray_st *musaArray_t;
         typedef const struct CUarray_st *musaArray_const_t;
@@ -472,6 +497,10 @@ jobs:
         typedef struct {
           char reserved[64];
         } musaIpcMemHandle_t;
+        typedef struct {
+          char bytes[16];
+        } musaUUID_t;
+        typedef void *musaFunction_t;
         typedef int musaStreamAttrID;
         typedef union musaStreamAttrValue {
           char reserved[64];
@@ -480,6 +509,30 @@ jobs:
           int result;
           musaGraphNode_t errorNode;
         } musaGraphExecUpdateResultInfo;
+
+        struct musaPitchedPtr {
+          void *ptr;
+          size_t pitch;
+          size_t xsize;
+          size_t ysize;
+        };
+
+        struct musaPos {
+          size_t x;
+          size_t y;
+          size_t z;
+        };
+
+        struct musaExtent {
+          size_t width;
+          size_t height;
+          size_t depth;
+        };
+
+        struct musaMemLocation {
+          int type;
+          int id;
+        };
 
         typedef struct musaFuncAttributes {
           size_t sharedSizeBytes;
