@@ -17,7 +17,7 @@ pip install mooncake-transfer-engine-non-cuda
 ```
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
 
-> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
+> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies, but it still requires the system runtime libraries used by the transfer stack. On Ubuntu, install them with `sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2`.
 > **Note**: MLU support is currently source-build only. If you need Cambricon MLU memory support, install Neuware and build with `-DUSE_MLU=ON`.
 
 ## Automatic Build
@@ -30,7 +30,7 @@ pip install mooncake-transfer-engine-non-cuda
 ### Steps
 1. Install dependencies, stable Internet connection is required:
    ```bash
-   bash dependencies.sh
+   sudo bash dependencies.sh
    ```
 
 2. In the root directory of this project, run the following commands:
@@ -51,7 +51,7 @@ To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
 Mooncake with `USE_NOF` enabled:
 
 ```bash
-bash dependencies.sh --with-spdk
+sudo bash dependencies.sh --with-spdk
 
 mkdir build
 cd build
