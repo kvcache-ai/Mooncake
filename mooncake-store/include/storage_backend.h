@@ -172,6 +172,14 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
+    // Removes every file and subdirectory under
+    // file_storage_config_.storage_filepath, keeping the directory itself.
+    // This is a no-op when the path is missing or empty. It is intentionally
+    // NOT invoked by the backends themselves; only the P2P tiered-cache path
+    // (StorageTier) calls it, so the centralized FileStorage path keeps its
+    // persist/recover-across-restart behavior unchanged.
+    void CleanStoragePath();
+
     FileStorageConfig file_storage_config_;
 };
 

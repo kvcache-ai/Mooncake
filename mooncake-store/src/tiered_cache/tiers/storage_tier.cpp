@@ -65,6 +65,16 @@ StorageTier::~StorageTier() {
 
     staging_allocator_.reset();
     staging_memory_.reset();
+
+    // P2P tiered cache treats SSD as ephemeral: wipe the storage path on exit
+    // so nothing is left behind for the next run. Wipe while the backend is
+    // still alive (CleanStoragePath unlinks the files), then destroy it so its
+    // worker threads stop and file handles close, releasing the inodes. Scoped
+    // to the P2P path only (centralized FileStorage is unaffected).
+    if (storage_backend_) {
+        storage_backend_->CleanStoragePath();
+        storage_backend_.reset();
+    }
 }
 
 tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
@@ -137,6 +147,12 @@ tl::expected<void, ErrorCode> StorageTier::Init(
             return tl::make_unexpected(backend_res.error());
         }
         storage_backend_ = backend_res.value();
+
+        // P2P tiered cache treats SSD as a purely ephemeral tier: wipe any
+        // leftover contents from a previous run on startup, before the backend
+        // scans the path. This is scoped to the P2P path only; the centralized
+        // FileStorage path keeps its persist/recover-across-restart behavior.
+        storage_backend_->CleanStoragePath();
 
         auto init_res = storage_backend_->Init();
         if (!init_res) {

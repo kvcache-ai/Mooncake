@@ -175,6 +175,79 @@ StorageBackendInterface::StorageBackendInterface(
     const FileStorageConfig& config)
     : file_storage_config_(config) {}
 
+void StorageBackendInterface::CleanStoragePath() {
+    namespace fs = std::filesystem;
+    // This is best-effort cleanup and is invoked from StorageTier's destructor,
+    // which is implicitly noexcept. Wrap the whole body so that no exception
+    // (filesystem_error from iteration, bad_alloc, ...) can escape into the
+    // destructor and trip std::terminate().
+    try {
+        const std::string& path = file_storage_config_.storage_filepath;
+        if (path.empty()) {
+            LOG(WARNING) << "CleanStoragePath: storage path is empty, skipping";
+            return;
+        }
+
+        // Refuse to wipe dangerous paths. Requiring an absolute, non-root
+        // directory rejects "", ".", ".." and any relative path, so a
+        // misconfigured storage_filepath cannot wipe the current working
+        // directory, its parent, or the filesystem root.
+        const fs::path normalized = fs::path(path).lexically_normal();
+        if (!normalized.is_absolute() || normalized == normalized.root_path()) {
+            LOG(ERROR) << "CleanStoragePath: refusing to clean unsafe path "
+                          "(must be an absolute, non-root directory): "
+                       << path;
+            return;
+        }
+
+        std::error_code ec;
+        if (!fs::exists(normalized, ec) || ec) {
+            return;  // Nothing to clean (missing path or stat error).
+        }
+        if (!fs::is_directory(normalized, ec) || ec) {
+            LOG(WARNING) << "CleanStoragePath: not a directory, skipping: "
+                         << path;
+            return;
+        }
+
+        // Snapshot entries first so removal does not invalidate the iterator.
+        // Use the non-throwing increment(ec) overload: a range-based for loop
+        // would call the throwing operator++(), which ignores the ec passed to
+        // the constructor and raises filesystem_error if the directory changes
+        // mid-traversal.
+        std::vector<fs::path> entries;
+        for (fs::directory_iterator it(normalized, ec), end; it != end;
+             it.increment(ec)) {
+            if (ec) {
+                LOG(ERROR) << "CleanStoragePath: failed to iterate " << path
+                           << ", error: " << ec.message();
+                break;
+            }
+            entries.push_back(it->path());
+        }
+
+        size_t removed = 0;
+        for (const auto& entry : entries) {
+            std::error_code rm_ec;
+            fs::remove_all(entry, rm_ec);
+            if (rm_ec) {
+                LOG(ERROR) << "CleanStoragePath: failed to remove " << entry
+                           << ", error: " << rm_ec.message();
+            } else {
+                ++removed;
+            }
+        }
+        LOG(INFO) << "CleanStoragePath: wiped storage path " << path
+                  << ", removed " << removed << " top-level entries";
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "CleanStoragePath: unexpected exception, skipping: "
+                   << e.what();
+    } catch (...) {
+        LOG(ERROR) << "CleanStoragePath: unexpected non-standard exception, "
+                      "skipping";
+    }
+}
+
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
     if (actual_fsdir.rfind("moon_", 0) == 0) {
