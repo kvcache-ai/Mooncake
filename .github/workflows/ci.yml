@@ -355,6 +355,30 @@ jobs:
           musaLimitStackSize = 0
         };
 
+        enum musaFuncCache {
+          musaFuncCachePreferNone = 0,
+          musaFuncCachePreferShared = 1,
+          musaFuncCachePreferL1 = 2,
+          musaFuncCachePreferEqual = 3
+        };
+
+        enum musaSharedMemConfig {
+          musaSharedMemBankSizeDefault = 0,
+          musaSharedMemBankSizeFourByte = 1,
+          musaSharedMemBankSizeEightByte = 2
+        };
+
+        enum musaMemcpyKind {
+          musaMemcpyHostToHost = 0,
+          musaMemcpyHostToDevice = 1,
+          musaMemcpyDeviceToHost = 2,
+          musaMemcpyDeviceToDevice = 3,
+          musaMemcpyDefault = 4
+        };
+
+        typedef struct CUstream_st *musaStream_t;
+        typedef struct CUevent_st *musaEvent_t;
+
         typedef struct musaFuncAttributes {
           size_t sharedSizeBytes;
           size_t constSizeBytes;
