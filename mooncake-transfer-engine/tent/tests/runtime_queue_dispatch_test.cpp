@@ -143,14 +143,15 @@ class FakeTransport : public Transport {
 };
 
 std::shared_ptr<Config> makeRuntimeQueueConfig(size_t max_dispatch_owners,
-                                               size_t max_dispatch_bytes) {
+                                               size_t max_dispatch_bytes,
+                                               bool merge_requests = false) {
     auto cfg = std::make_shared<Config>();
     cfg->set("metadata_type", "p2p");
     cfg->set("metadata_servers", "");
     cfg->set("rpc_server_hostname", "127.0.0.1");
     cfg->set("rpc_server_port", "0");
     cfg->set("log_level", "warning");
-    cfg->set("merge_requests", false);
+    cfg->set("merge_requests", merge_requests);
     cfg->set("enable_runtime_queue", true);
     cfg->set("runtime_queue/max_outstanding_owners", 16UL);
     cfg->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
@@ -287,6 +288,42 @@ TEST(RuntimeQueueDispatch, EarlyFreeWaitsForQueuedCompletion) {
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.getTransferStatus(batch, 0, status).IsInvalidArgument());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, PollingDerivedTaskCompletesMergedOwner) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20, true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x44);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    TransferStatus derived{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 1, derived).ok());
+    EXPECT_EQ(derived.s, TransferStatusEnum::COMPLETED);
+
+    TransferStatus owner{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, owner).ok());
+    EXPECT_EQ(owner.s, TransferStatusEnum::COMPLETED);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }

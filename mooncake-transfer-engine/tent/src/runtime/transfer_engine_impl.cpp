@@ -1824,45 +1824,51 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    const size_t public_task_id = task_id;
+    size_t poll_task_id = task_id;
     CHECK_STATUS(dispatchQueuedTransfers());
     if (runtime_queue_config_.enabled && batch->queue_token != 0) {
         QueueOwnerId owner_id = 0;
-        auto resolve_status =
-            runtime_queue_->resolveOwner(batch->queue_token, task_id, owner_id);
+        auto resolve_status = runtime_queue_->resolveOwner(
+            batch->queue_token, public_task_id, owner_id);
         if (resolve_status.ok()) {
             TransferStatusEnum public_status = PENDING;
             CHECK_STATUS(runtime_queue_->getPublicStatus(
-                batch->queue_token, task_id, public_status));
+                batch->queue_token, public_task_id, public_status));
             auto queued_it = queued_owners_.find(owner_id);
-            if (public_status != PENDING || batch->task_list[task_id].derived ||
+            if (public_status != PENDING ||
                 (queued_it != queued_owners_.end() &&
                  !queued_it->second.submitted)) {
                 task_status.s = public_status;
                 task_status.transferred_bytes =
                     public_status == COMPLETED
-                        ? batch->task_list[task_id].request.length
+                        ? batch->task_list[public_task_id].request.length
                         : 0;
                 return Status::OK();
             }
+            if (batch->task_list[public_task_id].derived &&
+                queued_it != queued_owners_.end()) {
+                poll_task_id = queued_it->second.owner_task_id;
+            }
         }
     }
-    auto& task = batch->task_list[task_id];
+    auto& task = batch->task_list[poll_task_id];
     auto prev_status = task.status;
-    CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
-    updateTaskStatusAfterPoll(batch, task_id, task_status,
+    CHECK_STATUS(pollTaskStatus(batch, poll_task_id, task_status));
+    updateTaskStatusAfterPoll(batch, poll_task_id, task_status,
                               enable_auto_failover_on_poll_);
     if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
         task_status.s != PENDING) {
         QueueOwnerId owner_id = 0;
-        auto resolve_status =
-            runtime_queue_->resolveOwner(batch->queue_token, task_id, owner_id);
+        auto resolve_status = runtime_queue_->resolveOwner(
+            batch->queue_token, public_task_id, owner_id);
         if (resolve_status.ok()) {
             CHECK_STATUS(finishQueuedOwner(owner_id, task_status.s));
         }
     }
 
     // Record metrics when task transitions to terminal state
-    recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
+    recordTaskCompletionMetrics(batch->task_list[poll_task_id], prev_status,
                                 task_status.s);
 
     if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
