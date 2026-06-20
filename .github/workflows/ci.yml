@@ -338,6 +338,10 @@ jobs:
 
     - name: Configure project
       run: |
+        export CUDA_HOME=/usr/local/cuda
+        export PATH=/usr/local/cuda/bin:$PATH
+        export LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}
+        export TORCH_DEVICE_BACKEND_AUTOLOAD=0
         apt update -y
         apt install -y ninja-build
         bash -x dependencies.sh -y
@@ -348,6 +352,10 @@ jobs:
 
     - name: Build project
       run: |
+        export CUDA_HOME=/usr/local/cuda
+        export PATH=/usr/local/cuda/bin:$PATH
+        export LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}
+        export TORCH_DEVICE_BACKEND_AUTOLOAD=0
         cd build
         source ~/.bashrc
         MAX_JOBS=1 cmake --build .
