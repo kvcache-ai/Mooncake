@@ -328,10 +328,52 @@ jobs:
         rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
         rm -rf /usr/local/cuda
         ln -s /usr/local/musa /usr/local/cuda
+        cat > /usr/local/musa/include/mooncake_musa_ci_compat.h <<'H'
+        #ifndef MOONCAKE_MUSA_CI_COMPAT_H
+        #define MOONCAKE_MUSA_CI_COMPAT_H
+
+        #include <stddef.h>
+
+        typedef struct musaChannelFormatDesc {
+          int x;
+          int y;
+          int z;
+          int w;
+          int f;
+        } musaChannelFormatDesc;
+
+        typedef enum musaError {
+          musaSuccess = 0,
+          musaErrorUnknown = 999
+        } musaError_t;
+
+        enum musaDeviceAttr {
+          musaDevAttrMaxThreadsPerBlock = 1
+        };
+
+        enum musaLimit {
+          musaLimitStackSize = 0
+        };
+
+        typedef struct musaFuncAttributes {
+          size_t sharedSizeBytes;
+          size_t constSizeBytes;
+          size_t localSizeBytes;
+          int maxThreadsPerBlock;
+          int numRegs;
+          int ptxVersion;
+          int binaryVersion;
+          int cacheModeCA;
+          int maxDynamicSharedSizeBytes;
+          int preferredShmemCarveout;
+        } musaFuncAttributes;
+
+        #endif  /* MOONCAKE_MUSA_CI_COMPAT_H */
+        H
         rm -f /usr/local/musa/bin/nvcc
         cat > /usr/local/musa/bin/nvcc <<'SH'
         #!/usr/bin/env bash
-        args=()
+        args=(-include /usr/local/musa/include/mooncake_musa_ci_compat.h)
         skip_compiler_options=0
         for arg in "$@"; do
           if [[ ${skip_compiler_options} -eq 1 ]]; then
