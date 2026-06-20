@@ -37,6 +37,13 @@ module_name = "mooncake.pg" + version_suffix
 
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
+include_dirs = [
+    os.path.join(current_dir, "include"),
+    os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+]
+cuda_compat_include = os.getenv("CUDA_COMPAT_INCLUDE")
+if use_musa and cuda_compat_include and os.path.isdir(cuda_compat_include):
+    include_dirs.append(cuda_compat_include)
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
@@ -84,10 +91,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name=module_name,
-            include_dirs=[
-                os.path.join(current_dir, "include"),
-                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-            ],
+            include_dirs=include_dirs,
             sources=[
                 "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",

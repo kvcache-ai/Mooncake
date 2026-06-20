@@ -323,11 +323,9 @@ jobs:
         rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
         ln -sfn /usr/local/musa /usr/local/cuda
         ln -sfn /usr/local/musa/bin/mcc /usr/local/musa/bin/nvcc
-        for header in /usr/local/cuda-12.4/include/*.h; do
-          ln -sfn "$header" "/usr/local/musa/include/$(basename "$header")"
-        done
         echo "MUSA_HOME=/usr/local/musa" >> $GITHUB_ENV
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
+        echo "CUDA_COMPAT_INCLUDE=/usr/local/cuda-12.4/include" >> $GITHUB_ENV
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
         # The public torch_musa wheel provides the build-time compatibility
@@ -353,6 +351,7 @@ jobs:
       run: |
         export MUSA_HOME=/usr/local/musa
         export CUDA_HOME=/usr/local/cuda
+        export CUDA_COMPAT_INCLUDE=/usr/local/cuda-12.4/include
         export PATH=/usr/local/cuda/bin:$PATH
         export LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
@@ -370,6 +369,7 @@ jobs:
         source ~/.bashrc
         export MUSA_HOME=/usr/local/musa
         export CUDA_HOME=/usr/local/cuda
+        export CUDA_COMPAT_INCLUDE=/usr/local/cuda-12.4/include
         export PATH=/usr/local/cuda/bin:$PATH
         export LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
