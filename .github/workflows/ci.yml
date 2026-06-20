@@ -328,7 +328,33 @@ jobs:
         rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
         rm -rf /usr/local/cuda
         ln -s /usr/local/musa /usr/local/cuda
-        ln -sfn /usr/local/musa/bin/mcc /usr/local/musa/bin/nvcc
+        rm -f /usr/local/musa/bin/nvcc
+        cat > /usr/local/musa/bin/nvcc <<'SH'
+        #!/usr/bin/env bash
+        args=()
+        skip_compiler_options=0
+        for arg in "$@"; do
+          if [[ ${skip_compiler_options} -eq 1 ]]; then
+            arg="${arg%\'}"
+            arg="${arg#\'}"
+            args+=("${arg}")
+            skip_compiler_options=0
+            continue
+          fi
+          case "${arg}" in
+            --expt-relaxed-constexpr)
+              ;;
+            --compiler-options)
+              skip_compiler_options=1
+              ;;
+            *)
+              args+=("${arg}")
+              ;;
+          esac
+        done
+        exec /usr/local/musa/bin/mcc "${args[@]}"
+        SH
+        chmod +x /usr/local/musa/bin/nvcc
         echo "MUSA_HOME=/usr/local/musa" >> $GITHUB_ENV
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
         echo "CUDA_COMPAT_INCLUDE=/usr/local/cuda-12.4/include" >> $GITHUB_ENV
