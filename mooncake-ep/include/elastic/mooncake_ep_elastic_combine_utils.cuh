@@ -196,8 +196,7 @@ __device__ __forceinline__ void combine_reduce(
 #ifdef MOONCAKE_EP_USE_MUSA
                     bf162_view[l] = __floats2bfloat162_rn(value.x, value.y);
 #else
-                    bf162_view[l] = __float22bfloat162_rn(
-                        value);
+                    bf162_view[l] = __float22bfloat162_rn(value);
 #endif
                 }
                 dst_buffer_ptr[i * (kUnrollFactor * 32) + j * 32 + lane_idx] =

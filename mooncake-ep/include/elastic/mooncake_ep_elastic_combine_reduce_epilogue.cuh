@@ -165,8 +165,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         // Issue TMA copy
 #ifdef MOONCAKE_EP_USE_MUSA
         {
-            const auto* src_ptr = static_cast<const combine_vec_t*>(
-                tma_buffer.get_base_ptr());
+            const auto* src_ptr =
+                static_cast<const combine_vec_t*>(tma_buffer.get_base_ptr());
             auto* dst_ptr = static_cast<combine_vec_t*>(
                 output_buffer.get_token_buffer(token_idx).get_base_ptr());
 #pragma unroll 1

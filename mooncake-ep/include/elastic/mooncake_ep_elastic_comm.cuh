@@ -70,8 +70,7 @@ __forceinline__ __device__ void local_grid_sync(
 #else
     (void)workspace;
     (void)thread_idx;
-    (gridDim.x > 1) ? cooperative_groups::this_grid().sync()
-                    : __syncthreads();
+    (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
 #endif
 }
 
@@ -158,7 +157,7 @@ __forceinline__ __device__ void gpu_barrier(
     if constexpr (kFlushStores) gin.flush();
     if constexpr (kSyncAtStart) {
         local_grid_sync<kNumSMs, kNumThreads, kNumTimeoutCycles>(workspace,
-                                                                thread_idx);
+                                                                 thread_idx);
     }
 
     do_scaleout &= kNumScaleoutRanks > 1;
@@ -184,7 +183,7 @@ __forceinline__ __device__ void gpu_barrier(
 
     if constexpr (kSyncAtEnd) {
         local_grid_sync<kNumSMs, kNumThreads, kNumTimeoutCycles>(workspace,
-                                                                thread_idx);
+                                                                 thread_idx);
     }
 }
 

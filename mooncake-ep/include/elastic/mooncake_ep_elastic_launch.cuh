@@ -32,8 +32,7 @@ struct ElasticLaunchContext {
 
 void launch_elastic_dispatch_deterministic_prologue(
     const int64_t* topk_idx, int* rank_count_buffer, int* dst_buffer_slot_idx,
-    int num_tokens,
-    int num_max_tokens_per_rank, int num_experts, int num_topk,
+    int num_tokens, int num_max_tokens_per_rank, int num_experts, int num_topk,
     int scaleup_rank_idx, int num_scaleup_ranks, int num_sms,
     int num_smem_bytes, cudaStream_t stream);
 

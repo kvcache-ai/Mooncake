@@ -51,8 +51,7 @@ __forceinline__ __device__ int get_lane_idx() {
 /// Election
 __forceinline__ __device__ int elect_one_sync() {
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(DISABLE_SM90_FEATURES) && \
-    defined(__CUDA_ARCH__) && \
-    (__CUDA_ARCH__ >= 900)
+    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     int pred = 0;
     asm volatile(
         "{\n"
@@ -716,8 +715,7 @@ __device__ __forceinline__ void accumulate(float2& a, nv_bfloat162 b) {
 #ifdef MOONCAKE_EP_USE_MUSA
     a.x += __low2float(b);
     a.y += __high2float(b);
-#elif defined(__CUDA_ARCH__) && \
-    (__CUDA_ARCH__ >= 1000)
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     // Use `add.rn.f32.bf16` instruction to perform fused (cast + add) operation
     // on SM100
     asm("add.rn.f32.bf16 %0, %1, %0;\n"

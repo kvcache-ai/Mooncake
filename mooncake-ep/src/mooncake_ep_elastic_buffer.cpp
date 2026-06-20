@@ -347,8 +347,9 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     }
     std::optional<torch::Tensor> deterministic_rank_count_buffer = std::nullopt;
 #ifdef MOONCAKE_EP_USE_MUSA
-    // MUSA non-hybrid dispatch always runs launch_musa_elastic_prepare_dispatch(),
-    // which assigns slots and publishes counts without cooperative grid sync.
+    // MUSA non-hybrid dispatch always runs
+    // launch_musa_elastic_prepare_dispatch(), which assigns slots and publishes
+    // counts without cooperative grid sync.
     const bool run_deterministic_prologue = false;
 #else
     const bool run_deterministic_prologue =
@@ -362,9 +363,9 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
             topk_idx.data_ptr<int64_t>(),
             deterministic_rank_count_buffer.value().data_ptr<int>(),
             dst_buffer_slot_idx.data_ptr<int>(), num_tokens,
-            num_max_tokens_per_rank, num_experts, num_topk, topology_.scaleup_rank_idx,
-            topology_.num_scaleup_ranks, num_sms, num_smem_bytes,
-            launch_stream.stream());
+            num_max_tokens_per_rank, num_experts, num_topk,
+            topology_.scaleup_rank_idx, topology_.num_scaleup_ranks, num_sms,
+            num_smem_bytes, launch_stream.stream());
     }
 
     launch_mooncake_elastic_dispatch(

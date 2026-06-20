@@ -251,8 +251,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                             src_token_idx);
 #ifdef MOONCAKE_EP_USE_MUSA
                     if (nvlink_bypass) {
-                        auto* dst_ptr = static_cast<combine_vec_t*>(
-                            gin.get_sym_ptr<team_t>(
+                        auto* dst_ptr =
+                            static_cast<combine_vec_t*>(gin.get_sym_ptr<team_t>(
                                 token_buffer.get_base_ptr(), src_rank_idx));
 #pragma unroll 1
                         for (int vec_idx = lane_idx; vec_idx < kHiddenVec;
