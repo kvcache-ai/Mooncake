@@ -68,8 +68,6 @@ if use_musa:
     device_args = [
         abi_define,
         *musa_defines,
-        "-D__host__=",
-        "-D__device__=",
         "-D__cudart_builtin__=",
         "-DCUDARTAPI=",
         "-std=c++20",

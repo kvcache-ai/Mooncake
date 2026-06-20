@@ -513,7 +513,9 @@ jobs:
         typedef struct CUkernel_st *musaKernel_t;
         typedef struct CUlibrary_st *musaLibrary_t;
         typedef struct CUmusaLaunchConfig_st musaLaunchConfig_t;
-        typedef unsigned int musaUserObjectFlags;
+        enum musaUserObjectFlags {
+          musaUserObjectNoDestructorSync = 1
+        };
         typedef struct CUarray_st *musaArray_t;
         typedef const struct CUarray_st *musaArray_const_t;
         typedef struct CUmipmappedArray_st *musaMipmappedArray_t;
