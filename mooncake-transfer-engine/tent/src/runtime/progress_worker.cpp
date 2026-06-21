@@ -37,6 +37,7 @@ void ProgressWorker::stop() {
         // user thread's freeBatch path.
         order_.clear();
         queued_.clear();
+        queue_ready_ = false;
     }
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
@@ -53,27 +54,47 @@ void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id) {
     cv_.notify_one();
 }
 
+void ProgressWorker::notifyRuntimeQueueReady() {
+    if (!running_.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        queue_ready_ = true;
+    }
+    cv_.notify_one();
+}
+
 void ProgressWorker::runner() {
     while (true) {
         BatchID batch_id = 0;
+        bool queue_ready = false;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] {
                 return !running_.load(std::memory_order_acquire) ||
-                       !order_.empty();
+                       queue_ready_ || !order_.empty();
             });
             if (!running_.load(std::memory_order_acquire)) return;
-            batch_id = order_.front();
-            order_.pop_front();
-            queued_.erase(batch_id);
+            queue_ready = queue_ready_;
+            queue_ready_ = false;
+            if (!order_.empty()) {
+                batch_id = order_.front();
+                order_.pop_front();
+                queued_.erase(batch_id);
+            }
+        }
+        if (queue_ready) {
+            (void)impl_->refillDispatchWindow();
         }
         // progressBatch acquires the engine's progress_mutex_ and silently
         // returns InvalidArgument if the batch was freed before we got here.
         // PENDING means "kick again later"; the next notify wakes us up.
         // Terminal states leave the batch alone — freeBatch on the user
         // thread is responsible for reclamation.
-        TransferStatus s;
-        (void)impl_->progressBatch(batch_id, s);
+        if (batch_id) {
+            TransferStatus s;
+            (void)impl_->progressBatch(batch_id, s);
+            (void)impl_->refillDispatchWindow();
+        }
     }
 }
 

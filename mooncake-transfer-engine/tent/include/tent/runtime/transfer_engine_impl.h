@@ -182,6 +182,8 @@ class TransferEngineImpl {
     void notifyBatchMaybeReady(BatchID batch_id);
 
    private:
+    friend class ProgressWorker;
+
     Status construct();
 
     Status deconstruct();
@@ -228,6 +230,8 @@ class TransferEngineImpl {
     uint64_t nextBatchToken();
 
     Status refillDispatchWindow();
+
+    void notifyRuntimeQueueReady();
 
     Status dispatchQueuedOwner(QueueOwnerId owner_id);
 

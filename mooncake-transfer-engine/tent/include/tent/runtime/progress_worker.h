@@ -55,6 +55,10 @@ class ProgressWorker {
     // started.
     void notifyBatchMaybeReady(BatchID batch_id);
 
+    // Safe from any thread. Coalesces multiple runtime queue wakes into one
+    // bounded refill step.
+    void notifyRuntimeQueueReady();
+
    private:
     void runner();
 
@@ -66,6 +70,7 @@ class ProgressWorker {
     std::condition_variable cv_;
     std::unordered_set<BatchID> queued_;
     std::deque<BatchID> order_;
+    bool queue_ready_{false};
 };
 
 }  // namespace tent

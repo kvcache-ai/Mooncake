@@ -1658,6 +1658,7 @@ Status TransferEngineImpl::submitTransfer(
             LOG(WARNING) << "runtime queue dispatch failed after admission: "
                          << dispatch_status.ToString();
         }
+        notifyRuntimeQueueReady();
     } else {
         CHECK_STATUS(commitPreparedSubmit(batch_ref.get(), prepared));
     }
@@ -2043,6 +2044,10 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
 
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
+}
+
+void TransferEngineImpl::notifyRuntimeQueueReady() {
+    if (progress_worker_) progress_worker_->notifyRuntimeQueueReady();
 }
 
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
