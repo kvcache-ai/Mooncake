@@ -211,7 +211,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
-    int active_qps_per_rank = active_qps_per_rank_for_ep(USE_QP_COUNT / num_ranks);
+    int active_qps_per_rank =
+        active_qps_per_rank_for_ep(USE_QP_COUNT / num_ranks);
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -368,7 +369,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
-    int active_qps_per_rank = active_qps_per_rank_for_ep(USE_QP_COUNT / num_ranks);
+    int active_qps_per_rank =
+        active_qps_per_rank_for_ep(USE_QP_COUNT / num_ranks);
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_USE_MUSA

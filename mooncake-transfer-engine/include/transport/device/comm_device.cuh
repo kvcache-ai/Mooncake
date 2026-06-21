@@ -121,7 +121,8 @@ __device__ __forceinline__ uint64_t mc_signal_atomic_laddr(const CommCtx& ctx,
 __device__ __forceinline__ int* mc_signal_write_source(const CommCtx& ctx,
                                                        int* sig_ptr) {
     return reinterpret_cast<int*>(
-        reinterpret_cast<char*>(const_cast<void*>(ctx.ibgda.local_atomic_base)) +
+        reinterpret_cast<char*>(
+            const_cast<void*>(ctx.ibgda.local_atomic_base)) +
         (reinterpret_cast<const char*>(sig_ptr) -
          reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)));
 }
@@ -169,9 +170,11 @@ __device__ __forceinline__ void mc_signal_write_from(
     }
 }
 
-__device__ __forceinline__ void mc_signal_write(
-    const CommCtx& ctx, int dst_rank, int channel, int qps_per_rank,
-    int* sig_ptr, int32_t val, bool wait_completion = true) {
+__device__ __forceinline__ void mc_signal_write(const CommCtx& ctx,
+                                                int dst_rank, int channel,
+                                                int qps_per_rank, int* sig_ptr,
+                                                int32_t val,
+                                                bool wait_completion = true) {
     mc_signal_write_from(ctx, dst_rank, channel, qps_per_rank,
                          mc_signal_write_source(ctx, sig_ptr), sig_ptr, val,
                          wait_completion);

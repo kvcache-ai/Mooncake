@@ -170,13 +170,10 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
 
 // RDMA WRITE: send `nbytes` from `send_ptr` to `recv_ptr` on `dst_rank`.
 // Must be called by lane 0 only.
-__device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
-                                             int channel, int dst_rank,
-                                             int src_rank, int qps_per_rank,
-                                             const void* send_ptr,
-                                             uint64_t recv_raddr,
-                                             uint32_t nbytes,
-                                             bool wait_completion = false) {
+__device__ __forceinline__ void mc_ibgda_put(
+    const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
+    int qps_per_rank, const void* send_ptr, uint64_t recv_raddr,
+    uint32_t nbytes, bool wait_completion = false) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
     const uint16_t wqe_idx = qp->wq_head;
