@@ -437,6 +437,18 @@ jobs:
         static __host__ __device__ inline nv_bfloat16 __float2bfloat16(float) { return 0; }
         #endif
         H
+        cat > /usr/local/musa/include/cuda_fp16.h <<'H'
+        #pragma once
+        #include <stdint.h>
+        struct __half { uint16_t __x; };
+        struct __half2 { uint32_t __x; };
+        typedef __half half;
+        typedef __half2 half2;
+        H
+        cat > /usr/local/musa/include/cuda_fp16.hpp <<'H'
+        #pragma once
+        #include <cuda_fp16.h>
+        H
         cat > /usr/local/musa/include/cuda_fp8.h <<'H'
         #pragma once
         typedef unsigned char __nv_fp8_storage_t;
