@@ -287,10 +287,7 @@ jobs:
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
-    # Match the public torch_musa v2.5.0 wheel bundle, which is built against
-    # MUSA 4.2.0.  Using the SDK-only image keeps the job small enough for
-    # GitHub-hosted runners, unlike the full MUSA PyTorch images.
-    container: mthreads/musa:rc4.2.0-devel-ubuntu22.04-amd64
+    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
     steps:
     - uses: actions/checkout@v4
       with:
@@ -304,17 +301,13 @@ jobs:
       run: |
         apt update -y
         apt install -y curl libopenblas0 python3-pip
-        curl -L --retry 3 \
-          -o /tmp/S80-v2.5.0-4.2.0.tar.gz \
-          https://github.com/MooreThreads/torch_musa/releases/download/v2.5.0/S80-v2.5.0-4.2.0.tar.gz
-        tar -xzf /tmp/S80-v2.5.0-4.2.0.tar.gz -C /tmp
         python3 -m pip install --no-cache-dir --upgrade pip
         python3 -m pip install --no-cache-dir \
-          /tmp/4.2.0/torch-2.5.0-cp310-cp310-linux_x86_64.whl \
-          /tmp/4.2.0/torch_musa-2.5.0-cp310-cp310-linux_x86_64.whl \
+          torch==2.9.0 \
+          --index-url https://download.pytorch.org/whl/cpu
+        python3 -m pip install --no-cache-dir \
           'numpy<2' \
-          torchada==0.1.48
-        rm -rf /tmp/S80-v2.5.0-4.2.0.tar.gz /tmp/4.2.0
+          torchada==0.1.66
         rm -rf /usr/local/cuda
         ln -s /usr/local/musa /usr/local/cuda
         cat > /usr/local/musa/include/mooncake_musa_ci_compat.h <<'H'
@@ -342,14 +335,6 @@ jobs:
 
         #endif  /* MOONCAKE_MUSA_CI_COMPAT_H */
         H
-        python3 - <<'PY'
-        from pathlib import Path
-        path = Path('/usr/local/musa/include/musa_runtime.h')
-        text = path.read_text()
-        include = '#include "mooncake_musa_ci_compat.h"\n'
-        if include not in text:
-            path.write_text(include + text)
-        PY
         cat > /usr/local/musa/include/cuda_runtime_api.h <<'H'
         #pragma once
         #include "mooncake_musa_ci_compat.h"
@@ -557,20 +542,17 @@ jobs:
         echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
-        # The public torch_musa wheel provides the build-time compatibility
-        # headers needed by torchada.  The SDK-only image intentionally does
-        # not ship all runtime DNN libraries, so keep PyTorch from eagerly
-        # loading the torch_musa runtime backend during extension builds.
+        # Keep PyTorch from eagerly loading accelerator runtime backends during
+        # extension builds; this job only needs the PyTorch 2.9 headers and
+        # torchada's CUDA-to-MUSA compile-time mapping.
         echo "TORCH_DEVICE_BACKEND_AUTOLOAD=0" >> $GITHUB_ENV
         echo "TORCHADA_PLATFORM=musa" >> $GITHUB_ENV
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
         export TORCHADA_PLATFORM=musa
         python3 - <<'PY'
-        import importlib.metadata as metadata
         import torch
         import torchada
         print("torch", torch.__version__)
-        print("torch_musa", metadata.version("torch_musa"))
         print("torchada", getattr(torchada, "__version__", "unknown"))
         print("torchada platform", torchada.get_platform().value)
         PY

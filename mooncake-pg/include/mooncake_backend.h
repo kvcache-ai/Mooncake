@@ -10,11 +10,6 @@
 #include <p2p_proxy.h>
 #include <sys/types.h>
 #include <torch/torch.h>
-#if __has_include(<torch/headeronly/version.h>)
-#include <torch/headeronly/version.h>
-#elif __has_include(<torch/version.h>)
-#include <torch/version.h>
-#endif
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <transfer_engine.h>
@@ -22,12 +17,6 @@
 #include <ATen/cuda/CUDAContext.h>
 
 namespace mooncake {
-
-#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 6
-#define MOONCAKE_C10D_OVERRIDE
-#else
-#define MOONCAKE_C10D_OVERRIDE override
-#endif
 
 // Forward declaration – MooncakeP2PShim holds a non-owning pointer to
 // MooncakeBackend, which is defined below.
@@ -47,7 +36,7 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
-    bool supportsCoalescing() const MOONCAKE_C10D_OVERRIDE { return false; }
+    bool supportsCoalescing() const override { return false; }
 
     c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
                                         int dstRank, int tag) override;
@@ -109,9 +98,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    int getSize() const MOONCAKE_C10D_OVERRIDE {
-        return meta_ ? meta_->activeSize : size_;
-    }
+    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -164,7 +151,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         std::vector<std::vector<at::Tensor>>& inputTensors,
         const c10d::ScatterOptions& opts) override;
 
-    void shutdown() MOONCAKE_C10D_OVERRIDE;
+    void shutdown() override;
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
