@@ -1531,11 +1531,13 @@ Status TransferEngineImpl::finishQueuedOwner(
             return Status::InternalError(
                 "runtime dispatch window accounting underflow" LOC_MARK);
         }
+    }
+    CHECK_STATUS(runtime_queue_->complete(owner_id, terminal_status));
+    if (queued.in_dispatch_window) {
         --dispatch_inflight_owners_;
         dispatch_inflight_bytes_ -= queued.byte_charge;
         queued.in_dispatch_window = false;
     }
-    CHECK_STATUS(runtime_queue_->complete(owner_id, terminal_status));
     for (const auto task_id : queued.public_task_ids) {
         queued.batch->task_list[task_id].status = terminal_status;
     }
