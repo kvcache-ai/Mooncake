@@ -101,6 +101,33 @@ __device__ __forceinline__ void mc_rdma_put(
 // sig_ptr is a local VA within the GDR buffer.
 // ---------------------------------------------------------------------------
 
+__device__ __forceinline__ uint64_t mc_signal_raddr(const CommCtx& ctx,
+                                                    int dst_rank,
+                                                    int* sig_ptr) {
+    return ctx.ibgda.raddrs[dst_rank] +
+           (reinterpret_cast<const char*>(sig_ptr) -
+            reinterpret_cast<const char*>(ctx.p2p.local_base));
+}
+
+__device__ __forceinline__ uint64_t mc_signal_atomic_laddr(const CommCtx& ctx,
+                                                           int* sig_ptr) {
+    return ctx.ibgda.raddrs[ctx.rank] +
+           (reinterpret_cast<const char*>(sig_ptr) -
+            reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)) +
+           (reinterpret_cast<const char*>(ctx.ibgda.local_atomic_base) -
+            reinterpret_cast<const char*>(ctx.p2p.local_base));
+}
+
+__device__ __forceinline__ int* mc_signal_write_source(const CommCtx& ctx,
+                                                       int* sig_ptr) {
+    return reinterpret_cast<int*>(
+        reinterpret_cast<char*>(const_cast<void*>(ctx.ibgda.local_atomic_base)) +
+        (reinterpret_cast<const char*>(sig_ptr) -
+         reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)));
+}
+
+// Signal via the historical route: local/P2P signals are release stores, while
+// IBGDA signals use RDMA atomic add.
 __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
                                           int channel, int qps_per_rank,
                                           int* sig_ptr, int32_t val) {
@@ -111,19 +138,43 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
     if (mc_comm_p2p_available(ctx, dst_rank)) {
         mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
     } else {
-        uint64_t recv_raddr =
-            ctx.ibgda.raddrs[dst_rank] +
-            (reinterpret_cast<const char*>(sig_ptr) -
-             reinterpret_cast<const char*>(ctx.p2p.local_base));
-        uint64_t laddr =
-            ctx.ibgda.raddrs[ctx.rank] +
-            (reinterpret_cast<const char*>(sig_ptr) -
-             reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)) +
-            (reinterpret_cast<const char*>(ctx.ibgda.local_atomic_base) -
-             reinterpret_cast<const char*>(ctx.p2p.local_base));
+        uint64_t recv_raddr = mc_signal_raddr(ctx, dst_rank, sig_ptr);
+        uint64_t laddr = mc_signal_atomic_laddr(ctx, sig_ptr);
         mc_ibgda_red_add(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
                          laddr, recv_raddr, val);
     }
+}
+
+// Signal via RDMA write. Use this only when the remote signal word is known to
+// be single-writer for the current protocol phase. The optional completion wait
+// protects the local source word from being reused before the NIC has DMA-read
+// it, which is important for protocols that double-buffer their signal memory.
+__device__ __forceinline__ void mc_signal_write_from(
+    const CommCtx& ctx, int dst_rank, int channel, int qps_per_rank,
+    int* local_sig_ptr, int* sig_ptr, int32_t val,
+    bool wait_completion = true) {
+    if (dst_rank == ctx.rank) {
+        mc_st_release(sig_ptr, val);
+        return;
+    }
+    if (mc_comm_p2p_available(ctx, dst_rank)) {
+        mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
+    } else {
+        uint64_t recv_raddr = mc_signal_raddr(ctx, dst_rank, sig_ptr);
+        mc_st_release(local_sig_ptr, val);
+        mc_fence();
+        mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
+                     local_sig_ptr, recv_raddr, sizeof(int32_t),
+                     wait_completion);
+    }
+}
+
+__device__ __forceinline__ void mc_signal_write(
+    const CommCtx& ctx, int dst_rank, int channel, int qps_per_rank,
+    int* sig_ptr, int32_t val, bool wait_completion = true) {
+    mc_signal_write_from(ctx, dst_rank, channel, qps_per_rank,
+                         mc_signal_write_source(ctx, sig_ptr), sig_ptr, val,
+                         wait_completion);
 }
 
 __device__ __forceinline__ void mc_red_add(const CommCtx& ctx, int dst_rank,
