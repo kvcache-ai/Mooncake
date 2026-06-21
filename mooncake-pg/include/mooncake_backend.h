@@ -10,7 +10,11 @@
 #include <p2p_proxy.h>
 #include <sys/types.h>
 #include <torch/torch.h>
+#if __has_include(<torch/headeronly/version.h>)
 #include <torch/headeronly/version.h>
+#elif __has_include(<torch/version.h>)
+#include <torch/version.h>
+#endif
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <transfer_engine.h>
