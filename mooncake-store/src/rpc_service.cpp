@@ -288,8 +288,10 @@ bool MasterAdminServer::Start() {
                         << snapshot.leader_view->view_version;
                 }
                 LOG(INFO) << log_stream.str();
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(kMetricReportIntervalSeconds));
+                if (metric_report_stop_sem_.try_acquire_for(
+                        std::chrono::seconds(kMetricReportIntervalSeconds))) {
+                    break;
+                }
             }
         });
     }
@@ -299,12 +301,13 @@ bool MasterAdminServer::Start() {
 }
 
 void MasterAdminServer::Stop() {
-    metric_report_running_.store(false);
-    if (metric_report_thread_.joinable()) {
-        metric_report_thread_.join();
-    }
+    metric_report_running_.store(false, std::memory_order_relaxed);
     if (started_.exchange(false)) {
         http_server_.stop();
+    }
+    if (metric_report_thread_.joinable()) {
+        metric_report_stop_sem_.release();
+        metric_report_thread_.join();
     }
 }
 
@@ -483,10 +486,11 @@ void MasterAdminServer::InitHttpServer() {
             auto key = req.get_query_value("key");
             auto get_result =
                 service->GetReplicaList(std::string(key), "default");
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
             if (get_result) {
-                std::string ss;
+                std::string ss = "{\"success\":true,\"data\":[";
                 const auto& replicas = get_result.value().replicas;
+                bool first = true;
                 for (const auto& replica : replicas) {
                     if (!replica.is_memory_replica()) {
                         continue;
@@ -494,15 +498,23 @@ void MasterAdminServer::InitHttpServer() {
                     std::string tmp;
                     struct_json::to_json(
                         replica.get_memory_descriptor().buffer_descriptor, tmp);
+                    if (!first) {
+                        ss += ",";
+                    }
                     ss += tmp;
-                    ss += "\n";
+                    first = false;
                 }
+                ss += "]}";
                 resp.set_status_and_content(status_type::ok, std::move(ss));
                 return;
             }
 
-            resp.set_status_and_content(status_type::not_found,
-                                        toString(get_result.error()));
+            resp.set_status_and_content(
+                status_type::not_found,
+                std::string("{\"success\":false,\"error_code\":") +
+                    std::to_string(toInt(get_result.error())) +
+                    ",\"error_message\":\"" +
+                    EscapeJson(toString(get_result.error())) + "\"}");
         });
 
     http_server_.set_http_handler<GET>(

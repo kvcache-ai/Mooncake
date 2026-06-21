@@ -49,19 +49,44 @@ Retrieve replica information for a specific key, including memory locations and 
 
 **Method**: `GET`
 **Parameters**: `key` (query parameter) - The object key to query
-**Content-Type**: `text/plain; version=0.0.4`
-**Response**: JSON-formatted replica descriptors for memory replicas
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with success status and replica data array
 
 **Example**:
 ```bash
 curl "http://localhost:8080/query_key?key=my_object"
 ```
 
-**Response Format**:
-```text
+**Success Response** (HTTP 200):
+```json
 {
-  "transport_endpoint_": "hostname:port",
-  "buffer_descriptors": [...]
+  "success": true,
+  "data": [
+    {
+      "size_": 1073741824,
+      "buffer_address_": 140732000000000,
+      "protocol_": "rdma",
+      "transport_endpoint_": "192.168.1.100:12345"
+    }
+  ]
+}
+```
+
+**Error Response** (key not found, HTTP 404):
+```json
+{
+  "success": false,
+  "error_code": -704,
+  "error_message": "OBJECT_NOT_FOUND"
+}
+```
+
+**Error Response** (service unavailable, HTTP 503):
+```json
+{
+  "success": false,
+  "error_code": -1011,
+  "error_message": "service plane is not active"
 }
 ```
 
@@ -205,7 +230,7 @@ Basic health check endpoint for service availability verification.
 **Method**: `GET`
 **Content-Type**: `text/plain; version=0.0.4`
 **Response**: `OK` when service is healthy
-**Status Codes**: 
+**Status Codes**:
 - `200 OK`: Service is healthy
 - Other: Service may be experiencing issues
 

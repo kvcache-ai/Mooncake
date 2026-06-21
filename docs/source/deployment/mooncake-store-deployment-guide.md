@@ -1,4 +1,4 @@
-# Mooncake Store Deployment
+# Mooncake Store Deployment & Tuning Guide
 
 This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
@@ -126,6 +126,90 @@ python -m mooncake.mooncake_store_service \
   --metadata_server=http://127.0.0.1:8080/metadata \
   --master_server=127.0.0.1:50051
 ```
+
+### Run the Stress Benchmark
+
+Mooncake Store includes sample programs for validating C++ and Python integrations. The [stress benchmark script](gh-file:mooncake-store/tests/stress_cluster_benchmark.py) can be used to verify a two-role prefill/decode setup.
+
+Configure the script for your network:
+
+- `local_hostname`: the local machine's reachable IP address or hostname.
+- `metadata_server`: the Transfer Engine metadata service, for example `P2PHANDSHAKE`, `http://127.0.0.1:8080/metadata`, or an etcd address.
+- `master_server_address`: the Mooncake Store master address. Use `IP:Port` in default mode, or `etcd://IP:Port;IP:Port;...;IP:Port` in etcd-backed HA mode.
+
+Then start the roles:
+
+```bash
+ROLE=prefill python3 mooncake-store/tests/stress_cluster_benchmark.py
+ROLE=decode python3 mooncake-store/tests/stress_cluster_benchmark.py
+```
+
+For RDMA, topology auto-discovery and NIC filters can be passed through environment variables:
+
+```bash
+ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/stress_cluster_benchmark.py
+ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/stress_cluster_benchmark.py
+```
+
+The absence of errors indicates successful data transfer.
+
+### Standalone Real Client via RPC
+
+To run a resource-owning real client as a standalone RPC process:
+
+```bash
+mooncake_client \
+  --global_segment_size="4GB" \
+  --master_server_address="localhost:50051" \
+  --metadata_server="http://localhost:8080/metadata"
+```
+
+The real client connects to the master and listens on port `50052` by default. Application processes such as vLLM or SGLang can then use dummy clients to forward requests to this real client.
+
+Common `mooncake_client` flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `0.0.0.0` | Client service bind host |
+| `--port` | `50052` | Client service listen port |
+| `--global_segment_size` | `4GB` | Global segment size contributed by the client |
+| `--master_server_address` | `localhost:50051` | Master service address |
+| `--metadata_server` | `http://localhost:8080/metadata` | Transfer Engine metadata service |
+| `--protocol` | `tcp` | Transfer protocol |
+| `--device_name` | empty | Transfer device name |
+| `--threads` | `1` | Client worker thread count |
+
+### Standalone Real Client via HTTP
+
+Use `python -m mooncake.mooncake_store_service` to start a real client with a lightweight HTTP API for manual `Get` and `Put` debugging.
+
+Create a JSON config:
+
+```json
+{
+  "local_hostname": "localhost",
+  "metadata_server": "http://localhost:8080/metadata",
+  "global_segment_size": 268435456,
+  "local_buffer_size": 268435456,
+  "protocol": "tcp",
+  "device_name": "",
+  "master_server_address": "localhost:50051"
+}
+```
+
+Start the service:
+
+```bash
+python -m mooncake.mooncake_store_service --config=<config_path> --port=8081
+```
+
+The main startup parameters are `--config`, the path to the JSON configuration file, and `--port`, the HTTP server port.
+
+### Verify Installed Examples
+
+For a Python integration check, run `mooncake-store/tests/distributed_object_store_provider.py` after starting the metadata service and `mooncake_master`.
+
+For a C++ integration check, run `build/mooncake-store/tests/client_integration_test` after building tests and starting the required services.
 
 ### Verify
 
@@ -276,14 +360,18 @@ curl -s http://<master_host>:9003/metrics/summary
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd-offload).
+- For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](nvmf-ssd-deployment-guide)
 - For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
+- For detailed monitoring and observation see [Observability](../getting_started/observability)
 
 :::{toctree}
 :maxdepth: 1
 :hidden:
 
 ssd-offload
-../getting_started/plugin-usage/3FS-USRBIO-Plugin
+NvMe-Of SSD Pool<nvmf-ssd-deployment-guide>
+HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
+../getting_started/observability
 :::
 
 ---

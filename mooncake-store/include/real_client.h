@@ -3,6 +3,7 @@
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
 #include <csignal>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -130,21 +131,17 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
-        override;
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) override;
 
     /**
-     * @brief Get object data directly into pre-allocated buffers for multiple
-     * keys (batch version)
-     * @param keys Vector of keys of the objects to get
-     * @param buffers Vector of pointers to the pre-allocated buffers
-     * @param sizes Vector of sizes of the buffers
-     * @return Vector of 64-bit integers, where each element is the number of
-     * bytes read on success, or a negative value on error
-     * @note The buffer addresses must resolve to Store-managed registered
-     * memory, either explicit register_buffer() regions or the setup-time local
-     * buffer
+     * @brief Batch query object placement/lease metadata for later read reuse
+     * @param keys Vector of keys to query
+     * @return Vector of query results in the same order as keys
      */
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
+
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
@@ -184,20 +181,15 @@ class RealClient : public PyClient {
                  const ReplicateConfig &config = ReplicateConfig{});
 
     /**
-     * @brief Put object data directly from pre-allocated buffers for multiple
-     * keys(metadata version, better not be directly used in Python)
-     * @param keys Vector of keys of the objects to put
-     * @param buffers Vector of pointers to the pre-allocated buffers
-     * @param metadata_buffers Vector of pointers to the pre-allocated metadata
-     * buffers
-     * @param size Number of sizes of the buffers
-     * @param metadata_size Number of sizes of the metadata buffers
+     * @brief Put one object directly from a registered data buffer plus a
+     * registered metadata buffer
+     * @param key Key of the object to put
+     * @param buffer Pointer to the registered data buffer
+     * @param metadata_buffer Pointer to the registered metadata buffer
+     * @param size Size of the data buffer in bytes
+     * @param metadata_size Size of the metadata buffer in bytes
      * @param config Replication configuration
-     * @return Vector of integers, where each element is 0 on success, or a
-     * negative value on error
-     * @note The buffer addresses must resolve to Store-managed registered
-     * memory, either explicit register_buffer() regions or the setup-time local
-     * buffer
+     * @return 0 on success, negative value on error
      */
     int put_from_with_metadata(
         const std::string &key, void *buffer, void *metadata_buffer,
@@ -464,6 +456,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
         int32_t device_id, const UUID &client_id);
 
     // Share mem management for dummy client
@@ -538,6 +532,11 @@ class RealClient : public PyClient {
         uint64_t total_size;
     };
 
+    tl::expected<RangedReadMetadata, ErrorCode>
+    build_ranged_read_metadata_from_query_result(
+        const std::string &key,
+        tl::expected<QueryResult, ErrorCode> query_result);
+
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
 
@@ -561,7 +560,8 @@ class RealClient : public PyClient {
         std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
             *prepared_results = nullptr,
         const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
-            nullptr);
+            nullptr,
+        const QueryResultCache *query_result_cache = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -664,6 +664,8 @@ class RealClient : public PyClient {
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<CachedQueryResultResponse> batch_get_query_results(
+        const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
     std::vector<std::string> batch_replica_clear(
