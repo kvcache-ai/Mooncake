@@ -397,7 +397,7 @@ jobs:
         #pragma once
         #include <stdint.h>
         #ifdef __MCC__
-        #include <musa_bf16.hpp>
+        #include <musa_bf16.h>
         typedef mt_bfloat16 nv_bfloat16;
         #else
         typedef uint16_t nv_bfloat16;
