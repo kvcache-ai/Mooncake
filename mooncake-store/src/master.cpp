@@ -14,6 +14,7 @@
 #include "ha/leadership/master_service_supervisor.h"
 
 #include "http_metadata_server.h"
+#include "master_admin_service.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "utils.h"

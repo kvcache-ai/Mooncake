@@ -130,9 +130,24 @@ Mooncake Store is a high-performance distributed key-value cache storage engine 
 
 </details>
 
-### Elastic Expert Parallelism Support
+### Mooncake EP and Process Group (PG)
 
-Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can work with the EPLB module to dynamically route tokens to healthy ranks during inference.
+Mooncake EP and Mooncake PG extend Mooncake from high-performance data movement to fault-tolerant distributed execution for large-scale MoE inference. Mooncake EP adapts DeepEP-style expert-parallel dispatch and combine operations with rank activeness awareness, while Mooncake PG provides a PyTorch distributed process-group backend with collective communication primitives that can detect failed ranks, report failures to upper layers, and recover ranks without restarting the entire inference service. See the [Mooncake EP & Backend guide](https://kvcache-ai.github.io/Mooncake/python-api-reference/ep-backend.html) for details.
+
+<details>
+<summary>Highlights</summary>
+
+- **Fault-tolerant expert parallelism.** Mooncake EP adds `active_ranks` awareness to expert-parallel dispatch and combine APIs, allowing MoE inference systems to route around failed ranks and continue serving with healthy experts.
+
+- **DeepEP-compatible programming model.** Mooncake EP keeps the API largely consistent with DeepEP's low-latency mode, making it easier for inference engines to adopt fault-tolerant expert parallelism without rewriting their MoE communication stack.
+
+- **PyTorch ProcessGroup integration.** Mooncake PG can be registered as a `torch.distributed` backend, enabling standard collective APIs such as `all_gather` while using Mooncake's communication and failure-reporting mechanisms underneath.
+
+- **Elastic rank recovery.** Mooncake PG exposes recovery-oriented primitives such as peer-state polling and rank recovery, allowing replacement processes to rejoin existing process groups and helping inference services recover from partial failures.
+
+- **SGLang integration for production MoE serving.** Mooncake's collective backend and expert-parallel kernels are integrated into SGLang to support fault-tolerant expert-parallel inference for large MoE models, including Elastic Expert Parallel serving scenarios.
+
+</details>
 
 ### Tensor-Centric Ecosystem
 
@@ -263,6 +278,27 @@ sudo make install # optional, make it ready to be used by vLLM/SGLang
 
 For custom accelerator backends, Docker deployment, NVMe-oF, EFA, CXL, Redis / HTTP metadata, Rust bindings, or other advanced build options, see the [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
+### Skills for AI coding assistants
+
+Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command:
+
+| Skill | Description |
+|-------|-------------|
+| `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
+| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
+| `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
+
+Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
+
+```text
+/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
+/plugin install mooncake-troubleshoot@mooncake
+/plugin install mooncake-ci-local@mooncake
+/plugin install mooncake-api@mooncake
+```
+
+The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.
+
 <h2 id="trace">📦 Open Source Trace</h2>
 
 ```json
@@ -287,6 +323,16 @@ The above presents two samples from our trace dataset. The trace includes the ti
 Please kindly cite our papers if you find the papers or the traces are useful:
 
 ```bibtex
+@misc{ren2026tentdeclarativeslicespraying,
+  title     = {TENT: A Declarative Slice Spraying Engine for Performant and Resilient Data Movement in Disaggregated LLM Serving},
+  author    = {Feng Ren and Ruoyu Qin and Teng Ma and Shangming Cai and Zheng Liu and Chao Lei and Dejiang Zhu and Ke Yang and Zheming Li and Jialei Cui and Weixiao Huang and Yikai Zhao and Yineng Zhang and Hao Wu and Xiang Gao and Yuhao Fu and Jinlei Jiang and Yongwei Wu and Mingxing Zhang},
+  year      = {2026},
+  eprint    = {2604.00368},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DC},
+  url       = {https://arxiv.org/abs/2604.00368},
+}
+
 @article{sun2026survivingpartialrankfailures,
   title     = {Surviving Partial Rank Failures in Wide Expert-Parallel MoE Inference},
   author    = {Xun Sun and Shaoyuan Chen and Pingchuan Ma and Yue Chen and Ziwei Yuan and Zhanhao Cao and Han Han and Shangming Cai and Teng Ma and Xuchun Shang and Xinpeng Zhao and Ke Yang and Junlin Wei and Lianzhi Lin and Yuji Liu and Feng Ren and Haoran Hu and Cheng Wan and Yingdi Shan and Yongwei Wu and Mingxing Zhang},

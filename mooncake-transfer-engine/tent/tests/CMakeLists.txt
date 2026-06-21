@@ -33,6 +33,13 @@ target_include_directories(tent_ip_utils_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
 
+add_executable(tent_coalesce_regions_test coalesce_regions_test.cpp)
+target_link_libraries(tent_coalesce_regions_test PRIVATE tent_common gtest
+                                                         gtest_main)
+target_include_directories(tent_coalesce_regions_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_coalesce_regions_test COMMAND tent_coalesce_regions_test)
+
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
                                                  tent_link_group)

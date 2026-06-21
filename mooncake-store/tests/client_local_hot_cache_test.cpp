@@ -476,9 +476,38 @@ TEST_F(LocalHotCacheTest, GetHotKeyProtectsBlockFromReuse) {
     HotMemBlock* block2 = cache.GetHotKey("key2");
     ASSERT_NE(block2, nullptr);
     VerifySliceData(block2, 1024, 'B');
+    cache.ReleaseHotKey("key2");
 
     // key1 should be evicted since we only have 1 block
     EXPECT_FALSE(cache.HasHotKey("key1"));
+}
+
+// Token check and publish must be atomic: a generation bump that races after
+// the token was captured must cancel the fill instead of resurrecting it.
+TEST_F(LocalHotCacheTest, PutHotKeyWithTokenRejectsStaleFill) {
+    const size_t cache_size = 16 * 1024 * 1024;  // 1 block
+    LocalHotCache cache(cache_size);
+
+    // Stale: token captured, then key generation bumped (as Remove would).
+    HotCachePutToken stale = cache.AcquirePutToken("k");
+    cache.BumpKeyGeneration("k");
+    HotMemBlock* b1 = cache.GetFreeBlock();
+    ASSERT_NE(b1, nullptr);
+    b1->key_ = "k";
+    b1->size = 1024;
+    EXPECT_FALSE(cache.PutHotKey(b1, stale));
+    EXPECT_FALSE(cache.HasHotKey("k"));
+    EXPECT_EQ(cache.GetCacheSize(), 1)
+        << "Stale fill must be returned to the pool, not published";
+
+    // Valid: token still current -> published.
+    HotCachePutToken fresh = cache.AcquirePutToken("k");
+    HotMemBlock* b2 = cache.GetFreeBlock();
+    ASSERT_NE(b2, nullptr);
+    b2->key_ = "k";
+    b2->size = 1024;
+    EXPECT_TRUE(cache.PutHotKey(b2, fresh));
+    EXPECT_TRUE(cache.HasHotKey("k"));
 }
 
 // Test LocalHotCacheHandler basic functionality
@@ -518,6 +547,54 @@ TEST_F(LocalHotCacheTest, LocalHotCacheHandlerNullCache) {
     EXPECT_FALSE(handler.SubmitPutTask("key", slice));
 }
 
+// Regression test: a block recycled from the LRU must still accept objects up
+// to the full block capacity, even if it previously held a smaller object.
+// Before the fix, SubmitPutTask compared the new slice against block->size
+// (the previous object's logical length, which GetFreeBlock does not reset)
+// instead of the block capacity, so a recycled block permanently rejected any
+// object larger than the one it last held.
+TEST_F(LocalHotCacheTest, RecycledBlockAcceptsLargerObject) {
+    const size_t block_size = 64 * 1024;  // 64KB
+    // Single-block cache, so the second Put must recycle the first block.
+    auto cache = std::make_shared<LocalHotCache>(block_size, block_size);
+    ASSERT_EQ(cache->GetCacheSize(), 1u);
+    ASSERT_EQ(cache->GetBlockSize(), block_size);
+
+    LocalHotCacheHandler handler(cache, /*num_worker_threads=*/1,
+                                 /*max_queue_capacity=*/16);
+
+    // Wait until an async Put has been published into the cache.
+    auto wait_for_key = [&](const std::string& key) {
+        for (int i = 0; i < 400; ++i) {  // up to ~2s
+            if (cache->HasHotKey(key)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return cache->HasHotKey(key);
+    };
+
+    // 1) Cache a small object. The block's logical size shrinks to small_size.
+    const size_t small_size = 1024;  // 1KB
+    Slice small_slice = CreateSlice(small_size, 'S');
+    ASSERT_TRUE(handler.SubmitPutTask("small_key", small_slice));
+    ASSERT_TRUE(wait_for_key("small_key"));
+
+    // 2) Cache a larger object that still fits the block. This forces
+    //    GetFreeBlock() to recycle the block that held "small_key". Before the
+    //    fix this returned false (large_size > stale block->size of 1KB).
+    const size_t large_size = 32 * 1024;  // 32KB: > small_size, <= block_size
+    Slice large_slice = CreateSlice(large_size, 'L');
+    EXPECT_TRUE(handler.SubmitPutTask("large_key", large_slice));
+    ASSERT_TRUE(wait_for_key("large_key"));
+
+    // The larger object is fully cached with the correct length and data, and
+    // the evicted small object is gone.
+    HotMemBlock* block = cache->GetHotKey("large_key");
+    ASSERT_NE(block, nullptr);
+    VerifySliceData(block, large_size, 'L');
+    cache->ReleaseHotKey("large_key");
+    EXPECT_FALSE(cache->HasHotKey("small_key"));
+}
+
 // Test concurrent access to LocalHotCache
 TEST_F(LocalHotCacheTest, ConcurrentAccess) {
     const size_t cache_size = 128 * 1024 * 1024;  // 128MB = 8 blocks
@@ -531,8 +608,7 @@ TEST_F(LocalHotCacheTest, ConcurrentAccess) {
 
     // Each thread puts and gets keys
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&cache, t, keys_per_thread, &successful_puts,
-                              &successful_gets]() {
+        threads.emplace_back([&cache, t, &successful_puts, &successful_gets]() {
             for (int i = 0; i < keys_per_thread; ++i) {
                 std::string key =
                     "thread_" + std::to_string(t) + "_key_" + std::to_string(i);

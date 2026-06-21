@@ -147,6 +147,12 @@ jobs:
         export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
         export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
         export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
+        # This job builds Mooncake with -DENABLE_ASAN=ON, so the C++ libraries
+        # the Rust crate links against carry undefined __asan_* references. Opt
+        # in to linking the ASan runtime; build.rs emits -lasan first, which
+        # keeps libasan first in the initial library list as ASan requires.
+        # Non-sanitized builds leave this unset and link without ASan.
+        export MOONCAKE_LINK_ASAN=1
         export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
         export MC_RUST_STORE_RUN_INTEGRATION=true
         export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
@@ -612,7 +618,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0" -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0;2.12.1" -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
