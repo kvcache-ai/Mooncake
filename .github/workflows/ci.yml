@@ -396,7 +396,10 @@ jobs:
         cat > /usr/local/musa/include/cuda_bf16.h <<'H'
         #pragma once
         #include <stdint.h>
-        #ifndef __MCC__
+        #ifdef __MCC__
+        #include <musa_bf16.hpp>
+        typedef mt_bfloat16 nv_bfloat16;
+        #else
         typedef uint16_t nv_bfloat16;
         static __host__ __device__ inline float __bfloat162float(nv_bfloat16) { return 0.0f; }
         static __host__ __device__ inline nv_bfloat16 __float2bfloat16(float) { return 0; }
