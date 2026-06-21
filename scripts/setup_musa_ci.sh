@@ -267,8 +267,8 @@ chmod +x "${CUDA_COMPAT_HOME}/bin/nvcc"
 echo "MUSA_HOME=/usr/local/musa" >> $GITHUB_ENV
 echo "CUDA_HOME=${CUDA_COMPAT_HOME}" >> $GITHUB_ENV
 echo "${CUDA_COMPAT_HOME}/bin" >> $GITHUB_PATH
-echo "CPATH=/usr/local/musa/include:${CPATH}" >> $GITHUB_ENV
-echo "LD_LIBRARY_PATH=${CUDA_COMPAT_HOME}/lib64:/usr/local/musa/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
+echo "CPATH=/usr/local/musa/include:${CPATH:-}" >> $GITHUB_ENV
+echo "LD_LIBRARY_PATH=${CUDA_COMPAT_HOME}/lib64:/usr/local/musa/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
 # Keep PyTorch from eagerly loading accelerator runtime backends during
 # extension builds; this job only needs the PyTorch 2.9 headers and
 # torchada's CUDA-to-MUSA compile-time mapping.
