@@ -378,17 +378,15 @@ jobs:
         #define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
         #define cudaStreamCaptureStatusActive musaStreamCaptureStatusActive
         #define cudaStreamCaptureStatusInvalidated musaStreamCaptureStatusInvalidated
-        static inline const char *cudaGetErrorString(cudaError_t) { return "MUSA build shim"; }
-        static inline cudaError_t cudaGetLastError(void) { return cudaSuccess; }
-        static inline cudaError_t cudaGetDevice(int *device) { return musaGetDevice(device); }
-        static inline cudaError_t cudaSetDevice(int device) { return musaSetDevice(device); }
-        static inline cudaError_t cudaDeviceGetAttribute(int *value, cudaDeviceAttr attr, int device) {
-          return musaDeviceGetAttribute(value, attr, device);
-        }
-        static inline cudaError_t cudaMalloc(void **ptr, size_t size) { return musaMalloc(ptr, size); }
-        static inline cudaError_t cudaFree(void *ptr) { return musaFree(ptr); }
-        static inline cudaError_t cudaMallocHost(void **ptr, size_t size) { return musaMallocHost(ptr, size); }
-        static inline cudaError_t cudaFreeHost(void *ptr) { return musaFreeHost(ptr); }
+        #define cudaGetErrorString musaGetErrorString
+        #define cudaGetLastError musaGetLastError
+        #define cudaGetDevice musaGetDevice
+        #define cudaSetDevice musaSetDevice
+        #define cudaDeviceGetAttribute musaDeviceGetAttribute
+        #define cudaMalloc musaMalloc
+        #define cudaFree musaFree
+        #define cudaMallocHost musaMallocHost
+        #define cudaFreeHost musaFreeHost
         #ifdef __cplusplus
         template <typename T>
         static inline cudaError_t cudaHostAlloc(T **ptr, size_t size, unsigned int flags) {
@@ -406,19 +404,11 @@ jobs:
           return musaHostGetDevicePointer(device_ptr, host_ptr, flags);
         }
         #endif
-        static inline cudaError_t cudaMemset(void *ptr, int value, size_t count) { return musaMemset(ptr, value, count); }
-        static inline cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t stream) {
-          return musaMemsetAsync(ptr, value, count, stream);
-        }
-        static inline cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind kind) {
-          return musaMemcpy(dst, src, count, kind);
-        }
-        static inline cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
-          return musaMemcpyAsync(dst, src, count, kind, stream);
-        }
-        static inline cudaError_t cudaPointerGetAttributes(cudaPointerAttributes *attr, const void *ptr) {
-          return musaPointerGetAttributes(attr, ptr);
-        }
+        #define cudaMemset musaMemset
+        #define cudaMemsetAsync musaMemsetAsync
+        #define cudaMemcpy musaMemcpy
+        #define cudaMemcpyAsync musaMemcpyAsync
+        #define cudaPointerGetAttributes musaPointerGetAttributes
         static inline cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode *mode) {
           (void)mode;
           return cudaSuccess;
@@ -428,7 +418,7 @@ jobs:
           if (status) *status = cudaStreamCaptureStatusNone;
           return cudaSuccess;
         }
-        static inline cudaError_t cudaStreamSynchronize(cudaStream_t stream) { return musaStreamSynchronize(stream); }
+        #define cudaStreamSynchronize musaStreamSynchronize
         static inline cudaError_t cudaStreamQuery(cudaStream_t stream) { return musaStreamQuery(stream); }
         static inline cudaError_t cudaStreamGetPriority(cudaStream_t stream, int *priority) { return musaStreamGetPriority(stream, priority); }
         static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags) {
@@ -450,9 +440,10 @@ jobs:
         H
         cat > /usr/local/musa/include/cuda.h <<'H'
         #pragma once
+        #include <musa.h>
         #include <cuda_runtime_api.h>
-        typedef int CUresult;
-        #define CUDA_SUCCESS 0
+        #define CUresult MUresult
+        #define CUDA_SUCCESS MUSA_SUCCESS
         H
         cat > /usr/local/musa/include/cuda_bf16.h <<'H'
         #pragma once
