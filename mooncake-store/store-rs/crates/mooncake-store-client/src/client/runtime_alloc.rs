@@ -701,7 +701,7 @@ impl StoreClient {
         self.release_segment_allocations_batch(&releases)
     }
 
-    fn flush_due_reclaims(&self) -> Result<()> {
+    pub fn flush_due_reclaims(&self) -> Result<()> {
         let due = {
             let mut state = self.state.lock();
             state.take_due_reclaims(now_ms())

@@ -510,7 +510,7 @@ pub(super) fn try_register_recovered_cold_object(
         let mut next = current.clone();
         next.version = current.version.next();
         next.cold_backing = Some(manifest_backing);
-        let cas = route_directory.compare_and_swap_object_route(
+        let cas = route_directory.compare_and_swap_local_route(
             observer,
             &recovered.manifest.key,
             Some(current.version),
@@ -536,7 +536,7 @@ pub(super) fn try_register_recovered_cold_object(
         }
     } else {
         let route = route_from_recovered_cold_object(recovered, observer.runtime.clone());
-        let cas = route_directory.compare_and_swap_object_route(
+        let cas = route_directory.compare_and_swap_local_route(
             observer,
             &recovered.manifest.key,
             None,
@@ -652,7 +652,7 @@ pub(super) fn reconcile_cold_tier_startup(
                                 if let Some(next_backing) = next.cold_backing.as_mut() {
                                     next_backing.owner = observer.runtime.clone();
                                 }
-                                let cas = route_directory.compare_and_swap_object_route(
+                                let cas = route_directory.compare_and_swap_local_route(
                                     observer,
                                     &route.key,
                                     Some(route.version),
@@ -683,7 +683,7 @@ pub(super) fn reconcile_cold_tier_startup(
                                     next_backing.owner = observer.runtime.clone();
                                 }
                             }
-                            let cas = route_directory.compare_and_swap_object_route(
+                            let cas = route_directory.compare_and_swap_local_route(
                                 observer,
                                 &route.key,
                                 Some(route.version),

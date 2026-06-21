@@ -675,6 +675,10 @@ fn graceful_shutdown(
     lease_ttl_ms: u64,
     heartbeat_interval_ms: u64,
 ) -> Result<String, Box<dyn Error>> {
+    // Persist DRAM-only objects to SSD before drain releases memory segments.
+    // This ensures data written since the last background offload tick survives
+    // the restart.
+    client.flush_pending_cold_tier_offloads();
     client.enter_draining()?;
     let Some(successor) = client.find_hot_upgrade_successor()? else {
         let evacuated = client.evacuate_owned_replicas()?;
