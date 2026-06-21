@@ -2000,7 +2000,16 @@ impl Drop for StoreClient {
             self._control_plane.shutdown();
             return;
         }
-        let _ = self.flush_all_reclaims();
+        match self.cold_tier_shutdown_mode {
+            ColdTierShutdownMode::Restart => {
+                // Preserve cold tier files on disk for startup reconcile.
+                // Only release hot segment DRAM allocations.
+                let _ = self.flush_all_reclaims_preserve_cold_tier();
+            }
+            ColdTierShutdownMode::Decommission => {
+                let _ = self.flush_all_reclaims();
+            }
+        }
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {

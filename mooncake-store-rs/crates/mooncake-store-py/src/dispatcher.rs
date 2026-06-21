@@ -357,6 +357,7 @@ impl StoreDispatcher {
     }
 
     pub fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {
+        let _ = self.client.flush_due_reclaims();
         self.health_publisher().heartbeat(expires_at_ms)
     }
 
@@ -419,6 +420,13 @@ impl StoreDispatcher {
         runtime: ClientRuntimeId,
     ) -> Result<Option<ClientLifecycleState>, StoreError> {
         self.run(move |client| client.runtime_state(&runtime))
+    }
+
+    pub fn flush_pending_cold_tier_offloads(&self) {
+        let _ = self.run(|client| {
+            client.flush_pending_cold_tier_offloads();
+            Ok(())
+        });
     }
 
     pub fn evacuate_owned_replicas(&self) -> Result<usize, StoreError> {
