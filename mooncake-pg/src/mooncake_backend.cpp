@@ -187,8 +187,12 @@ class MooncakeP2PWork : public ::c10d::Work {
 MooncakeBackend::MooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
+#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 6
+    : ProcessGroup(distBackendOpts.group_rank, distBackendOpts.group_size),
+#else
     : ProcessGroup(distBackendOpts.store, distBackendOpts.group_rank,
                    distBackendOpts.group_size),
+#endif
       options_(std::move(options)),
       isCpu_(isCpu) {
     auto store = std::move(distBackendOpts.store);

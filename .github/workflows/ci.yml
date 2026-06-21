@@ -368,6 +368,7 @@ jobs:
         #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
         #define cudaMemcpyDefault musaMemcpyDefault
         #define cudaMemoryTypeDevice musaMemoryTypeDevice
+        #define cudaHostAllocMapped musaHostAllocMapped
         static inline const char *cudaGetErrorString(cudaError_t) { return "MUSA build shim"; }
         static inline cudaError_t cudaGetLastError(void) { return cudaSuccess; }
         static inline cudaError_t cudaGetDevice(int *device) { return musaGetDevice(device); }
@@ -379,6 +380,9 @@ jobs:
         static inline cudaError_t cudaFree(void *ptr) { return musaFree(ptr); }
         static inline cudaError_t cudaMallocHost(void **ptr, size_t size) { return musaMallocHost(ptr, size); }
         static inline cudaError_t cudaFreeHost(void *ptr) { return musaFreeHost(ptr); }
+        static inline cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags) {
+          return musaHostAlloc(ptr, size, flags);
+        }
         static inline cudaError_t cudaMemset(void *ptr, int value, size_t count) { return musaMemset(ptr, value, count); }
         static inline cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t stream) {
           return musaMemsetAsync(ptr, value, count, stream);
