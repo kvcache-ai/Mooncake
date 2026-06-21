@@ -444,8 +444,12 @@ jobs:
         cc -shared -fPIC /tmp/mooncake_empty_cuda_stub.c -o /usr/local/musa/lib/libcudart.so
         torch_lib_dir=$(python3 - <<'PY'
         import pathlib
-        import torch
-        print(pathlib.Path(torch.__file__).parent / 'lib')
+        import site
+        for site_dir in site.getsitepackages():
+            torch_lib = pathlib.Path(site_dir) / 'torch' / 'lib'
+            if torch_lib.is_dir():
+                print(torch_lib)
+                break
         PY
         )
         [ -e "${torch_lib_dir}/libc10_cuda.so" ] || cc -shared -fPIC /tmp/mooncake_empty_cuda_stub.c -o "${torch_lib_dir}/libc10_cuda.so"
