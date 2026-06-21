@@ -302,6 +302,12 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/max_dispatch_owners", 64UL);
     runtime_queue_config_.max_dispatch_bytes =
         conf_->get("runtime_queue/max_dispatch_bytes", 64UL << 20);
+    if (runtime_queue_config_.enabled &&
+        (runtime_queue_config_.max_dispatch_owners == 0 ||
+         runtime_queue_config_.max_dispatch_bytes == 0)) {
+        return Status::InvalidArgument(
+            "runtime queue dispatch window must be non-zero" LOC_MARK);
+    }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);
     if (!hostname_.empty())
@@ -1474,6 +1480,10 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
     submit.batch_slots_left = batch->max_size - batch->task_list.size();
     submit.owners.reserve(prepared.owners.size());
     for (const auto& owner : prepared.owners) {
+        if (owner.request.length > runtime_queue_config_.max_dispatch_bytes) {
+            return Status::TooManyRequests(
+                "request exceeds runtime queue dispatch byte window" LOC_MARK);
+        }
         QueueOwnerInput input;
         input.owner_task_id = owner.owner_task_id;
         input.derived_task_ids = owner.derived_task_ids;

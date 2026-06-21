@@ -221,6 +221,47 @@ TEST(RuntimeQueueDispatch, RejectsOverfullBatchBeforePublishingTasks) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+TEST(RuntimeQueueDispatch, RejectsOwnerLargerThanDispatchByteWindow) {
+    constexpr size_t kReqLen = 4096;
+    auto cfg = makeRuntimeQueueConfig(1, kReqLen - 1);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    std::vector<uint8_t> buffer(kReqLen, 0x77);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto status =
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)});
+    EXPECT_TRUE(status.IsTooManyRequests()) << status.ToString();
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+
+    TransferStatus task_status{};
+    EXPECT_TRUE(
+        engine.getTransferStatus(batch, 0, task_status).IsInvalidArgument());
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, RejectsEmptyDispatchWindowConfig) {
+    auto cfg = makeRuntimeQueueConfig(0, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+
+    EXPECT_FALSE(engine.available());
+
+    cfg = makeRuntimeQueueConfig(1, 0);
+    TransferEngineImpl byte_window_engine(cfg);
+
+    EXPECT_FALSE(byte_window_engine.available());
+}
+
 TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);
