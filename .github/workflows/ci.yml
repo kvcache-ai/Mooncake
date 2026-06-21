@@ -420,10 +420,13 @@ jobs:
           return musaPointerGetAttributes(attr, ptr);
         }
         static inline cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode *mode) {
-          return musaThreadExchangeStreamCaptureMode(mode);
+          (void)mode;
+          return cudaSuccess;
         }
         static inline cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCaptureStatus *status) {
-          return musaStreamIsCapturing(stream, status);
+          (void)stream;
+          if (status) *status = cudaStreamCaptureStatusNone;
+          return cudaSuccess;
         }
         static inline cudaError_t cudaStreamSynchronize(cudaStream_t stream) { return musaStreamSynchronize(stream); }
         static inline cudaError_t cudaStreamQuery(cudaStream_t stream) { return musaStreamQuery(stream); }
