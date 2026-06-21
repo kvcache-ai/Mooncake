@@ -380,9 +380,23 @@ jobs:
         static inline cudaError_t cudaFree(void *ptr) { return musaFree(ptr); }
         static inline cudaError_t cudaMallocHost(void **ptr, size_t size) { return musaMallocHost(ptr, size); }
         static inline cudaError_t cudaFreeHost(void *ptr) { return musaFreeHost(ptr); }
+        #ifdef __cplusplus
+        template <typename T>
+        static inline cudaError_t cudaHostAlloc(T **ptr, size_t size, unsigned int flags) {
+          return musaHostAlloc(reinterpret_cast<void **>(ptr), size, flags);
+        }
+        template <typename T>
+        static inline cudaError_t cudaHostGetDevicePointer(T **device_ptr, T *host_ptr, unsigned int flags) {
+          return musaHostGetDevicePointer(reinterpret_cast<void **>(device_ptr), host_ptr, flags);
+        }
+        #else
         static inline cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags) {
           return musaHostAlloc(ptr, size, flags);
         }
+        static inline cudaError_t cudaHostGetDevicePointer(void **device_ptr, void *host_ptr, unsigned int flags) {
+          return musaHostGetDevicePointer(device_ptr, host_ptr, flags);
+        }
+        #endif
         static inline cudaError_t cudaMemset(void *ptr, int value, size_t count) { return musaMemset(ptr, value, count); }
         static inline cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t stream) {
           return musaMemsetAsync(ptr, value, count, stream);
