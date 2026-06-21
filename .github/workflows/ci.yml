@@ -357,9 +357,19 @@ jobs:
         typedef musaError_t cudaError_t;
         typedef musaStream_t cudaStream_t;
         typedef musaEvent_t cudaEvent_t;
-        enum { cudaSuccess = musaSuccess };
+        typedef enum musaMemcpyKind cudaMemcpyKind;
+        typedef struct musaDeviceProp cudaDeviceProp;
+        #define cudaSuccess musaSuccess
+        #define cudaErrorNotReady musaErrorNotReady
         static inline const char *cudaGetErrorString(cudaError_t) { return "MUSA build shim"; }
         static inline cudaError_t cudaGetLastError(void) { return cudaSuccess; }
+        static inline cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
+          return musaMemcpyAsync(dst, src, count, kind, stream);
+        }
+        static inline cudaError_t cudaStreamSynchronize(cudaStream_t stream) { return musaStreamSynchronize(stream); }
+        static inline cudaError_t cudaStreamQuery(cudaStream_t stream) { return musaStreamQuery(stream); }
+        static inline cudaError_t cudaStreamGetPriority(cudaStream_t stream, int *priority) { return musaStreamGetPriority(stream, priority); }
+        static inline cudaError_t cudaDeviceGetStreamPriorityRange(int *least, int *greatest) { return musaDeviceGetStreamPriorityRange(least, greatest); }
         H
         cat > /usr/local/musa/include/cuda_runtime.h <<'H'
         #pragma once
