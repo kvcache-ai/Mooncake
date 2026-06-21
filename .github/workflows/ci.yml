@@ -483,7 +483,13 @@ jobs:
         H
         cat > /usr/local/musa/include/cusolverDn.h <<'H'
         #pragma once
+        #include <cusolver_common.h>
         typedef struct cusolverDnContext *cusolverDnHandle_t;
+        typedef int cusolverStatus_t;
+        #define CUSOLVER_STATUS_SUCCESS 0
+        H
+        cat > /usr/local/musa/include/cusolver_common.h <<'H'
+        #pragma once
         typedef int cusolverStatus_t;
         #define CUSOLVER_STATUS_SUCCESS 0
         H
