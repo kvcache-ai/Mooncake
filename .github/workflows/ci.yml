@@ -371,6 +371,18 @@ jobs:
         typedef int CUresult;
         #define CUDA_SUCCESS 0
         H
+        cat > /usr/local/musa/include/cuda_bf16.h <<'H'
+        #pragma once
+        #include <stdint.h>
+        typedef uint16_t nv_bfloat16;
+        static __host__ __device__ inline float __bfloat162float(nv_bfloat16) { return 0.0f; }
+        static __host__ __device__ inline nv_bfloat16 __float2bfloat16(float) { return 0; }
+        H
+        cat > /usr/local/musa/include/cuda_fp8.h <<'H'
+        #pragma once
+        typedef unsigned char __nv_fp8_storage_t;
+        typedef unsigned short __nv_fp8x2_storage_t;
+        H
         cat > /usr/local/musa/include/cusparse.h <<'H'
         #pragma once
         typedef struct cusparseContext *cusparseHandle_t;
