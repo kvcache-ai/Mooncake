@@ -357,8 +357,11 @@ jobs:
         typedef musaError_t cudaError_t;
         typedef musaStream_t cudaStream_t;
         typedef musaEvent_t cudaEvent_t;
+        typedef musaIpcEventHandle_t cudaIpcEventHandle_t;
         typedef enum musaMemcpyKind cudaMemcpyKind;
         typedef enum musaDeviceAttr cudaDeviceAttr;
+        typedef enum musaStreamCaptureMode cudaStreamCaptureMode;
+        typedef enum musaStreamCaptureStatus cudaStreamCaptureStatus;
         typedef struct musaDeviceProp cudaDeviceProp;
         typedef struct musaPointerAttributes cudaPointerAttributes;
         #define cudaSuccess musaSuccess
@@ -369,6 +372,12 @@ jobs:
         #define cudaMemcpyDefault musaMemcpyDefault
         #define cudaMemoryTypeDevice musaMemoryTypeDevice
         #define cudaHostAllocMapped musaHostAllocMapped
+        #define cudaEventDefault musaEventDefault
+        #define cudaEventDisableTiming musaEventDisableTiming
+        #define cudaEventInterprocess musaEventInterprocess
+        #define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+        #define cudaStreamCaptureStatusActive musaStreamCaptureStatusActive
+        #define cudaStreamCaptureStatusInvalidated musaStreamCaptureStatusInvalidated
         static inline const char *cudaGetErrorString(cudaError_t) { return "MUSA build shim"; }
         static inline cudaError_t cudaGetLastError(void) { return cudaSuccess; }
         static inline cudaError_t cudaGetDevice(int *device) { return musaGetDevice(device); }
@@ -410,10 +419,27 @@ jobs:
         static inline cudaError_t cudaPointerGetAttributes(cudaPointerAttributes *attr, const void *ptr) {
           return musaPointerGetAttributes(attr, ptr);
         }
+        static inline cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode *mode) {
+          return musaThreadExchangeStreamCaptureMode(mode);
+        }
+        static inline cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCaptureStatus *status) {
+          return musaStreamIsCapturing(stream, status);
+        }
         static inline cudaError_t cudaStreamSynchronize(cudaStream_t stream) { return musaStreamSynchronize(stream); }
         static inline cudaError_t cudaStreamQuery(cudaStream_t stream) { return musaStreamQuery(stream); }
         static inline cudaError_t cudaStreamGetPriority(cudaStream_t stream, int *priority) { return musaStreamGetPriority(stream, priority); }
+        static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags) {
+          return musaStreamWaitEvent(stream, event, flags);
+        }
         static inline cudaError_t cudaDeviceGetStreamPriorityRange(int *least, int *greatest) { return musaDeviceGetStreamPriorityRange(least, greatest); }
+        static inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) { return musaEventCreateWithFlags(event, flags); }
+        static inline cudaError_t cudaEventDestroy(cudaEvent_t event) { return musaEventDestroy(event); }
+        static inline cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) { return musaEventRecord(event, stream); }
+        static inline cudaError_t cudaEventQuery(cudaEvent_t event) { return musaEventQuery(event); }
+        static inline cudaError_t cudaEventSynchronize(cudaEvent_t event) { return musaEventSynchronize(event); }
+        static inline cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEvent_t end) { return musaEventElapsedTime(ms, start, end); }
+        static inline cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) { return musaIpcGetEventHandle(handle, event); }
+        static inline cudaError_t cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle) { return musaIpcOpenEventHandle(event, handle); }
         H
         cat > /usr/local/musa/include/cuda_runtime.h <<'H'
         #pragma once
