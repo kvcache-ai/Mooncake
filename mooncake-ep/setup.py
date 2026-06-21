@@ -50,7 +50,11 @@ cuda_library_dirs = []
 
 if use_musa:
     cuda_libraries = []
-    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    musa_defines = [
+        "-DUSE_MUSA",
+        "-DMOONCAKE_EP_USE_MUSA=1",
+        "-DC10_CUDA_NO_CMAKE_CONFIGURE_FILE",
+    ]
     cxx_args += musa_defines
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
