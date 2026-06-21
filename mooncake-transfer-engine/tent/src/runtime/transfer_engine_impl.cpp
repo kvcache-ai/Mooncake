@@ -1604,6 +1604,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto& transport = transport_list_[task.type];
     if (!transport) return finishQueuedOwner(owner_id, FAILED);
     auto& sub_batch = batch->sub_batch[task.type];
+    if (task.type == RDMA) sub_batch->device_mask = task.device_mask;
     task.sub_task_id = sub_batch->size();
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
