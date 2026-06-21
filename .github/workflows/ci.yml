@@ -360,6 +360,10 @@ jobs:
         #define cudaEventDefault musaEventDefault
         #define cudaEventDisableTiming musaEventDisableTiming
         #define cudaEventInterprocess musaEventInterprocess
+        #define cudaEventRecordDefault musaEventRecordDefault
+        #define cudaEventRecordExternal musaEventRecordExternal
+        #define cudaEventWaitDefault musaEventWaitDefault
+        #define cudaEventWaitExternal musaEventWaitExternal
         #define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
         #define cudaStreamCaptureStatusActive musaStreamCaptureStatusActive
         #define cudaStreamCaptureStatusInvalidated musaStreamCaptureStatusInvalidated
@@ -413,6 +417,7 @@ jobs:
         static inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) { return musaEventCreateWithFlags(event, flags); }
         static inline cudaError_t cudaEventDestroy(cudaEvent_t event) { return musaEventDestroy(event); }
         static inline cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) { return musaEventRecord(event, stream); }
+        static inline cudaError_t cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream, unsigned int flags) { return musaEventRecordWithFlags(event, stream, flags); }
         static inline cudaError_t cudaEventQuery(cudaEvent_t event) { return musaEventQuery(event); }
         static inline cudaError_t cudaEventSynchronize(cudaEvent_t event) { return musaEventSynchronize(event); }
         static inline cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEvent_t end) { return musaEventElapsedTime(ms, start, end); }
