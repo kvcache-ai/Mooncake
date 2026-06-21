@@ -41,9 +41,6 @@ include_dirs = [
     os.path.join(current_dir, "include"),
     os.path.join(current_dir, "../mooncake-transfer-engine/include"),
 ]
-cuda_compat_include = os.getenv("CUDA_COMPAT_INCLUDE")
-if use_musa and cuda_compat_include and os.path.isdir(cuda_compat_include):
-    include_dirs.append(cuda_compat_include)
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
@@ -53,24 +50,13 @@ cuda_library_dirs = []
 
 if use_musa:
     cuda_libraries = []
-    musa_defines = [
-        "-DUSE_MUSA",
-        "-DMOONCAKE_EP_USE_MUSA=1",
-        "-DC10_CUDA_NO_CMAKE_CONFIGURE_FILE",
-    ]
-    cxx_args += musa_defines + [
-        "-D__host__=",
-        "-D__device__=",
-        "-D__cudart_builtin__=",
-        "-DCUDARTAPI=",
-    ]
+    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    cxx_args += musa_defines
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
         abi_define,
         *musa_defines,
         "-D__MCC__",
-        "-D__cudart_builtin__=",
-        "-DCUDARTAPI=",
         "-std=c++20",
         "--cuda-gpu-arch=mp_21",
         "--cuda-gpu-arch=mp_31",
