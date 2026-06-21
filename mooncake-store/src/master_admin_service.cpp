@@ -379,17 +379,17 @@ YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
 
 void MasterAdminServer::HandleKvEventsStatus(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
-    WithActiveService(resp, [&](const std::shared_ptr<WrappedMasterService>&
-                                    service) {
-        const auto stats = service->GetKvEventStats();
-        HttpKvEventsStatusResponse payload;
-        payload.enabled = service->KvEventsEnabled();
-        payload.published_batches = stats.published_batches;
-        payload.published_events = stats.published_events;
-        payload.dropped_events = stats.dropped_events;
-        payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
-        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
-    });
+    WithActiveService(
+        resp, [&](const std::shared_ptr<WrappedMasterService>& service) {
+            const auto stats = service->GetKvEventStats();
+            HttpKvEventsStatusResponse payload;
+            payload.enabled = service->KvEventsEnabled();
+            payload.published_batches = stats.published_batches;
+            payload.published_events = stats.published_events;
+            payload.dropped_events = stats.dropped_events;
+            payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
+            WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+        });
 }
 
 void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
