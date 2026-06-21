@@ -360,23 +360,37 @@ jobs:
         typedef enum musaMemcpyKind cudaMemcpyKind;
         typedef enum musaDeviceAttr cudaDeviceAttr;
         typedef struct musaDeviceProp cudaDeviceProp;
+        typedef struct musaPointerAttributes cudaPointerAttributes;
         #define cudaSuccess musaSuccess
         #define cudaErrorNotReady musaErrorNotReady
         #define cudaDevAttrClockRate musaDevAttrClockRate
+        #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+        #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+        #define cudaMemcpyDefault musaMemcpyDefault
+        #define cudaMemoryTypeDevice musaMemoryTypeDevice
         static inline const char *cudaGetErrorString(cudaError_t) { return "MUSA build shim"; }
         static inline cudaError_t cudaGetLastError(void) { return cudaSuccess; }
         static inline cudaError_t cudaGetDevice(int *device) { return musaGetDevice(device); }
+        static inline cudaError_t cudaSetDevice(int device) { return musaSetDevice(device); }
         static inline cudaError_t cudaDeviceGetAttribute(int *value, cudaDeviceAttr attr, int device) {
           return musaDeviceGetAttribute(value, attr, device);
         }
         static inline cudaError_t cudaMalloc(void **ptr, size_t size) { return musaMalloc(ptr, size); }
         static inline cudaError_t cudaFree(void *ptr) { return musaFree(ptr); }
+        static inline cudaError_t cudaMallocHost(void **ptr, size_t size) { return musaMallocHost(ptr, size); }
+        static inline cudaError_t cudaFreeHost(void *ptr) { return musaFreeHost(ptr); }
         static inline cudaError_t cudaMemset(void *ptr, int value, size_t count) { return musaMemset(ptr, value, count); }
         static inline cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t stream) {
           return musaMemsetAsync(ptr, value, count, stream);
         }
+        static inline cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind kind) {
+          return musaMemcpy(dst, src, count, kind);
+        }
         static inline cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
           return musaMemcpyAsync(dst, src, count, kind, stream);
+        }
+        static inline cudaError_t cudaPointerGetAttributes(cudaPointerAttributes *attr, const void *ptr) {
+          return musaPointerGetAttributes(attr, ptr);
         }
         static inline cudaError_t cudaStreamSynchronize(cudaStream_t stream) { return musaStreamSynchronize(stream); }
         static inline cudaError_t cudaStreamQuery(cudaStream_t stream) { return musaStreamQuery(stream); }
