@@ -256,6 +256,60 @@ TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+TEST(RuntimeQueueDispatch, KeepsDispatchWindowUntilOwnerIsTerminal) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [](const Request& request, int poll_count) {
+            if (poll_count == 1) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x55);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    TransferStatus first{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, first).ok());
+    EXPECT_EQ(first.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    TransferStatus second{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 1, second).ok());
+    EXPECT_EQ(second.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, first).ok());
+    EXPECT_EQ(first.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 2);
+
+    ASSERT_TRUE(engine.getTransferStatus(batch, 1, second).ok());
+    EXPECT_EQ(second.s, TransferStatusEnum::PENDING);
+    ASSERT_TRUE(engine.getTransferStatus(batch, 1, second).ok());
+    EXPECT_EQ(second.s, TransferStatusEnum::COMPLETED);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 TEST(RuntimeQueueDispatch, EarlyFreeWaitsForQueuedCompletion) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);

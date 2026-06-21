@@ -227,9 +227,11 @@ class TransferEngineImpl {
 
     uint64_t nextBatchToken();
 
-    Status dispatchQueuedTransfers();
+    Status refillDispatchWindow();
 
     Status dispatchQueuedOwner(QueueOwnerId owner_id);
+
+    Status markQueuedOwnerSubmitted(QueueOwnerId owner_id);
 
     Status finishQueuedOwner(QueueOwnerId owner_id,
                              TransferStatusEnum terminal_status);
@@ -291,7 +293,8 @@ class TransferEngineImpl {
         Batch* batch{nullptr};
         size_t owner_task_id{0};
         std::vector<size_t> public_task_ids;
-        bool submitted{false};
+        size_t byte_charge{0};
+        bool in_dispatch_window{false};
     };
 
    private:
@@ -323,6 +326,8 @@ class TransferEngineImpl {
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
+    size_t dispatch_inflight_owners_{0};
+    size_t dispatch_inflight_bytes_{0};
     uint64_t next_batch_token_{1};
 
     // Guards alive_batches_ and serializes pollTaskStatus /
