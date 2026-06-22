@@ -206,6 +206,45 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     EXPECT_EQ(oss.str(), "EMPTY");
 }
 
+// --- ChunkedReadHandle tests (precompleted path) ---
+
+TEST_F(TransferTaskTest, ChunkedReadHandlePrecompletedEmpty) {
+    auto handle = ChunkedReadHandle::make_precompleted(0, ErrorCode::OK);
+    EXPECT_EQ(handle.num_chunks(), 0u);
+    EXPECT_EQ(handle.completed_count(), 0u);
+    EXPECT_EQ(handle.wait_all(), ErrorCode::OK);
+}
+
+TEST_F(TransferTaskTest, ChunkedReadHandlePrecompletedWithChunks) {
+    auto handle = ChunkedReadHandle::make_precompleted(3, ErrorCode::OK);
+    EXPECT_EQ(handle.num_chunks(), 3u);
+    EXPECT_EQ(handle.completed_count(), 3u);
+    EXPECT_TRUE(handle.is_chunk_ready(0));
+    EXPECT_TRUE(handle.is_chunk_ready(2));
+    EXPECT_FALSE(handle.is_chunk_ready(3));
+    EXPECT_EQ(handle.wait_chunk(0), ErrorCode::OK);
+    EXPECT_EQ(handle.wait_chunk(2), ErrorCode::OK);
+    EXPECT_EQ(handle.wait_chunk(3), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(handle.wait_all(), ErrorCode::OK);
+}
+
+TEST_F(TransferTaskTest, ChunkedReadHandlePrecompletedWithError) {
+    auto handle =
+        ChunkedReadHandle::make_precompleted(2, ErrorCode::TRANSFER_FAIL);
+    EXPECT_EQ(handle.num_chunks(), 2u);
+    EXPECT_TRUE(handle.is_chunk_ready(0));
+    EXPECT_EQ(handle.wait_chunk(0), ErrorCode::TRANSFER_FAIL);
+    EXPECT_EQ(handle.wait_all(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(TransferTaskTest, ChunkedReadHandleMoveSemantics) {
+    auto h1 = ChunkedReadHandle::make_precompleted(2, ErrorCode::OK);
+    EXPECT_EQ(h1.num_chunks(), 2u);
+    ChunkedReadHandle h2(std::move(h1));
+    EXPECT_EQ(h2.num_chunks(), 2u);
+    EXPECT_EQ(h2.wait_all(), ErrorCode::OK);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

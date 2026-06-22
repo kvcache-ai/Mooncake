@@ -17,9 +17,13 @@
 
 #include <bits/stdint-uintn.h>
 #include <errno.h>
+#include <linux/futex.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -198,56 +202,32 @@ class Transport {
 
        private:
         inline void check_batch_completion(bool is_failed) {
-#ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
 
-            // When the last slice of a task completes, check if the entire task
-            // is done using a single atomic counter to avoid reading
-            // inconsistent results.
             uint64_t prev_completed = __atomic_fetch_add(
                 &task->completed_slice_count, 1, __ATOMIC_RELAXED);
+            if (prev_completed + 1 != task->slice_count) return;
 
-            // Only the thread completing the final slice will see prev+1 ==
-            // slice_count.
-            if (prev_completed + 1 == task->slice_count) {
-                __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
-
-                // Increment the number of finished tasks in the batch
-                // (relaxed). This counter does not itself publish data; only
-                // the thread that observes the last task completion performs
-                // the release-store on batch_desc.is_finished below. The waiter
-                // pairs this with an acquire load, which makes all prior writes
-                // (including relaxed increments) visible.
-                //
-                // check if this is the last task in the batch
-                auto prev = batch_desc.finished_task_count.fetch_add(
-                    1, std::memory_order_relaxed);
-
-                // Last task in the batch: wake up waiting thread directly
-                if (prev + 1 == batch_desc.batch_size) {
-                    // Publish completion of the entire batch under the same
-                    // mutex used by the waiter to avoid lost notifications.
-                    //
-                    // Keep a release-store because the reader has a fast path
-                    // that may observe completion without taking the mutex. The
-                    // acquire load in that fast path pairs with this release to
-                    // make all prior updates visible. For the predicate checked
-                    // under the mutex, relaxed would suffice since the mutex
-                    // acquire provides the necessary visibility.
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            batch_desc.completion_mutex);
-                        batch_desc.is_finished.store(true,
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
+            batch_desc.finished_task_count.fetch_add(1,
                                                      std::memory_order_release);
-                    }
-                    // Notify after releasing the lock to avoid waking threads
-                    // only to block again on the mutex.
-                    batch_desc.completion_cv.notify_all();
-                }
+
+            static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+                          "futex on low-32 of uint64_t requires little-endian");
+            ::syscall(
+                SYS_futex,
+                reinterpret_cast<uint32_t *>(&batch_desc.finished_task_count),
+                FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            {
+                std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+                batch_desc.publish_completion_if_ready_locked();
             }
+            batch_desc.completion_cv.notify_all();
 #endif
         }
     };
@@ -312,9 +292,7 @@ class Transport {
         std::chrono::steady_clock::time_point start_time;
 #endif
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;
-#endif
 
         // record the origin request
 #ifdef USE_ASCEND_HETEROGENEOUS
@@ -336,21 +314,31 @@ class Transport {
         BatchID id;
         size_t batch_size;
         std::vector<TransferTask> task_list;
-        void *context;  // for transport implementers.
+        void *context;
         int64_t start_timestamp;
 
-        // Track batch progress and notifies waiters
-        std::atomic<bool> has_failure{false};
-        std::atomic<bool> is_finished{
-            false};  // Completion flag for wait predicate
-        std::atomic<uint64_t> finished_transfer_bytes{0};
+        mutable std::mutex lifecycle_mutex;
+        std::atomic<uint64_t> submitted_task_count{0};
+        std::atomic<bool> sealed{false};
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-        // Event-driven completion: tracks batch progress and notifies waiters
+        std::atomic<bool> has_failure{false};
+        std::atomic<bool> is_finished{false};
+        std::atomic<uint64_t> finished_transfer_bytes{0};
         std::atomic<uint64_t> finished_task_count{0};
 
-        // Synchronization primitives for direct notification
-        std::mutex completion_mutex;
+        bool is_complete() const {
+            return sealed.load(std::memory_order_acquire) &&
+                   finished_task_count.load(std::memory_order_acquire) ==
+                       submitted_task_count.load(std::memory_order_acquire);
+        }
+
+        void publish_completion_if_ready_locked() {
+            if (is_complete()) {
+                is_finished.store(true, std::memory_order_release);
+            }
+        }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
         std::condition_variable completion_cv;
 #endif
     };

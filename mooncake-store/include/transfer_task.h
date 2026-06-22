@@ -519,6 +519,39 @@ class FilereadWorkerPool {
     std::shared_ptr<StorageBackend> backend_;
 };
 
+class ChunkedReadSession;
+
+/**
+ * @brief Handle for tracking per-chunk completion of a chunked read.
+ *
+ * Wraps a shared ChunkedReadSession.  Callers poll or wait on individual
+ * chunks to overlap transfer with compute.  Returned by
+ * TransferSubmitter::submitProgressiveRead and
+ * TransferSubmitter::submitStreamingBatchReadRanges.
+ */
+class ChunkedReadHandle {
+   public:
+    explicit ChunkedReadHandle(std::shared_ptr<ChunkedReadSession> session);
+    ~ChunkedReadHandle();
+
+    ChunkedReadHandle(const ChunkedReadHandle&) = delete;
+    ChunkedReadHandle& operator=(const ChunkedReadHandle&) = delete;
+    ChunkedReadHandle(ChunkedReadHandle&& other) noexcept;
+    ChunkedReadHandle& operator=(ChunkedReadHandle&& other) noexcept;
+
+    size_t num_chunks() const;
+    bool is_chunk_ready(size_t chunk_index);
+    size_t completed_count();
+    ErrorCode wait_chunk(size_t chunk_index);
+    ErrorCode wait_all();
+
+    static ChunkedReadHandle make_precompleted(size_t num_chunks,
+                                               ErrorCode result);
+
+   private:
+    std::shared_ptr<ChunkedReadSession> session_;
+};
+
 /**
  * @brief Submitter class for asynchronous transfer operations
  *
