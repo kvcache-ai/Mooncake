@@ -118,21 +118,23 @@ setup_torch_musa_env() {
   append_path "${CUDA_COMPAT_HOME}/bin"
 
   # Export MUSA and PyTorch library directories before any build subprocess tries
-  # to load torch_musa extension libraries.
+  # to load torch_musa extension libraries.  Do not import torch_musa while
+  # computing these paths: its extension modules need this LD_LIBRARY_PATH first.
   torch_libs=$(python3 - <<'PY'
 import pathlib
-import torch
-import torch_musa
+import site
 
 paths = []
-for module in (torch, torch_musa):
-    lib = pathlib.Path(module.__file__).resolve().parent / "lib"
-    if lib.is_dir():
-        paths.append(str(lib))
+for site_dir in site.getsitepackages():
+    for package in ("torch", "torch_musa"):
+        lib = pathlib.Path(site_dir) / package / "lib"
+        if lib.is_dir():
+            paths.append(str(lib))
 print(":".join(paths))
 PY
   )
-  append_env "LD_LIBRARY_PATH=${MUSA_HOME}/lib:${torch_libs}:${LD_LIBRARY_PATH:-}"
+  musa_libs=$(find "${MUSA_HOME}" -type f -name 'lib*.so*' -printf '%h\n' 2>/dev/null | sort -u | paste -sd: -)
+  append_env "LD_LIBRARY_PATH=${musa_libs}:${torch_libs}:${LD_LIBRARY_PATH:-}"
 }
 
 verify_env() {
