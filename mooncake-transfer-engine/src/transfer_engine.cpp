@@ -179,6 +179,10 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
 
+std::map<std::string, TransportHealth> TransferEngine::getTransportHealthMap() const {
+    return impl_->getTransportHealthMap();
+}
+
 bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
 
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
@@ -578,6 +582,13 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
         return nullptr;
     else
         return impl_->getTransport(proto);
+}
+
+std::map<std::string, TransportHealth> TransferEngine::getTransportHealthMap() const {
+    if (use_tent_)
+        return {};
+    else
+        return impl_->getTransportHealthMap();
 }
 
 bool TransferEngine::isTcpOnly() const {

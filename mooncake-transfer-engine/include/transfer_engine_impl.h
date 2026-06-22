@@ -335,6 +335,10 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
+    std::map<std::string, TransportHealth> getTransportHealthMap() const {
+        return multi_transports_->getTransportHealthMap();
+    }
+
     bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
 
     int syncSegmentCache(const std::string& segment_name = "") {

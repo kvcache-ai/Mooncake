@@ -1641,6 +1641,31 @@ int RealClient::start_http_server() {
             resp.set_status_and_content(status_type::ok, std::move(*result));
         });
 
+    http_server_->set_http_handler<GET>(
+        "/transport_health",
+        [this](coro_http_request &req, coro_http_response &resp) {
+            if (!client_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "client not initialized");
+                return;
+            }
+            auto health_map = client_->GetTransportHealth();
+            std::string body = "{";
+            bool first = true;
+            for (auto &[proto, health] : health_map) {
+                if (!first) body += ",";
+                first = false;
+                body += "\"" + proto + "\":{";
+                body += "\"healthy\":" + std::string(health.healthy ? "true" : "false");
+                body += ",\"consecutive_failures\":" + std::to_string(health.consecutive_failures);
+                body += ",\"cooling_down\":" + std::string(health.isCoolingDown() ? "true" : "false");
+                body += "}";
+            }
+            body += "}";
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
     auto ec = http_server_->async_start();
     if (ec.hasResult()) {
         LOG(ERROR) << "Failed to start HTTP server on port " << FLAGS_http_port;

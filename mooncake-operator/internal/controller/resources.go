@@ -274,6 +274,8 @@ exec mooncake_client \
   --local_buffer_size=512MB \
   --metadata_server="${METADATA_SERVER}" \
   --protocol="` + protocol + `" \
+  --enable_http_server \
+  --http_port=9300 \
   --host="${POD_IP}:${MC_STORE_CLIENT_MIN_PORT}"
 `,
 		},
@@ -387,6 +389,9 @@ sys.exit(0)
 			},
 		},
 		Resources: mc.Spec.Workers.Resources,
+		Ports: []corev1.ContainerPort{
+			{Name: "http", ContainerPort: 9300, Protocol: corev1.ProtocolTCP},
+		},
 	}
 
 	volumes := []corev1.Volume{}

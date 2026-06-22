@@ -101,6 +101,11 @@ class MultiTransport {
     bool isTransportHealthy(const std::string &proto) const;
 
     /**
+     * @brief Get a snapshot of all transport health states.
+     */
+    std::map<std::string, TransportHealth> getTransportHealthMap() const;
+
+    /**
      * @brief Check if TCP is the only installed transport.
      *
      * When only TCP transport is available (no RDMA, NVLink, etc.),

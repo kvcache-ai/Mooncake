@@ -702,6 +702,11 @@ bool MultiTransport::isTransportHealthy(const std::string& proto) const {
     return it->second.healthy;
 }
 
+std::map<std::string, TransportHealth> MultiTransport::getTransportHealthMap() const {
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    return transport_health_;
+}
+
 void MultiTransport::tryRecoverTransports() {
     std::lock_guard<std::mutex> lock(health_mutex_);
     for (auto& entry : transport_health_) {

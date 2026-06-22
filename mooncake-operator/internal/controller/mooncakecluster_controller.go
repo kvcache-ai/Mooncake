@@ -528,12 +528,16 @@ func (r *MooncakeClusterReconciler) reconcileWorkerDeployment(ctx context.Contex
 	patchBase := client.MergeFrom(existing.DeepCopy())
 	existing.Spec.Replicas = desired.Spec.Replicas
 	existing.Spec.Template.Spec.TerminationGracePeriodSeconds = desired.Spec.Template.Spec.TerminationGracePeriodSeconds
+	existing.Spec.Template.Spec.Volumes = desired.Spec.Template.Spec.Volumes
 	existing.Spec.Template.Spec.Containers[0].Lifecycle = desired.Spec.Template.Spec.Containers[0].Lifecycle
 	existing.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
 	existing.Spec.Template.Spec.Containers[0].ImagePullPolicy = desired.Spec.Template.Spec.Containers[0].ImagePullPolicy
 	existing.Spec.Template.Spec.Containers[0].Command = desired.Spec.Template.Spec.Containers[0].Command
 	existing.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
+	existing.Spec.Template.Spec.Containers[0].Ports = desired.Spec.Template.Spec.Containers[0].Ports
 	existing.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
+	existing.Spec.Template.Spec.Containers[0].SecurityContext = desired.Spec.Template.Spec.Containers[0].SecurityContext
+	existing.Spec.Template.Spec.Containers[0].VolumeMounts = desired.Spec.Template.Spec.Containers[0].VolumeMounts
 	return r.Patch(ctx, &existing, patchBase)
 }
 
@@ -566,6 +570,18 @@ func deploymentSpecsEqual(a, b *appsv1.DeploymentSpec) bool {
 		return false
 	}
 	if !reflect.DeepEqual(ac.Lifecycle, bc.Lifecycle) {
+		return false
+	}
+	if !reflect.DeepEqual(ac.Ports, bc.Ports) {
+		return false
+	}
+	if !reflect.DeepEqual(ac.SecurityContext, bc.SecurityContext) {
+		return false
+	}
+	if !reflect.DeepEqual(ac.VolumeMounts, bc.VolumeMounts) {
+		return false
+	}
+	if !reflect.DeepEqual(a.Template.Spec.Volumes, b.Template.Spec.Volumes) {
 		return false
 	}
 	return true

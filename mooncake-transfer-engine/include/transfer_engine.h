@@ -150,6 +150,8 @@ class TransferEngine {
 
     Transport* getTransport(const std::string& proto);
 
+    std::map<std::string, TransportHealth> getTransportHealthMap() const;
+
     /**
      * @brief Check if TCP is the only installed transport.
      *

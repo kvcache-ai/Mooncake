@@ -1076,20 +1076,25 @@ if (cancelDrainMatch && req.method === 'POST') {
 
             const nodeRdmaCount = nodeRdma.get(nodeName) || 0
 
-            // Also try to query the worker pod's transfer health endpoint
+            // Also try to query the worker pod's transport health endpoint
             let rdmaAvailable = false
             let transportHealth = {}
             if (ready && podIP) {
               try {
                 const containerPort = pod.spec?.containers?.[0]?.ports?.find(
-                  p => p.name === 'metrics'
-                )?.containerPort || 9003
+                  p => p.name === 'http'
+                )?.containerPort || 9300
                 const proxyPrefix = `/api/v1/namespaces/${namespace}/pods/${podName}:${containerPort}/proxy`
                 const healthText = await k8sRequest(`${proxyPrefix}/transport_health`)
                 if (typeof healthText === 'string') {
                   const health = JSON.parse(healthText)
-                  rdmaAvailable = health?.rdma?.available ?? (rdmaRequested && rdmaAllocated > 0)
-                  transportHealth = health?.transports || {}
+                  transportHealth = health
+                  // Check if RDMA transport is healthy from runtime data
+                  if (health.rdma) {
+                    rdmaAvailable = health.rdma.healthy
+                  } else if (health.mock_rdma) {
+                    rdmaAvailable = health.mock_rdma.healthy
+                  }
                 }
               } catch (e) {
                 // Transport health endpoint not available; fall back to resource/CR check
