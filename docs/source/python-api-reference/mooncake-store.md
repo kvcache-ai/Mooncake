@@ -12,9 +12,13 @@ pip install mooncake-transfer-engine
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
 
 ### Required Service
-Only one service is required now:
+The only always-required service is:
 
-- `mooncake_master` — Master service which now embeds the HTTP metadata server
+- `mooncake_master` — Master service for cluster membership and object placement
+
+For Transfer Engine metadata, use the `P2PHANDSHAKE` connection string for
+decentralized peer discovery, enable the master's embedded HTTP metadata
+server, or provide an external metadata service.
 
 ## Quick Start
 
@@ -60,13 +64,17 @@ print(data.decode())  # Output: Hello, Mooncake Store!
 store.close()
 ```
 
-**RDMA device selection**: Leave `rdma_devices` as `""` to auto-select RDMA NICs. Provide a comma-separated list (e.g. `"mlx5_0,mlx5_1"`) to pin to specific hardware.
+**RDMA device selection**: For `protocol="rdma"` or `protocol="efa"`, leave
+`rdma_devices` as `""` to auto-discover NICs. Set `MC_MS_AUTO_DISC=0` when you
+want auto-discovery disabled, then provide a comma-separated list such as
+`"mlx5_0,mlx5_1"` to pin specific hardware.
 
 Mooncake selects available ports internally at `setup() `, so you do not need to fix specific port numbers in these examples. Internally, ports are chosen from a dynamic range (currently 12300–14300).
 
-#### P2P Hello World (preview)
+#### P2P Hello World
 
-The following setup uses the new P2P handshake and does not require an HTTP metadata server. This feature is not released yet; use only if you’re testing the latest code.
+The following setup uses P2P handshake and does not require an HTTP metadata
+server. Pass the literal `P2PHANDSHAKE` value as the metadata server.
 
 ```python
 from mooncake.store import MooncakeDistributedStore
@@ -937,11 +945,14 @@ print("Retrieved all keys successfully:", retrieved == values)
 
 ## Topology & Devices
 
-- Auto-discovery: Disabled by default. For `protocol="rdma"`, you must specify RDMA devices.
-- Enable auto-discovery (optional):
-  - `MC_MS_AUTO_DISC=1` enables auto-discovery; then `rdma_devices` is not required.
-  - Optionally restrict candidates with `MC_MS_FILTERS`, a comma-separated whitelist of NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
-  - If `MC_MS_AUTO_DISC` is not set or set to `0`, auto-discovery remains disabled and `rdma_devices` is required for RDMA.
+- Auto-discovery: Enabled by default for `protocol="rdma"` or `protocol="efa"`
+  when `rdma_devices` is empty.
+- Discovery controls:
+  - `MC_MS_AUTO_DISC=1` forces auto-discovery; then `rdma_devices` is ignored.
+  - `MC_MS_AUTO_DISC=0` disables auto-discovery; then `rdma_devices` is required
+    for RDMA/EFA.
+  - `MC_MS_FILTERS` restricts auto-discovery to a comma-separated whitelist of
+    NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
 
 Examples:
 
@@ -1022,22 +1033,30 @@ def setup(
     self,
     local_hostname: str,
     metadata_server: str,
-    global_segment_size: int = 16777216,
-    local_buffer_size: int = 1073741824,
-    protocol: str = "tcp",
-    rdma_devices: str = "",
+    global_segment_size: int,
+    local_buffer_size: int,
+    protocol: str,
+    rdma_devices: str,
     master_server_addr: str,
+    engine: Optional[TransferEngine] = None,
+    enable_ssd_offload: bool = False,
+    ssd_offload_path: str = "",
+    tenant_id: str = "default",
 ) -> int
 ```
 
 **Parameters:**
 - `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost" or "localhost:12345")
-- `metadata_server` (str): **Required**. Metadata server address (e.g., "http://localhost:8080/metadata")
-- `global_segment_size` (int): Memory segment size in bytes for mounting (default: 16MB = 16777216)
-- `local_buffer_size` (int): Local buffer size in bytes (default: 1GB = 1073741824)
-- `protocol` (str): Network protocol - "tcp" or "rdma" (default: "tcp")
-- `rdma_devices` (str): RDMA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-select NICs. Provide device names to pin the NICs. Always empty for TCP.
+- `metadata_server` (str): **Required**. Metadata connection string, e.g. `"P2PHANDSHAKE"` or `"http://localhost:8080/metadata"`.
+- `global_segment_size` (int): Memory segment size in bytes for mounting.
+- `local_buffer_size` (int): Local buffer size in bytes.
+- `protocol` (str): Network protocol, usually `"tcp"` or `"rdma"`.
+- `rdma_devices` (str): RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
 - `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
+- `engine` (Optional[TransferEngine]): Existing Transfer Engine instance to reuse. Defaults to `None`.
+- `enable_ssd_offload` (bool): Enable client-side SSD offload support. Defaults to `False`.
+- `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
+- `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)

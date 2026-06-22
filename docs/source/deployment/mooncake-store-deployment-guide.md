@@ -472,7 +472,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `global_segment_size` | int (bytes) | required | DRAM contributed to the cluster (the sample uses 3.2 GB) |
 | `local_buffer_size` | int (bytes) | required | Transfer Engine buffer |
 | `protocol` | str | required | `tcp` / `rdma` / `cxl` / `ascend` |
-| `rdma_devices` | str | required | RDMA NIC(s), comma-separated (pass `""` for non-RDMA). **Keyword is `rdma_devices`, not `device_name`** |
+| `rdma_devices` | str | required | RDMA/EFA NIC(s), comma-separated. Leave `""` to auto-discover for RDMA/EFA unless `MC_MS_AUTO_DISC=0`; always use `""` for TCP. **Keyword is `rdma_devices`, not `device_name`** |
 | `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
 | `enable_ssd_offload` | bool | `false` | *(advanced)* Enable client-side SSD offload |
@@ -500,7 +500,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_MASTER` | `master_server_addr` | — (required unless `MOONCAKE_CONFIG_PATH`) | Master `host:port` |
 | `MOONCAKE_TE_META_DATA_SERVER` | `metadata_server` | `P2PHANDSHAKE` | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
 | `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `cxl` / `ascend` |
-| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA device(s), comma-separated; `auto-discovery` supported |
+| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated. Leave empty for auto-discovery unless `MC_MS_AUTO_DISC=0` |
 | `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
