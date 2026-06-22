@@ -6,7 +6,7 @@
 #include <string_view>
 
 #include "tiered_cache/scheduler/stats_collector.h"  // AccessStats
-#include "types.h"                                    // UUID
+#include "types.h"                                   // UUID
 
 namespace mooncake {
 

@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "tiered_cache/tiered_backend.h"  // TierView
-#include "types.h"                         // UUID
+#include "types.h"                        // UUID
 
 namespace mooncake {
 
@@ -38,8 +38,8 @@ struct TierRoleConfig {
 };
 
 struct TierRoles {
-    UUID fast{};                // fast role (priority-highest by default)
-    std::optional<UUID> slow;   // slow role; nullopt => offload/onboard disabled
+    UUID fast{};               // fast role (priority-highest by default)
+    std::optional<UUID> slow;  // slow role; nullopt => offload/onboard disabled
 };
 
 namespace tier_roles_detail {
@@ -71,8 +71,8 @@ inline bool HasTag(const TierView& v, const std::string& tag) {
 }
 
 // Highest-priority tier whose id differs from `fast` (nullptr if none).
-inline const TierView* HighestExcept(
-    const std::vector<const TierView*>& sorted, UUID fast) {
+inline const TierView* HighestExcept(const std::vector<const TierView*>& sorted,
+                                     UUID fast) {
     for (const auto* v : sorted) {
         if (v->id != fast) {
             return v;

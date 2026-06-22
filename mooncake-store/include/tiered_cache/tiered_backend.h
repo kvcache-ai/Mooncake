@@ -302,9 +302,9 @@ class TieredBackend {
      * @brief Get hot key statistics from the scheduler (e.g. for HA recovery
      *        prioritization).
      * @param hot_key_num see IClientScheduler::GetHotKeyStats. Defaults to
-     *        nullopt, which resolves to the startup config scheduler.hot_key_num
-     *        (default 64); set scheduler.hot_key_num=0 to return all tracked
-     *        keys (the historical no-arg behavior).
+     *        nullopt, which resolves to the startup config
+     * scheduler.hot_key_num (default 64); set scheduler.hot_key_num=0 to return
+     * all tracked keys (the historical no-arg behavior).
      */
     AccessStats GetHotKeyStats(
         std::optional<size_t> hot_key_num = std::nullopt) const;

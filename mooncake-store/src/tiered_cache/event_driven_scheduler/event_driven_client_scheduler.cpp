@@ -22,14 +22,16 @@ EventDrivenClientScheduler::EventDrivenClientScheduler(
     : backend_(backend),
       policy_(std::move(policy)),
       move_q_(ed_config::ReadSize(config, "queue_capacity", 1024)),
-      pool_(std::make_unique<ThreadPool>(
-          std::max<size_t>(1, ed_config::ReadSize(config, "thread_count", 2)))) {
+      pool_(std::make_unique<ThreadPool>(std::max<size_t>(
+          1, ed_config::ReadSize(config, "thread_count", 2)))) {
     role_cfg_.mode =
         (ed_config::ReadString(config, "tier_role_mode", "auto") == "manual")
             ? TierRoleMode::kManual
             : TierRoleMode::kAuto;
-    role_cfg_.fast_tier_tag = ed_config::ReadString(config, "fast_tier_tag", "");
-    role_cfg_.slow_tier_tag = ed_config::ReadString(config, "slow_tier_tag", "");
+    role_cfg_.fast_tier_tag =
+        ed_config::ReadString(config, "fast_tier_tag", "");
+    role_cfg_.slow_tier_tag =
+        ed_config::ReadString(config, "slow_tier_tag", "");
 
     loop_interval_ms_ = ed_config::ReadInt(config, "loop_interval_ms", 1000);
     if (loop_interval_ms_ <= 0) {
@@ -142,8 +144,8 @@ bool EventDrivenClientScheduler::OnAllocationFailure(
         ctx.tier_id != fast_tier_id_) {
         return false;
     }
-    // Nudge the periodic loop, then synchronously reclaim at least the requested
-    // amount using the policy's eviction decision.
+    // Nudge the periodic loop, then synchronously reclaim at least the
+    // requested amount using the policy's eviction decision.
     {
         std::lock_guard<std::mutex> lk(evict_mutex_);
         evict_wakeup_ = true;
@@ -201,9 +203,10 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
     switch (mv.kind) {
         case MovementRequest::Kind::kReplicate: {
             // Copy source -> dest, retaining the source (e.g. pre-demote). The
-            // CAS on the re-read version makes a stale request a no-op. CopyData
-            // is strict, so the offload lands on dest (the slow tier) or is
-            // skipped — it never bounces back onto a higher-priority tier.
+            // CAS on the re-read version makes a stale request a no-op.
+            // CopyData is strict, so the offload lands on dest (the slow tier)
+            // or is skipped — it never bounces back onto a higher-priority
+            // tier.
             uint64_t version = 0;
             auto src = backend_->Get(mv.key, mv.source_tier,
                                      /*record_access=*/false, &version);
@@ -221,13 +224,13 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
             return true;
         }
         case MovementRequest::Kind::kMigrate: {
-            // Copy source -> dest, then delete source. CopyData is strict, so it
-            // must land on dest (sync-evicting it if full) and can never fall
-            // back to another tier — a successful copy means the new replica is
-            // genuinely on dest, so deleting the source cannot lose the only
-            // copy. (Strict also makes onboard actually evict-to-fit instead of
-            // silently re-landing the copy on the slow tier under fast-tier
-            // pressure.)
+            // Copy source -> dest, then delete source. CopyData is strict, so
+            // it must land on dest (sync-evicting it if full) and can never
+            // fall back to another tier — a successful copy means the new
+            // replica is genuinely on dest, so deleting the source cannot lose
+            // the only copy. (Strict also makes onboard actually evict-to-fit
+            // instead of silently re-landing the copy on the slow tier under
+            // fast-tier pressure.)
             uint64_t version = 0;
             auto src = backend_->Get(mv.key, mv.source_tier,
                                      /*record_access=*/false, &version);
@@ -262,8 +265,8 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
     return false;
 }
 
-bool EventDrivenClientScheduler::HasAvailableBytes(UUID tier_id,
-                                                   size_t required_bytes) const {
+bool EventDrivenClientScheduler::HasAvailableBytes(
+    UUID tier_id, size_t required_bytes) const {
     for (const auto& view : backend_->GetTierViews()) {
         if (view.id == tier_id) {
             return view.free_space >= required_bytes;

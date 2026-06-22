@@ -1300,7 +1300,8 @@ TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
 
 // P0-2: an unrecognized scheduler.type must WARN and fall back to legacy
 // rather than silently ignoring the misconfiguration.
-TEST_F(SchedulerIntegrationTest, UnknownSchedulerTypeWarnsAndFallsBackToLegacy) {
+TEST_F(SchedulerIntegrationTest,
+       UnknownSchedulerTypeWarnsAndFallsBackToLegacy) {
     config_["scheduler"]["type"] = "definitely_not_a_real_type";
 
     LogCaptureSink sink;

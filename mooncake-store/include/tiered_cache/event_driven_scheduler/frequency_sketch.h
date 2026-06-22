@@ -37,13 +37,13 @@ class FixedDecayPolicy {
     // min(capacity * 10, UINT32_MAX), with saturating multiply.
     static FixedDecayPolicy FromCapacity(size_t cap) {
         const uint64_t cap64 = static_cast<uint64_t>(cap);
-        const uint64_t prod = (cap64 > std::numeric_limits<uint64_t>::max() / 10)
-                                  ? std::numeric_limits<uint64_t>::max()
-                                  : cap64 * 10;
-        const uint32_t sample =
-            (prod > std::numeric_limits<uint32_t>::max())
-                ? std::numeric_limits<uint32_t>::max()
-                : static_cast<uint32_t>(prod);
+        const uint64_t prod =
+            (cap64 > std::numeric_limits<uint64_t>::max() / 10)
+                ? std::numeric_limits<uint64_t>::max()
+                : cap64 * 10;
+        const uint32_t sample = (prod > std::numeric_limits<uint32_t>::max())
+                                    ? std::numeric_limits<uint32_t>::max()
+                                    : static_cast<uint32_t>(prod);
         return FixedDecayPolicy(sample);
     }
 
@@ -62,11 +62,13 @@ class FrequencySketch {
     // sample_size == 0 => derive from capacity via FixedDecayPolicy.
     explicit FrequencySketch(size_t capacity, uint32_t sample_size = 0)
         : table_(std::max<size_t>(1, capacity / 4), 0),
-          sample_size_(sample_size == 0
-                           ? FixedDecayPolicy::FromCapacity(capacity).sample_size()
-                           : sample_size) {}
+          sample_size_(
+              sample_size == 0
+                  ? FixedDecayPolicy::FromCapacity(capacity).sample_size()
+                  : sample_size) {}
 
-    // Bump all 4 rows (saturating at 15). Triggers a halving reset on threshold.
+    // Bump all 4 rows (saturating at 15). Triggers a halving reset on
+    // threshold.
     void Increment(uint64_t key) {
         std::lock_guard<std::mutex> lock(mu_);
         IncrementLocked(key);
@@ -201,14 +203,14 @@ class FrequencySketch {
     // output of a row.
     static uint64_t Hash(uint64_t key, int row) {
         static constexpr uint64_t kInc[kDepth] = {
-            0x9E3779B97F4A7C15ULL, 0xD1B54A32D192ED03ULL,
-            0xCA5A826395121157ULL, 0x2545F4914F6CDD1DULL};
+            0x9E3779B97F4A7C15ULL, 0xD1B54A32D192ED03ULL, 0xCA5A826395121157ULL,
+            0x2545F4914F6CDD1DULL};
         static constexpr uint64_t kMulA[kDepth] = {
-            0xBF58476D1CE4E5B9ULL, 0xC2B2AE3D27D4EB4FULL,
-            0xFF51AFD7ED558CCDULL, 0x9FB21C651E98DF25ULL};
+            0xBF58476D1CE4E5B9ULL, 0xC2B2AE3D27D4EB4FULL, 0xFF51AFD7ED558CCDULL,
+            0x9FB21C651E98DF25ULL};
         static constexpr uint64_t kMulB[kDepth] = {
-            0x94D049BB133111EBULL, 0x165667B19E3779F9ULL,
-            0xC4CEB9FE1A85EC53ULL, 0x9E3779B97F4A7C15ULL};
+            0x94D049BB133111EBULL, 0x165667B19E3779F9ULL, 0xC4CEB9FE1A85EC53ULL,
+            0x9E3779B97F4A7C15ULL};
         uint64_t x = key + kInc[row];
         x = (x ^ (x >> 30)) * kMulA[row];
         x = (x ^ (x >> 27)) * kMulB[row];

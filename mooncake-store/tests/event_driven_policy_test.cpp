@@ -12,7 +12,7 @@
 #include "tiered_cache/scheduler/scheduler_factory.h"  // detail::ReadMultiLRUConfig
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
-#include "utils/common.h"                    // InitTieredBackendForTest
+#include "utils/common.h"                   // InitTieredBackendForTest
 
 namespace mooncake {
 namespace {
@@ -184,7 +184,8 @@ TEST(MultiLRUPolicyTest, DecideEvictAboveWatermarkEmitsEvicts) {
     ASSERT_FALSE(movements.empty());
     for (const auto& mv : movements) {
         EXPECT_EQ(mv.source_tier, fast);
-        // Eviction only drops fast-tier copies; it never migrates synchronously.
+        // Eviction only drops fast-tier copies; it never migrates
+        // synchronously.
         EXPECT_EQ(mv.kind, MovementRequest::Kind::kEvict);
     }
 }
@@ -313,8 +314,8 @@ TEST(MultiLRUPolicyTest, AllocFailurePathDoesNotConsumeWriteLoad) {
     // Allocation-failure pass first: must leave the accumulator intact.
     policy.DecideEvict(/*min_reclaim_bytes=*/1);
     // Periodic pass still sees the load and floats the trigger DOWN to the low
-    // bound (it would rest at the high bound had the alloc-failure pass consumed
-    // the accumulator).
+    // bound (it would rest at the high bound had the alloc-failure pass
+    // consumed the accumulator).
     policy.DecideEvict(0);
     EXPECT_NEAR(policy.evict_wm(), cfg.evict_watermark_low, 1e-6);
 }
@@ -348,7 +349,8 @@ TEST(SchedulerFactoryConfigTest, CandidateScanLimitUsesOwnKey) {
     EXPECT_EQ(c.candidate_scan_limit, 128u);
 }
 
-TEST(SchedulerFactoryConfigTest, LegacyStatsSnapshotLimitDoesNotPolluteScanLimit) {
+TEST(SchedulerFactoryConfigTest,
+     LegacyStatsSnapshotLimitDoesNotPolluteScanLimit) {
     // stats_snapshot_limit is a *legacy* scheduler knob (0 == "snapshot all").
     // The event-driven policy must ignore it and keep its own default, rather
     // than inheriting 0 and mapping it to SIZE_MAX (a full scan every pass).

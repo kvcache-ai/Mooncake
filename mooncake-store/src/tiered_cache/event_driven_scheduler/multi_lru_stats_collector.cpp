@@ -56,7 +56,8 @@ void MultiLRUStatsCollector::OnDelete(std::string_view key,
     // and should remember a key's heat across residency churn.
 }
 
-uint64_t MultiLRUStatsCollector::GetAccessFrequency(std::string_view key) const {
+uint64_t MultiLRUStatsCollector::GetAccessFrequency(
+    std::string_view key) const {
     return sketch_.Estimate(HashKey(key));
 }
 

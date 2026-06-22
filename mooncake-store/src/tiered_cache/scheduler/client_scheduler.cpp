@@ -13,7 +13,7 @@
 namespace mooncake {
 
 LegacyClientScheduler::LegacyClientScheduler(TieredBackend* backend,
-                                 const Json::Value& config)
+                                             const Json::Value& config)
     : backend_(backend) {
     std::string policy_type = "SIMPLE";  // Default
     size_t stats_shards = detail::DefaultStatsShardCount();
@@ -40,8 +40,8 @@ LegacyClientScheduler::LegacyClientScheduler(TieredBackend* backend,
 
     if (config.isMember("scheduler") &&
         config["scheduler"].isMember("hot_key_num")) {
-        hot_key_num_ = static_cast<size_t>(
-            config["scheduler"]["hot_key_num"].asUInt64());
+        hot_key_num_ =
+            static_cast<size_t>(config["scheduler"]["hot_key_num"].asUInt64());
     }
 
     // Read eviction mode configuration
@@ -226,7 +226,8 @@ void LegacyClientScheduler::WorkerLoop() {
 
         // 3. Make Decision
         if (!policy_) {
-            LOG(ERROR) << "LegacyClientScheduler worker has no policy configured";
+            LOG(ERROR)
+                << "LegacyClientScheduler worker has no policy configured";
             continue;
         }
 
@@ -245,7 +246,8 @@ void LegacyClientScheduler::WorkerLoop() {
     }
 }
 
-std::unordered_map<UUID, TierStats> LegacyClientScheduler::CollectTierStats() const {
+std::unordered_map<UUID, TierStats> LegacyClientScheduler::CollectTierStats()
+    const {
     std::unordered_map<UUID, TierStats> tier_stats_map;
     for (const auto& [id, tier] : tiers_) {
         tier_stats_map[id] = {tier->GetCapacity(), tier->GetUsage()};
@@ -278,8 +280,8 @@ LegacyClientScheduler::KeyCacheShard& LegacyClientScheduler::GetKeyCacheShard(
     return key_cache_shards_[KeyCacheShardIndex(key)];
 }
 
-const LegacyClientScheduler::KeyCacheShard& LegacyClientScheduler::GetKeyCacheShard(
-    std::string_view key) const {
+const LegacyClientScheduler::KeyCacheShard&
+LegacyClientScheduler::GetKeyCacheShard(std::string_view key) const {
     return key_cache_shards_[KeyCacheShardIndex(key)];
 }
 
@@ -389,8 +391,9 @@ size_t LegacyClientScheduler::GetCachedKeySize(const std::string& key) const {
 }
 
 void LegacyClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
-                                         std::string_view key, UUID tier_id,
-                                         size_t size_bytes) {
+                                               std::string_view key,
+                                               UUID tier_id,
+                                               size_t size_bytes) {
     auto cache_it = shard.key_cache.find(key);
     if (cache_it == shard.key_cache.end()) {
         cache_it =
@@ -412,8 +415,8 @@ void LegacyClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
 }
 
 bool LegacyClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
-                                          std::string_view key,
-                                          std::optional<UUID> tier_id) {
+                                                std::string_view key,
+                                                std::optional<UUID> tier_id) {
     auto cache_it = shard.key_cache.find(key);
     if (cache_it == shard.key_cache.end()) {
         return true;
@@ -455,7 +458,8 @@ bool LegacyClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
     return false;
 }
 
-void LegacyClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
+void LegacyClientScheduler::ExecuteActions(
+    const std::vector<SchedAction>& actions) {
     // Execute in three phases: EVICT first, then MIGRATE, then REPLICATE.
     // This keeps the fast path biased towards freeing space before background
     // copy work.
@@ -588,7 +592,8 @@ void LegacyClientScheduler::ExecuteActions(const std::vector<SchedAction>& actio
     }
 }
 
-bool LegacyClientScheduler::TriggerSyncEviction(UUID tier_id, size_t required_bytes) {
+bool LegacyClientScheduler::TriggerSyncEviction(UUID tier_id,
+                                                size_t required_bytes) {
     auto tier_stats = CollectTierStats();
     auto access_stats = stats_collector_->GetSnapshot();
     auto active_keys = BuildActiveKeys(access_stats, tier_id);
@@ -610,7 +615,8 @@ bool LegacyClientScheduler::TriggerSyncEviction(UUID tier_id, size_t required_by
     return reclaimed_bytes >= plan.target_reclaim_bytes && enough_space;
 }
 
-bool LegacyClientScheduler::TryFastReclaim(UUID tier_id, size_t required_bytes) {
+bool LegacyClientScheduler::TryFastReclaim(UUID tier_id,
+                                           size_t required_bytes) {
     auto tier_stats = CollectTierStats();
     auto access_stats = stats_collector_->GetSnapshot();
     auto active_keys = BuildActiveKeys(access_stats, tier_id);
@@ -734,7 +740,7 @@ size_t LegacyClientScheduler::ExecuteReclaimPlan(const PlannedReclaim& plan) {
 }
 
 bool LegacyClientScheduler::HasAvailableBytes(UUID tier_id,
-                                        size_t required_bytes) const {
+                                              size_t required_bytes) const {
     auto tier_it = tiers_.find(tier_id);
     if (tier_it == tiers_.end() || !tier_it->second) {
         return false;

@@ -31,8 +31,8 @@ MultiLRUPolicy::MultiLRUPolicy(const Config& config, ClockFn clock)
       clock_(clock ? std::move(clock)
                    : ClockFn{[] { return std::chrono::steady_clock::now(); }}),
       // Start at the low bound: assume high write load at startup so the tier
-      // begins with maximum headroom (avoids an immediate alloc-failure fallback
-      // before the first periodic pass measures the real load).
+      // begins with maximum headroom (avoids an immediate alloc-failure
+      // fallback before the first periodic pass measures the real load).
       evict_wm_(config.evict_watermark_low) {}
 
 void MultiLRUPolicy::Init(TieredBackend* backend, UUID fast_tier,
@@ -49,9 +49,10 @@ size_t MultiLRUPolicy::BestEffortSize(std::string_view key, size_t hint) const {
         return hint;
     }
     uint64_t version = 0;
-    auto handle = backend_->Get(key, fast_tier_, /*record_access=*/false,
-                                &version);
-    if (handle.has_value() && handle.value() && handle.value()->loc.data.buffer) {
+    auto handle =
+        backend_->Get(key, fast_tier_, /*record_access=*/false, &version);
+    if (handle.has_value() && handle.value() &&
+        handle.value()->loc.data.buffer) {
         return handle.value()->loc.data.buffer->size();
     }
     return 0;
@@ -86,7 +87,8 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
     const auto views = backend_->GetTierViews();
     const TierView* fast = FindView(views, fast_tier_);
     if (fast == nullptr) {
-        // Topology inconsistency: the resolved fast tier is gone from the views.
+        // Topology inconsistency: the resolved fast tier is gone from the
+        // views.
         VLOG(2) << "MultiLRU OnAccess: fast tier view missing for " << ctx.key;
         return std::nullopt;
     }
@@ -150,9 +152,9 @@ double MultiLRUPolicy::RefreshEvictWatermark(size_t capacity) {
     }
 
     // Feed it into a time-decayed write-rate integrator (time constant
-    // evict_load_window_s). At steady state load_accum_ ~= rate * window, so the
-    // load reflects sustained throughput rather than one short pass's bytes and
-    // can reach full scale regardless of how fast this loop runs.
+    // evict_load_window_s). At steady state load_accum_ ~= rate * window, so
+    // the load reflects sustained throughput rather than one short pass's bytes
+    // and can reach full scale regardless of how fast this loop runs.
     const auto now = clock_();
     if (load_tp_valid_) {
         const double tau = config_.evict_load_window_s;
@@ -246,9 +248,9 @@ std::vector<MovementRequest> MultiLRUPolicy::DecideEvict(
     //
     // Design assumption: fast-tier data is reconstructible cache (KVCache), so
     // dropping a cold sole copy costs at most a recompute/refetch. Unlike the
-    // legacy path (which MIGRATEs a sole copy down before EVICTing), this trades
-    // that guarantee for evict-loop speed. Do NOT route non-cache, single-copy-
-    // of-record data through this policy expecting durability.
+    // legacy path (which MIGRATEs a sole copy down before EVICTing), this
+    // trades that guarantee for evict-loop speed. Do NOT route non-cache,
+    // single-copy- of-record data through this policy expecting durability.
     const auto candidates =
         collector_.CollectEvictionCandidates(config_.candidate_scan_limit);
     size_t planned = 0;
@@ -271,9 +273,9 @@ std::vector<MovementRequest> MultiLRUPolicy::DecideEvict(
         }
     }
     // Backpressure path could not free enough: surface it instead of silently
-    // under-reclaiming (the allocation retry may then still fail). The candidate
-    // scan is capped at candidate_scan_limit, so a large cold working set can
-    // leave a single pass short.
+    // under-reclaiming (the allocation retry may then still fail). The
+    // candidate scan is capped at candidate_scan_limit, so a large cold working
+    // set can leave a single pass short.
     if (min_reclaim_bytes > 0 && planned < min_reclaim_bytes) {
         LOG_EVERY_N(WARNING, 50)
             << "MultiLRU allocation-failure reclaim fell short: freed "

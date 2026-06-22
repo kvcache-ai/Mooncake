@@ -51,7 +51,8 @@ class FixedStatsTier : public CacheTier {
     FixedStatsTier(UUID id, size_t capacity, size_t usage, MemoryType type)
         : id_(id), capacity_(capacity), usage_(usage), type_(type) {}
 
-    tl::expected<void, ErrorCode> Init(TieredBackend*, TransferEngine*) override {
+    tl::expected<void, ErrorCode> Init(TieredBackend*,
+                                       TransferEngine*) override {
         return {};
     }
     tl::expected<void, ErrorCode> Allocate(size_t, DataSource&) override {
@@ -176,11 +177,11 @@ class TieredBackendTest : public ::testing::Test {
 // HasAvailableBytes (free_space >= required) accept any allocation.
 TEST_F(TieredBackendTest, GetTierViewsClampsFreeSpaceWhenUsageExceedsCapacity) {
     TieredBackend backend;
-    InjectTier(backend,
-               std::make_shared<FixedStatsTier>(UUID{7, 7}, /*capacity=*/1000,
-                                                 /*usage=*/1500,
-                                                 MemoryType::DRAM),
-               /*priority=*/10);
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{7, 7}, /*capacity=*/1000,
+                                         /*usage=*/1500, MemoryType::DRAM),
+        /*priority=*/10);
 
     auto views = backend.GetTierViews();
     ASSERT_EQ(views.size(), 1u);
@@ -195,11 +196,11 @@ TEST_F(TieredBackendTest, GetTierViewsClampsFreeSpaceWhenUsageExceedsCapacity) {
 // Sanity: the normal usage < capacity path still reports the exact remainder.
 TEST_F(TieredBackendTest, GetTierViewsReportsExactFreeSpaceBelowCapacity) {
     TieredBackend backend;
-    InjectTier(backend,
-               std::make_shared<FixedStatsTier>(UUID{8, 8}, /*capacity=*/1000,
-                                                 /*usage=*/400,
-                                                 MemoryType::DRAM),
-               /*priority=*/10);
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{8, 8}, /*capacity=*/1000,
+                                         /*usage=*/400, MemoryType::DRAM),
+        /*priority=*/10);
 
     auto views = backend.GetTierViews();
     ASSERT_EQ(views.size(), 1u);
@@ -210,18 +211,18 @@ TEST_F(TieredBackendTest, GetTierViewsReportsExactFreeSpaceBelowCapacity) {
 // highest-priority DRAM tier and ignore non-DRAM tiers regardless of priority.
 TEST_F(TieredBackendTest, GetDramTierIdPicksHighestPriorityDram) {
     TieredBackend backend;
-    InjectTier(backend,
-               std::make_shared<FixedStatsTier>(UUID{1, 1}, 1000, 0,
-                                                 MemoryType::NVME),
-               /*priority=*/100);  // highest priority but NOT DRAM
-    InjectTier(backend,
-               std::make_shared<FixedStatsTier>(UUID{2, 2}, 1000, 0,
-                                                 MemoryType::DRAM),
-               /*priority=*/20);
-    InjectTier(backend,
-               std::make_shared<FixedStatsTier>(UUID{3, 3}, 1000, 0,
-                                                 MemoryType::DRAM),
-               /*priority=*/50);  // highest-priority DRAM
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{1, 1}, 1000, 0, MemoryType::NVME),
+        /*priority=*/100);  // highest priority but NOT DRAM
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{2, 2}, 1000, 0, MemoryType::DRAM),
+        /*priority=*/20);
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{3, 3}, 1000, 0, MemoryType::DRAM),
+        /*priority=*/50);  // highest-priority DRAM
 
     auto dram = backend.GetDramTierId();
     ASSERT_TRUE(dram.has_value());
@@ -230,10 +231,10 @@ TEST_F(TieredBackendTest, GetDramTierIdPicksHighestPriorityDram) {
 
 TEST_F(TieredBackendTest, GetDramTierIdNulloptWhenNoDram) {
     TieredBackend backend;
-    InjectTier(backend,
-               std::make_shared<FixedStatsTier>(UUID{1, 1}, 1000, 0,
-                                                 MemoryType::NVME),
-               /*priority=*/100);
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{1, 1}, 1000, 0, MemoryType::NVME),
+        /*priority=*/100);
     EXPECT_FALSE(backend.GetDramTierId().has_value());
 }
 

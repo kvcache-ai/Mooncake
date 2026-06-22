@@ -6,7 +6,7 @@
 
 #include "tiered_cache/event_driven_scheduler/scheduler_context.h"
 #include "tiered_cache/scheduler/stats_collector.h"  // AccessStats
-#include "types.h"                                    // UUID
+#include "types.h"                                   // UUID
 
 namespace mooncake {
 
@@ -33,9 +33,9 @@ class IClientScheduler {
     virtual void RegisterTier(CacheTier* tier) = 0;
 
     // --- Incoming event hooks (thread-safe), Context-carrying ---
-    // All hook payloads are bundled into Context structs so the payload can grow
-    // (e.g. served_tier_id) without churning signatures or call sites. The data
-    // plane always invokes these Context variants.
+    // All hook payloads are bundled into Context structs so the payload can
+    // grow (e.g. served_tier_id) without churning signatures or call sites. The
+    // data plane always invokes these Context variants.
     virtual void OnAccess(const AccessContext& ctx) = 0;
     virtual void OnCommit(const CommitContext& ctx) = 0;
     virtual void OnDelete(const DeleteContext& ctx) = 0;
@@ -48,10 +48,10 @@ class IClientScheduler {
      * @brief Get current hot key statistics (e.g. for HA recovery
      *        prioritization).
      * @param hot_key_num Number of hottest keys to return.
-     *        - nullopt (default): use the startup config `scheduler.hot_key_num`
-     *          (defaults to 64). NOTE: this differs from the historical no-arg
-     *          behavior which returned *all* tracked keys. Deployments that need
-     *          the old "return everything" semantics should set
+     *        - nullopt (default): use the startup config
+     * `scheduler.hot_key_num` (defaults to 64). NOTE: this differs from the
+     * historical no-arg behavior which returned *all* tracked keys. Deployments
+     * that need the old "return everything" semantics should set
      *          `scheduler.hot_key_num = 0`.
      *        - explicit value: override for this call.
      *        - resolves to 0: return all (subject to the snapshot limit).

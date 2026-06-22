@@ -39,7 +39,8 @@ class CacheTier;
  */
 class EventDrivenClientScheduler : public IClientScheduler {
    public:
-    EventDrivenClientScheduler(TieredBackend* backend, const Json::Value& config,
+    EventDrivenClientScheduler(TieredBackend* backend,
+                               const Json::Value& config,
                                std::unique_ptr<EventDrivenPolicy> policy);
     ~EventDrivenClientScheduler() override;  // Stop() runs first (idempotent)
 
@@ -57,8 +58,9 @@ class EventDrivenClientScheduler : public IClientScheduler {
         std::optional<size_t> hot_key_num = std::nullopt) const override;
 
    private:
-    void EvictLoop();    // background evict thread
-    void ResolveRoles();  // resolve fast/slow from tier topology, Init the policy
+    void EvictLoop();  // background evict thread
+    void
+    ResolveRoles();  // resolve fast/slow from tier topology, Init the policy
 
     // Execute a single policy-decided movement against the data plane. Returns
     // true if the movement's source-side effect succeeded.

@@ -124,8 +124,8 @@ class MultiLRU {
         for (int band = kNumHeatBands - 1; band >= 0; --band) {
             for (const auto& node : lists_[band]) {  // front(MRU) -> back(LRU)
                 if (out.size() >= n) return out;
-                out.push_back(MultiLRUEntry{node.key, node.size_bytes,
-                                            node.band});
+                out.push_back(
+                    MultiLRUEntry{node.key, node.size_bytes, node.band});
             }
         }
         return out;

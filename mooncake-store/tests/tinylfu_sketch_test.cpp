@@ -51,8 +51,8 @@ TEST(TinyLFUSketchTest, AutoResetReducesCounters) {
     for (int i = 0; i < 4; ++i) {
         s.Increment(9);  // the 4th increment trips the decay threshold
     }
-    EXPECT_LT(s.size(), 4u);        // size counter was reduced by the reset
-    EXPECT_LE(s.Estimate(9), 2u);   // counters halved (4 -> 2)
+    EXPECT_LT(s.size(), 4u);       // size counter was reduced by the reset
+    EXPECT_LE(s.Estimate(9), 2u);  // counters halved (4 -> 2)
 }
 
 TEST(TinyLFUSketchTest, IndependentRowsKeepUnrelatedKeysLow) {
@@ -92,7 +92,8 @@ TEST(TinyLFUSketchTest, FusedIncrementAndEstimateAcrossAutoReset) {
     FrequencySketch split(/*capacity=*/64, /*sample_size=*/4);
     for (int i = 0; i < 8; ++i) {
         split.Increment(9);
-        EXPECT_EQ(fused.IncrementAndEstimate(9), split.Estimate(9)) << "i=" << i;
+        EXPECT_EQ(fused.IncrementAndEstimate(9), split.Estimate(9))
+            << "i=" << i;
     }
     EXPECT_EQ(fused.size(), split.size());
 }

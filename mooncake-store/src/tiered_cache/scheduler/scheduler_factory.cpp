@@ -21,8 +21,8 @@ MultiLRUPolicy::Config ReadMultiLRUConfig(const Json::Value& config) {
     // Floating-trigger bounds. New keys evict_watermark_low/high; the legacy
     // keys user_floor/evict_watermark are accepted as deprecated fallbacks.
     const Json::Value* sched = ed_config::Node(config);
-    if (sched && (sched->isMember("user_floor") ||
-                  sched->isMember("evict_watermark"))) {
+    if (sched &&
+        (sched->isMember("user_floor") || sched->isMember("evict_watermark"))) {
         LOG(WARNING) << "scheduler.user_floor / scheduler.evict_watermark are "
                         "deprecated; prefer evict_watermark_low / "
                         "evict_watermark_high";
@@ -30,10 +30,10 @@ MultiLRUPolicy::Config ReadMultiLRUConfig(const Json::Value& config) {
     c.evict_watermark_low = ed_config::ReadDouble(
         config, "evict_watermark_low",
         ed_config::ReadDouble(config, "user_floor", c.evict_watermark_low));
-    c.evict_watermark_high = ed_config::ReadDouble(
-        config, "evict_watermark_high",
-        ed_config::ReadDouble(config, "evict_watermark",
-                              c.evict_watermark_high));
+    c.evict_watermark_high =
+        ed_config::ReadDouble(config, "evict_watermark_high",
+                              ed_config::ReadDouble(config, "evict_watermark",
+                                                    c.evict_watermark_high));
     c.limit_watermark =
         ed_config::ReadDouble(config, "limit_watermark", c.limit_watermark);
     c.evict_rate_k =
@@ -53,9 +53,9 @@ MultiLRUPolicy::Config ReadMultiLRUConfig(const Json::Value& config) {
     if (c.candidate_scan_limit == 0) {
         c.candidate_scan_limit = std::numeric_limits<size_t>::max();
     }
-
     // Sanity-check the watermark ordering (low <= high <= limit) and the load
-    // window (> 0). Clamp + warn rather than silently mis-reclaiming.
+    // window (> 0). Clamp and warn rather than silently performing incorrect
+    // reclamation.
     if (c.evict_watermark_high < c.evict_watermark_low) {
         LOG(WARNING) << "evict_watermark_high (" << c.evict_watermark_high
                      << ") < evict_watermark_low (" << c.evict_watermark_low
@@ -85,7 +85,8 @@ namespace {
 // plug in here without touching the scheduler.
 std::unique_ptr<EventDrivenPolicy> MakeEventDrivenPolicy(
     const Json::Value& config) {
-    const std::string policy = ed_config::ReadString(config, "policy", "multi_lru");
+    const std::string policy =
+        ed_config::ReadString(config, "policy", "multi_lru");
     if (policy != "multi_lru") {
         LOG(WARNING) << "Unknown event-driven policy '" << policy
                      << "', falling back to multi_lru";
@@ -98,8 +99,7 @@ std::unique_ptr<EventDrivenPolicy> MakeEventDrivenPolicy(
 std::unique_ptr<IClientScheduler> MakeClientScheduler(
     TieredBackend* backend, const Json::Value& config) {
     std::string type = "legacy";
-    if (config.isMember("scheduler") &&
-        config["scheduler"].isMember("type")) {
+    if (config.isMember("scheduler") && config["scheduler"].isMember("type")) {
         type = config["scheduler"]["type"].asString();
     }
 

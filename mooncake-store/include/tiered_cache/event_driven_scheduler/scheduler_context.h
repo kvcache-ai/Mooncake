@@ -36,7 +36,7 @@ struct DeleteContext {
 };
 
 struct AllocationFailureContext {
-    UUID tier_id;          // tier whose allocation failed
+    UUID tier_id;           // tier whose allocation failed
     size_t required_bytes;  // bytes the failed allocation needed
 };
 

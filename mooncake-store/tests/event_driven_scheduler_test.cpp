@@ -11,7 +11,7 @@
 
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
-#include "utils/common.h"                    // InitTieredBackendForTest
+#include "utils/common.h"                   // InitTieredBackendForTest
 
 namespace mooncake {
 namespace {
@@ -19,9 +19,11 @@ namespace {
 constexpr size_t kMB = 1024 * 1024;
 
 // Two local DRAM tiers (fast = higher priority). DRAM<->DRAM copies are plain
-// memcpy, so no TransferEngine / Master is needed (same as tiered_backend_test).
+// memcpy, so no TransferEngine / Master is needed (same as
+// tiered_backend_test).
 Json::Value MakeConfig(size_t fast_cap, size_t slow_cap,
-                       double evict_wm_high = 0.90, double evict_wm_low = 0.70) {
+                       double evict_wm_high = 0.90,
+                       double evict_wm_low = 0.70) {
     Json::Value cfg;
     Json::Value& sched = cfg["scheduler"];
     sched["type"] = "event_driven";
@@ -164,9 +166,8 @@ TEST_F(EventDrivenSchedulerTest, OnboardPromotesAndDropsSlow) {
 TEST_F(EventDrivenSchedulerTest, OnboardCopyFailureKeepsSlowReplica) {
     TieredBackend backend;
     // Fast capacity is SMALLER than the item, so onboard's copy to fast fails.
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(1 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, MakeConfig(1 * kMB, 64 * kMB))
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
 
@@ -185,11 +186,11 @@ TEST_F(EventDrivenSchedulerTest, OnboardCopyFailureKeepsSlowReplica) {
 TEST_F(EventDrivenSchedulerTest, EvictReclaimsFastTierAboveWatermark) {
     TieredBackend backend;
     // Low watermarks so the fill clearly exceeds the trigger.
-    ASSERT_TRUE(InitTieredBackendForTest(
-                    backend, MakeConfig(4 * kMB, 64 * kMB,
-                                        /*evict_wm_high=*/0.50,
-                                        /*evict_wm_low=*/0.40))
-                    .has_value());
+    ASSERT_TRUE(
+        InitTieredBackendForTest(backend, MakeConfig(4 * kMB, 64 * kMB,
+                                                     /*evict_wm_high=*/0.50,
+                                                     /*evict_wm_low=*/0.40))
+            .has_value());
     const UUID fast = FastTier(backend);
 
     std::vector<std::string> keys;
@@ -215,14 +216,14 @@ TEST_F(EventDrivenSchedulerTest, EvictReclaimsFastTierAboveWatermark) {
         5000));
 }
 
-TEST_F(EventDrivenSchedulerTest, NonFastTierAllocationFailureDoesNotForceReclaim) {
+TEST_F(EventDrivenSchedulerTest,
+       NonFastTierAllocationFailureDoesNotForceReclaim) {
     // D2-B: the event-driven scheduler force-reclaims ONLY the fast tier. A
     // strict allocation on a full SLOW tier must fail without evicting any of
     // its residents (slow tiers own their eviction inside their own Allocate).
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(16 * kMB, 1 * kMB))
-            .has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, MakeConfig(16 * kMB, 1 * kMB))
+                    .has_value());
     const UUID slow = SlowTier(backend);
 
     std::vector<std::string> slow_keys;
@@ -251,11 +252,11 @@ TEST_F(EventDrivenSchedulerTest, StrictDramPutEvictsInsteadOfSpilling) {
     // cold fast-tier copies and retrying on DRAM — never spilling the local
     // replica down to the slow tier.
     TieredBackend backend;
-    ASSERT_TRUE(InitTieredBackendForTest(
-                    backend, MakeConfig(2 * kMB, 64 * kMB,
-                                        /*evict_wm_high=*/0.50,
-                                        /*evict_wm_low=*/0.40))
-                    .has_value());
+    ASSERT_TRUE(
+        InitTieredBackendForTest(backend, MakeConfig(2 * kMB, 64 * kMB,
+                                                     /*evict_wm_high=*/0.50,
+                                                     /*evict_wm_low=*/0.40))
+            .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     ASSERT_EQ(backend.GetDramTierId(), fast);  // fast role is the DRAM tier
@@ -277,8 +278,8 @@ TEST_F(EventDrivenSchedulerTest, StrictDramPutEvictsInsteadOfSpilling) {
 
 TEST_F(EventDrivenSchedulerTest, GetHotKeyStatsZeroReturnsAllBeyondDefaultCap) {
     // P1-1: HA recovery passes hot_key_num=0 (== all) through DataManager ->
-    // TieredBackend so Phase 1 recovers the entire hot working set, not just the
-    // scheduler's default cap. This guards the TieredBackend layer that
+    // TieredBackend so Phase 1 recovers the entire hot working set, not just
+    // the scheduler's default cap. This guards the TieredBackend layer that
     // DataManager::GetHotKeyStats forwards verbatim.
     auto cfg = MakeConfig(16 * kMB, 64 * kMB);
     cfg["scheduler"]["hot_key_num"] = 64;  // explicit small cap for the test
@@ -308,9 +309,8 @@ TEST_F(EventDrivenSchedulerTest, StrictCopyDataDoesNotFallBackToOtherTier) {
     // "did it land on dest?" accounting unreliable).
     TieredBackend backend;
     // Fast tier is too small to ever hold the item, even after eviction.
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(1 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, MakeConfig(1 * kMB, 64 * kMB))
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
 

@@ -46,10 +46,11 @@ class MultiLRUPolicy : public EventDrivenPolicy {
         // write load and floats DOWN toward `low` as write load rises (evict
         // earlier / keep more headroom under write pressure). `low` also serves
         // as the reclaim floor and the pessimistic startup value.
-        double evict_watermark_low = 0.70;   // lower bound (max load; floor; init)
+        double evict_watermark_low =
+            0.70;  // lower bound (max load; floor; init)
         double evict_watermark_high = 0.90;  // upper bound (no write load)
-        double limit_watermark = 0.95;   // rate saturates here (full watermark)
-        double evict_rate_k = 1.0;       // proportional rate coefficient
+        double limit_watermark = 0.95;  // rate saturates here (full watermark)
+        double evict_rate_k = 1.0;      // proportional rate coefficient
         // Write-load response window (seconds): the throughput that fills the
         // fast tier within one window drives the trigger to its low bound. Also
         // the reaction time constant — larger = more sensitive but slower.
@@ -96,8 +97,8 @@ class MultiLRUPolicy : public EventDrivenPolicy {
 
     void RecordCommitBytes(UUID tier_id, size_t bytes);
 
-    // Recompute the floating eviction trigger from accumulated write load, store
-    // it in evict_wm_, and return it. Caller must hold mutex_.
+    // Recompute the floating eviction trigger from accumulated write load,
+    // store it in evict_wm_, and return it. Caller must hold mutex_.
     double RefreshEvictWatermark(size_t capacity);
 
     const Config config_;

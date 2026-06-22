@@ -432,9 +432,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         // Failed - try sync eviction if available
         if (scheduler_ &&
             alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
-            bool evicted =
-                scheduler_->OnAllocationFailure(
-                    AllocationFailureContext{*preferred_tier, size});
+            bool evicted = scheduler_->OnAllocationFailure(
+                AllocationFailureContext{*preferred_tier, size});
             if (evicted) {
                 // Retry after eviction
                 alloc_result = it->second->Allocate(size, loc.data);

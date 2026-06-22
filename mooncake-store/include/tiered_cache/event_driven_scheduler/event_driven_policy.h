@@ -7,7 +7,7 @@
 
 #include "tiered_cache/event_driven_scheduler/scheduler_context.h"
 #include "tiered_cache/scheduler/stats_collector.h"  // AccessStats
-#include "types.h"                                    // UUID
+#include "types.h"                                   // UUID
 
 namespace mooncake {
 
@@ -50,14 +50,14 @@ class EventDrivenPolicy {
     virtual ~EventDrivenPolicy() = default;
 
     // Wire up the data plane and the resolved fast/slow tier roles. Called once
-    // before the scheduler starts. slow_tier == nullopt disables offload/onboard
-    // and demotion-on-evict.
+    // before the scheduler starts. slow_tier == nullopt disables
+    // offload/onboard and demotion-on-evict.
     virtual void Init(TieredBackend* backend, UUID fast_tier,
                       std::optional<UUID> slow_tier) = 0;
 
     // Event hooks. The policy updates its own statistics. OnAccess may return a
-    // movement to enqueue (e.g. promote/pre-demote a hot key); OnCommit/OnDelete
-    // update bookkeeping only.
+    // movement to enqueue (e.g. promote/pre-demote a hot key);
+    // OnCommit/OnDelete update bookkeeping only.
     virtual std::optional<MovementRequest> OnAccess(
         const AccessContext& ctx) = 0;
     virtual void OnCommit(const CommitContext& ctx) = 0;

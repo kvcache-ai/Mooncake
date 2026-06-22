@@ -61,9 +61,8 @@ TEST(BoundedDedupQueueTest, ConcurrentProducersConsumers) {
     for (int t = 0; t < kThreads; ++t) {
         producers.emplace_back([&q, t] {
             for (int i = 0; i < kPerThread; ++i) {
-                q.TryPush(
-                    "k" + std::to_string(t) + "_" + std::to_string(i),
-                    Ev("x"));
+                q.TryPush("k" + std::to_string(t) + "_" + std::to_string(i),
+                          Ev("x"));
             }
         });
         consumers.emplace_back([&q, &popped, &stop] {
@@ -78,8 +77,8 @@ TEST(BoundedDedupQueueTest, ConcurrentProducersConsumers) {
     stop.store(true);
     for (auto& c : consumers) c.join();
 
-    // Mainly a data-race check (run under ASAN/TSAN). Capacity means some pushes
-    // are dropped, so we only bound the popped count.
+    // Mainly a data-race check (run under ASAN/TSAN). Capacity means some
+    // pushes are dropped, so we only bound the popped count.
     EXPECT_LE(popped.load(), kThreads * kPerThread);
     EXPECT_EQ(q.size(), 0u);
 }
