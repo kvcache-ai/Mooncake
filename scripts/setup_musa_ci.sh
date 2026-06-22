@@ -50,7 +50,7 @@ PY
     packaging \
     torchada==0.1.66
 
-  curl -L --fail --retry 3 --connect-timeout 20 \
+  curl -L --fail --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
     -o "${TORCH_MUSA_WHEEL}" \
     "${TORCH_MUSA_WHEEL_URL}"
   python3 -m pip install --no-cache-dir --force-reinstall --no-deps "${TORCH_MUSA_WHEEL}"
