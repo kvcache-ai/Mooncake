@@ -764,10 +764,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
     defined(USE_HYGON) || defined(USE_COREX)
         {
+            // Pin staging buffer by default so GPU→host copies use DMA
+            // instead of CUDA's internal staging.  Opt out: MC_STORE_PIN_MEMORY=0
             const char* pin_env = std::getenv("MC_STORE_PIN_MEMORY");
-            if (pin_env &&
-                (std::string(pin_env) == "1" ||
-                 std::string(pin_env) == "true")) {
+            bool pin_memory = !(pin_env &&
+                (std::string(pin_env) == "0" ||
+                 std::string(pin_env) == "false"));
+            if (pin_memory) {
                 auto cuda_ret = cudaHostRegister(
                     client_buffer_allocator_->getBase(), local_buffer_size,
                     cudaHostRegisterDefault);
