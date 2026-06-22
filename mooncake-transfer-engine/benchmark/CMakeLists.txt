@@ -55,6 +55,11 @@ if(USE_SUNRISE)
 endif()
 
 # Set RPATH for finding libasio.so at runtime
+if(USE_SUNRISE AND MC_TANGRT_ROOT)
+  set(TANGRT_RPATH ":${MC_TANGRT_ROOT}/lib")
+else()
+  set(TANGRT_RPATH "")
+endif()
 set_target_properties(
   tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common")
+                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
