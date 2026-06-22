@@ -4193,15 +4193,26 @@ RealClient::batch_get_into_dummy_helper(
         std::vector<size_t> sizes;
         std::vector<void *> buffers;
         std::shared_ptr<std::shared_lock<std::shared_mutex>> lock;
+        int32_t device_id;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
     state->buffers = std::move(buffers_result.value());
     state->lock = std::move(lock);
+    state->device_id = device_id;
 
     auto *s = state.get();
     auto try_result = co_await coro_io::post([this, s]() {
+#ifdef USE_ASCEND_DIRECT
+        if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+                s->device_id)) {
+            LOG(ERROR) << "Failed to set context for physical device "
+                       << s->device_id << " in batch_get worker";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                s->keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+#endif
         return batch_get_into_internal(s->keys, s->buffers, s->sizes);
     });
     co_return try_result.value();
