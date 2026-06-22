@@ -64,8 +64,9 @@ Transport::TransferStatusEnum from_cufile_transfer_status(
 }
 
 NVMeoFTransport::BatchID NVMeoFTransport::allocateBatchID(size_t batch_size) {
-    auto nvmeof_desc = new NVMeoFBatchDesc();
     auto batch_id = Transport::allocateBatchID(batch_size);
+    if (batch_id == std::numeric_limits<BatchID>::max()) return batch_id;
+    auto nvmeof_desc = new NVMeoFBatchDesc();
     auto &batch_desc = *((BatchDesc *)(batch_id));
     nvmeof_desc->desc_idx_ = desc_pool_->allocCUfileDesc(batch_size);
     nvmeof_desc->transfer_status.reserve(batch_size);

@@ -525,9 +525,7 @@ class ChunkedReadSession;
  * @brief Handle for tracking per-chunk completion of a chunked read.
  *
  * Wraps a shared ChunkedReadSession.  Callers poll or wait on individual
- * chunks to overlap transfer with compute.  Returned by
- * TransferSubmitter::submitProgressiveRead and
- * TransferSubmitter::submitStreamingBatchReadRanges.
+ * chunks to overlap transfer with compute.
  */
 class ChunkedReadHandle {
    public:

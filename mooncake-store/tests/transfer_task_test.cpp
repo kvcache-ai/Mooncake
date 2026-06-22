@@ -241,6 +241,9 @@ TEST_F(TransferTaskTest, ChunkedReadHandleMoveSemantics) {
     auto h1 = ChunkedReadHandle::make_precompleted(2, ErrorCode::OK);
     EXPECT_EQ(h1.num_chunks(), 2u);
     ChunkedReadHandle h2(std::move(h1));
+    EXPECT_EQ(h1.num_chunks(), 0u);
+    EXPECT_FALSE(h1.is_chunk_ready(0));
+    EXPECT_EQ(h1.wait_all(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(h2.num_chunks(), 2u);
     EXPECT_EQ(h2.wait_all(), ErrorCode::OK);
 }

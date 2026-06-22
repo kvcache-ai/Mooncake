@@ -14,6 +14,9 @@
 
 #include "transport/transport.h"
 
+#include <cstdint>
+#include <limits>
+
 #include "error.h"
 #include "transfer_engine.h"
 
@@ -25,6 +28,8 @@ Transport::ThreadLocalSliceCache &Transport::getSliceCache() {
 }
 
 Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
+    if (batch_size > std::numeric_limits<uint32_t>::max())
+        return std::numeric_limits<BatchID>::max();
     auto batch_desc = new BatchDesc();
     if (!batch_desc) return ERR_MEMORY;
     batch_desc->id = BatchID(batch_desc);

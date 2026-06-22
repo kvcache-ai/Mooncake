@@ -777,7 +777,7 @@ Mooncake Store supports chunked (streaming) reads where a large transfer is spli
 
 ### Design Notes
 
-- **Futex-based notification**: `ChunkedReadSession` uses Linux futex (`FUTEX_WAIT_PRIVATE` / `FUTEX_WAKE_PRIVATE`) on the low 32 bits of `BatchDesc::finished_task_count` for efficient per-chunk wake-up without condition variable overhead.
+- **Futex-based notification**: `ChunkedReadSession` uses Linux futex (`FUTEX_WAIT_PRIVATE` / `FUTEX_WAKE_PRIVATE`) on `BatchDesc::finished_task_count` for efficient per-chunk wake-up without condition variable overhead.
 
 - **Windowed submission**: Chunks are submitted to the transfer engine in windows (controlled by `window_size_`) rather than all at once, preventing resource exhaustion for large transfers.
 

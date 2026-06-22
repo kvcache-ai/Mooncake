@@ -212,15 +212,10 @@ class Transport {
             if (prev_completed + 1 != task->slice_count) return;
 
             __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
-            batch_desc.finished_task_count.fetch_add(1,
-                                                     std::memory_order_release);
+            batch_desc.finished_task_count_fetch_add_release(1);
 
-            static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
-                          "futex on low-32 of uint64_t requires little-endian");
-            ::syscall(
-                SYS_futex,
-                reinterpret_cast<uint32_t *>(&batch_desc.finished_task_count),
-                FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+            ::syscall(SYS_futex, batch_desc.finished_task_count_futex_word(),
+                      FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             {
@@ -318,18 +313,27 @@ class Transport {
         int64_t start_timestamp;
 
         mutable std::mutex lifecycle_mutex;
-        std::atomic<uint64_t> submitted_task_count{0};
-        std::atomic<bool> sealed{false};
 
         std::atomic<bool> has_failure{false};
         std::atomic<bool> is_finished{false};
         std::atomic<uint64_t> finished_transfer_bytes{0};
-        std::atomic<uint64_t> finished_task_count{0};
+        alignas(uint32_t) uint32_t finished_task_count{0};
+
+        uint32_t finished_task_count_load_acquire() const {
+            return __atomic_load_n(&finished_task_count, __ATOMIC_ACQUIRE);
+        }
+
+        uint32_t finished_task_count_fetch_add_release(uint32_t value) {
+            return __atomic_fetch_add(&finished_task_count, value,
+                                      __ATOMIC_RELEASE);
+        }
+
+        uint32_t *finished_task_count_futex_word() {
+            return &finished_task_count;
+        }
 
         bool is_complete() const {
-            return sealed.load(std::memory_order_acquire) &&
-                   finished_task_count.load(std::memory_order_acquire) ==
-                       submitted_task_count.load(std::memory_order_acquire);
+            return finished_task_count_load_acquire() == batch_size;
         }
 
         void publish_completion_if_ready_locked() {
