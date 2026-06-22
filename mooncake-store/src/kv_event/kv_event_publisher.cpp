@@ -82,10 +82,6 @@ KvEventPublisher::KvEventPublisher(KvEventConfig config)
         config_.enabled = false;
         return;
     }
-    if (config_.block_size == 0) {
-        LOG(WARNING) << "kv_events block_size is 0; block_size field will be "
-                        "omitted in events";
-    }
 
     zmq_context_ = zmq_ctx_new();
     if (!zmq_context_) {
@@ -120,9 +116,7 @@ KvEventPublisher::KvEventPublisher(KvEventConfig config)
 
     worker_ = std::thread(&KvEventPublisher::WorkerLoop, this);
     LOG(INFO) << "kv_events publisher enabled on " << config_.bind_endpoint
-              << " backend_id=" << config_.backend_id
-              << " model_name=" << config_.model_name
-              << " tenant_id=" << config_.tenant_id;
+              << " backend_id=" << config_.backend_id;
 }
 
 KvEventPublisher::~KvEventPublisher() {
@@ -246,8 +240,6 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     msgpack::packer<msgpack::sbuffer> packer(&payload_buffer);
 
     const int64_t timestamp_ms = CurrentUnixTimeMs();
-    const bool has_block_size = config_.block_size > 0;
-    const bool has_dp_rank = true;
 
     packer.pack_array(3);
     packer.pack(timestamp_ms);
@@ -257,9 +249,8 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         const bool is_stored = item.pending.kind == EventKind::kStored;
         const char* rfc_type = is_stored ? "stored" : "removed";
         const char* legacy_type = is_stored ? "BlockStored" : "BlockRemoved";
-        const std::string& tenant_id = item.pending.tenant_id.empty()
-                                           ? config_.tenant_id
-                                           : item.pending.tenant_id;
+        const std::string& tenant_id =
+            item.pending.tenant_id.empty() ? "default" : item.pending.tenant_id;
 
         const size_t map_size =
             ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields,
@@ -276,14 +267,16 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
             packer.pack("type");
             packer.pack(legacy_type);
         }
+        // Per-block envelope fields unknown to the storage pool are omitted
+        // (nil). Indexer registration supplies model/block_size/dp_rank.
         packer.pack("model_name");
-        PackOptionalString(packer, config_.model_name);
+        packer.pack_nil();
         packer.pack("block_size");
-        PackOptionalU32(packer, config_.block_size, has_block_size);
+        packer.pack_nil();
         packer.pack("additional_salt");
-        PackOptionalString(packer, config_.additional_salt);
+        packer.pack_nil();
         packer.pack("lora_name");
-        PackOptionalString(packer, config_.lora_name);
+        packer.pack_nil();
         packer.pack("tenant_id");
         packer.pack(tenant_id);
         packer.pack("backend_id");
@@ -291,7 +284,7 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         packer.pack("medium");
         PackOptionalString(packer, item.pending.medium);
         packer.pack("dp_rank");
-        PackOptionalU32(packer, config_.dp_rank, has_dp_rank);
+        packer.pack_nil();
 
         if (config_.emit_object_key) {
             packer.pack("object_key");
@@ -336,7 +329,8 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         published_events_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    packer.pack(config_.dp_rank);
+    // Batch-level dp_rank; storage pool has no DP context (0).
+    packer.pack(static_cast<uint32_t>(0));
 
     const uint64_t seq = next_zmq_sequence_.fetch_add(1);
     const uint64_t seq_be = htobe64(seq);

@@ -369,6 +369,23 @@ not carry the full standardized envelope.
 vLLM/SGLang: empty topic, big-endian sequence number, and a msgpack payload
 `[timestamp, [events], dp_rank]`.
 
+**Per-block events, not global metadata.** Per the
+[Dynamo KV Events for Custom Engines](https://docs.nvidia.com/dynamo/kv-managers/kv-events-for-custom-engines)
+model, each event describes one or more **KV cache blocks** (`seq_hashes`,
+`token_ids`, `parent_hash`, eviction hashes). The master emits **one event per
+Mooncake object key** on `PutEnd` / `Remove` / eviction — each key is treated as
+one pooled block. Block identity comes from the object key (`seq_hashes` when
+the key is decimal/`0x` u64, else `object_key`) and per-object `tenant_id` /
+`medium`. The master does **not** stamp process-wide `model_name`, `block_size`,
+`lora_name`, or `dp_rank` on events; register those dimensions with the indexer
+via `POST /register` (same as decoupled SGLang + storage pool deployments).
+
+Publisher-level config is limited to transport and stream identity:
+`kv_events_bind_endpoint`, `kv_events_backend_id`, and optional compat flags
+(`kv_events_emit_object_key`, `kv_events_emit_legacy_compat`). Legacy master
+flags such as `kv_events_model_name` are retained for compatibility but are not
+written into event payloads.
+
 Each event map uses RFC #1527 field names (`event_type`, `seq_hashes`,
 `backend_id`, `medium`, and so on). When `kv_events_emit_object_key` is enabled
 (default), the map also includes `object_key` with the Mooncake store key so
@@ -408,14 +425,14 @@ splitting publishers or writing PR/integration notes.
 | `event_id` | Yes | Yes | — | Each publisher maintains its own monotonic counter per stream. |
 | `timestamp` | Yes | Yes | — | Informational only; not used for ordering. |
 | `event_type` | Yes | Yes | — | `stored` / `removed` / `cleared`. |
-| `model_name` | S+M | S+M | S+M | Register uses `modelname`. Static config on master; runtime on engine. |
-| `block_size` | Yes | S+M | Yes | Required for token↔block mapping. Master uses `kv_events_block_size` if set. |
-| `additional_salt` | Yes | S+M | S+M | Register uses `additionalsalt`. Hash namespace salt from engine; master only static string. |
-| `lora_name` | Yes | — | S+M | Engine knows active LoRA; master has no adapter context. |
-| `tenant_id` | S+M | S+M | Yes | Register default `default`. |
+| `model_name` | S+M | — | S+M | Register uses `modelname`. Engine events carry per-block context; master omits (nil). |
+| `block_size` | Yes | — | Yes | Required for token↔block mapping. Register supplies for master publisher. |
+| `additional_salt` | Yes | — | S+M | Register uses `additionalsalt`. Engine per-block; master omits (nil). |
+| `lora_name` | Yes | — | S+M | Per-block on engine events; master has no adapter context. |
+| `tenant_id` | S+M | Yes | Yes | Per-object on master events. Register default `default`. |
 | `backend_id` | S+M | Yes | — | **Master**: storage daemon / pool owner. **SGLang**: often worker id; in decoupled mode prefer master=`daemon`, engine via **Register** `instance_id`. |
 | `medium` | Yes | Partial | — | **SGLang**: `GPU`, `CPU_PINNED`, `DISK`, `EXTERNAL`, etc. **Master**: only `cpu` / `disk` (host/disk pool), never GPU. |
-| `dp_rank` | Yes | S+M | Yes | SGLang may override per batch (`attn_dp_rank`). Master uses static `kv_events_dp_rank`. |
+| `dp_rank` | Yes | — | Yes | Per-batch on engine ZMQ wire. Master batch trailer uses `0`; register dp_rank with indexer. |
 
 #### `stored` payload
 
