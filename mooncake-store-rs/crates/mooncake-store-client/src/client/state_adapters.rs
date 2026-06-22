@@ -182,6 +182,9 @@ impl LocalAllocatorAdapter {
                 }
                 Err(error) => return Err(error),
             }
+            cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
+                self.storage_owner.as_ref(),
+            );
             if !self.storage_owner.evict_one(None)? {
                 break;
             }
@@ -216,6 +219,9 @@ impl LocalAllocatorAdapter {
                 }
                 Err(error) => return Err(error),
             }
+            cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
+                self.storage_owner.as_ref(),
+            );
             if !self.storage_owner.evict_one(Some(segment_name))? {
                 break;
             }

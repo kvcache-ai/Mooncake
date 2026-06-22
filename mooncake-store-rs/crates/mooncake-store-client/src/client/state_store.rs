@@ -689,7 +689,7 @@ mod state_store_tests {
         );
 
         // pick_victim should return a cold entry, never the hot k-0.
-        let victim = rebuilt.pick_victim(None).expect("should find a cold victim");
+        let victim = rebuilt.pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0).expect("should find a cold victim");
         assert_ne!(
             victim.route_key,
             ObjectKey("k-0".to_string()),
@@ -748,7 +748,7 @@ mod state_store_tests {
         clock.mark_hot_keys(&[hot_route.key.clone()]);
 
         let victim = clock
-            .pick_victim(None)
+            .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
             .expect("clock should pick a victim after grace expires");
         assert_eq!(
             victim.route_key, fresh_route.key,
@@ -770,10 +770,10 @@ mod state_store_tests {
         clock.mark_hot_keys(&[hot_route.key.clone()]);
 
         let first = clock
-            .pick_victim(None)
+            .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
             .expect("clock should evict a fresh route before read-hot route");
         let second = clock
-            .pick_victim(None)
+            .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
             .expect("clock should still evict fresh routes before read-hot route");
 
         assert_ne!(first.route_key, hot_route.key);
@@ -898,7 +898,7 @@ impl StorageOwnerState {
                 for _ in 0..budget.max(1) {
                     let victim = {
                         let mut clock = self.hot_replicas.clock.lock();
-                        clock.pick_victim(preferred_segment)
+                        clock.pick_victim(preferred_segment, self.offload_priority.eviction_policy, self.offload_priority.eviction_scan_limit)
                     };
                     let Some(victim) = victim else {
                         break;
@@ -1119,7 +1119,21 @@ impl StorageClockState {
         RouteTrafficReport::new(keys.len(), bytes)
     }
 
-    fn pick_victim(&mut self, preferred_segment: Option<&SegmentName>) -> Option<ClockEntryId> {
+    fn pick_victim(
+        &mut self,
+        preferred_segment: Option<&SegmentName>,
+        policy: ColdTierEvictionPriorityPolicy,
+        scan_limit: usize,
+    ) -> Option<ClockEntryId> {
+        match policy {
+            ColdTierEvictionPriorityPolicy::Clock => self.pick_victim_clock(preferred_segment),
+            ColdTierEvictionPriorityPolicy::ColdestLargestFirst => {
+                self.pick_victim_coldest_largest_first(preferred_segment, scan_limit)
+            }
+        }
+    }
+
+    fn pick_victim_clock(&mut self, preferred_segment: Option<&SegmentName>) -> Option<ClockEntryId> {
         if self.entries.is_empty() {
             return None;
         }
@@ -1213,6 +1227,123 @@ impl StorageClockState {
                 self.by_key.remove(&id.route_key);
             }
         }
+    }
+
+    fn pick_victim_coldest_largest_first(
+        &mut self,
+        preferred_segment: Option<&SegmentName>,
+        scan_limit: usize,
+    ) -> Option<ClockEntryId> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let limit = scan_limit.max(1).min(self.eviction_budget().max(1));
+        let mut selected: Option<(ClockEntryId, u64)> = None;
+        for _ in 0..limit {
+            let index = self.hand % self.entries.len();
+            self.hand = (self.hand + 1) % self.entries.len();
+            let Some(entry) = self.entries[index].as_mut() else {
+                continue;
+            };
+            if preferred_segment.is_some_and(|segment| entry.id.segment_name != *segment) {
+                continue;
+            }
+            if entry.hot {
+                entry.hot = false;
+                continue;
+            }
+            match selected.as_ref() {
+                Some((_, length)) if *length >= entry.length_bytes => {}
+                _ => selected = Some((entry.id.clone(), entry.length_bytes)),
+            }
+        }
+        selected.map(|(id, _)| id)
+    }
+}
+
+#[allow(dead_code)]
+impl HotReplicaTracker {
+    fn eviction_budget(&self) -> usize {
+        self.clock.lock().eviction_budget()
+    }
+
+    fn track_route(&self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        self.clock.lock().track_route(route, runtime);
+    }
+
+    fn untrack_route(&self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        self.clock.lock().untrack_route(route, runtime);
+    }
+
+    fn sync_route(&self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        self.clock.lock().sync_route(route, runtime);
+    }
+
+    fn sync_routes(&self, routes: &[ObjectRoute], runtime: &ClientRuntimeId) {
+        let mut clock = self.clock.lock();
+        for route in routes {
+            clock.sync_route(route, runtime);
+        }
+    }
+
+    fn mark_hot_keys(&self, keys: &[ObjectKey]) {
+        self.clock.lock().mark_hot_keys(keys);
+    }
+
+    fn pick_victim(
+        &self,
+        preferred_segment: Option<&SegmentName>,
+        policy: ColdTierEvictionPriorityPolicy,
+        scan_limit: usize,
+    ) -> Option<ClockEntryId> {
+        self.clock
+            .lock()
+            .pick_victim(preferred_segment, policy, scan_limit)
+    }
+
+    fn remove_id(&self, id: &ClockEntryId) {
+        self.clock.lock().remove_id(id);
+    }
+
+    fn remove_key(&self, key: &ObjectKey) {
+        self.clock.lock().remove_key(key);
+    }
+
+    fn rebuild(&self, routes: &[ObjectRoute], runtime: &ClientRuntimeId) {
+        let mut clock = StorageClockState::default();
+        for route in routes {
+            clock.track_route(route, runtime);
+        }
+        *self.clock.lock() = clock;
+    }
+}
+
+#[allow(dead_code)]
+impl StoreState {
+    fn reclaim_queue_snapshot(&self, now_ms: u64) -> ReclaimQueueSnapshot {
+        let mut snapshot = ReclaimQueueSnapshot {
+            total_pending: self.pending_reclaims.len(),
+            ..ReclaimQueueSnapshot::default()
+        };
+        for reclaim in &self.pending_reclaims {
+            if reclaim.due_at_ms <= now_ms {
+                snapshot.due = snapshot.due.saturating_add(1);
+            }
+            if reclaim.cold_backing.is_some() {
+                snapshot.cold_backing_reclaims = snapshot.cold_backing_reclaims.saturating_add(1);
+            } else {
+                snapshot.hot_segment_reclaims = snapshot.hot_segment_reclaims.saturating_add(1);
+            }
+            *snapshot
+                .by_qos_tier
+                .entry(reclaim.qos_tier.clone())
+                .or_default() += 1;
+            *snapshot
+                .by_policy_rank
+                .entry(reclaim.policy_rank)
+                .or_default() += 1;
+        }
+        snapshot
     }
 }
 

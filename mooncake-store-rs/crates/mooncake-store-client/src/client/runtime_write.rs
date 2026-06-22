@@ -1512,21 +1512,20 @@ impl StoreClient {
         {
             match cas_result {
                 Ok(cas) if cas.applied => {
-                    if let Err(error) = self.finalize_tenant_quota_put(
+                    let route = match self.finalize_published_route(
                         pending.quota_reservation.as_ref(),
                         &pending.route,
                         prepared[index].value.len(),
-                    ) {
-                        first_error.get_or_insert(error);
-                        continue;
-                    }
-                    log_route_publish_sample(
-                        &self.lease.runtime,
-                        &pending.route,
-                        prepared[index].value.len(),
                         "batch_put",
-                    );
-                    self.storage_owner.track_route(&pending.route);
+                    ) {
+                        Ok(Some(updated)) => updated,
+                        Ok(None) => pending.route,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
+                    self.storage_owner.track_route(&route);
                     if let Some(previous) = pending.previous.as_ref() {
                         if let Err(error) = self.schedule_route_reclaim(previous) {
                             warn!(
@@ -1537,7 +1536,7 @@ impl StoreClient {
                             );
                         }
                     }
-                    published.push(pending.route);
+                    published.push(route);
                 }
                 Ok(cas) => {
                     let _ = self.release_reserved_allocations(

@@ -53,6 +53,7 @@ pub(super) fn pb_error(error: StoreError) -> pb::ErrorDetail {
         StoreError::Allocator(message) => (pb::ErrorKind::Allocator, message),
         StoreError::Metadata(message) => (pb::ErrorKind::Metadata, message),
         StoreError::Transport(message) => (pb::ErrorKind::Transport, message),
+        StoreError::Backpressure(message) => (pb::ErrorKind::Transport, message),
     };
     pb::ErrorDetail {
         kind: kind as i32,

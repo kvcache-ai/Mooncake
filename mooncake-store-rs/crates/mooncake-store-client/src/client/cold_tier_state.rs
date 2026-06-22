@@ -498,3 +498,169 @@ struct PendingDeleteGcResult {
 pub(crate) struct ColdTierMaintenanceStats {
     pub(crate) devices: BTreeMap<String, BackendMaintenanceStats>,
 }
+
+// ---------------------------------------------------------------------------
+// Eviction readiness signal
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+#[allow(dead_code)]
+struct EvictionReadySignal {
+    ready: AtomicBool,
+}
+
+#[allow(dead_code)]
+impl EvictionReadySignal {
+    fn signal(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn take(&self) -> bool {
+        self.ready.swap(false, Ordering::AcqRel)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Offload pipeline: materialization, CAS, prepare
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct PendingOffloadMaterialization {
+    entry: PendingOffloadEntry,
+    route: ObjectRoute,
+    cold_backing: mooncake_store_core::ColdBackingRoute,
+    payload: PendingOffloadPayload,
+    device: ColdTierDeviceRecord,
+    permit: ColdTierAdmissionPermit,
+}
+
+#[allow(dead_code)]
+enum PendingOffloadPayload {
+    Owned(Vec<u8>),
+    /// Raw pointer into registered shared-memory segment.
+    ///
+    /// # Safety
+    ///
+    /// The pointer is valid for the lifetime of the `PendingOffloadMaterialization` because:
+    /// 1. The source segment is pinned in the memory registry while any route references it.
+    /// 2. The offload CAS atomically transitions the route away from the segment before the
+    ///    segment can be freed — if the CAS fails, the pointer is never dereferenced again.
+    /// 3. The `PendingOffloadMaterialization` is consumed (and the pointer discarded) within a
+    ///    single offload batch iteration; it never escapes to another thread or outlives the
+    ///    segment pin.
+    LocalHot { addr: *const u8, len: usize },
+}
+
+// SAFETY: The raw pointer in LocalHot points into a pinned shared-memory segment that
+// remains valid for the lifetime of the containing PendingOffloadMaterialization (see
+// safety invariants on the LocalHot variant). The offload worker is the sole consumer.
+unsafe impl Send for PendingOffloadPayload {}
+
+#[allow(dead_code)]
+impl PendingOffloadPayload {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(payload) => payload,
+            // SAFETY: See invariants documented on `LocalHot` variant.
+            Self::LocalHot { addr, len } => unsafe { slice::from_raw_parts(*addr, *len) },
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(payload) => payload.len(),
+            Self::LocalHot { len, .. } => *len,
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct PendingOffloadReadyRoute {
+    index: usize,
+    materialized_cold_backing: mooncake_store_core::ColdBackingRoute,
+    next_route: ObjectRoute,
+}
+
+#[allow(dead_code)]
+struct PendingOffloadCasOutcome {
+    materialized: usize,
+    used_add_bytes: i64,
+    reserved_release_bytes: i64,
+    cleanup: Vec<mooncake_store_core::ColdBackingRoute>,
+}
+
+#[allow(dead_code)]
+struct PendingOffloadCasContext<'a> {
+    backend: &'a dyn PersistentStorageBackend,
+    pending: &'a [PendingOffloadMaterialization],
+    first_error: &'a mut Option<StoreError>,
+    outcome: &'a mut PendingOffloadCasOutcome,
+}
+
+#[allow(dead_code)]
+enum PendingOffloadPrepareOutcome {
+    Ready(Box<PendingOffloadMaterialization>),
+    Retry(PendingOffloadEntry),
+    RetryAfter(PendingOffloadEntry, Duration),
+    Refreshed(PendingOffloadEntry),
+    Skipped,
+}
+
+// ---------------------------------------------------------------------------
+// Restore promotion queue
+// ---------------------------------------------------------------------------
+
+type SharedRestorePromotionQueue = Arc<RestorePromotionQueue>;
+
+#[allow(dead_code)]
+struct RestorePromotionQueue {
+    state: Mutex<RestorePromotionQueueState>,
+    limit: usize,
+    batch_limit: usize,
+    max_in_flight: usize,
+}
+
+#[derive(Default)]
+#[allow(dead_code)]
+struct RestorePromotionQueueState {
+    entries: VecDeque<RestorePromotionTask>,
+    keys: BTreeSet<RestorePromotionKey>,
+    in_flight: BTreeSet<RestorePromotionKey>,
+    worker_active: bool,
+    shutdown: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RestorePromotionKey {
+    route_key: ObjectKey,
+    route_version: RouteVersion,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct RestorePromotionTask {
+    key: RestorePromotionKey,
+    tenant: String,
+    object_id: LogicalObjectId,
+    qos_tier: Option<String>,
+    current: ObjectRoute,
+    payload: Arc<Vec<u8>>,
+    policy: ReplicationPolicy,
+    target_runtime: Option<ClientRuntimeId>,
+    target_segment: Option<SegmentName>,
+}
+
+impl RestorePromotionQueue {
+    fn new(limit: usize, batch_limit: usize, max_in_flight: usize) -> Self {
+        Self {
+            state: Mutex::new(RestorePromotionQueueState::default()),
+            limit,
+            batch_limit,
+            max_in_flight,
+        }
+    }
+
+    fn shutdown(&self) {
+        self.state.lock().shutdown = true;
+    }
+}

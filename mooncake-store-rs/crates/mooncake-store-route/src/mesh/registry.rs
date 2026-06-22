@@ -3,8 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use mooncake_store_core::{
-    CasResult, ClientRuntimeId, ClientStableId, NamespaceScope, ObjectKey, ObjectRoute, Result,
-    ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
+    CasResult, ClientRuntimeId, ClientStableId, ColdBackingState, NamespaceScope, ObjectKey,
+    ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
 };
 use parking_lot::Mutex as ParkingMutex;
 
@@ -281,7 +281,13 @@ pub fn route_has_readable_replicas(namespace: &str, route: &ObjectRoute) -> bool
     let filter = mesh.readable_filter.lock().clone();
     match filter {
         None => true,
-        Some(readable) => route.replicas.iter().any(|r| readable.contains(&r.owner)),
+        Some(readable) => {
+            route.replicas.iter().any(|r| readable.contains(&r.owner))
+                || route
+                    .cold_backing
+                    .as_ref()
+                    .is_some_and(|cb| cb.state == ColdBackingState::Materialized)
+        }
     }
 }
 

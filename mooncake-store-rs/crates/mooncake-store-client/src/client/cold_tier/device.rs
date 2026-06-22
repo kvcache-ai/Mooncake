@@ -77,8 +77,12 @@ impl StorageOwnerState {
             state,
             cold_tier_devices: ColdTierDeviceManager::new(cold_tier),
             hot_replicas: super::super::HotReplicaTracker::default(),
+            pending_offloads: super::super::ColdTierOffloadManager::default(),
+            cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
+            initial_cold_backing_repair_at_ms: std::sync::atomic::AtomicU64::new(0),
             offload_mode,
             offload_priority,
+            eviction_ready_signal: super::super::EvictionReadySignal::default(),
         }
     }
 
@@ -115,6 +119,9 @@ impl StorageOwnerState {
         length: u64,
         checksum: u64,
     ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
+        if super::cold_tier_offload_disabled() {
+            return Ok(None);
+        }
         match self.offload_mode {
             super::super::ColdTierOffloadMode::Passthrough => {
                 self.pending_cold_backing_for_route(route, owner, length, checksum)
@@ -134,6 +141,9 @@ impl StorageOwnerState {
         length: u64,
         checksum: u64,
     ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
+        if super::cold_tier_offload_disabled() {
+            return Ok(None);
+        }
         let replica_count = cold_tier_replica_count();
         let devices = if replica_count > 1 {
             self.select_cold_tier_devices(length, replica_count)?

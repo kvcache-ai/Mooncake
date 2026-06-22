@@ -78,6 +78,9 @@ impl StoreClient {
             self.startup_activation_pending.store(true, Ordering::SeqCst);
             return Err(error);
         }
+        if let Err(error) = self.cold_tier.run_startup(self.storage_owner.clone(), &lease) {
+            tracing::warn!(error = %error, "cold tier startup deferred to background tick");
+        }
         self.set_lifecycle_state(ClientLifecycleState::Active);
         Ok(())
     }
@@ -263,6 +266,8 @@ impl StoreClient {
             for announcement in &announcements {
                 self.metadata.publish_segment(announcement)?;
             }
+            self.cold_tier
+                .repair_after_metadata_recovery(self.storage_owner.as_ref())?;
             Ok((announcements.len(), refreshed_transports))
         })();
         match &result {
@@ -763,6 +768,9 @@ impl StoreClient {
                     }
                     Err(error) => return Err(error),
                 }
+                cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
+                    self.storage_owner.as_ref(),
+                );
                 if !self.storage_owner.evict_one(segment_name)? {
                     break;
                 }

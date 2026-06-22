@@ -674,6 +674,19 @@ impl StoreClientBuilder {
             control_client.clone(),
             live_client_cache.clone(),
         )?;
+        let cold_tier_configured = !resolved_cold_tier.is_empty();
+        let restore_promotions = Arc::new(RestorePromotionQueue::new(1024, 32, 32));
+        let cold_tier = if cold_tier_configured {
+            cold_tier::ColdTierHandle::spawn(
+                &runtime,
+                &lease,
+                &self.local_memory,
+                storage_owner.clone(),
+                restore_promotions,
+            )?
+        } else {
+            cold_tier::ColdTierHandle::disabled(restore_promotions)
+        };
         Ok(StoreClient {
             metadata: runtime_metadata,
             route_directory,
@@ -712,6 +725,7 @@ impl StoreClientBuilder {
             state,
             owns_cold_tier_lifecycle: true,
             cold_tier_shutdown_mode: self.cold_tier_shutdown_mode,
+            cold_tier,
         })
     }
 }

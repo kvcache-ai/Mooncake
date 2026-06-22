@@ -2,11 +2,18 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 use mooncake_store_core::{
-    route_reuse_identity, CasResult, ClientRuntimeId, NamespaceScope, ObjectKey, ObjectRoute,
-    ReuseIdentity, RouteCasRequest, RouteVersion,
+    route_reuse_identity, CasResult, ClientRuntimeId, ColdBackingState, NamespaceScope, ObjectKey,
+    ObjectRoute, ReuseIdentity, RouteCasRequest, RouteVersion,
 };
 
 use crate::metrics::record_cas_outcome;
+
+fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
+    route
+        .cold_backing
+        .as_ref()
+        .is_some_and(|cb| cb.state == ColdBackingState::Materialized)
+}
 
 #[derive(Default)]
 pub(crate) struct LocalRouteTable {
@@ -39,7 +46,10 @@ impl LocalRouteTable {
         keys.iter()
             .map(|key| match self.routes.get(&key.0) {
                 None => false,
-                Some(route) => route.replicas.iter().any(|r| readable.contains(&r.owner)),
+                Some(route) => {
+                    route.replicas.iter().any(|r| readable.contains(&r.owner))
+                        || route_has_materialized_cold_backing(route)
+                }
             })
             .collect()
     }
@@ -50,10 +60,10 @@ impl LocalRouteTable {
         readable: &BTreeSet<ClientRuntimeId>,
     ) {
         for key in keys {
-            let dominated = self
-                .routes
-                .get(&key.0)
-                .is_some_and(|route| !route.replicas.iter().any(|r| readable.contains(&r.owner)));
+            let dominated = self.routes.get(&key.0).is_some_and(|route| {
+                !route.replicas.iter().any(|r| readable.contains(&r.owner))
+                    && !route_has_materialized_cold_backing(route)
+            });
             if dominated {
                 self.apply_update(key, None);
             }
