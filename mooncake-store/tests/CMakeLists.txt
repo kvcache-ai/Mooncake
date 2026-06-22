@@ -38,6 +38,8 @@ add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_tenant_quota_test
+               master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)

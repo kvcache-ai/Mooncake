@@ -67,7 +67,14 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"},
         {ErrorCode::TASK_NOT_FOUND, "TASK_NOT_FOUND"},
         {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, "TASK_PENDING_LIMIT_EXCEEDED"},
-        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"}};
+        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"},
+        {ErrorCode::DFS_NETWORK_TIMEOUT, "DFS_NETWORK_TIMEOUT"},
+        {ErrorCode::DFS_SERVICE_UNAVAILABLE, "DFS_SERVICE_UNAVAILABLE"},
+        {ErrorCode::DFS_QUOTA_EXCEEDED, "DFS_QUOTA_EXCEEDED"},
+        {ErrorCode::DFS_PERMISSION_DENIED, "DFS_PERMISSION_DENIED"},
+        {ErrorCode::DFS_STALE_HANDLE, "DFS_STALE_HANDLE"},
+        {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
+        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

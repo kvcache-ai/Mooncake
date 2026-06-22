@@ -22,7 +22,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -34,6 +33,7 @@
 #include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "char_util.h"
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>
@@ -447,7 +447,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char *ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;

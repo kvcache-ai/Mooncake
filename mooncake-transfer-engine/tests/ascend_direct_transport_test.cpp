@@ -1840,7 +1840,10 @@ TEST_F(AscendDirectTransportTest, Standalone_SameHostOffset_WrapsAround) {
 
 TEST_F(AscendDirectTransportTest,
        Standalone_FabricMem_SameHostUsesFrontEndpoint) {
+    // Fabric mem is a Store-TE feature, so the TE must be store-init for the
+    // transport to capture use_fabric_mem_=true.
     globalConfig().ascend_agent_mode = false;
+    globalConfig().ascend_store_te_init = true;
     globalConfig().ascend_use_fabric_mem = true;
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
     constexpr int kDeviceCount = 4;
@@ -1864,6 +1867,45 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_FALSE(result.failed);
     EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:8000")
         << "Fabric-mem standalone should not apply same-host offset";
+
+    globalConfig().ascend_use_fabric_mem = false;
+    globalConfig().ascend_store_te_init = false;
+}
+
+// A non-Store (e.g. P2P/HCCS) TE must NOT inherit a Store TE's fabric flag that
+// leaked into the process-global config: with ascend_use_fabric_mem=true but
+// ascend_store_te_init=false, the transport must capture use_fabric_mem_=false
+// and behave like a normal standalone TE (same-host offset +1), not the fabric
+// path (front endpoint).
+TEST_F(AscendDirectTransportTest,
+       Standalone_FabricFlagWithoutStoreTe_DoesNotInheritFabric) {
+    globalConfig().ascend_agent_mode = false;
+    globalConfig().ascend_store_te_init = false;
+    globalConfig().ascend_use_fabric_mem = true;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    g_device_id = 1;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"127.0.0.1:9000", "127.0.0.1:9100",
+                                          "127.0.0.1:9200", "127.0.0.1:9300"};
+    addMultiEndpointRemoteSegment(transport->meta(), 1, "p2p_no_fabric",
+                                  "127.0.0.1", endpoints);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    // phy_dev=1, same host, fabric NOT inherited -> offset +1 -> endpoints[2]
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:9200")
+        << "Non-Store TE must not inherit fabric; should apply same-host "
+           "offset";
 
     globalConfig().ascend_use_fabric_mem = false;
 }
@@ -1913,6 +1955,93 @@ TEST(RoceModeDetectionTest, IsRoceModeEnabled_FromHcclEnv) {
     setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
     EXPECT_TRUE(IsRoceModeEnabled());
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
+}
+
+// -----------------------------------------------------------------------------
+// Store vs P2P protocol split via a single ASCEND_GLOBAL_RESOURCE_CONFIG:
+// top-level = default (P2P, e.g. HCCS), optional "store" sub-object overrides
+// it for a Store-init TE (e.g. RoCE). Resolution is gated on
+// ascend_store_te_init.
+// -----------------------------------------------------------------------------
+
+namespace {
+// Top-level default = HCCS (P2P), "store" override = RoCE (Store).
+constexpr const char* kDualProtocolConfig =
+    R"({"comm_resource_config":{"protocol_desc":"hccs:device"},)"
+    R"("store":{"comm_resource_config":{"protocol_desc":"roce:device"}}})";
+
+struct StoreTeInitScope {
+    explicit StoreTeInitScope(bool v) {
+        globalConfig().ascend_store_te_init = v;
+    }
+    ~StoreTeInitScope() { globalConfig().ascend_store_te_init = false; }
+};
+}  // namespace
+
+TEST(StoreResourceConfigSplitTest, NoStoreKey_PassthroughVerbatimBothRoles) {
+    const char* cfg =
+        R"({"comm_resource_config":{"protocol_desc":"hccs:device"}})";
+    {
+        StoreTeInitScope store(true);
+        EXPECT_EQ(ResolveAscendGlobalResourceConfig(cfg), std::string(cfg));
+    }
+    {
+        StoreTeInitScope store(false);
+        EXPECT_EQ(ResolveAscendGlobalResourceConfig(cfg), std::string(cfg));
+    }
+}
+
+TEST(StoreResourceConfigSplitTest, EmptyOrNull_ReturnsEmpty) {
+    StoreTeInitScope store(true);
+    EXPECT_TRUE(ResolveAscendGlobalResourceConfig(nullptr).empty());
+    EXPECT_TRUE(ResolveAscendGlobalResourceConfig("").empty());
+}
+
+TEST(StoreResourceConfigSplitTest, StoreRole_SelectsStoreSubtreeRoce) {
+    StoreTeInitScope store(true);
+    std::string resolved =
+        ResolveAscendGlobalResourceConfig(kDualProtocolConfig);
+    // Store TE gets the "store" subtree (RoCE), with the "store" key stripped.
+    EXPECT_TRUE(HasRoceProtocolDescInGlobalResourceConfig(resolved.c_str()));
+    EXPECT_EQ(resolved.find("hccs"), std::string::npos);
+    EXPECT_EQ(resolved.find("\"store\""), std::string::npos);
+}
+
+TEST(StoreResourceConfigSplitTest, DefaultRole_StripsStoreKeyHccs) {
+    StoreTeInitScope store(false);
+    std::string resolved =
+        ResolveAscendGlobalResourceConfig(kDualProtocolConfig);
+    // P2P/default TE gets the top-level (HCCS) with the "store" key removed.
+    EXPECT_FALSE(HasRoceProtocolDescInGlobalResourceConfig(resolved.c_str()));
+    EXPECT_NE(resolved.find("hccs"), std::string::npos);
+    EXPECT_EQ(resolved.find("roce"), std::string::npos);
+    EXPECT_EQ(resolved.find("\"store\""), std::string::npos);
+}
+
+TEST(StoreResourceConfigSplitTest,
+     StoreRoleMissingStoreKey_FallsBackToDefault) {
+    const char* cfg =
+        R"({"comm_resource_config":{"protocol_desc":"hccs:device"}})";
+    StoreTeInitScope store(true);
+    // No "store" key -> store TE falls back to the (verbatim) default config.
+    EXPECT_EQ(ResolveAscendGlobalResourceConfig(cfg), std::string(cfg));
+    EXPECT_FALSE(HasRoceProtocolDescInGlobalResourceConfig(
+        ResolveAscendGlobalResourceConfig(cfg).c_str()));
+}
+
+// The headline case: one env var, Store TE -> RoCE, P2P TE -> HCCS.
+TEST(StoreResourceConfigSplitTest, IsRoceModeEnabled_StoreRoceP2pHccs) {
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG", kDualProtocolConfig, 1);
+    {
+        StoreTeInitScope store(true);
+        EXPECT_TRUE(IsRoceModeEnabled()) << "Store TE should resolve to RoCE";
+    }
+    {
+        StoreTeInitScope store(false);
+        EXPECT_FALSE(IsRoceModeEnabled()) << "P2P TE should resolve to HCCS";
+    }
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
 }
 
 int main(int argc, char** argv) {

@@ -407,6 +407,7 @@ enum class ErrorCode : int32_t {
     DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
     DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
     DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
+    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
