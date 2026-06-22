@@ -3,6 +3,7 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/struct_json/json_reader.h>
 
 #include <algorithm>
@@ -156,12 +157,14 @@ class MasterServiceTest : public ::testing::Test {
             ReplicaMovePayload payload;
             struct_json::from_json(payload, assignment.payload);
 
+            const std::string payload_tenant_id =
+                payload.tenant_id.value_or("default");
             auto move_start =
-                service.MoveStart(client_id, payload.key, payload.tenant_id,
+                service.MoveStart(client_id, payload.key, payload_tenant_id,
                                   payload.source, payload.target);
             EXPECT_TRUE(move_start.has_value());
             EXPECT_TRUE(
-                service.MoveEnd(client_id, payload.key, payload.tenant_id)
+                service.MoveEnd(client_id, payload.key, payload_tenant_id)
                     .has_value());
 
             TaskCompleteRequest complete_request;
@@ -1462,7 +1465,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     }
 
     for (const auto& key : keys) {
-        EXPECT_TRUE(service_.GetReplicaList(key, "default").has_value());
+        EXPECT_TRUE(service_.GetReplicaList(key).has_value());
     }
 
     ReplicateConfig invalid_config = config;
@@ -4527,7 +4530,34 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
 
     std::vector<std::string> lookup_keys = {tenant_key_a, default_only_key,
                                             missing_key, tenant_key_b};
-    auto resp = service_.BatchExistKey(lookup_keys, tenant_id);
+
+    // BatchExistKey keeps its v0.3.11 single-argument wire signature for
+    // cross-version compatibility, so the tenant identity travels in the
+    // coro_rpc request attachment rather than the argument tuple. Drive the
+    // call through a real coro_rpc loopback that sets the attachment to verify
+    // the tenant-aware batch path end-to-end.
+    coro_rpc::coro_rpc_server rpc_server(/*thread_num=*/1, /*port=*/0);
+    RegisterRpcService(rpc_server, service_);
+    auto server_started = rpc_server.async_start();
+    ASSERT_FALSE(server_started.hasResult());
+    const uint16_t rpc_port = rpc_server.port();
+
+    auto resp = async_simple::coro::syncAwait(
+        [&]() -> async_simple::coro::Lazy<
+                  std::vector<tl::expected<bool, ErrorCode>>> {
+            coro_rpc::coro_rpc_client client;
+            auto ec =
+                co_await client.connect("127.0.0.1", std::to_string(rpc_port));
+            EXPECT_EQ(ec, coro_rpc::errc{});
+            client.set_req_attachment(tenant_id);
+            auto call_result =
+                co_await client.call<&WrappedMasterService::BatchExistKey>(
+                    lookup_keys);
+            EXPECT_TRUE(call_result.has_value());
+            co_return call_result.value();
+        }());
+    rpc_server.stop();
+
     ASSERT_EQ(resp.size(), lookup_keys.size());
     EXPECT_TRUE(resp[0].value());
     EXPECT_FALSE(resp[1].value());
@@ -5695,13 +5725,13 @@ TEST_F(MasterServiceTest, TenantTasksCarryTenantInPayload) {
         if (assignment.id == copy_task_id.value()) {
             ReplicaCopyPayload payload;
             struct_json::from_json(payload, assignment.payload);
-            EXPECT_EQ(payload.tenant_id, tenant_id);
+            EXPECT_EQ(payload.tenant_id.value_or("default"), tenant_id);
             EXPECT_EQ(payload.key, key);
             saw_copy = true;
         } else if (assignment.id == move_task_id.value()) {
             ReplicaMovePayload payload;
             struct_json::from_json(payload, assignment.payload);
-            EXPECT_EQ(payload.tenant_id, tenant_id);
+            EXPECT_EQ(payload.tenant_id.value_or("default"), tenant_id);
             EXPECT_EQ(payload.key, key);
             saw_move = true;
         }
@@ -5715,7 +5745,11 @@ TEST_F(MasterServiceTest, LegacyTaskPayloadDefaultsTenant) {
     struct_json::from_json(
         copy_payload,
         R"({"key":"legacy_copy_key","source":"segment_0","targets":["segment_1"]})");
-    EXPECT_EQ(copy_payload.tenant_id, "default");
+    // tenant_id is a trailing struct_pack::compatible<> field for v0.3.11
+    // wire-compatibility: a legacy payload omits it, so it decodes as absent
+    // and resolves to the default tenant via value_or.
+    EXPECT_FALSE(copy_payload.tenant_id.has_value());
+    EXPECT_EQ(copy_payload.tenant_id.value_or("default"), "default");
     EXPECT_EQ(copy_payload.key, "legacy_copy_key");
     EXPECT_EQ(copy_payload.source, "segment_0");
     ASSERT_EQ(copy_payload.targets.size(), 1u);
@@ -5725,7 +5759,8 @@ TEST_F(MasterServiceTest, LegacyTaskPayloadDefaultsTenant) {
     struct_json::from_json(
         move_payload,
         R"({"key":"legacy_move_key","source":"segment_0","target":"segment_1"})");
-    EXPECT_EQ(move_payload.tenant_id, "default");
+    EXPECT_FALSE(move_payload.tenant_id.has_value());
+    EXPECT_EQ(move_payload.tenant_id.value_or("default"), "default");
     EXPECT_EQ(move_payload.key, "legacy_move_key");
     EXPECT_EQ(move_payload.source, "segment_0");
     EXPECT_EQ(move_payload.target, "segment_1");

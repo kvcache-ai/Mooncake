@@ -12,6 +12,42 @@
 
 namespace mooncake {
 
+namespace {
+
+// Default tenant identity applied when a request carries no explicit tenant.
+// Must match the historical default baked into v0.3.11 clients.
+constexpr const char* kDefaultTenantId = "default";
+
+// Resolves the tenant identity for a multi-argument RPC. PR #2288 appended
+// tenant_id as a trailing handler argument; to keep the coro_rpc argument-tuple
+// type-code identical to v0.3.11 we carry it as a struct_pack::compatible<>
+// field (excluded from the type hash, decoded as nullopt when a v0.3.11 client
+// omits it). value_or restores the historical default in that case.
+inline std::string ResolveTenant(
+    const struct_pack::compatible<std::string>& tenant_id) {
+    return tenant_id.value_or(kDefaultTenantId);
+}
+
+// Reads the tenant identity carried out-of-band in the coro_rpc request
+// attachment. Single-argument RPCs (ExistKey, BatchExistKey, GetReplicaList,
+// GetReplicaListByRegex, BatchGetReplicaList, RemoveAll) keep their exact
+// v0.3.11 wire signature, because adding any second argument flips the
+// argument-tuple framing from a bare value to std::tuple<...> and shifts the
+// type-code. The tenant therefore rides the request attachment instead. A
+// v0.3.11 client sends no attachment, so we fall back to the default tenant.
+inline std::string TenantFromAttachment() {
+    auto* ctx = coro_rpc::get_context();
+    if (ctx != nullptr) {
+        std::string_view attachment = ctx->get_request_attachment();
+        if (!attachment.empty()) {
+            return std::string(attachment);
+        }
+    }
+    return kDefaultTenantId;
+}
+
+}  // namespace
+
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config)
     : master_service_(MasterServiceConfig(config)) {}
@@ -24,7 +60,8 @@ WrappedMasterService::CalcCacheStats() {
 }
 
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
-    const std::string& key, const std::string& tenant_id) {
+    const std::string& key) {
+    const std::string tenant_id = TenantFromAttachment();
     return execute_rpc(
         "ExistKey", [&] { return master_service_.ExistKey(key, tenant_id); },
         [&](auto& timer) { timer.LogRequest("key=", key); },
@@ -33,7 +70,8 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
-    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    const std::vector<std::string>& keys) {
+    const std::string tenant_id = TenantFromAttachment();
     ScopedVLogTimer timer(1, "BatchExistKey");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -146,8 +184,8 @@ WrappedMasterService::BatchReplicaClear(
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
-WrappedMasterService::GetReplicaListByRegex(const std::string& str,
-                                            const std::string& tenant_id) {
+WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
+    const std::string tenant_id = TenantFromAttachment();
     return execute_rpc(
         "GetReplicaListByRegex",
         [&] { return master_service_.GetReplicaListByRegex(str, tenant_id); },
@@ -163,8 +201,8 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedMasterService::GetReplicaList(const std::string& key,
-                                     const std::string& tenant_id) {
+WrappedMasterService::GetReplicaList(const std::string& key) {
+    const std::string tenant_id = TenantFromAttachment();
     return execute_rpc(
         "GetReplicaList",
         [&] { return master_service_.GetReplicaList(key, tenant_id); },
@@ -176,8 +214,9 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                          const std::string& tenant_id) {
+WrappedMasterService::BatchGetReplicaList(
+    const std::vector<std::string>& keys) {
+    const std::string tenant_id = TenantFromAttachment();
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -220,10 +259,11 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
-                               const uint64_t slice_length,
-                               const ReplicateConfig& config,
-                               const std::string& tenant_id) {
+WrappedMasterService::PutStart(
+    const UUID& client_id, const std::string& key, const uint64_t slice_length,
+    const ReplicateConfig& config,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "PutStart",
         [&] {
@@ -240,7 +280,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "PutEnd",
         [&] {
@@ -257,7 +298,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "PutRevoke",
         [&] {
@@ -273,11 +315,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-WrappedMasterService::BatchPutStart(const UUID& client_id,
-                                    const std::vector<std::string>& keys,
-                                    const std::vector<uint64_t>& slice_lengths,
-                                    const ReplicateConfig& config,
-                                    const std::string& tenant_id) {
+WrappedMasterService::BatchPutStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -369,7 +411,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -409,7 +453,9 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -448,10 +494,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
-                                  const uint64_t slice_length,
-                                  const ReplicateConfig& config,
-                                  const std::string& tenant_id) {
+WrappedMasterService::UpsertStart(
+    const UUID& client_id, const std::string& key, const uint64_t slice_length,
+    const ReplicateConfig& config,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "UpsertStart",
         [&] {
@@ -468,7 +515,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "UpsertEnd",
         [&] {
@@ -485,7 +533,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "UpsertRevoke",
         [&] {
@@ -504,7 +553,8 @@ std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 WrappedMasterService::BatchUpsertStart(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
-    const std::string& tenant_id) {
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     ScopedVLogTimer timer(1, "BatchUpsertStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -539,7 +589,8 @@ WrappedMasterService::BatchUpsertStart(
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
-    const std::string& tenant_id) {
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     ScopedVLogTimer timer(1, "BatchUpsertEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -572,9 +623,10 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
-                                        const std::vector<std::string>& keys,
-                                        const std::string& tenant_id) {
+WrappedMasterService::BatchUpsertRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     ScopedVLogTimer timer(1, "BatchUpsertRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -608,7 +660,9 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    const std::string& key, bool force, const std::string& tenant_id) {
+    const std::string& key, bool force,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "Remove", [&] { return master_service_.Remove(key, tenant_id, force); },
         [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
@@ -617,7 +671,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    const std::string& str, bool force, const std::string& tenant_id) {
+    const std::string& str, bool force,
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     return execute_rpc(
         "RemoveByRegex",
         [&] { return master_service_.RemoveByRegex(str, tenant_id, force); },
@@ -628,7 +684,8 @@ tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
-long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
+long WrappedMasterService::RemoveAll(bool force) {
+    const std::string tenant_id = TenantFromAttachment();
     ScopedVLogTimer timer(1, "RemoveAll");
     timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
@@ -639,7 +696,8 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
-    const std::string& tenant_id) {
+    struct_pack::compatible<std::string> tenant_id_compat) {
+    const std::string tenant_id = ResolveTenant(tenant_id_compat);
     ScopedVLogTimer timer(1, "BatchRemove");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys, ", force=", force);

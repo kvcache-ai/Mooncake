@@ -6,6 +6,7 @@
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/struct_pack.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
@@ -22,15 +23,13 @@ class WrappedMasterService {
 
     ~WrappedMasterService();
 
-    tl::expected<bool, ErrorCode> ExistKey(
-        const std::string& key, const std::string& tenant_id = "default");
+    tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default");
+        const std::vector<std::string>& keys);
 
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
@@ -44,91 +43,88 @@ class WrappedMasterService {
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
-    GetReplicaListByRegex(const std::string& str,
-                          const std::string& tenant_id = "default");
+    GetReplicaListByRegex(const std::string& str);
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const std::string& tenant_id = "default");
+        const std::string& key);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const std::string& tenant_id = "default");
+    BatchGetReplicaList(const std::vector<std::string>& keys);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config,
-                  const std::string& tenant_id = "default");
+                  struct_pack::compatible<std::string> tenant_id = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<void, ErrorCode> UpsertEnd(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
                      const std::vector<std::string>& keys,
                      const std::vector<uint64_t>& slice_lengths,
                      const ReplicateConfig& config,
-                     const std::string& tenant_id = "default");
+                     struct_pack::compatible<std::string> tenant_id = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<void, ErrorCode> Remove(
         const std::string& key, bool force = false,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<long, ErrorCode> RemoveByRegex(
         const std::string& str, bool force = false,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
-    long RemoveAll(bool force = false,
-                   const std::string& tenant_id = "default");
+    long RemoveAll(bool force = false);
 
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
-        const std::string& tenant_id = "default");
+        struct_pack::compatible<std::string> tenant_id = {});
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);

@@ -3555,8 +3555,9 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result = Copy(payload.key, payload.tenant_id,
-                                        payload.source, payload.targets);
+                auto copy_result =
+                    Copy(payload.key, payload.tenant_id.value_or("default"),
+                         payload.source, payload.targets);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -3567,8 +3568,9 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result = Move(payload.key, payload.tenant_id,
-                                        payload.source, payload.target);
+                auto move_result =
+                    Move(payload.key, payload.tenant_id.value_or("default"),
+                         payload.source, payload.target);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {

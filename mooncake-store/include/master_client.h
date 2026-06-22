@@ -652,6 +652,21 @@ class MasterClient {
      * @param args Arguments to pass to the RPC call
      * @return The result of the RPC call
      */
+    /**
+     * @brief Common implementation for single-result RPC invocation.
+     *
+     * The preparer is invoked on the coro_rpc_client immediately before
+     * send_request, allowing callers to attach out-of-band data (such as the
+     * tenant id via set_req_attachment) without changing the argument tuple or
+     * its type-code. This keeps the wire framing byte-identical to v0.3.11.
+     *
+     * @tparam PrepareClient Callable taking coro_rpc::coro_rpc_client&
+     */
+    template <auto ServiceMethod, typename ReturnType, typename PrepareClient,
+              typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_internal(
+        PrepareClient preparer, Args&&... args);
+
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
         Args&&... args);
@@ -665,9 +680,43 @@ class MasterClient {
      * @param args Arguments to pass to the RPC call
      * @return Vector of results from the batch RPC call
      */
+    /**
+     * @brief Common implementation for batch RPC invocation.
+     *
+     * See invoke_rpc_internal for the preparer contract; the attachment keeps
+     * the argument tuple and type-code byte-identical to v0.3.11.
+     *
+     * @tparam PrepareClient Callable taking coro_rpc::coro_rpc_client&
+     */
+    template <auto ServiceMethod, typename ResultType, typename PrepareClient,
+              typename... Args>
+    [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
+    invoke_batch_rpc_internal(PrepareClient preparer, size_t input_size,
+                              Args&&... args);
+
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
+
+    /**
+     * @brief RPC invocation helper that carries the tenant identity in the
+     * coro_rpc request attachment instead of the argument tuple.
+     *
+     * Used for the single-argument object RPCs (ExistKey, BatchExistKey,
+     * GetReplicaList, GetReplicaListByRegex, BatchGetReplicaList, RemoveAll)
+     * whose v0.3.11 wire signatures must stay byte-identical for cross-version
+     * compatibility. Adding any second argument would flip the argument-tuple
+     * framing from a bare value to std::tuple<...> and change the type-code, so
+     * the tenant rides the attachment, which a v0.3.11 server simply ignores.
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_tenant(
+        const std::string& tenant_id, Args&&... args);
+
+    template <auto ServiceMethod, typename ResultType, typename... Args>
+    [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
+    invoke_batch_rpc_with_tenant(const std::string& tenant_id,
+                                 size_t input_size, Args&&... args);
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool

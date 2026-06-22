@@ -7403,10 +7403,10 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
-            select_client, {.tenant_id = object_id.tenant_id,
-                            .key = object_id.user_key,
+            select_client, {.key = object_id.user_key,
                             .source = selected_source_segment,
-                            .targets = targets});
+                            .targets = targets,
+                            .tenant_id = object_id.tenant_id});
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
@@ -7460,10 +7460,10 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_MOVE>(
-            select_client, {.tenant_id = object_id.tenant_id,
-                            .key = object_id.user_key,
+            select_client, {.key = object_id.user_key,
                             .source = source,
-                            .target = target});
+                            .target = target,
+                            .tenant_id = object_id.tenant_id});
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
