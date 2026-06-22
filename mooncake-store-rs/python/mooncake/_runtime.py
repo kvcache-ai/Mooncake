@@ -10,11 +10,13 @@ import tempfile
 _WHEEL_LIB_DIRS = ("mooncake.libs", "mooncake_store_rs.libs")
 _NATIVE_LIBRARIES = (
     "libasio.so",
+    "libtransfer_engine.so",
     "libtent_shared.so",
     "libmooncake_classic_shim.so",
     "libmooncake_tent_shim.so",
 )
 _NATIVE_LIBRARY_ENV_VARS = {
+    "libtransfer_engine.so": "MOONCAKE_CLASSIC_TE_LIB_PATH",
     "libtent_shared.so": "MOONCAKE_TENT_SHARED_LIB_PATH",
     "libmooncake_classic_shim.so": "MOONCAKE_CLASSIC_SHIM_LIB_PATH",
     "libmooncake_tent_shim.so": "MOONCAKE_TENT_SHIM_LIB_PATH",
