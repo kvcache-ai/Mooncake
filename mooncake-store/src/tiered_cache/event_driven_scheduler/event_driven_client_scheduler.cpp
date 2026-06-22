@@ -35,7 +35,7 @@ EventDrivenClientScheduler::EventDrivenClientScheduler(
     if (loop_interval_ms_ <= 0) {
         loop_interval_ms_ = 1000;
     }
-    hot_key_num_ = ed_config::ReadSize(config, "hot_key_num", 64);
+    hot_key_num_ = ed_config::ReadSize(config, "hot_key_num", 2000);
     LOG(INFO) << "EventDrivenClientScheduler constructed";
 }
 
@@ -201,7 +201,9 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
     switch (mv.kind) {
         case MovementRequest::Kind::kReplicate: {
             // Copy source -> dest, retaining the source (e.g. pre-demote). The
-            // CAS on the re-read version makes a stale request a no-op.
+            // CAS on the re-read version makes a stale request a no-op. CopyData
+            // is strict, so the offload lands on dest (the slow tier) or is
+            // skipped — it never bounces back onto a higher-priority tier.
             uint64_t version = 0;
             auto src = backend_->Get(mv.key, mv.source_tier,
                                      /*record_access=*/false, &version);
@@ -219,13 +221,13 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
             return true;
         }
         case MovementRequest::Kind::kMigrate: {
-            // Copy source -> dest, then delete source. The copy is STRICT so it
-            // must land on dest (triggering dest's sync eviction if full) and
-            // can never fall back to another tier — a successful CopyData then
-            // means the new replica is genuinely on dest, so deleting the source
-            // cannot lose the only copy. (Strict also makes onboard actually
-            // evict-to-fit instead of silently re-landing the copy on the slow
-            // tier under fast-tier pressure.)
+            // Copy source -> dest, then delete source. CopyData is strict, so it
+            // must land on dest (sync-evicting it if full) and can never fall
+            // back to another tier — a successful copy means the new replica is
+            // genuinely on dest, so deleting the source cannot lose the only
+            // copy. (Strict also makes onboard actually evict-to-fit instead of
+            // silently re-landing the copy on the slow tier under fast-tier
+            // pressure.)
             uint64_t version = 0;
             auto src = backend_->Get(mv.key, mv.source_tier,
                                      /*record_access=*/false, &version);
@@ -234,8 +236,7 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
             }
             auto copy = backend_->CopyData(mv.key, src.value()->loc.data,
                                            mv.dest_tier, version,
-                                           /*record_access=*/false,
-                                           /*strict=*/true);
+                                           /*record_access=*/false);
             if (!copy.has_value()) {
                 VLOG(2) << "Migrate copy skipped for " << mv.key << ": "
                         << copy.error();

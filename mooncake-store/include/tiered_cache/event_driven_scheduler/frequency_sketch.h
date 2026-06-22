@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 namespace mooncake {
@@ -25,8 +26,8 @@ namespace mooncake {
  * which weakens the Count-Min `min` estimate; we only require the 4 rows to be
  * statistically independent.
  *
- * Threading: the core is single-threaded; callers serialize access with their
- * own mutex.
+ * Threading: thread-safe — every public method locks an internal mutex, so
+ * callers do not serialize externally.
  */
 class FixedDecayPolicy {
    public:
@@ -65,9 +66,73 @@ class FrequencySketch {
                            ? FixedDecayPolicy::FromCapacity(capacity).sample_size()
                            : sample_size) {}
 
-    // Bump all 4 rows (saturating at 15). size_ advances only when at least one
-    // row actually moved. Triggers a halving Reset on threshold.
+    // Bump all 4 rows (saturating at 15). Triggers a halving reset on threshold.
     void Increment(uint64_t key) {
+        std::lock_guard<std::mutex> lock(mu_);
+        IncrementLocked(key);
+    }
+
+    // Fused Increment + Estimate: bump all 4 rows AND return the post-increment
+    // Count-Min estimate in a SINGLE pass — one Hash() per row instead of the
+    // two passes (8 hashes) that Increment() then Estimate() would do. Used on
+    // the hot access path. Semantically identical to Increment then Estimate.
+    uint32_t IncrementAndEstimate(uint64_t key) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (table_.empty()) {
+            return 0;
+        }
+        bool added = false;
+        uint32_t min_count = std::numeric_limits<uint32_t>::max();
+        for (int row = 0; row < kDepth; ++row) {
+            const uint64_t h = Hash(key, row);
+            const size_t cell = static_cast<size_t>(h % table_.size());
+            const uint8_t nibble = static_cast<uint8_t>(h & 15);
+            if (IncrementAt(cell, nibble)) {
+                added = true;
+            }
+            min_count = std::min<uint32_t>(min_count, CountAt(cell, nibble));
+        }
+        if (added) {
+            ++size_;
+            if (sample_size_ != 0 && size_ >= sample_size_) {
+                ResetLocked();
+                // The halving invalidated the counts read above; recompute.
+                return EstimateLocked(key);
+            }
+        }
+        return min_count;
+    }
+
+    // Count-Min estimate: min across the 4 rows. Range [0, 15].
+    uint32_t Estimate(uint64_t key) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return EstimateLocked(key);
+    }
+
+    // Halving decay: every nibble >>= 1; size_ is roughly halved minus a
+    // correction for the population of odd (lost) low bits.
+    void Reset() {
+        std::lock_guard<std::mutex> lock(mu_);
+        ResetLocked();
+    }
+
+    uint32_t size() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return size_;
+    }
+
+    // Approximate resident memory of the sketch table (for tests / accounting):
+    // ~8 * max(1, capacity/4) bytes. table_ size is fixed after construction.
+    size_t MemoryBytes() const { return table_.size() * sizeof(uint64_t); }
+
+   private:
+    static constexpr int kDepth = 4;
+    static constexpr uint64_t kOneMask = 0x1111111111111111ULL;
+    static constexpr uint64_t kResetMask = 0x7777777777777777ULL;
+
+    // --- Internal, NON-locking primitives (caller must hold mu_). ---
+
+    void IncrementLocked(uint64_t key) {
         if (table_.empty()) {
             return;
         }
@@ -83,45 +148,12 @@ class FrequencySketch {
         if (added) {
             ++size_;
             if (sample_size_ != 0 && size_ >= sample_size_) {
-                Reset();
+                ResetLocked();
             }
         }
     }
 
-    // Fused Increment + Estimate: bump all 4 rows AND return the post-increment
-    // Count-Min estimate in a SINGLE pass — one Hash() per row instead of the
-    // two passes (8 hashes) that Increment() followed by Estimate() would do.
-    // Used on the hot access path. Semantically identical to calling
-    // Increment(key) then Estimate(key).
-    uint32_t IncrementAndEstimate(uint64_t key) {
-        if (table_.empty()) {
-            return 0;
-        }
-        bool added = false;
-        uint32_t min_count = std::numeric_limits<uint32_t>::max();
-        for (int row = 0; row < kDepth; ++row) {
-            const uint64_t h = Hash(key, row);
-            const size_t cell = static_cast<size_t>(h % table_.size());
-            const uint8_t nibble = static_cast<uint8_t>(h & 15);
-            if (IncrementAt(cell, nibble)) {
-                added = true;
-            }
-            min_count = std::min<uint32_t>(min_count, CountAt(cell, nibble));
-        }
-        if (added) {
-            ++size_;
-            if (sample_size_ != 0 && size_ >= sample_size_) {
-                Reset();
-                // The halving invalidated the counts read above; recompute the
-                // estimate against the decayed table to match Increment+Estimate.
-                return Estimate(key);
-            }
-        }
-        return min_count;
-    }
-
-    // Count-Min estimate: min across the 4 rows. Range [0, 15].
-    uint32_t Estimate(uint64_t key) const {
+    uint32_t EstimateLocked(uint64_t key) const {
         if (table_.empty()) {
             return 0;
         }
@@ -135,30 +167,16 @@ class FrequencySketch {
         return min_count;
     }
 
-    // Halving decay: every nibble >>= 1; size_ is roughly halved minus a
-    // correction for the population of odd (lost) low bits.
-    void Reset() {
+    void ResetLocked() {
         uint32_t count = 0;
         for (auto& word : table_) {
-            count += static_cast<uint32_t>(
-                std::popcount(word & kOneMask));
+            count += static_cast<uint32_t>(std::popcount(word & kOneMask));
             word = (word >> 1) & kResetMask;
         }
         const uint32_t half = size_ >> 1;
         const uint32_t dec = count >> 2;
         size_ = half - std::min(half, dec);
     }
-
-    uint32_t size() const { return size_; }
-
-    // Approximate resident memory of the sketch table (for tests / accounting):
-    // ~8 * max(1, capacity/4) bytes.
-    size_t MemoryBytes() const { return table_.size() * sizeof(uint64_t); }
-
-   private:
-    static constexpr int kDepth = 4;
-    static constexpr uint64_t kOneMask = 0x1111111111111111ULL;
-    static constexpr uint64_t kResetMask = 0x7777777777777777ULL;
 
     // Returns true if the counter was below 15 and got incremented.
     bool IncrementAt(size_t cell, uint8_t nibble) {
@@ -198,6 +216,7 @@ class FrequencySketch {
         return x;
     }
 
+    mutable std::mutex mu_;
     std::vector<uint64_t> table_;
     uint32_t size_ = 0;
     uint32_t sample_size_;

@@ -2,12 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <optional>
 #include <string_view>
 #include <vector>
 
-#include "mutex.h"  // Mutex, MutexLocker, GUARDED_BY
 #include "tiered_cache/event_driven_scheduler/event_driven_stats_collector.h"
 #include "tiered_cache/event_driven_scheduler/frequency_sketch.h"
 #include "tiered_cache/event_driven_scheduler/multi_lru.h"
@@ -26,9 +24,9 @@ namespace mooncake {
  * RemoveKey, because a fast-tier replica is often dropped while the key still
  * lives in the slow tier (so "last replica gone" would never fire).
  *
- * Locking: two independent locks, never held simultaneously (sketch_mutex_ then
- * released before lru_mutex_, and vice versa), so there is no lock-ordering
- * hazard.
+ * Locking: none of its own — sketch_ and fast_lru_ are each internally
+ * thread-safe, and no operation needs them updated atomically together (a
+ * commit's freq estimate is only a hint for the initial band).
  */
 class MultiLRUStatsCollector : public EventDrivenStatsCollector {
    public:
@@ -57,11 +55,8 @@ class MultiLRUStatsCollector : public EventDrivenStatsCollector {
         return fast_tier_set_ && tier_id == fast_tier_id_;
     }
 
-    mutable std::mutex sketch_mutex_;
-    FrequencySketch sketch_;  // guarded by sketch_mutex_ (std::mutex)
-
-    mutable Mutex lru_mutex_;
-    MultiLRU fast_lru_ GUARDED_BY(lru_mutex_);
+    FrequencySketch sketch_;  // internally thread-safe
+    MultiLRU fast_lru_;       // internally thread-safe
 
     UUID fast_tier_id_{};
     bool fast_tier_set_ = false;

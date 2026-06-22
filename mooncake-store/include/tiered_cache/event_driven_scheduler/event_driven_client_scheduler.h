@@ -89,7 +89,9 @@ class EventDrivenClientScheduler : public IClientScheduler {
     bool evict_wakeup_ = false;  // guarded by evict_mutex_
 
     int loop_interval_ms_ = 1000;
-    size_t hot_key_num_ = 64;
+    // Default GetHotKeyStats(nullopt) count; sized to the ~2000-key async
+    // metadata-sync batch (overwritten from scheduler.hot_key_num if set).
+    size_t hot_key_num_ = 2000;
 };
 
 }  // namespace mooncake

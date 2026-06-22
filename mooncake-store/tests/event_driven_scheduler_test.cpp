@@ -277,16 +277,16 @@ TEST_F(EventDrivenSchedulerTest, StrictDramPutEvictsInsteadOfSpilling) {
 
 TEST_F(EventDrivenSchedulerTest, GetHotKeyStatsZeroReturnsAllBeyondDefaultCap) {
     // P1-1: HA recovery passes hot_key_num=0 (== all) through DataManager ->
-    // TieredBackend so Phase 1 recovers the entire hot working set, not just
-    // the scheduler's default top-64. This guards the TieredBackend layer that
+    // TieredBackend so Phase 1 recovers the entire hot working set, not just the
+    // scheduler's default cap. This guards the TieredBackend layer that
     // DataManager::GetHotKeyStats forwards verbatim.
+    auto cfg = MakeConfig(16 * kMB, 64 * kMB);
+    cfg["scheduler"]["hot_key_num"] = 64;  // explicit small cap for the test
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(16 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, cfg).has_value());
     const UUID fast = FastTier(backend);
 
-    constexpr int kKeys = 100;  // > the default cap of 64
+    constexpr int kKeys = 100;  // > the configured cap of 64
     int committed = 0;
     for (int i = 0; i < kKeys; ++i) {
         if (Put(backend, "h" + std::to_string(i), fast, 4 * 1024)) {
@@ -321,8 +321,8 @@ TEST_F(EventDrivenSchedulerTest, StrictCopyDataDoesNotFallBackToOtherTier) {
     ASSERT_TRUE(src.has_value());
 
     auto copy = backend.CopyData("src", src.value()->loc.data, fast, version,
-                                 /*record_access=*/false, /*strict=*/true);
-    EXPECT_FALSE(copy.has_value());           // strict: fails, no fallback
+                                 /*record_access=*/false);
+    EXPECT_FALSE(copy.has_value());            // strict: fails, no fallback
     EXPECT_FALSE(backend.Exist("src", fast));  // nothing landed on fast
 }
 

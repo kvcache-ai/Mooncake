@@ -62,6 +62,8 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
     // Always update the frequency memory / fast-tier band.
     collector_.OnAccess(ctx.key, ctx.served_tier_id);
     if (!initialized_) {
+        VLOG(2) << "MultiLRU OnAccess before Init for " << ctx.key
+                << "; no movement decided";
         return std::nullopt;
     }
 
@@ -181,6 +183,7 @@ std::vector<MovementRequest> MultiLRUPolicy::DecideEvict(
     size_t min_reclaim_bytes) {
     std::vector<MovementRequest> out;
     if (!initialized_) {
+        VLOG(2) << "MultiLRU DecideEvict before Init; nothing to reclaim";
         return out;
     }
     const auto views = backend_->GetTierViews();

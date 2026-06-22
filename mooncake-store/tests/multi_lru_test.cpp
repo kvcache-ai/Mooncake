@@ -57,8 +57,8 @@ TEST(MultiLRUTest, CollectHotReturnsHottestFirstBounded) {
     EXPECT_EQ(stats.metric, AccessStatMetric::kFrequency);
     EXPECT_EQ(stats.hot_keys[0].key, "veryhot");  // hottest first
     EXPECT_EQ(stats.hot_keys[1].key, "hot");
-    EXPECT_GT(stats.hot_keys[0].estimated_frequency,
-              stats.hot_keys[1].estimated_frequency);
+    // The hottest-first ordering above reflects frequency; confirm directly.
+    EXPECT_GT(c.GetAccessFrequency("veryhot"), c.GetAccessFrequency("hot"));
 }
 
 TEST(MultiLRUTest, RemoveDropsFromBandsButSketchRemembers) {

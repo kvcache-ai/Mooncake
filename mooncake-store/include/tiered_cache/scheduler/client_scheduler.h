@@ -167,7 +167,9 @@ class LegacyClientScheduler : public IClientScheduler {
     int loop_interval_ms_ = 1000;
     size_t stats_snapshot_limit_ = detail::DefaultSnapshotLimit();
     // Default count returned by GetHotKeyStats(nullopt). 0 => return all.
-    size_t hot_key_num_ = 64;
+    // Sized to the async metadata-sync batch (~2000 keys/RPC), not an arbitrary
+    // small cap.
+    size_t hot_key_num_ = 2000;
     enum class EvictionMode { SYNC, ASYNC };
     EvictionMode eviction_mode_ = EvictionMode::ASYNC;
 

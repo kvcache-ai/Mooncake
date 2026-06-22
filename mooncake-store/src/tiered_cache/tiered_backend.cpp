@@ -1011,7 +1011,7 @@ tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
     std::string_view key, const DataSource& source, UUID dest_tier_id,
-    std::optional<uint64_t> expected_version, bool record_access, bool strict) {
+    std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -1020,7 +1020,10 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
         LOG(ERROR) << "Invalid source buffer or size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto dest_handle = Allocate(source.buffer->size(), dest_tier_id, strict);
+    // Strict: the copy must land on dest_tier_id (sync-evicting it if full) or
+    // fail — never silently fall back to another tier.
+    auto dest_handle = Allocate(source.buffer->size(), dest_tier_id,
+                                /*strict=*/true);
     if (!dest_handle.has_value()) {
         LOG(ERROR) << "Failed to allocate memory for key: " << key
                    << " in Tier " << dest_tier_id;

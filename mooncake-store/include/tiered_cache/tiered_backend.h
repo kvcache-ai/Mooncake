@@ -260,13 +260,13 @@ class TieredBackend {
 
     // --- Composite Operations ---
 
-    // strict=true forces the copy onto dest_tier_id (triggering its sync
-    // eviction on a full tier) and never falls back to another tier, so a
-    // successful return guarantees the new replica landed on dest_tier_id.
+    // Allocates strictly on dest_tier_id (triggering its sync eviction on a
+    // full tier; never falls back to another tier), so a successful return
+    // guarantees the new replica landed on dest_tier_id.
     tl::expected<void, ErrorCode> CopyData(
         std::string_view key, const DataSource& source, UUID dest_tier_id,
         std::optional<uint64_t> expected_version = std::nullopt,
-        bool record_access = true, bool strict = false);
+        bool record_access = true);
 
     tl::expected<void, ErrorCode> Transfer(std::string_view key,
                                            UUID source_tier_id,

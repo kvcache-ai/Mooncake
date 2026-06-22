@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -55,8 +56,8 @@ struct MultiLRUEntry {
  *
  * Each band is a doubly-linked recency list (front = MRU, back = LRU). A key's
  * band is its frequency band; re-classification on access moves it between
- * bands while preserving recency within a band. NOT thread-safe; the owning
- * collector serializes access with its own mutex.
+ * bands while preserving recency within a band. Thread-safe — every public
+ * method locks an internal mutex.
  */
 class MultiLRU {
    public:
@@ -65,6 +66,7 @@ class MultiLRU {
     // band's MRU position. Takes a raw frequency and computes the band itself,
     // mirroring Touch() (callers no longer hand-roll BandOf).
     void Insert(std::string_view key, size_t size_bytes, uint64_t freq) {
+        std::lock_guard<std::mutex> lock(mu_);
         const HeatBand band = BandOf(freq);
         auto it = index_.find(key);
         if (it != index_.end()) {
@@ -80,6 +82,7 @@ class MultiLRU {
     // Recompute the key's band from `freq` and move it to that band's MRU.
     // No-op if the key is not resident. Returns true if the key was present.
     bool Touch(std::string_view key, uint64_t freq) {
+        std::lock_guard<std::mutex> lock(mu_);
         auto it = index_.find(key);
         if (it == index_.end()) {
             return false;
@@ -90,6 +93,7 @@ class MultiLRU {
 
     // Remove a key from whatever band holds it. Returns true if removed.
     bool Remove(std::string_view key) {
+        std::lock_guard<std::mutex> lock(mu_);
         auto it = index_.find(key);
         if (it == index_.end()) {
             return false;
@@ -101,14 +105,19 @@ class MultiLRU {
     }
 
     bool Contains(std::string_view key) const {
+        std::lock_guard<std::mutex> lock(mu_);
         return index_.find(key) != index_.end();
     }
 
-    size_t Size() const { return index_.size(); }
+    size_t Size() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return index_.size();
+    }
 
     // Hottest-first: very-hot MRU->LRU, then hot MRU->LRU, ... until `n` rows
     // are collected. Only as many as exist are returned.
     std::vector<MultiLRUEntry> CollectHot(size_t n) const {
+        std::lock_guard<std::mutex> lock(mu_);
         std::vector<MultiLRUEntry> out;
         if (n == 0) return out;
         out.reserve(std::min(n, index_.size()));
@@ -125,6 +134,7 @@ class MultiLRU {
     // Coldest-first eviction candidates: cold band LRU->MRU, then warm, ...,
     // up to `max_n`. Within a band, the LRU (back) comes first.
     std::vector<MultiLRUEntry> CollectColdFirst(size_t max_n) const {
+        std::lock_guard<std::mutex> lock(mu_);
         std::vector<MultiLRUEntry> out;
         if (max_n == 0) return out;
         out.reserve(std::min(max_n, index_.size()));
@@ -157,6 +167,7 @@ class MultiLRU {
         dst.splice(dst.begin(), src, node_it);
     }
 
+    mutable std::mutex mu_;
     // lists_[band]: front = MRU, back = LRU.
     std::list<Node> lists_[kNumHeatBands];
     std::unordered_map<std::string, ListIter, StringHash, std::equal_to<>>
