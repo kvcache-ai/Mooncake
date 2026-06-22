@@ -63,8 +63,9 @@ struct MasterConfig {
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
     // Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*)
-    // when client heartbeat times out. Only effective when
-    // enable_http_metadata_server is true.
+    // when client heartbeat times out. Works in two modes: (1) co-located
+    // (enable_http_metadata_server=true) via in-process removal, or
+    // (2) separately-deployed metadata server via async HTTP DELETE.
     bool enable_metadata_cleanup_on_timeout;
 
     // Pod identity for K8s label-based routing

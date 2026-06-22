@@ -92,13 +92,18 @@ std::string ResolveMetadataServerForCleanup() {
                     Json::Value root;
                     std::string errs;
                     if (Json::parseFromStream(builder, fin, &root, &errs) &&
-                        root.isMember("metadata_server")) {
+                        root.isMember("metadata_server") &&
+                        root["metadata_server"].isString()) {
                         return root["metadata_server"].asString();
                     }
                     if (!errs.empty()) {
                         LOG(WARNING) << "Failed to parse MOONCAKE_CONFIG_PATH ("
                                      << cfg << "): " << errs;
                     }
+                } else {
+                    LOG(WARNING)
+                        << "Cannot open MOONCAKE_CONFIG_PATH (" << cfg
+                        << "): file does not exist or is not readable";
                 }
             } catch (const std::exception& e) {
                 LOG(WARNING) << "Error reading MOONCAKE_CONFIG_PATH (" << cfg
@@ -241,8 +246,9 @@ DEFINE_string(http_metadata_server_host, "0.0.0.0",
 DEFINE_bool(
     enable_metadata_cleanup_on_timeout, false,
     "Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) "
-    "when client heartbeat times out. Only effective when "
-    "enable_http_metadata_server is true.");
+    "when client heartbeat times out. Works in two modes: (1) co-located "
+    "(enable_http_metadata_server=true) via in-process removal, or "
+    "(2) separately-deployed metadata server via async HTTP DELETE.");
 
 DEFINE_string(pod_name, "",
               "Pod name for K8s label-based routing (default: $POD_NAME)");

@@ -373,6 +373,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
 
+    // NOTE: The async HTTP metadata cleanup worker is started lazily in
+    // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
+    // since that happens after this constructor returns (in WrappedMasterService).
+
     job_dispatch_running_ = true;
     job_dispatch_thread_ =
         std::thread(&MasterService::JobDispatchThreadFunc, this);
@@ -446,6 +450,7 @@ MasterService::~MasterService() {
     snapshot_running_ = false;
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
+    http_metadata_cleanup_running_ = false;
     graceful_unmount_scheduler_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -453,6 +458,7 @@ MasterService::~MasterService() {
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
+    http_metadata_cleanup_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
@@ -470,6 +476,9 @@ MasterService::~MasterService() {
     }
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
+    }
+    if (http_metadata_cleanup_thread_.joinable()) {
+        http_metadata_cleanup_thread_.join();
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
@@ -8777,6 +8786,11 @@ void MasterService::setHttpMetadataRemoteUrl(
             LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
                          "(remote metadata server "
                       << metadata_connstring << ")";
+            // Start async cleanup worker now that http_metadata_remote_ is ready
+            http_metadata_cleanup_running_ = true;
+            http_metadata_cleanup_thread_ =
+                std::thread(&MasterService::HttpMetadataCleanupThreadFunc, this);
+            LOG(INFO) << "HTTP metadata cleanup worker thread started";
         } catch (const std::exception& e) {
             LOG(WARNING) << "Failed to initialize remote HTTP metadata client "
                             "for "
@@ -8801,13 +8815,13 @@ void MasterService::setHttpMetadataRemoteUrl(
 }
 
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
-    const std::string ram_key = http_metadata_prefix_ + "ram/" + segment_name;
-    const std::string rpc_key =
-        http_metadata_prefix_ + "rpc_meta/" + segment_name;
-
     // Co-located metadata server: remove via direct in-process call (no
-    // network overhead).
+    // network overhead). Safe to run inline — no I/O leaves the process.
     if (http_metadata_server_) {
+        const std::string ram_key =
+            http_metadata_prefix_ + "ram/" + segment_name;
+        const std::string rpc_key =
+            http_metadata_prefix_ + "rpc_meta/" + segment_name;
         bool ram_removed = http_metadata_server_->removeKey(ram_key);
         bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
         LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
@@ -8816,26 +8830,67 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
         return;
     }
 
-    // Separately-deployed metadata server: best-effort removal over HTTP.
-    // Failures/exceptions must never escape into the client-monitor thread.
+    // Separately-deployed metadata server: enqueue for async cleanup so that
+    // slow/unreachable metadata servers never block the client monitor thread.
     if (http_metadata_remote_) {
-        bool ram_removed = false;
-        bool rpc_removed = false;
-        try {
-            ram_removed = http_metadata_remote_->remove(ram_key);
-            rpc_removed = http_metadata_remote_->remove(rpc_key);
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Remote HTTP metadata cleanup failed for segment: "
-                         << segment_name << ": " << e.what();
-            return;
+        {
+            std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);
+            http_metadata_cleanup_queue_.push_back(segment_name);
         }
-        LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
-                  << segment_name << ", ram_key_removed=" << ram_removed
-                  << ", rpc_key_removed=" << rpc_removed;
+        http_metadata_cleanup_cv_.notify_one();
         return;
     }
 
     // Neither configured: cleanup is disabled, nothing to do.
+}
+
+void MasterService::HttpMetadataCleanupThreadFunc() {
+    LOG(INFO) << "HTTP metadata cleanup worker started";
+    while (http_metadata_cleanup_running_) {
+        std::vector<std::string> batch;
+        {
+            std::unique_lock<std::mutex> lk(http_metadata_cleanup_mutex_);
+            http_metadata_cleanup_cv_.wait(lk, [&] {
+                return !http_metadata_cleanup_queue_.empty() ||
+                       !http_metadata_cleanup_running_.load();
+            });
+            if (!http_metadata_cleanup_running_ &&
+                http_metadata_cleanup_queue_.empty()) {
+                break;
+            }
+            batch.swap(http_metadata_cleanup_queue_);
+        }
+
+        for (const auto& segment_name : batch) {
+            const std::string ram_key =
+                http_metadata_prefix_ + "ram/" + segment_name;
+            const std::string rpc_key =
+                http_metadata_prefix_ + "rpc_meta/" + segment_name;
+
+            // Each key attempted independently so one failure does not
+            // prevent cleanup of the other.
+            bool ram_removed = false;
+            bool rpc_removed = false;
+            try {
+                ram_removed = http_metadata_remote_->remove(ram_key);
+            } catch (const std::exception& e) {
+                LOG(WARNING)
+                    << "Remote HTTP metadata cleanup failed for ram_key: "
+                    << ram_key << ": " << e.what();
+            }
+            try {
+                rpc_removed = http_metadata_remote_->remove(rpc_key);
+            } catch (const std::exception& e) {
+                LOG(WARNING)
+                    << "Remote HTTP metadata cleanup failed for rpc_key: "
+                    << rpc_key << ": " << e.what();
+            }
+            LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
+                      << segment_name << ", ram_key_removed=" << ram_removed
+                      << ", rpc_key_removed=" << rpc_removed;
+        }
+    }
+    LOG(INFO) << "HTTP metadata cleanup worker stopped";
 }
 
 }  // namespace mooncake

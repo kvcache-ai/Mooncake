@@ -1905,8 +1905,21 @@ class MasterService {
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;
 
+    // Async cleanup worker for remote HTTP metadata removal.
+    // Segments are enqueued from the client monitor thread and processed
+    // asynchronously so that slow/unreachable metadata servers never block
+    // heartbeat processing or segment operations.
+    std::thread http_metadata_cleanup_thread_;
+    std::atomic<bool> http_metadata_cleanup_running_{false};
+    std::mutex http_metadata_cleanup_mutex_;
+    std::condition_variable http_metadata_cleanup_cv_;
+    std::vector<std::string> http_metadata_cleanup_queue_;
+
+    void HttpMetadataCleanupThreadFunc();
+
     // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
-    // segment
+    // segment. For the co-located case this is synchronous (no network I/O);
+    // for the remote case it enqueues to the async cleanup worker.
     void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
