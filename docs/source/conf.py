@@ -61,7 +61,6 @@ templates_path = ['_templates']
 exclude_patterns: list[str] = [
     "**/*.template.md",
     "**/*.inc.md",
-    "zh_archive/**",
 ]
 
 # Exclude the prompt "$" when copying code
