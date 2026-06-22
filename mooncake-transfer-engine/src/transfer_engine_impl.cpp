@@ -368,6 +368,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngineImpl::freeEngine() {
+    // Destroy transports first so they can clean up their segment descriptors
+    // before we remove the RPC metadata entry. This prevents a 404 error when
+    // the master cascades resource cleanup upon rpc_meta deletion.
+    multi_transports_.reset();
     if (metadata_) {
         metadata_->removeRpcMetaEntry(local_server_name_);
         metadata_.reset();

@@ -778,6 +778,7 @@ func (r *MooncakeClusterReconciler) waitDrainJobs(
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	done := make(map[string]bool)
+	var hasFailure bool
 	for _, id := range jobIDs {
 		done[id] = false
 	}
@@ -837,11 +838,13 @@ func (r *MooncakeClusterReconciler) waitDrainJobs(
 					"succeededUnits", queryResp.SucceededUnits)
 			case 4: // FAILED
 				done[id] = true
-				logger.Info("drain job failed", "jobID", id,
+				hasFailure = true
+				logger.Error(nil, "drain job FAILED", "jobID", id,
 					"message", queryResp.Message,
 					"failedUnits", queryResp.FailedUnits)
 			case 5: // CANCELED
 				done[id] = true
+				hasFailure = true
 				logger.Info("drain job canceled", "jobID", id)
 			default:
 				// Still running, log progress
@@ -856,6 +859,9 @@ func (r *MooncakeClusterReconciler) waitDrainJobs(
 		}
 
 		if allDoneExcept(done) {
+			if hasFailure {
+				return fmt.Errorf("drain jobs completed with failures")
+			}
 			return nil
 		}
 
@@ -1204,6 +1210,7 @@ func (r *MooncakeClusterReconciler) orchestrateDecodeScaleDown(
 	logger.Info("migrating decode pods",
 		"terminating", len(terminatingPods), "alive", len(alivePods))
 
+	var migrationErrors []string
 	for _, pod := range terminatingPods {
 		logger.Info("migrating pod", "pod", pod.Name, "ip", pod.Status.PodIP)
 
@@ -1216,6 +1223,8 @@ func (r *MooncakeClusterReconciler) orchestrateDecodeScaleDown(
 			logger.Error(err, "migration failed for pod", "pod", pod.Name)
 			r.Recorder.Event(mc, corev1.EventTypeWarning, "PodMigrationFailed",
 				fmt.Sprintf("migration failed for %s: %v", pod.Name, err))
+			migrationErrors = append(migrationErrors,
+				fmt.Sprintf("pod %s: %v", pod.Name, err))
 			continue
 		}
 
@@ -1233,6 +1242,9 @@ func (r *MooncakeClusterReconciler) orchestrateDecodeScaleDown(
 			fmt.Sprintf("pod %s migrated successfully", pod.Name))
 	}
 
+	if len(migrationErrors) > 0 {
+		return fmt.Errorf("decode scale-down migration failed: %s", strings.Join(migrationErrors, "; "))
+	}
 	return nil
 }
 
@@ -1512,13 +1524,17 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 
 	r.drainJobsMu.Unlock()
 	
-	// Force-delete pods whose drain jobs have completed (status >= 3: SUCCEEDED/FAILED/CANCELED).
-	// This handles the case where the PreStop hook doesn't detect the DRAINED status and the
-	// pod remains stuck in Terminating after data migration completes.
+	// Force-delete pods whose drain jobs have succeeded (status == 3).
+	// FAILED or CANCELED drain jobs should NOT trigger force-delete —
+	// they will terminate naturally via PreStop hook when the timeout
+	// expires, giving more time for data to be preserved.
+	// This also handles the case where the PreStop hook doesn't detect
+	// the DRAINED status and the pod remains stuck in Terminating after
+	// data migration completes.
 	r.drainJobsMu.Lock()
 	var completedUIDs []string
 	for uid, job := range r.drainJobs {
-		if job.Status >= 3 {
+		if job.Status == 3 {
 			completedUIDs = append(completedUIDs, uid)
 		}
 	}

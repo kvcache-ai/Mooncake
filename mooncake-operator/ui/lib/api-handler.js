@@ -686,6 +686,7 @@ print(f"Total data written: {total_bytes} bytes ({total_bytes / (1024 * 1024):.1
 print(f"Total time: {elapsed_total:.1f}s", flush=True)
 print(f"Throughput: {throughput:.1f} MB/s", flush=True)
 
+store.close()
 sys.exit(0 if failure == 0 else 1)`
 
       // Create the K8s Job with script inlined via bash heredoc (no ConfigMap needed)
