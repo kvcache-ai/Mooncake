@@ -31,6 +31,7 @@ namespace mooncake {
 class MultiLRUStatsCollector : public EventDrivenStatsCollector {
    public:
     explicit MultiLRUStatsCollector(size_t sketch_capacity,
+                                    BandThresholds band_thresholds = {},
                                     uint32_t sample_size = 0);
 
     void SetFastTier(UUID fast_tier_id) override;

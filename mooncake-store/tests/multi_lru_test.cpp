@@ -24,23 +24,49 @@ std::optional<HeatBand> BandOfKey(const MultiLRUStatsCollector& c,
 }
 
 TEST(MultiLRUTest, BandRisesWithFrequency) {
-    MultiLRUStatsCollector c(4096);
+    MultiLRUStatsCollector c(4096);  // default thresholds 3/8/15
     c.SetFastTier(kFast);
     c.OnCommit("k", kFast, 100);  // committed at freq 0 -> cold
     EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kCold);
 
-    c.OnAccess("k", kFast);
-    c.OnAccess("k", kFast);  // freq 2 -> warm
+    for (int i = 0; i < 3; ++i) c.OnAccess("k", kFast);  // freq 3 -> warm
     EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kWarm);
 
-    c.OnAccess("k", kFast);
-    c.OnAccess("k", kFast);  // freq 4 -> hot
+    for (int i = 0; i < 5; ++i) c.OnAccess("k", kFast);  // freq 8 -> hot
     EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kHot);
 
-    for (int i = 0; i < 4; ++i) {
-        c.OnAccess("k", kFast);  // freq 8 -> very hot
-    }
+    for (int i = 0; i < 7; ++i) c.OnAccess("k", kFast);  // freq 15 -> very hot
     EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kVeryHot);
+}
+
+TEST(MultiLRUTest, BandThresholdsAreConfigurable) {
+    // Custom cutoffs warm=1, hot=2, very_hot=3: each access climbs a band.
+    MultiLRUStatsCollector c(4096, BandThresholds{/*warm=*/1, /*hot=*/2,
+                                                  /*very_hot=*/3});
+    c.SetFastTier(kFast);
+    c.OnCommit("k", kFast, 10);  // freq 0 -> cold
+    EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kCold);
+    c.OnAccess("k", kFast);  // freq 1 -> warm
+    EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kWarm);
+    c.OnAccess("k", kFast);  // freq 2 -> hot
+    EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kHot);
+    c.OnAccess("k", kFast);  // freq 3 -> very hot
+    EXPECT_EQ(BandOfKey(c, "k"), HeatBand::kVeryHot);
+}
+
+TEST(MultiLRUTest, ValidateBandThresholdsClampsInvalidOrdering) {
+    BandThresholds t{/*warm=*/0, /*hot=*/0, /*very_hot=*/0};
+    ValidateBandThresholds(t);
+    EXPECT_GE(t.warm, 1u);
+    EXPECT_GT(t.hot, t.warm);
+    EXPECT_GT(t.very_hot, t.hot);
+
+    // A non-increasing set is repaired upward while preserving warm.
+    BandThresholds u{/*warm=*/10, /*hot=*/5, /*very_hot=*/5};
+    ValidateBandThresholds(u);
+    EXPECT_EQ(u.warm, 10u);
+    EXPECT_GT(u.hot, u.warm);
+    EXPECT_GT(u.very_hot, u.hot);
 }
 
 TEST(MultiLRUTest, CollectHotReturnsHottestFirstBounded) {

@@ -386,5 +386,34 @@ TEST(SchedulerFactoryConfigTest, RejectsNonPositiveLoadWindow) {
     EXPECT_GT(c.evict_load_window_s, 0.0);
 }
 
+TEST(SchedulerFactoryConfigTest, BandThresholdsDefaultTo3_8_15) {
+    const auto c = detail::ReadMultiLRUConfig(Json::Value{});
+    EXPECT_EQ(c.band_thresholds.warm, 3u);
+    EXPECT_EQ(c.band_thresholds.hot, 8u);
+    EXPECT_EQ(c.band_thresholds.very_hot, 15u);
+}
+
+TEST(SchedulerFactoryConfigTest, ReadsConfiguredBandThresholds) {
+    Json::Value cfg;
+    cfg["scheduler"]["band_warm_threshold"] = 2;
+    cfg["scheduler"]["band_hot_threshold"] = 5;
+    cfg["scheduler"]["band_veryhot_threshold"] = 12;
+    const auto c = detail::ReadMultiLRUConfig(cfg);
+    EXPECT_EQ(c.band_thresholds.warm, 2u);
+    EXPECT_EQ(c.band_thresholds.hot, 5u);
+    EXPECT_EQ(c.band_thresholds.very_hot, 12u);
+}
+
+TEST(SchedulerFactoryConfigTest, ClampsInvalidBandThresholdOrdering) {
+    Json::Value cfg;
+    cfg["scheduler"]["band_warm_threshold"] = 10;
+    cfg["scheduler"]["band_hot_threshold"] = 4;      // hot <= warm
+    cfg["scheduler"]["band_veryhot_threshold"] = 4;  // very_hot <= hot
+    const auto c = detail::ReadMultiLRUConfig(cfg);
+    EXPECT_GE(c.band_thresholds.warm, 1u);
+    EXPECT_GT(c.band_thresholds.hot, c.band_thresholds.warm);
+    EXPECT_GT(c.band_thresholds.very_hot, c.band_thresholds.hot);
+}
+
 }  // namespace
 }  // namespace mooncake

@@ -115,6 +115,58 @@ The scheduler drives background promotion, eviction, and statistics collection.
 | `high_watermark` | double | *(LRU default)* | Tier usage ratio (0–1) at which eviction begins. |
 | `low_watermark` | double | *(LRU default)* | Tier usage ratio (0–1) at which eviction stops. |
 
+**Event-driven scheduler (MultiLRU policy):**
+
+Selected with `"type": "event_driven"` (top-level scheduler selector; defaults
+to `"legacy"`, which uses the `policy` field above). The MultiLRU policy drives
+TinyLFU-ranked, watermark-based fast-tier eviction. Its eviction **trigger** is a
+watermark that floats within `[evict_watermark_low, evict_watermark_high]`: it
+rests at the high bound when idle and floats **down** toward the low bound as
+write load rises (evicting earlier to keep headroom for incoming writes).
+
+*Eviction trigger & reclaim rate:*
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `evict_watermark_low` | double | `0.70` | Lower bound (0–1) of the floating eviction trigger; also the reclaim floor and the startup value (startup assumes high write load). |
+| `evict_watermark_high` | double | `0.90` | Upper bound (0–1) of the floating eviction trigger (the no-write-load resting point). Must be ≥ `evict_watermark_low`. |
+| `limit_watermark` | double | `0.95` | Usage ratio (0–1) at which the proportional reclaim rate saturates to its max. Must be ≥ `evict_watermark_high`. |
+| `evict_rate_k` | double | `1.0` | Proportional reclaim-rate coefficient. Each pass reclaims `rate · (used − low·capacity)`, where `rate = evict_rate_k · (usage − low) / (limit − low)` clamped to [0,1]. Higher = reclaim more per pass. |
+| `evict_load_window_s` | double | `2.0` | Write-load response window in seconds. A sustained throughput that would fill the fast tier within this window drives the trigger fully down to `evict_watermark_low`; also the reaction time constant. Larger = more sensitive to slow writes but slower to react. Must be > 0. |
+
+*Promotion / demotion (TinyLFU-gated):*
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `offload_freq_threshold` | integer | `2` | A fast-tier key is offloaded (a slow-tier replica is pre-created while the fast copy is kept, so a later eviction is a cheap drop) only when its TinyLFU frequency **exceeds** this and the slow tier has room. Lower = pre-demote more eagerly. |
+| `onboard_freq_threshold` | integer | `4` | A slow-tier key is promoted (onboarded) to the fast tier only when its TinyLFU frequency **exceeds** this. Lower = promote more eagerly. |
+| `onboard_fast_threshold` | double | `0.50` | Fast-tier usage-ratio (0–1) ceiling for onboarding: promotion is skipped when fast usage is at/above this (hysteresis, so onboarding does not fight eviction). Should be < `evict_watermark_low`. |
+
+*Frequency sketch & scan:*
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sketch_capacity` | integer | `65536` | Counter count of the TinyLFU Count-Min frequency sketch (table = `capacity/4` 64-bit words; the halving-decay sample size derives from it). Larger = more accurate frequency estimates at higher memory cost. |
+| `candidate_scan_limit` | integer | `4096` | Max eviction-candidate victims scanned per pass. `0` = unlimited (scan all). |
+
+*Heat bands (MultiLRU):*
+
+Eviction candidates are ordered coldest-first across four heat bands derived from a key's TinyLFU frequency: cold `[0, warm)`, warm `[warm, hot)`, hot `[hot, very_hot)`, very-hot `[very_hot, ∞)`. These cutoffs set how aggressively rising frequency protects a key from eviction.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `band_warm_threshold` | integer | `3` | Frequency at/above which a key leaves the cold band. Must be ≥ 1. |
+| `band_hot_threshold` | integer | `8` | Frequency at/above which a key enters the hot band. Must be > `band_warm_threshold`. |
+| `band_veryhot_threshold` | integer | `15` | Frequency at/above which a key enters the very-hot (most-protected) band. Must be > `band_hot_threshold`. |
+
+*Reporting:*
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `hot_key_num` | integer | `2000` | Default number of hottest keys reported (e.g. to HA recovery) when no explicit count is requested. `0` = all tracked keys. Also honored by the legacy scheduler. |
+
+> Out-of-range values are clamped at startup with a warning: `evict_watermark_low ≤ evict_watermark_high ≤ limit_watermark`, `evict_load_window_s > 0`, and `1 ≤ band_warm_threshold < band_hot_threshold < band_veryhot_threshold`.
+
 ---
 
 ## Complete Examples
@@ -197,3 +249,41 @@ The scheduler drives background promotion, eviction, and statistics collection.
     }
 }
 ```
+
+### Multi-tier – DRAM + STORAGE, event-driven (MultiLRU) scheduler
+
+```json
+{
+    "tiers": [
+        {
+            "type": "DRAM",
+            "capacity": "16GB",
+            "priority": 100
+        },
+        {
+            "type": "STORAGE",
+            "capacity": "1TB",
+            "priority": 10,
+            "storage_filepath": "/data/mooncake"
+        }
+    ],
+    "scheduler": {
+        "type": "event_driven",
+        "loop_interval_ms": 1000,
+        "evict_watermark_low": 0.70,
+        "evict_watermark_high": 0.90,
+        "limit_watermark": 0.95,
+        "evict_rate_k": 1.0,
+        "evict_load_window_s": 2.0,
+        "offload_freq_threshold": 2,
+        "onboard_freq_threshold": 4,
+        "onboard_fast_threshold": 0.50,
+        "sketch_capacity": 65536,
+        "candidate_scan_limit": 4096,
+        "hot_key_num": 2000
+    }
+}
+```
+
+> All scheduler fields are optional; the values above are the defaults. Omit any
+> field to accept its default.

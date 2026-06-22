@@ -5,8 +5,9 @@
 namespace mooncake {
 
 MultiLRUStatsCollector::MultiLRUStatsCollector(size_t sketch_capacity,
+                                               BandThresholds band_thresholds,
                                                uint32_t sample_size)
-    : sketch_(sketch_capacity, sample_size) {}
+    : sketch_(sketch_capacity, sample_size), fast_lru_(band_thresholds) {}
 
 void MultiLRUStatsCollector::SetFastTier(UUID fast_tier_id) {
     fast_tier_id_ = fast_tier_id;

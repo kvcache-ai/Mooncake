@@ -27,7 +27,7 @@ const TierView* FindView(const std::vector<TierView>& views, UUID id) {
 
 MultiLRUPolicy::MultiLRUPolicy(const Config& config, ClockFn clock)
     : config_(config),
-      collector_(config.sketch_capacity),
+      collector_(config.sketch_capacity, config.band_thresholds),
       clock_(clock ? std::move(clock)
                    : ClockFn{[] { return std::chrono::steady_clock::now(); }}),
       // Start at the low bound: assume high write load at startup so the tier
@@ -64,7 +64,7 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
     collector_.OnAccess(ctx.key, ctx.served_tier_id);
     if (!initialized_) {
         LOG(ERROR) << "MultiLRU OnAccess before Init for " << ctx.key
-                << "; no movement decided";
+                   << "; no movement decided";
         return std::nullopt;
     }
 
@@ -89,7 +89,8 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
     if (fast == nullptr) {
         // Topology inconsistency: the resolved fast tier is gone from the
         // views.
-        LOG(ERROR) << "MultiLRU OnAccess: fast tier view missing for " << ctx.key;
+        LOG(ERROR) << "MultiLRU OnAccess: fast tier view missing for "
+                   << ctx.key;
         return std::nullopt;
     }
     const auto locations = backend_->GetReplicaTierIds(ctx.key);
@@ -102,7 +103,7 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
         const TierView* slow = FindView(views, *slow_tier_);
         if (slow == nullptr) {
             LOG(ERROR) << "MultiLRU OnAccess: slow tier view missing for "
-                    << ctx.key;
+                       << ctx.key;
             return std::nullopt;
         }
         if (ShouldOffload(freq, size, locations, *slow, *slow_tier_)) {
@@ -192,7 +193,7 @@ std::vector<MovementRequest> MultiLRUPolicy::DecideEvict(
     const TierView* fast = FindView(views, fast_tier_);
     if (fast == nullptr || fast->capacity == 0) {
         LOG(ERROR) << "MultiLRU DecideEvict: fast tier view missing or zero "
-                   "capacity; nothing to reclaim";
+                      "capacity; nothing to reclaim";
         return out;
     }
     const size_t capacity = fast->capacity;

@@ -218,7 +218,7 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
                                            /*record_access=*/false);
             if (!copy.has_value()) {
                 LOG(ERROR) << "Replicate skipped for " << mv.key << ": "
-                        << copy.error();
+                           << copy.error();
                 return false;
             }
             return true;
@@ -242,14 +242,14 @@ bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
                                            /*record_access=*/false);
             if (!copy.has_value()) {
                 LOG(ERROR) << "Migrate copy skipped for " << mv.key << ": "
-                        << copy.error();
+                           << copy.error();
                 return false;
             }
             // Defense-in-depth: confirm residency before dropping the source in
             // case the fresh dest replica was evicted in the meantime.
             if (!backend_->Exist(mv.key, mv.dest_tier)) {
                 LOG(ERROR) << "Migrate of " << mv.key
-                        << " did not land on dest; keeping source";
+                           << " did not land on dest; keeping source";
                 return false;
             }
             auto del = backend_->Delete(mv.key, mv.source_tier);

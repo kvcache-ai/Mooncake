@@ -60,6 +60,9 @@ class MultiLRUPolicy : public EventDrivenPolicy {
         double onboard_fast_threshold = 0.50;  // < evict_watermark_low (hyst.)
         size_t sketch_capacity = size_t{1} << 16;
         size_t candidate_scan_limit = 4096;  // max victims scanned per pass
+        // Frequency cutoffs for the 4-band MultiLRU (warm/hot/very-hot); see
+        // BandThresholds. Operator-tunable; defaults to 3/8/15.
+        BandThresholds band_thresholds{};
     };
 
     // Monotonic clock source for the write-load decay; injectable for tests.

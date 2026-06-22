@@ -1,5 +1,7 @@
 #pragma once
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -27,16 +29,60 @@ enum class HeatBand : uint8_t {
 
 inline constexpr int kNumHeatBands = 4;
 
-// Band thresholds: 0-1 cold, 2-3 warm, 4-7 hot, 8-15 very-hot.
-inline constexpr uint64_t kWarmThreshold = 2;
-inline constexpr uint64_t kHotThreshold = 4;
-inline constexpr uint64_t kVeryHotThreshold = 8;
+/**
+ * @struct BandThresholds
+ * @brief Frequency cutoffs that map a key's access frequency to a HeatBand.
+ *
+ * Bands are half-open frequency ranges:
+ *   cold     [0, warm)
+ *   warm     [warm, hot)
+ *   hot      [hot, very_hot)
+ *   very-hot [very_hot, inf)
+ *
+ * Operator-tunable via scheduler config; defaults to warm=3, hot=8,
+ * very_hot=15. Must be strictly increasing with warm >= 1 so all four bands are
+ * reachable (warm < 1 would leave the cold band empty). Run values through
+ * ValidateBandThresholds before use.
+ */
+struct BandThresholds {
+    uint64_t warm = 3;       // freq >= warm  -> at least warm band
+    uint64_t hot = 8;        // freq >= hot   -> at least hot band
+    uint64_t very_hot = 15;  // freq >= very_hot -> very-hot band
+};
 
-inline HeatBand BandOf(uint64_t freq) {
-    if (freq >= kVeryHotThreshold) return HeatBand::kVeryHot;
-    if (freq >= kHotThreshold) return HeatBand::kHot;
-    if (freq >= kWarmThreshold) return HeatBand::kWarm;
+inline HeatBand BandOf(uint64_t freq, const BandThresholds& t) {
+    if (freq >= t.very_hot) return HeatBand::kVeryHot;
+    if (freq >= t.hot) return HeatBand::kHot;
+    if (freq >= t.warm) return HeatBand::kWarm;
     return HeatBand::kCold;
+}
+
+/**
+ * @brief Repair an out-of-range BandThresholds in place, warning on each fix.
+ *
+ * Enforces warm >= 1 < hot < very_hot by clamping upward (rather than silently
+ * mis-banding keys): warm is raised to 1, then hot/very_hot are pushed to at
+ * least one above their predecessor. Mirrors the watermark-validation style in
+ * the scheduler factory.
+ */
+inline void ValidateBandThresholds(BandThresholds& t) {
+    if (t.warm < 1) {
+        LOG(WARNING) << "band_warm_threshold (" << t.warm
+                     << ") must be >= 1; clamping to 1";
+        t.warm = 1;
+    }
+    if (t.hot <= t.warm) {
+        LOG(WARNING) << "band_hot_threshold (" << t.hot
+                     << ") must be > band_warm_threshold (" << t.warm
+                     << "); clamping to " << (t.warm + 1);
+        t.hot = t.warm + 1;
+    }
+    if (t.very_hot <= t.hot) {
+        LOG(WARNING) << "band_veryhot_threshold (" << t.very_hot
+                     << ") must be > band_hot_threshold (" << t.hot
+                     << "); clamping to " << (t.hot + 1);
+        t.very_hot = t.hot + 1;
+    }
 }
 
 /**
@@ -61,13 +107,18 @@ struct MultiLRUEntry {
  */
 class MultiLRU {
    public:
+    // Banding thresholds default to BandThresholds{} (3/8/15); pass operator-
+    // configured (and validated) thresholds to override.
+    explicit MultiLRU(BandThresholds thresholds = {})
+        : thresholds_(thresholds) {}
+
     // Insert (or refresh) a key at the MRU of the band derived from `freq`. If
     // the key is already present, its size is updated and it is moved to that
     // band's MRU position. Takes a raw frequency and computes the band itself,
     // mirroring Touch() (callers no longer hand-roll BandOf).
     void Insert(std::string_view key, size_t size_bytes, uint64_t freq) {
         std::lock_guard<std::mutex> lock(mu_);
-        const HeatBand band = BandOf(freq);
+        const HeatBand band = BandOf(freq, thresholds_);
         auto it = index_.find(key);
         if (it != index_.end()) {
             it->second->size_bytes = size_bytes;
@@ -87,7 +138,7 @@ class MultiLRU {
         if (it == index_.end()) {
             return false;
         }
-        MoveToBandFront(it->second, BandOf(freq));
+        MoveToBandFront(it->second, BandOf(freq, thresholds_));
         return true;
     }
 
@@ -167,6 +218,7 @@ class MultiLRU {
         dst.splice(dst.begin(), src, node_it);
     }
 
+    const BandThresholds thresholds_;  // frequency -> band cutoffs (immutable)
     mutable std::mutex mu_;
     // lists_[band]: front = MRU, back = LRU.
     std::list<Node> lists_[kNumHeatBands];
