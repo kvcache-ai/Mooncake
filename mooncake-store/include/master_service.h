@@ -784,6 +784,15 @@ class MasterService {
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
 
+    // Records effective-retention histograms for one key being evicted at
+    // `now`. idle age is (now - last_accessed_at), recovered as
+    // (now - lease_timeout) + default_kv_lease_ttl_; absolute age is
+    // (now - put_start_time). Call exactly once per key actually freed.
+    void ObserveEvictedAges(
+        std::chrono::system_clock::time_point now,
+        std::chrono::system_clock::time_point lease_timeout,
+        std::chrono::system_clock::time_point put_start_time) const;
+
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
     std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;

@@ -269,6 +269,9 @@ class MasterMetricManager {
     // nof eviction metrics
     void inc_nof_eviction_success(int64_t key_count, int64_t size);
     void inc_nof_eviction_fail();  // not a single object is evicted
+    // effective-retention histograms (observed once per evicted key)
+    void observe_evicted_idle_age_ms(int64_t age_ms);
+    void observe_evicted_absolute_age_ms(int64_t age_ms);
 
     // Eviction Metrics Getters
     // total eviction metrics
@@ -652,6 +655,9 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+    // Effective-retention histograms (observed once per evicted key, mem+nof)
+    ylt::metric::histogram_t evicted_idle_age_ms_;
+    ylt::metric::histogram_t evicted_absolute_age_ms_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

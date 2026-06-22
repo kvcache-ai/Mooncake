@@ -319,6 +319,29 @@ MasterMetricManager::MasterMetricManager()
                              "Total number of keys evicted in nof"),
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
+      // Effective-retention histograms. 30 log-scale buckets spanning 5s..10h
+      // (values below 5s land in le=5s; values above 10h land in le=+Inf).
+      // Boundaries in milliseconds:
+      //   5s 7s 10s 15s 20s 30s 45s 1m 1.5m 2m 3m 4m 5m 7.5m 10m 15m 20m 30m
+      //   40m 1h 1.5h 2h 3h 4h 5h 6h 7h 8h 9h 10h
+      evicted_idle_age_ms_(
+          "master_evicted_idle_age_ms",
+          "Distribution of key idle age (evicted_at - last_accessed_at) at "
+          "eviction time, in milliseconds",
+          {5000,     7000,     10000,    15000,    20000,    30000,
+           45000,    60000,    90000,    120000,   180000,   240000,
+           300000,   450000,   600000,   900000,   1200000,  1800000,
+           2400000,  3600000,  5400000,  7200000,  10800000, 14400000,
+           18000000, 21600000, 25200000, 28800000, 32400000, 36000000}),
+      evicted_absolute_age_ms_(
+          "master_evicted_absolute_age_ms",
+          "Distribution of key absolute age (evicted_at - last write) at "
+          "eviction time, in milliseconds",
+          {5000,     7000,     10000,    15000,    20000,    30000,
+           45000,    60000,    90000,    120000,   180000,   240000,
+           300000,   450000,   600000,   900000,   1200000,  1800000,
+           2400000,  3600000,  5400000,  7200000,  10800000, 14400000,
+           18000000, 21600000, 25200000, 28800000, 32400000, 36000000}),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -580,6 +603,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
     nof_heartbeat_probe_latency_ms_.observe(0);
+    evicted_idle_age_ms_.observe(0);
+    evicted_absolute_age_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
     // mem_total_capacity_per_segment_) are not initialized here because they
@@ -1404,6 +1429,14 @@ void MasterMetricManager::inc_nof_eviction_fail() {
     nof_eviction_attempts_.inc();
 }
 
+void MasterMetricManager::observe_evicted_idle_age_ms(int64_t age_ms) {
+    evicted_idle_age_ms_.observe(age_ms);
+}
+
+void MasterMetricManager::observe_evicted_absolute_age_ms(int64_t age_ms) {
+    evicted_absolute_age_ms_.observe(age_ms);
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }
@@ -1763,6 +1796,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(eviction_attempts_);
     serialize_metric(evicted_key_count_);
     serialize_metric(evicted_size_);
+    serialize_metric(evicted_idle_age_ms_);
+    serialize_metric(evicted_absolute_age_ms_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);

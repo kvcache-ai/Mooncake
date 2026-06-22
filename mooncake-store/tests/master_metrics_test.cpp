@@ -785,6 +785,70 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
               std::string::npos);
 }
 
+// Parse the numeric value following "<metric_name><suffix> " in Prometheus
+// text output (e.g. "master_evicted_idle_age_ms_count 4"). Returns 0 if the
+// line is absent (metric not yet emitted).
+static double ParsePromScalar(const std::string& text,
+                              const std::string& metric_and_suffix) {
+    const std::string needle = metric_and_suffix + " ";
+    auto pos = text.find(needle);
+    if (pos == std::string::npos) return 0.0;
+    pos += needle.size();
+    auto end = text.find('\n', pos);
+    return std::stod(text.substr(pos, end - pos));
+}
+
+// Verifies that the effective-retention histograms record observations and are
+// exposed through the Prometheus serialization with correct count and sum.
+TEST_F(MasterMetricsTest, EvictedAgeHistogramsRecordObservations) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const std::string before = metrics.serialize_metrics();
+    const double idle_count_before =
+        ParsePromScalar(before, "master_evicted_idle_age_ms_count");
+    const double idle_sum_before =
+        ParsePromScalar(before, "master_evicted_idle_age_ms_sum");
+    const double abs_count_before =
+        ParsePromScalar(before, "master_evicted_absolute_age_ms_count");
+
+    // Samples spanning several buckets across the 10s..10h range.
+    const std::vector<int64_t> idle_samples = {10000, 30000, 600000, 3600000};
+    int64_t idle_sum_delta = 0;
+    for (int64_t v : idle_samples) {
+        metrics.observe_evicted_idle_age_ms(v);
+        idle_sum_delta += v;
+    }
+    metrics.observe_evicted_absolute_age_ms(123456);
+
+    const std::string after = metrics.serialize_metrics();
+
+    // Both histograms must be present in the Prometheus output.
+    EXPECT_NE(after.find("master_evicted_idle_age_ms_bucket"),
+              std::string::npos);
+    EXPECT_NE(after.find("master_evicted_absolute_age_ms_bucket"),
+              std::string::npos);
+
+    // Sum reflects exactly the new observations. _sum is immune to the
+    // observe(0) calls that update_metrics_for_zero_output() emits per
+    // serialization, so it is the reliable exact-value signal.
+    EXPECT_DOUBLE_EQ(ParsePromScalar(after, "master_evicted_idle_age_ms_sum"),
+                     idle_sum_before + static_cast<double>(idle_sum_delta));
+
+    // Count must grow by at least the number of observations (it may grow by
+    // more due to the periodic observe(0) zero-output marker, which adds to
+    // _count but not _sum).
+    EXPECT_GE(ParsePromScalar(after, "master_evicted_idle_age_ms_count"),
+              idle_count_before + static_cast<double>(idle_samples.size()));
+    EXPECT_GE(ParsePromScalar(after, "master_evicted_absolute_age_ms_count"),
+              abs_count_before + 1.0);
+
+    // The cumulative +Inf bucket must equal the total count.
+    EXPECT_DOUBLE_EQ(
+        ParsePromScalar(after,
+                        "master_evicted_idle_age_ms_bucket{le=\"+Inf\"}"),
+        ParsePromScalar(after, "master_evicted_idle_age_ms_count"));
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
