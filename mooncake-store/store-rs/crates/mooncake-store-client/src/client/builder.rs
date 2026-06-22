@@ -535,8 +535,13 @@ impl StoreClientBuilder {
         cold_tier_handles
             .entry(default_cold_tier_id.clone())
             .or_insert_with(|| {
+                let fallback_root = default_cold_tier_root();
+                warn!(
+                    path = %fallback_root.display(),
+                    "no cold tier target configured for default device, using ephemeral PID-based path"
+                );
                 Arc::new(LocalDirPersistentStorageBackend::new_with_root(
-                    default_cold_tier_root(),
+                    fallback_root,
                 ))
             });
         let cold_tier_resolver =

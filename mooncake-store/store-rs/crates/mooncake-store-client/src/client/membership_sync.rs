@@ -77,12 +77,17 @@ impl MembershipSyncHandle {
                                     "background tenant policy cache refresh failed"
                                 );
                             }
+                            // Cold tier refresh failures are logged but do NOT
+                            // contribute to the main backoff counter.  If cold
+                            // tier metadata is temporarily unavailable (e.g.
+                            // during an upgrade), we must not delay live-client
+                            // and tenant-policy refreshes that are critical for
+                            // correct routing.
                             if let Err(error) = refresh_cold_tier_device_cache(
                                 metadata.as_ref(),
                                 &cold_tier_device_cache,
                                 "cold_tier_device_snapshot_refresh",
                             ) {
-                                any_failed = true;
                                 tracing::warn!(
                                     error = %error,
                                     "background cold tier device cache refresh failed"
