@@ -265,7 +265,7 @@ write_nvcc_wrapper() {
   mkdir -p "${CUDA_COMPAT_HOME}/bin"
   cat > "${CUDA_COMPAT_HOME}/bin/nvcc" <<'SH'
 #!/usr/bin/env bash
-args=()
+args=(-D__MCC__)
 if [[ -d "${CUDA_HOME:-}/include" ]]; then
   args+=(-I"${CUDA_HOME}/include")
   args+=(-include "${CUDA_HOME}/include/mooncake_musa_ci_compat.h")
