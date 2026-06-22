@@ -60,7 +60,6 @@ if use_musa:
     device_args = [
         abi_define,
         *musa_defines,
-        "-D__MCC__",
         "-std=c++20",
         "--cuda-gpu-arch=mp_21",
         "--cuda-gpu-arch=mp_31",
