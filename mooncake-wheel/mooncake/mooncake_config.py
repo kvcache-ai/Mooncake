@@ -29,8 +29,8 @@ In addition to tcp and rdma, the C++ Transfer Engine also supports:
 - ascend: Huawei Ascend NPU communication (HCCL and direct transport)
 
 For most use cases, 'tcp' or 'rdma' is recommended. The default is 'tcp'.
-For RDMA, you also need to specify the device_name (e.g., 'mlx5_0', 'erdma_0')
-or use auto-discovery.
+For RDMA, specify the device_name (e.g., 'mlx5_0', 'erdma_0') to pin
+hardware, or leave it empty to use auto-discovery.
 
 Examples:
 ---------
@@ -43,8 +43,9 @@ export MOONCAKE_DEVICE="mlx5_0"
 
 # Using RDMA with auto-discovery
 export MOONCAKE_PROTOCOL="rdma"
-export MOONCAKE_DEVICE="auto-discovery"
+export MOONCAKE_DEVICE=""
 """
+
 import json
 import os
 from dataclasses import dataclass
@@ -55,13 +56,13 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 _SIZE_SUFFIXES = [
     ("kb", 1024),
-    ("mb", 1024 ** 2),
-    ("gb", 1024 ** 3),
-    ("tb", 1024 ** 4),
+    ("mb", 1024**2),
+    ("gb", 1024**3),
+    ("tb", 1024**4),
     ("k", 1024),
-    ("m", 1024 ** 2),
-    ("g", 1024 ** 3),
-    ("t", 1024 ** 4),
+    ("m", 1024**2),
+    ("g", 1024**3),
+    ("t", 1024**4),
     ("b", 1),
 ]
 
@@ -96,11 +97,11 @@ class MooncakeConfig:
         local_buffer_size (int): The size of the local buffer in bytes.
         protocol (str): The communication protocol to use. Supported values:
             - "tcp" (default): Standard TCP/IP protocol
-            - "rdma": RDMA protocol (requires RDMA-capable NICs and device_name)
+            - "rdma": RDMA protocol (requires RDMA-capable NICs)
             See module docstring for full list of supported protocols.
         device_name (Optional[str]): The name of the RDMA device to use
-            (e.g., "mlx5_0", "erdma_0", or "auto-discovery").
-            Required when protocol is "rdma", optional for other protocols.
+            (e.g., "mlx5_0" or "erdma_0"). Leave empty to auto-discover RDMA
+            devices unless `MC_MS_AUTO_DISC=0` disables discovery.
         master_server_address (str): The address of the master server.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.
@@ -117,7 +118,7 @@ class MooncakeConfig:
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload"
         }
-        
+
         For RDMA:
         {
             "local_hostname": "node1",
@@ -131,6 +132,7 @@ class MooncakeConfig:
             "ssd_offload_path": "/nvme/mooncake_offload"
         }
     """
+
     local_hostname: str
     metadata_server: str
     global_segment_size: int
@@ -142,7 +144,7 @@ class MooncakeConfig:
     ssd_offload_path: str = ""
 
     @staticmethod
-    def from_file(file_path: str) -> 'MooncakeConfig':
+    def from_file(file_path: str) -> "MooncakeConfig":
         """Load the config from a JSON file."""
         with open(file_path) as fin:
             config = json.load(fin)
@@ -171,22 +173,28 @@ class MooncakeConfig:
         )
 
     @staticmethod
-    def load_from_env() -> 'MooncakeConfig':
+    def load_from_env() -> "MooncakeConfig":
         """Load config from a file specified in the environment variable.
         export MOONCAKE_MASTER=10.13.3.232:50051
         export MOONCAKE_PROTOCOL="rdma"
         export MOONCAKE_DEVICE=""
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
-        config_file_path = os.getenv('MOONCAKE_CONFIG_PATH')
+        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
         if config_file_path is None:
             if not os.getenv("MOONCAKE_MASTER"):
-                raise ValueError("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.")
+                raise ValueError(
+                    "Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set."
+                )
             return MooncakeConfig(
                 local_hostname=os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
-                metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
+                metadata_server=os.getenv(
+                    "MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"
+                ),
                 global_segment_size=_parse_segment_size(
-                    os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
+                    os.getenv(
+                        "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
+                    )
                 ),
                 local_buffer_size=_parse_segment_size(
                     os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
@@ -194,7 +202,10 @@ class MooncakeConfig:
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
-                enable_ssd_offload=os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false").lower() in ("true", "1"),
+                enable_ssd_offload=os.getenv(
+                    "MOONCAKE_OFFLOAD_ENABLED", "false"
+                ).lower()
+                in ("true", "1"),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
             )
         return MooncakeConfig.from_file(config_file_path)

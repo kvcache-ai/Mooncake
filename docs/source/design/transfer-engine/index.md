@@ -121,7 +121,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
     ./transfer_engine_bench --mode=target \
                             --metadata_server=etcd://10.0.0.1:2379 \
                             [--local_server_name=TARGET_NAME] \
-                            [--device_name=erdma_0 | --auto-discovery]
+                            [--device_name=erdma_0 | --auto_discovery]
     ```
    The meanings of the various parameters are as follows:
    - `--mode=target` indicates the start of the target node. The target node does not initiate read/write requests; it passively supplies or writes data as required by the initiator node.
@@ -140,7 +140,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
     ./transfer_engine_bench --metadata_server=etcd://10.0.0.1:2379 \
                             --segment_id=TARGET_NAME \
                             [--local_server_name=INITIATOR_NAME] \
-                            [--device_name=erdma_1 | --auto-discovery]
+                            [--device_name=erdma_1 | --auto_discovery]
     ```
    The meanings of the various parameters are as follows (the rest are the same as before):
    - `--segment_id` is the segment name of target node. It needs to be consistent with the value passed to `--local_server_name` when starting the target node (if any).

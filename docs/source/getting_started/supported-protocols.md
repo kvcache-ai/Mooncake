@@ -90,14 +90,14 @@ engine.initialize(
     hostname="node1",
     metadata_server="P2PHANDSHAKE",
     protocol="rdma",
-    device_name="auto-discovery"  # Automatically detect optimal device
+    device_name=""  # Empty string enables auto-discovery
 )
 ```
 
 ```bash
 # Environment variables
 export MOONCAKE_PROTOCOL="rdma"
-export MOONCAKE_DEVICE="mlx5_0"  # or "auto-discovery"
+export MOONCAKE_DEVICE="mlx5_0"  # or leave empty for auto-discovery
 ```
 
 **Device Discovery:**
@@ -306,7 +306,7 @@ export MOONCAKE_DEVICE="mlx5_0"
 
 # RDMA with auto-discovery
 export MOONCAKE_PROTOCOL="rdma"
-export MOONCAKE_DEVICE="auto-discovery"
+export MOONCAKE_DEVICE=""
 
 # Other configuration
 export MOONCAKE_MASTER="10.0.0.1:50051"

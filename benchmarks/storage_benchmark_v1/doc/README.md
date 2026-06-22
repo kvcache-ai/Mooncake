@@ -9,6 +9,7 @@ The KVCache Storage Benchmark is a tool for evaluating storage performance of KV
 ### Basic Usage
 
 ```bash
+cd benchmarks/storage_benchmark_v1
 python benchmark.py --scenario conversation \
                     --trace-dir /path/to/Mooncake/FAST25-release/traces \
                     --storage-dir /path/to/test/drive
@@ -25,7 +26,7 @@ python benchmark.py --scenario conversation \
 | `--page-size-tokens` | `512` | Page size in tokens |
 | `--max-requests` | `None` | Maximum number of requests to process |
 | `--max-pages` | `2000` | Maximum number of pages (creates modulo mapping if trace is larger) |
-| `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always` |
+| `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always`, or `end` |
 | `--fsync-batch-size` | `100` | Number of writes between fsync in batch mode |
 
 ## Output Format
