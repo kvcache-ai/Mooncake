@@ -54,8 +54,9 @@ static inline const std::string statusToString(
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
                                    uint16_t peer_lid, uint32_t peer_qp_num,
-                                   uint16_t pkey_index, uint8_t service_level,
-                                   uint8_t traffic_class);
+                                   uint16_t pkey_index,
+                                   uint8_t service_level = 0,
+                                   uint8_t traffic_class = 0);
 
 RdmaEndPoint::RdmaEndPoint() : status_(EP_UNINIT) {}
 
