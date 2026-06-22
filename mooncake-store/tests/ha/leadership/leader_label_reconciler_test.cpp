@@ -27,10 +27,20 @@ class FakeLabelBackend {
         fail_remaining_ = count;
     }
 
+    void CommitThenFailNext(int count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        commit_then_fail_remaining_ = count;
+    }
+
     // Waits until the last successful apply matches `want`, or times out.
     bool WaitForApplied(bool want, std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
         return cv_.wait_for(lock, timeout, [&] { return applied_ == want; });
+    }
+
+    bool WaitForCommitted(bool want, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return committed_ == want; });
     }
 
     int CallCount() {
@@ -43,15 +53,27 @@ class FakeLabelBackend {
         return applied_;
     }
 
+    std::optional<bool> Committed() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return committed_;
+    }
+
    private:
     ErrorCode Apply(bool desired) {
         std::lock_guard<std::mutex> lock(mutex_);
         ++call_count_;
+        if (commit_then_fail_remaining_ > 0) {
+            --commit_then_fail_remaining_;
+            committed_ = desired;
+            cv_.notify_all();
+            return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+        }
         if (fail_remaining_ > 0) {
             --fail_remaining_;
             cv_.notify_all();
             return ErrorCode::K8S_LEASE_OPERATION_ERROR;
         }
+        committed_ = desired;
         applied_ = desired;
         cv_.notify_all();
         return ErrorCode::OK;
@@ -61,11 +83,14 @@ class FakeLabelBackend {
     std::condition_variable cv_;
     int call_count_ = 0;
     int fail_remaining_ = 0;
+    int commit_then_fail_remaining_ = 0;
     std::optional<bool> applied_;
+    std::optional<bool> committed_;
 };
 
 constexpr auto kRetry = 5ms;
 constexpr auto kTimeout = 2s;
+constexpr auto kSlowRetry = 10s;
 
 TEST(LeaderLabelReconcilerTest, ConvergesToLeaderAfterTransientFailures) {
     FakeLabelBackend backend;
@@ -123,6 +148,37 @@ TEST(LeaderLabelReconcilerTest, DisabledNeverApplies) {
 
     EXPECT_EQ(backend.CallCount(), 0);
     EXPECT_EQ(backend.Applied(), std::nullopt);
+}
+
+TEST(LeaderLabelReconcilerTest, AmbiguousSetFailureDoesNotLeaveStaleLeader) {
+    FakeLabelBackend backend;
+    backend.CommitThenFailNext(1);
+    LeaderLabelReconciler reconciler(/*enabled=*/true, backend.Fn(),
+                                     kSlowRetry);
+
+    reconciler.SetLeader(true);
+    ASSERT_TRUE(backend.WaitForCommitted(true, kTimeout));
+
+    reconciler.SetLeader(false);
+
+    ASSERT_TRUE(backend.WaitForCommitted(false, kTimeout));
+}
+
+TEST(LeaderLabelReconcilerTest, AmbiguousClearFailureDoesNotLeaveMissingLabel) {
+    FakeLabelBackend backend;
+    LeaderLabelReconciler reconciler(/*enabled=*/true, backend.Fn(),
+                                     kSlowRetry);
+
+    reconciler.SetLeader(true);
+    ASSERT_TRUE(backend.WaitForCommitted(true, kTimeout));
+
+    backend.CommitThenFailNext(1);
+    reconciler.SetLeader(false);
+    ASSERT_TRUE(backend.WaitForCommitted(false, kTimeout));
+
+    reconciler.SetLeader(true);
+
+    ASSERT_TRUE(backend.WaitForCommitted(true, kTimeout));
 }
 
 }  // namespace

@@ -75,6 +75,7 @@ class LeaderLabelReconciler {
                 applied = target;
                 continue;
             }
+            applied.reset();
             LOG(WARNING) << "Failed to " << (target ? "set" : "clear")
                          << " leader label: " << toString(err);
             cv_.wait_for(lock, retry_interval_,
