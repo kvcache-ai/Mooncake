@@ -464,6 +464,7 @@ else
     -DUSE_REDIS=ON \
     -DUSE_HTTP=ON \
     -DUSE_ETCD=OFF \
+    -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 
   _timer_elapsed $_CMAKE_CONF_START "cmake configure"
