@@ -50,12 +50,10 @@ PY
     packaging \
     torchada==0.1.66
 
-  if ! python_has_module torch_musa; then
-    curl -L --fail --retry 3 --connect-timeout 20 \
-      -o "${TORCH_MUSA_WHEEL}" \
-      "${TORCH_MUSA_WHEEL_URL}"
-    python3 -m pip install --no-cache-dir "${TORCH_MUSA_WHEEL}"
-  fi
+  curl -L --fail --retry 3 --connect-timeout 20 \
+    -o "${TORCH_MUSA_WHEEL}" \
+    "${TORCH_MUSA_WHEEL_URL}"
+  python3 -m pip install --no-cache-dir --force-reinstall --no-deps "${TORCH_MUSA_WHEEL}"
 }
 
 write_nvcc_wrapper() {
@@ -133,7 +131,16 @@ for site_dir in site.getsitepackages():
 print(":".join(paths))
 PY
   )
-  musa_libs=$(find "${MUSA_HOME}" -type f -name 'lib*.so*' -printf '%h\n' 2>/dev/null | sort -u | paste -sd: -)
+  musa_libs=$(
+    {
+      printf '%s\n' \
+        "${MUSA_HOME}/lib" \
+        "${MUSA_HOME}/mudnn/lib" \
+        "${MUSA_HOME}/mccl/lib" \
+        "${MUSA_HOME}/mufft/lib"
+      find -L "${MUSA_HOME}" -type f -name 'lib*.so*' -printf '%h\n' 2>/dev/null
+    } | awk 'NF && !seen[$0]++' | paste -sd: -
+  )
   append_env "LD_LIBRARY_PATH=${musa_libs}:${torch_libs}:${LD_LIBRARY_PATH:-}"
 }
 
