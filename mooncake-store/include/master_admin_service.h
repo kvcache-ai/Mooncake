@@ -91,6 +91,8 @@ class MasterAdminServer {
                              coro_http::coro_http_response& resp);
     void HandleBatchQueryKeys(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
+    void HandleKvEventsStatus(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
 
     void RegisterHandler();
 

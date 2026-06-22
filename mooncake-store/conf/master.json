@@ -20,5 +20,13 @@
   "client_live_ttl_sec": 60, 
   "enable_http_metadata_server": false,
   "http_metadata_server_host": "0.0.0.0",
-  "http_metadata_server_port": 8080
+  "http_metadata_server_port": 8080,
+  "enable_kv_events": false,
+  "kv_events_bind_endpoint": "tcp://0.0.0.0:5557",
+  "kv_events_model_name": "",
+  "kv_events_backend_id": "",
+  "kv_events_tenant_id": "default",
+  "kv_events_block_size": 0,
+  "kv_events_dp_rank": 0,
+  "kv_events_emit_object_key": true
 }

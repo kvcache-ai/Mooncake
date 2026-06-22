@@ -353,6 +353,7 @@ fn main() {
         ("cudart", &["cudart"]),
         ("mlx5", &["mlx5"]), // IBGDA device transport (mlx5 DevX) pulled into transfer_engine, CUDA-only
         ("uring", &["uring"]),
+        ("zmq", &["zmq"]),
     ] {
         if has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");

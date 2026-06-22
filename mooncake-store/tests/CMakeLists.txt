@@ -37,6 +37,11 @@ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
+add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
+if(ENABLE_KV_EVENTS)
+  target_compile_definitions(kv_event_publisher_test PRIVATE
+                             MOONCAKE_ENABLE_KV_EVENTS=1)
+endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)

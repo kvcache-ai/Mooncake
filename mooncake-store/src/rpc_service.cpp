@@ -1186,6 +1186,14 @@ WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
     return master_service_.QuerySegmentStatusById(segment_id);
 }
 
+bool WrappedMasterService::KvEventsEnabled() const {
+    return master_service_.KvEventsEnabled();
+}
+
+KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
+    return master_service_.GetKvEventStats();
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {

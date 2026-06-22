@@ -367,6 +367,31 @@ void MasterAdminServer::HandleHaStatus(coro_http::coro_http_request&,
                                 ha::MasterRuntimeStateToString(snapshot.state));
 }
 
+struct HttpKvEventsStatusResponse {
+    bool enabled{false};
+    uint64_t published_batches{0};
+    uint64_t published_events{0};
+    uint64_t dropped_events{0};
+    uint64_t skipped_unparsed_keys{0};
+};
+YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
+         published_events, dropped_events, skipped_unparsed_keys);
+
+void MasterAdminServer::HandleKvEventsStatus(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(
+        resp, [&](const std::shared_ptr<WrappedMasterService>& service) {
+            const auto stats = service->GetKvEventStats();
+            HttpKvEventsStatusResponse payload;
+            payload.enabled = service->KvEventsEnabled();
+            payload.published_batches = stats.published_batches;
+            payload.published_events = stats.published_events;
+            payload.dropped_events = stats.dropped_events;
+            payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
+            WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+        });
+}
+
 void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
                                        coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
@@ -822,6 +847,11 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/ha_status", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHaStatus(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/kv_events/status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleKvEventsStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/leader", [this](coro_http_request& req, coro_http_response& resp) {
