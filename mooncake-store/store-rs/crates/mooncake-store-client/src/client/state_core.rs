@@ -326,7 +326,7 @@ struct SegmentTransportMetadata {
 /// Central state for a storage-owner runtime.  Cold tier fields
 /// (cold_tier_devices, hot_replicas, offload_mode, offload_priority)
 /// are consumed by the offload/restore pipeline.
-#[allow(dead_code)] // cold tier fields consumed by offload/restore
+#[allow(dead_code)]
 struct StorageOwnerState {
     runtime: ClientRuntimeId,
     route_ops: RouteOperations,
@@ -335,8 +335,13 @@ struct StorageOwnerState {
     state: Arc<Mutex<StoreState>>,
     cold_tier_devices: ColdTierDeviceManager,
     hot_replicas: HotReplicaTracker,
+    pending_offloads: ColdTierOffloadManager,
+    cold_tier_cleanup: ColdTierCleanupManager,
+    initial_cold_backing_repair_at_ms: AtomicU64,
     offload_mode: ColdTierOffloadMode,
     offload_priority: ColdTierOffloadPriorityConfig,
+    /// Signaled by offload when an entry becomes Materialized (clean).
+    eviction_ready_signal: EvictionReadySignal,
 }
 
 #[derive(Default)]

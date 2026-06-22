@@ -395,9 +395,9 @@ fn manifest_from_route(
 /// A batched cold tier write request: route (for manifest embedding), backing descriptor, and
 /// the raw payload bytes.
 pub(super) struct ColdObjectWrite<'a> {
-    route: Option<&'a ObjectRoute>,
-    cold_backing: &'a mooncake_store_core::ColdBackingRoute,
-    payload: &'a [u8],
+    pub(super) route: Option<&'a ObjectRoute>,
+    pub(super) cold_backing: &'a mooncake_store_core::ColdBackingRoute,
+    pub(super) payload: &'a [u8],
 }
 
 /// A batched cold tier read request that copies the payload into a caller-provided buffer.
@@ -477,9 +477,9 @@ impl AsRef<[u8]> for ColdObjectPayload {
 #[derive(Clone, Debug)]
 pub(super) struct PersistentStorageBackendHealth {
     /// Total filesystem capacity in bytes.
-    capacity_bytes: Option<u64>,
+    pub(super) capacity_bytes: Option<u64>,
     /// Available (non-privileged) filesystem space in bytes.
-    available_bytes: Option<u64>,
+    pub(super) available_bytes: Option<u64>,
 }
 
 /// Result of a compaction pass on a cold tier backend.
@@ -831,7 +831,7 @@ fn validate_cold_tier_id(cold_tier_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cold_tier_device_id(cold_backing: &mooncake_store_core::ColdBackingRoute) -> &str {
+pub(super) fn cold_tier_device_id(cold_backing: &mooncake_store_core::ColdBackingRoute) -> &str {
     cold_backing.cold_tier_id.as_str()
 }
 

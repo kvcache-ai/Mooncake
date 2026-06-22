@@ -2013,6 +2013,7 @@ pub(crate) fn store_error_to_py(error: StoreError) -> PyErr {
         | StoreError::StaleEpoch(message)
         | StoreError::Unsupported(message)
         | StoreError::Allocator(message)
+        | StoreError::Backpressure(message)
         | StoreError::Metadata(message)
         | StoreError::Transport(message) => PyRuntimeError::new_err(message),
     }
@@ -2025,6 +2026,7 @@ fn should_soft_miss_error(error: &StoreError) -> bool {
             | StoreError::InvalidState(_)
             | StoreError::Metadata(_)
             | StoreError::Transport(_)
+            | StoreError::Backpressure(_)
     )
 }
 
@@ -2038,6 +2040,7 @@ fn soft_miss_status(error: &StoreError) -> i64 {
         StoreError::StaleEpoch(_) => -6,
         StoreError::Unsupported(_) => -7,
         StoreError::Allocator(_) => -8,
+        StoreError::Backpressure(_) => -9,
     }
 }
 

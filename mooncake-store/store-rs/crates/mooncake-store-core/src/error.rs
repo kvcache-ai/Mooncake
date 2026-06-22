@@ -36,6 +36,9 @@ pub enum StoreError {
 
     #[error("transport error: {0}")]
     Transport(String),
+
+    #[error("backpressure: {0}")]
+    Backpressure(String),
 }
 
 #[cfg(test)]

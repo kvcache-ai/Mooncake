@@ -14,13 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, ColdTierDeviceRecord, CompatibilityDescriptor, HandoffKind, HandoffPlan,
-    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
-    ReplicaTier, Result, RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy,
-    RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-    SegmentName, SegmentTargetChunk, StoreError, TenantObjectAccountingState,
-    TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest,
-    TenantQuotaPolicy, TenantQuotaReservationRequest,
+    ClientStableId, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierDeviceUpdate,
+    CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId, MetadataBackend,
+    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest,
+    RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentTargetChunk, StoreError,
+    TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
 use mooncake_store_route::{RouteHitReporter, RouteOperations};
 use mooncake_transport::{
@@ -71,6 +71,20 @@ const DEFAULT_TENANT_POLICY_CACHE_IDLE_TTL_MS: u64 = 30_000;
 const DEBUG_PER_KEY_SAMPLE_MODULUS: u64 = 128;
 const STABLE_PHASE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
+#[allow(dead_code)]
+const DEFAULT_OFFLOAD_MATERIALIZE_BATCH: usize = 32;
+#[allow(dead_code)]
+const DEFAULT_PENDING_OFFLOAD_RETRY_BASE_MS: u64 = 100;
+#[allow(dead_code)]
+const DEFAULT_PENDING_OFFLOAD_RETRY_MAX_MS: u64 = 5_000;
+#[allow(dead_code)]
+const DEFAULT_COLD_TIER_CLEANUP_DEVICE_BATCH: usize = 1;
+#[allow(dead_code)]
+const DEFAULT_COLD_TIER_CLEANUP_VICTIM_BATCH: usize = 32;
+#[allow(dead_code)]
+const DEFAULT_PENDING_DELETE_GC_BATCH: usize = 64;
+#[allow(dead_code)]
+const DEFAULT_OFFLOAD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
 const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
 const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
@@ -101,15 +115,13 @@ include!("helpers.rs");
 
 /// Cold tier persistent storage backend abstraction.
 /// Contains PersistentStorageBackend trait, LocalDir backend, and ColdTierBackendResolver.
-/// Consumers (offload, restore, GC) are added by later modules.
-#[allow(dead_code)] // consumed by offload/restore/GC
+#[allow(dead_code)]
 #[path = "cold_tier_storage_backend.rs"]
 mod cold_tier_storage_backend;
 use cold_tier_storage_backend::*;
 
-/// Cold tier device management and admission control.
-/// Contains device selection, bootstrap, probe, and rate limiting.
-#[allow(dead_code)] // cold_tier::device consumed by offload/restore
+/// Cold tier device management, admission control, offload pipeline, and cleanup.
+#[allow(dead_code)]
 mod cold_tier;
 
 type SharedRouteWriteGate = Arc<RouteWriteGate>;
@@ -155,6 +167,7 @@ pub struct StoreClient {
     /// Controls cleanup behavior during client shutdown (Restart vs Decommission).
     #[allow(dead_code)] // used in Drop impl for shutdown cleanup
     cold_tier_shutdown_mode: ColdTierShutdownMode,
+    cold_tier: cold_tier::ColdTierHandle,
 }
 
 enum HealthUpdateKind {

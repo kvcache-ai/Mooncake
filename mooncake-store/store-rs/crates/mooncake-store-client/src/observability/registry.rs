@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use mooncake_store_core::{
-    ClientLease, ClientLifecycleState, ObjectKey, ObjectRoute, ReplicaTier, SegmentAnnouncement,
-    SegmentLifecycleState,
+    ClientLease, ClientLifecycleState, ColdTierDeviceState, ObjectKey, ObjectRoute, ReplicaTier,
+    SegmentAnnouncement, SegmentLifecycleState,
 };
 
 use super::process::ProcessSnapshot;
@@ -106,6 +106,23 @@ pub struct MetricsSnapshot {
     pub metadata_operations: Vec<CounterSample<MetadataOperationKey>>,
     pub metadata_inflight: Vec<GaugeSample<MetadataInflightKey>>,
     pub metadata_duration: Vec<HistogramSample<MetadataOperationKey>>,
+    pub cold_tier_device_states: Vec<GaugeSample<ColdTierDeviceStateKey>>,
+    pub cold_tier_device_totals: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_device_schedulable: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_device_used_bytes: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_device_reserved_bytes: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_device_capacity_bytes: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_pending_offload_total: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_pending_offload_ready: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_pending_offload_delayed: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_pending_offload_attempts_total: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_pending_offload_max_attempts: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_reclaim_pending_total: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_reclaim_due_total: Vec<GaugeSample<ColdTierRuntimeKey>>,
+    pub cold_tier_reclaim_by_kind: Vec<GaugeSample<ColdTierReclaimKindKey>>,
+    pub cold_tier_reclaim_by_qos_tier: Vec<GaugeSample<ColdTierReclaimQosKey>>,
+    pub cold_tier_reclaim_by_policy_rank: Vec<GaugeSample<ColdTierReclaimPolicyRankKey>>,
+    pub cold_tier_operations: Vec<CounterSample<ColdTierOperationKey>>,
     pub process: ProcessSnapshot,
 }
 
@@ -209,6 +226,42 @@ pub struct RuntimeKey {
 pub struct RuntimeStatusKey {
     pub runtime: String,
     pub state: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ColdTierRuntimeKey {
+    pub runtime: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ColdTierDeviceStateKey {
+    pub runtime: String,
+    pub state: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ColdTierReclaimQosKey {
+    pub runtime: String,
+    pub qos_tier: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ColdTierReclaimKindKey {
+    pub runtime: String,
+    pub kind: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ColdTierReclaimPolicyRankKey {
+    pub runtime: String,
+    pub policy_rank: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ColdTierOperationKey {
+    pub operation: &'static str,
+    pub result: &'static str,
+    pub error_kind: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +479,23 @@ struct MetricsRegistry {
     metadata_operations: CounterFamily<MetadataOperationKey>,
     metadata_inflight: GaugeFamily<MetadataInflightKey>,
     metadata_duration: HistogramFamily<MetadataOperationKey>,
+    cold_tier_device_totals: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_device_schedulable: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_device_used_bytes: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_device_reserved_bytes: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_device_capacity_bytes: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_device_states: GaugeFamily<ColdTierDeviceStateKey>,
+    cold_tier_pending_offload_total: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_pending_offload_ready: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_pending_offload_delayed: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_pending_offload_attempts_total: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_pending_offload_max_attempts: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_reclaim_pending_total: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_reclaim_due_total: GaugeFamily<ColdTierRuntimeKey>,
+    cold_tier_reclaim_by_kind: GaugeFamily<ColdTierReclaimKindKey>,
+    cold_tier_reclaim_by_qos_tier: GaugeFamily<ColdTierReclaimQosKey>,
+    cold_tier_reclaim_by_policy_rank: GaugeFamily<ColdTierReclaimPolicyRankKey>,
+    cold_tier_operations: CounterFamily<ColdTierOperationKey>,
 }
 
 #[derive(Clone, Default)]
@@ -589,6 +659,27 @@ impl MetricsRegistry {
             metadata_operations: self.metadata_operations.snapshot(),
             metadata_inflight: self.metadata_inflight.snapshot(),
             metadata_duration: self.metadata_duration.snapshot(),
+            cold_tier_device_states: self.cold_tier_device_states.snapshot(),
+            cold_tier_device_totals: self.cold_tier_device_totals.snapshot(),
+            cold_tier_device_schedulable: self.cold_tier_device_schedulable.snapshot(),
+            cold_tier_device_used_bytes: self.cold_tier_device_used_bytes.snapshot(),
+            cold_tier_device_reserved_bytes: self.cold_tier_device_reserved_bytes.snapshot(),
+            cold_tier_device_capacity_bytes: self.cold_tier_device_capacity_bytes.snapshot(),
+            cold_tier_pending_offload_total: self.cold_tier_pending_offload_total.snapshot(),
+            cold_tier_pending_offload_ready: self.cold_tier_pending_offload_ready.snapshot(),
+            cold_tier_pending_offload_delayed: self.cold_tier_pending_offload_delayed.snapshot(),
+            cold_tier_pending_offload_attempts_total: self
+                .cold_tier_pending_offload_attempts_total
+                .snapshot(),
+            cold_tier_pending_offload_max_attempts: self
+                .cold_tier_pending_offload_max_attempts
+                .snapshot(),
+            cold_tier_reclaim_pending_total: self.cold_tier_reclaim_pending_total.snapshot(),
+            cold_tier_reclaim_due_total: self.cold_tier_reclaim_due_total.snapshot(),
+            cold_tier_reclaim_by_kind: self.cold_tier_reclaim_by_kind.snapshot(),
+            cold_tier_reclaim_by_qos_tier: self.cold_tier_reclaim_by_qos_tier.snapshot(),
+            cold_tier_reclaim_by_policy_rank: self.cold_tier_reclaim_by_policy_rank.snapshot(),
+            cold_tier_operations: self.cold_tier_operations.snapshot(),
             process,
         }
     }
@@ -1232,5 +1323,195 @@ fn replica_tier_label(tier: ReplicaTier) -> &'static str {
         ReplicaTier::Nvme => "nvme",
         ReplicaTier::File => "file",
         ReplicaTier::Unknown => "unknown",
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct ColdTierDeviceMetrics<'a> {
+    pub runtime: &'a str,
+    pub total_devices: usize,
+    pub schedulable_devices: usize,
+    pub total_used_bytes: u64,
+    pub total_reserved_bytes: u64,
+    pub total_capacity_bytes: Option<u64>,
+    pub by_state: Vec<(ColdTierDeviceState, usize)>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct ColdTierPendingOffloadMetrics<'a> {
+    pub runtime: &'a str,
+    pub total_pending: usize,
+    pub ready: usize,
+    pub delayed: usize,
+    pub max_attempts: u32,
+    pub total_attempts: u64,
+}
+
+#[allow(dead_code)]
+pub(crate) struct ColdTierReclaimMetrics<'a> {
+    pub runtime: &'a str,
+    pub total_pending: usize,
+    pub due: usize,
+    pub cold_backing_reclaims: usize,
+    pub hot_segment_reclaims: usize,
+    pub by_qos_tier: Vec<(&'a str, usize)>,
+    pub by_policy_rank: Vec<(u8, usize)>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_cold_tier_device_metrics(metrics: ColdTierDeviceMetrics<'_>) {
+    let mut registry = global_metrics_registry().lock();
+    let key = ColdTierRuntimeKey {
+        runtime: metrics.runtime.to_string(),
+    };
+    registry
+        .cold_tier_device_totals
+        .set(key.clone(), metrics.total_devices as f64);
+    registry
+        .cold_tier_device_schedulable
+        .set(key.clone(), metrics.schedulable_devices as f64);
+    registry
+        .cold_tier_device_used_bytes
+        .set(key.clone(), metrics.total_used_bytes as f64);
+    registry
+        .cold_tier_device_reserved_bytes
+        .set(key.clone(), metrics.total_reserved_bytes as f64);
+    if let Some(capacity) = metrics.total_capacity_bytes {
+        registry
+            .cold_tier_device_capacity_bytes
+            .set(key, capacity as f64);
+    }
+    for (state, count) in metrics.by_state {
+        registry.cold_tier_device_states.set(
+            ColdTierDeviceStateKey {
+                runtime: metrics.runtime.to_string(),
+                state: cold_tier_device_state_label(state),
+            },
+            count as f64,
+        );
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_cold_tier_pending_offload_metrics(metrics: ColdTierPendingOffloadMetrics<'_>) {
+    let mut registry = global_metrics_registry().lock();
+    let key = ColdTierRuntimeKey {
+        runtime: metrics.runtime.to_string(),
+    };
+    registry
+        .cold_tier_pending_offload_total
+        .set(key.clone(), metrics.total_pending as f64);
+    registry
+        .cold_tier_pending_offload_ready
+        .set(key.clone(), metrics.ready as f64);
+    registry
+        .cold_tier_pending_offload_delayed
+        .set(key.clone(), metrics.delayed as f64);
+    registry
+        .cold_tier_pending_offload_attempts_total
+        .set(key.clone(), metrics.total_attempts as f64);
+    registry
+        .cold_tier_pending_offload_max_attempts
+        .set(key, metrics.max_attempts as f64);
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_cold_tier_reclaim_metrics(metrics: ColdTierReclaimMetrics<'_>) {
+    let mut registry = global_metrics_registry().lock();
+    let key = ColdTierRuntimeKey {
+        runtime: metrics.runtime.to_string(),
+    };
+    registry
+        .cold_tier_reclaim_pending_total
+        .set(key.clone(), metrics.total_pending as f64);
+    registry
+        .cold_tier_reclaim_due_total
+        .set(key.clone(), metrics.due as f64);
+    registry.cold_tier_reclaim_by_kind.set(
+        ColdTierReclaimKindKey {
+            runtime: metrics.runtime.to_string(),
+            kind: "cold_backing",
+        },
+        metrics.cold_backing_reclaims as f64,
+    );
+    registry.cold_tier_reclaim_by_kind.set(
+        ColdTierReclaimKindKey {
+            runtime: metrics.runtime.to_string(),
+            kind: "hot_segment",
+        },
+        metrics.hot_segment_reclaims as f64,
+    );
+    for (qos_tier, count) in metrics.by_qos_tier {
+        registry.cold_tier_reclaim_by_qos_tier.set(
+            ColdTierReclaimQosKey {
+                runtime: metrics.runtime.to_string(),
+                qos_tier: qos_tier.to_string(),
+            },
+            count as f64,
+        );
+    }
+    for (policy_rank, count) in metrics.by_policy_rank {
+        registry.cold_tier_reclaim_by_policy_rank.set(
+            ColdTierReclaimPolicyRankKey {
+                runtime: metrics.runtime.to_string(),
+                policy_rank,
+            },
+            count as f64,
+        );
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_cold_tier_operation(
+    operation: &'static str,
+    result: &'static str,
+    error_kind: &'static str,
+) {
+    global_metrics_registry().lock().cold_tier_operations.add(
+        ColdTierOperationKey {
+            operation,
+            result,
+            error_kind,
+        },
+        1,
+    );
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_cold_tier_operation_result<T>(
+    operation: &'static str,
+    result: &std::result::Result<T, mooncake_store_core::StoreError>,
+) {
+    match result {
+        Ok(_) => record_cold_tier_operation(operation, "ok", "none"),
+        Err(error) => record_cold_tier_operation(operation, "error", cold_tier_error_kind(error)),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn cold_tier_error_kind(error: &mooncake_store_core::StoreError) -> &'static str {
+    match error {
+        mooncake_store_core::StoreError::NotFound(_) => "not_found",
+        mooncake_store_core::StoreError::InvalidState(_) => "invalid_state",
+        mooncake_store_core::StoreError::Conflict(_) => "conflict",
+        mooncake_store_core::StoreError::StaleEpoch(_) => "stale_epoch",
+        mooncake_store_core::StoreError::Transport(_) => "transport",
+        mooncake_store_core::StoreError::Allocator(_) => "allocator",
+        mooncake_store_core::StoreError::Metadata(_) => "metadata",
+        mooncake_store_core::StoreError::Unsupported(_) => "unsupported",
+        mooncake_store_core::StoreError::QuotaExceeded { .. } => "quota_exceeded",
+        mooncake_store_core::StoreError::Backpressure(_) => "backpressure",
+    }
+}
+
+#[allow(dead_code)]
+fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
+    match state {
+        ColdTierDeviceState::Unregistered => "unregistered",
+        ColdTierDeviceState::Healthy => "healthy",
+        ColdTierDeviceState::Full => "full",
+        ColdTierDeviceState::DisabledByAdmin => "disabled_by_admin",
+        ColdTierDeviceState::Draining => "draining",
+        ColdTierDeviceState::Failed => "failed",
     }
 }

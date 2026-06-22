@@ -1663,6 +1663,7 @@ fn soft_get_status(error: &StoreError) -> i64 {
         StoreError::StaleEpoch(_) => -6,
         StoreError::Unsupported(_) => -7,
         StoreError::Allocator(_) => -8,
+        StoreError::Backpressure(_) => -9,
     }
 }
 
