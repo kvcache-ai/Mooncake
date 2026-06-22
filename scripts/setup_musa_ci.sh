@@ -261,6 +261,16 @@ typedef struct cusolverDnContext *cusolverDnHandle_t;
 H
 }
 
+write_cuda_compat_libraries() {
+  mkdir -p "${CUDA_COMPAT_HOME}/lib64"
+  cat > "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" <<'C'
+void mooncake_empty_cuda_stub(void) {}
+C
+  cc -shared -fPIC "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" -o "${CUDA_COMPAT_HOME}/lib64/libcudart.so"
+  cc -shared -fPIC "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" -o "${CUDA_COMPAT_HOME}/lib64/libc10_cuda.so"
+  cc -shared -fPIC "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" -o "${CUDA_COMPAT_HOME}/lib64/libtorch_cuda.so"
+}
+
 write_nvcc_wrapper() {
   mkdir -p "${CUDA_COMPAT_HOME}/bin"
   cat > "${CUDA_COMPAT_HOME}/bin/nvcc" <<'SH'
@@ -313,7 +323,7 @@ setup_torch_musa_env() {
   rm -rf "${CUDA_COMPAT_HOME}"
   mkdir -p "${CUDA_COMPAT_HOME}"
   write_cuda_compat_headers
-  ln -s "${MUSA_HOME}/lib" "${CUDA_COMPAT_HOME}/lib64"
+  write_cuda_compat_libraries
   write_nvcc_wrapper
 
   torch_musa_includes=$(python3 - <<'PY'
@@ -366,7 +376,7 @@ PY
       find -L "${MUSA_HOME}" -type f -name 'lib*.so*' -printf '%h\n' 2>/dev/null
     } | awk 'NF && !seen[$0]++' | paste -sd: -
   )
-  append_env "LD_LIBRARY_PATH=${musa_libs}:${torch_libs}:${LD_LIBRARY_PATH:-}"
+  append_env "LD_LIBRARY_PATH=${CUDA_COMPAT_HOME}/lib64:${musa_libs}:${torch_libs}:${LD_LIBRARY_PATH:-}"
 }
 
 verify_env() {
