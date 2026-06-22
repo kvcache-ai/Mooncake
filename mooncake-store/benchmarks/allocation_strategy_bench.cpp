@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -105,7 +106,11 @@ constexpr int kDsaMaxRetries = 5;
 // Lower bound on the auto-derived allocation count per DSA case.
 constexpr int kDsaMinAllocs = 100;
 constexpr int kSizeClassMaxRetries = 5;
-constexpr int kSizeClassPrefillMaxAttempts = 5000;
+constexpr size_t kSizeClassMinPrefillAttempts = 5000;
+// The theoretical prefill budget assumes every allocation succeeds. Use a
+// small multiplier to absorb partial allocations, retries, and fragmentation
+// without turning unreachable targets into long-running cases.
+constexpr double kSizeClassPrefillAttemptMultiplier = 2.0;
 
 enum class WorkloadType {
     FILL_UP,    // Only allocate, measure throughput/latency
@@ -162,8 +167,6 @@ struct DistributionStats {
 };
 
 struct FragmentationSnapshot {
-    uint64_t allocated_size = 0;
-    uint64_t allocated_num = 0;
     uint64_t total_free_space = 0;
     uint64_t largest_free_region = 0;
     uint64_t capacity = 0;
@@ -200,7 +203,8 @@ struct SizeClassAllocationResult {
 };
 
 struct SizeClassPrefillStats {
-    int attempts = 0;
+    size_t attempts = 0;
+    size_t max_attempts = 0;
     int full_count = 0;
     int partial_count = 0;
     int failed_count = 0;
@@ -512,8 +516,6 @@ static FragmentationSnapshot computeFragmentationSnapshot(
             if (!allocator) continue;
 
             auto metrics = allocator->get_metrics();
-            snapshot.allocated_size += metrics.allocated_size_;
-            snapshot.allocated_num += metrics.allocated_num_;
             snapshot.total_free_space += metrics.total_free_space_;
             snapshot.capacity += metrics.capacity;
             snapshot.largest_free_region = std::max(
@@ -578,6 +580,45 @@ static size_t chooseSizeClassIndex(const std::vector<SizeClassSpec>& specs,
     }
 
     return specs.size() - 1;
+}
+
+static double computeWeightedAverageObjectSize(
+    const std::vector<SizeClassSpec>& specs) {
+    double weighted_size = 0.0;
+    int total_weight = 0;
+
+    for (const auto& spec : specs) {
+        if (spec.weight <= 0) continue;
+        weighted_size += static_cast<double>(spec.size) * spec.weight;
+        total_weight += spec.weight;
+    }
+
+    if (total_weight <= 0) return 0.0;
+    return static_cast<double>(weighted_size / total_weight);
+}
+
+static size_t deriveSizeClassPrefillMaxAttempts(
+    const AllocatorManager& manager, const BenchConfig& cfg,
+    const std::vector<SizeClassSpec>& specs) {
+    if (cfg.prefill_pct <= 0 || cfg.replica_num <= 0) return 0;
+
+    const double avg_object_size = computeWeightedAverageObjectSize(specs);
+    if (avg_object_size <= 0.0) return kSizeClassMinPrefillAttempts;
+
+    const double target_bytes =
+        static_cast<double>(computeTotalCapacity(manager)) * cfg.prefill_pct /
+        100.0;
+    const double bytes_per_attempt =
+        avg_object_size * static_cast<double>(cfg.replica_num);
+    if (target_bytes <= 0.0 || bytes_per_attempt <= 0.0) {
+        return kSizeClassMinPrefillAttempts;
+    }
+
+    const double derived_attempts =
+        std::ceil((target_bytes / bytes_per_attempt) *
+                  kSizeClassPrefillAttemptMultiplier);
+    return std::max(kSizeClassMinPrefillAttempts,
+                    static_cast<size_t>(derived_attempts));
 }
 
 static std::string strategyName(AllocationStrategyType type) {
@@ -1026,12 +1067,13 @@ static SizeClassPrefillStats prefillSizeClassChurn(
     SizeClassPrefillStats stats;
     if (cfg.prefill_pct <= 0 || specs.empty()) return stats;
     stats.requested_pct = cfg.prefill_pct;
+    stats.max_attempts = deriveSizeClassPrefillMaxAttempts(manager, cfg, specs);
 
     int consec_failures = 0;
     int evict_throwaway = 0;
     const int kMaxConsecFailures = 10;
 
-    while (stats.attempts < kSizeClassPrefillMaxAttempts) {
+    while (stats.attempts < stats.max_attempts) {
         if (stats.attempts % kPreFillSampleInterval == 0) {
             stats.achieved_util_pct = computeAverageUtilAll(manager) * 100.0;
             if (stats.achieved_util_pct >= cfg.prefill_pct) {
@@ -1493,7 +1535,7 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
               << ", achieved_pct=" << r.prefill_stats.achieved_util_pct
               << ", reached=" << (r.prefill_stats.reached_target ? "yes" : "no")
               << ", attempts=" << r.prefill_stats.attempts << "/"
-              << kSizeClassPrefillMaxAttempts
+              << r.prefill_stats.max_attempts
               << ", full/partial/failed=" << r.prefill_stats.full_count << "/"
               << r.prefill_stats.partial_count << "/"
               << r.prefill_stats.failed_count << std::endl;

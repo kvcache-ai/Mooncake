@@ -21,6 +21,10 @@ KVCache-like allocation pressure. It pre-fills the simulated cluster when
 classes. On allocation failure it randomly evicts a fraction of live objects and
 retries.
 
+When prefill is enabled, the prefill attempt cap is auto-derived from target
+utilization, total cluster capacity, weighted average object size, and replica
+count, with a 5000-attempt minimum for small cases.
+
 This is an allocation-strategy-layer benchmark. It complements the existing
 `dsa` workload by adding explicit fragmentation sampling and configurable
 weighted size-class patterns. It is not a replacement for `allocator_bench`,
