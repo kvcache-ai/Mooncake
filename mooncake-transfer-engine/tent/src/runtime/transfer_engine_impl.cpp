@@ -447,7 +447,8 @@ Status TransferEngineImpl::deconstruct() {
     // does not access transport-internal state (workers, connections).
     // Callers must ensure no transfers are in-flight before calling
     // deconstruct().
-    batch_set_.forEach([&](BatchSet& entry) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
         std::unordered_set<Batch*> released_batches;
         auto release_batch = [&](Batch* batch) {
             if (!released_batches.insert(batch).second) return;
@@ -459,11 +460,12 @@ Status TransferEngineImpl::deconstruct() {
             }
             Slab<Batch>::Get().deallocate(batch);
         };
-        for (auto& batch : entry.active) release_batch(batch);
-        for (auto& batch : entry.freelist) release_batch(batch);
-        entry.active.clear();
-        entry.freelist.clear();
-    });
+        for (auto& batch : batch_set_.active) release_batch(batch);
+        for (auto& batch : batch_set_.freelist) release_batch(batch);
+        batch_set_.active.clear();
+        batch_set_.freelist.clear();
+        alive_batches_.clear();
+    }
 
     // Now safe to destroy transports (workers join here)
     for (auto& transport : transport_list_) transport.reset();
@@ -757,12 +759,10 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     Batch* batch = Slab<Batch>::Get().allocate();
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
-    batch_set_.get().active.insert(batch);
     BatchID batch_id = (BatchID)batch;
-    {
-        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-        alive_batches_.insert(batch_id);
-    }
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    batch_set_.active.insert(batch);
+    alive_batches_.insert(batch_id);
     return batch_id;
 }
 
@@ -783,16 +783,15 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
         return Status::OK();
     }
     batch->free_requested = true;
-    batch_set_.get().freelist.push_back(batch);
+    batch_set_.freelist.push_back(batch);
     lazyFreeBatch();
     return Status::OK();
 }
 
 Status TransferEngineImpl::lazyFreeBatch() {
-    // Caller must hold progress_mutex_.
-    auto& batch_set = batch_set_.get();
-    for (auto it = batch_set.freelist.begin();
-         it != batch_set.freelist.end();) {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    for (auto it = batch_set_.freelist.begin();
+         it != batch_set_.freelist.end();) {
         auto& batch = *it;
         if (batch->runtime_refs > 0) {
             it++;
@@ -812,10 +811,10 @@ Status TransferEngineImpl::lazyFreeBatch() {
             auto& sub_batch = batch->sub_batch[type];
             if (transport && sub_batch) transport->freeSubBatch(sub_batch);
         }
-        batch_set.active.erase(batch);
+        batch_set_.active.erase(batch);
         alive_batches_.erase((BatchID)batch);
         Slab<Batch>::Get().deallocate(batch);
-        it = batch_set.freelist.erase(it);
+        it = batch_set_.freelist.erase(it);
     }
     return Status::OK();
 }

@@ -451,7 +451,7 @@ TEST(RuntimeQueueDispatch, RuntimeQueueDrainsWithoutUserPolling) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
-TEST(RuntimeQueueDispatch, EarlyFreeWaitsForQueuedCompletion) {
+TEST(RuntimeQueueDispatch, EarlyFreeReclaimsAfterQueuedCompletion) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
@@ -487,10 +487,6 @@ TEST(RuntimeQueueDispatch, EarlyFreeWaitsForQueuedCompletion) {
     EXPECT_GE(fake_rdma->status_calls.load(), 2);
 
     TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-
-    EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.getTransferStatus(batch, 0, status).IsInvalidArgument());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());

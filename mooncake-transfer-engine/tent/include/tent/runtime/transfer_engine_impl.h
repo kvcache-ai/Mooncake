@@ -30,7 +30,6 @@
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/common/types.h"
-#include "tent/common/concurrent/thread_local_storage.h"
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
@@ -39,7 +38,6 @@ namespace mooncake {
 namespace tent {
 
 class Batch;
-class BatchSet;
 class Topology;
 class Transport;
 class SegmentDesc;
@@ -320,7 +318,7 @@ class TransferEngineImpl {
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
 
-    ThreadLocalStorage<BatchSet> batch_set_;
+    BatchSet batch_set_;
 
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;

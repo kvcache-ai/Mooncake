@@ -98,19 +98,22 @@ void ProgressWorker::runner() {
         }
         if (queue_ready) {
             (void)impl_->progressRuntimeQueue();
+            (void)impl_->lazyFreeBatch();
         }
         // progressBatch acquires the engine's progress_mutex_ and silently
         // returns InvalidArgument if the batch was freed before we got here.
         // PENDING means "kick again later"; the next notify wakes us up.
-        // Terminal states leave the batch alone — freeBatch on the user
-        // thread is responsible for reclamation.
+        // Terminal states are observed here; lazyFreeBatch reclaims a batch
+        // only if freeBatch has already marked it free_requested.
         if (batch_id) {
             TransferStatus s;
             (void)impl_->progressBatch(batch_id, s);
             (void)impl_->progressRuntimeQueue();
+            (void)impl_->lazyFreeBatch();
         }
         if (fallback_due && !queue_ready && !batch_id && queue_active) {
             (void)impl_->progressRuntimeQueue();
+            (void)impl_->lazyFreeBatch();
         }
     }
 }

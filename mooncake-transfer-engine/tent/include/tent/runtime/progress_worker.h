@@ -33,9 +33,9 @@ class TransferEngineImpl;
 // Event-driven progress worker for issue #2116. When the engine is configured
 // with enable_progress_worker=true, transports call
 // notifyBatchMaybeReady to wake this worker, which then drives one
-// progressBatch step per notification. Runtime queue users also get a bounded
-// fallback tick while queue work is active, so older transports without a
-// completion wake still make progress.
+// progressBatch step per notification. When the runtime queue has active work,
+// the worker also uses a low-frequency fallback tick so transports that do not
+// yet emit completion wakes can still drain the queue.
 class ProgressWorker {
    public:
     explicit ProgressWorker(TransferEngineImpl* impl,
