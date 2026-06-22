@@ -1889,7 +1889,7 @@ WrappedMasterService::GetAllSegmentsForAdmin() {
     return master_service_.GetAllSegments();
 }
 
-tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
+tl::expected<std::vector<SegmentDetailInfo>, ErrorCode>
 WrappedMasterService::GetSegmentsDetailForAdmin() {
     return master_service_.GetSegmentsDetail();
 }

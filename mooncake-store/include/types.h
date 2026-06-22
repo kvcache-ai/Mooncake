@@ -199,6 +199,20 @@ using EtcdLeaseId = int64_t;
 
 using UUID = std::pair<uint64_t, uint64_t>;
 
+/**
+ * @brief Hash functor for UUID, used in unordered containers.
+ * Defined here so interface headers need not include boost headers directly.
+ */
+struct UUIDHash {
+    size_t operator()(const UUID& uuid) const noexcept {
+        size_t seed = std::hash<uint64_t>{}(uuid.first);
+        // Combine the two halves using a standard hash-combine technique.
+        seed ^= std::hash<uint64_t>{}(uuid.second) + 0x9e3779b9 + (seed << 6) +
+                (seed >> 2);
+        return seed;
+    }
+};
+
 using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
               "SerializedByte must be exactly 1 byte in size");

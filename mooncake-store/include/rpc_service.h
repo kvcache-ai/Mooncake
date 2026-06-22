@@ -179,7 +179,7 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
-    tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
+    tl::expected<std::vector<SegmentDetailInfo>, ErrorCode>
     GetSegmentsDetailForAdmin();
 
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(

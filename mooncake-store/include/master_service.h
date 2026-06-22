@@ -35,6 +35,10 @@
 #include "task_manager.h"
 
 namespace mooncake {
+
+// Forward declaration
+class MetadataBackend;
+
 namespace ha {
 class SnapshotCatalogStore;
 }
@@ -69,6 +73,8 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    // Allow NativeMetadataBackend to access private members
+    friend class NativeMetadataBackend;
 
    public:
     using NoFProbeFn =
@@ -201,24 +207,6 @@ class MasterService {
      */
     auto GetNoFSegmentsByName(const std::string& segment_name)
         -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>;
-
-    /**
-     * @brief Detailed information about a single segment.
-     * Keeps original types so callers can use values directly without
-     * needing to parse strings back to uuid/address/enum.
-     */
-    struct SegmentDetailInfo {
-        std::string segment_name;
-        UUID segment_id{0, 0};
-        UUID client_id{0, 0};
-        uintptr_t base_address{0};
-        uint64_t size_bytes{0};
-        std::string te_endpoint;
-        std::string protocol;
-        SegmentStatus status{SegmentStatus::UNDEFINED};
-        uint64_t allocator_used_bytes{0};
-        uint64_t allocator_capacity_bytes{0};
-    };
 
     /**
      * @brief Get detailed information of all segments, including the
@@ -1901,6 +1889,9 @@ class MasterService {
     std::mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);
+
+    // Metadata backend - delegates all metadata operations
+    std::unique_ptr<MetadataBackend> backend_;
 };
 
 }  // namespace mooncake

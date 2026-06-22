@@ -46,6 +46,24 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
+/**
+ * @brief Detailed information about a single segment.
+ * Keeps original types so callers can use values directly without
+ * needing to parse strings back to uuid/address/enum.
+ */
+struct SegmentDetailInfo {
+    std::string segment_name;
+    UUID segment_id{0, 0};
+    UUID client_id{0, 0};
+    uintptr_t base_address{0};
+    uint64_t size_bytes{0};
+    std::string te_endpoint;
+    std::string protocol;
+    SegmentStatus status{SegmentStatus::UNDEFINED};
+    uint64_t allocator_used_bytes{0};
+    uint64_t allocator_capacity_bytes{0};
+};
+
 struct MountedSegment {
     Segment segment;
     SegmentStatus status;
