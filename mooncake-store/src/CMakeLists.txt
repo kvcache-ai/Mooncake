@@ -65,9 +65,39 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
     tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
     task_manager.cpp
+    # HA OpLog components (ported from main branch)
+    ha/oplog/oplog_manager.cpp
+    ha/oplog/oplog_serializer.cpp
+    ha/oplog/localfs_oplog_store.cpp
+    ha/oplog/polling_oplog_change_notifier.cpp
+    ha/oplog/oplog_store_factory.cpp
+    ha/oplog/oplog_applier.cpp
+    ha/oplog/oplog_replicator.cpp
+    standby_state_machine.cpp
+    ha_metric_manager.cpp
 )
 
 set(EXTRA_LIBS "")
+
+# Find xxHash (required for ComputeChecksum)
+find_path(
+  XXHASH_INCLUDE_DIR
+  NAMES xxhash.h
+  PATHS /usr/include /usr/local/include)
+find_library(
+  XXHASH_LIBRARY
+  NAMES xxhash libxxhash
+  PATHS /usr/lib /usr/local/lib /usr/lib64)
+if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
+  message(
+    STATUS "Found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}")
+  list(APPEND MASTER_EXTRA_INCS ${XXHASH_INCLUDE_DIR})
+else()
+  message(
+    FATAL_ERROR
+      "xxHash library/header not found. Please install xxhash (development headers) and try again."
+  )
+endif()
 
 if(USE_3FS)
   add_subdirectory(hf3fs)
@@ -85,12 +115,18 @@ if(USE_ASCEND_CACHE_TIER)
   message(STATUS "Ascend Cache Tier enabled")
 endif()
 
+# Ascend DRAM Tier support (aclrtMallocHost-based DRAM allocation)
+if(USE_ASCEND_DRAM_TIER)
+  message(STATUS "Ascend DRAM Tier enabled")
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 # Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., vendor-specific hardware)
 # to targets that don't need it (e.g., mooncake_master).
 # Targets that need transfer_engine should link it explicitly.
+target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 target_link_libraries(mooncake_store
     PUBLIC
         cachelib_memory_allocator
@@ -98,6 +134,7 @@ target_link_libraries(mooncake_store
         glog::glog
         gflags::gflags
         JsonCpp::JsonCpp
+        ${XXHASH_LIBRARY}
         ${EXTRA_LIBS}
         asio_shared
     PRIVATE
@@ -130,6 +167,36 @@ if(USE_ASCEND_CACHE_TIER)
 
     # Only define USE_ASCEND_CACHE_TIER when library is found
     target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_CACHE_TIER)
+  endif()
+endif()
+
+# Link Ascend ACL library if USE_ASCEND_DRAM_TIER is enabled
+if(USE_ASCEND_DRAM_TIER)
+  set(NEED_LINK_ASCEND FALSE)
+  if(NOT ASCENDCL_LIB)
+    set(NEED_LINK_ASCEND TRUE)
+    set(ASCEND_SEARCH_PATHS
+        $ENV{ASCEND_HOME}/lib64
+        /usr/local/Ascend/ascend-toolkit/latest/lib64
+        /usr/local/Ascend/nnrt/latest/lib64
+    )
+    find_library(ASCENDCL_LIB ascendcl PATHS ${ASCEND_SEARCH_PATHS} NO_DEFAULT_PATH)
+  endif()
+
+  if(NOT ASCENDCL_LIB)
+    message(FATAL_ERROR "ascendcl library not found, USE_ASCEND_DRAM_TIER requires it")
+  else()
+    message(STATUS "Found ascendcl library for DRAM tier: ${ASCENDCL_LIB}")
+    if(NEED_LINK_ASCEND)
+      target_link_libraries(mooncake_store PUBLIC ${ASCENDCL_LIB})
+      set(ASCEND_INCLUDE_PATHS
+          $ENV{ASCEND_HOME}/include
+          /usr/local/Ascend/ascend-toolkit/latest/include
+          /usr/local/Ascend/nnrt/latest/include
+      )
+      target_include_directories(mooncake_store PUBLIC ${ASCEND_INCLUDE_PATHS})
+    endif()
+    target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_DRAM_TIER)
   endif()
 endif()
 if (STORE_USE_ETCD)

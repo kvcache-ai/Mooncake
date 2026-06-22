@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <mutex>
 #include <set>
+#include <fstream>
 #include <thread>
 #include <vector>
 #include <limits>
@@ -434,6 +435,90 @@ TEST_F(StorageTierTest, StorageTierBucket) {
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_bucket");
+}
+
+// The P2P tiered cache treats SSD as a purely ephemeral tier: it wipes the
+// configured storage path both on startup (before the backend scans it) and on
+// exit (when the tier is destroyed). This is scoped to the P2P path only; the
+// centralized FileStorage path keeps its persist/recover-across-restart
+// behavior (covered by storage_backend_test).
+TEST_F(StorageTierTest, StorageTierWipesStoragePathOnStartupAndExit) {
+    const std::string storage_path = "/tmp/mooncake_test_ephemeral_wipe";
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", storage_path.c_str(), 1);
+
+    // Simulate leftovers from a previous run: a stray file and a stale subdir.
+    fs::remove_all(storage_path);
+    fs::create_directories(storage_path);
+    {
+        std::ofstream leftover(storage_path + "/leftover_from_previous_run.bin",
+                               std::ios::binary);
+        leftover << "stale data that must be wiped on startup";
+    }
+    fs::create_directories(storage_path + "/stale_subdir");
+    ASSERT_GT(std::distance(fs::directory_iterator(storage_path),
+                            fs::directory_iterator{}),
+              0);
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    {
+        TieredBackend backend;
+        auto init_res = InitTieredBackendForTest(backend, config);
+        ASSERT_TRUE(init_res.has_value())
+            << "Init failed: " << init_res.error();
+
+        // Startup wipe: the leftovers must be gone after init.
+        EXPECT_FALSE(
+            fs::exists(storage_path + "/leftover_from_previous_run.bin"))
+            << "startup wipe should remove the stale file";
+        EXPECT_FALSE(fs::exists(storage_path + "/stale_subdir"))
+            << "startup wipe should remove the stale subdir";
+
+        // Write + commit + flush so real bucket files land on disk.
+        const size_t data_size = 1024;
+        {
+            auto alloc_result = backend.Allocate(data_size);
+            ASSERT_TRUE(alloc_result.has_value());
+            AllocationHandle handle = alloc_result.value();
+
+            auto test_buffer = CreateTestBuffer(data_size);
+            DataSource source;
+            source.buffer = std::make_unique<TempDRAMBuffer>(
+                std::move(test_buffer), data_size);
+            source.type = MemoryType::DRAM;
+            ASSERT_TRUE(backend.Write(source, handle).has_value());
+            ASSERT_TRUE(backend.Commit("ephemeral_key", handle).has_value());
+        }  // handle released here
+
+        auto tier_views = backend.GetTierViews();
+        ASSERT_FALSE(tier_views.empty());
+        auto tier = backend.GetTier(tier_views[0].id);
+        ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
+        EXPECT_GT(CountFilesWithExtension(storage_path, ".bucket"), 0)
+            << "flushed data should produce a .bucket file";
+    }  // backend (and its StorageTier) destroyed here -> exit wipe
+
+    // Exit wipe: the storage path is emptied, but the directory itself stays.
+    ASSERT_TRUE(fs::exists(storage_path));
+    EXPECT_EQ(std::distance(fs::directory_iterator(storage_path),
+                            fs::directory_iterator{}),
+              0)
+        << "exit wipe should remove everything left in the storage path";
+
+    fs::remove_all(storage_path);
 }
 
 TEST_F(StorageTierTest, BucketBackendRejectsOffloadWhenPhysicalSpaceTooLow) {

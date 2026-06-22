@@ -7,6 +7,10 @@
 #include <limits>
 #include <memory>
 
+#ifdef USE_ASCEND_DRAM_TIER
+#include "acl/acl.h"
+#endif
+
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"
 #include "utils/common.h"
@@ -71,11 +75,23 @@ class FixedStatsTier : public CacheTier {
 class TieredBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        // glog is already initialized by gtest_main
+#ifdef USE_ASCEND_DRAM_TIER
+        aclError ret = aclInit(nullptr);
+        if (ret != ACL_SUCCESS && ret != ACL_ERROR_REPEAT_INITIALIZE) {
+            GTEST_SKIP() << "ACL init failed (" << ret << "), skipping tests";
+        }
+        ret = aclrtSetDevice(0);
+        if (ret != ACL_SUCCESS) {
+            GTEST_SKIP() << "aclrtSetDevice(0) failed (" << ret
+                         << "), no NPU device available";
+        }
+#endif
     }
 
     void TearDown() override {
-        // Cleanup storage directories created by tests
+#ifdef USE_ASCEND_DRAM_TIER
+        aclrtResetDevice(0);
+#endif
         std::filesystem::remove_all("/tmp/mooncake_test_storage");
         std::filesystem::remove_all("/tmp/mooncake_test_bucket");
         std::filesystem::remove_all("/tmp/mooncake_test_multitier");
