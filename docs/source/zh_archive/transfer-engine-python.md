@@ -186,7 +186,7 @@ transfer_submit_write(target_hostname, buffer, peer_buffer_address, length)
 - `length` (int): 要传输的字节数
 
 **返回值：**
-- `int`: 用于跟踪操作的批次ID，失败时返回负值
+- `int`: 用于跟踪操作的批次ID，失败时返回0
 
 #### transfer_check_status()
 
@@ -289,6 +289,7 @@ TransferOpcode.WRITE  # 写操作
 - `MC_TCP_BIND_ADDRESS`: 指定TCP绑定地址
 - `MC_RDMA_BIND_ADDRESS`: 指定RDMA绑定地址，用于双网卡环境下的NIC路径构建。设置后，RDMA NIC路径使用此地址，而TCP握手使用 `local_hostname` 中的地址。适用于TCP和RDMA流量使用不同网络接口的场景（例如 `eth0` 用于TCP，`rdma-net1` 用于RDMA）。
 - `MC_CUSTOM_TOPO_JSON`: 自定义拓扑JSON文件路径
+- `MC_TE_FILTERS`: 可选，逗号分隔的 IB 设备名白名单（如 `mlx5_0,mlx5_2`），用于 Legacy Transfer Engine 拓扑自动发现；未设置时不限制。
 - `MC_TE_METRIC`: 启用指标报告（设置为"1"、"true"、"yes"或"on"）
 - `MC_TE_METRIC_INTERVAL_SECONDS`: 设置指标报告间隔（秒）
 

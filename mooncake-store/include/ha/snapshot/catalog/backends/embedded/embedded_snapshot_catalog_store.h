@@ -10,7 +10,8 @@ namespace embedded {
 
 class EmbeddedSnapshotCatalogStore : public SnapshotCatalogStore {
    public:
-    explicit EmbeddedSnapshotCatalogStore(SnapshotObjectStore* object_store);
+    EmbeddedSnapshotCatalogStore(SnapshotObjectStore* object_store,
+                                 const std::string& cluster_id);
 
     ErrorCode Publish(const SnapshotDescriptor& snapshot) override;
 
@@ -22,8 +23,13 @@ class EmbeddedSnapshotCatalogStore : public SnapshotCatalogStore {
 
     ErrorCode Delete(const SnapshotId& snapshot_id) override;
 
+    const std::string& GetSnapshotRoot() const override {
+        return snapshot_root_;
+    }
+
    private:
     SnapshotObjectStore* object_store_;
+    std::string snapshot_root_;
 };
 
 }  // namespace embedded

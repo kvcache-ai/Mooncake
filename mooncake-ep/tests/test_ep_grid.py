@@ -13,6 +13,26 @@ from mooncake.mooncake_ep_buffer import Buffer
 import mooncake.pg as pg
 
 
+def using_musa_backend() -> bool:
+    return os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    }
+
+
+def import_torchada_if_needed():
+    if not using_musa_backend():
+        return
+    try:
+        import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
+    except ImportError as exc:
+        raise unittest.SkipTest(
+            "torchada is required when MOONCAKE_EP_USE_MUSA is enabled"
+        ) from exc
+
+
 def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     hidden = x_fp8.shape[-1]
     x_view = x_fp8.reshape(-1, hidden // 128, 128).float()
@@ -23,7 +43,6 @@ def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 def run_test_iteration(
     group: dist.ProcessGroup,
-    cpu_group: dist.ProcessGroup,
     rank: int,
     num_ranks: int,
     max_tokens: int,
@@ -91,7 +110,7 @@ def run_test_iteration(
     # 5s timeout if we simulate a failed rank
     timeout_us = 5 * 1_000_000 if fail_rank != -1 else -1
 
-    cpu_group.barrier()
+    dist.barrier(group)
 
     if rank == fail_rank:
         os._exit(0)
@@ -181,10 +200,13 @@ def run_test_iteration(
     )
 
     torch.cuda.synchronize()
-    dist.barrier(cpu_group)
+    if fail_rank == -1:
+        dist.barrier(group)
 
 
 def worker(rank, world_size, config_dict):
+    import_torchada_if_needed()
+
     # Device filter
     device_filter = [
         f
@@ -200,12 +222,10 @@ def worker(rank, world_size, config_dict):
 
     dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
     group = dist.group.WORLD
-    cpu_group = dist.new_group(list(range(world_size)), backend="mooncake-cpu")
 
     try:
         run_test_iteration(
             group=group,
-            cpu_group=cpu_group,
             rank=rank,
             num_ranks=world_size,
             **config_dict,
@@ -214,11 +234,12 @@ def worker(rank, world_size, config_dict):
         traceback.print_exc()
         raise
 
-    dist.destroy_process_group()
+    os._exit(0)
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
+        import_torchada_if_needed()
         self.world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"

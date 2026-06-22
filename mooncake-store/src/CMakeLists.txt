@@ -16,7 +16,9 @@ set(MOONCAKE_STORE_SOURCES
     etcd_helper.cpp
     segment.cpp
     transfer_task.cpp
+    tenant_quota.cpp
     rpc_service.cpp
+    master_admin_service.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -58,6 +60,7 @@ set(MOONCAKE_STORE_SOURCES
     ha_metric_manager.cpp
     store_c.cpp
     memory_alloc.cpp
+    ssd_register_client.cpp
     engram/engram_store.cpp
 )
 

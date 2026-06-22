@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
@@ -317,6 +318,120 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
 
 #ifdef STORE_USE_ETCD
 
+// WaitForViewChange must return promptly when the leader's master_view key is
+// deleted, driven by the etcd watch rather than the timeout. We give it a long
+// (5s) timeout but delete the key after ~300ms; a watch-based implementation
+// returns shortly after the deletion, well before the timeout would fire.
+TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsPromptlyOnLeaderLoss) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:5555");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    // Release leadership from another thread after a short delay; this revokes
+    // the lease and deletes the master_view key, which the watch observes.
+    std::thread releaser([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        coordinator->ReleaseLeadership(session);
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto changed = coordinator->WaitForViewChange(session.view.view_version,
+                                                  std::chrono::seconds(5));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    releaser.join();
+
+    ASSERT_TRUE(changed.has_value());
+    EXPECT_TRUE(changed->changed);
+    EXPECT_FALSE(changed->current_view.has_value());
+    // Must be driven by the watch (key deleted at ~300ms), not the 5s timeout.
+    EXPECT_LT(elapsed, std::chrono::seconds(3));
+}
+
+// WaitForViewChange must honor its timeout when the leader is stable: the watch
+// blocks with no deletion event, and the timer cancels it so the call returns
+// timed_out at roughly the requested deadline -- neither returning early nor
+// hanging past it.
+TEST_F(HighAvailabilityTest, WaitForViewChangeTimesOutWhenStable) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:4444");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    const auto timeout = std::chrono::milliseconds(500);
+    const auto start = std::chrono::steady_clock::now();
+    auto result =
+        coordinator->WaitForViewChange(session.view.view_version, timeout);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->changed);
+    EXPECT_TRUE(result->timed_out);
+    // Did not return early (watch did not spuriously fire) ...
+    EXPECT_GE(elapsed, std::chrono::milliseconds(400));
+    // ... and did not hang past the deadline (timer cancelled the watch).
+    EXPECT_LT(elapsed, std::chrono::seconds(3));
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
+
+// When the observed view already differs from the caller's known version,
+// WaitForViewChange returns promptly: it arms the watch (now established
+// synchronously via WithCreatedNotify) and then the initial read short-circuits
+// on the version mismatch before any event is awaited. Passing no known version
+// while a leader exists is one such case.
+TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:3333");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    const auto start = std::chrono::steady_clock::now();
+    auto result =
+        coordinator->WaitForViewChange(std::nullopt, std::chrono::seconds(5));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->changed);
+    ASSERT_TRUE(result->current_view.has_value());
+    EXPECT_EQ(result->current_view->view_version, session.view.view_version);
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
+
 TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
@@ -352,6 +467,229 @@ TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
 
     monitor.value()->Stop();
     ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
+
+TEST_F(HighAvailabilityTest, EtcdStoreClientResetKeepsBasicOperationsWorking) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const std::string key =
+        FLAGS_etcd_test_key_prefix + "reset_basic_operation";
+    const std::string value_before = "before_reset";
+    const std::string value_after = "after_reset";
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::Put(key.c_str(), key.size(), value_before.c_str(),
+                              value_before.size()));
+
+    std::string got;
+    EtcdRevisionId rev = 0;
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::Get(key.c_str(), key.size(), got, rev));
+    ASSERT_EQ(value_before, got);
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::ResetEtcdStoreClient(FLAGS_etcd_endpoints));
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::Put(key.c_str(), key.size(), value_after.c_str(),
+                              value_after.size()));
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::Get(key.c_str(), key.size(), got, rev));
+    ASSERT_EQ(value_after, got);
+
+    EtcdLeaseId lease_id = 0;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(10, lease_id));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::RevokeLease(lease_id));
+}
+
+TEST_F(HighAvailabilityTest, EtcdStoreClientResetStopsOldKeepAlive) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    EtcdLeaseId lease_id = 0;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(10, lease_id));
+
+    std::promise<ErrorCode> promise;
+    auto future = promise.get_future();
+    std::thread keep_alive_thread(
+        [&]() { promise.set_value(EtcdHelper::KeepAlive(lease_id)); });
+
+    auto cleanup_keep_alive = [&]() {
+        if (keep_alive_thread.joinable()) {
+            (void)EtcdHelper::CancelKeepAlive(lease_id);
+            keep_alive_thread.join();
+        }
+    };
+
+    auto ready_err = EtcdHelper::WaitKeepAliveReady(lease_id, 1000);
+    if (ready_err != ErrorCode::OK) {
+        cleanup_keep_alive();
+    }
+    ASSERT_EQ(ErrorCode::OK, ready_err);
+
+    auto reset_err = EtcdHelper::ResetEtcdStoreClient(FLAGS_etcd_endpoints);
+    if (reset_err != ErrorCode::OK) {
+        cleanup_keep_alive();
+    }
+    ASSERT_EQ(ErrorCode::OK, reset_err);
+
+    auto keep_alive_status = future.wait_for(std::chrono::seconds(5));
+    if (keep_alive_status != std::future_status::ready) {
+        cleanup_keep_alive();
+    }
+    ASSERT_EQ(keep_alive_status, std::future_status::ready);
+    EXPECT_NE(ErrorCode::OK, future.get());
+    keep_alive_thread.join();
+
+    EtcdLeaseId new_lease_id = 0;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(10, new_lease_id));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::RevokeLease(new_lease_id));
+}
+
+// Static data for prefix watch callback (C-linkage required for Go callback)
+static std::atomic<int> g_prefix_watch_event_count{0};
+static std::atomic<int> g_prefix_watch_broken_count{0};
+
+extern "C" void PrefixWatchTestCallback(void* /*ctx*/, const char* /*key*/,
+                                        size_t /*key_size*/,
+                                        const char* /*value*/,
+                                        size_t /*value_size*/, int event_type,
+                                        int64_t /*mod_revision*/) {
+    if (event_type == 2) {
+        g_prefix_watch_broken_count.fetch_add(1);
+    } else {
+        g_prefix_watch_event_count.fetch_add(1);
+    }
+}
+
+bool WaitForAtomicAtLeast(const std::atomic<int>& value, int expected,
+                          std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (value.load() >= expected) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return value.load() >= expected;
+}
+
+TEST_F(HighAvailabilityTest,
+       EtcdStoreClientResetTriggersPrefixWatchBrokenAndReconnect) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const std::string prefix =
+        FLAGS_etcd_test_key_prefix + "reset_prefix_watch/";
+    const std::string key1 = prefix + "key1";
+    const std::string value1 = "value1";
+    const std::string value2 = "value2";
+
+    // Clean up any leftover keys
+    std::string prefix_end = prefix;
+    if (!prefix_end.empty()) prefix_end.back()++;
+    (void)EtcdHelper::DeleteRange(prefix.c_str(), prefix.size(),
+                                  prefix_end.c_str(), prefix_end.size());
+
+    // Reset counters and start prefix watch
+    g_prefix_watch_event_count.store(0);
+    g_prefix_watch_broken_count.store(0);
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::WatchWithPrefixFromRevision(
+                  prefix.c_str(), prefix.size(), /*start_revision=*/0,
+                  /*callback_context=*/nullptr, PrefixWatchTestCallback));
+
+    // Allow watch to establish
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Write first value -- watch should receive it
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::Put(key1.c_str(), key1.size(),
+                                             value1.c_str(), value1.size()));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_GE(g_prefix_watch_event_count.load(), 1);
+
+    // Trigger reset
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::ResetEtcdStoreClient(FLAGS_etcd_endpoints));
+
+    // Wait for WATCH_BROKEN callback
+    ASSERT_TRUE(WaitForAtomicAtLeast(g_prefix_watch_broken_count, 1,
+                                     std::chrono::seconds(5)))
+        << "Expected WATCH_BROKEN after reset";
+    EXPECT_EQ(1, g_prefix_watch_broken_count.load());
+
+    // Wait for old goroutine to fully exit
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::WaitWatchWithPrefixStopped(
+                                 prefix.c_str(), prefix.size(), 5000));
+
+    // Start a new watch -- should succeed (old entry cleaned up by defer)
+    g_prefix_watch_event_count.store(0);
+    g_prefix_watch_broken_count.store(0);
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::WatchWithPrefixFromRevision(
+                  prefix.c_str(), prefix.size(), /*start_revision=*/0,
+                  /*callback_context=*/nullptr, PrefixWatchTestCallback));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Write second value -- new watch should receive it
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::Put(key1.c_str(), key1.size(),
+                                             value2.c_str(), value2.size()));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_GE(g_prefix_watch_event_count.load(), 1)
+        << "New watch should receive events after reset";
+
+    // Clean up
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::CancelWatchWithPrefix(prefix.c_str(), prefix.size()));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::WaitWatchWithPrefixStopped(
+                                 prefix.c_str(), prefix.size(), 5000));
+}
+
+TEST_F(HighAvailabilityTest, EtcdStorePrefixWatchCancelDoesNotReportBroken) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const std::string prefix =
+        FLAGS_etcd_test_key_prefix + "cancel_prefix_watch/";
+    const std::string key = prefix + "key";
+    const std::string value = "value";
+
+    std::string prefix_end = prefix;
+    if (!prefix_end.empty()) prefix_end.back()++;
+    (void)EtcdHelper::DeleteRange(prefix.c_str(), prefix.size(),
+                                  prefix_end.c_str(), prefix_end.size());
+
+    g_prefix_watch_event_count.store(0);
+    g_prefix_watch_broken_count.store(0);
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::WatchWithPrefixFromRevision(
+                  prefix.c_str(), prefix.size(), /*start_revision=*/0,
+                  /*callback_context=*/nullptr, PrefixWatchTestCallback));
+
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::Put(key.c_str(), key.size(),
+                                             value.c_str(), value.size()));
+    ASSERT_TRUE(WaitForAtomicAtLeast(g_prefix_watch_event_count, 1,
+                                     std::chrono::seconds(5)));
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::CancelWatchWithPrefix(prefix.c_str(), prefix.size()));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::WaitWatchWithPrefixStopped(
+                                 prefix.c_str(), prefix.size(), 5000));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(0, g_prefix_watch_broken_count.load())
+        << "Explicit cancel should not report WATCH_BROKEN";
 }
 
 #endif

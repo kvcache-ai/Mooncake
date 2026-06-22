@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -75,6 +76,32 @@ static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<uint8_t>,  // FLOAT8_E5M2 = 14 (using uint8_t as storage)
 }};
 
+inline std::optional<size_t> TensorDtypeElementSize(int32_t dtype) {
+    switch (static_cast<TensorDtype>(dtype)) {
+        case TensorDtype::FLOAT64:
+        case TensorDtype::INT64:
+        case TensorDtype::UINT64:
+            return size_t{8};
+        case TensorDtype::FLOAT32:
+        case TensorDtype::INT32:
+        case TensorDtype::UINT32:
+            return size_t{4};
+        case TensorDtype::INT16:
+        case TensorDtype::UINT16:
+        case TensorDtype::FLOAT16:
+        case TensorDtype::BFLOAT16:
+            return size_t{2};
+        case TensorDtype::INT8:
+        case TensorDtype::UINT8:
+        case TensorDtype::BOOL:
+        case TensorDtype::FLOAT8_E4M3:
+        case TensorDtype::FLOAT8_E5M2:
+            return size_t{1};
+        default:
+            return std::nullopt;
+    }
+}
+
 inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     if (dtype_obj.is_none()) {
         return TensorDtype::UNKNOWN;
@@ -101,6 +128,44 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
         return TensorDtype::FLOAT8_E5M2;
 
     return TensorDtype::UNKNOWN;
+}
+
+inline py::object tensor_dtype_to_torch_dtype(TensorDtype dtype) {
+    auto torch = torch_module();
+    switch (dtype) {
+        case TensorDtype::FLOAT32:
+            return torch.attr("float32");
+        case TensorDtype::FLOAT64:
+            return torch.attr("float64");
+        case TensorDtype::INT8:
+            return torch.attr("int8");
+        case TensorDtype::UINT8:
+            return torch.attr("uint8");
+        case TensorDtype::INT16:
+            return torch.attr("int16");
+        case TensorDtype::UINT16:
+            return torch.attr("uint16");
+        case TensorDtype::INT32:
+            return torch.attr("int32");
+        case TensorDtype::UINT32:
+            return torch.attr("uint32");
+        case TensorDtype::INT64:
+            return torch.attr("int64");
+        case TensorDtype::UINT64:
+            return torch.attr("uint64");
+        case TensorDtype::BOOL:
+            return torch.attr("bool");
+        case TensorDtype::FLOAT16:
+            return torch.attr("float16");
+        case TensorDtype::BFLOAT16:
+            return torch.attr("bfloat16");
+        case TensorDtype::FLOAT8_E4M3:
+            return torch.attr("float8_e4m3fn");
+        case TensorDtype::FLOAT8_E5M2:
+            return torch.attr("float8_e5m2");
+        default:
+            return py::none();
+    }
 }
 
 constexpr uint32_t kTensorObjectMagic = 0x4d4f4f4e;
@@ -212,6 +277,34 @@ inline TensorMetadata BuildTensorMetadata(
     return metadata;
 }
 
+inline std::optional<size_t> TensorMetadataExpectedDataBytes(
+    const TensorMetadata &metadata) {
+    auto element_size = TensorDtypeElementSize(metadata.header.dtype);
+    if (!element_size.has_value()) {
+        return std::nullopt;
+    }
+
+    size_t numel = 1;
+    for (int32_t i = 0; i < metadata.header.ndim; ++i) {
+        const int64_t dim = metadata.layout.local_shape.dims[i];
+        if (dim < 0) {
+            return std::nullopt;
+        }
+        const auto dim_size = static_cast<size_t>(dim);
+        if (dim_size != 0 &&
+            numel > std::numeric_limits<size_t>::max() / dim_size) {
+            return std::nullopt;
+        }
+        numel *= dim_size;
+    }
+
+    if (*element_size != 0 &&
+        numel > std::numeric_limits<size_t>::max() / *element_size) {
+        return std::nullopt;
+    }
+    return numel * *element_size;
+}
+
 inline bool ValidateTensorMetadata(const TensorMetadata &metadata,
                                    size_t total_length) {
     if (metadata.header.magic != kTensorObjectMagic ||
@@ -250,10 +343,16 @@ inline bool ValidateTensorMetadata(const TensorMetadata &metadata,
     }
 
     for (int32_t i = 0; i < metadata.header.ndim; ++i) {
-        if (metadata.layout.global_shape.dims[i] <= 0 ||
+        if (metadata.layout.global_shape.dims[i] < 0 ||
             metadata.layout.local_shape.dims[i] < 0) {
             return false;
         }
+    }
+
+    auto expected_data_bytes = TensorMetadataExpectedDataBytes(metadata);
+    if (!expected_data_bytes.has_value() ||
+        metadata.header.data_bytes != *expected_data_bytes) {
+        return false;
     }
 
     for (size_t i = metadata.header.ndim; i < kMaxTensorDims; ++i) {

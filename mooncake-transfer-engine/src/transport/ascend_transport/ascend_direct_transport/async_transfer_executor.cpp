@@ -14,21 +14,20 @@
 // limitations under the License.
 
 #include "transport/ascend_transport/ascend_direct_transport/async_transfer_executor.h"
-#include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 #include <glog/logging.h>
 
 #include <chrono>
+#include <utility>
 
 #include "common.h"
-#include "transfer_metadata.h"
 
 namespace mooncake {
 namespace {
 constexpr int64_t kMillisToNano = 1000000;
-constexpr size_t kAsyncTaskLimit = 100U;
+constexpr size_t kAsyncTaskLimit = 100;
 constexpr int32_t kDefaultDisconnectTime = 1000;
-constexpr int64_t kQueryPollIntervalMicros = 10;
+constexpr int64_t kQueryPollIntervalMicros = 1;
 }  // namespace
 
 AsyncTransferExecutor::AsyncTransferExecutor(const InitParams& params)
@@ -115,21 +114,24 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
         adxl::TransferArgs(), req_handle);
 
     if (status == adxl::SUCCESS) {
-        {
-            std::lock_guard<std::mutex> lock(async_handle_map_mutex_);
-            async_handle_to_engine_idx_[reinterpret_cast<uintptr_t>(
-                req_handle)] = local_engine_idx;
-        }
+        recordConnectedSegment(local_engine_idx, target_adxl_engine_name);
+        QueryBatch batch;
+        batch.slices = slice_list;
+        batch.engine_idx = local_engine_idx;
+        batch.target_adxl_engine_name = target_adxl_engine_name;
+
         for (auto* slice : slice_list) {
             slice->ascend_direct.handle = req_handle;
         }
+
         {
             std::unique_lock<std::mutex> lock(query_mutex_);
-            query_slice_queue_.push(slice_list);
+            query_slice_queue_.push(std::move(batch));
         }
         query_cv_.notify_one();
         return {.ret = 0, .status = status, .retryable = false};
     }
+
     {
         std::lock_guard<std::mutex> lock(async_task_mutex_);
         if (active_async_tasks_ > 0) {
@@ -143,21 +145,42 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
 }
 
 void AsyncTransferExecutor::queryThreadLoop() {
-    std::vector<std::vector<Transport::Slice*>> pending_batches;
+    std::vector<QueryBatch> pending_batches;
+    pending_batches.reserve(64);
+
     while (running_) {
         fetchPendingBatches(pending_batches);
         if (pending_batches.empty()) {
             continue;
         }
 
-        auto it = pending_batches.begin();
-        while (it != pending_batches.end()) {
-            auto& slice_list = *it;
-            if (processOneBatch(slice_list)) {
-                it = pending_batches.erase(it);
-            } else {
-                ++it;
+        size_t i = 0;
+        while (i < pending_batches.size()) {
+            auto& batch = pending_batches[i];
+            BatchPollResult poll_result;
+            processOneBatch(batch, poll_result);
+            if (!poll_result.done) {
+                ++i;
+                continue;
             }
+
+            if (poll_result.fail_entire_route) {
+                const std::string& reason =
+                    poll_result.fail_reason.empty()
+                        ? "Route failed for target: " +
+                              batch.target_adxl_engine_name
+                        : poll_result.fail_reason;
+                failAllPendingOnRoute(batch.engine_idx,
+                                      batch.target_adxl_engine_name,
+                                      pending_batches, reason);
+                // failAllPendingOnRoute swap-pops may move unvisited batches to
+                // indices < i; restart the scan so none are skipped this cycle.
+                i = 0;
+                continue;
+            }
+
+            std::swap(pending_batches[i], pending_batches.back());
+            pending_batches.pop_back();
         }
 
         if (!pending_batches.empty()) {
@@ -168,7 +191,7 @@ void AsyncTransferExecutor::queryThreadLoop() {
 }
 
 void AsyncTransferExecutor::fetchPendingBatches(
-    std::vector<std::vector<Transport::Slice*>>& out_batches) {
+    std::vector<QueryBatch>& out_batches) {
     std::unique_lock<std::mutex> lock(query_mutex_);
     if (out_batches.empty()) {
         query_cv_.wait(
@@ -183,110 +206,115 @@ void AsyncTransferExecutor::fetchPendingBatches(
     }
 }
 
-bool AsyncTransferExecutor::processOneBatch(
-    std::vector<Transport::Slice*>& slice_list) {
-    if (slice_list.empty()) {
-        return true;
+void AsyncTransferExecutor::markBatchFailed(QueryBatch& batch,
+                                            const std::string& reason,
+                                            bool log_error) {
+    if (log_error) {
+        LOG(ERROR) << reason;
+    }
+    for (auto* slice : batch.slices) {
+        slice->markFailed();
+    }
+    handleTaskFinished();
+}
+
+void AsyncTransferExecutor::failAllPendingOnRoute(
+    size_t engine_idx, const std::string& target,
+    std::vector<QueryBatch>& pending, const std::string& reason) {
+    LOG(ERROR) << reason;
+    bool disconnected = false;
+    for (size_t j = 0; j < pending.size();) {
+        auto& batch = pending[j];
+        if (batch.engine_idx != engine_idx ||
+            batch.target_adxl_engine_name != target) {
+            ++j;
+            continue;
+        }
+
+        markBatchFailed(batch, reason, false);
+        if (!disconnected && engine_idx < adxl_engines_.size() &&
+            !target.empty()) {
+            disconnect(engine_idx, target, params_.connect_timeout);
+            disconnected = true;
+        }
+
+        std::swap(pending[j], pending.back());
+        pending.pop_back();
+    }
+}
+
+void AsyncTransferExecutor::processOneBatch(QueryBatch& batch,
+                                            BatchPollResult& result) {
+    result = {};
+
+    if (batch.slices.empty()) {
+        result.done = true;
+        return;
+    }
+
+    if (batch.engine_idx >= adxl_engines_.size() ||
+        batch.engine_idx >= local_engine_contexts_.size()) {
+        markBatchFailed(
+            batch, "Invalid engine_idx: " + std::to_string(batch.engine_idx));
+        result.done = true;
+        return;
+    }
+
+    if (last_context_engine_idx_ != batch.engine_idx) {
+        auto context_ret =
+            aclrtSetCurrentContext(local_engine_contexts_[batch.engine_idx]);
+        if (context_ret != ACL_ERROR_NONE) {
+            markBatchFailed(
+                batch, "aclrtSetCurrentContext failed, ret: " +
+                           std::to_string(context_ret) +
+                           ", engine_idx: " + std::to_string(batch.engine_idx));
+            result.done = true;
+            return;
+        }
+        last_context_engine_idx_ = batch.engine_idx;
     }
 
     auto handle =
-        static_cast<adxl::TransferReq>(slice_list[0]->ascend_direct.handle);
-    size_t engine_idx = 0;
-    bool found_engine_idx = false;
-    {
-        std::lock_guard<std::mutex> lock(async_handle_map_mutex_);
-        auto it_handle = async_handle_to_engine_idx_.find(
-            reinterpret_cast<uintptr_t>(handle));
-        if (it_handle != async_handle_to_engine_idx_.end()) {
-            engine_idx = it_handle->second;
-            found_engine_idx = true;
-        }
-    }
-
-    auto fail_batch = [&](const std::string& message,
-                          const std::string& target_adxl_engine_name) {
-        LOG(ERROR) << message;
-        for (auto* slice : slice_list) {
-            slice->markFailed();
-        }
-        handleTaskFinished(handle);
-        if (engine_idx < adxl_engines_.size() &&
-            !target_adxl_engine_name.empty()) {
-            disconnect(engine_idx, target_adxl_engine_name,
-                       params_.connect_timeout);
-        }
-        return true;
-    };
-
-    if (!found_engine_idx) {
-        return fail_batch("Cannot resolve async handle to engine index", "");
-    }
-
-    if (engine_idx >= adxl_engines_.size() ||
-        engine_idx >= local_engine_contexts_.size()) {
-        return fail_batch(
-            "Invalid async engine index: " + std::to_string(engine_idx), "");
-    }
-
-    auto target_segment_desc =
-        metadata_->getSegmentDescByID(slice_list[0]->target_id);
-    if (!target_segment_desc) {
-        return fail_batch(
-            "Cannot find target segment descriptor for target_id: " +
-                std::to_string(slice_list[0]->target_id),
-            "");
-    }
-
-    std::string target_adxl_engine_name =
-        resolveTargetAdxlEngineName(target_segment_desc, engine_idx);
-    if (target_adxl_engine_name.empty()) {
-        return fail_batch("Cannot resolve target adxl engine name", "");
-    }
-
-    auto context_ret =
-        aclrtSetCurrentContext(local_engine_contexts_[engine_idx]);
-    if (context_ret != ACL_ERROR_NONE) {
-        return fail_batch("Call aclrtSetCurrentContext failed, ret: " +
-                              std::to_string(context_ret) +
-                              ", engine_idx: " + std::to_string(engine_idx),
-                          target_adxl_engine_name);
-    }
+        static_cast<adxl::TransferReq>(batch.slices[0]->ascend_direct.handle);
 
     adxl::TransferStatus task_status;
     auto ret =
-        adxl_engines_[engine_idx]->GetTransferStatus(handle, task_status);
+        adxl_engines_[batch.engine_idx]->GetTransferStatus(handle, task_status);
 
     if (ret != adxl::SUCCESS || task_status == adxl::TransferStatus::FAILED) {
-        return fail_batch("Get transfer status failed, ret: " +
-                              std::to_string(static_cast<int>(ret)) +
-                              ", errmsg: " + aclGetRecentErrMsg(),
-                          target_adxl_engine_name);
+        result.done = true;
+        result.fail_entire_route = true;
+        result.fail_reason = "Get transfer status failed, ret: " +
+                             std::to_string(static_cast<int>(ret)) +
+                             ", errmsg: " + aclGetRecentErrMsg();
+        return;
     }
 
     if (task_status == adxl::TransferStatus::COMPLETED) {
-        for (auto* slice : slice_list) {
+        for (auto* slice : batch.slices) {
             slice->markSuccess();
         }
-        handleTaskFinished(handle);
+        handleTaskFinished();
         if (params_.use_short_connection) {
-            disconnect(engine_idx, target_adxl_engine_name,
+            disconnect(batch.engine_idx, batch.target_adxl_engine_name,
                        params_.connect_timeout);
         }
-        return true;
+        result.done = true;
+        return;
     }
 
     auto now = getCurrentTimeInNano();
-    if (now - slice_list[0]->ascend_direct.start_time >
+    if (now - batch.slices[0]->ascend_direct.start_time >
         transfer_timeout_in_nano_) {
-        return fail_batch("Transfer timeout", target_adxl_engine_name);
+        result.done = true;
+        result.fail_entire_route = true;
+        result.fail_reason =
+            "Transfer timeout to: " + batch.target_adxl_engine_name;
+        return;
     }
-
-    return false;
 }
 
-void AsyncTransferExecutor::handleTaskFinished(adxl::TransferReq handle) {
-    std::lock_guard<std::mutex> handle_lock(async_handle_map_mutex_);
-    async_handle_to_engine_idx_.erase(reinterpret_cast<uintptr_t>(handle));
+void AsyncTransferExecutor::handleTaskFinished() {
     std::lock_guard<std::mutex> lock(async_task_mutex_);
     if (active_async_tasks_ > 0) {
         active_async_tasks_--;

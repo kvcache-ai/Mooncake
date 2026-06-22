@@ -287,21 +287,41 @@ fn main() {
     push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
     push_env_paths(&mut search_dirs, "LIBRARY_PATH");
 
-    let asan_runtime_so = compiler_runtime_library("libasan.so");
-    if let Some(path) = asan_runtime_so.as_ref() {
-        if let Some(parent) = path.parent() {
-            push_existing_dir(&mut search_dirs, parent.to_path_buf());
+    // Only link the AddressSanitizer runtime when explicitly requested via
+    // MOONCAKE_LINK_ASAN. Linking libasan whenever the toolchain merely *ships*
+    // it (gcc always does) pulls the ASan runtime into an otherwise
+    // non-sanitized build, even though a Release Mooncake has no `__asan_*`
+    // symbols. Any consumer that `dlopen()`s the resulting library then aborts
+    // at load with "ASan runtime does not come first in the initial library
+    // list", since a late-loaded plugin can never be first. Default to NOT
+    // linking it; sanitized builds opt in with `MOONCAKE_LINK_ASAN=1` (and run
+    // with `LD_PRELOAD=$(gcc -print-file-name=libasan.so)`).
+    let want_asan = env::var("MOONCAKE_LINK_ASAN")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(false);
+    let has_asan_runtime = if want_asan {
+        let asan_runtime_so = compiler_runtime_library("libasan.so");
+        if let Some(path) = asan_runtime_so.as_ref() {
+            if let Some(parent) = path.parent() {
+                push_existing_dir(&mut search_dirs, parent.to_path_buf());
+            }
         }
-    }
-    let has_asan_runtime = asan_runtime_so.is_some()
-        || add_compiler_runtime_search_dir(&mut search_dirs, "libasan.a");
+        asan_runtime_so.is_some() || add_compiler_runtime_search_dir(&mut search_dirs, "libasan.a")
+    } else {
+        false
+    };
     let has_gcov_runtime = add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.a")
         || add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.so");
 
     emit_link_searches(&search_dirs);
     emit_runtime_rpaths(&search_dirs);
 
-    if has_asan_runtime || has_library(&search_dirs, &["asan"]) {
+    if want_asan && (has_asan_runtime || has_library(&search_dirs, &["asan"])) {
         println!("cargo:rustc-link-lib=asan");
     }
 
@@ -331,6 +351,7 @@ fn main() {
         ("curl", &["curl"]),
         ("cuda", &["cuda"]),
         ("cudart", &["cudart"]),
+        ("mlx5", &["mlx5"]), // IBGDA device transport (mlx5 DevX) pulled into transfer_engine, CUDA-only
         ("uring", &["uring"]),
     ] {
         if has_library(&search_dirs, candidates) {
@@ -355,6 +376,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=CXX");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_LINK_ASAN");
 
     let bindings = bindgen::Builder::default()
         .header(&header)

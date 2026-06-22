@@ -357,7 +357,8 @@ enum class ErrorCode : int32_t {
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
 
     // RPC errors (Range: -900 to -999)
-    RPC_FAIL = -900,  ///< RPC operation failed.
+    RPC_FAIL = -900,     ///< RPC operation failed.
+    RPC_TIMEOUT = -901,  ///< RPC call timed out (client-side deadline hit).
 
     // High availability errors (Range: -1000 to -1099)
     ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
@@ -406,6 +407,7 @@ enum class ErrorCode : int32_t {
     DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
     DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
     DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
+    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

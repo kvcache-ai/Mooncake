@@ -10,6 +10,7 @@ Mooncake Store provides low-level object storage and management capabilities, in
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
+- **Optional object grouping**: Related objects can carry an optional group ID so that the Master can route their metadata to the same shard and apply best-effort shared lifecycle behavior.
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
 - **Strong consistency**: Mooncake Store guarantees that `Get` operations always return correct and complete data. Once an object has been successfully `Put`, it remains immutable until removal, ensuring that all subsequent `Get` requests retrieve the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
@@ -425,6 +426,24 @@ tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 
 The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
 
+### Optional Object Groups
+
+Object groups are intended for workloads where one logical cache entry is split into multiple Mooncake Store objects, such as separate K/V tensors, parallel shards, or auxiliary index objects. Without grouping, these objects are managed independently, so lease refresh and memory eviction may affect different parts of the same logical entry at different times.
+
+Mooncake Store remains an object-oriented KV cache: objects are still put, queried, and removed by key. For workloads where one logical cache unit is represented by multiple physical objects, callers may attach optional group metadata through `ReplicateConfig::group_ids` during `Put`, `BatchPut`, `Upsert`, or `BatchUpsert`.
+
+For single-object writes, `group_ids` contains one entry. For batch writes, it must have the same length as the key list, and entry `i` is the group ID for key `i`. An empty string stores that key as ungrouped, and leaving the field unset preserves the legacy ungrouped behavior. For an existing object, group membership is immutable: `Upsert` may preserve the existing group, but it cannot move the object to another group or clear its group while the object exists.
+
+On the Master side, group state is tenant-scoped. Objects with a non-empty group ID are routed to the metadata shard selected by `hash(group_id)`, and the Master keeps a tenant-scoped object-to-group routing index so existing key-based APIs can still locate grouped objects. The Master tracks only the current member set of each group; it does not require an expected member count, a member index, or a commit protocol for group completeness.
+
+Group metadata affects lifecycle behavior on a best-effort basis:
+
+- `ExistKey` and `GetReplicaList` refresh the lease, and the soft-pin timeout if present, for the current members of the group.
+- Memory eviction expands a grouped candidate to the group's current members and then applies the existing per-object safety checks. Members with active leases, hard pins, soft pins when soft-pin eviction is disabled, incomplete writes, busy replicas, or unavailable replica states are skipped.
+- Object removal APIs, copy/move tasks, and NoF eviction keep their existing object-level semantics. Group routing and membership metadata are cleaned up when objects are removed.
+
+This design is intentionally lightweight and backward compatible. Grouping should be treated as a lifecycle hint for related objects, not as a transactional guarantee that all members are created, made visible, or evicted atomically.
+
 ## Buffer Allocator
 
 The buffer allocator serves as a low-level memory management component within the Mooncake Store system, primarily responsible for efficient memory allocation and deallocation. It builds upon underlying memory allocators to perform its functions.
@@ -434,6 +453,8 @@ Importantly, the memory managed by the buffer allocator does not reside within t
 Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
 
 **OffsetBufferAllocator (default and recommended)**: This allocator is derived from [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), which uses a custom bin-based allocation strategy that supports fast hard realtime `O(1)` offset allocation with minimal fragmentation. Mooncake Store optimizes this allocator based on the specific memory usage characteristics of LLM inference workloads, thereby enhancing memory utilization in LLM scenarios.
+
+For measured utilization and allocation latency across LLM-style workloads, see [Allocator Performance](../performance/allocator-benchmark-result.md).
 
 **CachelibBufferAllocator (deprecated)**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios. However, in our modified version, it does not handle workloads with highly variable object sizes effectively, so it is currently marked as deprecated.
 
@@ -454,6 +475,14 @@ class BufferAllocatorBase {
 2. **`allocate` Function**: When the upstream issues read or write requests, it needs a memory region to operate on. The `allocate` function invokes the internal allocator to reserve a memory block and returns metadata such as the starting address and size. The status of the newly allocated memory is initialized as `BufStatus::INIT`.
 
 3. **`deallocate` Function**: This function is automatically triggered by the `BufHandle` destructor. It calls the internal allocator to release the associated memory and updates the handle’s status to `BufStatus::UNREGISTERED`.
+
+### Client Local Buffer and Python BufferPool
+
+Each Store client can also create a setup-time local buffer through `local_buffer_size`. This memory is registered once with the Transfer Engine and managed by `ClientBufferAllocator` for short-lived client-side staging work.
+
+The Python `BufferPool` reuses this existing local buffer instead of allocating a second registered arena. A pool lease is a sub-allocation from `client_buffer_allocator_`, so the common path avoids per-lease `register_buffer()` and `unregister_buffer()` calls. The pool still keeps the Python-facing lease API, memoryview lifetime checks, blocking acquire semantics, and optional `max_regions` concurrency limiting.
+
+This is a soft-isolation policy: internal Store paths and external Python leases share the local registered buffer, allowing bursty external usage when memory is available rather than reserving a hard partition. If the local buffer is temporarily exhausted, `BufferPool` can allocate and register a short-lived overflow buffer so bursts do not immediately surface as upper-layer errors; that overflow region is unregistered as soon as the lease is released. If callers need to cap long-lived external pressure, they should use pool-level controls such as `max_regions`, `max_bytes`, or acquire timeouts.
 
 ## AllocationStrategy
 AllocationStrategy is a strategy class for efficiently managing memory resource allocation and replica storage location selection in a distributed environment. It is mainly used in the following scenarios:
@@ -513,6 +542,8 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 
 **Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
 
+For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../performance/allocation-strategy-benchmark-result.md).
+
 #### Strategy Details
 
 **`random` — RandomAllocationStrategy**
@@ -556,9 +587,13 @@ When a `PutStart` request fails due to insufficient memory, or when the eviction
 
 Currently, an approximate LRU policy is adopted, where the least recently used objects are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
 
+For grouped objects, memory eviction resolves the current group membership and attempts to reclaim eligible members together.
+
 ## Lease
 
 To avoid data conflicts, a per-object lease is granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. While the lease is active, the object is protected from `Remove`, `RemoveAll`, and `Eviction` operations. Specifically, a `Remove` request targeting a leased object will fail, and a `RemoveAll` request will only delete objects without an active lease. This ensures that the object’s data can be safely read as long as the lease has not expired.
+
+For grouped objects, a successful `ExistKey` or `GetReplicaList` refreshes the lease for the current members of the group, so recently accessed members are less likely to be separated by memory eviction.
 
 However, if the lease expires before a `Get` operation finishes reading the data, the operation will be considered failed, and no data will be returned, in order to prevent potential data corruption.
 
@@ -697,188 +732,6 @@ For detailed guidance on monitoring master metrics, Prometheus endpoints, and he
 ## Mooncake Store Python API
 
 **Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)
-
-## Compilation and Usage
-Mooncake Store is compiled together with other related components (such as the Transfer Engine).
-
-For default mode:
-```
-mkdir build && cd build
-cmake .. # default mode
-make
-sudo make install # Install Python interface support package
-```
-
-High availability mode:
-```
-mkdir build && cd build
-cmake .. -DSTORE_USE_ETCD # compile etcd wrapper that depends on go
-make
-sudo make install # Install Python interface support package
-```
-
-**Note:** To use high availability mode, only `-DSTORE_USE_ETCD` is required. `-DUSE_ETCD` is a compilation option for the **Transfer Engine** and is **not related** to the high availability mode.
-
-### Starting the Transfer Engine's Metadata Service
-Mooncake Store uses the Transfer Engine as its core transfer engine, so it is necessary to start the metadata service (etcd/redis/http). The startup and configuration of the `metadata` service can be referred to in the relevant sections of [Transfer Engine](./transfer-engine/index.md). **Special Note**: For the etcd service, by default, it only provides services for local processes. You need to modify the listening options (IP to 0.0.0.0 instead of the default 127.0.0.1). You can use commands like curl to verify correctness.
-
-### Starting the Master Service
-The Master Service runs as an independent process, provides gRPC interfaces externally, and is responsible for the metadata management of Mooncake Store (note that the Master Service does not reuse the metadata service of the Transfer Engine). The default listening port is `50051`. After compilation, you can directly run `mooncake_master` located in the `build/mooncake-store/src/` directory. After starting, the Master Service will output the following content in the log:
-```
-Starting Mooncake Master Service
-Port: 50051
-Max threads: 4
-Master service listening on 0.0.0.0:50051
-```
-
-**High availability mode**:
-
-HA mode relies on an etcd service for coordination. If Transfer Engine also uses etcd as its metadata service, the etcd cluster used by Mooncake Store can either be shared with or separate from the one used by Transfer Engine.
-
-HA mode allows deployment of multiple master instances to eliminate the single point of failure. Each master instance must be started with the following parameters:
-```
---enable-ha: enables high availability mode
---etcd-endpoints: specifies endpoints for etcd service, separated by ';'
---rpc-address: the RPC address of this instance. Note that the address specified here should be accessible to the client.
-```
-
-For example:
-```
-./build/mooncake-store/src/mooncake_master \
-    --enable-ha=true \
-    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
-    --rpc-address=10.0.0.1
-```
-
-### Starting the Sample Program
-Mooncake Store provides various sample programs, including interface forms based on C++ and Python. Below is an example of how to run using `stress_cluster_benchmark`.
-
-1. Open `stress_cluster_benchmark.py` and update the initialization settings based on your network environment. Pay particular attention to the following fields:
-`local_hostname`: the IP address of the local machine
-`metadata_server`: the address of the Transfer Engine metadata service
-`master_server_address`: the address of the Master Service
-**Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
-For example:
-```python
-import os
-import time
-
-from distributed_object_store import DistributedObjectStore
-
-store = DistributedObjectStore()
-# Protocol used by the transfer engine, optional values are "rdma" or "tcp"
-protocol = os.getenv("PROTOCOL", "tcp")
-# Device name used by the transfer engine
-device_name = os.getenv("DEVICE_NAME", "ibp6s0")
-# Hostname of this node in the cluster, port number is randomly selected from (12300-14300)
-local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
-# Metadata service address of the Transfer Engine, here etcd is used as the metadata service
-metadata_server = os.getenv("METADATA_ADDR", "127.0.0.1:2379")
-# The size of the Segment mounted by each node to the cluster, allocated by the Master Service after mounting, in bytes
-global_segment_size = 3200 * 1024 * 1024
-# Local buffer size registered with the Transfer Engine, in bytes
-local_buffer_size = 512 * 1024 * 1024
-# Address of the Master Service of Mooncake Store
-master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-# Data length for each put()
-value_length = 1 * 1024 * 1024
-# Total number of requests sent
-max_requests = 1000
-# Initialize Mooncake Store Client
-retcode = store.setup(
-    local_hostname,
-    metadata_server,
-    global_segment_size,
-    local_buffer_size,
-    protocol,
-    device_name,
-    master_server_address,
-)
-```
-
-2. Run `ROLE=prefill python3 ./stress_cluster_benchmark.py` on one machine to start the Prefill node.
-   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
-
-3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
-   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
-
-The absence of error messages indicates successful data transfer.
-
-### Starting the Client as Standalone Process and accessing via RPC
-To start an RPC type **real** `Client` as a standalone process, you can use the following command:
-
-```bash
-./build/mooncake-store/src/mooncake_client \
-    --global_segment_size="4GB" \
-    --master_server_address="localhost:50051" \
-    --metadata_server="http://localhost:8080/metadata"
-```
-
-Next, a **real** `Client` instance is created and connected to the Master Service. The **real** `Client` instance is listening on port 50052 as default.
-If you want to send requests to it, a **dummy** `Client` should be used in the application process (e.g., vLLM, SGLang). You can start a **dummy** `Client`
-with specific parameters defined in the application.
-
-The **real** `Client` can be configured using the following parameters:
-
-- **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
-
-- **`port`**: (int, default: 50052): The port number the client service listens on.
-
-- **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
-
-- **`master_server_address`**: (string, default: "localhost:50051"): The address of the Master Service.
-
-- **`metadata_server`**: (string, default: "http://localhost:8080/metadata"): The address of the metadata service.
-
-- **`protocol`**: (string, default: "tcp"): The protocol used by the Transfer Engine.
-
-- **`device_name`**: (string, default: ""): The device name used by the Transfer Engine.
-
-- **`threads`**: (int, default: 1): The number of threads used by the client.
-
-### Starting the Client as Standalone Process and accessing via HTTP
-
-Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start a **real** `Client` as a standalone process and accessing via HTTP.
-
-First, create and save a configuration file in JSON format. For example:
-
-```
-{
-    "local_hostname": "localhost",
-    "metadata_server": "http://localhost:8080/metadata",
-    "global_segment_size": 268435456,
-    "local_buffer_size": 268435456,
-    "protocol": "tcp",
-    "device_name": "",
-    "master_server_address": "localhost:50051"
-}
-```
-
-Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the **real** `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
-
-The main startup parameters include:
-
-* `config`: Path to the configuration file.
-* `port`: Port number for the HTTP server.
-
-Suppose the `mooncake_transfer_engine` wheel package is already installed, the following command starts the program:
-```bash
-python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
-```
-
-### Set the Log Level for yalantinglibs coro_rpc and coro_http
-By default, the log level is set to warning. You can customize it using the following environment variable:
-`export MC_YLT_LOG_LEVEL=info`
-This sets the log level for yalantinglibs (including coro_rpc and coro_http) to info.
-Available log levels: trace, debug, info, warn (or warning), error, and critical.
-
-## Example Code
-
-### Python Usage Example
-We provide a reference example `distributed_object_store_provider.py`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) in the background on the same server, and then execute this Python program in the foreground. It should output a successful test result.
-
-### C++ Usage Example
-The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.
 
 ## Version Management Policy
 

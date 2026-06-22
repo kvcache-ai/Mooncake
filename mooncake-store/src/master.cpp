@@ -1,6 +1,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <memory>  // For std::unique_ptr
@@ -11,7 +12,9 @@
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
+
 #include "http_metadata_server.h"
+#include "master_admin_service.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -199,6 +202,13 @@ DEFINE_bool(enable_disk_eviction, true,
 DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
+DEFINE_bool(enable_tenant_quota, false,
+            "Enable per-tenant memory quota admission");
+DEFINE_uint64(default_tenant_quota_bytes, 0,
+              "Default per-tenant memory quota in bytes (0 = unlimited)");
+DEFINE_uint64(tenant_quota_pool_capacity_bytes, 0,
+              "Capacity used to compute effective tenant quotas "
+              "(0 = mounted memory capacity)");
 
 // Snapshot related configuration flags (migrated from global_flags)
 DEFINE_string(snapshot_backup_dir, "",
@@ -408,6 +418,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+    default_config.GetBool("enable_tenant_quota",
+                           &master_config.enable_tenant_quota,
+                           FLAGS_enable_tenant_quota);
+    default_config.GetUInt64("default_tenant_quota_bytes",
+                             &master_config.default_tenant_quota_bytes,
+                             FLAGS_default_tenant_quota_bytes);
+    default_config.GetUInt64("tenant_quota_pool_capacity_bytes",
+                             &master_config.tenant_quota_pool_capacity_bytes,
+                             FLAGS_tenant_quota_pool_capacity_bytes);
 
     default_config.GetString("snapshot_backup_dir",
                              &master_config.snapshot_backup_dir,
@@ -774,6 +793,24 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
     }
+    if ((google::GetCommandLineFlagInfo("enable_tenant_quota", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_tenant_quota = FLAGS_enable_tenant_quota;
+    }
+    if ((google::GetCommandLineFlagInfo("default_tenant_quota_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.default_tenant_quota_bytes =
+            FLAGS_default_tenant_quota_bytes;
+    }
+    if ((google::GetCommandLineFlagInfo("tenant_quota_pool_capacity_bytes",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.tenant_quota_pool_capacity_bytes =
+            FLAGS_tenant_quota_pool_capacity_bytes;
+    }
     if ((google::GetCommandLineFlagInfo("max_total_finished_tasks", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -954,6 +991,16 @@ int main(int argc, char* argv[]) {
 
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
+        // Merge all master logs into a single journal file in --log_dir,
+        // reusing glog: every record is already written to its own severity
+        // file and all lower ones, so the INFO sink is a complete journal.
+        // Disable the higher-severity files so everything lands in one file.
+        const std::string log_base = FLAGS_log_dir + "/mooncake_master.";
+        google::SetLogDestination(google::GLOG_INFO, log_base.c_str());
+        google::SetLogDestination(google::GLOG_WARNING, "");
+        google::SetLogDestination(google::GLOG_ERROR, "");
+        google::SetLogDestination(google::GLOG_FATAL, "");
+        google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
 
     // Initialize the master configuration
@@ -1126,6 +1173,32 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceAvailable(true);
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
-        return server.start();
+
+        static std::atomic<bool> shutdown_requested{false};
+        auto signal_handler = [](int /* signum */) {
+            shutdown_requested.store(true);
+        };
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
+
+        int server_result = 0;
+        std::atomic<bool> server_done{false};
+        std::thread server_thread([&server, &server_result, &server_done]() {
+            server_result = server.start();
+            server_done.store(true);
+        });
+
+        while (!shutdown_requested.load() && !server_done.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        server.stop();
+        server_thread.join();
+
+        if (shutdown_requested.load()) {
+            LOG(INFO) << "Shutdown signal received, exiting gracefully";
+            return 0;
+        }
+        return server_result;
     }
 }

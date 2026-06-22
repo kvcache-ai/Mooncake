@@ -657,8 +657,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             desc.location = entries[0].location;
         } else {
             desc.location = entries[0].location;
-            for (auto& entry : entries)
-                desc.regions.push_back(Region{entry.len, entry.location});
+            desc.regions = coalesceRegions(entries);
         }
         desc.ref_count = 1;
         if (options.location != kWildcardLocation)
@@ -804,6 +803,25 @@ static MemoryType getTypeEnum(const std::string& type) {
     return MTYPE_UNKNOWN;
 }
 
+Status TransferEngineImpl::validateTransportHint(const Request& req,
+                                                 size_t request_index) {
+    if (req.transport_hint == UNSPEC) return Status::OK();
+    if ((int)req.transport_hint < 0 ||
+        (int)req.transport_hint >= kSupportedTransportTypes) {
+        return Status::InvalidArgument(
+            "transport_hint out of range for request[" +
+            std::to_string(request_index) + "]" LOC_MARK);
+    }
+    if (!transport_list_[req.transport_hint]) {
+        return Status::InvalidArgument(
+            "transport_hint=" +
+            TransportSelector::transportTypeName(req.transport_hint) +
+            " is not enabled in config (request[" +
+            std::to_string(request_index) + "])" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
     SegmentDesc* desc;
@@ -816,16 +834,17 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     }
     auto local_mtype = Platform::getLoader().getMemoryType(request.source);
 
+    const TransportType hint = request.transport_hint;
+
     // Legacy mode: use original logic (before TransportSelector)
     if (transport_selector_ && transport_selector_->isLegacyMode()) {
         SelectionResult result;
+        std::vector<TransportType> raw;
         if (desc->type == SegmentType::File) {
-            if (checkAvailability(transport_list_[GDS], local_mtype)) {
-                if (transport_index-- == 0) result.transport = GDS;
-            }
-            if (checkAvailability(transport_list_[IOURING], local_mtype)) {
-                if (transport_index-- == 0) result.transport = IOURING;
-            }
+            if (checkAvailability(transport_list_[GDS], local_mtype))
+                raw.push_back(GDS);
+            if (checkAvailability(transport_list_[IOURING], local_mtype))
+                raw.push_back(IOURING);
         } else {
             auto entry =
                 desc->findBuffer(request.target_offset, request.length);
@@ -844,19 +863,25 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                         continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
-                        if (transport_index-- == 0) {
-                            result.transport = type;
-                            break;
-                        }
+                        raw.push_back(type);
                     }
                 }
             }
         }
+
+        auto candidates = TransportSelector::reorderWithHint(raw, hint);
+        if (!candidates) {
+            return result;  // UNSPEC: hint not authorized for this req
+        }
+        if (transport_index >= 0 &&
+            (size_t)transport_index < candidates->size()) {
+            result.transport = (*candidates)[transport_index];
+        }
         return result;
     }
 
-    // New TransportSelector-based logic
-    // Build selection context
+    // Selector mode: build ctx, then defer everything to
+    // TransportSelector::select().
     SelectionContext ctx;
     ctx.transfer_size = request.length;
     ctx.priority_level =
@@ -870,9 +895,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = MTYPE_CPU;
         ctx.buffer_transports = nullptr;  // Empty - use policy priority
-
-        return transport_selector_->select(ctx, transport_list_,
-                                           transport_index);
     } else {
         // Memory segment
         auto entry = desc->findBuffer(request.target_offset, request.length);
@@ -887,14 +909,16 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = remote_mtype;
         ctx.buffer_transports = &entry->transports;
-
-        return transport_selector_->select(ctx, transport_list_,
-                                           transport_index);
     }
+
+    return transport_selector_->select(ctx, transport_list_, transport_index,
+                                       hint);
 }
 
 static const char* transportTypeName(TransportType type) {
     switch (type) {
+        case UNSPEC:
+            return "UNSPEC";
         case RDMA:
             return "RDMA";
         case MNNVL:
@@ -911,16 +935,18 @@ static const char* transportTypeName(TransportType type) {
             return "TCP";
         case AscendDirect:
             return "AscendDirect";
-        default:
-            return "UNSPEC";
+        case SUNRISE_LINK:
+            return "SUNRISE_LINK";
     }
+    return "UNKNOWN";
 }
 
 std::string printRequest(const Request& request) {
     std::stringstream ss;
     ss << "opcode " << request.opcode << " source " << request.source
        << " target_id " << request.target_id << " target_offset "
-       << (void*)request.target_offset << " length " << request.length;
+       << (void*)request.target_offset << " length " << request.length
+       << " transport_hint " << transportTypeName(request.transport_hint);
     return ss.str();
 }
 
@@ -989,6 +1015,8 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         if (a.req.opcode != b.req.opcode) return a.req.opcode < b.req.opcode;
         if (a.req.target_id != b.req.target_id)
             return a.req.target_id < b.req.target_id;
+        if (a.req.transport_hint != b.req.transport_hint)
+            return a.req.transport_hint < b.req.transport_hint;
         if (a.req.target_offset != b.req.target_offset)
             return a.req.target_offset < b.req.target_offset;
         return requestSourceAddr(a.req) < requestSourceAddr(b.req);
@@ -997,6 +1025,10 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
     auto can_merge = [](const Item& last, const Item& curr) {
         if (last.req.opcode != curr.req.opcode ||
             last.req.target_id != curr.req.target_id) {
+            return false;
+        }
+        // Mixed transport_hint inside one batch must not be merged.
+        if (last.req.transport_hint != curr.req.transport_hint) {
             return false;
         }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
@@ -1049,43 +1081,61 @@ std::optional<BufferKey> toBufferKey(BufferDesc* buffer) {
     return BufferKey{buffer->addr, buffer->length};
 }
 
-RequestBoundaryInfo resolveRequestBoundary(ControlService* metadata,
-                                           SegmentDesc* local_desc,
-                                           const Request& request) {
-    RequestBoundaryInfo boundary;
-
-    if (local_desc) {
-        auto source_addr =
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(request.source));
-        boundary.source_key =
-            toBufferKey(local_desc->findBuffer(source_addr, request.length));
-    }
-
-    metadata->segmentManager().withCachedSegment(
-        request.target_id, [&](SegmentDesc* target_desc) {
-            auto buffer =
-                target_desc->findBuffer(request.target_offset, request.length);
-
-            if (!buffer) {
-                boundary.target_key = std::nullopt;
-                return Status::NeedsRefreshCache(
-                    "Requested address is not in registered buffer" LOC_MARK);
-            }
-
-            boundary.target_key = toBufferKey(buffer);
-            return Status::OK();
-        });
-    return boundary;
-}
-
 std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     ControlService* metadata, const std::vector<Request>& requests) {
-    std::vector<RequestBoundaryInfo> boundaries;
-    boundaries.reserve(requests.size());
+    // Group requests by target_id so withCachedSegment fires at most once per
+    // peer.
+    std::vector<RequestBoundaryInfo> boundaries(requests.size());
     auto* local_desc = metadata->segmentManager().getLocal().get();
-    for (const auto& request : requests) {
-        boundaries.push_back(
-            resolveRequestBoundary(metadata, local_desc, request));
+
+    if (local_desc) {
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto source_addr = static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(requests[i].source));
+            boundaries[i].source_key = toBufferKey(
+                local_desc->findBuffer(source_addr, requests[i].length));
+        }
+    }
+
+    std::unordered_map<SegmentID, std::vector<size_t>> by_target;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        by_target[requests[i].target_id].push_back(i);
+    }
+
+    for (auto& [target_id, idxs] : by_target) {
+        metadata->segmentManager().withCachedSegment(
+            target_id, [&](SegmentDesc* target_desc) {
+                bool any_missing = false;
+                for (size_t i : idxs) {
+                    const auto& r = requests[i];
+                    auto* buffer =
+                        target_desc->findBuffer(r.target_offset, r.length);
+                    if (!buffer) {
+                        any_missing = true;
+                        boundaries[i].target_key = std::nullopt;
+                    } else {
+                        boundaries[i].target_key = toBufferKey(buffer);
+                    }
+                }
+                // Invariant: when this lambda returns NeedsRefreshCache, all
+                // writes it made in this pass are wiped before it returns.
+                // Reason: withCachedSegment will invalidate the cache and try
+                // ONE refetch; if that refetch fails (e.g. peer RPC down) the
+                // retry pass never runs, and any tentative writes from this
+                // (stale) pass would leak downstream into mergeRequests. By
+                // clearing here we leave a clean nullopt state for the group,
+                // and the retry pass (if it does run) repopulates from the
+                // fresh desc so the wipe is harmless.
+                if (any_missing) {
+                    for (size_t i : idxs) {
+                        boundaries[i].target_key = std::nullopt;
+                    }
+                    return Status::NeedsRefreshCache(
+                        "Requested address is not in registered "
+                        "buffer" LOC_MARK);
+                }
+                return Status::OK();
+            });
     }
     return boundaries;
 }
@@ -1169,6 +1219,11 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
+
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        auto st = validateTransportHint(request_list[i], i);
+        if (!st.ok()) return st;
+    }
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];

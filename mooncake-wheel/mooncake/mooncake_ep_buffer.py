@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
@@ -63,20 +64,17 @@ class EventOverlap:
 
 class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
-        from mooncake import ep, pg
+        from mooncake import ep
 
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
-        # Get the index of the closest NIC
         self.backend = self.group
-        preferred_hca = pg.get_preferred_hca(
-            self.group, f"cuda:{torch.cuda.current_device()}"
-        )
+        # NIC auto-detection happens inside ep.Buffer via Topology::discover().
         self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca
+            self.rank, self.group_size, num_ep_buffer_bytes
         )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
@@ -125,57 +123,46 @@ class Buffer:
                 for _ in range(self.group_size)
             ]
             dist.all_to_all(remote_qpns, local_qpns, self.group)
-            remote_qpns = torch.cat(remote_qpns).tolist()
+            peer_qpns = [remote_qpns[r].tolist() for r in range(self.group_size)]
 
-            if self.runtime.is_roce():
-                (subnet_prefix, interface_id) = self.runtime.get_gid()
-
-                subnet_prefix = torch.tensor(
-                    [subnet_prefix], dtype=torch.int64, device="cuda"
-                )
-                subnet_prefixes = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(subnet_prefixes, subnet_prefix, self.group)
-                subnet_prefixes = torch.cat(subnet_prefixes).tolist()
-
-                interface_id = torch.tensor(
-                    [interface_id], dtype=torch.int64, device="cuda"
-                )
-                interface_ids = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(interface_ids, interface_id, self.group)
-                interface_ids = torch.cat(interface_ids).tolist()
-
-                from mooncake.ep import get_active_ranks
-                active_ranks_mask = get_active_ranks(self.backend).tolist()
-                self.runtime.sync_roce(
-                    raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids,
-                    active_ranks_mask
-                )
-            else:
-                local_lids = self.runtime.get_local_lids()
-                local_lids = list(
-                    torch.unbind(
-                        torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
-                            -1, all_to_all_size
-                        )
+            local_lids = self.runtime.get_local_lids()
+            local_lids = list(
+                torch.unbind(
+                    torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
+                        -1, all_to_all_size
                     )
                 )
-                remote_lids = [
-                    torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_to_all(remote_lids, local_lids, self.group)
-                remote_lids = torch.cat(remote_lids).tolist()
+            )
+            remote_lids = [
+                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                for _ in range(self.group_size)
+            ]
+            dist.all_to_all(remote_lids, local_lids, self.group)
+            peer_lids = [remote_lids[r].tolist() for r in range(self.group_size)]
 
-                from mooncake.ep import get_active_ranks
-                active_ranks_mask = get_active_ranks(self.backend).tolist()
-                self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids,
-                                     active_ranks_mask)
+            (subnet_prefix, interface_id) = self.runtime.get_gid()
+            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64, device="cuda")
+            subnet_prefixes_list = [
+                torch.empty(1, dtype=torch.int64, device="cuda")
+                for _ in range(self.group_size)
+            ]
+            dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.group)
+            subnet_prefixes = torch.cat(subnet_prefixes_list).tolist()
+
+            interface_id_t = torch.tensor([interface_id], dtype=torch.int64, device="cuda")
+            interface_ids_list = [
+                torch.empty(1, dtype=torch.int64, device="cuda")
+                for _ in range(self.group_size)
+            ]
+            dist.all_gather(interface_ids_list, interface_id_t, self.group)
+            interface_ids = torch.cat(interface_ids_list).tolist()
+
+            from mooncake.ep import get_active_ranks
+            active_ranks_mask = get_active_ranks(self.backend).tolist()
+            self.runtime.sync_ibgda_peers(
+                raddrs, rkeys, peer_qpns, peer_lids,
+                subnet_prefixes, interface_ids, active_ranks_mask
+            )
 
         try:
             local_handle_ints = self.runtime.get_ipc_handle()
@@ -247,6 +234,20 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
+        # MUSA does not support cooperative grid sync, so the C++ runtime
+        # splits no-hook calls into SEND -> phase-ack -> RECV instead of using
+        # a single cooperative kernel.  async_finish still returns a stream
+        # event, but it is not the CUDA single-kernel cooperative path.
+        if os.getenv("MOONCAKE_EP_USE_MUSA") and async_finish:
+            import warnings
+
+            warnings.warn(
+                "MUSA async_finish uses split SEND/RECV kernels plus a stream "
+                "event, not CUDA cooperative single-kernel async semantics.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         if self._use_fallback:
             from mooncake.ep import get_active_ranks
 
@@ -329,6 +330,17 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        # Same MUSA split-kernel behavior as dispatch().
+        if os.getenv("MOONCAKE_EP_USE_MUSA") and async_finish:
+            import warnings
+
+            warnings.warn(
+                "MUSA async_finish uses split SEND/RECV kernels plus a stream "
+                "event, not CUDA cooperative single-kernel async semantics.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         (
             src_info,
             layout_range,
