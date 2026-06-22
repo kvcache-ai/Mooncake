@@ -364,14 +364,22 @@ std::string MasterAdminServer::BuildMetricsText() const {
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
+    auto tenant_metrics = BuildTenantQuotaMetricsText();
+    if (tenant_metrics.empty()) {
+        return metrics;
+    }
+    return AppendMetricSections(std::move(metrics), std::move(tenant_metrics));
+}
+
+std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
     auto service = GetActiveService();
     if (!service) {
-        return metrics;
+        return "";
     }
     auto snapshots_result = service->ListTenantQuotaSnapshots();
     auto capacity_result = service->GetTenantQuotaAllocatableCapacityBytes();
     if (!snapshots_result || !capacity_result) {
-        return metrics;
+        return "";
     }
 
     const auto& snapshots = snapshots_result.value();
@@ -438,7 +446,7 @@ std::string MasterAdminServer::BuildMetricsText() const {
         << "mooncake_tenant_quota_effective_bytes_sum " << effective_sum
         << "\n";
 
-    return AppendMetricSections(std::move(metrics), tenant_metrics.str());
+    return tenant_metrics.str();
 }
 
 std::string MasterAdminServer::BuildMetricsSummaryText() const {

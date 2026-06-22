@@ -51,6 +51,8 @@ class MasterAdminServer {
 
     std::string BuildMetricsText() const;
 
+    std::string BuildTenantQuotaMetricsText() const;
+
     std::string BuildMetricsSummaryText() const;
 
     std::shared_ptr<WrappedMasterService> GetActiveService() const;
