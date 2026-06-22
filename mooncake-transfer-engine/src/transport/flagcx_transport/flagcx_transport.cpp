@@ -58,6 +58,11 @@ int FlagCxTransport::install(std::string &local_server_name,
     (void)topo;
     local_server_name_ = local_server_name;
     metadata_ = meta;
+    const char *direct_submit_env = std::getenv("MC_FLAGCX_DIRECT_SUBMIT");
+    direct_submit_ =
+        direct_submit_env && std::string(direct_submit_env) != "0" &&
+        std::string(direct_submit_env) != "false" &&
+        std::string(direct_submit_env) != "FALSE";
 
     engine_ = flagcxP2pEngineCreate();
     if (!engine_) {
@@ -95,9 +100,14 @@ int FlagCxTransport::install(std::string &local_server_name,
 
     if (allocateLocalSegment() != 0) return -1;
 
-    running_.store(true);
-    io_thread_ = std::thread(&FlagCxTransport::ioWorker, this);
-    LOG(INFO) << "FlagCxTransport: install OK (io_thread spawned)";
+    if (direct_submit_) {
+        LOG(INFO) << "FlagCxTransport: install OK (direct submit enabled; "
+                     "io_thread not spawned)";
+    } else {
+        running_.store(true);
+        io_thread_ = std::thread(&FlagCxTransport::ioWorker, this);
+        LOG(INFO) << "FlagCxTransport: install OK (io_thread spawned)";
+    }
     return 0;
 }
 
@@ -175,6 +185,30 @@ void FlagCxTransport::runSliceGroup(const std::vector<Slice *> &group) {
         else
             s->markFailed();
     }
+}
+
+void FlagCxTransport::enqueueSlices(const std::vector<Slice *> &slices) {
+    {
+        std::lock_guard<std::mutex> lk(queue_mu_);
+        for (auto *s : slices) io_queue_.push_back(s);
+    }
+    queue_cv_.notify_all();
+}
+
+void FlagCxTransport::submitSlicesDirect(const std::vector<Slice *> &slices) {
+    // Keep direct-submit FlagCX engine calls serialized for this experiment.
+    // The existing implementation routes all data-path calls through one
+    // ioWorker thread, so this preserves that single-caller assumption while
+    // removing the worker queue and wakeup from the submission path.
+    std::lock_guard<std::mutex> lk(submit_mu_);
+    std::unordered_map<uint64_t, std::vector<Slice *>> groups;
+    for (Slice *s : slices) {
+        const uint64_t key =
+            (static_cast<uint64_t>(s->target_id) << 1) |
+            (s->opcode == TransferRequest::WRITE ? 0u : 1u);
+        groups[key].push_back(s);
+    }
+    for (auto &kv : groups) runSliceGroup(kv.second);
 }
 
 void FlagCxTransport::ioWorker() {
@@ -402,11 +436,10 @@ Status FlagCxTransport::submitTransfer(
         __sync_fetch_and_add(&task.slice_count, 1);
         to_post.push_back(slice);
     }
-    {
-        std::lock_guard<std::mutex> lk(queue_mu_);
-        for (auto *s : to_post) io_queue_.push_back(s);
-    }
-    queue_cv_.notify_all();
+    if (direct_submit_)
+        submitSlicesDirect(to_post);
+    else
+        enqueueSlices(to_post);
     return Status::OK();
 }
 
@@ -432,11 +465,10 @@ Status FlagCxTransport::submitTransferTask(
         __sync_fetch_and_add(&task.slice_count, 1);
         to_post.push_back(slice);
     }
-    {
-        std::lock_guard<std::mutex> lk(queue_mu_);
-        for (auto *s : to_post) io_queue_.push_back(s);
-    }
-    queue_cv_.notify_all();
+    if (direct_submit_)
+        submitSlicesDirect(to_post);
+    else
+        enqueueSlices(to_post);
     return Status::OK();
 }
 

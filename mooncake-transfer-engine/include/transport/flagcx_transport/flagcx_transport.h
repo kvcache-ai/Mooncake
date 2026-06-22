@@ -94,6 +94,8 @@ class FlagCxTransport : public Transport {
     // Issue a group of same-target, same-opcode slices as one multi-iov
     // (multi-rail) transfer and mark each slice's completion.
     void runSliceGroup(const std::vector<Slice *> &group);
+    void enqueueSlices(const std::vector<Slice *> &slices);
+    void submitSlicesDirect(const std::vector<Slice *> &slices);
 
     // Find the engine MR handle whose registered region fully contains
     // [addr, addr+length).  Returns false if the source is unregistered.
@@ -120,6 +122,8 @@ class FlagCxTransport : public Transport {
     // submitTransfer/Task pushes Slice* into io_queue_ and returns
     // immediately.
     void ioWorker();
+    bool direct_submit_ = false;
+    std::mutex submit_mu_;
     std::thread io_thread_;
     std::atomic<bool> running_{false};
     std::mutex queue_mu_;
