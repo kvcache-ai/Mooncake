@@ -7,6 +7,7 @@
 #endif
 
 #include <cstddef>
+#include <cstring>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -162,5 +163,173 @@ inline bool IsHostPointer(const void* ptr) {
     return true;  // CPU-only build: all pointers are host
 #endif
 }
+/// GPU-safe memcpy: auto-detects pointer types and dispatches to CopyAuto
+/// for GPU pointers, std::memcpy for host pointers.
+inline bool MemcpySafe(void* dst, const void* src, size_t size) {
+    int src_dev = -1, dst_dev = -1;
+    bool src_gpu = IsDevicePointer(src, &src_dev);
+    bool dst_gpu = IsDevicePointer(dst, &dst_dev);
+    if (!src_gpu && !dst_gpu) {
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    int dev = src_gpu ? src_dev : dst_dev;
+    SetDevice(dev);
+    return CopyAuto(dst, src, size);
+}
+
+// ── Async copy support ─────────────────────────────────────────────────
+// Used by ensureRegisteredForRDMA to batch multiple GPU→host copies on a
+// single stream, synchronise once, amortising per-call overhead.
+//
+// Design choices (borrowed from community PRs):
+//   - CUDA/HYGON/COREX: use Driver API (cuMemcpyAsync) instead of Runtime
+//     API (cudaMemcpyAsync) to avoid deadlocking with PyTorch's global
+//     CUDA Runtime mutex.  See: github.com/kvcache-ai/Mooncake/pull/2094
+//   - CUDA 12.8+: cudaMemcpyBatchAsync batches all copies into one driver
+//     call for lower per-transfer overhead.
+//     See: github.com/kvcache-ai/Mooncake/pull/1890
+//   - MUSA/MACA: use Runtime API (no known deadlock issue with these runtimes).
+
+#if defined(USE_CUDA) || defined(USE_HYGON) || defined(USE_COREX)
+// ── CUDA Driver API path ───────────────────────────────────────────────
+
+/// One-shot Driver API initialization.
+inline bool InitDriverAPI() {
+    static CUresult init_result = cuInit(0);
+    return init_result == CUDA_SUCCESS;
+}
+
+/// Thread-local stream type for CUDA Driver API.
+using AsyncCopyStream = CUstream;
+
+/// Get (or lazily create) a thread-local CUDA stream via Driver API.
+inline AsyncCopyStream GetCopyStream() {
+    thread_local CUstream stream = nullptr;
+    if (!stream) {
+        if (!InitDriverAPI()) return nullptr;
+        auto err = cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
+        if (err != CUDA_SUCCESS) {
+            const char* err_str = nullptr;
+            cuGetErrorString(err, &err_str);
+            LOG(WARNING) << "cuStreamCreate failed: "
+                         << (err_str ? err_str : "unknown")
+                         << "; falling back to sync";
+            stream = nullptr;
+        }
+    }
+    return stream;
+}
+
+/// Enqueue a single async copy via Driver API (auto-detects direction via UVA).
+inline bool CopyAutoAsync(void* dst, const void* src, size_t size,
+                           AsyncCopyStream stream) {
+    return cuMemcpyAsync(reinterpret_cast<CUdeviceptr>(dst),
+                         reinterpret_cast<CUdeviceptr>(src),
+                         size, stream) == CUDA_SUCCESS;
+}
+
+/// Batch-enqueue multiple async copies.  Uses cudaMemcpyBatchAsync on
+/// CUDA 12.8+ for lower per-call overhead; falls back to looped
+/// cuMemcpyAsync on older toolkits.
+/// Returns false on any copy failure.
+inline bool CopyBatchAsync(void* const* dsts, const void* const* srcs,
+                            const size_t* sizes, size_t count,
+                            AsyncCopyStream stream) {
+#if CUDART_VERSION >= 13000
+    // CUDA 13+: const void** signature, no fail_idx.
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    return cudaMemcpyBatchAsync(
+               const_cast<const void**>(reinterpret_cast<void**>(
+                   const_cast<void**>(dsts))),
+               const_cast<const void**>(reinterpret_cast<void**>(
+                   const_cast<void* const*>(srcs))),
+               sizes, count, &attr, &attrs_idx, 1,
+               reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
+#elif CUDART_VERSION >= 12080
+    // CUDA 12.8+: void** signature with fail_idx.
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    size_t fail_idx = count;
+    auto err = cudaMemcpyBatchAsync(
+        const_cast<void**>(reinterpret_cast<void* const*>(dsts)),
+        const_cast<void**>(reinterpret_cast<void* const*>(srcs)),
+        sizes, count, &attr, &attrs_idx, 1, &fail_idx,
+        reinterpret_cast<cudaStream_t>(stream));
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "cudaMemcpyBatchAsync failed at index " << fail_idx
+                   << ": " << cudaGetErrorString(err);
+    }
+    return err == cudaSuccess;
+#else
+    // Pre-12.8: loop cuMemcpyAsync (Driver API, deadlock-safe).
+    for (size_t i = 0; i < count; ++i) {
+        auto err = cuMemcpyAsync(reinterpret_cast<CUdeviceptr>(dsts[i]),
+                                 reinterpret_cast<CUdeviceptr>(srcs[i]),
+                                 sizes[i], stream);
+        if (err != CUDA_SUCCESS) {
+            const char* err_str = nullptr;
+            cuGetErrorString(err, &err_str);
+            LOG(ERROR) << "cuMemcpyAsync failed at index " << i << ": "
+                       << (err_str ? err_str : "unknown");
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
+/// Synchronize the copy stream (Driver API).
+inline bool SyncCopyStream(AsyncCopyStream stream) {
+    return cuStreamSynchronize(stream) == CUDA_SUCCESS;
+}
+
+#elif defined(USE_MUSA) || defined(USE_MACA)
+// ── MUSA/MACA Runtime API path ─────────────────────────────────────────
+
+using AsyncCopyStream = cudaStream_t;
+
+inline AsyncCopyStream GetCopyStream() {
+    thread_local cudaStream_t stream = nullptr;
+    if (!stream) {
+        auto err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "cudaStreamCreate failed: "
+                         << cudaGetErrorString(err);
+            stream = nullptr;
+        }
+    }
+    return stream;
+}
+
+inline bool CopyAutoAsync(void* dst, const void* src, size_t size,
+                           AsyncCopyStream stream) {
+    return cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream) ==
+           cudaSuccess;
+}
+
+inline bool CopyBatchAsync(void* const* dsts, const void* const* srcs,
+                            const size_t* sizes, size_t count,
+                            AsyncCopyStream stream) {
+    for (size_t i = 0; i < count; ++i) {
+        if (cudaMemcpyAsync(const_cast<void*>(
+                                static_cast<const void*>(dsts[i])),
+                            srcs[i], sizes[i], cudaMemcpyDefault,
+                            stream) != cudaSuccess) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool SyncCopyStream(AsyncCopyStream stream) {
+    return cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
+#endif  // platform selection
+
 }  // namespace gpu_staging
 }  // namespace mooncake

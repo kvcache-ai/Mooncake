@@ -361,6 +361,8 @@ class TransferEngineImpl {
 
     bool checkOverlap(void* addr, uint64_t length);
 
+    bool isLocalMemoryRegistered(const void* addr);
+
 #ifdef ENABLE_MULTI_PROTOCOL
     struct RegisteredRecord {
         Transport* transport;

@@ -1467,7 +1467,7 @@ std::vector<bool> execute_tensor_into_plan_transfers(
             continue;
         }
         if (plans[plan_idx].materialized_metadata.has_value()) {
-            std::memcpy(
+            gpu_staging::MemcpySafe(
                 reinterpret_cast<void *>(plans[plan_idx].user_buffer_ptr),
                 &*plans[plan_idx].materialized_metadata,
                 sizeof(TensorMetadata));

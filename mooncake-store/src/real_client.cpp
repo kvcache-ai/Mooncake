@@ -761,6 +761,27 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(result.error());
             return tl::unexpected(result.error());
         }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+        {
+            const char* pin_env = std::getenv("MC_STORE_PIN_MEMORY");
+            if (pin_env &&
+                (std::string(pin_env) == "1" ||
+                 std::string(pin_env) == "true")) {
+                auto cuda_ret = cudaHostRegister(
+                    client_buffer_allocator_->getBase(), local_buffer_size,
+                    cudaHostRegisterDefault);
+                if (cuda_ret != cudaSuccess) {
+                    LOG(WARNING)
+                        << "cudaHostRegister staging buffer failed: "
+                        << cudaGetErrorString(cuda_ret);
+                } else {
+                    LOG(INFO) << "cudaHostRegister staging buffer OK, size="
+                              << local_buffer_size;
+                }
+            }
+        }
+#endif
         {
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
             local_buffer_region_ = WritableBufferRegion{
@@ -772,6 +793,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
+
+    // Reinitialize TransferSubmitter with the staging allocator so that
+    // ensureRegisteredForRDMA can stage unregistered user buffers for RDMA.
+    client_->setStagingAllocator(client_buffer_allocator_);
 
     // If global_segment_size is 0, skip mount segment;
     // If global_segment_size is larger than max_mr_size, split to multiple
@@ -1681,20 +1706,14 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!client_buffer_allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
-    if (!alloc_result) {
-        LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
-                   << key << ", value size: " << value.size();
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto &buffer_handle = *alloc_result;
-    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    // Staging is deferred to ensureRegisteredForRDMA in the transfer layer.
+    // For LOCAL_MEMCPY this eliminates one copy; for RDMA with registered
+    // buffers it also eliminates one copy; for RDMA with unregistered buffers
+    // the total work is the same (staging just happens later).
+    (void)client_buffer_allocator;
 
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
+    std::vector<Slice> slices = split_into_slices(
+        const_cast<char *>(value.data()), value.size_bytes());
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
@@ -1750,43 +1769,13 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         LOG(ERROR) << "Key and value size mismatch";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!client_buffer_allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    std::vector<BufferHandle> buffer_handles;
-    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
-    batched_slices.reserve(keys.size());
+    (void)client_buffer_allocator;
 
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto &key = keys[i];
-        auto &value = values[i];
-        auto alloc_result =
-            client_buffer_allocator->allocate(value.size_bytes());
-        if (!alloc_result) {
-            LOG(ERROR)
-                << "Failed to allocate buffer for put_batch operation, key: "
-                << key << ", value size: " << value.size();
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        auto &buffer_handle = *alloc_result;
-        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
-        auto slices = split_into_slices(buffer_handle);
-        buffer_handles.emplace_back(std::move(*alloc_result));
-        batched_slices.emplace(key, std::move(slices));
-    }
-
-    // Convert unordered_map to vector format expected by BatchPut
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
-    for (const auto &key : keys) {
-        auto it = batched_slices.find(key);
-        if (it != batched_slices.end()) {
-            ordered_batched_slices.emplace_back(it->second);
-        } else {
-            LOG(ERROR) << "Missing slices for key: " << key;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ordered_batched_slices.emplace_back(split_into_slices(
+            const_cast<char *>(values[i].data()), values[i].size_bytes()));
     }
 
     auto results = client_->BatchPut(keys, ordered_batched_slices, config);
@@ -1845,44 +1834,25 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!client_buffer_allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
+    (void)client_buffer_allocator;
 
-    // Calculate total size needed
-    size_t total_size = 0;
+    // Create slices directly from each part's data pointer.
+    // Parts are stored sequentially in the object — the server assembles
+    // them in order. No staging copy needed; ensureRegisteredForRDMA handles
+    // RDMA registration if required.
+    std::vector<Slice> slices;
     for (const auto &value : values) {
-        total_size += value.size_bytes();
+        if (value.size_bytes() == 0) continue;
+        auto part_slices = split_into_slices(
+            const_cast<char *>(value.data()), value.size_bytes());
+        slices.insert(slices.end(), part_slices.begin(), part_slices.end());
     }
 
-    if (total_size == 0) {
+    if (slices.empty()) {
         LOG(WARNING) << "Attempting to put empty data for key: " << key;
         return {};
     }
 
-    // Allocate buffer using the new allocator
-    auto alloc_result = client_buffer_allocator->allocate(total_size);
-    if (!alloc_result) {
-        LOG(ERROR) << "Failed to allocate buffer for put_parts operation, key: "
-                   << key << ", total size: " << total_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto &buffer_handle = *alloc_result;
-
-    // Copy all parts into the contiguous buffer
-    size_t offset = 0;
-    for (const auto &value : values) {
-        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
-               value.size_bytes());
-        offset += value.size_bytes();
-    }
-
-    // Split into slices
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
-
-    // Perform the put operation - buffer_handle will be automatically released
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
@@ -3713,20 +3683,10 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!client_buffer_allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
-    if (!alloc_result) {
-        LOG(ERROR) << "Failed to allocate buffer for upsert operation, key: "
-                   << key << ", value size: " << value.size();
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto &buffer_handle = *alloc_result;
-    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    (void)client_buffer_allocator;
 
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
+    std::vector<Slice> slices = split_into_slices(
+        const_cast<char *>(value.data()), value.size_bytes());
 
     auto result = client_->Upsert(key, slices, config);
     if (!result) {
@@ -3945,37 +3905,20 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!client_buffer_allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    (void)client_buffer_allocator;
+
+    std::vector<Slice> slices;
+    for (const auto &value : values) {
+        if (value.size_bytes() == 0) continue;
+        auto part_slices = split_into_slices(
+            const_cast<char *>(value.data()), value.size_bytes());
+        slices.insert(slices.end(), part_slices.begin(), part_slices.end());
     }
 
-    size_t total_size = 0;
-    for (const auto &value : values) {
-        total_size += value.size_bytes();
-    }
-    if (total_size == 0) {
+    if (slices.empty()) {
         LOG(WARNING) << "Attempting to upsert empty data for key: " << key;
         return {};
     }
-
-    auto alloc_result = client_buffer_allocator->allocate(total_size);
-    if (!alloc_result) {
-        LOG(ERROR)
-            << "Failed to allocate buffer for upsert_parts operation, key: "
-            << key << ", total size: " << total_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto &buffer_handle = *alloc_result;
-    size_t offset = 0;
-    for (const auto &value : values) {
-        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
-               value.size_bytes());
-        offset += value.size_bytes();
-    }
-
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
 
     auto result = client_->Upsert(key, slices, config);
     if (!result) {
@@ -4034,43 +3977,12 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
         LOG(ERROR) << "Key and value size mismatch";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!client_buffer_allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    std::vector<BufferHandle> buffer_handles;
-    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
-    batched_slices.reserve(keys.size());
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto &key = keys[i];
-        auto &value = values[i];
-        auto alloc_result =
-            client_buffer_allocator->allocate(value.size_bytes());
-        if (!alloc_result) {
-            LOG(ERROR)
-                << "Failed to allocate buffer for upsert_batch operation, key: "
-                << key << ", value size: " << value.size();
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        auto &buffer_handle = *alloc_result;
-        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
-        auto slices = split_into_slices(buffer_handle);
-        buffer_handles.emplace_back(std::move(*alloc_result));
-        batched_slices.emplace(key, std::move(slices));
-    }
-
-    // Convert unordered_map to vector format expected by BatchUpsert
+    (void)client_buffer_allocator;  // staging moved to ensureRegisteredForRDMA
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
-    for (const auto &key : keys) {
-        auto it = batched_slices.find(key);
-        if (it != batched_slices.end()) {
-            ordered_batched_slices.emplace_back(it->second);
-        } else {
-            LOG(ERROR) << "Missing slices for key: " << key;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ordered_batched_slices.emplace_back(split_into_slices(
+            const_cast<char *>(values[i].data()), values[i].size_bytes()));
     }
 
     auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
@@ -4808,6 +4720,75 @@ RealClient::batch_put_from_multi_buffers_internal(
     }
     // Call client BatchPut and return the vector<expected> directly
     return client_->BatchPut(keys, batched_slices, config);
+}
+
+std::vector<int> RealClient::batch_upsert_from_multi_buffers(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &sizes,
+    const ReplicateConfig &config) {
+    auto internal_results =
+        execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
+            [&]() {
+                return batch_upsert_from_multi_buffers_internal(
+                    keys, all_buffers, sizes, config);
+            },
+            [](const auto &) { return true; },
+            [&](uint64_t latency_us, const auto &ret) {
+                std::vector<int> py_results;
+                py_results.reserve(ret.size());
+                for (const auto &item : ret) {
+                    py_results.push_back(to_py_ret(item));
+                }
+                client_->ObserveTransferOperation(
+                    TransferOperationKind::kWrite,
+                    "batch_upsert_from_multi_buffers",
+                    sum_successful_nested_sizes(py_results, sizes), latency_us);
+            });
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_multi_buffers_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const ReplicateConfig &config) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    if ((keys.size() != all_buffers.size()) ||
+        (all_buffers.size() != all_sizes.size())) {
+        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<std::vector<mooncake::Slice>> batched_slices(keys.size());
+    for (size_t i = 0; i < all_buffers.size(); ++i) {
+        const auto &buffers = all_buffers[i];
+        const auto &sizes = all_sizes[i];
+        if (buffers.size() != sizes.size()) {
+            LOG(ERROR) << "Mismatched buffers and sizes of key:" << keys[i];
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        batched_slices[i].reserve(buffers.size());
+        for (size_t j = 0; j < buffers.size(); ++j) {
+            batched_slices[i].emplace_back(Slice{buffers[j], sizes[j]});
+        }
+    }
+    return client_->BatchUpsert(keys, batched_slices, config);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(

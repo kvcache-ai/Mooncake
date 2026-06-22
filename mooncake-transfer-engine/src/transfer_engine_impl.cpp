@@ -561,6 +561,12 @@ bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
     return hasOverlapLocked(reinterpret_cast<uintptr_t>(addr), length);
 }
 
+bool TransferEngineImpl::isLocalMemoryRegistered(const void* addr) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr))
+           != local_memory_regions_.end();
+}
+
 int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
                                             const std::string& location,
                                             bool remote_accessible,
