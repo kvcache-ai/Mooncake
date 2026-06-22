@@ -50,9 +50,11 @@ class FakeTransport : public Transport {
         std::function<TransferStatus(const Request&, int)>;
 
     explicit FakeTransport(TransportType self_type,
-                           PollStatusFactory poll_status_factory = {})
+                           PollStatusFactory poll_status_factory = {},
+                           bool notify_on_submit = false)
         : self_type_(self_type),
-          poll_status_factory_(std::move(poll_status_factory)) {
+          poll_status_factory_(std::move(poll_status_factory)),
+          notify_on_submit_(notify_on_submit) {
         caps.dram_to_dram = true;
     }
 
@@ -87,6 +89,7 @@ class FakeTransport : public Transport {
             fake->poll_counts.push_back(0);
             ++fake->task_count;
         }
+        if (notify_on_submit_) batch->notifyProgress();
         return Status::OK();
     }
 
@@ -142,6 +145,7 @@ class FakeTransport : public Transport {
    private:
     TransportType self_type_;
     PollStatusFactory poll_status_factory_;
+    bool notify_on_submit_;
 };
 
 std::shared_ptr<Config> makeRuntimeQueueConfig(size_t max_dispatch_owners,
@@ -161,6 +165,7 @@ std::shared_ptr<Config> makeRuntimeQueueConfig(size_t max_dispatch_owners,
     cfg->set("runtime_queue/max_dispatch_bytes", max_dispatch_bytes);
     cfg->set("runtime_queue/staging_owner_reserve", 0UL);
     cfg->set("runtime_queue/staging_byte_reserve", 0UL);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 50000UL);
 
     cfg->set("transports/tcp/enable", false);
     cfg->set("transports/shm/enable", false);
@@ -353,13 +358,15 @@ TEST(RuntimeQueueDispatch, KeepsDispatchWindowUntilOwnerIsTerminal) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
-TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowAfterProgress) {
+TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowFromTransportNotify) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     cfg->set("enable_progress_worker", true);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 0UL);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::PollStatusFactory{}, true);
     installFakeRdma(engine, fake_rdma);
 
     constexpr size_t kReqLen = 4096;
@@ -377,7 +384,6 @@ TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowAfterProgress) {
             .ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
 
-    engine.notifyBatchMaybeReady(batch);
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
     while (std::chrono::steady_clock::now() < deadline &&
@@ -397,7 +403,7 @@ TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowAfterProgress) {
 
 TEST(RuntimeQueueDispatch, RuntimeQueueDrainsWithoutUserPolling) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
-    cfg->set("enable_progress_worker", false);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 1000UL);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 

@@ -136,10 +136,11 @@ Status ProxyManager::waitCrossStage(const Request& request,
     return impl_->waitTransferCompletion(batch);
 }
 
-Status ProxyManager::submit(TaskInfo* task,
+Status ProxyManager::submit(TaskInfo* task, BatchID batch,
                             const std::vector<std::string>& params) {
     StagingTask staging_task;
     staging_task.native = task;
+    staging_task.batch = batch;
     staging_task.params = params;
     task->staging_status = PENDING;
     static std::atomic<size_t> next_queue_index(0);
@@ -242,6 +243,7 @@ void ProxyManager::runner(size_t id) {
         auto staging_status = status.ok() ? COMPLETED : FAILED;
         __atomic_store(&task.native->staging_status, &staging_status,
                        __ATOMIC_RELEASE);
+        impl_->notifyBatchMaybeReady(task.batch);
     }
     cache.reset();
 }

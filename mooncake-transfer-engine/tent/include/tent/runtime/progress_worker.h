@@ -16,6 +16,7 @@
 #define PROGRESS_WORKER_H_
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -30,15 +31,16 @@ namespace tent {
 class TransferEngineImpl;
 
 // Event-driven progress worker for issue #2116. When the engine is configured
-// with enable_progress_worker=true, transports (or test hooks) call
+// with enable_progress_worker=true, transports call
 // notifyBatchMaybeReady to wake this worker, which then drives one
-// progressBatch step per notification. This decouples failover/resubmit from
-// the caller polling loop, so integrators that turn off
-// enable_auto_failover_on_poll do not need to spin a polling thread of their
-// own to keep failover progressing.
+// progressBatch step per notification. Runtime queue users also get a bounded
+// fallback tick while queue work is active, so older transports without a
+// completion wake still make progress.
 class ProgressWorker {
    public:
-    explicit ProgressWorker(TransferEngineImpl* impl);
+    explicit ProgressWorker(TransferEngineImpl* impl,
+                            std::chrono::microseconds fallback_interval =
+                                std::chrono::microseconds(0));
     ~ProgressWorker();
 
     ProgressWorker(const ProgressWorker&) = delete;
@@ -63,6 +65,7 @@ class ProgressWorker {
     void runner();
 
     TransferEngineImpl* impl_;
+    std::chrono::microseconds fallback_interval_;
     std::atomic<bool> running_{false};
     std::thread thread_;
 

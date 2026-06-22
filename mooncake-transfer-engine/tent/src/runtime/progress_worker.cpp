@@ -21,11 +21,10 @@
 
 namespace mooncake {
 namespace tent {
-namespace {
-constexpr auto kRuntimeQueueTick = std::chrono::milliseconds(2);
-}  // namespace
 
-ProgressWorker::ProgressWorker(TransferEngineImpl* impl) : impl_(impl) {}
+ProgressWorker::ProgressWorker(TransferEngineImpl* impl,
+                               std::chrono::microseconds fallback_interval)
+    : impl_(impl), fallback_interval_(fallback_interval) {}
 
 ProgressWorker::~ProgressWorker() { stop(); }
 
@@ -72,14 +71,16 @@ void ProgressWorker::runner() {
     while (true) {
         BatchID batch_id = 0;
         bool queue_ready = false;
+        bool fallback_due = false;
         bool queue_active = impl_->hasActiveRuntimeQueue();
         {
             std::unique_lock<std::mutex> lk(mu_);
-            if (queue_active) {
-                cv_.wait_for(lk, kRuntimeQueueTick, [&] {
+            if (queue_active && fallback_interval_.count() > 0) {
+                const bool woke = cv_.wait_for(lk, fallback_interval_, [&] {
                     return !running_.load(std::memory_order_acquire) ||
                            queue_ready_ || !order_.empty();
                 });
+                fallback_due = !woke;
             } else {
                 cv_.wait(lk, [&] {
                     return !running_.load(std::memory_order_acquire) ||
@@ -106,9 +107,9 @@ void ProgressWorker::runner() {
         if (batch_id) {
             TransferStatus s;
             (void)impl_->progressBatch(batch_id, s);
-            (void)impl_->refillDispatchWindow();
+            (void)impl_->progressRuntimeQueue();
         }
-        if (!queue_ready && !batch_id && queue_active) {
+        if (fallback_due && !queue_ready && !batch_id && queue_active) {
             (void)impl_->progressRuntimeQueue();
         }
     }

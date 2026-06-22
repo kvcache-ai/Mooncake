@@ -32,6 +32,7 @@
 #include "tent/common/types.h"
 #include "tent/common/concurrent/thread_local_storage.h"
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 
 namespace mooncake {
@@ -177,8 +178,8 @@ class TransferEngineImpl {
     }
 
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
-    // enable_progress_worker is false. Currently used by test/integration
-    // hooks; transports will be migrated to call this in a follow-up PR.
+    // enable_progress_worker is false. Transport completion paths use this as
+    // an idempotent "maybe ready" signal.
     void notifyBatchMaybeReady(BatchID batch_id);
 
    private:
@@ -226,6 +227,8 @@ class TransferEngineImpl {
                          PreparedSubmit& prepared);
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
+
+    void attachProgressNotifier(Batch* batch, Transport::SubBatchRef sub_batch);
 
     uint64_t nextBatchToken();
 
@@ -295,6 +298,7 @@ class TransferEngineImpl {
         QueueLimits limits{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
+        std::chrono::microseconds progress_fallback_interval{50000};
     };
 
     struct QueuedOwnerState {

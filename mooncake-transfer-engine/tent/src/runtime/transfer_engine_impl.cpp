@@ -303,6 +303,9 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/max_dispatch_owners", 64UL);
     runtime_queue_config_.max_dispatch_bytes =
         conf_->get("runtime_queue/max_dispatch_bytes", 64UL << 20);
+    runtime_queue_config_.progress_fallback_interval =
+        std::chrono::microseconds(
+            conf_->get("runtime_queue/progress_fallback_interval_us", 50000UL));
     if (runtime_queue_config_.enabled &&
         (runtime_queue_config_.max_dispatch_owners == 0 ||
          runtime_queue_config_.max_dispatch_bytes == 0)) {
@@ -364,7 +367,10 @@ Status TransferEngineImpl::construct() {
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
     if (enable_progress_worker_) {
-        progress_worker_ = std::make_unique<ProgressWorker>(this);
+        progress_worker_ = std::make_unique<ProgressWorker>(
+            this, runtime_queue_config_.enabled
+                      ? runtime_queue_config_.progress_fallback_interval
+                      : std::chrono::microseconds(0));
         progress_worker_->start();
     }
 
@@ -411,10 +417,11 @@ Status TransferEngineImpl::deconstruct() {
     // Metrics cleanup is handled automatically by TentMetrics destructor
 
     // Stop the progress worker first so it cannot race with batch teardown
-    // below (it dereferences BatchID into Batch* via progressBatch).
+    // below (it dereferences BatchID into Batch* via progressBatch). Keep the
+    // object alive until transports are destroyed: completion paths may still
+    // issue a final no-op wake while their workers are joining.
     if (progress_worker_) {
         progress_worker_->stop();
-        progress_worker_.reset();
     }
 
     // Destroy staging_proxy_ first: its destructor calls back into
@@ -460,6 +467,7 @@ Status TransferEngineImpl::deconstruct() {
 
     // Now safe to destroy transports (workers join here)
     for (auto& transport : transport_list_) transport.reset();
+    progress_worker_.reset();
     local_segment_tracker_.reset();
     if (metadata_) {
         metadata_->segmentManager().deleteLocal();
@@ -1367,6 +1375,15 @@ Status TransferEngineImpl::prepareSubmit(
 
 uint64_t TransferEngineImpl::nextBatchToken() { return next_batch_token_++; }
 
+void TransferEngineImpl::attachProgressNotifier(
+    Batch* batch, Transport::SubBatchRef sub_batch) {
+    if (!batch || !sub_batch) return;
+    sub_batch->progress_batch_id = (BatchID)batch;
+    sub_batch->notify_progress = [this](BatchID batch_id) {
+        notifyBatchMaybeReady(batch_id);
+    };
+}
+
 Status TransferEngineImpl::commitPreparedSubmit(
     Batch* batch, const PreparedSubmit& prepared) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
@@ -1410,7 +1427,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
 
         if (owner.staging) {
             task.staging = true;
-            staging_proxy_->submit(&task, owner.staging_params);
+            staging_proxy_->submit(&task, (BatchID)batch, owner.staging_params);
             continue;
         }
 
@@ -1424,6 +1441,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 merged_task_id_map[merged_task_id] = task;
                 continue;
             }
+            attachProgressNotifier(batch, batch->sub_batch[task.type]);
         }
 
         if (!next_sub_task_id.count(task.type))
@@ -1598,7 +1616,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
             task.staging = true;
-            auto status = staging_proxy_->submit(&task, staging_params);
+            auto status =
+                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
             return markQueuedOwnerSubmitted(owner_id);
         }
@@ -1610,6 +1629,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         auto status = transport->allocateSubBatch(batch->sub_batch[task.type],
                                                   batch->max_size);
         if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+        attachProgressNotifier(batch, batch->sub_batch[task.type]);
     }
 
     auto& transport = transport_list_[task.type];
@@ -1829,9 +1849,11 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     TENT_RECORD_TRANSPORT_FAILOVER();
 
     auto& transport = transport_list_[type];
-    if (!batch->sub_batch[type])
+    if (!batch->sub_batch[type]) {
         CHECK_STATUS(transport->allocateSubBatch(batch->sub_batch[type],
                                                  batch->max_size));
+        attachProgressNotifier(batch, batch->sub_batch[type]);
+    }
     auto& sub_batch = batch->sub_batch[type];
     task.sub_task_id = sub_batch->size();
     task.type = type;
