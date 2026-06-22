@@ -91,6 +91,16 @@ class MasterAdminServer {
                              coro_http::coro_http_response& resp);
     void HandleBatchQueryKeys(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
+    void HandleGetTenantQuotas(coro_http::coro_http_request& req,
+                               coro_http::coro_http_response& resp);
+    void HandleUpsertTenantQuota(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
+    void HandleDeleteTenantQuota(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
+    void HandleGetDefaultTenantQuota(coro_http::coro_http_request& req,
+                                     coro_http::coro_http_response& resp);
+    void HandleSetDefaultTenantQuota(coro_http::coro_http_request& req,
+                                     coro_http::coro_http_response& resp);
 
     void RegisterHandler();
 

@@ -71,7 +71,11 @@ coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
             return coro_http::status_type::bad_request;
         case ErrorCode::JOB_NOT_FOUND:
         case ErrorCode::SEGMENT_NOT_FOUND:
+        case ErrorCode::OBJECT_NOT_FOUND:
             return coro_http::status_type::not_found;
+        case ErrorCode::UNAVAILABLE_IN_CURRENT_MODE:
+        case ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS:
+            return coro_http::status_type::conflict;
         default:
             return coro_http::status_type::internal_server_error;
     }
@@ -141,6 +145,110 @@ std::string EscapeJson(std::string_view input) {
         }
     }
     return escaped;
+}
+
+std::string EscapePrometheusLabel(std::string_view input) {
+    std::string escaped;
+    escaped.reserve(input.size());
+    for (char ch : input) {
+        switch (ch) {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            default:
+                escaped.push_back(ch);
+                break;
+        }
+    }
+    return escaped;
+}
+
+struct HttpTenantQuotaSnapshot {
+    std::string tenant_id;
+    uint64_t requested_quota_bytes{0};
+    uint64_t effective_quota_bytes{0};
+    uint64_t used_bytes{0};
+    uint64_t reserved_bytes{0};
+    uint64_t committed_count{0};
+    bool over_quota{false};
+    bool has_explicit_policy{false};
+};
+YLT_REFL(HttpTenantQuotaSnapshot, tenant_id, requested_quota_bytes,
+         effective_quota_bytes, used_bytes, reserved_bytes, committed_count,
+         over_quota, has_explicit_policy);
+
+HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
+    const TenantQuotaSnapshot& snapshot) {
+    return HttpTenantQuotaSnapshot{
+        .tenant_id = snapshot.tenant_id,
+        .requested_quota_bytes = snapshot.requested_quota_bytes,
+        .effective_quota_bytes = snapshot.effective_quota_bytes,
+        .used_bytes = snapshot.used_bytes,
+        .reserved_bytes = snapshot.reserved_bytes,
+        .committed_count = snapshot.committed_count,
+        .over_quota = snapshot.over_quota,
+        .has_explicit_policy = snapshot.has_explicit_policy,
+    };
+}
+
+struct HttpTenantQuotaListResponse {
+    bool success{true};
+    std::vector<HttpTenantQuotaSnapshot> data;
+};
+YLT_REFL(HttpTenantQuotaListResponse, success, data);
+
+struct HttpTenantQuotaResponse {
+    bool success{true};
+    HttpTenantQuotaSnapshot data;
+};
+YLT_REFL(HttpTenantQuotaResponse, success, data);
+
+struct HttpTenantQuotaDeleteResponse {
+    bool success{true};
+    std::optional<HttpTenantQuotaSnapshot> data;
+};
+YLT_REFL(HttpTenantQuotaDeleteResponse, success, data);
+
+struct HttpTenantQuotaPolicyRequest {
+    uint64_t requested_quota_bytes{0};
+};
+YLT_REFL(HttpTenantQuotaPolicyRequest, requested_quota_bytes);
+
+struct HttpDefaultTenantQuotaResponse {
+    bool success{true};
+    uint64_t requested_quota_bytes{0};
+};
+YLT_REFL(HttpDefaultTenantQuotaResponse, success, requested_quota_bytes);
+
+tl::expected<std::string, ErrorCode> ParseAdminTenantId(
+    coro_http::coro_http_request& req) {
+    auto tenant_id_view = req.get_decode_query_value("tenant_id");
+    if (tenant_id_view.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::string tenant_id = NormalizeTenantId(std::string(tenant_id_view));
+    if (tenant_id.empty() || tenant_id.front() == '_') {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return tenant_id;
+}
+
+tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
+    coro_http::coro_http_request& req) {
+    HttpTenantQuotaPolicyRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    return request;
 }
 
 }  // namespace
@@ -253,9 +361,84 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 }
 
 std::string MasterAdminServer::BuildMetricsText() const {
-    return AppendMetricSections(
+    std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
+    auto service = GetActiveService();
+    if (!service) {
+        return metrics;
+    }
+    auto snapshots_result = service->ListTenantQuotaSnapshots();
+    auto capacity_result = service->GetTenantQuotaAllocatableCapacityBytes();
+    if (!snapshots_result || !capacity_result) {
+        return metrics;
+    }
+
+    const auto& snapshots = snapshots_result.value();
+    uint64_t requested_sum = 0;
+    uint64_t effective_sum = 0;
+    std::ostringstream tenant_metrics;
+    tenant_metrics
+        << "# HELP mooncake_tenant_quota_requested_bytes Requested tenant "
+           "quota policy in bytes\n"
+        << "# TYPE mooncake_tenant_quota_requested_bytes gauge\n"
+        << "# HELP mooncake_tenant_quota_effective_bytes Effective tenant "
+           "quota in bytes\n"
+        << "# TYPE mooncake_tenant_quota_effective_bytes gauge\n"
+        << "# HELP mooncake_tenant_quota_used_bytes Tenant committed quota "
+           "usage in bytes\n"
+        << "# TYPE mooncake_tenant_quota_used_bytes gauge\n"
+        << "# HELP mooncake_tenant_quota_reserved_bytes Tenant reserved quota "
+           "usage in bytes\n"
+        << "# TYPE mooncake_tenant_quota_reserved_bytes gauge\n"
+        << "# HELP mooncake_tenant_quota_committed_count Tenant committed "
+           "object count\n"
+        << "# TYPE mooncake_tenant_quota_committed_count gauge\n"
+        << "# HELP mooncake_tenant_quota_over_quota Tenant over-quota flag\n"
+        << "# TYPE mooncake_tenant_quota_over_quota gauge\n"
+        << "# HELP mooncake_tenant_quota_explicit_policy Tenant explicit "
+           "policy flag\n"
+        << "# TYPE mooncake_tenant_quota_explicit_policy gauge\n";
+    for (const auto& snapshot : snapshots) {
+        requested_sum += snapshot.requested_quota_bytes;
+        effective_sum += snapshot.effective_quota_bytes;
+        const auto tenant = EscapePrometheusLabel(snapshot.tenant_id);
+        tenant_metrics << "mooncake_tenant_quota_requested_bytes{tenant_id=\""
+                       << tenant << "\"} " << snapshot.requested_quota_bytes
+                       << "\n";
+        tenant_metrics << "mooncake_tenant_quota_effective_bytes{tenant_id=\""
+                       << tenant << "\"} " << snapshot.effective_quota_bytes
+                       << "\n";
+        tenant_metrics << "mooncake_tenant_quota_used_bytes{tenant_id=\""
+                       << tenant << "\"} " << snapshot.used_bytes << "\n";
+        tenant_metrics << "mooncake_tenant_quota_reserved_bytes{tenant_id=\""
+                       << tenant << "\"} " << snapshot.reserved_bytes << "\n";
+        tenant_metrics << "mooncake_tenant_quota_committed_count{tenant_id=\""
+                       << tenant << "\"} " << snapshot.committed_count << "\n";
+        tenant_metrics << "mooncake_tenant_quota_over_quota{tenant_id=\""
+                       << tenant << "\"} " << (snapshot.over_quota ? 1 : 0)
+                       << "\n";
+        tenant_metrics << "mooncake_tenant_quota_explicit_policy{tenant_id=\""
+                       << tenant << "\"} "
+                       << (snapshot.has_explicit_policy ? 1 : 0) << "\n";
+    }
+    tenant_metrics
+        << "# HELP mooncake_tenant_quota_allocatable_capacity_bytes Global "
+           "tenant quota allocatable capacity in bytes\n"
+        << "# TYPE mooncake_tenant_quota_allocatable_capacity_bytes gauge\n"
+        << "mooncake_tenant_quota_allocatable_capacity_bytes "
+        << capacity_result.value() << "\n"
+        << "# HELP mooncake_tenant_quota_requested_bytes_sum Global requested "
+           "tenant quota sum in bytes\n"
+        << "# TYPE mooncake_tenant_quota_requested_bytes_sum gauge\n"
+        << "mooncake_tenant_quota_requested_bytes_sum " << requested_sum << "\n"
+        << "# HELP mooncake_tenant_quota_effective_bytes_sum Global effective "
+           "tenant quota sum in bytes\n"
+        << "# TYPE mooncake_tenant_quota_effective_bytes_sum gauge\n"
+        << "mooncake_tenant_quota_effective_bytes_sum " << effective_sum
+        << "\n";
+
+    return AppendMetricSections(std::move(metrics), tenant_metrics.str());
 }
 
 std::string MasterAdminServer::BuildMetricsSummaryText() const {
@@ -799,6 +982,147 @@ void MasterAdminServer::HandleBatchQueryKeys(
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
 }
 
+void MasterAdminServer::HandleGetTenantQuotas(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto tenant_id_view = req.get_decode_query_value("tenant_id");
+    WithActiveService(resp, [&](auto service) {
+        if (tenant_id_view.empty()) {
+            auto result = service->ListTenantQuotaSnapshots();
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+            HttpTenantQuotaListResponse payload;
+            payload.data.reserve(result->size());
+            for (const auto& snapshot : result.value()) {
+                payload.data.push_back(ToHttpTenantQuotaSnapshot(snapshot));
+            }
+            WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+            return;
+        }
+
+        auto tenant_id_result = ParseAdminTenantId(req);
+        if (!tenant_id_result.has_value()) {
+            WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                               ErrorCode::INVALID_PARAMS, "Invalid tenant_id");
+            return;
+        }
+        auto result = service->GetTenantQuotaSnapshot(tenant_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(
+            resp, coro_http::status_type::ok,
+            HttpTenantQuotaResponse{
+                .data = ToHttpTenantQuotaSnapshot(result.value())});
+    });
+}
+
+void MasterAdminServer::HandleUpsertTenantQuota(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto tenant_id_result = ParseAdminTenantId(req);
+    if (!tenant_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           tenant_id_result.error(),
+                           "Missing or invalid tenant_id");
+        return;
+    }
+    auto body_result = ParseQuotaPolicyBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+    if (body_result->requested_quota_bytes == 0) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Tenant quota must be positive");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->UpsertTenantQuotaPolicy(
+            tenant_id_result.value(), body_result->requested_quota_bytes);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(
+            resp, coro_http::status_type::ok,
+            HttpTenantQuotaResponse{
+                .data = ToHttpTenantQuotaSnapshot(result.value())});
+    });
+}
+
+void MasterAdminServer::HandleDeleteTenantQuota(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto tenant_id_result = ParseAdminTenantId(req);
+    if (!tenant_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           tenant_id_result.error(),
+                           "Missing or invalid tenant_id");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result =
+            service->DeleteTenantQuotaPolicy(tenant_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        HttpTenantQuotaDeleteResponse payload;
+        if (result.value().has_value()) {
+            payload.data = ToHttpTenantQuotaSnapshot(result.value().value());
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleGetDefaultTenantQuota(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetDefaultTenantQuotaPolicy();
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpDefaultTenantQuotaResponse{
+                              .requested_quota_bytes = result.value()});
+    });
+}
+
+void MasterAdminServer::HandleSetDefaultTenantQuota(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto body_result = ParseQuotaPolicyBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->SetDefaultTenantQuotaPolicy(
+            body_result->requested_quota_bytes);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(
+            resp, coro_http::status_type::ok,
+            HttpDefaultTenantQuotaResponse{
+                .requested_quota_bytes = body_result->requested_quota_bytes});
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -871,6 +1195,31 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/segments/status",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSegmentStatus(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/tenant_quotas",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetTenantQuotas(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/tenant_quotas",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUpsertTenantQuota(req, resp);
+        });
+    http_server_.set_http_handler<DEL>(
+        "/api/v1/tenant_quotas",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleDeleteTenantQuota(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/tenant_quotas/default",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDefaultTenantQuota(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/tenant_quotas/default",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetDefaultTenantQuota(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/batch_query_keys",
