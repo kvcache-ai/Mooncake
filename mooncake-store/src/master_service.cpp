@@ -1238,14 +1238,15 @@ MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
     const std::string& tenant_id, QuotaEraseMode quota_mode) {
-    return EraseMetadata(tenant_state, it, tenant_id, nullptr);
+    return EraseMetadata(tenant_state, it, tenant_id, quota_mode, nullptr);
 }
 
 std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const std::string& tenant_id, MetadataShardAccessorRW* shard) {
+    const std::string& tenant_id, QuotaEraseMode quota_mode,
+    MetadataShardAccessorRW* shard) {
     bool had_completed_disk = it->second.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -1365,7 +1366,7 @@ void MasterService::ClearInvalidHandles(
                     ErasePromotionTaskIfPresent(tenant_state, it->first,
                                                 tenant_it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       &shard);
+                                       QuotaEraseMode::kFull, &shard);
                 } else {
                     ++it;
                 }
@@ -2395,7 +2396,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key,
                                             object_id.tenant_id);
-                EraseMetadata(tenant_state, it, object_id.tenant_id, &shard);
+                EraseMetadata(tenant_state, it, object_id.tenant_id,
+                              QuotaEraseMode::kFull, &shard);
                 it = tenant_state.metadata.end();
             } else {
                 auto& metadata = it->second;
@@ -2417,7 +2419,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             put_start_release_timeout_sec_);
                 }
                 tenant_state.processing_keys.erase(key);
-                EraseMetadata(tenant_state, it, object_id.tenant_id, &shard);
+                EraseMetadata(tenant_state, it, object_id.tenant_id,
+                              QuotaEraseMode::kFull, &shard);
                 it = tenant_state.metadata.end();
             }
         }
@@ -2767,7 +2770,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             CleanupStaleHandles(it->second, alive_clients, &shard)) {
             tenant_state.processing_keys.erase(key);
             ErasePromotionTaskIfPresent(tenant_state, key, object_id.tenant_id);
-            EraseMetadata(tenant_state, it, object_id.tenant_id, &shard);
+            EraseMetadata(tenant_state, it, object_id.tenant_id,
+                          QuotaEraseMode::kFull, &shard);
             it = tenant_state.metadata.end();
         }
 
@@ -2822,7 +2826,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     ErasePromotionTaskIfPresent(tenant_state, key,
                                                 object_id.tenant_id);
                     EraseMetadata(tenant_state, it, object_id.tenant_id,
-                                  &shard);
+                                  QuotaEraseMode::kFull, &shard);
                     it = tenant_state.metadata.end();
                 }
             }
@@ -3658,7 +3662,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                         << " matched by regex. Removing.";
                 ErasePromotionTaskIfPresent(tenant_state, it->first,
                                             normalized_tenant);
-                it = EraseMetadata(tenant_state, it, normalized_tenant, &shard);
+                it = EraseMetadata(tenant_state, it, normalized_tenant,
+                                   QuotaEraseMode::kFull, &shard);
                 removed_count++;
             } else {
                 ++it;
@@ -3696,7 +3701,7 @@ long MasterService::RemoveAll(bool force) {
                     ErasePromotionTaskIfPresent(tenant_state, it->first,
                                                 tenant_it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       &shard);
+                                       QuotaEraseMode::kFull, &shard);
                     removed_count++;
                 } else {
                     ++it;
@@ -3742,7 +3747,8 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                 total_freed_size += it->second.size * mem_rep_count;
                 ErasePromotionTaskIfPresent(tenant_state, it->first,
                                             normalized_tenant);
-                it = EraseMetadata(tenant_state, it, normalized_tenant, &shard);
+                it = EraseMetadata(tenant_state, it, normalized_tenant,
+                                   QuotaEraseMode::kFull, &shard);
                 removed_count++;
             } else {
                 ++it;
@@ -3813,7 +3819,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key,
                                             normalized_tenant);
-                EraseMetadata(tenant_state, it, normalized_tenant, &shard);
+                EraseMetadata(tenant_state, it, normalized_tenant,
+                              QuotaEraseMode::kFull, &shard);
                 if (tenant_state.Empty()) {
                     shard->tenants.erase(tenant_it);
                 }
@@ -3853,7 +3860,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Remove object metadata
             ErasePromotionTaskIfPresent(tenant_state, key, normalized_tenant);
-            EraseMetadata(tenant_state, it, normalized_tenant, &shard);
+            EraseMetadata(tenant_state, it, normalized_tenant,
+                          QuotaEraseMode::kFull, &shard);
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
@@ -4708,7 +4716,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first, &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first,
+                                  QuotaEraseMode::kFull, &shard);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
@@ -4723,7 +4732,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first, &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first,
+                                  QuotaEraseMode::kFull, &shard);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
@@ -4766,7 +4776,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
             if (!metadata.IsValid()) {
                 EraseMetadata(tenant_state, metadata_it, tenant_it->first,
-                              &shard);
+                              QuotaEraseMode::kFull, &shard);
             }
             task_it = tenant_state.replication_tasks.erase(task_it);
         }
@@ -6093,7 +6103,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 result.evicted_objects++;
             }
             if (member_key != key && !member_metadata.IsValid()) {
-                EraseMetadata(tenant_state, member_it, tenant_id, &shard);
+                EraseMetadata(tenant_state, member_it, tenant_id,
+                              QuotaEraseMode::kFull, &shard);
             }
         }
         return result;
@@ -6248,7 +6259,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     /*allow_soft_pinned=*/false);
                 total_freed_size += evict_result.freed_bytes;
                 if (!it->second.IsValid()) {
-                    EraseMetadata(tenant_state, it, c.tenant_id, &shard);
+                    EraseMetadata(tenant_state, it, c.tenant_id,
+                                  QuotaEraseMode::kFull, &shard);
                 }
                 if (tenant_state.Empty()) {
                     shard->tenants.erase(tenant_it);
@@ -6307,9 +6319,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     /*allow_soft_pinned=*/false);
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
-                                    it =
-                                        EraseMetadata(tenant_state, it,
-                                                      tenant_it->first, &shard);
+                                    it = EraseMetadata(
+                                        tenant_state, it, tenant_it->first,
+                                        QuotaEraseMode::kFull, &shard);
                                 } else {
                                     ++it;
                                 }
@@ -6367,9 +6379,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     /*allow_soft_pinned=*/true);
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
-                                    it =
-                                        EraseMetadata(tenant_state, it,
-                                                      tenant_it->first, &shard);
+                                    it = EraseMetadata(
+                                        tenant_state, it, tenant_it->first,
+                                        QuotaEraseMode::kFull, &shard);
                                 } else {
                                     ++it;
                                 }
@@ -6527,7 +6539,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 shard_evicted_count++;
                 if (!metadata.IsValid()) {
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       &shard);
+                                       QuotaEraseMode::kFull, &shard);
                 } else {
                     ++it;
                 }

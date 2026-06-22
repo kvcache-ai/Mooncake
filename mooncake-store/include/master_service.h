@@ -1370,7 +1370,8 @@ class MasterService {
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id, MetadataShardAccessorRW* shard);
+        const std::string& tenant_id, QuotaEraseMode quota_mode,
+        MetadataShardAccessorRW* shard);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -1598,7 +1599,7 @@ class MasterService {
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
             service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
-                                    &shard_guard_);
+                                    QuotaEraseMode::kFull, &shard_guard_);
             it_ = tenant_state_->metadata.end();
             MaybeEraseEmptyTenant();
         }
