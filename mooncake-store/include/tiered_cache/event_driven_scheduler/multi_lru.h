@@ -61,7 +61,7 @@ inline HeatBand BandOf(uint64_t freq, const BandThresholds& t) {
  * @brief Repair an out-of-range BandThresholds in place, warning on each fix.
  *
  * Enforces warm >= 1 < hot < very_hot by clamping upward (rather than silently
- * mis-banding keys): warm is raised to 1, then hot/very_hot are pushed to at
+ * banding keys): warm is raised to 1, then hot/very_hot are pushed to at
  * least one above their predecessor. Mirrors the watermark-validation style in
  * the scheduler factory.
  */
