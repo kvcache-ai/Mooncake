@@ -252,12 +252,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
     }
 
     std::string encodeUrl(const std::string &key) const {
-        CURL *h = tl_easy();
-        char *esc =
-            curl_easy_escape(h, key.c_str(), static_cast<int>(key.size()));
-        std::string url = metadata_uri_ + "?key=" + (esc ? esc : "");
-        if (esc) curl_free(esc);
-        return url;
+        return metadata_uri_ + "?key=" + key;
     }
 
     static inline bool is_200(long code) { return code == 200; }
