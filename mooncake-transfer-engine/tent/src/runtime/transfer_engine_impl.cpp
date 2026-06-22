@@ -290,6 +290,7 @@ Status TransferEngineImpl::construct() {
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
+    if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
     runtime_queue_config_.limits.max_outstanding_owners =
         conf_->get("runtime_queue/max_outstanding_owners", 1024UL);
     runtime_queue_config_.limits.max_outstanding_bytes =
@@ -1642,6 +1643,57 @@ Status TransferEngineImpl::refillDispatchWindow() {
         CHECK_STATUS(dispatchQueuedOwner(owner_id));
     }
     return Status::OK();
+}
+
+Status TransferEngineImpl::progressRuntimeQueue() {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!runtime_queue_config_.enabled) return Status::OK();
+
+    CHECK_STATUS(refillDispatchWindow());
+
+    std::vector<QueueOwnerId> owner_ids;
+    owner_ids.reserve(queued_owners_.size());
+    for (const auto& entry : queued_owners_) {
+        if (entry.second.in_dispatch_window) owner_ids.push_back(entry.first);
+    }
+
+    bool released_window = false;
+    for (const auto owner_id : owner_ids) {
+        auto queued_it = queued_owners_.find(owner_id);
+        if (queued_it == queued_owners_.end()) continue;
+
+        auto& queued = queued_it->second;
+        if (!queued.in_dispatch_window) continue;
+        auto* batch = queued.batch;
+        if (!batch || !alive_batches_.count((BatchID)batch)) continue;
+        if (queued.owner_task_id >= batch->task_list.size()) {
+            return Status::InternalError(
+                "queued owner task id out of range" LOC_MARK);
+        }
+
+        auto& task = batch->task_list[queued.owner_task_id];
+        auto prev_status = task.status;
+        TransferStatus task_status;
+        CHECK_STATUS(pollTaskStatus(batch, queued.owner_task_id, task_status));
+        updateTaskStatusAfterPoll(batch, queued.owner_task_id, task_status,
+                                  true);
+        recordTaskCompletionMetrics(task, prev_status, task_status.s);
+
+        if (task_status.s == PENDING) continue;
+
+        CHECK_STATUS(finishQueuedOwner(owner_id, task_status.s));
+        if (task_status.s == COMPLETED)
+            CHECK_STATUS(maybeFireSubmitHooks(batch));
+        released_window = true;
+    }
+
+    if (released_window) CHECK_STATUS(refillDispatchWindow());
+    return Status::OK();
+}
+
+bool TransferEngineImpl::hasActiveRuntimeQueue() {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    return runtime_queue_config_.enabled && !queued_owners_.empty();
 }
 
 bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,

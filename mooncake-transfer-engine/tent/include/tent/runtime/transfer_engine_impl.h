@@ -231,6 +231,10 @@ class TransferEngineImpl {
 
     Status refillDispatchWindow();
 
+    Status progressRuntimeQueue();
+
+    bool hasActiveRuntimeQueue();
+
     void notifyRuntimeQueueReady();
 
     Status dispatchQueuedOwner(QueueOwnerId owner_id);

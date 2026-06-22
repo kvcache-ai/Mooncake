@@ -14,11 +14,16 @@
 
 #include "tent/runtime/progress_worker.h"
 
+#include <chrono>
+
 #include "tent/common/status.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
 namespace mooncake {
 namespace tent {
+namespace {
+constexpr auto kRuntimeQueueTick = std::chrono::milliseconds(2);
+}  // namespace
 
 ProgressWorker::ProgressWorker(TransferEngineImpl* impl) : impl_(impl) {}
 
@@ -67,12 +72,20 @@ void ProgressWorker::runner() {
     while (true) {
         BatchID batch_id = 0;
         bool queue_ready = false;
+        bool queue_active = impl_->hasActiveRuntimeQueue();
         {
             std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&] {
-                return !running_.load(std::memory_order_acquire) ||
-                       queue_ready_ || !order_.empty();
-            });
+            if (queue_active) {
+                cv_.wait_for(lk, kRuntimeQueueTick, [&] {
+                    return !running_.load(std::memory_order_acquire) ||
+                           queue_ready_ || !order_.empty();
+                });
+            } else {
+                cv_.wait(lk, [&] {
+                    return !running_.load(std::memory_order_acquire) ||
+                           queue_ready_ || !order_.empty();
+                });
+            }
             if (!running_.load(std::memory_order_acquire)) return;
             queue_ready = queue_ready_;
             queue_ready_ = false;
@@ -83,7 +96,7 @@ void ProgressWorker::runner() {
             }
         }
         if (queue_ready) {
-            (void)impl_->refillDispatchWindow();
+            (void)impl_->progressRuntimeQueue();
         }
         // progressBatch acquires the engine's progress_mutex_ and silently
         // returns InvalidArgument if the batch was freed before we got here.
@@ -94,6 +107,9 @@ void ProgressWorker::runner() {
             TransferStatus s;
             (void)impl_->progressBatch(batch_id, s);
             (void)impl_->refillDispatchWindow();
+        }
+        if (!queue_ready && !batch_id && queue_active) {
+            (void)impl_->progressRuntimeQueue();
         }
     }
 }
