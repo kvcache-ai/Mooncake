@@ -37,16 +37,24 @@ fn cold_tier_replica_count() -> usize {
     })
 }
 
-/// Returns true if offload writes should be deferred when restore reads are
-/// active on the same device.  Prevents write bandwidth from competing with
-/// latency-sensitive cold reads on the same SSD.
-/// Controlled by env var `MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE`.
-fn throttle_offload_on_restore() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Returns the IO-score weight used in `device_offload_score()`.
+///
+/// When `MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE` is set (non-zero,
+/// non-"false"), the weight is raised from the default 0.7 to 0.9 so offload
+/// more aggressively avoids devices with concurrent restore reads.  The
+/// selection never hard-filters devices — even when all devices have active
+/// restores, the least-busy one is still chosen to prevent offload starvation.
+fn io_score_weight() -> f64 {
+    static CACHED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE")
+        let throttle = std::env::var("MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE")
             .map(|v| v != "0" && v != "false")
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if throttle {
+            0.9
+        } else {
+            0.7
+        }
     })
 }
 
@@ -640,19 +648,19 @@ impl ColdTierDeviceManager {
         // away from SSDs that are busy serving restore reads, reducing read/write
         // contention on the same physical disk.
         //
-        // Score = 0.3 × capacity_score + 0.7 × io_score
+        // Score = (1 - w) × capacity_score + w × io_score
         //   capacity_score = free_percentage / 100.0          (0.0 – 1.0)
         //   io_score       = 1.0 / (1.0 + restore_in_flight) (0.0 – 1.0)
+        //   w              = io_score_weight()                (0.7 or 0.9)
         //
         // When no restore reads are active on any device, the formula degrades
         // gracefully to pure free-percentage selection (the prior behaviour).
-        let throttle = throttle_offload_on_restore();
+        // Notably there is no hard filter: even when all devices have active
+        // restores, the least-busy device is selected to prevent offload
+        // starvation.
         devices
             .into_iter()
             .filter(|device| self.offload_rejection_reason(device, length).is_none())
-            .filter(|device| {
-                !throttle || self.admission.device_restore_in_flight(&device.device_id) == 0
-            })
             .max_by(|left, right| {
                 let left_score = self.device_offload_score(left);
                 let right_score = self.device_offload_score(right);
@@ -674,13 +682,9 @@ impl ColdTierDeviceManager {
         if devices.is_empty() || n == 0 {
             return Vec::new();
         }
-        let throttle = throttle_offload_on_restore();
         let mut eligible: Vec<_> = devices
             .into_iter()
             .filter(|device| self.offload_rejection_reason(device, length).is_none())
-            .filter(|device| {
-                !throttle || self.admission.device_restore_in_flight(&device.device_id) == 0
-            })
             .collect();
         // Sort descending by offload score (best first).
         eligible.sort_by(|a, b| {
@@ -705,7 +709,8 @@ impl ColdTierDeviceManager {
         let capacity_score = free_pct / 100.0; // 0.0 – 1.0
         let restore_in_flight = self.admission.device_restore_in_flight(&device.device_id);
         let io_score = 1.0 / (1.0 + restore_in_flight as f64); // 0.0 – 1.0
-        0.3 * capacity_score + 0.7 * io_score
+        let w = io_score_weight();
+        (1.0 - w) * capacity_score + w * io_score
     }
 
     fn usable_device(&self, device: &ColdTierDeviceRecord) -> bool {

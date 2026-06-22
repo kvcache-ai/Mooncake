@@ -105,19 +105,27 @@ impl ColdTierDeviceCache {
 
     pub(crate) fn store(&mut self, devices: Vec<ColdTierDeviceRecord>) {
         self.refreshed_at = Some(Instant::now());
-        // Merge: if a locally-upserted record is newer (by updated_at_ms) than the
-        // incoming refresh snapshot, keep the local version to avoid a stale
-        // background refresh overwriting a recent apply_cold_tier_usage_delta.
+        // Split-field merge: lifecycle fields (state, epoch, root_dir) always
+        // come from the incoming backend snapshot — the metadata backend is the
+        // authoritative source for device lifecycle.  Usage fields (used_bytes,
+        // reserved_bytes) are kept from the local version when the local
+        // timestamp is newer, because apply_cold_tier_usage_delta updates them
+        // in real-time and the background refresh may lag behind.
         let merged = devices
             .into_iter()
-            .map(|incoming| {
+            .map(|mut incoming| {
                 match self
                     .devices
                     .iter()
                     .find(|d| d.device_id == incoming.device_id)
                 {
                     Some(existing) if existing.updated_at_ms > incoming.updated_at_ms => {
-                        existing.clone()
+                        // Local usage is fresher — graft it onto the incoming
+                        // record so lifecycle fields stay authoritative.
+                        incoming.used_bytes = existing.used_bytes;
+                        incoming.reserved_bytes = existing.reserved_bytes;
+                        incoming.updated_at_ms = existing.updated_at_ms;
+                        incoming
                     }
                     _ => incoming,
                 }
@@ -260,7 +268,6 @@ pub(super) struct OffloadPressureTracker {
     epoch: Instant,
     /// Configuration thresholds.
     soft_threshold: usize,
-    hard_threshold: usize,
     offload_boost: usize,
     stall_timeout_ms: u64,
 }
@@ -273,7 +280,6 @@ impl OffloadPressureTracker {
             last_completion_ms: AtomicU64::new(0),
             epoch: Instant::now(),
             soft_threshold: config.pressure_soft_threshold.max(1),
-            hard_threshold: config.pressure_hard_threshold.max(config.pressure_soft_threshold + 1),
             offload_boost: config.pressure_offload_boost.max(config.offload_device_max_in_flight),
             stall_timeout_ms: config.pressure_stall_timeout_ms.max(100),
         }
