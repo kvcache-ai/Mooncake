@@ -146,13 +146,13 @@ PY
 
 verify_env() {
   python3 - <<'PY'
+import importlib.metadata
 import os
 import torch
-import torch_musa
 import torchada
 
 print("torch", torch.__version__)
-print("torch_musa", getattr(torch_musa, "__version__", "unknown"))
+print("torch_musa", importlib.metadata.version("torch_musa"))
 print("torchada", getattr(torchada, "__version__", "unknown"))
 print("torchada platform", torchada.get_platform().value)
 print("CUDA_HOME", os.environ.get("CUDA_HOME"))
