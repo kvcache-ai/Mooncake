@@ -180,6 +180,24 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
+    // Override offloading queue limit from env var if set
+    {
+        const char* env_val = std::getenv("MC_OFFLOADING_QUEUE_LIMIT");
+        if (env_val) {
+            try {
+                offloading_queue_limit_ = std::stoull(env_val);
+                LOG(INFO)
+                    << "MC_OFFLOADING_QUEUE_LIMIT set, offloading_queue_limit="
+                    << offloading_queue_limit_;
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Invalid MC_OFFLOADING_QUEUE_LIMIT value: "
+                           << env_val << ", error: " << e.what();
+            }
+        }
+    }
+    MasterMetricManager::instance().set_offloading_queue_limit(
+        static_cast<int64_t>(offloading_queue_limit_));
+
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -1961,6 +1979,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                         object_id.user_key,
                         OffloadingTask{replica.id(),
                                        std::chrono::system_clock::now()});
+                } else {
+                    MasterMetricManager::instance()
+                        .inc_offload_queue_push_failures();
+                    LOG_FIRST_N(WARNING, 100)
+                        << "PutEnd offload queue push failed: key="
+                        << object_id.user_key
+                        << ", error=" << toString(result.error());
                 }
             });
     }
@@ -3379,6 +3404,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                  local_disk_segment_it->second->offloading_objects) {
                 result.push_back(task);
             }
+            MasterMetricManager::instance().dec_offloading_queue_size(
+                local_disk_segment_it->second->offloading_objects.size());
             local_disk_segment_it->second->offloading_objects.clear();
             return result;
         }
@@ -3391,6 +3418,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         // violation: the lock order is Shard Lock -> offloading_mutex_, so we
         // must release offloading_mutex_ before taking shard locks via
         // MetadataAccessorRW.
+        MasterMetricManager::instance().dec_offloading_queue_size(
+            local_disk_segment_it->second->offloading_objects.size());
         offloading_objects_copy =
             std::move(local_disk_segment_it->second->offloading_objects);
     }
@@ -3542,6 +3571,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
+        MasterMetricManager::instance().inc_offloading_queue_size();
     }
     return {};
 }

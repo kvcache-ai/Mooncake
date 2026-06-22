@@ -322,6 +322,12 @@ class MasterMetricManager {
     int64_t get_promotion_rejected_cap();
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
+    void inc_offload_queue_push_failures(int64_t val = 1);
+    void inc_offloading_queue_size(int64_t val = 1);
+    void dec_offloading_queue_size(int64_t val = 1);
+    void set_offloading_queue_limit(int64_t val);
+    int64_t get_offloading_queue_limit();
+
     void inc_copy_start_requests(int64_t val = 1);
     void inc_copy_start_failures(int64_t val = 1);
     void inc_copy_end_requests(int64_t val = 1);
@@ -339,6 +345,8 @@ class MasterMetricManager {
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     // Getters
+    int64_t get_offload_queue_push_failures();
+    int64_t get_offloading_queue_size();
     int64_t get_copy_start_requests();
     int64_t get_copy_start_failures();
     int64_t get_copy_end_requests();
@@ -409,6 +417,7 @@ class MasterMetricManager {
         int64_t put_start_alloc_fails = 0;
         int64_t put_ends = 0;
         int64_t put_end_fails = 0;
+        int64_t offload_queue_push_fails = 0;
         int64_t put_revoke_requests = 0;
         int64_t put_revoke_fails = 0;
         int64_t get_replicas = 0;
@@ -545,6 +554,12 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_alloc_failures_;
     ylt::metric::counter_t put_end_requests_;
     ylt::metric::counter_t put_end_failures_;
+    ylt::metric::counter_t
+        offload_queue_push_failures_;  // PutEnd offload queue push failures
+    ylt::metric::gauge_t
+        offloading_queue_size_;  // Current offload queue item count
+    ylt::metric::gauge_t
+        offloading_queue_limit_;  // Configured offload queue max capacity
     ylt::metric::counter_t put_revoke_requests_;
     ylt::metric::counter_t put_revoke_failures_;
     ylt::metric::counter_t get_replica_list_requests_;
