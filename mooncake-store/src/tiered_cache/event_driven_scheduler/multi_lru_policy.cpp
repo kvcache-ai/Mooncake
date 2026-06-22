@@ -63,7 +63,7 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
     // Always update the frequency memory / fast-tier band.
     collector_.OnAccess(ctx.key, ctx.served_tier_id);
     if (!initialized_) {
-        VLOG(2) << "MultiLRU OnAccess before Init for " << ctx.key
+        LOG(ERROR) << "MultiLRU OnAccess before Init for " << ctx.key
                 << "; no movement decided";
         return std::nullopt;
     }
@@ -89,7 +89,7 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
     if (fast == nullptr) {
         // Topology inconsistency: the resolved fast tier is gone from the
         // views.
-        VLOG(2) << "MultiLRU OnAccess: fast tier view missing for " << ctx.key;
+        LOG(ERROR) << "MultiLRU OnAccess: fast tier view missing for " << ctx.key;
         return std::nullopt;
     }
     const auto locations = backend_->GetReplicaTierIds(ctx.key);
@@ -101,7 +101,7 @@ std::optional<MovementRequest> MultiLRUPolicy::OnAccess(
         }
         const TierView* slow = FindView(views, *slow_tier_);
         if (slow == nullptr) {
-            VLOG(2) << "MultiLRU OnAccess: slow tier view missing for "
+            LOG(ERROR) << "MultiLRU OnAccess: slow tier view missing for "
                     << ctx.key;
             return std::nullopt;
         }
@@ -185,13 +185,13 @@ std::vector<MovementRequest> MultiLRUPolicy::DecideEvict(
     size_t min_reclaim_bytes) {
     std::vector<MovementRequest> out;
     if (!initialized_) {
-        VLOG(2) << "MultiLRU DecideEvict before Init; nothing to reclaim";
+        LOG(ERROR) << "MultiLRU DecideEvict before Init; nothing to reclaim";
         return out;
     }
     const auto views = backend_->GetTierViews();
     const TierView* fast = FindView(views, fast_tier_);
     if (fast == nullptr || fast->capacity == 0) {
-        VLOG(2) << "MultiLRU DecideEvict: fast tier view missing or zero "
+        LOG(ERROR) << "MultiLRU DecideEvict: fast tier view missing or zero "
                    "capacity; nothing to reclaim";
         return out;
     }

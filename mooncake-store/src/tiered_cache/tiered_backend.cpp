@@ -1078,7 +1078,7 @@ tl::expected<void, ErrorCode> TieredBackend::Transfer(std::string_view key,
 
         if (dest_available < required_size) {
             // Insufficient space, skip this transfer silently
-            VLOG(2) << "Insufficient space in destination tier " << dest_tier_id
+            LOG(ERROR) << "Insufficient space in destination tier " << dest_tier_id
                     << " for key " << key << " (required: " << required_size
                     << ", available: " << dest_available << ")";
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);

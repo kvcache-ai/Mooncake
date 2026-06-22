@@ -199,7 +199,7 @@ bool LegacyClientScheduler::OnAllocationFailure(
                   << ", triggering SYNC eviction";
         return TriggerSyncEviction(tier_id, required_bytes);
     } else {
-        VLOG(2) << "Allocation failed on tier " << tier_id
+        LOG(ERROR) << "Allocation failed on tier " << tier_id
                 << ", ASYNC mode - will handle in next cycle";
         return false;
     }
@@ -509,7 +509,7 @@ void LegacyClientScheduler::ExecuteActions(
                 } else if (res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                     // Insufficient space - mark tier for eviction
                     const size_t key_size = GetCachedKeySize(action.key);
-                    VLOG(2) << "Transfer skipped due to insufficient space for "
+                    LOG(ERROR) << "Transfer skipped due to insufficient space for "
                                "key: "
                             << action.key << ", will trigger eviction";
                     auto& required_bytes =
@@ -577,7 +577,7 @@ void LegacyClientScheduler::ExecuteActions(
         if (!copy_res) {
             if (copy_res.error() == ErrorCode::CAS_FAILED ||
                 copy_res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
-                VLOG(2) << "Replica preparation skipped for key: " << action.key
+                LOG(ERROR) << "Replica preparation skipped for key: " << action.key
                         << ", error: " << copy_res.error();
             } else {
                 LOG(ERROR) << "Replica preparation failed for key: "
