@@ -147,8 +147,11 @@ function k8sRequest(apiPath, method = 'GET', body) {
 }
 
 function jsonReply(res, status, data) {
+  // Ensure we never send an empty body — JSON.stringify(undefined) returns undefined,
+  // which makes res.end() send an empty body and causes "Unexpected end of JSON input" on the client.
+  const body = data !== undefined ? JSON.stringify(data) : '{}'
   res.writeHead(status, { 'Content-Type': 'application/json' })
-  res.end(JSON.stringify(data))
+  res.end(body)
 }
 
 // Recursive deep merge: merges src into target for plain objects, replaces for scalars/arrays
@@ -780,7 +783,29 @@ PYEOF`
         const pods = podResult?.items || []
         if (pods.length > 0) {
           podName = pods[0].metadata.name
-          // Fetch logs — k8sRequest returns raw text when JSON.parse fails (existing fallback at line 62-67)
+          const podPhase = pods[0].status?.phase || ''
+          const containerStatuses = pods[0].status?.containerStatuses || []
+
+          // Early detection: check pod container state directly — don't wait for Job controller
+          if (jobStatus === 'Pending' || jobStatus === 'Running') {
+            for (const cs of containerStatuses) {
+              if (cs.state?.terminated) {
+                const exitCode = cs.state.terminated.exitCode
+                if (exitCode === 0) jobStatus = 'Succeeded'
+                else jobStatus = 'Failed'
+                break
+              }
+              if (cs.state?.waiting?.reason === 'CrashLoopBackOff' || cs.state?.waiting?.reason === 'Error') {
+                jobStatus = 'Failed'
+                break
+              }
+            }
+            if (jobStatus === 'Pending' && (podPhase === 'Succeeded' || podPhase === 'Failed')) {
+              jobStatus = podPhase === 'Succeeded' ? 'Succeeded' : 'Failed'
+            }
+          }
+
+          // Fetch logs
           const logResult = await k8sRequest(`/api/v1/namespaces/${namespace}/pods/${podName}/log?tailLines=500`)
           logs = typeof logResult === 'string' ? logResult : JSON.stringify(logResult)
         }
@@ -790,6 +815,435 @@ PYEOF`
       }
 
       return jsonReply(res, 200, { status: jobStatus, logs, jobName, podName })
+    } catch (e) {
+      return jsonReply(res, 500, { error: e.message })
+    }
+  }
+
+  // ── Benchmark Endpoints ────────────────────────────────────────────────
+
+  // POST /api/clusters/:namespace/:name/benchmark — create a benchmark job
+  const createBenchmarkMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/benchmark$/)
+  if (createBenchmarkMatch && req.method === 'POST') {
+    let body = ''
+    for await (const chunk of req) body += chunk
+    try {
+      const [, namespace, name] = createBenchmarkMatch
+      const { workload, objSize, duration, protocol, label } = JSON.parse(body)
+
+      // Validate inputs
+      const validWorkloads = ['put-only', 'full-cycle']
+      if (!validWorkloads.includes(workload)) {
+        return jsonReply(res, 400, { error: `workload must be one of: ${validWorkloads.join(', ')}` })
+      }
+      const objSz = parseInt(objSize) || 4096
+      if (objSz < 1 || objSz > 100 * 1024 * 1024) {
+        return jsonReply(res, 400, { error: 'objSize must be between 1 and 104857600 (100MB)' })
+      }
+      const dur = parseInt(duration) || 60
+      if (dur < 5 || dur > 3600) {
+        return jsonReply(res, 400, { error: 'duration must be between 5 and 3600 seconds' })
+      }
+      const validProtocols = ['rdma', 'tcp']
+      if (!validProtocols.includes(protocol)) {
+        return jsonReply(res, 400, { error: `protocol must be one of: ${validProtocols.join(', ')}` })
+      }
+
+      // Fetch cluster CR to get master / metadata server config
+      const cluster = await k8sRequest(
+        `/apis/mooncake.io/v1alpha1/namespaces/${namespace}/mooncakeclusters/${name}`
+      )
+      const spec = cluster.spec || {}
+      const image = spec.image || 'mooncake/mooncake-store:latest'
+      const rpcPort = spec.master?.rpcPort || 50051
+      const metadataPort = spec.master?.httpMetadataServerPort || 8080
+      const segmentSize = spec.workers?.segmentSize || '4Gi'
+      const rdmaEnabled = protocol === 'rdma' ? (spec.workers?.rdmaEnabled !== false) : false
+
+      // Parse data size helpers (reuse from test logic)
+      function parseDataSize(str) {
+        if (!str || typeof str !== 'string') return null
+        const s = str.trim().toUpperCase()
+        const m = s.match(/^(\d+(?:\.\d+)?)\s*(?:B)?\s*(KB|MB|GB|TB|KIB|MIB|GIB|TIB|K|M|G|T)?$/)
+        if (!m) return null
+        const val = parseFloat(m[1])
+        const unit = m[2] || 'B'
+        const multipliers = { B: 1, K: 1024, KB: 1024, KIB: 1024, M: 1024 * 1024, MB: 1024 * 1024, MIB: 1024 * 1024, G: 1024 * 1024 * 1024, GB: 1024 * 1024 * 1024, GIB: 1024 * 1024 * 1024, T: 1024 * 1024 * 1024 * 1024, TB: 1024 * 1024 * 1024 * 1024, TIB: 1024 * 1024 * 1024 * 1024 }
+        return Math.floor(val * (multipliers[unit] || 1))
+      }
+      const segmentBytes = parseDataSize(segmentSize) || 4 * 1024 * 1024 * 1024
+
+      const masterAddr = name + '-master-headless.' + namespace + ':' + rpcPort
+      const leaderPod = await findLeaderPod(namespace, name)
+      const metadataServer = 'http://' + leaderPod + '.' + name + '-master-headless.' + namespace + '.svc:' + metadataPort + '/metadata'
+
+      const timestamp = Date.now()
+      const benchLabel = label || ('benchmark-' + name + '-' + timestamp)
+      const jobName = name + '-benchmark-' + timestamp
+
+      // The benchmark Python script — inlined via heredoc
+      const pythonScript = `import os, sys, time, json, signal, statistics, urllib.request
+
+os.environ["LD_LIBRARY_PATH"] = "/usr/local/lib/mooncake:/usr/local/lib/python3.12/dist-packages/mooncake:" + os.environ.get("LD_LIBRARY_PATH", "")
+sys.path.insert(0, "/usr/local/lib/python3.12/dist-packages")
+from mooncake import store
+
+PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "pushgateway:9091")
+TEST_LABEL = os.environ.get("TEST_LABEL", "benchmark")
+OBJ_SIZE = int(os.environ.get("OBJ_SIZE", "4096"))
+DURATION = int(os.environ.get("DURATION", "60"))
+PROTOCOL = os.environ.get("PROTOCOL", "rdma")
+WORKLOAD = os.environ.get("WORKLOAD", "put-only")
+LOSS_PCT = os.environ.get("LOSS_PCT", "0")
+MASTER_ADDR = os.environ.get("MASTER_ADDR", "")
+METADATA_SERVER = os.environ.get("METADATA_SERVER", "")
+SEGMENT_SIZE = int(os.environ.get("SEGMENT_SIZE", "536870912"))
+LOCAL_BUFFER_SIZE = int(os.environ.get("LOCAL_BUFFER_SIZE", "268435456"))
+NETWORK_IF = os.environ.get("NETWORK_IF", "")
+
+running = True
+def _handler(sig, frame):
+    global running
+    running = False
+signal.signal(signal.SIGINT, _handler)
+signal.signal(signal.SIGTERM, _handler)
+
+def push_metrics(metrics):
+    lines = []
+    for name, value, labels in metrics:
+        label_str = ",".join(k + '="' + v + '"' for k, v in labels.items())
+        lines.append(name + "{" + label_str + "} " + str(value))
+    data = "\\n".join(lines) + "\\n"
+    try:
+        req = urllib.request.Request(
+            "http://" + PUSHGATEWAY + "/metrics/job/mooncake/instance/" + TEST_LABEL,
+            data=data.encode(),
+            method="PUT"
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+
+hostname = os.environ.get("POD_IP", "0.0.0.0")
+if not MASTER_ADDR or not METADATA_SERVER:
+    print("FATAL: MASTER_ADDR and METADATA_SERVER must be set", flush=True)
+    sys.exit(1)
+
+s = store.MooncakeDistributedStore()
+rc = s.setup(hostname, METADATA_SERVER, SEGMENT_SIZE, LOCAL_BUFFER_SIZE, PROTOCOL, NETWORK_IF, MASTER_ADDR)
+if rc != 0:
+    print("FATAL: setup failed rc=" + str(rc), flush=True)
+    sys.exit(1)
+print("[SETUP OK] hostname=" + hostname + " master=" + MASTER_ADDR + " protocol=" + PROTOCOL + " workload=" + WORKLOAD, flush=True)
+
+d = os.urandom(OBJ_SIZE)
+start = time.time()
+end_time = start + DURATION
+
+total_ops = 0
+total_errors = 0
+all_latencies = []
+interval_latencies = []
+
+push_interval = 1.0
+last_push = start
+prev_ops = 0
+prev_errors = 0
+last_print = start
+
+print("[BENCH] Running " + WORKLOAD + " for " + str(DURATION) + "s...", flush=True)
+while running and time.time() < end_time:
+    key = TEST_LABEL + "_" + str(total_ops)
+    try:
+        t0 = time.time()
+        if WORKLOAD == "full-cycle":
+            try:
+                rc1 = s.put(key, d)
+                _val = s.get(key)
+                rc3 = s.remove(key)
+                op_ok = True
+            except Exception as _e:
+                print("[FULLCYCLE_ERROR] " + str(_e), flush=True)
+                op_ok = False
+        else:
+            rc1 = s.put(key, d)
+            op_ok = (rc1 == 0)
+
+        t1 = time.time()
+        if op_ok:
+            lat = (t1 - t0) * 1000
+            all_latencies.append(lat)
+            interval_latencies.append(lat)
+            total_ops += 1
+        else:
+            total_errors += 1
+    except Exception:
+        total_errors += 1
+
+    now = time.time()
+    if now - last_push >= push_interval:
+        elapsed = now - start
+        if elapsed > 0:
+            labels = {"test_label": TEST_LABEL, "protocol": PROTOCOL, "loss_pct": LOSS_PCT}
+
+            lats_sorted = sorted(interval_latencies)
+            p50 = statistics.median(interval_latencies) if interval_latencies else 0
+            p99 = lats_sorted[min(int(len(lats_sorted)*0.99), len(lats_sorted)-1)] if len(lats_sorted) > 10 else (interval_latencies[-1] if interval_latencies else 0)
+            avg_lat = statistics.mean(interval_latencies) if interval_latencies else 0
+
+            interval_elapsed = now - last_push
+            interval_ops = total_ops - prev_ops
+            ops_per_s = interval_ops / interval_elapsed if interval_elapsed > 0 else 0
+            mb_per_s = interval_ops * OBJ_SIZE / interval_elapsed / 1024 / 1024 if interval_elapsed > 0 else 0
+
+            push_metrics([
+                ("mooncake_ops_total", total_ops, labels),
+                ("mooncake_bytes_total", total_ops * OBJ_SIZE, labels),
+                ("mooncake_errors_total", total_errors, labels),
+                ("mooncake_avg_latency_ms", avg_lat, labels),
+                ("mooncake_p50_latency_ms", p50, labels),
+                ("mooncake_p99_latency_ms", p99, labels),
+                ("mooncake_throughput_mbps", mb_per_s, labels),
+                ("mooncake_ops_per_sec", ops_per_s, labels),
+            ])
+
+            prev_ops = total_ops
+            prev_errors = total_errors
+            interval_latencies = []
+
+        last_push = now
+
+    if now - last_print >= 5:
+        elapsed = now - start
+        cur_mbps = total_ops * OBJ_SIZE / elapsed / 1024 / 1024 if elapsed > 0 else 0
+        print("  [" + str(int(elapsed)) + "s] " + str(total_ops) + " ops, " + str(round(total_ops/elapsed, 1)) + " ops/s, " + str(round(cur_mbps, 2)) + " MB/s, " + str(total_errors) + " err", flush=True)
+        last_print = now
+
+elapsed = time.time() - start
+if elapsed > 0:
+    mbps = total_ops * OBJ_SIZE / elapsed / 1024 / 1024
+    avg_lat = statistics.mean(all_latencies) if all_latencies else 0
+    print("[DONE] " + str(total_ops) + " ops in " + str(round(elapsed, 1)) + "s = " + str(round(mbps, 2)) + " MB/s, " + str(round(total_ops/elapsed, 1)) + " ops/s, " + str(total_errors) + " err", flush=True)
+    print("[LATENCY] avg=" + str(round(avg_lat, 3)) + "ms over " + str(len(all_latencies)) + " samples", flush=True)
+else:
+    print("[DONE] 0 ops", flush=True)
+
+result = {
+    "test": TEST_LABEL,
+    "protocol": PROTOCOL,
+    "loss_pct": LOSS_PCT,
+    "workload": WORKLOAD,
+    "obj_size": OBJ_SIZE,
+    "duration": round(elapsed, 2),
+    "ops": total_ops,
+    "errors": total_errors,
+    "throughput_mbps": round(mbps, 2) if elapsed > 0 else 0,
+    "ops_per_sec": round(total_ops/elapsed, 1) if elapsed > 0 else 0,
+    "avg_latency_ms": round(statistics.mean(all_latencies), 3) if all_latencies else 0,
+}
+os.makedirs("/tmp/monitor-results", exist_ok=True)
+with open("/tmp/monitor-results/" + TEST_LABEL + ".json", "w") as f:
+    json.dump(result, f, indent=2)
+print("[RESULT] " + json.dumps(result), flush=True)
+
+try:
+    s.close()
+except:
+    pass`
+
+      const bashCommand = 'python3 << \'PYEOF\'\n' + pythonScript + '\nPYEOF'
+
+      const env = [
+        { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },
+        { name: 'LD_LIBRARY_PATH', value: '/usr/local/lib/mooncake' },
+        { name: 'MASTER_ADDR', value: masterAddr },
+        { name: 'METADATA_SERVER', value: metadataServer },
+        { name: 'SEGMENT_SIZE', value: String(segmentBytes) },
+        { name: 'LOCAL_BUFFER_SIZE', value: String(256 * 1024 * 1024) },
+        { name: 'PROTOCOL', value: protocol },
+        { name: 'WORKLOAD', value: workload },
+        { name: 'PUSHGATEWAY', value: process.env.PUSHGATEWAY || 'pushgateway:9091' },
+        { name: 'TEST_LABEL', value: benchLabel },
+        { name: 'OBJ_SIZE', value: String(objSz) },
+        { name: 'DURATION', value: String(dur) },
+      ]
+
+      // When RDMA is enabled, set network interface and add privileged access
+      if (rdmaEnabled) {
+        env.push({ name: 'NETWORK_IF', value: 'rxe-eth0' })
+      }
+
+      const benchmarkContainer = {
+        name: 'benchmark',
+        image: image,
+        imagePullPolicy: 'IfNotPresent',
+        command: ['bash', '-c', bashCommand],
+        env: env,
+      }
+
+      const podSpec = {
+        restartPolicy: 'Never',
+        containers: [benchmarkContainer],
+      }
+
+      if (rdmaEnabled) {
+        benchmarkContainer.securityContext = { privileged: true }
+        podSpec.volumes = [{
+          name: 'rdma-dev',
+          volumeSource: { hostPath: { path: '/dev/infiniband', type: 'DirectoryOrCreate' } },
+        }]
+        benchmarkContainer.volumeMounts = [{
+          name: 'rdma-dev',
+          mountPath: '/dev/infiniband',
+        }]
+      }
+
+      const job = {
+        apiVersion: 'batch/v1',
+        kind: 'Job',
+        metadata: {
+          name: jobName,
+          namespace,
+          labels: { app: 'mooncake-benchmark', cluster: name },
+        },
+        spec: {
+          backoffLimit: 0,
+          ttlSecondsAfterFinished: 3600,
+          template: { spec: podSpec },
+        },
+      }
+
+      await k8sRequest('/apis/batch/v1/namespaces/' + namespace + '/jobs', 'POST', job)
+
+      console.log('[api-handler] Benchmark job created: ' + jobName + ' in namespace ' + namespace)
+      return jsonReply(res, 201, { jobName, namespace, label: benchLabel })
+    } catch (e) {
+      console.log('[api-handler] POST benchmark error:', e.message)
+      return jsonReply(res, 500, { error: e.message })
+    }
+  }
+
+  // GET /api/clusters/:namespace/:name/benchmark/:jobname — get benchmark job status and logs
+  const benchmarkStatusMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/benchmark\/([^/]+)$/)
+  if (benchmarkStatusMatch && req.method === 'GET') {
+    try {
+      const [, namespace, name, jobName] = benchmarkStatusMatch
+
+      // Fetch Job status
+      let jobStatus = 'Pending'
+      let succeeded = 0, failed = 0, active = 0
+      try {
+        const jobResult = await k8sRequest('/apis/batch/v1/namespaces/' + namespace + '/jobs/' + jobName)
+        const st = jobResult.status || {}
+        succeeded = st.succeeded || 0
+        failed = st.failed || 0
+        active = st.active || 0
+        if (succeeded > 0) jobStatus = 'Succeeded'
+        else if (failed > 0) jobStatus = 'Failed'
+        else if (active > 0) jobStatus = 'Running'
+      } catch (e) {
+        return jsonReply(res, 200, { status: 'Expired', logs: 'Job has expired (TTL 1h).' })
+      }
+
+      // Find associated pod and fetch logs
+      let podName = null
+      let logs = ''
+      let result = null
+      try {
+        const podResult = await k8sRequest('/api/v1/namespaces/' + namespace + '/pods?labelSelector=job-name=' + jobName)
+        const pods = podResult?.items || []
+        if (pods.length > 0) {
+          podName = pods[0].metadata.name
+          const podPhase = pods[0].status?.phase || ''
+          const containerStatuses = pods[0].status?.containerStatuses || []
+
+          // Early detection: check pod container state directly — don't wait for Job controller
+          if (jobStatus === 'Pending' || jobStatus === 'Running') {
+            for (const cs of containerStatuses) {
+              if (cs.state?.terminated) {
+                const exitCode = cs.state.terminated.exitCode
+                if (exitCode === 0) {
+                  jobStatus = 'Succeeded'
+                } else {
+                  jobStatus = 'Failed'
+                }
+                break
+              }
+              // Container waiting with CrashLoopBackOff or error
+              if (cs.state?.waiting?.reason === 'CrashLoopBackOff' || cs.state?.waiting?.reason === 'Error') {
+                jobStatus = 'Failed'
+                break
+              }
+            }
+            // Also use pod phase as signal (some runtimes set phase=Succeeded before job status updates)
+            if (jobStatus === 'Pending' && (podPhase === 'Succeeded' || podPhase === 'Failed')) {
+              jobStatus = podPhase === 'Succeeded' ? 'Succeeded' : 'Failed'
+            }
+          }
+
+          const logResult = await k8sRequest('/api/v1/namespaces/' + namespace + '/pods/' + podName + '/log?tailLines=500')
+          logs = typeof logResult === 'string' ? logResult : JSON.stringify(logResult)
+
+          // Try to parse result JSON from the last line
+          if (jobStatus === 'Succeeded' || jobStatus === 'Failed') {
+            const lines = logs.split('\n').filter(l => l.trim())
+            for (let i = lines.length - 1; i >= 0; i--) {
+              const line = lines[i].trim()
+              if (line.startsWith('[RESULT] ')) {
+                try {
+                  result = JSON.parse(line.substring(9))
+                } catch (e) { /* ignore parse error */ }
+                break
+              }
+            }
+          }
+        }
+      } catch (e) {
+        logs = ''
+      }
+
+      return jsonReply(res, 200, { status: jobStatus, logs, jobName, podName, result })
+    } catch (e) {
+      return jsonReply(res, 500, { error: e.message })
+    }
+  }
+
+  // GET /api/clusters/:namespace/:name/benchmarks — list all benchmark jobs for a cluster
+  const listBenchmarksMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/benchmarks$/)
+  if (listBenchmarksMatch && req.method === 'GET') {
+    try {
+      const [, namespace, name] = listBenchmarksMatch
+      const result = await k8sRequest(
+        '/apis/batch/v1/namespaces/' + namespace + '/jobs?labelSelector=app%3Dmooncake-benchmark%2Ccluster%3D' + name
+      )
+      const items = (result?.items || []).map(job => {
+        const st = job.status || {}
+        let status = 'Pending'
+        if (st.succeeded > 0) status = 'Succeeded'
+        else if (st.failed > 0) status = 'Failed'
+        else if (st.active > 0) status = 'Running'
+        return {
+          name: job.metadata.name,
+          status,
+          created: job.metadata.creationTimestamp,
+          completed: st.completionTime || null,
+        }
+      })
+      // Sort by creation time descending
+      items.sort((a, b) => new Date(b.created).getTime() - new Date(a.created).getTime())
+      return jsonReply(res, 200, { benchmarks: items })
+    } catch (e) {
+      return jsonReply(res, 500, { error: e.message })
+    }
+  }
+
+  // DELETE /api/clusters/:namespace/:name/benchmark/:jobname — delete a benchmark job
+  const deleteBenchmarkMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/benchmark\/([^/]+)$/)
+  if (deleteBenchmarkMatch && req.method === 'DELETE') {
+    try {
+      const [, namespace, , jobName] = deleteBenchmarkMatch
+      await k8sRequest('/apis/batch/v1/namespaces/' + namespace + '/jobs/' + jobName, 'DELETE')
+      return jsonReply(res, 200, { success: true })
     } catch (e) {
       return jsonReply(res, 500, { error: e.message })
     }

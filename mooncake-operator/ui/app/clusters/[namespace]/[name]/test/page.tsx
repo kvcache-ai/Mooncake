@@ -48,6 +48,7 @@ export default function TestClusterPage({
     if (!jobName) return
     if (jobStatus === 'Succeeded' || jobStatus === 'Failed' || jobStatus === 'Expired') return
 
+    const pollInterval = jobStatus === 'Running' ? 1000 : 2000
     const interval = setInterval(async () => {
       try {
         const res = await fetch(`/api/clusters/${namespace}/${name}/test/${jobName}`)
@@ -57,7 +58,7 @@ export default function TestClusterPage({
       } catch (e) {
         // Ignore transient poll failures
       }
-    }, 3000)
+    }, pollInterval)
 
     return () => clearInterval(interval)
   }, [jobName, jobStatus, namespace, name])

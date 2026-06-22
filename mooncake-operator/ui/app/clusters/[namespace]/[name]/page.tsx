@@ -383,6 +383,12 @@ export default function ClusterDetailPage({
           >
             Test
           </a>
+          <a
+            href={`/clusters/${namespace}/${name}/benchmark`}
+            className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-green-600 hover:bg-green-700"
+          >
+            Benchmark
+          </a>
           <button
             type="button"
             onClick={handleDelete}
