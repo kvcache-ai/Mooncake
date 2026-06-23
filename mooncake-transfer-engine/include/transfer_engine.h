@@ -71,6 +71,10 @@ class TransferEngine {
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
+    TransferEngine(TransferEngine&&) = default;
+
+    TransferEngine& operator=(TransferEngine&&) = default;
+
     ~TransferEngine();
 
     int init(const std::string& metadata_conn_string,
