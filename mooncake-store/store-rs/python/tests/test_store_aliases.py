@@ -21,6 +21,7 @@ def _load_store_module():
     sys.modules["mooncake._runtime"] = fake_runtime
 
     fake_native = types.ModuleType("mooncake._store_rs")
+    fake_native.BufferPool = type("BufferPool", (), {})
     sys.modules["mooncake._store_rs"] = fake_native
 
     spec = importlib.util.spec_from_file_location(
@@ -57,6 +58,7 @@ def _load_package_with_stale_native_store():
     sys.modules["mooncake._runtime"] = fake_runtime
 
     fake_native = types.ModuleType("mooncake._store_rs")
+    fake_native.BufferPool = type("BufferPool", (), {})
     sys.modules["mooncake._store_rs"] = fake_native
 
     stale_store = types.ModuleType("mooncake.store")

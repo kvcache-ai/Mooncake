@@ -11,6 +11,7 @@ from ._build_info import BUILD_INFO
 _STORE_EXPORTS = {
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
+    "BufferPool",
     "ReplicateConfig",
     "init_tracing",
     "metrics_server_address",

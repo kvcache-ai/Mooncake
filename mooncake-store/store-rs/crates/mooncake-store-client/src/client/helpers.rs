@@ -134,6 +134,15 @@ impl StoreClient {
             .saturating_add(self.local_memory.scratch_bytes);
         u64::try_from(total).unwrap_or(u64::MAX)
     }
+
+    pub fn local_scratch_capacity_bytes(&self) -> usize {
+        self.local_memory.scratch_bytes
+    }
+
+    pub fn plan_local_scratch(&self, len: usize) -> Result<ScratchReservation> {
+        let state = self.state.lock();
+        state.memory_ref()?.plan_scratch(&[len.max(1)])
+    }
 }
 
 impl RouteHitReporter for StoreClient {

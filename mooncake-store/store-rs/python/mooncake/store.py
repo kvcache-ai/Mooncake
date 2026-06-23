@@ -84,9 +84,8 @@ def _load_native():
 
 _native = _load_native()
 
-# Re-export native buffer pool types so `from mooncake.store import RegisteredBufferPool` works.
-RegisteredBufferPool = _native.RegisteredBufferPool
-RegisteredBufferLease = _native.RegisteredBufferLease
+# Re-export native buffer pool type so `from mooncake.store import BufferPool` works.
+BufferPool = _native.BufferPool
 
 _CACHE_STATUS = "status"
 _CACHE_STATUS_LIST = "status_list"
@@ -1798,6 +1797,7 @@ except AttributeError:
 __all__ = [
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
+    "BufferPool",
     "ReplicateConfig",
     "init_tracing",
     "metrics_text",
