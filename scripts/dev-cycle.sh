@@ -26,10 +26,16 @@ restart-store-pods() {
     fi
     if [[ -n "$ns" ]]; then
         for n in $ns; do
-            kubectl rollout restart statefulset -n "$n" --selector 'app=mooncake-master' 2>/dev/null || true
-            kubectl rollout restart deployment -n "$n" --selector 'app=mooncake-worker' 2>/dev/null || true
-            kubectl rollout restart deployment -n "$n" --selector 'app=mooncake-proxy' 2>/dev/null || true
-            kubectl rollout status statefulset -n "$n" --selector 'app=mooncake-master' --timeout=120s 2>/dev/null || true
+            # Restart statefulsets and deployments directly by name pattern instead of label selector
+            # (statefulset labels may not match template labels, causing selector-based restart to fail)
+            kubectl get statefulset -n "$n" -o name 2>/dev/null | while read -r sts; do
+                kubectl rollout restart "$sts" -n "$n"
+            done
+            kubectl get deployment -n "$n" -o name 2>/dev/null | while read -r deploy; do
+                kubectl rollout restart "$deploy" -n "$n"
+            done
+            kubectl rollout status statefulset -n "$n" --timeout=120s 2>/dev/null || true
+            kubectl rollout status deployment -n "$n" --timeout=120s 2>/dev/null || true
         done
     else
         info "未找到 MooncakeCluster CR，跳过 Pod 重启"
@@ -48,7 +54,8 @@ deploy-operator() {
     cd "${OPERATOR_DIR}"
     go build -o bin/manager ./cmd/main.go && ok "Go 编译完成"
     docker build -t mooncake-operator:latest . && ok "Docker 镜像构建完成"
-    kind load docker-image mooncake-operator:latest && ok "镜像加载到 kind"
+    local kind_cluster="${KIND_CLUSTER:-three-node-cluster}"
+    kind load docker-image --name "$kind_cluster" mooncake-operator:latest && ok "镜像加载到 kind"
     kubectl rollout restart deployment -n mooncake-operator-system mooncake-operator-controller-manager
     kubectl rollout status deployment -n mooncake-operator-system mooncake-operator-controller-manager --timeout=60s
     ok "Operator 部署完成！"
@@ -65,7 +72,8 @@ deploy-ui() {
     [[ ! -d node_modules ]] && npm install
     npm run build && ok "Next.js 构建完成"
     docker build -f Dockerfile.hostbuild -t mooncake-operator-ui:latest . && ok "Docker 镜像构建完成"
-    kind load docker-image mooncake-operator-ui:latest && ok "镜像加载到 kind"
+    local kind_cluster="${KIND_CLUSTER:-three-node-cluster}"
+    kind load docker-image --name "$kind_cluster" mooncake-operator-ui:latest && ok "镜像加载到 kind"
     kubectl rollout restart deployment -n mooncake-operator-system mooncake-operator-ui
     kubectl rollout status deployment -n mooncake-operator-system mooncake-operator-ui --timeout=60s
     # 重启端口转发
@@ -140,6 +148,9 @@ deploy-store() {
 
     # Step 5: 构建快速 Docker 镜像（使用预编译 wheel，跳过 C++ 编译）
     info "构建 Store Docker 镜像（快速模式，无 C++ 编译）..."
+    # Update mooncake_master.bin from build output (Dockerfile copies this into the image)
+    cp "${ROOT_DIR}/build/mooncake-store/src/mooncake_master" "${ROOT_DIR}/mooncake_master.bin" && \
+        ok "mooncake_master.bin 已更新"
     docker build --no-cache -f docker/mooncake-store-fast.Dockerfile \
         -t mooncake/mooncake-store:latest \
         -t mooncake-store:latest . && ok "Docker 镜像构建完成"

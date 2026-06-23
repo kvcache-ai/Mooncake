@@ -51,16 +51,30 @@ type drainJobInfo struct {
 	FailedUnits    uint64
 	Error          string
 	CreatedAt      time.Time
+	RetryCount     int       // number of times this drain has been retried
+	LastRetryTime  time.Time // when the last retry was attempted
 }
 
 // MooncakeClusterReconciler reconciles a MooncakeCluster object.
 type MooncakeClusterReconciler struct {
 	client.Client
-	Scheme      *runtime.Scheme
-	Recorder    record.EventRecorder
-	drainJobsMu sync.Mutex
-	drainJobs   map[string]*drainJobInfo // key: pod.UID
+	Scheme        *runtime.Scheme
+	Recorder      record.EventRecorder
+	drainJobsMu   sync.Mutex
+	drainJobs     map[string]*drainJobInfo // key: pod.UID
+	drainRetryMu  sync.Mutex
+	drainRetryMap map[string]drainRetryInfo // pod.UID -> retry info
 }
+
+type drainRetryInfo struct {
+	retryAfter time.Time // retry backoff until this time
+	retryCount int       // number of retries so far
+}
+
+const (
+	maxDrainRetries    = 5                // maximum drain retry attempts
+	drainRetryInterval = 30 * time.Second // wait between retries
+)
 
 // +kubebuilder:rbac:groups=mooncake.io,resources=mooncakeclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=mooncake.io,resources=mooncakeclusters/status,verbs=get;update;patch
@@ -86,6 +100,11 @@ func (r *MooncakeClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		r.drainJobs = make(map[string]*drainJobInfo)
 	}
 	r.drainJobsMu.Unlock()
+	r.drainRetryMu.Lock()
+	if r.drainRetryMap == nil {
+		r.drainRetryMap = make(map[string]drainRetryInfo)
+	}
+	r.drainRetryMu.Unlock()
 
 	// 1. Fetch MooncakeCluster CR
 	var mc mooncakev1alpha1.MooncakeCluster
@@ -459,11 +478,11 @@ func (r *MooncakeClusterReconciler) reconcileMasterStatefulSet(ctx context.Conte
 	existing.Spec.Replicas = desired.Spec.Replicas
 	existing.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
 	existing.Spec.Template.Spec.Containers[0].ImagePullPolicy = desired.Spec.Template.Spec.Containers[0].ImagePullPolicy
-		existing.Spec.Template.Spec.Containers[0].Command = desired.Spec.Template.Spec.Containers[0].Command
-		existing.Spec.Template.Spec.Containers[0].Args = desired.Spec.Template.Spec.Containers[0].Args
-		existing.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
-		existing.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
-		existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
+	existing.Spec.Template.Spec.Containers[0].Command = desired.Spec.Template.Spec.Containers[0].Command
+	existing.Spec.Template.Spec.Containers[0].Args = desired.Spec.Template.Spec.Containers[0].Args
+	existing.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
+	existing.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
+	existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
 	return r.Patch(ctx, &existing, patchBase)
 }
 
@@ -1338,9 +1357,12 @@ func (r *MooncakeClusterReconciler) migrateDecodePod(
 }
 
 // reconcileTerminatingWorkers handles worker pods that are being deleted.
-// Drain jobs are created for all terminating pods simultaneously. The master
-// handles concurrent drain scheduling; the otherWorkersExist check prevents
-// circular draining (A→B and B→A) deadlocks.
+// It creates drain jobs for all terminating pods. When drain completes and the
+// segment becomes DRAINED, the pod's PreStop hook detects it and exits cleanly,
+// triggering SIGTERM → mooncake_client cleanup → container termination.
+// Unlike the old approach, we do NOT force-delete pods, because GracePeriodSeconds=0
+// can leave container processes running indefinitely, resulting in orphaned
+// mooncake_client processes that still register with the master.
 func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 	ctx context.Context,
 	mc *mooncakev1alpha1.MooncakeCluster,
@@ -1425,46 +1447,50 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 		}
 		if !podStillExists && job.Status >= 3 {
 			delete(r.drainJobs, uid)
+			continue
+		}
+		// Retry FAILED drain jobs: leases may have expired since the last
+		// attempt, or transient conditions may have resolved.
+		if job.Status == 4 && podStillExists && job.RetryCount < maxDrainRetries {
+			newRetryCount := job.RetryCount + 1
+			logger.Info("drain job FAILED, will retry",
+				"pod", job.PodName, "segment", job.SegmentName,
+				"retryCount", newRetryCount)
+			delete(r.drainJobs, uid)
+			r.drainRetryMu.Lock()
+			r.drainRetryMap[uid] = drainRetryInfo{
+				retryAfter: time.Now().Add(drainRetryInterval),
+				retryCount: newRetryCount,
+			}
+			r.drainRetryMu.Unlock()
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "AutoDrainRetry",
+				fmt.Sprintf("Drain job for pod %s failed, retry %d/%d",
+					job.PodName, newRetryCount, maxDrainRetries))
+		} else if job.Status == 4 && podStillExists {
+			logger.Info("drain job FAILED, max retries reached",
+				"pod", job.PodName, "segment", job.SegmentName,
+				"retryCount", job.RetryCount, "error", job.Error)
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "AutoDrainExhausted",
+				fmt.Sprintf("Drain job for pod %s max retries %d reached: %s",
+					job.PodName, maxDrainRetries, job.Error))
 		}
 	}
 
 	r.drainJobsMu.Unlock()
-	
-	// Force-delete pods whose drain jobs have succeeded (status == 3).
-	// FAILED or CANCELED drain jobs should NOT trigger force-delete —
-	// they will terminate naturally via PreStop hook when the timeout
-	// expires, giving more time for data to be preserved.
-	// This also handles the case where the PreStop hook doesn't detect
-	// the DRAINED status and the pod remains stuck in Terminating after
-	// data migration completes.
+
+	// Clean up tracking for completed drain jobs and let PreStop handle
+	// the pod termination. When the drain succeeds, the DRAINED status
+	// triggers the PreStop hook sys.exit(0), the kubelet sends SIGTERM
+	// to mooncake_client, which cleans up properly (no orphaned processes).
 	r.drainJobsMu.Lock()
-	var completedUIDs []string
 	for uid, job := range r.drainJobs {
-		if job.Status == 3 {
-			completedUIDs = append(completedUIDs, uid)
+		if job.Status == 3 { // SUCCEEDED
+			logger.Info("drain job completed, PreStop will detect DRAINED and terminate",
+				"pod", job.PodName, "segment", job.SegmentName)
+			delete(r.drainJobs, uid)
 		}
 	}
 	r.drainJobsMu.Unlock()
-	
-	for _, uid := range completedUIDs {
-		for _, tp := range terminatingPods {
-			if string(tp.UID) != uid {
-				continue
-			}
-			logger.Info("drain completed, force-deleting terminating pod", "pod", tp.Name)
-			zero := int64(0)
-			if err := r.Delete(ctx, &tp, &client.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
-				if !errors.IsNotFound(err) {
-					logger.Error(err, "failed to force-delete pod after drain", "pod", tp.Name)
-				}
-			} else {
-				r.Recorder.Event(mc, corev1.EventTypeNormal, "PodForceDeleted",
-					fmt.Sprintf("Force-deleted terminating pod %s after drain completed", tp.Name))
-			}
-			break
-		}
-	}
-	
 	// 3. Process the next terminating pod that doesn't have a tracked job
 	for _, pod := range terminatingPods {
 		r.drainJobsMu.Lock()
@@ -1472,6 +1498,19 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 		r.drainJobsMu.Unlock()
 		if tracked {
 			continue
+		}
+		// Skip pods that recently had a failed drain (retry backoff)
+		r.drainRetryMu.Lock()
+		drainRetry, hasRetry := r.drainRetryMap[string(pod.UID)]
+		r.drainRetryMu.Unlock()
+		if hasRetry && time.Now().Before(drainRetry.retryAfter) {
+			continue
+		}
+		// Clean up expired retry entries
+		if hasRetry && time.Now().After(drainRetry.retryAfter) {
+			r.drainRetryMu.Lock()
+			delete(r.drainRetryMap, string(pod.UID))
+			r.drainRetryMu.Unlock()
 		}
 
 		podIP := pod.Status.PodIP
@@ -1489,16 +1528,17 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 				"pod", pod.Name, "segment", segmentName, "error", err)
 			// Don't skip — try to create drain job anyway
 		} else if lifecycle == "DRAINED" {
-			logger.Info("segment already drained, force-deleting terminating pod",
+			logger.Info("segment drained, will re-delete pod with short grace period",
 				"pod", pod.Name, "segment", segmentName)
-			zero := int64(0)
-			if err := r.Delete(ctx, &pod, &client.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
-				if !errors.IsNotFound(err) {
-					logger.Error(err, "failed to force-delete pod with drained segment", "pod", pod.Name)
-				}
-			} else {
-				r.Recorder.Event(mc, corev1.EventTypeNormal, "PodForceDeleted",
-					fmt.Sprintf("Force-deleted terminating pod %s with drained segment %s", pod.Name, segmentName))
+			// The PreStop hook may not detect DRAINED in all environments
+			// (kubelet behavior, DNS timing, etc.). To avoid waiting the full
+			// TerminationGracePeriodSeconds, re-delete the pod with a
+			// 1-second grace period. This overrides the original grace period
+			// and triggers SIGTERM after 1s. Since the segment is already DRAINED,
+			// no orphaned segments will linger on the master.
+			if err := r.Delete(ctx, &pod, client.GracePeriodSeconds(1)); err != nil {
+				logger.Error(err, "failed to re-delete terminating pod with short grace period",
+					"pod", pod.Name)
 			}
 			continue
 		}
@@ -1516,10 +1556,10 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 		}
 
 		if !otherWorkersExist {
-			logger.Info("no other ready workers available, discarding data for terminating pod",
+			logger.Info("no other ready workers, skipping drain for terminating pod",
 				"pod", pod.Name, "segment", segmentName)
-			r.Recorder.Event(mc, corev1.EventTypeWarning, "AutoDrainSkipped",
-				fmt.Sprintf("No target workers for segment %s on terminating pod %s, data will be discarded", segmentName, pod.Name))
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "AutoDrainDeferred",
+				fmt.Sprintf("No target workers for segment %s on terminating pod %s, deferring drain", segmentName, pod.Name))
 			continue
 		}
 
@@ -1542,6 +1582,14 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 		}
 
 		r.drainJobsMu.Lock()
+		// Carry over retry count from previous failed attempt
+		r.drainRetryMu.Lock()
+		prevRetry, hasPrevRetry := r.drainRetryMap[string(pod.UID)]
+		r.drainRetryMu.Unlock()
+		prevRetryCount := 0
+		if hasPrevRetry {
+			prevRetryCount = prevRetry.retryCount
+		}
 		r.drainJobs[string(pod.UID)] = &drainJobInfo{
 			PodName:     pod.Name,
 			PodIP:       podIP,
@@ -1549,6 +1597,7 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 			JobID:       jobID,
 			Status:      0, // CREATED
 			CreatedAt:   time.Now(),
+			RetryCount:  prevRetryCount,
 		}
 		r.drainJobsMu.Unlock()
 
@@ -1748,7 +1797,8 @@ func (r *MooncakeClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
-	// Only trigger on pod deletion (DeletionTimestamp set)
+	// Trigger on pod DeletionTimestamp (new Terminating) and when a worker
+	// pod becomes Ready (replacement pod ready, so drain can start).
 	podPredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool { return false },
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -1757,8 +1807,15 @@ func (r *MooncakeClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok1 || !ok2 {
 				return false
 			}
-			// Only trigger when DeletionTimestamp is newly set
-			return newPod.DeletionTimestamp != nil && oldPod.DeletionTimestamp == nil
+			// Trigger when DeletionTimestamp is newly set (pod being deleted)
+			if newPod.DeletionTimestamp != nil && oldPod.DeletionTimestamp == nil {
+				return true
+			}
+			// Trigger when pod transitions to Ready (e.g. replacement pod ready for drain)
+			if !isPodReady(oldPod) && isPodReady(newPod) {
+				return true
+			}
+			return false
 		},
 		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
 		GenericFunc: func(e event.GenericEvent) bool { return false },

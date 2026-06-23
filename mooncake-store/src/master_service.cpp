@@ -2705,22 +2705,30 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     source->dec_refcnt();
 
     // If the move target has already existed on MoveStart, task.replica_ids
-    // will be empty. Thus we need to check whether we have replica_ids to
-    // process.
-    if (!task.replica_ids.empty()) {
-        auto replica_id = task.replica_ids[0];
-        auto replica = metadata.GetReplicaByID(replica_id);
-        if (replica == nullptr || replica->has_invalid_mem_handle()) {
-            LOG(WARNING)
-                << "key=" << key << ", replica_id=" << replica_id
-                << ", move target becomes invalid during data transfer";
-            accessor.EraseReplicationTask();
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
-        }
-
-        // Mark replica as complete
-        replica->mark_complete();
+    // will be empty. Removing the source replica without creating a new one
+    // would reduce the total replica count for this key. Fail the move so
+    // the caller (e.g. drain scheduler) can retry with a different target.
+    if (task.replica_ids.empty()) {
+        LOG(WARNING) << "key=" << key
+                     << ", MoveEnd called with empty replica_ids"
+                     << " (target already had this key's replica),"
+                     << " refusing to delete source to preserve replica count";
+        accessor.EraseReplicationTask();
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
+
+    auto replica_id = task.replica_ids[0];
+    auto replica = metadata.GetReplicaByID(replica_id);
+    if (replica == nullptr || replica->has_invalid_mem_handle()) {
+        LOG(WARNING)
+            << "key=" << key << ", replica_id=" << replica_id
+            << ", move target becomes invalid during data transfer";
+        accessor.EraseReplicationTask();
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+    }
+
+    // Mark replica as complete
+    replica->mark_complete();
 
     // Remove the source replica and release its space later.
     auto source_replica =
@@ -6928,8 +6936,6 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
             << " existing_replicas=" << existing_segments.size();
     double best_util = std::numeric_limits<double>::max();
     std::optional<std::string> best_target;
-    std::optional<std::string> fallback_target;
-    double fallback_best_util = std::numeric_limits<double>::max();
     for (const auto& candidate : candidate_segments) {
         if (candidate == source_segment) {
             continue;
@@ -6945,19 +6951,19 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
         }
         const double util =
             static_cast<double>(used) / static_cast<double>(capacity);
+        // Skip candidates that already hold a replica of this key.
+        // Draining to such a segment would cause MoveEnd to delete the
+        // source replica without creating a new one, reducing the total
+        // replica count for this key.
         bool is_existing = std::find(existing_segments.begin(),
                                      existing_segments.end(),
                                      candidate) != existing_segments.end();
-        if (!is_existing) {
-            if (util < best_util) {
-                best_util = util;
-                best_target = candidate;
-            }
-        } else {
-            if (util < fallback_best_util) {
-                fallback_best_util = util;
-                fallback_target = candidate;
-            }
+        if (is_existing) {
+            continue;
+        }
+        if (util < best_util) {
+            best_util = util;
+            best_target = candidate;
         }
     }
     if (best_target.has_value()) {
@@ -6965,10 +6971,15 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
                 << " util=" << best_util;
         return best_target;
     }
-    VLOG(6) << "Drain SelectDrainTargetForKey: fallback_target="
-            << (fallback_target.has_value() ? *fallback_target : "(none)")
-            << " util=" << fallback_best_util;
-    return fallback_target;
+    // Do NOT fall back to a segment that already holds a replica of this key.
+    // Falling back would cause MoveEnd to delete the source replica without
+    // creating a new one (because the target already has it), reducing the
+    // total replica count. Instead, return nullopt to block this drain unit
+    // until a suitable non-existing target segment becomes available.
+    VLOG(6) << "Drain SelectDrainTargetForKey: no suitable target found"
+            << " (all candidates already hold this key or are not allocatable),"
+            << " blocking unit for retry";
+    return std::nullopt;
 }
 
 void MasterService::RefreshDrainJobTasks(DrainJob& job) {

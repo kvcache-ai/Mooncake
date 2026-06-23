@@ -42,7 +42,7 @@ interface Cluster {
 }
 
 interface PodInfo {
-  metadata: { name: string; uid: string }
+  metadata: { name: string; uid: string; deletionTimestamp?: string }
   spec: {
     nodeName: string
     containers: Array<{
@@ -142,7 +142,14 @@ function PhaseBadge({ phase }: { phase: string | undefined }) {
   )
 }
 
-function PodStatusBadge({ phase }: { phase: string }) {
+function PodStatusBadge({ phase, deletionTimestamp }: { phase: string; deletionTimestamp?: string }) {
+  if (deletionTimestamp) {
+    return (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800">
+        Terminating
+      </span>
+    )
+  }
   const colors: Record<string, string> = {
     Running: 'bg-green-100 text-green-800',
     Pending: 'bg-yellow-100 text-yellow-800',
@@ -492,7 +499,7 @@ export default function ClusterDetailPage({
                   <td colSpan={8} className="px-6 py-12 text-center text-sm text-gray-500">No pods found.</td>
                 </tr>
               ) : (
-                workerPods.map(p => {
+                workerPods.map((p, i) => {
                   const ms = masterStats.find(s => s.name === p.metadata.name)
                   const metric = podMetrics.find(m => m.metadata.name === p.metadata.name)
                   const res = containerResources(p.spec.containers)
@@ -515,11 +522,15 @@ export default function ClusterDetailPage({
                   }
                   return (
                     <tr key={p.metadata.uid} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{p.metadata.name}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-indigo-600 hover:text-indigo-800">
+                        <a href={`/clusters/${namespace}/${name}/worker/${p.metadata.name}`} title={p.metadata.name}>
+                          worker-{i + 1}
+                        </a>
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                         <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">worker</span>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap"><PodStatusBadge phase={p.status.phase} /></td>
+                      <td className="px-6 py-4 whitespace-nowrap"><PodStatusBadge phase={p.status.phase} deletionTimestamp={p.metadata.deletionTimestamp} /></td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{p.spec.nodeName}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[120px]">
                         {metric ? (
@@ -551,12 +562,18 @@ export default function ClusterDetailPage({
                         })()}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
-                        <button
-                          onClick={handleDeletePod}
-                          className="inline-flex items-center px-2.5 py-1 border border-transparent text-xs font-medium rounded text-red-700 bg-red-100 hover:bg-red-200"
-                        >
-                          Delete
-                        </button>
+                        {p.metadata.deletionTimestamp ? (
+                          <span className="inline-flex items-center px-2.5 py-1 border border-transparent text-xs font-medium rounded text-gray-400 bg-gray-100 cursor-not-allowed">
+                            Delete
+                          </span>
+                        ) : (
+                          <button
+                            onClick={handleDeletePod}
+                            className="inline-flex items-center px-2.5 py-1 border border-transparent text-xs font-medium rounded text-red-700 bg-red-100 hover:bg-red-200"
+                          >
+                            Delete
+                          </button>
+                        )}
                       </td>
                     </tr>
                   )

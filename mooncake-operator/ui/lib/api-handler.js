@@ -1597,6 +1597,244 @@ if (cancelDrainMatch && req.method === 'POST') {
         }
       }
 
+
+      // GET /api/clusters/:namespace/:name/worker-keys
+      // Paginated list of KV cache keys owned by a specific worker segment.
+      // Query params:
+      //   segment  - the segment name, e.g. "10.244.1.132:13006" (required)
+      //   page     - page number, 1-based (default 1)
+      //   pageSize - keys per page (default 50, max 200)
+      // Performance: batches replica queries (100 keys/batch, 5 concurrent) to
+      // filter keys by segment. For clusters with >10k keys, only the first
+      // 10k are scanned; a future master-side endpoint can improve this.
+      const workerKeysMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/worker-keys$/)
+      if (workerKeysMatch && req.method === 'GET') {
+        try {
+          const [, namespace, name] = workerKeysMatch
+          const segment = url.searchParams.get('segment')
+          const pageNum = Math.max(1, parseInt(url.searchParams.get('page')) || 1)
+          const pageSize = Math.min(Math.max(1, parseInt(url.searchParams.get('pageSize')) || 50), 200)
+
+          if (!segment) {
+            return jsonReply(res, 400, { error: 'segment query parameter is required (e.g. ?segment=10.244.1.132:13006)' })
+          }
+
+          // 1. Get all keys from master
+          let allKeysText = ''
+          try {
+            allKeysText = await callMasterAPI(namespace, name, 'GET', '/get_all_keys')
+          } catch (e) {
+            return jsonReply(res, 502, { error: 'Failed to fetch keys from master: ' + e.message })
+          }
+
+          const allKeys = (typeof allKeysText === 'string' ? allKeysText : String(allKeysText))
+            .split('\n')
+            .map(s => s.trim())
+            .filter(s => s.length > 0)
+
+          const MAX_SCAN = 10000
+          const scannedKeys = allKeys.length > MAX_SCAN ? allKeys.slice(0, MAX_SCAN) : allKeys
+          const truncated = allKeys.length > MAX_SCAN
+
+          // 2. Batch query replicas to find keys belonging to target segment
+          const BATCH_SIZE = 100
+          const CONCURRENCY = 5
+          const matchingKeys = []
+
+          for (let i = 0; i < scannedKeys.length; i += BATCH_SIZE * CONCURRENCY) {
+            const chunkBatches = []
+            for (let j = 0; j < CONCURRENCY; j++) {
+              const batchStart = i + j * BATCH_SIZE
+              if (batchStart >= scannedKeys.length) break
+              const batch = scannedKeys.slice(batchStart, batchStart + BATCH_SIZE)
+              chunkBatches.push(batch)
+            }
+
+            const results = await Promise.all(chunkBatches.map(async (batch) => {
+              try {
+                const keysParam = batch.map(encodeURIComponent).join(',')
+                const resp = await callMasterAPI(namespace, name, 'GET', '/batch_query_keys?keys=' + keysParam)
+                // Returns: {"success":true,"data":{"key1":{"ok":true,"values":[{...}]},...}}
+                if (resp && resp.success && resp.data) {
+                  const batchMatches = []
+                  for (const [key, info] of Object.entries(resp.data)) {
+                    if (info.ok && info.values) {
+                      for (const val of info.values) {
+                        // Master API returns underscores in field names: "transport_endpoint_", "size_"
+                        const ep = val.transport_endpoint_ || val.transport_endpoint || ''
+                        if (ep === segment) {
+                          batchMatches.push({ key, size: val.size_ || val.size || 0, transport_endpoint: ep })
+                          break // key matched this segment, no need to check other replicas
+                        }
+                      }
+                    }
+                  }
+                  return batchMatches
+                }
+              } catch (e) {
+                // skip batch errors
+              }
+              return null
+            }))
+
+            for (const r of results) {
+              if (r && r.length) matchingKeys.push(...r)
+            }
+          }
+
+          // 3. Paginate
+          const total = matchingKeys.length
+          const totalPages = Math.max(1, Math.ceil(total / pageSize))
+          const start = (pageNum - 1) * pageSize
+          const page = matchingKeys.slice(start, start + pageSize)
+
+          return jsonReply(res, 200, {
+            segment,
+            keys: page,
+            total,
+            page: pageNum,
+            pageSize,
+            totalPages,
+            truncated,
+            scannedCount: scannedKeys.length,
+            totalKeyCount: allKeys.length,
+          })
+        } catch (e) {
+          return jsonReply(res, 500, { error: e.message })
+        }
+      }
+
+
+      // POST /api/clusters/:namespace/:name/clear-worker-data
+      // Clear all KV cache data from a specific worker segment.
+      // Body: { segment: "10.244.1.132:13006" }
+      // Returns: { success: true, removed: N, failed: M, totalKeys: T }
+      const clearWorkerDataMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/clear-worker-data$/)
+      if (clearWorkerDataMatch && req.method === 'POST') {
+        let body = ''
+        try {
+          for await (const chunk of req) body += chunk
+        } catch (e) {
+          return jsonReply(res, 400, { error: 'Failed to read request body' })
+        }
+        let segment
+        try {
+          segment = JSON.parse(body).segment
+        } catch (e) {
+          return jsonReply(res, 400, { error: 'Invalid JSON body' })
+        }
+        if (!segment) {
+          return jsonReply(res, 400, { error: 'segment is required' })
+        }
+
+        const [, namespace, name] = clearWorkerDataMatch
+
+        try {
+          // 1. Get all keys from master
+          let allKeysText = ''
+          try {
+            allKeysText = await callMasterAPI(namespace, name, 'GET', '/get_all_keys')
+          } catch (e) {
+            return jsonReply(res, 502, { error: 'Failed to fetch keys from master: ' + e.message })
+          }
+
+          const allKeys = (typeof allKeysText === 'string' ? allKeysText : String(allKeysText))
+            .split('\n')
+            .map(s => s.trim())
+            .filter(s => s.length > 0)
+
+          const MAX_SCAN = 10000
+          const MAX_REMOVE = 5000
+          const scannedKeys = allKeys.length > MAX_SCAN ? allKeys.slice(0, MAX_SCAN) : allKeys
+
+          // 2. Batch query replicas to find keys belonging to target segment
+          const BATCH_SIZE = 100
+          const CONCURRENCY = 5
+          const matchingKeys = []
+
+          for (let i = 0; i < scannedKeys.length; i += BATCH_SIZE * CONCURRENCY) {
+            const chunkBatches = []
+            for (let j = 0; j < CONCURRENCY; j++) {
+              const batchStart = i + j * BATCH_SIZE
+              if (batchStart >= scannedKeys.length) break
+              const batch = scannedKeys.slice(batchStart, batchStart + BATCH_SIZE)
+              chunkBatches.push(batch)
+            }
+
+            const results = await Promise.all(chunkBatches.map(async (batch) => {
+              try {
+                const keysParam = batch.map(encodeURIComponent).join(',')
+                const resp = await callMasterAPI(namespace, name, 'GET', '/batch_query_keys?keys=' + keysParam)
+                if (resp && resp.success && resp.data) {
+                  const batchMatches = []
+                  for (const [key, info] of Object.entries(resp.data)) {
+                    if (info.ok && info.values) {
+                      for (const val of info.values) {
+                        const ep = val.transport_endpoint_ || val.transport_endpoint || ''
+                        if (ep === segment) {
+                          batchMatches.push(key)
+                          break
+                        }
+                      }
+                    }
+                  }
+                  return batchMatches
+                }
+              } catch (e) {
+                // skip batch errors
+              }
+              return null
+            }))
+
+            for (const r of results) {
+              if (r && r.length) matchingKeys.push(...r)
+            }
+          }
+
+          if (matchingKeys.length === 0) {
+            return jsonReply(res, 200, {
+              success: true,
+              segment,
+              removed: 0,
+              failed: 0,
+              totalKeys: allKeys.length,
+              scannedKeys: scannedKeys.length,
+              message: 'No keys found for this segment',
+            })
+          }
+
+          if (matchingKeys.length > MAX_REMOVE) {
+            return jsonReply(res, 400, {
+              error: `Too many keys (${matchingKeys.length}) to clear. Maximum ${MAX_REMOVE} keys allowed for safety.`,
+            })
+          }
+
+          // 3. Remove all matching keys via the master's remove API
+          let removeResult
+          try {
+            removeResult = await callMasterAPI(namespace, name, 'POST', '/api/v1/objects/remove', {
+              keys: matchingKeys,
+              force: true,
+            })
+          } catch (e) {
+            return jsonReply(res, 502, { error: 'Failed to remove keys from master: ' + e.message })
+          }
+
+          return jsonReply(res, 200, {
+            success: removeResult.success !== false,
+            segment,
+            removed: removeResult.removed || 0,
+            failed: removeResult.failed || 0,
+            total: matchingKeys.length,
+            totalKeys: allKeys.length,
+            scannedKeys: scannedKeys.length,
+          })
+        } catch (e) {
+          return jsonReply(res, 500, { error: e.message })
+        }
+      }
+
+
       return false // not handled
   } catch (e) {
     console.error('[api-handler] Unhandled error:', e.message)

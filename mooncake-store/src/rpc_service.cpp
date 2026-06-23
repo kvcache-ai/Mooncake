@@ -139,6 +139,23 @@ struct HttpSegmentStatusResponse {
 YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
          error_code, error_message);
 
+struct HttpRemoveKeysRequest {
+    std::vector<std::string> keys;
+    bool force{false};
+};
+YLT_REFL(HttpRemoveKeysRequest, keys, force);
+
+struct HttpRemoveKeysResponse {
+    bool success{false};
+    uint64_t total{0};
+    uint64_t removed{0};
+    uint64_t failed{0};
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpRemoveKeysResponse, success, total, removed, failed, error_code,
+         error_message);
+
 template <typename T>
 void WriteJsonResponse(coro_http::coro_http_response& resp,
                        coro_http::status_type status, const T& payload) {
@@ -748,6 +765,51 @@ void MasterAdminServer::InitHttpServer() {
                     << " results=" << results.size();
             }
             resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<POST>(
+        "/api/v1/objects/remove",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            HttpRemoveKeysRequest request;
+            try {
+                struct_json::from_json(request, req.get_body());
+            } catch (const std::exception& e) {
+                WriteErrorResponse(
+                    resp, status_type::bad_request, ErrorCode::INVALID_PARAMS,
+                    std::string("Invalid JSON body: ") + e.what());
+                return;
+            }
+
+            if (request.keys.empty()) {
+                WriteErrorResponse(resp, status_type::bad_request,
+                                   ErrorCode::INVALID_PARAMS,
+                                   "No keys provided");
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->BatchRemove(request.keys, request.force,
+                                               "default");
+
+            HttpRemoveKeysResponse payload;
+            payload.total = request.keys.size();
+            payload.removed = 0;
+            payload.failed = 0;
+            for (const auto& r : result) {
+                if (r.has_value()) {
+                    payload.removed++;
+                } else {
+                    payload.failed++;
+                }
+            }
+            payload.success = (payload.failed < payload.total);
+
+            WriteJsonResponse(resp, status_type::ok, payload);
         });
 }
 

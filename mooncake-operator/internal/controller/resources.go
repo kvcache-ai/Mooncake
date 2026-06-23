@@ -103,7 +103,7 @@ func (r *MooncakeClusterReconciler) buildMasterStatefulSet(mc *mooncakev1alpha1.
 							Name:            "master",
 							Image:           image,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Command: []string{"/bin/sh", "-c"},
+							Command:         []string{"/bin/sh", "-c"},
 							Args: []string{
 								fmt.Sprintf(
 									`cp /etc/mooncake/master.json /tmp/master.json && `+
@@ -293,41 +293,29 @@ segment = pod_ip + ':' + port
 cluster = os.environ.get('CLUSTER_NAME', '')
 namespace = os.environ.get('POD_NAMESPACE', '')
 
-def discover_leader():
+def is_drained():
+    """Query all 3 masters directly for segment status.
+    Return True if ANY master reports DRAINED, without needing
+    leader discovery (which can fail due to DNS timing)."""
     for i in range(3):
         try:
             addr = '%s-master-%d.%s-master-headless.%s.svc' % (cluster, i, cluster, namespace)
-            r = urllib.request.urlopen('http://' + addr + ':9003/role', timeout=3)
-            role = r.read().decode().strip()
-            if role == 'leader':
-                return addr
+            req = urllib.request.Request(
+                'http://' + addr + ':9003/api/v1/segments/status?segment=' + segment)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read().decode()
+                result = json.loads(data)
+                if result.get('status_name') == 'DRAINED':
+                    return True
         except Exception:
             continue
-    return '%s-master.%s.svc' % (cluster, namespace)
-
-def get_lifecycle(leader):
-    try:
-        req = urllib.request.Request(
-            'http://' + leader + ':9003/api/v1/segments/status?segment=' + segment)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read().decode()
-            result = json.loads(data)
-            return result.get('status_name', '')
-    except Exception:
-        return ''
-
-leader = discover_leader()
-lifecycle = get_lifecycle(leader)
-if lifecycle == 'DRAINED':
-    sys.exit(0)
+    return False
 
 timeout = 600
-interval = 5
+interval = 1
 elapsed = 0
 while elapsed < timeout:
-    leader = discover_leader()
-    lifecycle = get_lifecycle(leader)
-    if lifecycle == 'DRAINED':
+    if is_drained():
         sys.exit(0)
     time.sleep(interval)
     elapsed += interval
@@ -464,7 +452,7 @@ sys.exit(0)
 					Labels: mergeLabels(labels, selector),
 				},
 				Spec: corev1.PodSpec{
-					TerminationGracePeriodSeconds: int64Ptr(300),
+					TerminationGracePeriodSeconds: int64Ptr(30),
 					Containers:                    []corev1.Container{container},
 					Volumes:                       volumes,
 				},
