@@ -57,8 +57,9 @@ class TransferExecutorBase {
         bool auto_connect = true;
         bool use_short_connection = false;
         bool use_buffer_pool = false;
-        bool dummy_real_mode = false;
+        bool agent_mode = false;
         bool roce_mode = false;
+        bool use_fabric_mem = false;
     };
 
     explicit TransferExecutorBase(const InitParams& params);
@@ -77,7 +78,7 @@ class TransferExecutorBase {
     void processSliceList(const std::vector<Transport::Slice*>& slice_list);
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
-                    bool use_buffer_pool, bool roce_mode, bool dummy_real_mode);
+                    bool use_buffer_pool, bool roce_mode, bool agent_mode);
     int deregisterMem(void* addr);
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }
