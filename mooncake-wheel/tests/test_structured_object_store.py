@@ -371,6 +371,24 @@ def test_bundle_copy_mode_forces_store_put() -> None:
     assert result.objects["payload"] == payload
 
 
+def test_structured_object_copy_mode_skips_pre_registered_validation() -> None:
+    store, transfer = make_transfer()
+    payload = np.arange(64, dtype=np.uint8).reshape(8, 8).T
+
+    ref = transfer.put_structured_object(
+        structured_payload(payload=payload),
+        policy=BundleTransferPolicy(copy_mode="copy"),
+        pre_registered_buffers={"payload": True},
+    )
+
+    assert store.batch_put_from_calls == 0
+    assert store.register_buffer_calls == 0
+    assert store.unregister_buffer_calls == 0
+
+    result = transfer.materialize(transfer.read_spec(ref))
+    assert np.array_equal(result.objects["payload"], payload)
+
+
 def test_bundle_zero_copy_mode_requires_batch_put_support() -> None:
     _store, transfer = make_transfer(MinimalStore())
 
@@ -425,6 +443,19 @@ def test_structured_object_pre_registered_rejects_copied_buffers() -> None:
             structured_payload(payload=bytearray(b"data")),
             pre_registered_buffers={"missing": True},
         )
+
+
+def test_structured_object_pre_registered_empty_buffer() -> None:
+    _store, transfer = make_transfer()
+    payload = bytearray()
+
+    ref = transfer.put_structured_object(
+        structured_payload(payload=payload),
+        pre_registered_buffers={"payload": True},
+    )
+
+    result = transfer.materialize(transfer.read_spec(ref))
+    assert result.objects["payload"] == b""
 
 
 def test_structured_object_roundtrip() -> None:

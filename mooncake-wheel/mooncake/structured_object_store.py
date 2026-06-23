@@ -231,16 +231,20 @@ class _StructuredObjectLayer:
         pre_registered_buffers: Optional[Mapping[str, bool]],
     ) -> RemoteBundleRef:
         metadata, buffers = _encode_structured_fields(payload.metadata, payload.buffers)
-        _validate_pre_registered_structured_buffers(
-            payload.buffers, buffers, pre_registered_buffers
+        transfer_policy = self._bundle_store._policy(
+            policy, max_inflight_put=max_inflight_put
         )
+        if transfer_policy.copy_mode != "copy":
+            _validate_pre_registered_structured_buffers(
+                payload.buffers, buffers, pre_registered_buffers
+            )
         return self._bundle_store.put_bundle(
             meta=_encode_structured_metadata(metadata),
             buffers=buffers,
             partition=partition,
             chunk_bytes=chunk_bytes,
-            policy=policy,
-            max_inflight_put=max_inflight_put,
+            policy=transfer_policy,
+            max_inflight_put=None,
             pre_registered_buffers=pre_registered_buffers,
         )
 
@@ -934,6 +938,8 @@ class _MooncakePayloadTransport:
         registered_ptrs: list[int] = []
         try:
             for ptr, size in zip(buffer_ptrs, sizes):
+                if size == 0:
+                    continue
                 register_status = register_buffer(ptr, size)
                 if register_status == 0:
                     registered_ptrs.append(ptr)
@@ -1110,6 +1116,9 @@ def _bytes_view(value: Any, name: str) -> memoryview:
 
 
 def _prepare_chunk_source_buffer(chunk: memoryview) -> tuple[Any, int, int]:
+    if len(chunk) == 0:
+        copied = ctypes.create_string_buffer(0)
+        return copied, ctypes.addressof(copied), 0
     if chunk.c_contiguous and not chunk.readonly:
         return chunk, ctypes.addressof(ctypes.c_char.from_buffer(chunk)), len(chunk)
     copied = ctypes.create_string_buffer(bytes(chunk))
@@ -1265,12 +1274,14 @@ def _is_same_writable_buffer(original: Any, encoded: Any) -> bool:
         encoded_view = memoryview(encoded)
     except TypeError:
         return False
-    if not original_view.contiguous or not encoded_view.c_contiguous:
+    if not original_view.c_contiguous or not encoded_view.c_contiguous:
         return False
     if original_view.readonly or encoded_view.readonly:
         return False
     if original_view.nbytes != encoded_view.nbytes:
         return False
+    if original_view.nbytes == 0:
+        return True
     try:
         original_bytes = original_view.cast("B")
         encoded_bytes = encoded_view.cast("B")
