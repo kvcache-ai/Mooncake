@@ -457,7 +457,17 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     hipError_t err;
     int device_id;
 
+    // setDeviceContext() switches the active device to the source GPU and the
+    // async copy below is enqueued on a stream bound to that device. Without
+    // restoring the caller's device before returning, the host thread is left
+    // pinned to device_id, so the engine's next kernel launch on the same
+    // thread (e.g. a PyTorch op in a TP worker) targets the wrong GPU and
+    // fails with hipErrorInvalidDevice. Save it here and restore on every exit.
+    int prev_device = 0;
+    (void)hipGetDevice(&prev_device);
+
     if (setDeviceContext(request.source, device_id) != 0) {
+        (void)hipSetDevice(prev_device);
         return Status::InvalidArgument("Failed to set device context");
     }
 
@@ -494,6 +504,7 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
         if (event != nullptr) {
             event_pool_.putEvent(event, device_id);
         }
+        (void)hipSetDevice(prev_device);
         return Status::Memory("Failed to get event or stream from pool");
     }
 
@@ -509,8 +520,12 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     if (!checkHip(err, "HipTransport: hipMemcpyAsync failed")) {
         slice->markFailed();
         event_pool_.putEvent(event, device_id);
+        (void)hipSetDevice(prev_device);
         return Status::Memory("HipTransport: Async memory copy failed");
     }
+    // The copy is queued on its device-bound stream; restore the caller's
+    // device so the engine's subsequent kernels run where they expect.
+    (void)hipSetDevice(prev_device);
 
     // Record event on the stream
     err = hipEventRecord(event, stream);
