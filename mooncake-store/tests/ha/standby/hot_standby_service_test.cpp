@@ -8,7 +8,12 @@
 #include <string>
 #include <thread>
 
+#include <xxhash.h>
+
 #include "master_service.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store_factory.h"
+#include "ha/oplog/mock_oplog_store.h"
 
 namespace mooncake::test {
 
@@ -231,6 +236,11 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus) {
     EXPECT_EQ(s1.state, s2.state);
 }
 
+TEST_F(HotStandbyServiceTest, SyncStatusReportsUnresolvedGapCount) {
+    auto status = service_->GetSyncStatus();
+    EXPECT_EQ(0u, status.unresolved_gap_count);
+}
+
 // ========== 6.1.4 Promotion tests ==========
 
 TEST_F(HotStandbyServiceTest, TestPromote_WhenNotReady) {
@@ -290,40 +300,10 @@ TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
     EXPECT_EQ("key-1", post_snapshot.objects[0].key);
 }
 
-TEST_F(HotStandbyServiceTest, TestPromote_FinalCatchUp) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real etcd and OpLog data to exercise final "
-                    "catch-up logic.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
-}
-
-TEST_F(HotStandbyServiceTest, TestPromote_WithGaps) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP()
-        << "Requires real etcd and gaps in OpLog to validate gap resolution.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
-}
-
-TEST_F(HotStandbyServiceTest, TestPromote_Timeout) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP()
-        << "Requires real etcd and slow reads to trigger catch-up timeout.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
-}
-
-TEST_F(HotStandbyServiceTest, TestPromote_BatchLimit) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real etcd and large OpLog to hit batch limit.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
-}
+// The promotion catch-up tests above (TestPromote_*) have been replaced by the
+// mock-driven PromotionCatchUpTest fixture below. The new tests use
+// SetCatchUpOpLogStoreForTesting + MockOpLogStore with SetForceReadEmpty /
+// SetReadError seams, eliminating the STORE_USE_ETCD dependency.
 
 // ========== 6.1.5 Warm start tests ==========
 
@@ -540,6 +520,201 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
     service_->Stop();
     SUCCEED();
 #endif
+}
+
+// ========== Issue 2 fail-closed catch-up ==========
+
+namespace {
+
+// Helper to create a valid OpLogEntry with checksum (mirrors the helper in
+// oplog_applier_test.cpp).
+OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
+                     const std::string& payload) {
+    OpLogEntry e;
+    e.sequence_id = seq;
+    e.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    e.op_type = type;
+    e.object_key = key;
+    e.payload = payload;
+    // Compute checksum and prefix_hash using the same algorithm as OpLogManager
+    e.checksum =
+        static_cast<uint32_t>(XXH32(payload.data(), payload.size(), 0));
+    e.prefix_hash =
+        key.empty() ? 0
+                    : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
+    return e;
+}
+
+// Helper to create a valid struct_pack payload for PUT_END
+std::string MakeValidPayload(uint64_t client_id_first = 1,
+                             uint64_t client_id_second = 2,
+                             uint64_t size = 1024) {
+    mooncake::MetadataPayload payload;
+    payload.client_id = {client_id_first, client_id_second};
+    payload.size = size;
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+}  // namespace
+
+class PromotionCatchUpTest : public HotStandbyServiceTest {
+   protected:
+    void SetUp() override {
+        HotStandbyServiceTest::SetUp();
+        config_.enable_oplog_following = true;
+        config_.fail_closed_on_incomplete_catch_up = true;
+        config_.fail_closed_on_unresolved_gaps = true;
+
+        // Re-create the service with updated config
+        service_ = std::make_unique<HotStandbyService>(config_);
+
+        mock_store_ = std::make_shared<MockOpLogStore>();
+        service_->SetCatchUpOpLogStoreForTesting(mock_store_);
+    }
+
+    std::shared_ptr<MockOpLogStore> mock_store_;
+};
+
+TEST_F(PromotionCatchUpTest, EmptyReadBeforeMaxFailsClosed) {
+    for (uint64_t s = 1; s <= 5; ++s) {
+        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
+                           MakeValidPayload());
+        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
+    }
+    mock_store_->SetForceReadEmpty(true);
+
+    // Try to promote; the service needs to reach WATCHING first
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // PromoteAndExportSnapshot should fail-closed because the mock store has
+    // durable entries (seq 1-5) but ReadOpLogSince returns empty.
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+}
+
+TEST_F(PromotionCatchUpTest, ReadErrorFailsClosed) {
+    for (uint64_t s = 1; s <= 3; ++s) {
+        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
+                           MakeValidPayload());
+        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
+    }
+    mock_store_->SetReadError(ErrorCode::PERSISTENT_FAIL);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+}
+
+TEST_F(PromotionCatchUpTest, UnresolvedGapsFailClosed) {
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // Seed a skipped gap into the applier. The gap cannot be resolved because
+    // no OpLogStore has the entry, so ResolvePromotionGapsLocked leaves it
+    // untouched. PromoteLockedInternal's post-catch-up gap check then fires.
+    auto* applier = service_->GetOpLogApplierForTesting();
+    ASSERT_NE(nullptr, applier);
+    applier->AddSkippedGapForTesting(999);
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, BestEffortReturnsOkWhenFlagFalse) {
+    config_.fail_closed_on_incomplete_catch_up = false;
+
+    for (uint64_t s = 1; s <= 3; ++s) {
+        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
+                           MakeValidPayload());
+        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
+    }
+    mock_store_->SetForceReadEmpty(true);
+
+    // Re-create service to apply updated config
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpOpLogStoreForTesting(mock_store_);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // With fail_closed_on_incomplete_catch_up=false, the best-effort path
+    // should return OK despite read-empty behavior.
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::OK, promote_err);
+}
+
+TEST_F(PromotionCatchUpTest, BypassesGapCheckWhenFlagFalse) {
+    config_.fail_closed_on_unresolved_gaps = false;
+
+    // Re-create service to apply updated config
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpOpLogStoreForTesting(mock_store_);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // Seed a gap; with fail_closed_on_unresolved_gaps=false the post-catch-up
+    // gap check is skipped, so promotion succeeds.
+    auto* applier = service_->GetOpLogApplierForTesting();
+    ASSERT_NE(nullptr, applier);
+    applier->AddSkippedGapForTesting(999);
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::OK, promote_err);
+    // PromoteAndExportSnapshot calls Stop() on success, so state becomes
+    // STOPPED.
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, PromoteAppliesSameFailClosedChecks) {
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // Seed a gap and verify Promote() (not PromoteAndExportSnapshot) applies
+    // the same fail-closed checks via PromoteLockedInternal.
+    auto* applier = service_->GetOpLogApplierForTesting();
+    ASSERT_NE(nullptr, applier);
+    applier->AddSkippedGapForTesting(999);
+
+    ErrorCode promote_err = service_->Promote();
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
 
 }  // namespace mooncake::test

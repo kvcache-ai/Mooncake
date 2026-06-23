@@ -2544,22 +2544,34 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
+    return BatchReplicaClear(object_keys, client_id, segment_name, "default");
+}
+
+auto MasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name, const std::string& tenant_id)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
     const bool clear_all_segments = segment_name.empty();
+    const TenantId requested_tenant(tenant_id);
+    if (!requested_tenant.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const TenantId& normalized_tenant = ResolveRequestTenantId(requested_tenant);
 
     for (const auto& key : object_keys) {
         if (key.empty()) {
-            LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
+            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
+                         << " empty key, skipping";
             continue;
         }
-        // BatchReplicaClear is a default-tenant compatibility/admin helper.
-        MetadataAccessorRW accessor(
-            this, MakeObjectIdentity(key, TenantId::Default()));
+        MetadataAccessorRW accessor(this,
+                                    MakeObjectIdentity(key, normalized_tenant));
         if (!accessor.Exists()) {
-            LOG(WARNING) << "BatchReplicaClear: key=" << key
-                         << " not found, skipping";
+            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
+                         << " key=" << key << " not found, skipping";
             continue;
         }
 
@@ -2567,8 +2579,8 @@ auto MasterService::BatchReplicaClear(
 
         // Security check: Ensure the requesting client owns the object.
         if (metadata.client_id != client_id) {
-            LOG(WARNING) << "BatchReplicaClear: key=" << key
-                         << " belongs to different client_id="
+            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
+                         << " key=" << key << " belongs to different client_id="
                          << metadata.client_id << ", expected=" << client_id
                          << ", skipping";
             continue;
@@ -2576,8 +2588,8 @@ auto MasterService::BatchReplicaClear(
 
         // Safety check: Do not clear an object that has an active lease.
         if (!metadata.IsLeaseExpired()) {
-            LOG(WARNING) << "BatchReplicaClear: key=" << key
-                         << " has active lease, skipping";
+            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
+                         << " key=" << key << " has active lease, skipping";
             continue;
         }
 
@@ -2586,14 +2598,15 @@ auto MasterService::BatchReplicaClear(
             // indicate an ongoing Put operation, and clearing during this time
             // could lead to an inconsistent state or interfere with the write.
             if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
-                LOG(WARNING) << "BatchReplicaClear: key=" << key
-                             << " has incomplete replicas, skipping";
+                LOG(WARNING)
+                    << "BatchReplicaClear: tenant=" << normalized_tenant
+                    << " key=" << key << " has incomplete replicas, skipping";
                 continue;
             }
 
             if (enable_ha_ && oplog_store_) {
-                auto persist_result =
-                    AppendOpLogAndNotifyDurableOrAbort(OpType::REMOVE, key, {});
+                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    OpType::REMOVE, normalized_tenant, key, {});
                 if (!persist_result) {
                     continue;
                 }
@@ -2604,9 +2617,9 @@ auto MasterService::BatchReplicaClear(
             // decrements disk_object_count via OnDiskReplicaRemoved.
             accessor.Erase();
             cleared_keys.emplace_back(key);
-            VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
-                       "for key="
-                    << key << " for client_id=" << client_id;
+            VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
+                    << " successfully cleared all replicas for key=" << key
+                    << " for client_id=" << client_id;
         } else {
             // Clear only replicas on the specified segment_name
             const auto match_replica_on_segment =
@@ -2626,7 +2639,8 @@ auto MasterService::BatchReplicaClear(
 
             if (!metadata.HasReplica(match_replica_on_segment)) {
                 LOG(WARNING)
-                    << "BatchReplicaClear: key=" << key
+                    << "BatchReplicaClear: tenant=" << normalized_tenant
+                    << " key=" << key
                     << " has no replica on segment_name=" << segment_name
                     << ", skipping";
                 continue;
@@ -2652,10 +2666,10 @@ auto MasterService::BatchReplicaClear(
                 tl::expected<OpLogEntry, ErrorCode> persist_result;
                 if (remaining.empty()) {
                     persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                        OpType::REMOVE, key, {});
+                        OpType::REMOVE, normalized_tenant, key, {});
                 } else {
                     persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                        OpType::PUT_END, key,
+                        OpType::PUT_END, normalized_tenant, key,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata.client_id, metadata.size, remaining,
                             metadata.group_id, metadata.data_type));
@@ -2685,8 +2699,8 @@ auto MasterService::BatchReplicaClear(
             }
 
             cleared_keys.emplace_back(key);
-            VLOG(1) << "BatchReplicaClear: successfully cleared replicas on "
-                       "segment_name="
+            VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
+                    << " successfully cleared replicas on segment_name="
                     << segment_name << " for key=" << key
                     << " for client_id=" << client_id;
         }
@@ -5256,8 +5270,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     [](const Replica& r) { return !r.is_completed(); });
             if (would_invalidate) {
                 if (had_complete_replica && enable_ha_ && oplog_store_) {
-                    auto err = PersistRemoveForHA(
-                        "BatchRemove(stale cleanup)", normalized_tenant, key);
+                    auto err = PersistRemoveForHA("BatchRemove(stale cleanup)",
+                                                  normalized_tenant, key);
                     if (!err) {
                         results[original_idx] =
                             tl::make_unexpected(err.error());

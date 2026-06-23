@@ -68,6 +68,26 @@ class OpLogApplierTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
+    // Helpers for gap-status tests. TEST_F creates a derived class, so the
+    // friend declaration on OpLogApplier does not propagate. These member
+    // functions are defined on the fixture base class and access the maps
+    // through the friend grant.
+    void ClearGaps() {
+        applier_->missing_sequence_ids_.clear();
+        applier_->skipped_sequence_ids_.clear();
+    }
+    void AddMissingGap(uint64_t seq) {
+        applier_->missing_sequence_ids_[seq] = std::chrono::steady_clock::now();
+    }
+    void AddSkippedGap(uint64_t seq) {
+        applier_->skipped_sequence_ids_[seq] = std::chrono::steady_clock::now();
+    }
+
+    // Helper to call private ApplyPutEndIfNewer from TEST_F bodies.
+    bool ApplyPutEndIfNewer(const OpLogEntry& entry) {
+        return applier_->ApplyPutEndIfNewer(entry);
+    }
+
     std::unique_ptr<MockMetadataStore> mock_metadata_store_;
     std::unique_ptr<OpLogApplier> applier_;
     std::string cluster_id_;
@@ -769,6 +789,174 @@ TEST_F(OpLogApplierTest, TestApplySegmentOperations_Mixed) {
     auto info3 = registry.GetSegment("192.168.1.3:12345");
     ASSERT_TRUE(info3.has_value());
     EXPECT_EQ(8192u, info3->capacity);
+}
+
+// ========== Issue 3 gap-status API ==========
+
+TEST_F(OpLogApplierTest, GetUnresolvedGapCountTracksMissingThenSkipped) {
+    EXPECT_EQ(0u, applier_->GetUnresolvedGapCount());
+    EXPECT_FALSE(applier_->HasUnresolvedGaps());
+
+    // Inject a missing entry via helper (uses friend access from fixture).
+    AddMissingGap(42);
+    EXPECT_EQ(1u, applier_->GetUnresolvedGapCount());
+    EXPECT_TRUE(applier_->HasUnresolvedGaps());
+
+    // Inject a skipped entry: unresolved count sums both maps.
+    AddSkippedGap(7);
+    EXPECT_EQ(2u, applier_->GetUnresolvedGapCount());
+    EXPECT_TRUE(applier_->HasUnresolvedGaps());
+
+    // Clear both maps via helper and verify zero.
+    ClearGaps();
+    EXPECT_EQ(0u, applier_->GetUnresolvedGapCount());
+    EXPECT_FALSE(applier_->HasUnresolvedGaps());
+}
+
+// ========== Issue 2 ApplyPutEndIfNewer ==========
+
+TEST_F(OpLogApplierTest, LateSkippedPutEndDoesNotOverwriteNewerMetadata) {
+    // Recover to expected=5, then apply seq=5 normally.
+    applier_->Recover(4);
+    auto newer =
+        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 8192));
+    newer.tenant_id = "default";
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(newer));
+
+    // Friend-access: inject seq=3 into skipped_sequence_ids_ to force
+    // the late-skipped branch on the next ApplyOpLogEntry call.
+    AddSkippedGap(3);
+
+    // A late-arriving PUT_END with seq=3 for the same key1 must NOT
+    // overwrite the newer seq=5 metadata.
+    auto older =
+        MakeEntry(3, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
+    older.tenant_id = "default";
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(older));
+
+    auto meta = mock_metadata_store_->GetMetadata("default", "key1");
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(8192u, meta->size);
+    EXPECT_EQ(5u, meta->last_sequence_id);
+}
+
+TEST_F(OpLogApplierTest, ApplyPutEndIfNewerRejectsStaleEntry) {
+    // Direct test of the helper via fixture method.
+    applier_->Recover(4);
+    auto newer =
+        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 8192));
+    newer.tenant_id = "default";
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(newer));
+
+    auto older =
+        MakeEntry(3, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
+    older.tenant_id = "default";
+    EXPECT_TRUE(ApplyPutEndIfNewer(older));
+
+    auto meta = mock_metadata_store_->GetMetadata("default", "key1");
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(8192u, meta->size);
+}
+
+TEST_F(OpLogApplierTest, ApplyPutEndIfNewerAppliesWhenNoExistingMetadata) {
+    auto entry =
+        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
+    entry.tenant_id = "default";
+    EXPECT_TRUE(ApplyPutEndIfNewer(entry));
+    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
+}
+
+TEST_F(OpLogApplierTest, ApplyPutEndIfNewerAppliesWhenSameSequenceId) {
+    applier_->Recover(4);
+    auto first =
+        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
+    first.tenant_id = "default";
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(first));
+
+    auto same_seq =
+        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 2048));
+    same_seq.tenant_id = "default";
+    EXPECT_TRUE(ApplyPutEndIfNewer(same_seq));
+
+    auto meta = mock_metadata_store_->GetMetadata("default", "key1");
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(2048u, meta->size);
+}
+
+// ========== Issue 2 Promotion gap resolution ==========
+
+TEST_F(OpLogApplierTest, PromotionGapResolutionReplaysSkippedPutEnd) {
+    auto store = std::make_shared<MockOpLogStore>();
+    applier_->SetOpLogStore(store.get());
+
+    auto gap =
+        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 4096));
+    gap.tenant_id = "default";
+    ASSERT_EQ(ErrorCode::OK, store->WriteOpLog(gap, /*sync=*/true));
+
+    // Friend-access: directly register seq=1 as a skipped gap.
+    AddSkippedGap(1);
+
+    auto result = applier_->TryResolveGapsOnceForPromotion();
+
+    EXPECT_EQ(1u, result.attempted);
+    EXPECT_EQ(1u, result.fetched);
+    EXPECT_EQ(1u, result.applied_puts);
+    EXPECT_EQ(0u, result.applied_deletes);
+    EXPECT_FALSE(applier_->HasUnresolvedGaps());
+    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
+}
+
+TEST_F(OpLogApplierTest, PromotionGapResolutionFetchesMissingEntry) {
+    auto store = std::make_shared<MockOpLogStore>();
+    applier_->SetOpLogStore(store.get());
+
+    auto gap = MakeEntry(1, OpType::PUT_REVOKE, "key1", "");
+    gap.tenant_id = "default";
+    ASSERT_EQ(ErrorCode::OK, store->WriteOpLog(gap, /*sync=*/true));
+
+    AddMissingGap(1);
+
+    auto result = applier_->TryResolveGapsOnceForPromotion();
+
+    EXPECT_EQ(1u, result.attempted);
+    EXPECT_EQ(1u, result.fetched);
+    EXPECT_EQ(0u, result.applied_puts);
+    EXPECT_EQ(1u, result.applied_deletes);
+    EXPECT_FALSE(applier_->HasUnresolvedGaps());
+}
+
+// MockOpLogStore seam smoke test.
+TEST(MockOpLogStoreTest, ForceReadEmptyReturnsEmptyVector) {
+    MockOpLogStore store;
+    auto e1 = MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload());
+    auto e2 = MakeEntry(2, OpType::PUT_END, "key2", MakeValidPayload());
+    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(e1));
+    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(e2));
+
+    // Sanity: GetMaxSequenceId reports 2.
+    uint64_t max_seq = 0;
+    ASSERT_EQ(ErrorCode::OK, store.GetMaxSequenceId(max_seq));
+    EXPECT_EQ(2u, max_seq);
+
+    // Without force-empty, ReadOpLogSince returns both entries.
+    std::vector<OpLogEntry> batch;
+    ASSERT_EQ(ErrorCode::OK, store.ReadOpLogSince(0, 100, batch));
+    EXPECT_EQ(2u, batch.size());
+
+    // With force-empty, ReadOpLogSince returns OK + empty vector
+    // while GetMaxSequenceId still reports 2.
+    store.SetForceReadEmpty(true);
+    batch.clear();
+    ASSERT_EQ(ErrorCode::OK, store.ReadOpLogSince(0, 100, batch));
+    EXPECT_TRUE(batch.empty());
+    ASSERT_EQ(ErrorCode::OK, store.GetMaxSequenceId(max_seq));
+    EXPECT_EQ(2u, max_seq);
+
+    // Toggling back restores normal behavior.
+    store.SetForceReadEmpty(false);
+    ASSERT_EQ(ErrorCode::OK, store.ReadOpLogSince(0, 100, batch));
+    EXPECT_EQ(2u, batch.size());
 }
 
 }  // namespace mooncake::test

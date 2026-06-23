@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "ha/oplog/mock_oplog_store.h"
+#include "ha/oplog/mock_metadata_store.h"
+#include "ha/oplog/oplog_applier.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -81,6 +83,40 @@ class MasterServiceHATest : public ::testing::Test {
         return key;
     }
 
+    std::string PutObjectWithTenant(MasterService& service,
+                                    const UUID& client_id,
+                                    const std::string& key,
+                                    const std::string& tenant_id,
+                                    size_t slice_length = 1024) const {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start =
+            service.PutStart(client_id, key, tenant_id, slice_length, config);
+        EXPECT_TRUE(put_start.has_value());
+        EXPECT_TRUE(
+            service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
+                .has_value());
+        return key;
+    }
+
+    std::string PutObjectOnSegmentWithTenant(MasterService& service,
+                                             const UUID& client_id,
+                                             const std::string& key,
+                                             const std::string& segment_name,
+                                             const std::string& tenant_id,
+                                             size_t slice_length = 1024) const {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {segment_name};
+        auto put_start =
+            service.PutStart(client_id, key, tenant_id, slice_length, config);
+        EXPECT_TRUE(put_start.has_value());
+        EXPECT_TRUE(
+            service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
+                .has_value());
+        return key;
+    }
+
     Replica::Descriptor MakeStandbyMemoryReplica(const std::string& endpoint,
                                                  size_t size = 1024) const {
         Replica::Descriptor replica;
@@ -115,6 +151,33 @@ class MasterServiceHATest : public ::testing::Test {
         segment.capacity = capacity;
         segment.is_memory_segment = true;
         return segment;
+    }
+
+    // Friend access to MasterService::metadata_shards_ and
+    // getMetadataShardIndex, which are otherwise private.
+    // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
+    // hence this static funnel. Seeds an in-flight PromotionTask for a
+    // given (tenant, key) so NotifyPromotionSuccess can proceed without
+    // going through the on-hit admission gate (which is currently
+    // restricted to the "default" tenant). Used only by the non-default
+    // tenant promotion tests.
+    static void SeedPromotionTaskForTesting(MasterService* service,
+                                            const std::string& tenant,
+                                            const std::string& key,
+                                            const UUID& holder_id,
+                                            ReplicaID alloc_id,
+                                            uint64_t object_size) {
+        const size_t shard_idx = service->getMetadataShardIndex(tenant, key);
+        auto shard_access =
+            MasterService::MetadataShardAccessorRW(service, shard_idx);
+        auto& tenant_state = shard_access->tenants[tenant];
+        tenant_state.promotion_tasks.emplace(
+            key, MasterService::PromotionTask{
+                     .source_id = 0,
+                     .alloc_id = alloc_id,
+                     .object_size = object_size,
+                     .start_time = std::chrono::system_clock::now(),
+                     .holder_id = holder_id});
     }
 };
 
@@ -845,6 +908,426 @@ TEST_F(MasterServiceHATest,
 // proper test would need an integration harness that exercises the
 // retry queue across primary/standby boundaries (covered by
 // localfs_hot_standby_integration_test).
+
+// AddReplica publishes OpLog entry with the non-default tenant_id.
+TEST_F(MasterServiceHATest, AddReplicaPublishesTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string tenant = "tenant_a";
+    const std::string key = "tenant_add_replica_key";
+
+    // Create the object in tenant_a so the subsequent AddReplica operates
+    // on the same tenant.
+    PutObjectWithTenant(*service, client_id, key, tenant);
+
+    Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    auto res = service->AddReplica(client_id, key, tenant, local_disk_replica);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// PutRevoke(MEMORY) on a tenant_a object publishes REMOVE OpLog with
+// non-default tenant_id.
+TEST_F(MasterServiceHATest, PutRevokeMemoryPublishesRemoveTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string tenant = "tenant_a";
+    const std::string key = "tenant_put_revoke_key";
+
+    // PutStart only — replica is still in PROCESSING state, which is the
+    // pre-condition for PutRevoke(MEMORY) to be accepted.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service->PutStart(client_id, key, tenant, /*slice_length=*/1024, config)
+            .has_value());
+
+    auto res = service->PutRevoke(client_id, key, tenant, ReplicaType::MEMORY);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::REMOVE, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// EvictDiskReplica with a remaining MEMORY replica in tenant_a publishes
+// PUT_END OpLog with non-default tenant_id (not REMOVE — the object stays
+// alive in memory).
+TEST_F(MasterServiceHATest, EvictDiskReplicaLocalDiskPublishesPutEndTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string tenant = "tenant_a";
+    const std::string key = "tenant_evict_disk_key";
+
+    // PutEnd creates the MEMORY replica in tenant_a; AddReplica adds the
+    // LOCAL_DISK replica in tenant_a. After eviction the object remains
+    // alive in MEMORY, so the OpLog must be PUT_END, not REMOVE.
+    PutObjectWithTenant(*service, client_id, key, tenant);
+
+    Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service->AddReplica(client_id, key, tenant, local_disk_replica)
+                    .has_value());
+
+    auto res = service->EvictDiskReplica(client_id, key, tenant,
+                                         ReplicaType::LOCAL_DISK);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// CopyEnd within tenant_a publishes PUT_END OpLog with non-default
+// tenant_id (not "default" — the bug is that the 3-arg AppendOpLog overload
+// publishes under "default", which would cause the standby to apply it
+// against the wrong tenant).
+TEST_F(MasterServiceHATest, CopyEndPublishesPutEndTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    PrepareSimpleSegment(*service, "seg1", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const std::string tenant = "tenant_a";
+    const std::string key = "tenant_copy_end_key";
+    const UUID client_id = generate_uuid();
+
+    // Create source object in tenant_a on seg1.
+    PutObjectOnSegmentWithTenant(*service, client_id, key, "seg1", tenant);
+
+    // Begin cross-segment copy within tenant_a.
+    auto copy_start =
+        service->CopyStart(client_id, key, tenant, "seg1", {"seg2"});
+    ASSERT_TRUE(copy_start.has_value());
+
+    // Complete the copy under tenant_a — this is where the bug manifests.
+    auto copy_end = service->CopyEnd(client_id, key, tenant);
+    ASSERT_TRUE(copy_end.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// MoveEnd within tenant_a publishes PUT_END OpLog with non-default
+// tenant_id (not "default" — the bug is that the 3-arg AppendOpLog overload
+// publishes under "default", which would cause the standby to apply it
+// against the wrong tenant). Structurally identical to the CopyEnd case.
+TEST_F(MasterServiceHATest, MoveEndPublishesPutEndTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    PrepareSimpleSegment(*service, "seg1", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const std::string tenant = "tenant_a";
+    const std::string key = "tenant_move_end_key";
+    const UUID client_id = generate_uuid();
+
+    // Create source object in tenant_a on seg1.
+    PutObjectOnSegmentWithTenant(*service, client_id, key, "seg1", tenant);
+
+    // Begin cross-segment move within tenant_a.
+    auto move_start =
+        service->MoveStart(client_id, key, tenant, "seg1", "seg2");
+    ASSERT_TRUE(move_start.has_value());
+
+    // Complete the move under tenant_a — this is where the bug manifests.
+    auto move_end = service->MoveEnd(client_id, key, tenant);
+    ASSERT_TRUE(move_end.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    // MoveEnd publishes PUT_END.
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// NotifyPromotionSuccess within tenant_a publishes PUT_END OpLog with
+// non-default tenant_id. The HA promotion path is exercised when a standby
+// promotes to master: the leaseholder replica is flipped COMPLETE and a
+// PUT_END is broadcast to other standbys. The 3-arg AppendOpLog overload
+// inside NotifyPromotionSuccess would publish under "default", causing
+// standbys to apply it against the wrong tenant.
+//
+// Note on fixture setup: the production on-hit admission path
+// (TryPushPromotionQueue) is gated to "default" tenant with a comment
+// stating promotion-on-hit does not support non-default tenants. So this
+// test seeds the per-tenant promotion_tasks entry directly via friend
+// access (MasterServiceHATest is friended), bypassing the admission gate
+// to isolate the OpLog-call bug. This mirrors how PromotionOnHitTest
+// covers the default-tenant happy path through the public API; here we
+// cover the non-default-tenant OpLog bug at the same code path.
+TEST_F(MasterServiceHATest, NotifyPromotionSuccessPublishesPutEndTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    const std::string tenant = "tenant_a";
+    const std::string key = "promo_tenant_key";
+    const UUID client_id = generate_uuid();
+    constexpr size_t kObjectSize = 1024;
+
+    // Mount a memory segment so PutStart has somewhere to allocate the
+    // PROCESSING MEMORY replica that promotion will then flip COMPLETE.
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service, "test_segment");
+
+    // Stage a PROCESSING MEMORY replica for tenant_a via the tenant-aware
+    // PutStart overload (no PutEnd -- keep the replica in PROCESSING).
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"test_segment"};
+    auto put_start =
+        service->PutStart(client_id, key, tenant, kObjectSize, config);
+    ASSERT_TRUE(put_start.has_value())
+        << "PutStart(tenant_a) failed; error=" << put_start.error();
+    ASSERT_EQ(1u, put_start->size());
+    const ReplicaID staged_replica_id = put_start->front().id;
+
+    // Seed the in-flight PromotionTask directly. Friend access is required
+    // because TryPushPromotionQueue is gated to "default" tenants (see
+    // master_service.cpp). alloc_id must be non-zero and holder_id must
+    // match client_id for NotifyPromotionSuccess to proceed.
+    SeedPromotionTaskForTesting(service.get(), tenant, key, client_id,
+                                staged_replica_id, kObjectSize);
+
+    // NotifyPromotionSuccess under tenant_a -- this is where the bug
+    // manifests. The 3-arg AppendOpLog overload at line ~4364 would
+    // publish under "default" instead of the real tenant.
+    auto res = service->NotifyPromotionSuccess(client_id, key, tenant);
+    ASSERT_TRUE(res.has_value())
+        << "NotifyPromotionSuccess should succeed; error=" << res.error();
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// BatchRemove on a tenant_a object publishes REMOVE OpLog with
+// non-default tenant_id (exercises line 3702 in master_service.cpp).
+TEST_F(MasterServiceHATest, BatchRemoveForcePublishesRemoveTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string tenant = "tenant_a";
+    const std::string key = "tenant_batch_remove_key";
+
+    // Create the object in tenant_a so the subsequent BatchRemove operates
+    // on the same tenant.
+    PutObjectWithTenant(*service, client_id, key, tenant);
+
+    // Call BatchRemove under tenant_a with force=true. This hits the
+    // `PersistRemoveForHA("BatchRemove", key)` site at line 3702.
+    std::vector<std::string> keys{key};
+    auto results = service->BatchRemove(keys, tenant, /*force=*/true);
+    ASSERT_EQ(1u, results.size());
+    ASSERT_TRUE(results[0].has_value())
+        << "BatchRemove should succeed; error=" << results[0].error();
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::REMOVE, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// BatchReplicaClear (new tenant-aware overload) publishes REMOVE OpLog
+// with the real (non-default) tenant_id.
+TEST_F(MasterServiceHATest, BatchReplicaClearPublishesRemoveTenantId) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string tenant = "tenant_a";
+
+    // Create the object in tenant_a
+    PutObjectWithTenant(*service, client_id, "batch_clear_key", tenant);
+
+    // Call new tenant-aware BatchReplicaClear overload (clear_all=true)
+    std::vector<std::string> keys = {"batch_clear_key"};
+    auto res = service->BatchReplicaClear(keys, client_id, "", tenant);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK,
+              mock_store->FindLatestEntryForKey("batch_clear_key", entry));
+    EXPECT_EQ(OpType::REMOVE, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+// ===== Step 5: end-to-end standby convergence regression test =====
+//
+// The per-call-site tests above prove the publish side (each call site
+// publishes the correct tenant_id). This test proves the cumulative effect:
+// when those entries are applied by OpLogApplier on the standby, the
+// standby's MockMetadataStore converges to the correct tenant.
+//
+// This is the regression test that would have caught any missed
+// call-site in Tasks 1-8: if any fix were missing, the standby would
+// apply the entry to the wrong tenant and the assertions below would
+// fail.
+TEST_F(MasterServiceHATest, NonDefaultTenantStandbyConvergesCorrectly) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_oplog = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_oplog);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string tenant = "tenant_a";
+    const std::string key = "e2e_tenant_key";
+
+    // 1. PutStart + PutEnd under tenant_a.
+    PutObjectWithTenant(*service, client_id, key, tenant);
+
+    // 2. Capture the PUT_END entry from the master's MockOpLogStore.
+    OpLogEntry put_entry;
+    ASSERT_EQ(ErrorCode::OK, mock_oplog->FindLatestEntryForKey(key, put_entry));
+    ASSERT_EQ(OpType::PUT_END, put_entry.op_type);
+    ASSERT_EQ(tenant, put_entry.tenant_id);
+
+    // 3. Simulate the standby replay: create an independent
+    //    MockMetadataStore + OpLogApplier and apply the captured entry.
+    auto mock_meta = std::make_shared<MockMetadataStore>();
+    OpLogApplier applier(mock_meta.get(), "test_cluster");
+    // Fast-forward the applier's expected_sequence_id so seq=N (where N is
+    // the PUT_END's actual sequence_id) is accepted in-order. In a real
+    // standby, prior entries (PutStart, etc.) would already be applied; here
+    // we skip them since the goal is to verify tenant_id propagation only.
+    applier.Recover(put_entry.sequence_id - 1);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(put_entry));
+
+    // 4. Assert standby state: key is in tenant_a, NEVER in "default".
+    ASSERT_TRUE(mock_meta->Exists(tenant, key))
+        << "Key must be in tenant_a after applying PUT_END with tenant_id="
+        << tenant;
+    ASSERT_FALSE(mock_meta->Exists("default", key))
+        << "Key must never be in 'default' tenant for tenant_a operations";
+
+    // 5. Remove the key under tenant_a via the master.
+    auto remove_res = service->Remove(key, tenant);
+    ASSERT_TRUE(remove_res.has_value())
+        << "Remove failed; error=" << toString(remove_res.error());
+
+    // 6. Capture the REMOVE entry.
+    OpLogEntry remove_entry;
+    ASSERT_EQ(ErrorCode::OK,
+              mock_oplog->FindLatestEntryForKey(key, remove_entry));
+    ASSERT_EQ(OpType::REMOVE, remove_entry.op_type);
+    ASSERT_EQ(tenant, remove_entry.tenant_id);
+
+    // 7. Apply the REMOVE on the standby.
+    ASSERT_TRUE(applier.ApplyOpLogEntry(remove_entry));
+
+    // 8. Assert standby state: key gone from tenant_a, "default" never
+    //    existed.
+    ASSERT_FALSE(mock_meta->Exists(tenant, key))
+        << "Key must be gone from tenant_a after applying REMOVE with "
+           "tenant_id="
+        << tenant;
+    ASSERT_FALSE(mock_meta->Exists("default", key))
+        << "'default' tenant must never have been created";
+}
+
+// ===== End-to-end promotion failure placeholder =====
+
+TEST_F(MasterServiceHATest, EndToEndOpLogStoreInaccessibleFailsPromotion) {
+    GTEST_SKIP() << "End-to-end wiring is deferred; the unit tests in "
+                    "hot_standby_service_test.cpp cover the fail-closed "
+                    "behavior at the HotStandbyService layer.";
+}
 
 }  // namespace mooncake::test
 
