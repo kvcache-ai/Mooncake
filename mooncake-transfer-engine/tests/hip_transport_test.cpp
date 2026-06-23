@@ -63,17 +63,18 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
 
     Transport* transport = engine->installTransport("hip", nullptr);
     if (transport == nullptr) {
-        GTEST_SKIP() << "HIP transport unavailable (built without -DUSE_HIP=ON?).";
+        GTEST_SKIP()
+            << "HIP transport unavailable (built without -DUSE_HIP=ON?).";
     }
 
     // Both buffers on kSourceDevice so the source GPU differs from the caller.
     void* src = allocOnDevice(kLen, kSourceDevice);
     void* dst = allocOnDevice(kLen, kSourceDevice);
-    ASSERT_EQ(engine->registerLocalMemory(src, kLen,
-                                          "cuda:" + std::to_string(kSourceDevice)),
+    ASSERT_EQ(engine->registerLocalMemory(
+                  src, kLen, "cuda:" + std::to_string(kSourceDevice)),
               0);
-    ASSERT_EQ(engine->registerLocalMemory(dst, kLen,
-                                          "cuda:" + std::to_string(kSourceDevice)),
+    ASSERT_EQ(engine->registerLocalMemory(
+                  dst, kLen, "cuda:" + std::to_string(kSourceDevice)),
               0);
 
     auto segment_id = engine->openSegment(server_name);
@@ -96,13 +97,15 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     Status s = engine->submitTransfer(batch_id, {entry});
     ASSERT_TRUE(s.ok());
 
-    // Invariant: the caller's device is unchanged (== kSourceDevice before fix).
+    // Invariant: the caller's device is unchanged (== kSourceDevice before
+    // fix).
     int active_after_submit = -1;
     ASSERT_EQ(cudaGetDevice(&active_after_submit), cudaSuccess);
     EXPECT_EQ(active_after_submit, kCallerDevice)
         << "startAsyncTransfer() must restore the caller's active device. "
            "Leaving it on the source GPU corrupts the engine thread's HIP "
-           "context, so its next kernel launch fails with hipErrorInvalidDevice.";
+           "context, so its next kernel launch fails with "
+           "hipErrorInvalidDevice.";
 
     // Drain the transfer (also a basic functional check).
     TransferStatus status;
