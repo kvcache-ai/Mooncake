@@ -22,7 +22,7 @@ append_path() {
 
 install_base_packages() {
   apt update -y
-  apt install -y curl libopenblas0 python3-pip
+  apt install -y binutils curl libopenblas0 python3-pip
   python3 -m pip install --no-cache-dir --upgrade pip
 }
 
@@ -107,22 +107,38 @@ setup_musa_library_compat() {
     local source="${MUSA_COMPAT_LIB_DIR}/${soname}.stub.c"
     case "${soname}" in
       libmudnn.so.3)
-        cat > "${source}" <<'C'
-void mooncake_musa_ci_mudnn_stub(void) {}
-void _ZN4musa3dnn4Sort13SetDescendingEb() {}
-void _ZN4musa3dnn4Sort6SetDimEi() {}
-void _ZN4musa3dnn4Sort9SetStableEb() {}
-void _ZN4musa3dnn4SortC1Ev() {}
-void _ZN4musa3dnn4SortD1Ev() {}
-void mudnn_tensor_set_dimensions_info() __asm__("_ZN4musa3dnn6Tensor9SetN" "dInfoESt16initializer_listIlE");
-void mudnn_tensor_set_dimensions_info() {}
-void _ZN4musa3dnn6TensorD1Ev() {}
-void _ZN4musa3dnn9SortByKey13SetDescendingEb() {}
-void _ZN4musa3dnn9SortByKey6SetDimEi() {}
-void _ZN4musa3dnn9SortByKey9SetStableEb() {}
-void _ZN4musa3dnn9SortByKeyC1Ev() {}
-void _ZN4musa3dnn9SortByKeyD1Ev() {}
-C
+        python3 - "${source}" <<'PY'
+import pathlib
+import site
+import subprocess
+import sys
+
+symbols = set()
+for site_dir in site.getsitepackages():
+    lib_dir = pathlib.Path(site_dir) / "torch_musa" / "lib"
+    if not lib_dir.is_dir():
+        continue
+    for library in lib_dir.glob("*.so*"):
+        output = subprocess.run(
+            ["nm", "-D", str(library)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[-2] == "U":
+                symbol = fields[-1]
+                if symbol.startswith("_Z") and "musa3dnn" in symbol:
+                    symbols.add(symbol)
+
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    f.write("void mooncake_musa_ci_mudnn_stub(void) {}\n")
+    for index, symbol in enumerate(sorted(symbols)):
+        f.write(f'void mudnn_symbol_{index}() __asm__("{symbol}");\n')
+        f.write(f"void mudnn_symbol_{index}() {{}}\n")
+PY
         ;;
       libmccl.so.2)
         cat > "${source}" <<'C'
