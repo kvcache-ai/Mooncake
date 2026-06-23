@@ -2343,7 +2343,7 @@ impl PyMooncakeDistributedStore {
             tenant,
             Some(query_cache.clone()),
         );
-        let unregister_result = self.unregister_buffer(scratch_ptr, scratch_size);
+        let unregister_result = self.unregister_buffer(scratch_ptr, Some(scratch_size));
         match unregister_result {
             Ok(0) => {}
             Ok(_) => return Ok(None),

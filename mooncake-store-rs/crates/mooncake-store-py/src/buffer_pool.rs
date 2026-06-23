@@ -12,7 +12,6 @@ use pyo3::prelude::*;
 
 struct OverflowRegion {
     ptr: *mut u8,
-    size: usize,
 }
 
 // SAFETY: OverflowRegion owns an aligned heap allocation. The pointer is only
@@ -119,25 +118,25 @@ impl PoolShared {
             ));
         }
 
-        Ok((
-            ptr as usize,
-            LeaseBacking::Overflow(OverflowRegion { ptr, size }),
-        ))
+        Ok((ptr as usize, LeaseBacking::Overflow(OverflowRegion { ptr })))
     }
 
-    fn unregister_overflow(&self, py: Python<'_>, region: OverflowRegion) -> PyResult<()> {
+    fn unregister_overflow(&self, py: Python<'_>, region: &OverflowRegion) -> PyResult<()> {
         let ret: i32 = self
             .config
             .store
-            .call_method1(py, "unregister_buffer", (region.ptr as usize, region.size))?
+            .call_method1(py, "unregister_buffer", (region.ptr as usize,))?
             .extract(py)?;
         if ret != 0 {
             return Err(PyRuntimeError::new_err(
                 "overflow buffer unregistration failed",
             ));
         }
-        unsafe { libc::free(region.ptr as *mut libc::c_void) };
         Ok(())
+    }
+
+    fn free_overflow(region: OverflowRegion) {
+        unsafe { libc::free(region.ptr as *mut libc::c_void) };
     }
 
     fn reserve_allocate(
@@ -165,7 +164,8 @@ impl PoolShared {
         if state.closed || state.closing {
             drop(state);
             if let Ok((_, LeaseBacking::Overflow(region))) = result {
-                let _ = self.unregister_overflow(py, region);
+                let _ = self.unregister_overflow(py, &region);
+                Self::free_overflow(region);
             }
             return Err(PyRuntimeError::new_err("buffer pool is closing"));
         }
@@ -320,9 +320,34 @@ impl BufferLease {
                 "cannot release buffer while exported views exist",
             ));
         }
-        self.closed = true;
 
+        let mut release_result = match self.backing.as_ref() {
+            Some(LeaseBacking::Local(lease)) => lease.call_method0(py, "release").map(|_| ()),
+            Some(LeaseBacking::Overflow(region)) => self.pool.unregister_overflow(py, region),
+            None => Ok(()),
+        };
+        if release_result.is_err() && check_exports {
+            return release_result;
+        }
+        if release_result.is_err() {
+            if let Some(LeaseBacking::Overflow(region)) = self.backing.as_ref() {
+                for _ in 0..2 {
+                    release_result = self.pool.unregister_overflow(py, region);
+                    if release_result.is_ok() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let should_free_overflow = release_result.is_ok();
+        self.closed = true;
         let backing = self.backing.take();
+        if should_free_overflow {
+            if let Some(LeaseBacking::Overflow(region)) = backing {
+                PoolShared::free_overflow(region);
+            }
+        }
         {
             let mut state = self.pool.state.lock().unwrap();
             state.in_use.remove(&self.ptr);
@@ -330,14 +355,7 @@ impl BufferLease {
         }
         self.pool.cvar.notify_all();
 
-        match backing {
-            Some(LeaseBacking::Local(lease)) => {
-                let _ = lease.call_method0(py, "release")?;
-                Ok(())
-            }
-            Some(LeaseBacking::Overflow(region)) => self.pool.unregister_overflow(py, region),
-            None => Ok(()),
-        }
+        release_result
     }
 }
 

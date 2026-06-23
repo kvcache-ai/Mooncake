@@ -143,6 +143,11 @@ impl StoreClient {
         let state = self.state.lock();
         state.memory_ref()?.plan_scratch(&[len.max(1)])
     }
+
+    pub fn registered_buffer_size(&self, buffer: *mut c_void) -> Result<usize> {
+        let state = self.state.lock();
+        state.registered_buffer_size(buffer)
+    }
 }
 
 impl RouteHitReporter for StoreClient {

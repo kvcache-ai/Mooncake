@@ -398,7 +398,7 @@ impl DummyStoreContext {
         {
             if let Err(error) = self
                 .client
-                .unregister_buffer(previous.base(), previous.len())
+                .unregister_buffer(previous.base(), Some(previous.len()))
             {
                 tracing::warn!(error = %error, "dummy shm stale region unregister failed");
             }

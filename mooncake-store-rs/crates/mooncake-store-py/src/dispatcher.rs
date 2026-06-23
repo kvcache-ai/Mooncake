@@ -442,7 +442,13 @@ impl StoreDispatcher {
         })
     }
 
-    pub fn unregister_buffer(&self, base_ptr: usize, len: usize) -> Result<(), StoreError> {
+    pub fn unregister_buffer(&self, base_ptr: usize, len: Option<usize>) -> Result<(), StoreError> {
+        let len = match len {
+            Some(len) => len,
+            None => {
+                self.run(move |client| client.registered_buffer_size(base_ptr as *mut c_void))?
+            }
+        };
         let timeout = self.registration_timeout_for_bytes(len);
         self.run_with_timeout("buffer unregistration", timeout, move |client| {
             client.unregister_buffer(base_ptr as *mut c_void, len)

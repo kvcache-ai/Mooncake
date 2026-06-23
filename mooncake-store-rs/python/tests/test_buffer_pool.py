@@ -32,6 +32,9 @@ class _FakeStore:
         self.local_leases: dict[int, _LocalLease] = {}
         self.overflow_regions: dict[int, int] = {}
         self.objects: dict[str, bytes] = {}
+        self.register_calls = 0
+        self.unregister_calls = 0
+        self.fail_next_unregister = False
 
     def local_buffer_pool_capacity(self) -> int:
         return self.local_capacity
@@ -49,12 +52,17 @@ class _FakeStore:
         self.local_used -= lease.size
 
     def register_buffer(self, ptr: int, size: int) -> int:
+        self.register_calls += 1
         self.overflow_regions[int(ptr)] = int(size)
         return 0
 
-    def unregister_buffer(self, ptr: int, size: int) -> int:
+    def unregister_buffer(self, ptr: int) -> int:
+        self.unregister_calls += 1
+        if self.fail_next_unregister:
+            self.fail_next_unregister = False
+            return -1
         ptr = int(ptr)
-        if self.overflow_regions.get(ptr) != int(size):
+        if ptr not in self.overflow_regions:
             return -1
         del self.overflow_regions[ptr]
         return 0
@@ -107,6 +115,41 @@ def test_buffer_pool_put_from_get_into_with_local_buffer() -> None:
     pool.close()
     assert store.local_used == 0
     assert store.overflow_regions == {}
+    assert store.register_calls == 0
+    assert store.unregister_calls == 0
+
+
+def test_buffer_pool_release_rejects_live_memoryview() -> None:
+    store = _FakeStore(local_capacity=256)
+    pool = BufferPool(store, max_bytes=256, alignment=64)
+    lease = pool.acquire(64)
+    view = lease.buffer
+
+    with pytest.raises(RuntimeError, match="exported views exist"):
+        lease.release()
+
+    del view
+    gc.collect()
+    lease.release()
+    pool.close()
+    assert store.local_used == 0
+
+
+def test_buffer_pool_drop_waits_for_memoryview_before_reclaiming_local() -> None:
+    store = _FakeStore(local_capacity=256)
+    pool = BufferPool(store, max_bytes=256, alignment=64)
+    lease = pool.acquire(64)
+    view = lease.buffer
+    assert store.local_used == 64
+
+    del lease
+    gc.collect()
+    assert store.local_used == 64
+
+    del view
+    gc.collect()
+    assert store.local_used == 0
+    pool.close()
 
 
 def test_buffer_pool_put_from_get_into_with_overflow_buffer() -> None:
@@ -130,3 +173,40 @@ def test_buffer_pool_put_from_get_into_with_overflow_buffer() -> None:
     pool.close()
     assert store.local_used == 0
     assert store.overflow_regions == {}
+    assert store.register_calls == 2
+    assert store.unregister_calls == 2
+
+
+def test_buffer_pool_overflow_unregister_failure_can_retry_release() -> None:
+    store = _FakeStore(local_capacity=32)
+    pool = BufferPool(store, alignment=64)
+    lease = pool.acquire(64)
+    ptr = lease.ptr
+    assert ptr in store.overflow_regions
+
+    store.fail_next_unregister = True
+    with pytest.raises(RuntimeError, match="overflow buffer unregistration failed"):
+        lease.release()
+
+    assert lease.ptr == ptr
+    assert ptr in store.overflow_regions
+
+    lease.release()
+    assert store.overflow_regions == {}
+    pool.close()
+
+
+def test_buffer_pool_drop_reclaims_overflow_after_transient_unregister_failure() -> None:
+    store = _FakeStore(local_capacity=32)
+    pool = BufferPool(store, alignment=64)
+    lease = pool.acquire(64)
+    ptr = lease.ptr
+    assert ptr in store.overflow_regions
+
+    store.fail_next_unregister = True
+    del lease
+    gc.collect()
+
+    assert ptr not in store.overflow_regions
+    assert store.unregister_calls == 2
+    pool.close()
