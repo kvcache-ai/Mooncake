@@ -70,6 +70,21 @@ class MasterClient {
             detail::MaybeEnableRdmaSocketConfig(
                 pool_conf.client_config.socket_config);
         }
+
+        // Per-request timeout for all client->master RPCs. coro_rpc's
+        // send_request falls back to this config value when no per-call
+        // timeout is given, so setting it here covers every RPC method
+        // uniformly. Default stays at coro_rpc's built-in 30s if unset;
+        // a negative value disables the timeout (no timer is armed).
+        if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
+            pool_conf.client_config.request_timeout_duration =
+                std::chrono::milliseconds(std::atoll(timeout_ms));
+        }
+        // Optional override for the TCP/RDMA connect timeout (default 30s).
+        if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
+            pool_conf.client_config.connect_timeout_duration =
+                std::chrono::milliseconds(std::atoll(connect_ms));
+        }
         client_pools_ =
             std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
                 pool_conf);

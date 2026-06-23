@@ -14,6 +14,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -21,7 +22,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -33,6 +33,7 @@
 #include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "char_util.h"
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>
@@ -142,10 +143,55 @@ struct InfinibandDevice {
     int numa_node;
 };
 
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+                return !std::isspace(ch);
+            }));
+}
+
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
+}
+
+static std::set<std::string> getIbvDeviceWhitelist() {
+    std::set<std::string> whitelist;
+    const char *env = std::getenv("MC_TE_FILTERS");
+    if (!env || !*env) {
+        return whitelist;
+    }
+
+    LOG(INFO) << "IB device whitelist: " << env;
+    std::string env_str(env);
+    size_t start = 0;
+    size_t pos = 0;
+    while ((pos = env_str.find(',', start)) != std::string::npos) {
+        std::string token = env_str.substr(start, pos - start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+        start = pos + 1;
+    }
+    if (start < env_str.length()) {
+        std::string token = env_str.substr(start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+    }
+    return whitelist;
+}
+
 static std::vector<InfinibandDevice> listInfiniBandDevices(
     const std::vector<std::string> &filter) {
     int num_devices = 0;
     std::vector<InfinibandDevice> devices;
+    const auto whitelist = getIbvDeviceWhitelist();
 
     struct ibv_device **device_list = ibv_get_device_list(&num_devices);
     if (!device_list) {
@@ -163,6 +209,12 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         if (!filter.empty() && std::find(filter.begin(), filter.end(),
                                          device_name) == filter.end())
             continue;
+
+        if (!whitelist.empty() &&
+            whitelist.find(device_name) == whitelist.end()) {
+            LOG(INFO) << "Skipping device: " << device_name;
+            continue;
+        }
 
         // Check device availability before adding to the list
         if (!isIbDeviceAvailable(device_list[i])) {
@@ -395,7 +447,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char *ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;

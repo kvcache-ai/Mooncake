@@ -226,8 +226,9 @@ Status ControlService::start(uint16_t& port, bool ipv6_) {
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
                                       std::string& response) {
-    json j = *manager_->getLocal();
-    response = j.dump();
+    // Re-use the cached dump shared across concurrent peer fetches.
+    auto cached = manager_->getLocalDumpedJson();
+    response = *cached;
 }
 
 void ControlService::onBootstrapRdma(const std::string_view& request,

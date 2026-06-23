@@ -126,6 +126,8 @@ performance/mooncake/index
 design/architecture
 design/mooncake-store
 design/p2p-store
+design/mooncake-backend-pg
+design/mooncake-ep
 design/transfer-engine/index
 design/hicache-design
 design/engram
@@ -133,7 +135,6 @@ design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
-design/conductor/indexer-api-design
 design/ssd-free-ratio-first-allocation
 :::
 
@@ -156,6 +157,7 @@ api-reference/http/index
 
 troubleshooting/error-code
 troubleshooting/troubleshooting
+troubleshooting/pg-ep-troubleshooting
 :::
 
 

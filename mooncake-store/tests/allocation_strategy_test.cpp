@@ -793,17 +793,10 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
         const auto name = std::to_string(i) + "-segment";
         ssd_provider.total_capacity[name] = 1000 * MiB;
     }
+    ssd_provider.used_bytes["0-segment"] = 800 * MiB;  // 20% free
+    ssd_provider.used_bytes["1-segment"] = 400 * MiB;  // 60% free
+    ssd_provider.used_bytes["2-segment"] = 100 * MiB;  // 90% free
 
-    // Set different SSD usage ratios:
-    // segment 0: 20% free
-    // segment 1: 60% free
-    // segment 2: 90% free
-    ssd_provider.used_bytes["0-segment"] = 800 * MiB;
-    ssd_provider.used_bytes["1-segment"] = 400 * MiB;
-    ssd_provider.used_bytes["2-segment"] = 100 * MiB;
-
-    // Allocate a small slice. The SSD free-ratio-first strategy should
-    // choose the segment with the most SSD free space, which is segment 2.
     auto result =
         ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {}, {},
                                ReplicaType::MEMORY, &ssd_provider);
@@ -813,7 +806,6 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
     const auto& replica = result.value()[0];
     auto descriptor = replica.get_descriptor();
     ASSERT_TRUE(descriptor.is_memory_replica());
-
     const auto& mem_desc = descriptor.get_memory_descriptor();
     EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "2-segment");
 }

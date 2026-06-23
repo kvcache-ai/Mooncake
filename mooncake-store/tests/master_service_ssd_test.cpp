@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "master_metric_manager.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -57,16 +58,18 @@ void PutAndOffload(MasterService& service, const UUID& client_id,
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(
-        service.PutStart(client_id, key, object_size, config).has_value());
-    ASSERT_TRUE(
-        service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service.PutStart(client_id, key, "default", object_size, config)
+                    .has_value());
+    ASSERT_TRUE(service.PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = object_size;
     metadata.transport_endpoint = local_disk_endpoint;
-    ASSERT_TRUE(
-        service.NotifyOffloadSuccess(client_id, {key}, {metadata}).has_value());
+    OffloadTaskItem task{
+        .tenant_id = "default", .key = key, .size = object_size};
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
+                    .has_value());
 }
 
 void ExpectNextAllocationOnSegment(MasterService& service,
@@ -75,7 +78,7 @@ void ExpectNextAllocationOnSegment(MasterService& service,
                                    const std::string& expected_segment) {
     ReplicateConfig config;
     config.replica_num = 1;
-    auto result = service.PutStart(client_id, key, 64, config);
+    auto result = service.PutStart(client_id, key, "default", 64, config);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     ASSERT_TRUE((*result)[0].is_memory_replica());
@@ -181,6 +184,51 @@ TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
+}
+
+TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+    auto& metrics = MasterMetricManager::instance();
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+    const auto base_stats = metrics.calculate_cache_stats();
+    const double base_memory_total = base_stats.at(CacheHitStat::MEMORY_TOTAL);
+    const double base_ssd_total = base_stats.at(CacheHitStat::SSD_TOTAL);
+
+    constexpr size_t buffer = 0x310000000;
+    constexpr size_t size = 1024 * 1024 * 64;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment_revoke_processing_disk";
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    std::string key = "revoke_processing_disk_metric_key";
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, "default", 1024, {.replica_num = 1})
+            .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+
+    auto stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
+
+    EXPECT_TRUE(
+        service_->PutRevoke(client_id, key, "default", ReplicaType::DISK)
+            .has_value());
+
+    stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
+
+    ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());
+    stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
 }
 
 TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
@@ -517,6 +565,46 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplica_RemovesDiskReplica) {
     EXPECT_TRUE(get_result.value().replicas[0].is_memory_replica());
 }
 
+TEST_F(MasterServiceSSDTest, RemoveDecrementsCacheTotalMetrics) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+    auto& metrics = MasterMetricManager::instance();
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+    const auto base_stats = metrics.calculate_cache_stats();
+    const double base_memory_total = base_stats.at(CacheHitStat::MEMORY_TOTAL);
+    const double base_ssd_total = base_stats.at(CacheHitStat::SSD_TOTAL);
+
+    constexpr size_t buffer = 0x320000000;
+    constexpr size_t size = 1024 * 1024 * 64;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment_remove_metrics";
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    std::string key = "remove_cache_total_metric_key";
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, "default", 1024, {.replica_num = 1})
+            .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
+                    .has_value());
+
+    auto stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total + 1);
+
+    ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());
+
+    stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
+}
+
 TEST_F(MasterServiceSSDTest, EvictDiskReplica_NonExistentKeyReturnsError) {
     auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
@@ -571,7 +659,7 @@ TEST_F(MasterServiceSSDTest, RemoveReleasesLocalDiskUsageTracking) {
     PutAndOffload(*service, client1, "ssd_remove_released", 800, segment1);
     PutAndOffload(*service, client2, "ssd_remove_baseline", 100, segment2);
 
-    ASSERT_TRUE(service->Remove("ssd_remove_released").has_value());
+    ASSERT_TRUE(service->Remove("ssd_remove_released", "default").has_value());
 
     ExpectNextAllocationOnSegment(*service, client1, "ssd_remove_probe",
                                   segment1);
