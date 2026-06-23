@@ -18,6 +18,7 @@ set(MOONCAKE_STORE_SOURCES
     transfer_task.cpp
     tenant_quota.cpp
     rpc_service.cpp
+    master_admin_service.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -60,8 +61,7 @@ set(MOONCAKE_STORE_SOURCES
     store_c.cpp
     memory_alloc.cpp
     ssd_register_client.cpp
-    engram/engram_store.cpp
-)
+    engram/engram_store.cpp)
 
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -146,11 +146,16 @@ if(STORE_USE_REDIS)
   list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
 endif()
 
+list(APPEND MOONCAKE_STORE_SOURCES k8s_lease_helper.cpp)
 if(STORE_USE_K8S_LEASE)
   list(APPEND MOONCAKE_STORE_SOURCES
-    k8s_lease_helper.cpp
-    ha/leadership/backends/k8s/k8s_leader_coordinator.cpp)
+       ha/leadership/backends/k8s/k8s_leader_coordinator.cpp)
   list(APPEND EXTRA_LIBS ${K8S_LEASE_WRAPPER_LIB})
+  set_source_files_properties(
+    k8s_lease_helper.cpp
+    PROPERTIES
+      OBJECT_DEPENDS
+      "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
 endif()
 
 if(USE_NOF)
@@ -247,14 +252,19 @@ endif()
 # mooncake_master). Targets that need transfer_engine should link it explicitly.
 target_link_libraries(
   mooncake_store
-  PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
-         ${EXTRA_LIBS} ${SPDK_STATIC_LIBS} asio_shared
+  PUBLIC cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB}
+         glog::glog
+         gflags::gflags
+         ${EXTRA_LIBS}
+         ${SPDK_STATIC_LIBS}
+         asio_shared
   PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 if(STORE_USE_K8S_LEASE)
-    add_dependencies(mooncake_store build_k8s_lease_wrapper)
+  add_dependencies(mooncake_store build_k8s_lease_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)
@@ -303,23 +313,22 @@ target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
 
 # Optimize binary sizes only in Release mode
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
-if (CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
+if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
   target_compile_options(mooncake_master PRIVATE -Os)
   target_link_options(mooncake_master PRIVATE -Os -s)
   target_compile_options(mooncake_client PRIVATE -Os)
   target_link_options(mooncake_client PRIVATE -Os -s)
 endif()
 
-
 # GPU runtime library for D2H staging in PutToLocalFile / OffloadObjects.
-# transfer_engine is PRIVATE-linked, so its CUDA/HIP/Ascend dependencies
-# are not propagated; we must detect and link them independently.
+# transfer_engine is PRIVATE-linked, so its CUDA/HIP/Ascend dependencies are not
+# propagated; we must detect and link them independently.
 #
-# Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags,
-# because USE_CUDA may be OFF even when GPU pointers are present
-# (e.g. WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart).
-# Each detected toolkit gets both link libraries AND compile definitions,
-# so that gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
+# Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags, because
+# USE_CUDA may be OFF even when GPU pointers are present (e.g.
+# WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart). Each
+# detected toolkit gets both link libraries AND compile definitions, so that
+# gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
 #
 # NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
 # Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
@@ -327,30 +336,33 @@ endif()
 
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
-    message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
-    target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
-    target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
-    target_include_directories(mooncake_store PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-    target_include_directories(mooncake_client PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-    target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
-    target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
+  message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
+  target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
+  target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
+  target_include_directories(mooncake_store PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_include_directories(mooncake_client
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
+  target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
 endif()
 
 if(NOT CUDAToolkit_FOUND)
-    find_package(hip QUIET)
-    if(hip_FOUND)
-        message(STATUS "mooncake_store: HIP detected, enabling D2H staging")
-        target_compile_definitions(mooncake_store PRIVATE USE_HIP)
-        target_compile_definitions(mooncake_client PRIVATE USE_HIP)
-        target_link_libraries(mooncake_store PRIVATE hip::host)
-        target_link_libraries(mooncake_client PRIVATE hip::host)
-    endif()
+  find_package(hip QUIET)
+  if(hip_FOUND)
+    message(STATUS "mooncake_store: HIP detected, enabling D2H staging")
+    target_compile_definitions(mooncake_store PRIVATE USE_HIP)
+    target_compile_definitions(mooncake_client PRIVATE USE_HIP)
+    target_link_libraries(mooncake_store PRIVATE hip::host)
+    target_link_libraries(mooncake_client PRIVATE hip::host)
+  endif()
 endif()
 
-if(USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
-    target_include_directories(mooncake_store PRIVATE $ENV{ASCEND_PATH}/include)
-    target_link_libraries(mooncake_store PRIVATE ascendcl)
-    target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
-    target_link_libraries(mooncake_client PRIVATE ascendcl)
+if(USE_ASCEND
+   OR USE_ASCEND_DIRECT
+   OR USE_UBSHMEM)
+  target_include_directories(mooncake_store PRIVATE $ENV{ASCEND_PATH}/include)
+  target_link_libraries(mooncake_store PRIVATE ascendcl)
+  target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
+  target_link_libraries(mooncake_client PRIVATE ascendcl)
 endif()
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

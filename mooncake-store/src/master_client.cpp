@@ -341,6 +341,10 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             }
             auto result = co_await std::move(ret.value());
             if (!result) {
+                if (result.error().code == coro_rpc::errc::timed_out) {
+                    LOG(ERROR) << "RPC call timed out: " << result.error().msg;
+                    co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
@@ -383,12 +387,15 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             }
             auto result = co_await std::move(ret.value());
             if (!result) {
+                const ErrorCode err_code =
+                    (result.error().code == coro_rpc::errc::timed_out)
+                        ? ErrorCode::RPC_TIMEOUT
+                        : ErrorCode::RPC_FAIL;
                 LOG(ERROR) << "Batch RPC call failed: " << result.error().msg;
                 std::vector<tl::expected<ResultType, ErrorCode>> error_results;
                 error_results.reserve(input_size);
                 for (size_t i = 0; i < input_size; ++i) {
-                    error_results.emplace_back(
-                        tl::make_unexpected(ErrorCode::RPC_FAIL));
+                    error_results.emplace_back(tl::make_unexpected(err_code));
                 }
                 co_return error_results;
             }

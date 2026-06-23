@@ -36,6 +36,13 @@ constexpr int32_t kMaxGenPortAttempts = 500;
 constexpr const char* kProtocolDescFlatKey =
     "comm_resource_config.protocol_desc";
 constexpr const char* kRocePrefix = "roce:";
+constexpr const char* kStoreConfigKey = "store";
+
+std::string SerializeCompactJson(const Json::Value& value) {
+    Json::StreamWriterBuilder writer;
+    writer["indentation"] = "";
+    return Json::writeString(writer, value);
+}
 
 bool IsRoceProtocolDesc(const std::string& desc) {
     return desc.size() >= std::strlen(kRocePrefix) &&
@@ -96,20 +103,58 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
     return ProtocolDescValueContainsRoce(*protocol_desc);
 }
 
+std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
+    if (config_str == nullptr || config_str[0] == '\0') {
+        return std::string();
+    }
+    Json::CharReaderBuilder builder;
+    builder["collectComments"] = false;
+    Json::Value root;
+    std::string errs;
+    const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    if (!reader->parse(config_str, config_str + std::strlen(config_str), &root,
+                       &errs)) {
+        // Not valid JSON: leave it untouched and let adxl reject/handle it.
+        return std::string(config_str);
+    }
+    if (!root.isObject() || !root.isMember(kStoreConfigKey)) {
+        // Plain (legacy) config without a "store" override: pass verbatim.
+        return std::string(config_str);
+    }
+    if (globalConfig().ascend_store_te_init) {
+        return SerializeCompactJson(root[kStoreConfigKey]);
+    }
+    Json::Value normal = root;
+    normal.removeMember(kStoreConfigKey);
+    return SerializeCompactJson(normal);
+}
+
 bool IsRoceModeEnabled() {
+    const char* store_te =
+        globalConfig().ascend_store_te_init ? "true" : "false";
     char* roce_enable_str = std::getenv("HCCL_INTRA_ROCE_ENABLE");
+    LOG(INFO) << "[AscendTE] resolving link config, te is created for store="
+              << store_te << ", HCCL_INTRA_ROCE_ENABLE="
+              << (roce_enable_str ? roce_enable_str : "(unset)");
     if (roce_enable_str) {
         const auto roce_enable = parseFromString<int32_t>(roce_enable_str);
         if (roce_enable.has_value() && roce_enable.value() == 1) {
+            LOG(INFO) << "[AscendTE] roce mode enabled via "
+                         "HCCL_INTRA_ROCE_ENABLE.";
             return true;
         }
         LOG(WARNING) << "HCCL_INTRA_ROCE_ENABLE is not valid, value:"
                      << roce_enable_str;
     }
     char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
-    if (HasRoceProtocolDescInGlobalResourceConfig(global_resource_config)) {
-        LOG(INFO) << "Roce mode is enabled via ASCEND_GLOBAL_RESOURCE_CONFIG "
-                     "protocol_desc.";
+    std::string resolved =
+        ResolveAscendGlobalResourceConfig(global_resource_config);
+    LOG(INFO) << "[AscendTE] resolved ASCEND_GLOBAL_RESOURCE_CONFIG "
+                 "(protocol_desc): "
+              << (resolved.empty() ? "(none)" : resolved);
+    if (HasRoceProtocolDescInGlobalResourceConfig(resolved.c_str())) {
+        LOG(INFO) << "[AscendTE] roce mode enabled via "
+                     "ASCEND_GLOBAL_RESOURCE_CONFIG protocol_desc.";
         return true;
     }
     return false;

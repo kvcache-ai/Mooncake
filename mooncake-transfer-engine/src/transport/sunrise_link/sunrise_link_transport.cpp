@@ -34,7 +34,7 @@ static std::string TangRtSharedObjectPath(const char* soname) {
     std::string arch_dir =
         (arch && arch[0]) ? std::string(arch) : std::string("linux-x86_64");
     std::string arch_path = r + "/lib/" + arch_dir + "/" + soname;
-    if (access(arch_path.c_str(), F_OK) == 0) return arch_path;
+    if (access(arch_path.c_str(), R_OK) == 0) return arch_path;
     return r + "/lib/" + soname;
 }
 
@@ -140,20 +140,20 @@ static tangError_t QueryPointerAttrsBestEffort(void* ptr,
                                                int preferred_dev) {
     if (!ptr || !attr) return tangErrorInvalidValue;
     SavedTangDevice saved;
-    tangError_t ret = tangPointerGetAttributes(attr, ptr);
-    if (ret == tangSuccess) return ret;
 
     if (preferred_dev >= 0) {
         tangSetDevice(preferred_dev);
-        ret = tangPointerGetAttributes(attr, ptr);
-        if (ret == tangSuccess) return ret;
     }
+
+    tangError_t ret = tangPointerGetAttributes(attr, ptr);
+    if (ret == tangSuccess) return ret;
 
     int dev_count = 0;
     if (tangGetDeviceCount(&dev_count) != tangSuccess || dev_count <= 0) {
         return ret;
     }
     for (int d = 0; d < dev_count; ++d) {
+        if (d == preferred_dev) continue;
         tangSetDevice(d);
         ret = tangPointerGetAttributes(attr, ptr);
         if (ret == tangSuccess) return ret;

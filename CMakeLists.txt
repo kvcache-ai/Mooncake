@@ -70,6 +70,7 @@ add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
+include_directories(mooncake-common/k8s-lease)
 include_directories(mooncake-common/include)
 
 if (WITH_TE)

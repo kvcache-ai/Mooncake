@@ -73,7 +73,7 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
 
     const auto policy_str = GetEnvStringOr(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
-        GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY", "none"));
+        GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
     if (policy_str == "fifo") {
         config.eviction_policy = BucketEvictionPolicy::FIFO;
     } else if (policy_str == "lru") {

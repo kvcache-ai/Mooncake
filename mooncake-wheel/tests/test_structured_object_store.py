@@ -236,6 +236,25 @@ class ForceTrackingStore(InMemoryStore):
         return super().batch_remove(keys, force)
 
 
+class TransientBatchRemoveStore(InMemoryStore):
+    """batch_remove reports a transient failure for one key without deleting it.
+
+    The inherited per-key remove() retry then succeeds and deletes the key, so
+    cleanup should end with no outstanding error.
+    """
+
+    def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
+        self.batch_remove_calls += 1
+        results: list[int] = []
+        for index, key in enumerate(keys):
+            if index == 0:
+                results.append(-1)  # transient failure, key left in place
+            else:
+                self.remove(key, force)
+                results.append(0)
+        return results
+
+
 class StrictRegisterStore(InMemoryStore):
     def register_buffer(self, buffer_ptr: int, size: int) -> int:
         if buffer_ptr in self.registered:
@@ -578,6 +597,16 @@ def test_bundle_remove_uses_force_batch_remove_when_available() -> None:
 
     assert store.batch_remove_forces == [True]
     assert store.objects == {}
+
+
+def test_bundle_remove_recovers_after_transient_batch_failure() -> None:
+    store, transfer = make_transfer(TransientBatchRemoveStore())
+
+    ref = transfer.put_bundle(b"meta", {"a": b"x", "b": b"y", "c": b"z"})
+    transfer.remove_bundle(ref)
+
+    assert store.objects == {}
+    assert store.batch_remove_calls == 1
 
 
 def test_bundle_concurrent_put_and_read_spec_full_read() -> None:
