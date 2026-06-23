@@ -27,6 +27,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "hip_device_guard.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -251,16 +252,9 @@ static int setDeviceContext(void* source_ptr, int& device_id) {
 }
 
 static void setupP2PAccess(int num_devices) {
-    // Save the active device. The loop below calls hipSetDevice once per
-    // iteration; without restoring it before returning, the calling thread is
-    // left with its active device pinned to num_devices-1, causing downstream
-    // HIP calls on the same thread (e.g. PyTorch allocations in TP workers) to
-    // target the wrong GPU.
-    int original_device = -1;
-    if (!checkHip(hipGetDevice(&original_device),
-                  "HipTransport: failed to get current device")) {
-        return;
-    }
+    // The loop below switches the active device per iteration; the guard
+    // restores the caller's device on return so this is transparent to it.
+    HipDeviceGuard device_guard;
 
     auto clearStickyPeerAccessError = [](int src_device, int dst_device) {
         // hipDeviceEnablePeerAccess may leave hipErrorPeerAccessAlreadyEnabled
@@ -310,12 +304,6 @@ static void setupP2PAccess(int num_devices) {
                     << i << " and device " << j;
             }
         }
-    }
-
-    // Restore the active device so this function is transparent to the caller.
-    if (original_device >= 0) {
-        (void)checkHip(hipSetDevice(original_device),
-                       "HipTransport: failed to restore device");
     }
 }
 
@@ -457,16 +445,7 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     hipError_t err;
     int device_id;
 
-    // setDeviceContext() below switches the active device to the source GPU.
-    // Restore the caller's device on every exit (RAII) so its next kernel launch
-    // doesn't hit hipErrorInvalidDevice; the guard also keeps device_id active
-    // through hipEventRecord, which needs the event/stream's device current.
-    int prev_device = 0;
-    (void)hipGetDevice(&prev_device);
-    struct DeviceGuard {
-        int prev;
-        ~DeviceGuard() { (void)hipSetDevice(prev); }
-    } device_guard{prev_device};
+    HipDeviceGuard device_guard;
 
     if (setDeviceContext(request.source, device_id) != 0) {
         return Status::InvalidArgument("Failed to set device context");
