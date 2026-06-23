@@ -688,6 +688,62 @@ TEST_F(MasterServiceSSDTest,
                                   segment1);
 }
 
+// Test that after offloading more data to segment1, the next allocation prefers
+// segment2 which has more SSD free space.
+TEST_F(MasterServiceSSDTest, SsdFreeRatioFirstPrefersFresherSsdAfterOffload) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client1 = generate_uuid();
+    UUID client2 = generate_uuid();
+    const std::string segment1 = "ssd_fresher_seg_1";
+    const std::string segment2 = "ssd_fresher_seg_2";
+    // Each segment reports total SSD capacity = 1000 bytes
+    MountMemoryAndLocalDisk(*service, client1, segment1, 0x800000000);
+    MountMemoryAndLocalDisk(*service, client2, segment2, 0x900000000);
+
+    // Offload 800 bytes to segment1 → ssd_used[seg1]=800, free=20%
+    PutAndOffload(*service, client1, "ssd_fresher_heavy", 800, segment1);
+    // Offload 100 bytes to segment2 → ssd_used[seg2]=100, free=90%
+    PutAndOffload(*service, client2, "ssd_fresher_light", 100, segment2);
+
+    // segment2 has higher SSD free ratio → allocation should prefer segment2
+    ExpectNextAllocationOnSegment(*service, client2, "ssd_fresher_probe",
+                                  segment2);
+}
+
+// Test that EvictDiskReplica decrements ssd_used_bytes so that the evicted
+// segment becomes preferred again for the next allocation.
+TEST_F(MasterServiceSSDTest,
+       EvictDiskReplicaDecrementsLocalDiskUsageTracking) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client1 = generate_uuid();
+    UUID client2 = generate_uuid();
+    const std::string segment1 = "ssd_evict_dec_seg_1";
+    const std::string segment2 = "ssd_evict_dec_seg_2";
+    MountMemoryAndLocalDisk(*service, client1, segment1, 0xa00000000);
+    MountMemoryAndLocalDisk(*service, client2, segment2, 0xb00000000);
+
+    // Offload 800 bytes to segment1 → ssd_used[seg1]=800 (20% free)
+    PutAndOffload(*service, client1, "ssd_evict_dec_heavy", 800, segment1);
+    // Offload 100 bytes to segment2 → ssd_used[seg2]=100 (90% free)
+    PutAndOffload(*service, client2, "ssd_evict_dec_light", 100, segment2);
+
+    // segment2 has more SSD free space → should be preferred
+    ExpectNextAllocationOnSegment(*service, client2, "ssd_evict_dec_probe1",
+                                  segment2);
+
+    // Evict the LOCAL_DISK replica of the heavy object from segment1.
+    // NotifyOffloadSuccess creates a LOCAL_DISK replica (not DISK).
+    // This decrements ssd_used[seg1] by 800 → ssd_used[seg1]=0 (100% free)
+    auto evict_result = service->EvictDiskReplica(
+        client1, "ssd_evict_dec_heavy", "default", ReplicaType::LOCAL_DISK);
+    ASSERT_TRUE(evict_result.has_value());
+
+    // After eviction: segment1 has 100% free, segment2 has 90% free
+    // → segment1 should now be preferred
+    ExpectNextAllocationOnSegment(*service, client1, "ssd_evict_dec_probe2",
+                                  segment1);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

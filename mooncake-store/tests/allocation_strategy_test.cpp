@@ -826,4 +826,87 @@ TEST_F(AllocationStrategyTest,
     EXPECT_EQ(result.value().size(), 1u);
 }
 
+// Test that SsdFreeRatioFirstAllocationStrategy skips excluded segments even
+// when they have the highest SSD free ratio.
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstExcludedSegmentsSkipped) {
+    auto ssd_strategy = std::make_unique<SsdFreeRatioFirstAllocationStrategy>();
+
+    const int kNumSegments = 3;
+    const size_t kSegmentSize = 64 * MiB;
+
+    AllocatorManager allocator_manager;
+    for (int i = 0; i < kNumSegments; i++) {
+        const auto name = std::to_string(i) + "-segment";
+        allocator_manager.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x100000000ULL + i * kSegmentSize, kSegmentSize,
+                      name));
+    }
+
+    // SSD free ratios: 0-segment=95%, 1-segment=50%, 2-segment=30%
+    MockSsdMetricsProvider ssd_provider;
+    for (int i = 0; i < kNumSegments; i++) {
+        const auto name = std::to_string(i) + "-segment";
+        ssd_provider.total_capacity[name] = 1000 * MiB;
+    }
+    ssd_provider.used_bytes["0-segment"] = 50 * MiB;   // 95% free (highest)
+    ssd_provider.used_bytes["1-segment"] = 500 * MiB;  // 50% free
+    ssd_provider.used_bytes["2-segment"] = 700 * MiB;  // 30% free
+
+    // Exclude 0-segment which has the highest SSD free ratio
+    std::set<std::string> excluded = {"0-segment"};
+
+    auto result =
+        ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {}, excluded,
+                               ReplicaType::MEMORY, &ssd_provider);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().size(), 1u);
+
+    const auto& replica = result.value()[0];
+    auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_memory_replica());
+    const auto& mem_desc = descriptor.get_memory_descriptor();
+    // Must NOT be allocated to the excluded segment despite its high free ratio
+    EXPECT_NE(mem_desc.buffer_descriptor.transport_endpoint_, "0-segment");
+}
+
+// Test that ssd_used_bytes > ssd_total_capacity is clamped to 0% free,
+// so the other segment (with normal usage) is preferred.
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstUsedExceedsTotalIsClamped) {
+    auto ssd_strategy = std::make_unique<SsdFreeRatioFirstAllocationStrategy>();
+
+    const size_t kSegmentSize = 64 * MiB;
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator(
+        "0-segment", std::make_shared<OffsetBufferAllocator>(
+                         "0-segment", 0x100000000ULL, kSegmentSize, "0-segment"));
+    allocator_manager.addAllocator(
+        "1-segment",
+        std::make_shared<OffsetBufferAllocator>(
+            "1-segment", 0x100000000ULL + kSegmentSize, kSegmentSize,
+            "1-segment"));
+
+    // 0-segment: used exceeds total (concurrent drift) → clamped to 0% free
+    // 1-segment: used=100, total=1000 → 90% free
+    MockSsdMetricsProvider ssd_provider;
+    ssd_provider.total_capacity["0-segment"] = 1000 * MiB;
+    ssd_provider.total_capacity["1-segment"] = 1000 * MiB;
+    ssd_provider.used_bytes["0-segment"] = 1500 * MiB;  // exceeds total
+    ssd_provider.used_bytes["1-segment"] = 100 * MiB;   // 90% free
+
+    auto result =
+        ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {}, {},
+                               ReplicaType::MEMORY, &ssd_provider);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().size(), 1u);
+
+    const auto& replica = result.value()[0];
+    auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_memory_replica());
+    const auto& mem_desc = descriptor.get_memory_descriptor();
+    // 0-segment is clamped to 0% free; 1-segment is 90% free → pick 1-segment
+    EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "1-segment");
+}
+
 }  // namespace mooncake
