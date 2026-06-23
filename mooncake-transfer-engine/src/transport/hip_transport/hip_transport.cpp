@@ -457,14 +457,10 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     hipError_t err;
     int device_id;
 
-    // setDeviceContext() switches the active device to the source GPU and the
-    // async copy below is enqueued on a stream bound to that device. Without
-    // restoring the caller's device the host thread is left pinned to the
-    // source GPU, so the engine's next kernel launch on the same thread (e.g. a
-    // PyTorch op in a TP worker) targets the wrong GPU and fails with
-    // hipErrorInvalidDevice. An RAII guard restores the device on every exit
-    // path and keeps device_id active through hipEventRecord below (which must
-    // run with the event/stream's device current).
+    // setDeviceContext() below switches the active device to the source GPU.
+    // Restore the caller's device on every exit (RAII) so its next kernel launch
+    // doesn't hit hipErrorInvalidDevice; the guard also keeps device_id active
+    // through hipEventRecord, which needs the event/stream's device current.
     int prev_device = 0;
     (void)hipGetDevice(&prev_device);
     struct DeviceGuard {

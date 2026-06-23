@@ -26,23 +26,11 @@
 
 using namespace mooncake;
 
-// This test documents *why* HipTransport must restore the caller's active HIP
-// device after a transfer.
-//
-// HipTransport::startAsyncTransfer() calls setDeviceContext(request.source),
-// which switches the active device to the GPU that owns the source buffer, and
-// enqueues the copy on a stream bound to that device. The engine thread that
-// drives transfers is the SAME thread that subsequently launches compute
-// kernels — for example, a PyTorch op in a tensor-parallel worker that is also
-// pulling KV cache for intra-node prefill/decode disaggregation. If the
-// transport returns with the thread still pinned to the source GPU, the next
-// kernel launch on that thread targets the wrong device and fails with
-// hipErrorInvalidDevice (which surfaces asynchronously, often far from here).
-//
-// The test pins the calling thread to one GPU, runs a transfer whose source
-// buffer lives on a DIFFERENT GPU, and asserts the active device is unchanged
-// afterwards. Without the device-restore fix in startAsyncTransfer(), the
-// active device is left as the source GPU and the EXPECT_EQ below fails.
+// startAsyncTransfer() switches the active device to the source GPU; if it does
+// not restore it, the calling thread (which also launches the engine's compute
+// kernels) is left on the wrong GPU and the next kernel fails with
+// hipErrorInvalidDevice. This pins the caller to one GPU, transfers from a
+// buffer on a different GPU, and asserts the active device is unchanged.
 
 namespace {
 constexpr size_t kLen = 64 * 1024;
@@ -66,8 +54,7 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     const int kCallerDevice = 0;  // device the engine thread runs on
     const int kSourceDevice = 1;  // KV source lives on a different GPU
 
-    // P2PHANDSHAKE keeps the test self-contained (no external etcd/http
-    // metadata server). The engine talks only to itself (loopback segment).
+    // P2PHANDSHAKE: self-contained loopback, no external metadata server.
     auto engine = std::make_unique<TransferEngine>(false);
     const std::string server_name = "127.0.0.1:17813";
     if (engine->init(P2PHANDSHAKE, server_name, "127.0.0.1", 17813) != 0) {
@@ -79,8 +66,7 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
         GTEST_SKIP() << "HIP transport unavailable (built without -DUSE_HIP=ON?).";
     }
 
-    // Source and destination buffers both live on kSourceDevice, so the
-    // transfer's source GPU differs from the calling thread's device.
+    // Both buffers on kSourceDevice so the source GPU differs from the caller.
     void* src = allocOnDevice(kLen, kSourceDevice);
     void* dst = allocOnDevice(kLen, kSourceDevice);
     ASSERT_EQ(engine->registerLocalMemory(src, kLen,
@@ -97,8 +83,7 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     ASSERT_EQ(cudaMemset(src, 0xAB, kLen), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    // Pin the calling thread to a device DIFFERENT from the source, mimicking
-    // the engine thread that will launch the next compute kernel.
+    // Pin the caller to a different device than the source, as the engine does.
     ASSERT_EQ(cudaSetDevice(kCallerDevice), cudaSuccess);
 
     auto batch_id = engine->allocateBatchID(1);
@@ -111,8 +96,7 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     Status s = engine->submitTransfer(batch_id, {entry});
     ASSERT_TRUE(s.ok());
 
-    // The invariant under test: submitTransfer() must not leave the calling
-    // thread pinned to the source GPU. Before the fix this is kSourceDevice.
+    // Invariant: the caller's device is unchanged (== kSourceDevice before fix).
     int active_after_submit = -1;
     ASSERT_EQ(cudaGetDevice(&active_after_submit), cudaSuccess);
     EXPECT_EQ(active_after_submit, kCallerDevice)
@@ -120,15 +104,14 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
            "Leaving it on the source GPU corrupts the engine thread's HIP "
            "context, so its next kernel launch fails with hipErrorInvalidDevice.";
 
-    // Drain the transfer; also serves as a basic functional check that the
-    // copy still works with the device-restore in place.
+    // Drain the transfer (also a basic functional check).
     TransferStatus status;
     do {
         ASSERT_TRUE(engine->getTransferStatus(batch_id, 0, status).ok());
     } while (status.s == TransferStatusEnum::WAITING);
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 
-    // The active device must remain restored after completion as well.
+    // Still restored after completion polling.
     int active_after_wait = -1;
     ASSERT_EQ(cudaGetDevice(&active_after_wait), cudaSuccess);
     EXPECT_EQ(active_after_wait, kCallerDevice);
