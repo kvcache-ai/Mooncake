@@ -70,21 +70,19 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             }
         }
         if (was_skipped) {
-            if (entry.op_type == OpType::REMOVE ||
-                entry.op_type == OpType::PUT_REVOKE) {
-                // Safe: ensure we don't keep stale metadata.
-                if (entry.op_type == OpType::REMOVE) {
-                    ApplyRemove(entry);
-                } else {
-                    ApplyPutRevoke(entry);
-                }
+            if (entry.op_type == OpType::REMOVE) {
+                ApplyRemove(entry);
                 return true;
             }
-            // PUT_END (or others): discard to avoid resurrecting stale state.
-            if (entry.op_type == OpType::PUT_END) {
-                HAMetricManager::instance().inc_oplog_dropped_put_end();
+            if (entry.op_type == OpType::PUT_REVOKE) {
+                ApplyPutRevoke(entry);
+                return true;
             }
-            VLOG(1) << "OpLogApplier: discard late skipped entry, op_type="
+            if (entry.op_type == OpType::PUT_END) {
+                return ApplyPutEndIfNewer(entry);
+            }
+            VLOG(1) << "OpLogApplier: discard late skipped non-metadata entry, "
+                       "op_type="
                     << static_cast<int>(entry.op_type)
                     << ", sequence_id=" << entry.sequence_id
                     << ", key=" << entry.object_key;
@@ -405,8 +403,12 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
         }
         r.fetched++;
 
-        // Apply policy: only delete/revoke; drop PUT_END.
-        if (e.op_type == OpType::REMOVE) {
+        if (e.op_type == OpType::PUT_END) {
+            if (ApplyPutEndIfNewer(e)) {
+                r.applied_puts++;
+                successfully_processed.push_back(seq);
+            }
+        } else if (e.op_type == OpType::REMOVE) {
             ApplyRemove(e);
             r.applied_deletes++;
             successfully_processed.push_back(seq);
@@ -415,7 +417,6 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
             r.applied_deletes++;
             successfully_processed.push_back(seq);
         } else {
-            // PUT_END or others: mark as processed (dropped) so we don't retry.
             successfully_processed.push_back(seq);
         }
     }
@@ -431,6 +432,25 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
         }
     }
     return r;
+}
+
+size_t OpLogApplier::GetUnresolvedGapCount() const {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    return missing_sequence_ids_.size() + skipped_sequence_ids_.size();
+}
+
+bool OpLogApplier::HasUnresolvedGaps() const {
+    return GetUnresolvedGapCount() != 0;
+}
+
+void OpLogApplier::AddMissingGapForTesting(uint64_t seq) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    missing_sequence_ids_[seq] = std::chrono::steady_clock::now();
+}
+
+void OpLogApplier::AddSkippedGapForTesting(uint64_t seq) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    skipped_sequence_ids_[seq] = std::chrono::steady_clock::now();
 }
 
 bool OpLogApplier::CheckSequenceOrder(const OpLogEntry& entry) {
@@ -492,6 +512,20 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
                 << ", replicas=" << metadata.replicas.size()
                 << ", size=" << metadata.size;
     }
+}
+
+bool OpLogApplier::ApplyPutEndIfNewer(const OpLogEntry& entry) {
+    auto existing =
+        metadata_store_->GetMetadata(entry.tenant_id, entry.object_key);
+    if (existing.has_value() &&
+        existing->last_sequence_id > entry.sequence_id) {
+        VLOG(1) << "OpLogApplier: skip stale PUT_END, key=" << entry.object_key
+                << ", entry_seq=" << entry.sequence_id
+                << ", existing_seq=" << existing->last_sequence_id;
+        return true;
+    }
+    ApplyPutEnd(entry);
+    return true;
 }
 
 void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
