@@ -744,6 +744,125 @@ TEST_F(MasterServiceSSDTest,
                                   segment1);
 }
 
+// Real-path performance comparison: MasterService PutStart throughput for
+// three configurations:
+//   (A) RANDOM, no offload        — baseline, original behavior
+//   (B) RANDOM, with offload      — isolates disk-replica creation overhead
+//   (C) SSD_FREE_RATIO_FIRST, with offload — adds SSD metrics lock + sorting
+//
+// Comparing A→B separates the cost of mounting LocalDisk segments.
+// Comparing B→C isolates the pure SSD-ranking strategy overhead.
+//
+// Each round: PutStart → PutEnd(MEMORY) (timed) → Remove (not timed).
+TEST_F(MasterServiceSSDTest,
+       SsdFreeRatioFirstVsRandomMasterServicePerformance) {
+    constexpr int kNumNodes = 32;
+    constexpr size_t kSegmentSize = 8 * 1024 * 1024;  // 8 MiB each
+    constexpr size_t kSliceSize = 512;                 // 512 B – focus on strategy cost
+    constexpr int kWarmupRounds = 50;
+    constexpr int kBenchmarkRounds = 300;
+
+    // Build a MasterService with kNumNodes segments. with_ssd=true also
+    // mounts LocalDisk and reports varied SSD capacity per node.
+    auto buildAndMount =
+        [&](AllocationStrategyType strategy, bool with_ssd,
+            size_t base_start,
+            const std::string& tag) -> std::unique_ptr<MasterService> {
+        MasterServiceConfig config;
+        config.enable_offload = with_ssd;
+        config.default_kv_lease_ttl = 10000;
+        config.allocation_strategy_type = strategy;
+        auto svc = std::make_unique<MasterService>(config);
+
+        for (int i = 0; i < kNumNodes; i++) {
+            UUID cid = generate_uuid();
+            Segment seg;
+            seg.id = generate_uuid();
+            seg.name = "ms_perf_" + std::to_string(i) + "_" + tag;
+            seg.base = base_start + static_cast<size_t>(i) * kSegmentSize;
+            seg.size = kSegmentSize;
+            seg.te_endpoint = seg.name;
+            (void)svc->MountSegment(seg, cid);
+            if (with_ssd) {
+                (void)svc->MountLocalDiskSegment(cid, true);
+                // Vary total SSD capacity so nodes have distinct free ratios
+                (void)svc->ReportSsdCapacity(
+                    cid, static_cast<int64_t>(1024 * 1024) * (i + 1));
+            }
+        }
+        return svc;
+    };
+
+    // Measure kRounds of PutStart + PutEnd(MEMORY). Remove is called after
+    // timing to free allocator space without inflating the measurement.
+    auto runBenchmark = [&](MasterService& svc, const std::string& key_pfx,
+                            int rounds) -> std::chrono::microseconds {
+        const UUID writer = generate_uuid();
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        std::chrono::microseconds total{0};
+
+        for (int i = 0; i < rounds; i++) {
+            const std::string key = key_pfx + std::to_string(i);
+            auto t0 = std::chrono::steady_clock::now();
+            (void)svc.PutStart(writer, key, "default", kSliceSize, cfg);
+            (void)svc.PutEnd(writer, key, "default", ReplicaType::MEMORY);
+            total += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0);
+            (void)svc.Remove(key, "default", /*force=*/true);
+        }
+        return total;
+    };
+
+    // (A) RANDOM, no offload – baseline
+    auto svc_a = buildAndMount(AllocationStrategyType::RANDOM, false,
+                               0xc00000000ULL, "A");
+    (void)runBenchmark(*svc_a, "ms_A_wu_", kWarmupRounds);
+    auto elapsed_a = runBenchmark(*svc_a, "ms_A_bm_", kBenchmarkRounds);
+
+    // (B) RANDOM, with offload – quantify disk-replica overhead alone
+    auto svc_b = buildAndMount(AllocationStrategyType::RANDOM, true,
+                               0xd00000000ULL, "B");
+    (void)runBenchmark(*svc_b, "ms_B_wu_", kWarmupRounds);
+    auto elapsed_b = runBenchmark(*svc_b, "ms_B_bm_", kBenchmarkRounds);
+
+    // (C) SSD_FREE_RATIO_FIRST, with offload – full new feature
+    auto svc_c = buildAndMount(AllocationStrategyType::SSD_FREE_RATIO_FIRST,
+                               true, 0xe00000000ULL, "C");
+    (void)runBenchmark(*svc_c, "ms_C_wu_", kWarmupRounds);
+    auto elapsed_c = runBenchmark(*svc_c, "ms_C_bm_", kBenchmarkRounds);
+
+    auto us_per_op = [&](std::chrono::microseconds us) {
+        return static_cast<double>(us.count()) / kBenchmarkRounds;
+    };
+    double ratio_b_a =
+        static_cast<double>(elapsed_b.count()) / elapsed_a.count();
+    double ratio_c_b =
+        static_cast<double>(elapsed_c.count()) / elapsed_b.count();
+    double ratio_c_a =
+        static_cast<double>(elapsed_c.count()) / elapsed_a.count();
+
+    std::cout
+        << "\n=== MasterService Real-Path Performance (PutStart+PutEnd) ===\n"
+        << "Nodes: " << kNumNodes << " | Slice: " << kSliceSize
+        << " B | Rounds: " << kBenchmarkRounds << "\n\n"
+        << "  (A) RANDOM, offload=OFF (baseline):         "
+        << elapsed_a.count() << " us  |  " << std::fixed
+        << std::setprecision(3) << us_per_op(elapsed_a) << " us/op\n"
+        << "  (B) RANDOM, offload=ON  (disk replica cost):"
+        << elapsed_b.count() << " us  |  " << us_per_op(elapsed_b)
+        << " us/op  [" << std::setprecision(2) << ratio_b_a << "x vs A]\n"
+        << "  (C) SSD_FREE_RATIO_FIRST, offload=ON:       "
+        << elapsed_c.count() << " us  |  " << us_per_op(elapsed_c)
+        << " us/op  [" << ratio_c_b << "x vs B]\n\n"
+        << "  A→B  disk-replica overhead:   " << std::setprecision(1)
+        << (ratio_b_a - 1.0) * 100.0 << "%\n"
+        << "  B→C  SSD-ranking overhead:    "
+        << (ratio_c_b - 1.0) * 100.0 << "%\n"
+        << "  A→C  total overhead vs origin:" << (ratio_c_a - 1.0) * 100.0
+        << "%\n\n";
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

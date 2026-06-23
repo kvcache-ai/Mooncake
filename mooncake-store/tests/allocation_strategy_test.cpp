@@ -909,4 +909,100 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstUsedExceedsTotalIsClamped) {
     EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "1-segment");
 }
 
+// Strategy-level performance comparison: Random vs SsdFreeRatioFirst.
+// Uses OffsetBufferAllocator (real physical memory via aligned_alloc) and
+// MockSsdMetricsProvider. Measures pure strategy overhead without MasterService
+// locking, reflecting only the allocation algorithm cost.
+TEST_F(AllocationStrategyTest,
+       SsdFreeRatioFirstVsRandomStrategyPerformance) {
+    constexpr size_t kNumSegments = 64;
+    constexpr size_t kSegmentSize = 8 * MiB;   // 64 * 8MB = 512MB physical
+    constexpr size_t kAllocSize = 128 * 1024;   // 128KB per allocation
+    constexpr int kWarmupRounds = 200;
+    constexpr int kBenchmarkRounds = 2000;
+
+    // Build AllocatorManager: 64 segments, each 8 MiB
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = "perf_seg_" + std::to_string(i);
+        allocator_manager.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x200000000ULL + i * kSegmentSize, kSegmentSize,
+                      name));
+    }
+
+    // SSD free ratios vary uniformly from ~10% to ~90% across segments
+    MockSsdMetricsProvider ssd_provider;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = "perf_seg_" + std::to_string(i);
+        ssd_provider.total_capacity[name] = 1000 * MiB;
+        // used: 100 MiB (10% used) to 900 MiB (90% used)
+        ssd_provider.used_bytes[name] =
+            static_cast<int64_t>((100 + i * 800 / kNumSegments)) * MiB;
+    }
+
+    // -------- Random strategy --------
+    auto random_strategy = std::make_unique<RandomAllocationStrategy>();
+    {
+        // Warmup (results discarded)
+        for (int i = 0; i < kWarmupRounds; i++) {
+            (void)random_strategy->Allocate(allocator_manager, kAllocSize);
+        }
+    }
+    std::vector<std::vector<Replica>> random_replicas;
+    random_replicas.reserve(kBenchmarkRounds);
+
+    auto t_rand_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBenchmarkRounds; i++) {
+        auto r = random_strategy->Allocate(allocator_manager, kAllocSize);
+        ASSERT_TRUE(r.has_value());
+        random_replicas.emplace_back(std::move(r.value()));
+    }
+    auto rand_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_rand_start);
+    random_replicas.clear();  // deallocate so SSD strategy starts fresh
+
+    // -------- SsdFreeRatioFirst strategy --------
+    auto ssd_strategy = std::make_unique<SsdFreeRatioFirstAllocationStrategy>();
+    {
+        // Warmup
+        for (int i = 0; i < kWarmupRounds; i++) {
+            (void)ssd_strategy->Allocate(allocator_manager, kAllocSize, 1, {},
+                                         {}, ReplicaType::MEMORY, &ssd_provider);
+        }
+    }
+    std::vector<std::vector<Replica>> ssd_replicas;
+    ssd_replicas.reserve(kBenchmarkRounds);
+
+    auto t_ssd_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBenchmarkRounds; i++) {
+        auto r = ssd_strategy->Allocate(allocator_manager, kAllocSize, 1, {},
+                                        {}, ReplicaType::MEMORY, &ssd_provider);
+        ASSERT_TRUE(r.has_value());
+        ssd_replicas.emplace_back(std::move(r.value()));
+    }
+    auto ssd_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_ssd_start);
+    ssd_replicas.clear();
+
+    double rand_us_per_op = static_cast<double>(rand_us.count()) / kBenchmarkRounds;
+    double ssd_us_per_op = static_cast<double>(ssd_us.count()) / kBenchmarkRounds;
+    double overhead_ratio =
+        static_cast<double>(ssd_us.count()) / rand_us.count();
+
+    std::cout << "\n=== Strategy-Level Performance: Random vs SsdFreeRatioFirst ===\n"
+              << "Segments: " << kNumSegments
+              << " | Alloc size: " << (kAllocSize / 1024) << " KB"
+              << " | Rounds: " << kBenchmarkRounds << "\n"
+              << "Random:              " << rand_us.count() << " us total  |  "
+              << std::fixed << std::setprecision(3) << rand_us_per_op
+              << " us/op\n"
+              << "SsdFreeRatioFirst:   " << ssd_us.count() << " us total  |  "
+              << ssd_us_per_op << " us/op\n"
+              << "Overhead ratio:      " << std::setprecision(2)
+              << overhead_ratio << "x  ("
+              << std::setprecision(1)
+              << (overhead_ratio - 1.0) * 100.0 << "% slower)\n\n";
+}
+
 }  // namespace mooncake
