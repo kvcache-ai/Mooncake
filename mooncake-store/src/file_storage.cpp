@@ -685,9 +685,32 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 void FileStorage::RemoveAll() {
+    namespace fs = std::filesystem;
+
+    // 1. Drain in-memory metadata via storage_backend_ so that
+    //    concurrent readers/writers can no longer reference stale entries.
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
+
+    // 2. Unconditionally wipe all files under the storage directory.
+    //    This guarantees physical cleanup even if the in-memory map was
+    //    empty (e.g. after a crash or partial ScanMeta).
+    const auto& storage_dir = config_.storage_filepath;
+    std::error_code ec;
+    if (fs::exists(storage_dir, ec) && !ec) {
+        for (const auto& entry : fs::directory_iterator(storage_dir, ec)) {
+            if (ec) break;
+            std::error_code remove_ec;
+            fs::remove_all(entry.path(), remove_ec);
+            if (remove_ec &&
+                remove_ec != std::errc::no_such_file_or_directory) {
+                LOG(WARNING) << "RemoveAll: failed to remove " << entry.path()
+                             << ", error: " << remove_ec.message();
+            }
+        }
+    }
+    LOG(INFO) << "FileStorage::RemoveAll: cleaned directory " << storage_dir;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
