@@ -1493,25 +1493,27 @@ class ChunkedReadSession {
     }
 
     ErrorCode wait_chunk(size_t chunk_index) {
-        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
         if (chunk_index >= num_chunks_) return ErrorCode::INVALID_PARAMS;
         if (precompleted_) return chunk_results_[chunk_index];
         maybe_submit_more(chunk_index + 1);
         if (poll_chunk(chunk_index)) return chunk_results_[chunk_index];
-        if (!futex_wait_until_chunk(chunk_index)) {
-            mark_chunk_done(chunk_index, ErrorCode::TRANSFER_FAIL);
-            seal_batch();
+        if (!futex_wait_until_chunk(chunk_index, state_lock)) {
+            if (!poll_chunk(chunk_index)) {
+                mark_chunk_done(chunk_index, ErrorCode::TRANSFER_FAIL);
+                seal_batch();
+            }
         }
         return chunk_results_[chunk_index];
     }
 
     ErrorCode wait_all() {
-        std::lock_guard<std::mutex> state_lock(state_mutex_);
-        return wait_all_locked();
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
+        return wait_all_locked(state_lock);
     }
 
    private:
-    ErrorCode wait_all_locked() {
+    ErrorCode wait_all_locked(std::unique_lock<std::mutex>& state_lock) {
         if (precompleted_) return aggregate_result();
         maybe_submit_more(window_size_);
 
@@ -1535,14 +1537,13 @@ class ChunkedReadSession {
                     continue;
                 }
             }
-            if (!futex_wait_once(futex_word, snapshot, deadline)) break;
+            state_lock.unlock();
+            bool waited = futex_wait_once(futex_word, snapshot, deadline);
+            state_lock.lock();
+            if (!waited) break;
             current = completed_count_.load(std::memory_order_relaxed);
         }
-        if (finished_task_count_snapshot() ==
-            chunk_task_offsets_[submitted_chunks_.load(
-                std::memory_order_acquire)]) {
-            drain_completed_chunks(num_chunks_, true);
-        }
+        drain_completed_chunks(observed_batch_finished_count(), true);
         if (completed_count_.load(std::memory_order_relaxed) != num_chunks_) {
             mark_remaining_chunks_failed();
         }
@@ -1571,7 +1572,8 @@ class ChunkedReadSession {
         return true;
     }
 
-    bool futex_wait_until_chunk(size_t chunk_index) {
+    bool futex_wait_until_chunk(size_t chunk_index,
+                                std::unique_lock<std::mutex>& state_lock) {
         auto* futex_word = get_futex_word();
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(kChunkedReadTimeoutSeconds);
@@ -1584,14 +1586,20 @@ class ChunkedReadSession {
                 if (chunk_done_[chunk_index]) return true;
             }
             if (materialize_chunk_result(chunk_index)) return true;
-            if (!futex_wait_once(futex_word, snapshot, deadline)) return false;
+            state_lock.unlock();
+            bool waited = futex_wait_once(futex_word, snapshot, deadline);
+            state_lock.lock();
+            if (!waited) {
+                if (poll_chunk(chunk_index)) return true;
+                return false;
+            }
         }
     }
 
     void cleanup() {
-        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
         if (precompleted_ || !engine_ || batch_id_ == INVALID_BATCH_ID) return;
-        wait_all_locked();
+        wait_all_locked(state_lock);
         Status s = engine_->freeBatchID(batch_id_);
         if (!s.ok()) {
             LOG(ERROR) << "Failed to free chunked read batch " << batch_id_
@@ -1605,7 +1613,6 @@ class ChunkedReadSession {
 
     void maybe_submit_more(size_t required_chunks) {
         if (precompleted_) return;
-        std::lock_guard<std::mutex> lock(submit_mutex_);
         if (sealed_) return;
         size_t submitted = submitted_chunks_.load(std::memory_order_acquire);
         size_t target = std::min(
@@ -1639,7 +1646,6 @@ class ChunkedReadSession {
 
     void seal_batch() {
         if (precompleted_) return;
-        std::lock_guard<std::mutex> lock(submit_mutex_);
         seal_batch_locked();
     }
 
@@ -1759,8 +1765,8 @@ class ChunkedReadSession {
     bool precompleted_ = false;
     bool submit_failed_ = false;
     std::string submit_context_;
+    // Protects session state; wait helpers release it while sleeping on futex.
     std::mutex state_mutex_;
-    std::mutex submit_mutex_;
 };
 
 // ChunkedReadHandle — thin wrapper over ChunkedReadSession
