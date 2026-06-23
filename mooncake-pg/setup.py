@@ -8,22 +8,27 @@ use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", 
 if use_musa:
     try:
         import torchada  # noqa: F401
-        from torchada.utils.cpp_extension import (  # noqa: F401, E402
-            BuildExtension,
-            CUDAExtension,
-            CUDA_HOME,
-        )
     except ImportError as e:
         raise ImportError(
             "torchada is required to build the MUSA PG extension. "
             "Please install it first using 'pip install torchada'."
         ) from e
-else:
-    from torch.utils.cpp_extension import (  # noqa: E402
-        BuildExtension,
-        CUDAExtension,
-        CUDA_HOME,
-    )
+
+
+import torch.utils.cpp_extension as cpp_extension  # noqa: E402
+from torch.utils.cpp_extension import (  # noqa: E402
+    BuildExtension,
+    CUDAExtension,
+    CUDA_HOME,
+)
+
+if use_musa and CUDA_HOME is None and os.getenv("CUDA_HOME"):
+    # MUSA PyTorch wheels may report torch.cuda as not compiled, causing
+    # torch.utils.cpp_extension.CUDA_HOME to stay None even when CUDA_HOME is
+    # set to the MUSA SDK compatibility path.  CUDAExtension consults the
+    # module-level CUDA_HOME when resolving library paths, so patch it here.
+    cpp_extension.CUDA_HOME = os.getenv("CUDA_HOME")
+    CUDA_HOME = cpp_extension.CUDA_HOME
 
 
 torch_version = re.match(r"\d+(?:\.\d+)*", torch.__version__).group()

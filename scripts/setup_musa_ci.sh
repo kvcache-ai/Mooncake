@@ -2,7 +2,7 @@
 set -euxo pipefail
 
 MUSA_HOME="${MUSA_HOME:-/usr/local/musa}"
-MUSA_COMPAT_LIB_DIR="${RUNNER_TEMP:-/tmp}/mooncake-musa-libs"
+CUDA_COMPAT_HOME="${RUNNER_TEMP:-/tmp}/mooncake-musa-cuda"
 TORCH_MUSA_WHEEL_URL="${TORCH_MUSA_WHEEL_URL:-https://cloud.tsinghua.edu.cn/f/6213611820c34bb881fd/?dl=1}"
 TORCH_MUSA_WHEEL="${RUNNER_TEMP:-/tmp}/torch_musa-2.9.0-cp310-cp310-linux_x86_64.whl"
 
@@ -20,9 +20,17 @@ append_path() {
   export PATH="$1:${PATH}"
 }
 
+python_has_module() {
+  python3 - "$1" <<'PY'
+import importlib.util
+import sys
+sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)
+PY
+}
+
 install_base_packages() {
   apt update -y
-  apt install -y binutils curl libopenblas0 python3-pip
+  apt install -y curl libopenblas0 python3-pip
   python3 -m pip install --no-cache-dir --upgrade pip
 }
 
@@ -48,152 +56,276 @@ PY
   python3 -m pip install --no-cache-dir --force-reinstall --no-deps "${TORCH_MUSA_WHEEL}"
 }
 
-setup_musa_library_compat() {
-  rm -rf "${MUSA_COMPAT_LIB_DIR}"
-  mkdir -p "${MUSA_COMPAT_LIB_DIR}"
+write_cuda_compat_headers() {
+  mkdir -p "${CUDA_COMPAT_HOME}/include"
 
-  local roots=(
-    "${MUSA_HOME}/lib"
-    "${MUSA_HOME}/lib64"
-    "${MUSA_HOME}/mudnn/lib"
-    "${MUSA_HOME}/mccl/lib"
-    "${MUSA_HOME}/mufft/lib"
-    "${MUSA_HOME}/mublas/lib"
-    "${MUSA_HOME}/musolver/lib"
-    "${MUSA_HOME}/musparse/lib"
-    "/driver/usr/local/musa/lib"
-    "/driver/usr/lib/x86_64-linux-gnu"
-    "/usr/lib/x86_64-linux-gnu"
-  )
+  # PyTorch's CPU wheel still exposes CUDA-facing headers under ATen/cuda and
+  # c10/cuda.  When torchada ports Mooncake's sources to MUSA, a few host-side
+  # includes can still transitively reach those headers.  Provide only the CUDA
+  # surface needed for compilation, backed by the MUSA SDK, in the temporary
+  # CUDA_HOME tree instead of patching /usr/local/musa or site-packages.
+  cat > "${CUDA_COMPAT_HOME}/include/mooncake_musa_ci_compat.h" <<'H'
+#ifndef MOONCAKE_MUSA_CI_COMPAT_H
+#define MOONCAKE_MUSA_CI_COMPAT_H
 
-  find_musa_library() {
-    local soname="$1"
-    local base="${soname%%.so*}.so"
-    local root candidate
-    shopt -s nullglob
-    for root in "${roots[@]}"; do
-      for candidate in "${root}/${soname}" "${root}/${base}" "${root}/${base}".*; do
-        if [[ -e "${candidate}" ]]; then
-          printf '%s\n' "${candidate}"
-          shopt -u nullglob
-          return 0
-        fi
-      done
-    done
-    candidate=$(find -L /usr/local/musa /driver /usr/lib /lib \
-      -type f \( -name "${soname}" -o -name "${base}" -o -name "${base}.*" \) \
-      -print -quit 2>/dev/null || true)
-    if [[ -n "${candidate}" ]]; then
-      printf '%s\n' "${candidate}"
-      shopt -u nullglob
-      return 0
-    fi
-    shopt -u nullglob
-    return 1
-  }
+#include <driver_types.h>
 
-  link_musa_soname() {
-    local soname="$1"
-    local target
-    if target="$(find_musa_library "${soname}")"; then
-      ln -sf "${target}" "${MUSA_COMPAT_LIB_DIR}/${soname}"
-      return 0
-    fi
-    return 1
-  }
+#ifndef __host__
+#define __host__
+#endif
+#ifndef __device__
+#define __device__
+#endif
+#ifndef __cudart_builtin__
+#define __cudart_builtin__
+#endif
+#ifndef CUDARTAPI
+#define CUDARTAPI
+#endif
 
-  write_build_only_stub() {
-    local soname="$1"
-    local source="${MUSA_COMPAT_LIB_DIR}/${soname}.stub.c"
-    case "${soname}" in
-      libmudnn.so.3)
-        python3 - "${source}" <<'PY'
-import pathlib
-import site
-import subprocess
-import sys
+#ifndef MUSART_PI
+#define MUSART_PI 3.14159265358979323846
+#endif
+#ifndef MUSART_THIRD
+#define MUSART_THIRD 0.33333333333333333333
+#endif
+#ifndef MUSART_SQRT_HALF_HI
+#define MUSART_SQRT_HALF_HI 0.70710678118654752440
+#endif
+#ifndef MUSART_SQRT_HALF_LO
+#define MUSART_SQRT_HALF_LO 0.0
+#endif
 
-symbols = set()
-for site_dir in site.getsitepackages():
-    lib_dir = pathlib.Path(site_dir) / "torch_musa" / "lib"
-    if not lib_dir.is_dir():
-        continue
-    for library in lib_dir.glob("*.so*"):
-        output = subprocess.run(
-            ["nm", "-D", str(library)],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        ).stdout
-        for line in output.splitlines():
-            fields = line.split()
-            if len(fields) >= 2 and fields[-2] == "U":
-                symbol = fields[-1]
-                if symbol.startswith("_Z") and "musa3dnn" in symbol:
-                    symbols.add(symbol)
+#endif  /* MOONCAKE_MUSA_CI_COMPAT_H */
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cuda_runtime_api.h" <<'H'
+#pragma once
+#include "mooncake_musa_ci_compat.h"
+#include <musa_runtime_api.h>
+typedef musaError_t cudaError_t;
+typedef musaStream_t cudaStream_t;
+typedef musaEvent_t cudaEvent_t;
+typedef musaIpcEventHandle_t cudaIpcEventHandle_t;
+typedef enum musaMemcpyKind cudaMemcpyKind;
+typedef enum musaDeviceAttr cudaDeviceAttr;
+typedef enum musaStreamCaptureMode cudaStreamCaptureMode;
+typedef enum musaStreamCaptureStatus cudaStreamCaptureStatus;
+typedef struct musaDeviceProp cudaDeviceProp;
+typedef struct musaPointerAttributes cudaPointerAttributes;
+#define cudaSuccess musaSuccess
+#define cudaErrorNotReady musaErrorNotReady
+#define cudaDevAttrClockRate musaDevAttrClockRate
+#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaMemcpyDefault musaMemcpyDefault
+#define cudaMemoryTypeDevice musaMemoryTypeDevice
+#define cudaHostAllocMapped musaHostAllocMapped
+#define cudaEventDefault musaEventDefault
+#define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventInterprocess musaEventInterprocess
+#define cudaEventRecordDefault musaEventRecordDefault
+#define cudaEventRecordExternal musaEventRecordExternal
+#define cudaEventWaitDefault musaEventWaitDefault
+#define cudaEventWaitExternal musaEventWaitExternal
+#define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+#define cudaStreamCaptureStatusActive musaStreamCaptureStatusActive
+#define cudaStreamCaptureStatusInvalidated musaStreamCaptureStatusInvalidated
+#define cudaGetErrorString musaGetErrorString
+#define cudaGetLastError musaGetLastError
+#define cudaGetDevice musaGetDevice
+#define cudaSetDevice musaSetDevice
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaMalloc musaMalloc
+#define cudaFree musaFree
+#define cudaMallocHost musaMallocHost
+#define cudaFreeHost musaFreeHost
+#ifdef __cplusplus
+template <typename T>
+static inline cudaError_t cudaHostAlloc(T **ptr, size_t size, unsigned int flags) {
+  return musaHostAlloc(reinterpret_cast<void **>(ptr), size, flags);
+}
+template <typename T>
+static inline cudaError_t cudaHostGetDevicePointer(T **device_ptr, T *host_ptr, unsigned int flags) {
+  return musaHostGetDevicePointer(reinterpret_cast<void **>(device_ptr), host_ptr, flags);
+}
+#else
+static inline cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags) {
+  return musaHostAlloc(ptr, size, flags);
+}
+static inline cudaError_t cudaHostGetDevicePointer(void **device_ptr, void *host_ptr, unsigned int flags) {
+  return musaHostGetDevicePointer(device_ptr, host_ptr, flags);
+}
+#endif
+#define cudaMemset musaMemset
+#define cudaMemsetAsync musaMemsetAsync
+#define cudaMemcpy musaMemcpy
+#define cudaMemcpyAsync musaMemcpyAsync
+#define cudaPointerGetAttributes musaPointerGetAttributes
+static inline cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode *mode) {
+  (void)mode;
+  return cudaSuccess;
+}
+static inline cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCaptureStatus *status) {
+  (void)stream;
+  if (status) *status = cudaStreamCaptureStatusNone;
+  return cudaSuccess;
+}
+#define cudaStreamSynchronize musaStreamSynchronize
+static inline cudaError_t cudaStreamQuery(cudaStream_t stream) { return musaStreamQuery(stream); }
+static inline cudaError_t cudaStreamGetPriority(cudaStream_t stream, int *priority) { return musaStreamGetPriority(stream, priority); }
+static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags) {
+  return musaStreamWaitEvent(stream, event, flags);
+}
+static inline cudaError_t cudaDeviceGetStreamPriorityRange(int *least, int *greatest) { return musaDeviceGetStreamPriorityRange(least, greatest); }
+static inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) { return musaEventCreateWithFlags(event, flags); }
+static inline cudaError_t cudaEventDestroy(cudaEvent_t event) { return musaEventDestroy(event); }
+static inline cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) { return musaEventRecord(event, stream); }
+static inline cudaError_t cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream, unsigned int flags) { return musaEventRecordWithFlags(event, stream, flags); }
+static inline cudaError_t cudaEventQuery(cudaEvent_t event) { return musaEventQuery(event); }
+static inline cudaError_t cudaEventSynchronize(cudaEvent_t event) { return musaEventSynchronize(event); }
+static inline cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEvent_t end) { return musaEventElapsedTime(ms, start, end); }
+static inline cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) { return musaIpcGetEventHandle(handle, event); }
+static inline cudaError_t cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle) { return musaIpcOpenEventHandle(event, handle); }
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cuda_runtime.h" <<'H'
+#pragma once
+#include <cuda_runtime_api.h>
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cuda.h" <<'H'
+#pragma once
+#include <musa.h>
+#include <cuda_runtime_api.h>
+#define CUresult MUresult
+#define CUDA_SUCCESS MUSA_SUCCESS
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cuda_bf16.h" <<'H'
+#pragma once
+#include <stdint.h>
+#ifdef __MCC__
+#include <musa_bf16.h>
+typedef mt_bfloat16 nv_bfloat16;
+#else
+typedef uint16_t nv_bfloat16;
+static __host__ __device__ inline float __bfloat162float(nv_bfloat16) { return 0.0f; }
+static __host__ __device__ inline nv_bfloat16 __float2bfloat16(float) { return 0; }
+#endif
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cuda_fp16.h" <<'H'
+#pragma once
+#include <stdint.h>
+struct __half { uint16_t __x; };
+struct __half2 { uint32_t __x; };
+typedef __half half;
+typedef __half2 half2;
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cuda_fp16.hpp" <<'H'
+#pragma once
+#include <cuda_fp16.h>
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cuda_fp8.h" <<'H'
+#pragma once
+typedef unsigned char __nv_fp8_storage_t;
+typedef unsigned short __nv_fp8x2_storage_t;
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cusparse.h" <<'H'
+#pragma once
+typedef struct cusparseContext *cusparseHandle_t;
+typedef struct cusparseMatDescr *cusparseMatDescr_t;
+typedef int cusparseStatus_t;
+#define CUSPARSE_STATUS_SUCCESS 0
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cublas_v2.h" <<'H'
+#pragma once
+typedef struct cublasContext *cublasHandle_t;
+typedef int cublasStatus_t;
+typedef int cublasPointerMode_t;
+typedef int cublasSideMode_t;
+typedef int cublasFillMode_t;
+typedef int cublasOperation_t;
+typedef int cublasDiagType_t;
+#define CUBLAS_STATUS_SUCCESS 0
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cublasLt.h" <<'H'
+#pragma once
+typedef struct cublasLtContext *cublasLtHandle_t;
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cusolver_common.h" <<'H'
+#pragma once
+typedef int cusolverStatus_t;
+#define CUSOLVER_STATUS_SUCCESS 0
+H
+  cat > "${CUDA_COMPAT_HOME}/include/cusolverDn.h" <<'H'
+#pragma once
+#include <cusolver_common.h>
+typedef struct cusolverDnContext *cusolverDnHandle_t;
+H
+}
 
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    f.write("void mooncake_musa_ci_mudnn_stub(void) {}\n")
-    for index, symbol in enumerate(sorted(symbols)):
-        f.write(f'void mudnn_symbol_{index}() __asm__("{symbol}");\n')
-        f.write(f"void mudnn_symbol_{index}() {{}}\n")
-PY
-        ;;
-      libmccl.so.2)
-        cat > "${source}" <<'C'
-const char *mcclGetErrorString() { return "mccl unavailable in build-only CI"; }
-int mcclGetVersion(int *version) { if (version) *version = 0; return 0; }
-int mcclAllGather() { return 0; }
-int mcclAllReduce() { return 0; }
-int mcclBcast() { return 0; }
-int mcclBroadcast() { return 0; }
-int mcclCommAbort() { return 0; }
-int mcclCommCount() { return 0; }
-int mcclCommDestroy() { return 0; }
-int mcclCommGetAsyncError() { return 0; }
-int mcclCommInitRank() { return 0; }
-int mcclCommUserRank() { return 0; }
-int mcclGetUniqueId() { return 0; }
-int mcclGroupEnd() { return 0; }
-int mcclGroupStart() { return 0; }
-int mcclRecv() { return 0; }
-int mcclReduce() { return 0; }
-int mcclReduceScatter() { return 0; }
-int mcclSend() { return 0; }
+write_cuda_compat_libraries() {
+  mkdir -p "${CUDA_COMPAT_HOME}/lib64"
+  cat > "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" <<'C'
+void mooncake_empty_cuda_stub(void) {}
 C
-        ;;
-      *)
-        return 1
-        ;;
-    esac
-    cc -shared -fPIC -Wl,-soname,"${soname}" "${source}" -o "${MUSA_COMPAT_LIB_DIR}/${soname}"
-  }
+  cc -shared -fPIC "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" -o "${CUDA_COMPAT_HOME}/lib64/libcudart.so"
+  cc -shared -fPIC "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" -o "${CUDA_COMPAT_HOME}/lib64/libc10_cuda.so"
+  cc -shared -fPIC "${CUDA_COMPAT_HOME}/empty_cuda_stub.c" -o "${CUDA_COMPAT_HOME}/lib64/libtorch_cuda.so"
+}
 
-  local soname
-  for soname in \
-    libmusart.so.4 \
-    libmusa.so.1 \
-    libmudnn.so.3 \
-    libmccl.so.2 \
-    libmublas.so.1 \
-    libmublasLt.so.1 \
-    libmusolver.so.1 \
-    libmusparse.so \
-    libmufft.so.1; do
-    if ! link_musa_soname "${soname}"; then
-      # The public MUSA devel CI image does not ship every optional runtime
-      # library required by the vendor torch_musa wheel.  These stubs are only
-      # to make torch_musa's build helpers importable; the CI job builds but
-      # does not execute MUDNN or MCCL code paths.
-      if ! write_build_only_stub "${soname}"; then
-        echo "warning: could not find ${soname} under ${MUSA_HOME}" >&2
-      fi
-    fi
-  done
+write_nvcc_wrapper() {
+  mkdir -p "${CUDA_COMPAT_HOME}/bin"
+  cat > "${CUDA_COMPAT_HOME}/bin/nvcc" <<'SH'
+#!/usr/bin/env bash
+args=(-D__MCC__)
+if [[ -d "${CUDA_HOME:-}/include" ]]; then
+  args+=(-I"${CUDA_HOME}/include")
+  args+=(-include "${CUDA_HOME}/include/mooncake_musa_ci_compat.h")
+fi
+if [[ -d "${MUSA_HOME:-}/include" ]]; then
+  args+=(-I"${MUSA_HOME}/include")
+fi
+skip_compiler_options=0
+for arg in "$@"; do
+  if [[ ${skip_compiler_options} -eq 1 ]]; then
+    arg="${arg%\'}"
+    arg="${arg#\'}"
+    args+=("${arg}")
+    skip_compiler_options=0
+    continue
+  fi
+  case "${arg}" in
+    --expt-relaxed-constexpr)
+      ;;
+    --cuda-gpu-arch=*)
+      args+=("--offload-arch=${arg#--cuda-gpu-arch=}")
+      ;;
+    --compiler-options)
+      skip_compiler_options=1
+      ;;
+    *.cu)
+      mu_source="${TMPDIR:-/tmp}/$(basename "${arg%.cu}").mu"
+      cp "${arg}" "${mu_source}"
+      args+=("${mu_source}")
+      ;;
+    *)
+      args+=("${arg}")
+      ;;
+  esac
+done
+exec /usr/local/musa/bin/mcc "${args[@]}"
+SH
+  chmod +x "${CUDA_COMPAT_HOME}/bin/nvcc"
 }
 
 setup_torch_musa_env() {
+  # Keep CUDAExtension/torchada on their expected CUDA_HOME-shaped layout while
+  # using the real MUSA SDK and torch_musa wheel.  The CUDA compatibility headers
+  # are temporary build-only headers in this tree, not patches to /usr/local/musa.
+  rm -rf "${CUDA_COMPAT_HOME}"
+  mkdir -p "${CUDA_COMPAT_HOME}"
+  write_cuda_compat_headers
+  write_cuda_compat_libraries
+  write_nvcc_wrapper
+
   torch_musa_includes=$(python3 - <<'PY'
 import pathlib
 import site
@@ -202,13 +334,25 @@ paths = []
 for site_dir in site.getsitepackages():
     root = pathlib.Path(site_dir)
     if (root / "torch_musa").is_dir():
-        # torchada's JIT helper includes torch_musa internal headers as
-        # <torch_musa/...>; the vendor wheel ships them under site-packages.
         paths.append(str(root))
+        generated = root / "torch_musa" / "share" / "generated_cuda_compatible" / "include"
+        if generated.is_dir():
+            paths.append(str(generated))
 print(":".join(paths))
 PY
   )
 
+  append_env "MUSA_HOME=${MUSA_HOME}"
+  append_env "CUDA_HOME=${CUDA_COMPAT_HOME}"
+  append_env "MOONCAKE_MUSA_USE_CUDA_COMPAT_SHIMS=1"
+  append_env "CPATH=${CUDA_COMPAT_HOME}/include:${MUSA_HOME}/include:${torch_musa_includes}:${CPATH:-}"
+  append_env "TORCHADA_PLATFORM=musa"
+  append_env "TORCH_DEVICE_BACKEND_AUTOLOAD=0"
+  append_path "${CUDA_COMPAT_HOME}/bin"
+
+  # Export MUSA and PyTorch library directories before any build subprocess tries
+  # to load torch_musa extension libraries.  Do not import torch_musa while
+  # computing these paths: its extension modules need this LD_LIBRARY_PATH first.
   torch_libs=$(python3 - <<'PY'
 import pathlib
 import site
@@ -222,7 +366,6 @@ for site_dir in site.getsitepackages():
 print(":".join(paths))
 PY
   )
-
   musa_libs=$(
     {
       printf '%s\n' \
@@ -233,20 +376,7 @@ PY
       find -L "${MUSA_HOME}" -type f -name 'lib*.so*' -printf '%h\n' 2>/dev/null
     } | awk 'NF && !seen[$0]++' | paste -sd: -
   )
-
-  append_env "MUSA_HOME=${MUSA_HOME}"
-  # torchada deliberately exposes the active accelerator root as CUDA_HOME so
-  # existing CUDAExtension-based setup.py files do not need a CUDA-shaped shim.
-  append_env "CUDA_HOME=${MUSA_HOME}"
-  # Keep torch_musa's generated CUDA-compatible headers out of global CPATH:
-  # they intentionally shadow torch/ATen headers and can break unrelated JIT
-  # builds such as torchada's import-time C++ ops.  MUSAExtension adds those
-  # headers where they are needed for the actual extension build.
-  append_env "CPATH=${MUSA_HOME}/include:${torch_musa_includes}:${CPATH:-}"
-  append_env "TORCHADA_PLATFORM=musa"
-  append_env "TORCH_DEVICE_BACKEND_AUTOLOAD=0"
-  append_env "LD_LIBRARY_PATH=${MUSA_COMPAT_LIB_DIR}:${musa_libs}:${torch_libs}:${LD_LIBRARY_PATH:-}"
-  append_path "${MUSA_HOME}/bin"
+  append_env "LD_LIBRARY_PATH=${CUDA_COMPAT_HOME}/lib64:${musa_libs}:${torch_libs}:${LD_LIBRARY_PATH:-}"
 }
 
 verify_env() {
@@ -254,23 +384,19 @@ verify_env() {
 import importlib.metadata
 import os
 import torch
-import torch_musa
-import torch_musa.utils.musa_extension as musa_extension
-from torchada._platform import detect_platform
+import torchada
 
 print("torch", torch.__version__)
 print("torch_musa", importlib.metadata.version("torch_musa"))
-print("torchada", importlib.metadata.version("torchada"))
-print("torchada platform", detect_platform().value)
+print("torchada", getattr(torchada, "__version__", "unknown"))
+print("torchada platform", torchada.get_platform().value)
 print("CUDA_HOME", os.environ.get("CUDA_HOME"))
 print("MUSA_HOME", os.environ.get("MUSA_HOME"))
-print("torch_musa file", torch_musa.__file__)
-print("musa include paths", ":".join(musa_extension.include_paths(musa=True)))
+print("MOONCAKE_MUSA_USE_CUDA_COMPAT_SHIMS", os.environ.get("MOONCAKE_MUSA_USE_CUDA_COMPAT_SHIMS"))
 PY
 }
 
 install_base_packages
 install_torch_stack
-setup_musa_library_compat
 setup_torch_musa_env
 verify_env
