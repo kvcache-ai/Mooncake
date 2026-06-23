@@ -581,9 +581,13 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.protocol = buffer_protocol;
             for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt());
+                buffer.rkey.push_back(
+                    static_cast<decltype(buffer.rkey)::value_type>(
+                        rkeyJSON.asUInt64()));
             for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt());
+                buffer.lkey.push_back(
+                    static_cast<decltype(buffer.lkey)::value_type>(
+                        lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
@@ -691,9 +695,13 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt64());
+                buffer.rkey.push_back(
+                    static_cast<decltype(buffer.rkey)::value_type>(
+                        rkeyJSON.asUInt64()));
             for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt64());
+                buffer.lkey.push_back(
+                    static_cast<decltype(buffer.lkey)::value_type>(
+                        lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {

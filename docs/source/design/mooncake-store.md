@@ -91,6 +91,36 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 >
 > The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
 
+### Tenant Quota
+
+The Master Service can optionally enforce memory quota admission per tenant. This feature is disabled by default. When `enable_tenant_quota=false`, existing allocation and eviction behavior is preserved, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
+
+When tenant quota is enabled, each tenant has a requested quota policy and an effective quota. Explicit tenant policies are set through the master admin HTTP API. Tenants without an explicit policy inherit the default requested quota. The default policy may be `0`; explicit tenant policies must be positive.
+
+Effective quota is recomputed from the current registered memory capacity and the optional tenant quota pool cap:
+
+- The allocatable capacity is the smaller of total registered memory and `tenant_quota_pool_capacity_bytes`; a pool cap of `0` means total registered memory.
+- If explicit tenant requests fit within the allocatable capacity, explicit tenants receive their requested quotas and the remaining capacity is split evenly among active inherited-default tenants.
+- If explicit tenant requests exceed the allocatable capacity, only explicit tenants receive quota, scaled proportionally by request size. Inherited-default tenants receive `0` effective quota until capacity is available.
+- Remainders are assigned deterministically by tenant ID, so repeated recomputes produce stable results.
+
+`PutStart` and size-changing `UpsertStart` charge quota before memory is allocated. If the first reservation fails, the master performs tenant-scoped memory eviction for the target tenant and retries the reservation. The retry is bounded to two eviction attempts. Tenant quota eviction scans only the target tenant, skips hard-pinned objects, honors soft-pin eviction configuration, and preserves grouped-object lease safety checks.
+
+The admin HTTP API exposes:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/tenant_quotas` | List quota snapshots for active or explicit tenants |
+| `GET` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Query one tenant quota snapshot |
+| `PUT` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Upsert an explicit tenant quota policy |
+| `DELETE` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Delete an explicit tenant quota policy |
+| `GET` | `/api/v1/tenant_quotas/default` | Query the default requested quota policy |
+| `PUT` | `/api/v1/tenant_quotas/default` | Set the default requested quota policy |
+
+Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `over_quota`, and `has_explicit_policy`.
+
+When snapshots are enabled, tenant quota policies are written to a separate `tenant_quota_policy` snapshot object. This file stores only requested policy: the default requested quota and explicit tenant requested quotas. Effective quota, usage, reservations, and committed object charge are rebuilt from restored metadata and current capacity. Older snapshots without `tenant_quota_policy` remain valid and use the configured default quota on restore.
+
 ### Master Service APIs
 
 The protobuf definition between Master and Client is as follows:

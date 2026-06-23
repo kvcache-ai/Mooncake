@@ -315,6 +315,25 @@ TEST(AdmissionQueueTest, RetainsTerminalStatusUntilBatchRetire) {
     EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
 }
 
+TEST(AdmissionQueueTest, RetainsSpecificTerminalStatus) {
+    LocalTransferAdmissionQueue queue({1, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    status = queue.complete(picked[0], TransferStatusEnum::TIMEOUT);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    TransferStatusEnum public_status = TransferStatusEnum::PENDING;
+    status = queue.getPublicStatus(1, 0, public_status);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(public_status, TransferStatusEnum::TIMEOUT);
+}
+
 TEST(AdmissionQueueTest, RejectsRetireWithNonTerminalOwners) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;

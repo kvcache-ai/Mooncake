@@ -69,7 +69,11 @@ inline ErrorCode ValidateHABackendAvailability(HABackendType type) {
             return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 #endif
         case HABackendType::K8S:
+#ifdef STORE_USE_K8S_LEASE
+            return ErrorCode::OK;
+#else
             return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#endif
     }
 
     return ErrorCode::INVALID_PARAMS;

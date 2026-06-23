@@ -38,6 +38,92 @@ TenantQuotaResult AccountingMismatch(const char* operation,
 
 }  // namespace
 
+std::vector<TenantQuotaAssignment> BuildEffectiveQuotaAssignments(
+    const std::map<std::string, TenantQuotaState>& tenants,
+    uint64_t default_requested_quota_bytes,
+    uint64_t allocatable_capacity_bytes) {
+    unsigned __int128 explicit_requested_sum = 0;
+    std::vector<std::string> explicit_tenants;
+    std::vector<std::string> default_tenants;
+
+    for (const auto& [tenant_id, state] : tenants) {
+        if (state.has_explicit_policy) {
+            explicit_tenants.push_back(tenant_id);
+            explicit_requested_sum += state.requested_quota_bytes;
+        } else if (!IsLazyEmptyTenant(state)) {
+            default_tenants.push_back(tenant_id);
+        }
+    }
+
+    std::map<std::string, uint64_t> assigned;
+    for (const auto& [tenant_id, _] : tenants) {
+        assigned[tenant_id] = 0;
+    }
+
+    auto distribute = [&](const std::vector<std::string>& tenant_ids,
+                          uint64_t capacity, unsigned __int128 denominator,
+                          bool proportional_to_requested) {
+        if (tenant_ids.empty() || capacity == 0 || denominator == 0) {
+            return;
+        }
+
+        std::vector<RemainderShare> shares;
+        shares.reserve(tenant_ids.size());
+        uint64_t base_assigned = 0;
+        for (const auto& tenant_id : tenant_ids) {
+            const auto& state = tenants.at(tenant_id);
+            unsigned __int128 numerator =
+                proportional_to_requested ? state.requested_quota_bytes : 1;
+            unsigned __int128 product =
+                static_cast<unsigned __int128>(capacity) * numerator;
+            uint64_t base = static_cast<uint64_t>(product / denominator);
+            unsigned __int128 remainder = product % denominator;
+            shares.push_back({tenant_id, base, remainder});
+            base_assigned += base;
+        }
+
+        std::sort(shares.begin(), shares.end(),
+                  [](const RemainderShare& lhs, const RemainderShare& rhs) {
+                      if (lhs.remainder != rhs.remainder) {
+                          return lhs.remainder > rhs.remainder;
+                      }
+                      return lhs.tenant_id < rhs.tenant_id;
+                  });
+
+        uint64_t remaining = capacity - base_assigned;
+        for (auto& share : shares) {
+            if (remaining > 0) {
+                ++share.base;
+                --remaining;
+            }
+            assigned[share.tenant_id] = share.base;
+        }
+    };
+
+    if (explicit_requested_sum <= allocatable_capacity_bytes) {
+        for (const auto& tenant_id : explicit_tenants) {
+            assigned[tenant_id] = tenants.at(tenant_id).requested_quota_bytes;
+        }
+        const uint64_t remaining_capacity =
+            allocatable_capacity_bytes -
+            static_cast<uint64_t>(explicit_requested_sum);
+        distribute(default_tenants, remaining_capacity, default_tenants.size(),
+                   /*proportional_to_requested=*/false);
+    } else {
+        distribute(explicit_tenants, allocatable_capacity_bytes,
+                   explicit_requested_sum,
+                   /*proportional_to_requested=*/true);
+    }
+
+    std::vector<TenantQuotaAssignment> result;
+    result.reserve(assigned.size());
+    for (const auto& [tenant_id, effective_quota_bytes] : assigned) {
+        result.push_back({.tenant_id = tenant_id,
+                          .effective_quota_bytes = effective_quota_bytes});
+    }
+    return result;
+}
+
 void TenantQuotaTable::SetDefaultRequestedQuota(uint64_t bytes) {
     default_requested_quota_bytes_ = bytes;
     for (auto& [_, state] : tenants_) {
@@ -77,80 +163,18 @@ void TenantQuotaTable::EraseTenantPolicy(std::string tenant_id) {
 
 void TenantQuotaTable::RecomputeEffectiveQuotas(
     uint64_t allocatable_capacity_bytes) {
-    unsigned __int128 explicit_requested_sum = 0;
-    std::vector<std::string> explicit_tenants;
-    std::vector<std::string> default_tenants;
-
     for (auto& [tenant_id, state] : tenants_) {
-        if (state.has_explicit_policy) {
-            explicit_tenants.push_back(tenant_id);
-            explicit_requested_sum += state.requested_quota_bytes;
-        } else {
+        if (!state.has_explicit_policy) {
             state.requested_quota_bytes = default_requested_quota_bytes_;
-            if (!IsLazyEmptyTenant(state)) {
-                default_tenants.push_back(tenant_id);
-            }
         }
         state.effective_quota_bytes = 0;
     }
 
-    auto distribute = [&](const std::vector<std::string>& tenant_ids,
-                          uint64_t capacity, bool proportional_to_requested) {
-        if (tenant_ids.empty() || capacity == 0) {
-            return;
-        }
-
-        std::vector<RemainderShare> shares;
-        shares.reserve(tenant_ids.size());
-        uint64_t assigned = 0;
-        unsigned __int128 denominator = proportional_to_requested
-                                            ? explicit_requested_sum
-                                            : tenant_ids.size();
-
-        for (const auto& tenant_id : tenant_ids) {
-            auto& state = tenants_.at(tenant_id);
-            unsigned __int128 numerator =
-                proportional_to_requested ? state.requested_quota_bytes : 1;
-            unsigned __int128 product =
-                static_cast<unsigned __int128>(capacity) * numerator;
-            uint64_t base = static_cast<uint64_t>(product / denominator);
-            unsigned __int128 remainder = product % denominator;
-            shares.push_back({tenant_id, base, remainder});
-            assigned += base;
-        }
-
-        std::sort(shares.begin(), shares.end(),
-                  [](const RemainderShare& lhs, const RemainderShare& rhs) {
-                      if (lhs.remainder != rhs.remainder) {
-                          return lhs.remainder > rhs.remainder;
-                      }
-                      return lhs.tenant_id < rhs.tenant_id;
-                  });
-
-        uint64_t remaining = capacity - assigned;
-        for (auto& share : shares) {
-            if (remaining > 0) {
-                ++share.base;
-                --remaining;
-            }
-            tenants_.at(share.tenant_id).effective_quota_bytes = share.base;
-        }
-    };
-
-    if (explicit_requested_sum <= allocatable_capacity_bytes) {
-        for (const auto& tenant_id : explicit_tenants) {
-            auto& state = tenants_.at(tenant_id);
-            state.effective_quota_bytes = state.requested_quota_bytes;
-        }
-
-        const uint64_t remaining_capacity =
-            allocatable_capacity_bytes -
-            static_cast<uint64_t>(explicit_requested_sum);
-        distribute(default_tenants, remaining_capacity,
-                   /*proportional_to_requested=*/false);
-    } else {
-        distribute(explicit_tenants, allocatable_capacity_bytes,
-                   /*proportional_to_requested=*/true);
+    for (const auto& assignment : BuildEffectiveQuotaAssignments(
+             tenants_, default_requested_quota_bytes_,
+             allocatable_capacity_bytes)) {
+        tenants_.at(assignment.tenant_id).effective_quota_bytes =
+            assignment.effective_quota_bytes;
     }
 
     for (auto& [_, state] : tenants_) {

@@ -38,6 +38,8 @@ add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_tenant_quota_test
+               master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
@@ -158,6 +160,8 @@ if(STORE_USE_ETCD
 endif()
 add_ha_test(ha_backend_availability_test
             ha/leadership/ha_backend_availability_test.cpp)
+add_ha_test(leader_label_reconciler_test
+            ha/leadership/leader_label_reconciler_test.cpp)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(

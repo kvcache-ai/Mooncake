@@ -56,13 +56,16 @@ class TransferMetadata {
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
-#ifdef USE_CXI
-        std::vector<uint64_t> lkey;  // CXI provider with FI_MR_PROD
-        std::vector<uint64_t> rkey;  // requires 64-bit MR keys
+        // EFA/CXI's libfabric provider returns 64-bit MR keys (fi_mr_key()), so
+        // these must be 64-bit wide to avoid truncation. RDMA verbs keys are
+        // 32-bit and the non-EFA/CXI path keeps them as such.
+#if defined(USE_EFA) || defined(USE_CXI)
+        using mr_key_t = uint64_t;
 #else
-        std::vector<uint32_t> lkey;  // for rdma
-        std::vector<uint32_t> rkey;  // for rdma
+        using mr_key_t = uint32_t;
 #endif
+        std::vector<mr_key_t> lkey;         // for rdma/efa
+        std::vector<mr_key_t> rkey;         // for rdma/efa
         std::string shm_name;               // for nvlink and hip
         uint64_t offset;                    // for cxl
         std::vector<std::string> tseg;      // for ub/urma

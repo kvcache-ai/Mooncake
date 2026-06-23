@@ -132,6 +132,7 @@ void ShmTransport::startTransfer(ShmTask *task, ShmSubBatch *batch) {
     } else {
         task->status_word = TransferStatusEnum::FAILED;
     }
+    batch->notifyProgress();
 }
 
 Status ShmTransport::getTransferStatus(SubBatchRef batch, int task_id,
