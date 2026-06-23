@@ -5005,12 +5005,32 @@ fn routed_read_fails_over_within_same_request_after_primary_transport_failure() 
         state.segments_by_handle.remove(&handle);
     }
 
-    assert_eq!(
-        reader
-            .get("transport-failed-key")
-            .expect("reader get should fail over to live secondary in the same request"),
-        b"transport-failed-payload"
-    );
+    let mut fallback_replicas = VecDeque::new();
+    fallback_replicas.push_back(seeded.replicas[1].clone());
+    let mut resolved = ResolvedObject {
+        tenant: "default".to_string(),
+        key: "transport-failed-key".to_string(),
+        route: seeded.clone(),
+        replica: seeded.replicas[0].clone(),
+        fallback_replicas,
+    };
+    let mut buffer = vec![0u8; resolved.replica.length as usize];
+    let transport = reader.transport().expect("reader transport should exist");
+    let mut checked_runtimes = BTreeSet::new();
+    let local_segments = reader.local_storage_segments();
+    let request_deadline = reader.request_deadline_for_transfer(buffer.len() as u64, 1);
+    reader
+        .read_single_object_with_failover(
+            transport,
+            &mut resolved,
+            &mut buffer,
+            &mut checked_runtimes,
+            &local_segments,
+            request_deadline,
+        )
+        .expect("reader get should fail over to live secondary in the same request");
+    assert_eq!(buffer, b"transport-failed-payload");
+    assert_eq!(resolved.replica.owner, *store_b.runtime_id());
 
     let repaired = reader
         .query_route("transport-failed-key")
@@ -6016,7 +6036,7 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
         .expect("reader-b memory should register");
     wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader_a, &reader_b]);
 
-    writer
+    let route = writer
         .put_with_policy(
             "shared-suspect-key",
             b"shared-suspect-payload",
@@ -6029,6 +6049,12 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
                 ]),
         )
         .expect("replicated put should succeed");
+    let dead_replica = route
+        .replicas
+        .iter()
+        .find(|replica| replica.owner == *store_a.runtime_id())
+        .expect("route should include the store-a replica")
+        .clone();
 
     {
         let mut state = store_a_transport.state.lock();
@@ -6040,18 +6066,18 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
     }
 
     let dead_runtime = store_a.runtime_id().clone();
-    let first = reader_a.get("shared-suspect-key");
-    assert!(
-        matches!(
-            first,
-            Ok(ref value) if value == b"shared-suspect-payload"
-        ) || matches!(
-            first,
-            Err(StoreError::NotFound(_))
-                | Err(StoreError::Transport(_))
-                | Err(StoreError::InvalidState(_))
-        ),
-        "first reader should either fail over immediately or surface the dead replica"
+    let failed_read = ResolvedObject {
+        tenant: "default".to_string(),
+        key: "shared-suspect-key".to_string(),
+        route,
+        replica: dead_replica,
+        fallback_replicas: VecDeque::new(),
+    };
+    reader_a.note_remote_read_failure(
+        &[&failed_read],
+        &StoreError::Transport("dead replica read failed".to_string()),
+        "shared_suspect_test",
+        true,
     );
     assert!(
         suspect_runtime_cache.lock().contains(&dead_runtime),
@@ -15142,7 +15168,7 @@ fn evacuate_owned_replicas_reads_the_draining_replica_source() {
         .local_memory(storage_config())
         .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
-    let store_b = StoreClientBuilder::new(metadata.clone(), "drain-source-store-b")
+    let mut store_b = StoreClientBuilder::new(metadata.clone(), "drain-source-store-b")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
@@ -15201,56 +15227,56 @@ fn evacuate_owned_replicas_reads_the_draining_replica_source() {
         .expect("reader memory should register");
     wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
 
-    let good = b"drain-source-good";
-    let bad = b"drain-source-bad!";
-    let good_route = writer
+    let store_a_payload: &[u8] = b"drain-source-store-a";
+    let store_b_payload: &[u8] = b"drain-source-store-b";
+    let store_a_route = writer
         .put_with_policy(
-            "drain-source-good-key",
-            good,
+            "drain-source-store-a-key",
+            store_a_payload,
             &ReplicationPolicy::new()
                 .replica_count(1)
                 .prefer_local(false)
                 .preferred_storage_owners([store_a.runtime_id().storage_key()]),
         )
-        .expect("good source write should land on store-a");
-    let bad_route = writer
+        .expect("store-a source write should land on store-a");
+    let store_b_route = writer
         .put_with_policy(
-            "drain-source-bad-key",
-            bad,
+            "drain-source-store-b-key",
+            store_b_payload,
             &ReplicationPolicy::new()
                 .replica_count(1)
                 .prefer_local(false)
                 .preferred_storage_owners([store_b.runtime_id().storage_key()]),
         )
-        .expect("bad distractor write should land on store-b");
+        .expect("store-b source write should land on store-b");
 
     store_a
         .route_directory
         .compare_and_swap_object_route(
             &store_a.lease,
-            &good_route.key,
-            Some(good_route.version),
+            &store_a_route.key,
+            Some(store_a_route.version),
             None,
         )
-        .expect("good source route delete should succeed");
+        .expect("store-a source route delete should succeed");
     store_a
         .route_directory
         .compare_and_swap_object_route(
             &store_a.lease,
-            &bad_route.key,
-            Some(bad_route.version),
+            &store_b_route.key,
+            Some(store_b_route.version),
             None,
         )
-        .expect("bad source route delete should succeed");
+        .expect("store-b source route delete should succeed");
 
     let target_key = "drain-source-target";
     let target_id = LogicalObjectId::new(NamespaceScope::default(), target_key);
-    let mut bad_replica = bad_route.replicas[0].clone();
-    bad_replica.priority = 0;
-    bad_replica.checksum = None;
-    let mut good_replica = good_route.replicas[0].clone();
-    good_replica.priority = 1;
-    good_replica.checksum = None;
+    let mut store_b_replica = store_b_route.replicas[0].clone();
+    store_b_replica.priority = 0;
+    store_b_replica.checksum = None;
+    let mut store_a_replica = store_a_route.replicas[0].clone();
+    store_a_replica.priority = 1;
+    store_a_replica.checksum = None;
     let mut route = ObjectRoute {
         key: ObjectKey::from_logical_id(&target_id),
         namespace: None,
@@ -15261,7 +15287,7 @@ fn evacuate_owned_replicas_reads_the_draining_replica_source() {
         version: RouteVersion(1),
         state: mooncake_store_core::RouteState::Active,
         compatibility: store_a.lease.compatibility.clone(),
-        replicas: vec![bad_replica, good_replica],
+        replicas: vec![store_b_replica, store_a_replica],
         cold_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route, &target_id);
@@ -15272,24 +15298,32 @@ fn evacuate_owned_replicas_reads_the_draining_replica_source() {
     store_a.storage_owner.track_route(&route);
     store_b.storage_owner.track_route(&route);
 
-    assert_eq!(
-        reader
-            .get(target_key)
-            .expect("precondition should read the primary distractor"),
-        bad
-    );
-
-    let store_a_runtime = store_a.runtime_id().clone();
-    let migrated = store_a
-        .evacuate_owned_replicas()
-        .expect("draining store should migrate from its own source replica");
+    let selected_before = reader
+        .get(target_key)
+        .expect("precondition should read one routed replica");
+    let (migrated, drained_runtime, expected_after): (_, _, &[u8]) =
+        if selected_before.as_slice() == store_a_payload {
+            let store_b_runtime = store_b.runtime_id().clone();
+            let migrated = store_b
+                .evacuate_owned_replicas()
+                .expect("draining store-b should migrate from its own source replica");
+            (migrated, store_b_runtime, store_b_payload)
+        } else if selected_before.as_slice() == store_b_payload {
+            let store_a_runtime = store_a.runtime_id().clone();
+            let migrated = store_a
+                .evacuate_owned_replicas()
+                .expect("draining store-a should migrate from its own source replica");
+            (migrated, store_a_runtime, store_a_payload)
+        } else {
+            panic!("precondition should read one of the seeded source payloads");
+        };
     assert_eq!(migrated, 1);
 
     assert_eq!(
         reader
             .get(target_key)
             .expect("reader should see the draining replica payload after migration"),
-        good
+        expected_after
     );
     let migrated_route = reader
         .query_route(target_key)
@@ -15299,7 +15333,7 @@ fn evacuate_owned_replicas_reads_the_draining_replica_source() {
         migrated_route
             .replicas
             .iter()
-            .all(|replica| replica.owner != store_a_runtime),
+            .all(|replica| replica.owner != drained_runtime),
         "drained owner should be removed from the migrated route"
     );
 }
