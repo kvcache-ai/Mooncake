@@ -21,7 +21,6 @@ def _load_store_module():
     sys.modules["mooncake._runtime"] = fake_runtime
 
     fake_native = types.ModuleType("mooncake._store_rs")
-    fake_native.BufferPool = type("BufferPool", (), {})
     sys.modules["mooncake._store_rs"] = fake_native
 
     spec = importlib.util.spec_from_file_location(
@@ -58,7 +57,6 @@ def _load_package_with_stale_native_store():
     sys.modules["mooncake._runtime"] = fake_runtime
 
     fake_native = types.ModuleType("mooncake._store_rs")
-    fake_native.BufferPool = type("BufferPool", (), {})
     sys.modules["mooncake._store_rs"] = fake_native
 
     stale_store = types.ModuleType("mooncake.store")
@@ -83,6 +81,9 @@ MooncakeDistributedStore = STORE_MODULE.MooncakeDistributedStore
 
 
 class StoreAliasTests(unittest.TestCase):
+    def test_store_import_tolerates_native_without_buffer_pool(self) -> None:
+        self.assertIsNone(STORE_MODULE.BufferPool)
+
     def test_package_prefers_store_rs_python_module_over_stale_native_store(
         self,
     ) -> None:
