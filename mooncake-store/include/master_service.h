@@ -324,9 +324,18 @@ class MasterService {
      * keys on success, or an ErrorCode on failure. Only successfully
      * cleared keys are included in the result.
      */
+    // Existing key-only overload (signature unchanged): kept for legacy
+    // callers; delegates with "default".
     auto BatchReplicaClear(const std::vector<std::string>& object_keys,
                            const UUID& client_id,
                            const std::string& segment_name)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    // New: tenant-aware overload
+    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
+                           const UUID& client_id,
+                           const std::string& segment_name,
+                           const std::string& tenant_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**

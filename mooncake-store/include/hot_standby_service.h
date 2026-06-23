@@ -51,6 +51,19 @@ struct HotStandbyConfig {
     OpLogStoreType oplog_store_type{kDefaultOpLogStoreType};
     std::string oplog_store_root_dir{kDefaultOpLogRootDir};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+
+    // Programmatic migration escape hatch (default: fail-closed).
+    // When true, FinalCatchUpForPromotionLocked returns
+    // INCOMPLETE_OPLOG_CATCH_UP if the standby cannot prove it has applied
+    // every durable OpLog entry. When false, falls back to the previous
+    // best-effort behavior (WARNING log + OK).
+    bool fail_closed_on_incomplete_catch_up{true};
+
+    // Programmatic migration escape hatch (default: fail-closed).
+    // When true, promotion is refused while OpLogApplier has unresolved
+    // missing/skipped sequence ids, even if the final catch-up loop drained
+    // a batch successfully. When false, the gap check is skipped entirely.
+    bool fail_closed_on_unresolved_gaps{true};
 };
 
 /**
@@ -65,6 +78,7 @@ struct StandbySyncStatus {
     bool is_connected{false};
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
+    size_t unresolved_gap_count{0};
 };
 
 /**
@@ -177,6 +191,21 @@ class HotStandbyService {
     void SetSyncStatusCallback(SyncStatusCallback callback);
 
     /**
+     * @brief Test seam: when set, FinalCatchUpForPromotionLocked uses this
+     *        store instead of calling OpLogStoreFactory::Create. Production
+     *        code never calls this; tests inject a MockOpLogStore.
+     */
+    void SetCatchUpOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
+
+    /**
+     * @brief Test seam: returns the internal OpLogApplier so tests can seed
+     *        gaps via AddMissingGapForTesting / AddSkippedGapForTesting.
+     */
+    OpLogApplier* GetOpLogApplierForTesting() const {
+        return oplog_applier_.get();
+    }
+
+    /**
      * @brief Get current state from state machine
      */
     StandbyState GetState() const { return state_machine_.GetState(); }
@@ -202,6 +231,19 @@ class HotStandbyService {
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     void ResolvePromotionGapsLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
+
+    // Legacy best-effort variant of FinalCatchUpForPromotionLocked, only
+    // used when config_.fail_closed_on_incomplete_catch_up == false.
+    ErrorCode FinalCatchUpBestEffortLocked(
+        std::shared_ptr<OpLogStore> catch_up_store,
+        uint64_t current_applied_seq_id);
+
+    // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
+    // promotion sequence machine transitions + gap resolution + final
+    // catch-up + post catch-up gap check + success transition. Returns
+    // ErrorCode::OK on success or any fail-closed error code.
+    ErrorCode PromoteLockedInternal(uint64_t current_applied_seq_id);
+
     void NotifySyncStatus();
 
     /**
@@ -277,6 +319,8 @@ class HotStandbyService {
     std::shared_ptr<OpLogStore> watcher_oplog_store_;
     std::unique_ptr<OpLogChangeNotifier> oplog_change_notifier_;
     std::unique_ptr<OpLogReplicator> oplog_replicator_;
+
+    std::shared_ptr<OpLogStore> catch_up_oplog_store_for_testing_;
 
     // Configuration for OpLog sync
     std::string oplog_endpoints_;

@@ -51,6 +51,10 @@ class MockOpLogStore : public OpLogStore {
         if (read_error_ != ErrorCode::OK) {
             return read_error_;
         }
+        if (force_read_empty_) {
+            entries.clear();
+            return ErrorCode::OK;
+        }
         entries.clear();
         for (const auto& [seq, entry] : entries_) {
             if (seq > start_sequence_id) {
@@ -116,6 +120,14 @@ class MockOpLogStore : public OpLogStore {
 
     void SetWriteError(ErrorCode err) { write_error_ = err; }
     void SetReadError(ErrorCode err) { read_error_ = err; }
+
+    // When true, ReadOpLogSince clears its output vector and returns OK,
+    // simulating a store that has durable entries but cannot serve them
+    // on a range read. Used by fail-closed catch-up tests.
+    void SetForceReadEmpty(bool force) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        force_read_empty_ = force;
+    }
     void Clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         entries_.clear();
@@ -148,6 +160,7 @@ class MockOpLogStore : public OpLogStore {
     uint64_t latest_seq_id_{0};
     ErrorCode write_error_{ErrorCode::OK};
     ErrorCode read_error_{ErrorCode::OK};
+    bool force_read_empty_{false};
 };
 
 }  // namespace mooncake::test
