@@ -31,6 +31,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/common/concurrent/thread_local_storage.h"
+#include "tent/runtime/congestion_control.h"
 #include "tent/runtime/transport_selector.h"
 
 namespace mooncake {
@@ -180,6 +181,10 @@ class TransferEngineImpl {
     // hooks; transports will be migrated to call this in a follow-up PR.
     void notifyBatchMaybeReady(BatchID batch_id);
 
+    Status setCongestionControlPlugin(
+        std::shared_ptr<CongestionControlPlugin> plugin);
+    CongestionControlPlugin* getCongestionControlPlugin() const;
+
    private:
     Status construct();
 
@@ -271,6 +276,7 @@ class TransferEngineImpl {
     std::recursive_mutex progress_mutex_;
     std::unordered_set<BatchID> alive_batches_;
     std::unique_ptr<ProgressWorker> progress_worker_;
+    std::shared_ptr<CongestionControlPlugin> cc_plugin_;
 };
 }  // namespace tent
 }  // namespace mooncake

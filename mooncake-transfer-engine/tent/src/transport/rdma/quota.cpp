@@ -16,6 +16,7 @@
 #include "tent/transport/rdma/shared_quota.h"
 #include "tent/common/utils/random.h"
 #include "tent/common/utils/os.h"
+#include "tent/runtime/congestion_control.h"
 
 #include <algorithm>
 #include <iostream>
@@ -312,6 +313,17 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
         std::min(sched_params_.ewma_max_multiplier * theoretical_bw, new_ewma));
 
     dev.ewma_bandwidth_bps.store(new_ewma, std::memory_order_relaxed);
+
+    // Notify congestion control plugin
+    if (cc_plugin_) {
+        CompletionEvent event;
+        event.device_id = dev_id;
+        event.bytes = length;
+        event.latency_us = latency;
+        event.status = TransferStatusEnum::COMPLETED;
+        event.priority = PRIO_HIGH;  // Default; actual priority not available here
+        cc_plugin_->onCompletion(event);
+    }
 
     return Status::OK();
 }
