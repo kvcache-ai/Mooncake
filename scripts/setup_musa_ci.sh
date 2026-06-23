@@ -114,7 +114,8 @@ void _ZN4musa3dnn4Sort6SetDimEi() {}
 void _ZN4musa3dnn4Sort9SetStableEb() {}
 void _ZN4musa3dnn4SortC1Ev() {}
 void _ZN4musa3dnn4SortD1Ev() {}
-void _ZN4musa3dnn6Tensor9SetNdInfoESt16initializer_listIlE() {}
+void mudnn_tensor_set_nd_info() __asm__("_ZN4musa3dnn6Tensor9SetN" "dInfoESt16initializer_listIlE");
+void mudnn_tensor_set_nd_info() {}
 void _ZN4musa3dnn6TensorD1Ev() {}
 void _ZN4musa3dnn9SortByKey13SetDescendingEb() {}
 void _ZN4musa3dnn9SortByKey6SetDimEi() {}
