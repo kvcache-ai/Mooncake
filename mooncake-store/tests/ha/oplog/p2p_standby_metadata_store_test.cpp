@@ -83,6 +83,33 @@ TEST(P2PStandbyMetadataStoreTest, GetKeyCount) {
 // AddReplica / RemoveReplica
 // ============================================================================
 
+TEST(P2PStandbyMetadataStoreTest, LegacyPut) {
+    P2PStandbyMetadataStore store;
+    EXPECT_TRUE(store.Put("key1"));
+    auto result = store.GetMetadata("key1");
+    EXPECT_TRUE(result.has_value());
+    EXPECT_EQ(result->size, 0u);
+}
+
+TEST(P2PStandbyMetadataStoreTest, AddReplicaAfterClientRegistered) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto seg_id = MakeUUID(10, 0);
+
+    // Register client first, then add replica
+    store.RegisterClient(client_id, "10.0.0.1", 50051, {});
+    store.AddReplica("key1", client_id, seg_id, 1024, 0, {}, MemoryType::DRAM);
+
+    auto it = store.GetObjects().find("key1");
+    ASSERT_NE(it, store.GetObjects().end());
+    ASSERT_EQ(it->second.replicas.size(), 1u);
+    auto& p2p =
+        std::get<P2PProxyDescriptor>(it->second.replicas[0].descriptor_variant);
+    // IP/port should be populated since client was registered first
+    EXPECT_EQ(p2p.ip_address, "10.0.0.1");
+    EXPECT_EQ(p2p.rpc_port, 50051u);
+}
+
 TEST(P2PStandbyMetadataStoreTest, AddReplicaCreatesObject) {
     P2PStandbyMetadataStore store;
     auto client_id = MakeUUID(1, 0);
@@ -188,6 +215,44 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesExisting) {
     EXPECT_EQ(info->segments.size(), 1u);
 }
 
+TEST(P2PStandbyMetadataStoreTest, RegisterClientPreservesEarlyMountSegment) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto early_seg_id = MakeUUID(50, 0);
+
+    // MOUNT_SEGMENT arrives before REGISTER_CLIENT
+    Segment early_seg;
+    early_seg.id = early_seg_id;
+    early_seg.size = 2048;
+    store.AddSegment(client_id, early_seg);
+
+    // REGISTER_CLIENT with a different segment
+    auto reg_seg = MakeSegment(MakeUUID(100, 0));
+    store.RegisterClient(client_id, "192.168.1.1", 50051, {reg_seg});
+
+    // Both segments should be preserved (merge, not overwrite)
+    auto* info = store.GetClient(client_id);
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(info->segments.size(), 2u);
+}
+
+TEST(P2PStandbyMetadataStoreTest, RegisterClientDuplicateSegmentIgnored) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto seg_id = MakeUUID(100, 0);
+
+    // MOUNT_SEGMENT first
+    Segment seg = MakeSegment(seg_id, 4096);
+    store.AddSegment(client_id, seg);
+
+    // REGISTER_CLIENT with same segment — should not duplicate
+    store.RegisterClient(client_id, "10.0.0.1", 50051, {seg});
+
+    auto* info = store.GetClient(client_id);
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(info->segments.size(), 1u);
+}
+
 TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesReplicaIPs) {
     P2PStandbyMetadataStore store;
     auto client_id = MakeUUID(1, 0);
@@ -196,7 +261,7 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesReplicaIPs) {
     // Add replica BEFORE client is registered (ip/port unknown)
     store.AddReplica("key1", client_id, seg_id, 1024, 0, {}, MemoryType::DRAM);
 
-    // Verify replica has empty ip/port
+    // Verify replica has empty ip/port (backfilling deferred to ExportMetadata)
     auto it = store.GetObjects().find("key1");
     ASSERT_NE(it, store.GetObjects().end());
     ASSERT_EQ(it->second.replicas.size(), 1u);
@@ -205,22 +270,55 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesReplicaIPs) {
     EXPECT_TRUE(p2p.ip_address.empty());
     EXPECT_EQ(p2p.rpc_port, 0u);
 
-    // Register client — should update existing replicas
+    // Register client — does NOT update replicas in-place (deferred)
     store.RegisterClient(client_id, "192.168.1.1", 50051, {});
 
-    // Verify replica now has ip/port
+    // In-place replicas still have empty ip/port
     it = store.GetObjects().find("key1");
     ASSERT_NE(it, store.GetObjects().end());
-    auto& updated_desc = it->second.replicas[0];
-    auto& updated_p2p =
-        std::get<P2PProxyDescriptor>(updated_desc.descriptor_variant);
-    EXPECT_EQ(updated_p2p.ip_address, "192.168.1.1");
-    EXPECT_EQ(updated_p2p.rpc_port, 50051u);
+    auto& in_place_p2p =
+        std::get<P2PProxyDescriptor>(it->second.replicas[0].descriptor_variant);
+    EXPECT_TRUE(in_place_p2p.ip_address.empty());
+    EXPECT_EQ(in_place_p2p.rpc_port, 0u);
+
+    // Verify IP/port is backfilled in exported metadata (during promotion)
+    auto exported = store.ExportMetadata();
+    auto obj_it = exported.objects.find("key1");
+    ASSERT_NE(obj_it, exported.objects.end());
+    ASSERT_EQ(obj_it->second.replicas.size(), 1u);
+    auto& exported_p2p = std::get<P2PProxyDescriptor>(
+        obj_it->second.replicas[0].descriptor_variant);
+    EXPECT_EQ(exported_p2p.ip_address, "192.168.1.1");
+    EXPECT_EQ(exported_p2p.rpc_port, 50051u);
 }
 
 // ============================================================================
 // AddSegment / RemoveSegment
 // ============================================================================
+
+TEST(P2PStandbyMetadataStoreTest, AddSegmentDuplicateIgnored) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto seg_id = MakeUUID(100, 0);
+    Segment seg = MakeSegment(seg_id, 4096);
+
+    store.AddSegment(client_id, seg);
+    store.AddSegment(client_id, seg);  // duplicate — should be ignored
+
+    auto* info = store.GetClient(client_id);
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(info->segments.size(), 1u);
+}
+
+TEST(P2PStandbyMetadataStoreTest, RemoveSegmentUnknownClient) {
+    P2PStandbyMetadataStore store;
+    auto seg_id = MakeUUID(100, 0);
+    auto client_id = MakeUUID(1, 0);
+
+    // RemoveSegment with unregistered client — should not crash
+    store.RemoveSegment(seg_id, client_id);
+    EXPECT_EQ(store.GetKeyCount(), 0u);
+}
 
 TEST(P2PStandbyMetadataStoreTest, AddAndRemoveSegment) {
     P2PStandbyMetadataStore store;
@@ -319,6 +417,25 @@ TEST(P2PStandbyMetadataStoreTest, ExportMetadata) {
     EXPECT_EQ(exported.clients.size(), 1u);
     EXPECT_NE(exported.clients.find(client), exported.clients.end());
     EXPECT_EQ(exported.clients.at(client).ip_address, "1.2.3.4");
+}
+
+TEST(P2PStandbyMetadataStoreTest, ExportMetadataNoBackfillForUnknownClient) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto seg_id = MakeUUID(10, 0);
+
+    // Add replica but never register the client
+    store.AddReplica("key1", client_id, seg_id, 1024, 0, {}, MemoryType::DRAM);
+
+    auto exported = store.ExportMetadata();
+    auto obj_it = exported.objects.find("key1");
+    ASSERT_NE(obj_it, exported.objects.end());
+    ASSERT_EQ(obj_it->second.replicas.size(), 1u);
+    auto& p2p = std::get<P2PProxyDescriptor>(
+        obj_it->second.replicas[0].descriptor_variant);
+    // Client not registered — ip/port stays empty
+    EXPECT_TRUE(p2p.ip_address.empty());
+    EXPECT_EQ(p2p.rpc_port, 0u);
 }
 
 }  // namespace mooncake::test

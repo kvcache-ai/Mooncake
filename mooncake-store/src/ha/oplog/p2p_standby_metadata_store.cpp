@@ -1,6 +1,7 @@
 #include "ha/oplog/p2p_standby_metadata_store.h"
 
 #include <glog/logging.h>
+#include <xxhash.h>
 
 namespace mooncake {
 
@@ -58,10 +59,9 @@ void P2PStandbyMetadataStore::AddReplica(const std::string& object_key,
     // Build a Replica::Descriptor for this replica.
     // P2PProxyDescriptor is the P2P-specific descriptor type.
     Replica::Descriptor desc;
-    ReplicaID replica_id =
-        static_cast<ReplicaID>(std::hash<std::string>{}(object_key) ^
-                               std::hash<uint64_t>{}(client_id.first) ^
-                               std::hash<uint64_t>{}(segment_id.first));
+    ReplicaID replica_id = static_cast<ReplicaID>(XXH64(
+        object_key.data(), object_key.size(),
+        XXH64(&client_id, sizeof(UUID), XXH64(&segment_id, sizeof(UUID), 0))));
     desc.id = replica_id;
 
     // Look up client info for IP/port
@@ -137,28 +137,26 @@ void P2PStandbyMetadataStore::RegisterClient(
     info.client_id = client_id;
     info.ip_address = ip_address;
     info.rpc_port = rpc_port;
-    info.segments = segments;
+    // Merge segments instead of overwriting to preserve segments added by
+    // out-of-order AddSegment (MOUNT_SEGMENT) calls that arrived before
+    // REGISTER_CLIENT.
+    for (const auto& seg : segments) {
+        if (std::find_if(info.segments.begin(), info.segments.end(),
+                         [&](const Segment& existing) {
+                             return existing.id == seg.id;
+                         }) == info.segments.end()) {
+            info.segments.push_back(seg);
+        }
+    }
 
     VLOG(1) << "P2PStandbyMetadataStore::RegisterClient "
             << "client=" << client_id.first << ":" << client_id.second
             << " ip=" << ip_address << ":" << rpc_port
             << " segments=" << segments.size();
 
-    // Update existing replica entries with this client's IP/port if they
-    // were added before REGISTER_CLIENT arrived.
-    for (auto& [key, metadata] : objects_) {
-        for (auto& desc : metadata.replicas) {
-            if (!std::holds_alternative<P2PProxyDescriptor>(
-                    desc.descriptor_variant)) {
-                continue;
-            }
-            auto& p2p = std::get<P2PProxyDescriptor>(desc.descriptor_variant);
-            if (p2p.client_id == client_id) {
-                p2p.ip_address = ip_address;
-                p2p.rpc_port = rpc_port;
-            }
-        }
-    }
+    // IP/port backfilling is deferred to ExportMetadata() to avoid O(N*M)
+    // overhead on the OpLog replication thread. IP/port is only needed after
+    // promotion, so a one-time scan during ExportMetadata() is acceptable.
 }
 
 void P2PStandbyMetadataStore::AddSegment(const UUID& client_id,
@@ -222,6 +220,28 @@ P2PStandbyMetadataStore::ExportMetadata() const {
     ExportedMetadata result;
     result.objects = objects_;
     result.clients = clients_;
+
+    // Backfill IP/port for replicas whose clients were registered out-of-order.
+    // This is deferred from RegisterClient to avoid O(N*M) overhead on the
+    // replication thread. ExportMetadata() is a one-time call during promotion,
+    // where this cost is acceptable.
+    for (auto& [key, metadata] : result.objects) {
+        for (auto& desc : metadata.replicas) {
+            if (!std::holds_alternative<P2PProxyDescriptor>(
+                    desc.descriptor_variant)) {
+                continue;
+            }
+            auto& p2p = std::get<P2PProxyDescriptor>(desc.descriptor_variant);
+            if (p2p.ip_address.empty()) {
+                auto client_it = result.clients.find(p2p.client_id);
+                if (client_it != result.clients.end()) {
+                    p2p.ip_address = client_it->second.ip_address;
+                    p2p.rpc_port = client_it->second.rpc_port;
+                }
+            }
+        }
+    }
+
     return result;
 }
 
