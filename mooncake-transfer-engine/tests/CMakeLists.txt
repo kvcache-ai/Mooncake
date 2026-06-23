@@ -75,6 +75,12 @@ if (USE_MNNVL)
     add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
 endif()
 
+if (USE_HIP)
+    add_executable(hip_transport_test ${WORKSPACE}/hip_transport_test.cpp)
+    target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest gtest_main )
+    add_test(NAME hip_transport_test COMMAND hip_transport_test)
+endif()
+
 if (USE_UBSHMEM)
     add_executable(ubshmem_transport_test ${WORKSPACE}/ubshmem_transport_test.cpp)
     target_link_libraries(ubshmem_transport_test PUBLIC transfer_engine gtest gtest_main ascendcl)
