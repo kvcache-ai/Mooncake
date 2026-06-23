@@ -27,6 +27,19 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror=thread-safety")
 endif()
 
+# Link the C++ runtime statically so artifacts depend only on the host glibc,
+# not its libstdc++ version. auditwheel does not vendor libstdc++, so otherwise
+# the build toolchain's GLIBCXX requirement leaks into the wheel and fails to
+# load on hosts with an older libstdc++.
+option(STATIC_CXX_RUNTIME "Statically link libstdc++/libgcc into binaries and extensions" ON)
+if(STATIC_CXX_RUNTIME AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++ -static-libgcc")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static-libstdc++ -static-libgcc")
+  # pybind11_add_module builds MODULE libraries (engine.so, store.so), which
+  # take CMAKE_MODULE_LINKER_FLAGS rather than the SHARED ones.
+  set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -static-libstdc++ -static-libgcc")
+endif()
+
 option(ENABLE_ASAN "enable address sanitizer" OFF)
 
 if (ENABLE_ASAN)
