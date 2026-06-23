@@ -109,6 +109,18 @@ setup_musa_library_compat() {
       libmudnn.so.3)
         cat > "${source}" <<'C'
 void mooncake_musa_ci_mudnn_stub(void) {}
+void _ZN4musa3dnn4Sort13SetDescendingEb() {}
+void _ZN4musa3dnn4Sort6SetDimEi() {}
+void _ZN4musa3dnn4Sort9SetStableEb() {}
+void _ZN4musa3dnn4SortC1Ev() {}
+void _ZN4musa3dnn4SortD1Ev() {}
+void _ZN4musa3dnn6Tensor9SetNdInfoESt16initializer_listIlE() {}
+void _ZN4musa3dnn6TensorD1Ev() {}
+void _ZN4musa3dnn9SortByKey13SetDescendingEb() {}
+void _ZN4musa3dnn9SortByKey6SetDimEi() {}
+void _ZN4musa3dnn9SortByKey9SetStableEb() {}
+void _ZN4musa3dnn9SortByKeyC1Ev() {}
+void _ZN4musa3dnn9SortByKeyD1Ev() {}
 C
         ;;
       libmccl.so.2)
