@@ -395,7 +395,10 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
-    snapshot_running_ = false;
+    {
+        std::lock_guard<std::mutex> lk(snapshot_thread_mutex_);
+        snapshot_running_ = false;
+    }
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
     graceful_unmount_scheduler_.Stop();

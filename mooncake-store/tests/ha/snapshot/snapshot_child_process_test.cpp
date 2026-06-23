@@ -365,7 +365,7 @@ TEST_F(SnapshotChildProcessTest, DestructorInterruptsSnapshotThreadSleep) {
                       .set_enable_snapshot(true)
                       .set_enable_snapshot_restore(false)
                       .set_snapshot_backup_dir(tmp_dir() + "/backup")
-                      .set_snapshot_interval_seconds(4)
+                      .set_snapshot_interval_seconds(30)
                       .set_snapshot_child_timeout_seconds(60)
                       .set_snapshot_retention_count(3)
                       .set_snapshot_object_store_type("local")
@@ -382,7 +382,7 @@ TEST_F(SnapshotChildProcessTest, DestructorInterruptsSnapshotThreadSleep) {
             std::chrono::steady_clock::now() - destroy_start)
             .count();
 
-    EXPECT_LT(elapsed_ms, 2500)
+    EXPECT_LT(elapsed_ms, 5000)
         << "MasterService shutdown should not wait for the full snapshot "
            "interval";
 }
