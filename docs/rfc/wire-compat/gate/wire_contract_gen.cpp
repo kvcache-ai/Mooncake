@@ -1,29 +1,32 @@
 // wire_contract_gen.cpp
 //
-// Wire-contract golden generator for the Mooncake Store master coro_rpc surface.
+// Wire-contract golden generator for the Mooncake Store master coro_rpc
+// surface.
 //
 // This is the FACTUAL backbone of the wire-compat CI gate proposed in
-// WIRE-COMPAT-RFC.md (a complement to upstream issue #1920). It emits, for every
-// WrappedMasterService coro_rpc handler, the two integers that together define
-// the on-wire identity of an RPC:
+// WIRE-COMPAT-RFC.md (a complement to upstream issue #1920). It emits, for
+// every WrappedMasterService coro_rpc handler, the two integers that together
+// define the on-wire identity of an RPC:
 //
 //   * function-id   = coro_rpc dispatch key
 //                   = struct_pack::MD5::MD5Hash32(qualified-function-name)
 //                     where the name is the fully-qualified
-//                     "mooncake::WrappedMasterService::<Method>" string produced
-//                     by coro_rpc::get_func_name<&Method>()
+//                     "mooncake::WrappedMasterService::<Method>" string
+//                     produced by coro_rpc::get_func_name<&Method>()
 //                     (ylt/util/utils.hpp: consteval func_id()).
 //
 //   * arg-type-code = struct_pack type code of the serialized argument tuple
-//                   = struct_pack::MD5::MD5Hash32(type-layout-literal) & 0xFFFFFFFE
-//                     (ylt/struct_pack/type_calculate.hpp:515 get_types_code_impl).
+//                   = struct_pack::MD5::MD5Hash32(type-layout-literal) &
+//                   0xFFFFFFFE
+//                     (ylt/struct_pack/type_calculate.hpp:515
+//                     get_types_code_impl).
 //
 // Both are computed here with the REAL yalantinglibs implementation, not a
-// re-implementation. The function-id is fully self-contained (it depends only on
-// the qualified name). The arg-type-codes below are computed over layout mirrors
-// that are pinned to the v0.3.11.post1 wire layout and are proven faithful by the
-// self-check in main(): they reproduce the type codes already established in the
-// #2288 tenant-identity investigation
+// re-implementation. The function-id is fully self-contained (it depends only
+// on the qualified name). The arg-type-codes below are computed over layout
+// mirrors that are pinned to the v0.3.11.post1 wire layout and are proven
+// faithful by the self-check in main(): they reproduce the type codes already
+// established in the #2288 tenant-identity investigation
 //   (ExistKey  bare<string>            = 0x9dcffa76,
 //    PutStart  v0.3.11 4-arg tuple     = 0xfad0c534,
 //    PutStart  + bare trailing string  = 0x22f8edba   <- the #2288 break,
@@ -32,14 +35,16 @@
 // The PRODUCTION gate (wire_contract_test.cpp) instead #includes the real
 // types.h / replica.h and computes the same codes over the actual production
 // structs, so it tracks real layout drift. This standalone generator exists so
-// the gate can be built and demonstrated without the full Mooncake build, and so
-// the golden file can be regenerated and diffed in code review.
+// the gate can be built and demonstrated without the full Mooncake build, and
+// so the golden file can be regenerated and diffed in code review.
 //
 // Build:
-//   g++ -std=c++20 -I<ylt-install>/include wire_contract_gen.cpp -o wire_contract_gen
+//   g++ -std=c++20 -I<ylt-install>/include wire_contract_gen.cpp -o
+//   wire_contract_gen
 // Run:
 //   ./wire_contract_gen            # prints the golden table to stdout
-//   ./wire_contract_gen --selfcheck  # verifies the #2288 reference codes, rc!=0 on mismatch
+//   ./wire_contract_gen --selfcheck  # verifies the #2288 reference codes,
+//   rc!=0 on mismatch
 
 #include <ylt/util/function_name.h>
 #include <ylt/struct_pack.hpp>
@@ -49,6 +54,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -56,9 +62,11 @@
 #include <utility>
 #include <vector>
 
-// --- Real coro_rpc function-id, reproduced verbatim from ylt/util/utils.hpp ---
-// (utils.hpp pulls async_simple transitively via other headers, so we restate the
-//  three-line consteval here. It calls the REAL get_func_name + REAL MD5Hash32.)
+// --- Real coro_rpc function-id, reproduced verbatim from ylt/util/utils.hpp
+// --- (utils.hpp pulls async_simple transitively via other headers, so we
+// restate the
+//  three-line consteval here. It calls the REAL get_func_name + REAL
+//  MD5Hash32.)
 namespace coro_rpc_gate {
 template <auto func>
 consteval std::uint32_t func_id() {
@@ -78,18 +86,37 @@ using UUID = std::pair<std::uint64_t, std::uint64_t>;
 // allocator.h ReplicaType: a plain enum class over the default underlying type.
 enum class ReplicaType { MEMORY, DISK, LOCAL_DISK, NOF_SSD, ALL };
 
-// replica.h ReplicateConfig as serialized at the CURRENT v0.3.11.post1 HEAD
-// (commit e9c6107). NOTE: this is a 7-field layout. The #2288-era investigation
-// recorded the PutStart code 0xfad0c534, which corresponds to the EARLIER 3-field
-// layout (replica_num, with_soft_pin, preferred_segment) -- captured below as
-// ReplicateConfigV2288. The fact that these two produce DIFFERENT type-codes
-//   3-field -> 0xfad0c534      (#2288-era)
-//   7-field -> 0x2b2f212e      (current HEAD)
-// is itself a real, silent PutStart wire-code shift introduced by field additions
-// (e.g. NoF metadata, #2143) -- exactly the class of break this gate exists to
-// catch. The golden table emits the CURRENT (7-field) code; the self-check
-// validates the engine against the recorded #2288 reference using the 3-field
-// layout that produced it.
+// replica.h ObjectDataType, mirrored as a fixed-width enum so the data_type
+// field below contributes the same struct_pack type code as production. The
+// underlying type (uint8_t) is part of the wire layout and must match.
+enum class ObjectDataType : std::uint8_t {
+    UNKNOWN = 0,
+    KVCACHE = 1,
+    TENSOR = 2,
+    WEIGHT = 3,
+    SAMPLE = 4,
+    ACTIVATION = 5,
+    GRADIENT = 6,
+    OPTIMIZER_STATE = 7,
+    METADATA = 8,
+    GENERAL = 9,
+};
+
+// replica.h ReplicateConfig as serialized at the CURRENT upstream HEAD. This
+// mirrors the production struct field-for-field (order, type, default) so the
+// generated arg-type-code tracks the real layout. NOTE: the #2288-era
+// investigation recorded the PutStart code 0xfad0c534, which corresponds to the
+// EARLIER 3-field layout (replica_num, with_soft_pin, preferred_segment) --
+// captured below as ReplicateConfigV2288. The fact that these produce DIFFERENT
+// type-codes
+//   3-field  -> 0xfad0c534      (#2288-era)
+//   current  -> 0x3d15a970      (current HEAD, 10-field)
+// is itself a real, silent PutStart wire-code shift introduced by field
+// additions (NoF metadata #2143, prefer_alloc_in_same_node / data_type /
+// group_ids) -- exactly the class of break this gate exists to catch. The
+// golden table emits the CURRENT code; the self-check validates the engine
+// against the recorded #2288 reference using the 3-field layout that produced
+// it.
 struct ReplicateConfig {
     std::size_t replica_num{1};
     std::size_t nof_replica_num{0};
@@ -98,6 +125,9 @@ struct ReplicateConfig {
     std::vector<std::string> preferred_segments{};
     std::string preferred_segment{};
     std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::optional<std::vector<std::string>> group_ids{};
 };
 
 // Frozen 3-field layout as serialized at the time of the #2288 investigation.
@@ -120,8 +150,9 @@ std::uint32_t arg_type_code() {
 
 // --- Stub of the real service for faithful function-id computation ----------
 // Only the qualified NAME of each member matters for the function-id, so these
-// stubs reproduce the exact dispatch keys of the production handlers. The bodies
-// are never defined; we only take their addresses in a consteval context.
+// stubs reproduce the exact dispatch keys of the production handlers. The
+// bodies are never defined; we only take their addresses in a consteval
+// context.
 namespace mooncake {
 struct WrappedMasterService {
     bool ExistKey(const std::string&);
@@ -192,7 +223,8 @@ struct WrappedMasterService {
     int MoveRevoke(const wire::UUID&, const std::string&);
     int EvictDiskReplica(const wire::UUID&, const std::string&,
                          wire::ReplicaType);
-    int BatchEvictDiskReplica(const wire::UUID&, const std::vector<std::string>&,
+    int BatchEvictDiskReplica(const wire::UUID&,
+                              const std::vector<std::string>&,
                               wire::ReplicaType);
     int CreateCopyTask(const std::string&, const std::vector<std::string>&);
     int CreateMoveTask(const std::string&, const std::string&,
@@ -210,48 +242,78 @@ struct Row {
     std::uint32_t function_id;
 };
 
-// Every handler registered in rpc_service.cpp RegisterRpcService(), in registration
-// order. Function-ids are REAL coro_rpc dispatch keys.
+// Every handler registered in rpc_service.cpp RegisterRpcService(), in
+// registration order. Function-ids are REAL coro_rpc dispatch keys.
 static const std::vector<Row> kFunctionIds = {
 #define FID(M) {#M, coro_rpc_gate::func_id<&mc::WrappedMasterService::M>()}
-    FID(ExistKey),          FID(BatchQueryIp),
-    FID(BatchReplicaClear), FID(GetReplicaListByRegex),
-    FID(GetReplicaList),    FID(BatchGetReplicaList),
-    FID(PutStart),          FID(PutEnd),
-    FID(PutRevoke),         FID(BatchPutStart),
-    FID(BatchPutEnd),       FID(BatchPutRevoke),
-    FID(UpsertStart),       FID(UpsertEnd),
-    FID(UpsertRevoke),      FID(BatchUpsertStart),
-    FID(BatchUpsertEnd),    FID(BatchUpsertRevoke),
-    FID(Remove),            FID(RemoveByRegex),
-    FID(RemoveAll),         FID(BatchRemove),
-    FID(MountSegment),      FID(MountNoFSegment),
-    FID(ReMountSegment),    FID(ReMountNoFSegment),
-    FID(UnmountSegment),    FID(GracefulUnmountSegment),
-    FID(UnmountNoFSegment), FID(GetAllNoFSegments),
-    FID(GetNoFSegmentsByName), FID(Ping),
-    FID(GetFsdir),          FID(QuerySegmentStatus),
-    FID(QuerySegmentStatusById), FID(GetStorageConfig),
-    FID(BatchExistKey),     FID(ServiceReady),
-    FID(MountLocalDiskSegment), FID(OffloadObjectHeartbeat),
-    FID(ReportSsdCapacity), FID(NotifyOffloadSuccess),
-    FID(PromotionObjectHeartbeat), FID(PromotionAllocStart),
-    FID(NotifyPromotionSuccess), FID(NotifyPromotionFailure),
-    FID(CopyStart),         FID(CopyEnd),
-    FID(CopyRevoke),        FID(MoveStart),
-    FID(MoveEnd),           FID(MoveRevoke),
-    FID(EvictDiskReplica),  FID(BatchEvictDiskReplica),
-    FID(CreateCopyTask),    FID(CreateMoveTask),
-    FID(QueryTask),         FID(FetchTasks),
+    FID(ExistKey),
+    FID(BatchQueryIp),
+    FID(BatchReplicaClear),
+    FID(GetReplicaListByRegex),
+    FID(GetReplicaList),
+    FID(BatchGetReplicaList),
+    FID(PutStart),
+    FID(PutEnd),
+    FID(PutRevoke),
+    FID(BatchPutStart),
+    FID(BatchPutEnd),
+    FID(BatchPutRevoke),
+    FID(UpsertStart),
+    FID(UpsertEnd),
+    FID(UpsertRevoke),
+    FID(BatchUpsertStart),
+    FID(BatchUpsertEnd),
+    FID(BatchUpsertRevoke),
+    FID(Remove),
+    FID(RemoveByRegex),
+    FID(RemoveAll),
+    FID(BatchRemove),
+    FID(MountSegment),
+    FID(MountNoFSegment),
+    FID(ReMountSegment),
+    FID(ReMountNoFSegment),
+    FID(UnmountSegment),
+    FID(GracefulUnmountSegment),
+    FID(UnmountNoFSegment),
+    FID(GetAllNoFSegments),
+    FID(GetNoFSegmentsByName),
+    FID(Ping),
+    FID(GetFsdir),
+    FID(QuerySegmentStatus),
+    FID(QuerySegmentStatusById),
+    FID(GetStorageConfig),
+    FID(BatchExistKey),
+    FID(ServiceReady),
+    FID(MountLocalDiskSegment),
+    FID(OffloadObjectHeartbeat),
+    FID(ReportSsdCapacity),
+    FID(NotifyOffloadSuccess),
+    FID(PromotionObjectHeartbeat),
+    FID(PromotionAllocStart),
+    FID(NotifyPromotionSuccess),
+    FID(NotifyPromotionFailure),
+    FID(CopyStart),
+    FID(CopyEnd),
+    FID(CopyRevoke),
+    FID(MoveStart),
+    FID(MoveEnd),
+    FID(MoveRevoke),
+    FID(EvictDiskReplica),
+    FID(BatchEvictDiskReplica),
+    FID(CreateCopyTask),
+    FID(CreateMoveTask),
+    FID(QueryTask),
+    FID(FetchTasks),
     FID(MarkTaskToComplete),
 #undef FID
 };
 
-// Arg-tuple type-codes for handlers whose argument types are fully self-contained
-// here (primitives / string / vector<string> / UUID / ReplicaType /
-// ReplicateConfig). Handlers whose arguments use heavier production structs
-// (Segment, *Request, *Response) are covered by the in-build production gate and
-// are intentionally omitted from this standalone golden (marked OMITTED there).
+// Arg-tuple type-codes for handlers whose argument types are fully
+// self-contained here (primitives / string / vector<string> / UUID /
+// ReplicaType / ReplicateConfig). Handlers whose arguments use heavier
+// production structs (Segment, *Request, *Response) are covered by the in-build
+// production gate and are intentionally omitted from this standalone golden
+// (marked OMITTED there).
 struct TcRow {
     const char* name;
     std::uint32_t arg_type_code;
@@ -282,17 +344,14 @@ static std::vector<TcRow> argTypeCodes() {
          arg_type_code<UUID, std::string, std::uint64_t, ReplicateConfig>()},
         {"UpsertEnd", arg_type_code<UUID, std::string, ReplicaType>()},
         {"UpsertRevoke", arg_type_code<UUID, std::string, ReplicaType>()},
-        {"BatchUpsertEnd",
-         arg_type_code<UUID, std::vector<std::string>>()},
-        {"BatchUpsertRevoke",
-         arg_type_code<UUID, std::vector<std::string>>()},
+        {"BatchUpsertEnd", arg_type_code<UUID, std::vector<std::string>>()},
+        {"BatchUpsertRevoke", arg_type_code<UUID, std::vector<std::string>>()},
         {"Remove", arg_type_code<std::string, bool>()},
         {"RemoveByRegex", arg_type_code<std::string, bool>()},
         {"RemoveAll", arg_type_code<bool>()},
         {"BatchRemove", arg_type_code<std::vector<std::string>, bool>()},
         {"UnmountSegment", arg_type_code<UUID, UUID>()},
-        {"GracefulUnmountSegment",
-         arg_type_code<UUID, UUID, std::uint64_t>()},
+        {"GracefulUnmountSegment", arg_type_code<UUID, UUID, std::uint64_t>()},
         {"UnmountNoFSegment", arg_type_code<UUID, UUID>()},
         {"GetNoFSegmentsByName", arg_type_code<std::string>()},
         {"Ping", arg_type_code<UUID>()},
@@ -303,22 +362,19 @@ static std::vector<TcRow> argTypeCodes() {
         {"OffloadObjectHeartbeat", arg_type_code<UUID, bool>()},
         {"ReportSsdCapacity", arg_type_code<UUID, std::int64_t>()},
         {"PromotionObjectHeartbeat", arg_type_code<UUID>()},
-        {"PromotionAllocStart",
-         arg_type_code<UUID, std::string, std::uint64_t,
-                       std::vector<std::string>>()},
+        {"PromotionAllocStart", arg_type_code<UUID, std::string, std::uint64_t,
+                                              std::vector<std::string>>()},
         {"NotifyPromotionSuccess", arg_type_code<UUID, std::string>()},
         {"NotifyPromotionFailure", arg_type_code<UUID, std::string>()},
-        {"CopyStart",
-         arg_type_code<UUID, std::string, std::string,
-                       std::vector<std::string>>()},
+        {"CopyStart", arg_type_code<UUID, std::string, std::string,
+                                    std::vector<std::string>>()},
         {"CopyEnd", arg_type_code<UUID, std::string>()},
         {"CopyRevoke", arg_type_code<UUID, std::string>()},
         {"MoveStart",
          arg_type_code<UUID, std::string, std::string, std::string>()},
         {"MoveEnd", arg_type_code<UUID, std::string>()},
         {"MoveRevoke", arg_type_code<UUID, std::string>()},
-        {"EvictDiskReplica",
-         arg_type_code<UUID, std::string, ReplicaType>()},
+        {"EvictDiskReplica", arg_type_code<UUID, std::string, ReplicaType>()},
         {"BatchEvictDiskReplica",
          arg_type_code<UUID, std::vector<std::string>, ReplicaType>()},
         {"CreateCopyTask",
@@ -340,7 +396,8 @@ static int selfcheck() {
     const Case cases[] = {
         {"ExistKey bare<string>", arg_type_code<std::string>(), 0x9dcffa76u},
         {"PutStart #2288-era 4-arg (3-field RC)",
-         arg_type_code<UUID, std::string, std::uint64_t, ReplicateConfigV2288>(),
+         arg_type_code<UUID, std::string, std::uint64_t,
+                       ReplicateConfigV2288>(),
          0xfad0c534u},
         {"PutStart + bare trailing string (#2288 break)",
          arg_type_code<UUID, std::string, std::uint64_t, ReplicateConfigV2288,
@@ -371,9 +428,13 @@ int main(int argc, char** argv) {
     for (const auto& r : tc) tcmap[r.name] = r.arg_type_code;
 
     std::printf("# Mooncake Store master wire-contract golden\n");
-    std::printf("# source: rpc_service.cpp RegisterRpcService (v0.3.11.post1)\n");
-    std::printf("# function_id = MD5Hash32(\"mooncake::WrappedMasterService::<M>\")\n");
-    std::printf("# arg_type_code = struct_pack::get_type_code<args...> (& 0xFFFFFFFE); OMITTED = covered by in-build gate\n");
+    std::printf(
+        "# source: rpc_service.cpp RegisterRpcService (v0.3.11.post1)\n");
+    std::printf(
+        "# function_id = MD5Hash32(\"mooncake::WrappedMasterService::<M>\")\n");
+    std::printf(
+        "# arg_type_code = struct_pack::get_type_code<args...> (& 0xFFFFFFFE); "
+        "OMITTED = covered by in-build gate\n");
     std::printf("# columns: name function_id arg_type_code\n");
     for (const auto& r : kFunctionIds) {
         auto it = tcmap.find(r.name);

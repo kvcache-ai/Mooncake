@@ -23,7 +23,7 @@ on:
       - "mooncake-store/include/types.h"
       - "mooncake-store/include/allocator.h"
       - "mooncake-store/src/master_client.cpp"
-      - "docs/rust-rewrite/wire-compat-rfc/gate/**"
+      - "docs/rfc/wire-compat/gate/**"
   workflow_dispatch: {}
 
 jobs:
@@ -48,8 +48,8 @@ jobs:
 
       - name: Run wire-contract gate (standalone golden)
         run: |
-          chmod +x docs/rust-rewrite/wire-compat-rfc/gate/check_wire_contract.sh
-          docs/rust-rewrite/wire-compat-rfc/gate/check_wire_contract.sh \
+          chmod +x docs/rfc/wire-compat/gate/check_wire_contract.sh
+          docs/rfc/wire-compat/gate/check_wire_contract.sh \
             --ylt "${YLT_INCLUDE}"
 
       # Optional second face: the in-build ctest computes the same codes over the

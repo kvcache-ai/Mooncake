@@ -1,24 +1,27 @@
 // wire_contract_test.cpp
 //
-// In-build production face of the wire-compat gate (a gtest/ctest target). Unlike
-// the standalone wire_contract_gen.cpp -- which freezes argument struct layouts as
-// local mirrors so it can build with only the yalantinglibs headers -- this test
-// #includes the REAL Mooncake headers and computes coro_rpc function-ids and
-// struct_pack argument type-codes over the ACTUAL production structs. It therefore
-// tracks real layout drift end-to-end (it would, for example, have flagged the
-// #2143 ReplicateConfig field additions that silently shifted PutStart's
-// argument type-code from 0xfad0c534 to 0x2b2f212e).
+// In-build production face of the wire-compat gate (a gtest/ctest target).
+// Unlike the standalone wire_contract_gen.cpp -- which freezes argument struct
+// layouts as local mirrors so it can build with only the yalantinglibs headers
+// -- this test #includes the REAL Mooncake headers and computes coro_rpc
+// function-ids and struct_pack argument type-codes over the ACTUAL production
+// structs. It therefore tracks real layout drift end-to-end (it would, for
+// example, have flagged the successive ReplicateConfig field additions -- NoF
+// metadata (#2143), prefer_alloc_in_same_node / data_type / group_ids -- that
+// silently shifted PutStart's argument type-code from 0xfad0c534 to its current
+// 0x3d15a970).
 //
 // It also carries the cross-version interop methodology from PR #2551
-// (tenant_id_wire_compat_test.cpp), generalized into AssertInteropBothWays<>, so
-// that each new struct_pack::compatible<> field lands with a real old<->new
+// (tenant_id_wire_compat_test.cpp), generalized into AssertInteropBothWays<>,
+// so that each new struct_pack::compatible<> field lands with a real old<->new
 // round-trip proof, not just a type-code assertion.
 //
 // Wire into mooncake-store/tests/CMakeLists.txt as a ctest target named
-// "wire_contract_test". The golden it checks is the same gate/wire_contract_golden.txt
-// produced by the standalone generator; this test asserts the non-OMITTED rows and
-// additionally pins the rows the standalone generator marks OMITTED (Segment-typed
-// and *Request/*Response-typed handlers).
+// "wire_contract_test". The golden it checks is the same
+// gate/wire_contract_golden.txt produced by the standalone generator; this test
+// asserts the non-OMITTED rows and additionally pins the rows the standalone
+// generator marks OMITTED (Segment-typed and *Request/*Response-typed
+// handlers).
 
 #include <gtest/gtest.h>
 
@@ -34,15 +37,16 @@
 // Real production headers. These pull the actual wire types and the real
 // WrappedMasterService declaration, so all codes below are computed over the
 // genuine layouts used on the wire.
-#include "rpc_service.h"   // mooncake::WrappedMasterService
-#include "replica.h"       // ReplicateConfig, Replica::Descriptor
-#include "types.h"         // UUID, Segment, *Request/*Response, ReplicaType, ...
-#include "allocator.h"     // ReplicaType
+#include "rpc_service.h"  // mooncake::WrappedMasterService
+#include "replica.h"      // ReplicateConfig, Replica::Descriptor
+#include "types.h"        // UUID, Segment, *Request/*Response, ReplicaType, ...
+#include "allocator.h"    // ReplicaType
 
 namespace mooncake {
 namespace {
 
-// Real coro_rpc function-id (verbatim from ylt/util/utils.hpp consteval func_id).
+// Real coro_rpc function-id (verbatim from ylt/util/utils.hpp consteval
+// func_id).
 template <auto func>
 consteval std::uint32_t func_id() {
     constexpr auto name = coro_rpc::get_func_name<func>();
@@ -58,7 +62,8 @@ using compat_string = struct_pack::compatible<std::string>;
 
 // ---------------------------------------------------------------------------
 // 1. Codec faithfulness self-check against the recorded #2288 reference codes.
-//    Mirrors the standalone gate's self-check so both faces agree on the engine.
+//    Mirrors the standalone gate's self-check so both faces agree on the
+//    engine.
 // ---------------------------------------------------------------------------
 
 // Frozen 3-field ReplicateConfig as serialized at the #2288 investigation.
@@ -66,12 +71,20 @@ struct ReplicateConfigV2288 {
     std::size_t replica_num{1};
     bool with_soft_pin{false};
     std::string preferred_segment{};
+
+    // Needed so the interop helper can assert legacy fields decode intact.
+    bool operator==(const ReplicateConfigV2288& other) const {
+        return replica_num == other.replica_num &&
+               with_soft_pin == other.with_soft_pin &&
+               preferred_segment == other.preferred_segment;
+    }
 };
 
 TEST(WireContract, CodecMatchesRecordedReferenceCodes) {
     EXPECT_EQ(arg_code<std::string>(), 0x9dcffa76u) << "ExistKey bare<string>";
-    EXPECT_EQ((arg_code<UUID, std::string, std::uint64_t, ReplicateConfigV2288>()),
-              0xfad0c534u)
+    EXPECT_EQ(
+        (arg_code<UUID, std::string, std::uint64_t, ReplicateConfigV2288>()),
+        0xfad0c534u)
         << "PutStart #2288-era 4-arg (3-field RC)";
     EXPECT_EQ((arg_code<UUID, std::string, std::uint64_t, ReplicateConfigV2288,
                         std::string>()),
@@ -113,7 +126,7 @@ TEST(WireContract, RealStructArgCodesArePinned) {
     // Example: MountSegment(const Segment&, const UUID&). Segment is a real
     // production struct; its layout is part of the wire contract.
     const std::uint32_t mount = arg_code<Segment, UUID>();
-    // PutStart over the CURRENT real ReplicateConfig (7-field at HEAD).
+    // PutStart over the CURRENT real ReplicateConfig (10-field at HEAD).
     const std::uint32_t put_start =
         arg_code<UUID, std::string, std::uint64_t, ReplicateConfig>();
 
@@ -122,7 +135,7 @@ TEST(WireContract, RealStructArgCodesArePinned) {
     // the OMITTED markers) and commit; thereafter any layout drift fails here.
     RecordProperty("MountSegment_arg_code", testing::PrintToString(mount));
     RecordProperty("PutStart_arg_code", testing::PrintToString(put_start));
-    EXPECT_EQ(put_start, 0x2b2f212eu)
+    EXPECT_EQ(put_start, 0x3d15a970u)
         << "PutStart real-layout arg code drifted; if intentional, bump the "
            "major protocol version and update the golden";
     // (MountSegment expected value to be pinned from the golden once recorded.)
@@ -134,63 +147,92 @@ TEST(WireContract, RealStructArgCodesArePinned) {
 //    round-trips with real struct_pack serialize/deserialize.
 // ---------------------------------------------------------------------------
 
+// Generalized cross-version interop proof (PR #2551 methodology). For an
+// additive struct_pack::compatible<> field, a single call asserts all three
+// guarantees the RFC requires:
+//   1. type-code parity   -- the evolved tuple keeps the legacy arg-type-code
+//                            (the compatible<> trailing field is excluded from
+//                            the hash);
+//   2. old client -> new server -- legacy bytes deserialize into the evolved
+//                            tuple, with the new field absent (nullopt);
+//   3. new client -> old server -- evolved bytes deserialize into the legacy
+//                            tuple intact, and the same bytes still recover the
+//                            new field on a new server.
+// LegacyTuple and EvolvedTuple are the std::tuple<> argument shapes; the caller
+// supplies a populated legacy value and the expected decoded value of the new
+// trailing field.
 template <typename LegacyTuple, typename EvolvedTuple>
-void AssertTypeCodeParity() {
-    // Reuse the tuple's element type-codes; compatible<> trailing field must be
-    // excluded from the hash so the evolved tuple keeps the legacy code.
-    EXPECT_EQ(std::apply([](auto&&... a) {
-                  return struct_pack::get_type_code<
-                      std::decay_t<decltype(a)>...>();
-              }, LegacyTuple{}),
-              std::apply([](auto&&... a) {
-                  return struct_pack::get_type_code<
-                      std::decay_t<decltype(a)>...>();
-              }, EvolvedTuple{}))
+void AssertInteropBothWays(const LegacyTuple& legacy_value,
+                           const std::string& evolved_field_value) {
+    // 1. Type-code parity.
+    EXPECT_EQ(std::apply(
+                  [](auto&&... a) {
+                      return struct_pack::get_type_code<
+                          std::decay_t<decltype(a)>...>();
+                  },
+                  LegacyTuple{}),
+              std::apply(
+                  [](auto&&... a) {
+                      return struct_pack::get_type_code<
+                          std::decay_t<decltype(a)>...>();
+                  },
+                  EvolvedTuple{}))
         << "evolved tuple must keep the legacy argument type-code";
+
+    // 2. Old client -> new server: legacy bytes decode, new field is absent.
+    auto legacy_wire = struct_pack::serialize(legacy_value);
+    EvolvedTuple decoded_evolved;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded_evolved, legacy_wire),
+              struct_pack::errc{});
+    EXPECT_FALSE(std::get<std::tuple_size_v<EvolvedTuple> - 1>(decoded_evolved)
+                     .has_value());
+
+    // 3. New client -> old server: build the evolved value by appending the new
+    //    trailing field, then prove both decode directions on the same bytes.
+    EvolvedTuple evolved_value = std::tuple_cat(
+        legacy_value, std::make_tuple(compat_string{evolved_field_value}));
+    auto evolved_wire = struct_pack::serialize(evolved_value);
+
+    LegacyTuple decoded_legacy;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded_legacy, evolved_wire),
+              struct_pack::errc{});
+    EXPECT_EQ(decoded_legacy, legacy_value)
+        << "old server must recover the legacy fields intact";
+
+    EvolvedTuple decoded_new;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded_new, evolved_wire),
+              struct_pack::errc{});
+    EXPECT_EQ(std::get<std::tuple_size_v<EvolvedTuple> - 1>(decoded_new)
+                  .value_or("default"),
+              evolved_field_value);
 }
 
 TEST(WireContract, InteropOldClientNewServer) {
-    // Old client serializes the legacy PutStart tuple (no tenant).
+    // Old client serializes the legacy PutStart tuple (no tenant); the helper
+    // proves the legacy bytes decode on a new server with the tenant absent.
     UUID client_id{7, 9};
     ReplicateConfigV2288 cfg;
     cfg.replica_num = 2;
-    auto legacy_wire = struct_pack::serialize(
-        std::tuple<UUID, std::string, std::uint64_t, ReplicateConfigV2288>{
-            client_id, "obj-key", 4096, cfg});
-
-    // New server decodes into the evolved tuple; tenant absent -> nullopt.
-    std::tuple<UUID, std::string, std::uint64_t, ReplicateConfigV2288,
-               compat_string>
-        decoded;
-    ASSERT_EQ(struct_pack::deserialize_to(decoded, legacy_wire),
-              struct_pack::errc{});
-    EXPECT_EQ(std::get<1>(decoded), "obj-key");
-    EXPECT_FALSE(std::get<4>(decoded).has_value());
+    using Legacy =
+        std::tuple<UUID, std::string, std::uint64_t, ReplicateConfigV2288>;
+    using Evolved = std::tuple<UUID, std::string, std::uint64_t,
+                               ReplicateConfigV2288, compat_string>;
+    AssertInteropBothWays<Legacy, Evolved>(
+        Legacy{client_id, "obj-key", 4096, cfg}, "acme");
 }
 
 TEST(WireContract, InteropNewClientOldServer) {
-    // New client serializes the evolved tuple carrying a tenant.
+    // New client carries a tenant; the helper proves the evolved bytes decode
+    // on an old server (legacy fields intact) and that a new server recovers
+    // it.
     UUID client_id{1, 2};
     ReplicateConfigV2288 cfg;
-    auto evolved_wire = struct_pack::serialize(
-        std::tuple<UUID, std::string, std::uint64_t, ReplicateConfigV2288,
-                   compat_string>{client_id, "obj-key", 4096, cfg,
-                                  compat_string{std::string("acme")}});
-
-    // Old server decodes into the legacy tuple and ignores the trailing tenant.
-    std::tuple<UUID, std::string, std::uint64_t, ReplicateConfigV2288>
-        old_decoded;
-    ASSERT_EQ(struct_pack::deserialize_to(old_decoded, evolved_wire),
-              struct_pack::errc{});
-    EXPECT_EQ(std::get<1>(old_decoded), "obj-key");
-
-    // New server reads the same bytes and recovers the tenant.
-    std::tuple<UUID, std::string, std::uint64_t, ReplicateConfigV2288,
-               compat_string>
-        new_decoded;
-    ASSERT_EQ(struct_pack::deserialize_to(new_decoded, evolved_wire),
-              struct_pack::errc{});
-    EXPECT_EQ(std::get<4>(new_decoded).value_or("default"), "acme");
+    using Legacy =
+        std::tuple<UUID, std::string, std::uint64_t, ReplicateConfigV2288>;
+    using Evolved = std::tuple<UUID, std::string, std::uint64_t,
+                               ReplicateConfigV2288, compat_string>;
+    AssertInteropBothWays<Legacy, Evolved>(
+        Legacy{client_id, "obj-key", 4096, cfg}, "acme");
 }
 
 }  // namespace

@@ -56,9 +56,9 @@ The 59 handlers registered in `mooncake-store/src/rpc_service.cpp` `RegisterRpcS
 
 ```
 ExistKey                   0x89385f09 0x9dcffa76
-PutStart                   0x65ea9ac1 0x2b2f212e
+PutStart                   0x65ea9ac1 0x3d15a970
 PutEnd                     0x8e8b2099 0x61232de0
-BatchPutStart              0x56be1822 0x4fb9d994
+BatchPutStart              0x56be1822 0x955f4c96
 MountSegment               0x3e7ec4bb OMITTED   (arg uses Segment struct; pinned by in-build gate)
 Ping                       0xd6c2dae5 0x3c6d83e0
 ServiceReady               0x7b81bb56 OMITTED   (no-arg handshake; see 3.3)
@@ -67,7 +67,7 @@ EvictDiskReplica           0xd00ac42b 0x61232de0
 
 `OMITTED` marks handlers whose argument types use heavier production structs (`Segment`, `*Request`, `*Response`); these are pinned by the in-build production gate (`gate/wire_contract_test.cpp`) that includes the real headers. The standalone generator pins the 47 self-contained ones plus all 59 function-ids.
 
-Note the live `PutStart` code is `0x2b2f212e`, not the `0xfad0c534` recorded during the #2288 investigation. That difference is real: later field additions to `ReplicateConfig` (e.g. NoF metadata, #2143) silently shifted `PutStart`'s argument type-code. This is precisely the drift the gate makes visible.
+Note the live `PutStart` code is `0x3d15a970`, not the `0xfad0c534` recorded during the #2288 investigation. That difference is real: later field additions to `ReplicateConfig` (NoF metadata #2143, then `prefer_alloc_in_same_node` / `data_type` / `group_ids`) silently shifted `PutStart`'s argument type-code. This is precisely the drift the gate makes visible.
 
 ### 3.2 On-wire structs serialized by struct_pack
 
@@ -156,7 +156,7 @@ To prove the gate is not cosmetic, we flipped one handler signature -- appending
 --- gate/wire_contract_golden.txt
 +++ gate/.wire_contract_live.txt
 @@ -10,7 +10,7 @@
- PutStart                   0x65ea9ac1 0x2b2f212e
+ PutStart                   0x65ea9ac1 0x3d15a970
 -PutEnd                     0x8e8b2099 0x61232de0
 +PutEnd                     0x8e8b2099 0x1b7a228a
  PutRevoke                  0xa0767c44 0x61232de0

@@ -9,13 +9,13 @@ BatchReplicaClear          0x137b01fc 0x472b2fa2
 GetReplicaListByRegex      0xfe6af93c 0x9dcffa76
 GetReplicaList             0x1f7ef174 0x9dcffa76
 BatchGetReplicaList        0x1b0d20ff 0x8a86e11a
-PutStart                   0x65ea9ac1 0x2b2f212e
+PutStart                   0x65ea9ac1 0x3d15a970
 PutEnd                     0x8e8b2099 0x61232de0
 PutRevoke                  0xa0767c44 0x61232de0
-BatchPutStart              0x56be1822 0x4fb9d994
+BatchPutStart              0x56be1822 0x955f4c96
 BatchPutEnd                0x80e020ab 0x3af685d6
 BatchPutRevoke             0xb82567aa 0x3af685d6
-UpsertStart                0xa1335e41 0x2b2f212e
+UpsertStart                0xa1335e41 0x3d15a970
 UpsertEnd                  0x2e20e258 0x61232de0
 UpsertRevoke               0x610b042e 0x61232de0
 BatchUpsertStart           0xd564b423 OMITTED

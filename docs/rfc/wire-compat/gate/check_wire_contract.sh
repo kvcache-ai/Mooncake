@@ -20,7 +20,12 @@ ylt="${YLT_INCLUDE:-/tmp/compat-official/ylt-install/include}"
 update=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --ylt) ylt="$2"; shift 2;;
+    --ylt)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "ERROR: --ylt requires a value (ylt-install include dir)" >&2
+        exit 2
+      fi
+      ylt="$2"; shift 2;;
     --update) update=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -49,7 +54,11 @@ if ! "$gen" --selfcheck; then
 fi
 
 live="$here/.wire_contract_live.txt"
-"$gen" > "$live"
+if ! "$gen" > "$live"; then
+  echo "ERROR: generator failed to emit the live wire contract" >&2
+  rm -f "$live"
+  exit 2
+fi
 
 if [ "$update" = "1" ]; then
   cp "$live" "$golden"
