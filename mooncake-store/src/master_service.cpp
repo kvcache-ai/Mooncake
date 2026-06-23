@@ -8774,10 +8774,8 @@ void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
 void MasterService::setHttpMetadataRemoteUrl(
     const std::string& metadata_connstring) {
 #ifdef USE_HTTP
-    // Only http/https metadata servers are supported for remote cleanup. Guard
-    // the scheme here to avoid MetadataStoragePlugin::Create()'s LOG(FATAL)
-    // path for unsupported backends (etcd / redis / P2PHANDSHAKE), which are
-    // left for a future change.
+    // Only http(s) is supported; guard the scheme to avoid
+    // MetadataStoragePlugin::Create()'s LOG(FATAL) on other backends.
     if (metadata_connstring.rfind("http://", 0) == 0 ||
         metadata_connstring.rfind("https://", 0) == 0) {
         try {
@@ -8815,8 +8813,7 @@ void MasterService::setHttpMetadataRemoteUrl(
 }
 
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
-    // Co-located metadata server: remove via direct in-process call (no
-    // network overhead). Safe to run inline — no I/O leaves the process.
+    // Co-located: remove in-process, safe to run inline (no network I/O).
     if (http_metadata_server_) {
         const std::string ram_key =
             http_metadata_prefix_ + "ram/" + segment_name;
@@ -8830,8 +8827,8 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
         return;
     }
 
-    // Separately-deployed metadata server: enqueue for async cleanup so that
-    // slow/unreachable metadata servers never block the client monitor thread.
+    // Separately-deployed: enqueue for async cleanup so a slow/unreachable
+    // server never blocks the client monitor thread.
     if (http_metadata_remote_) {
         {
             std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);

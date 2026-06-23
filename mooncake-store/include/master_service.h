@@ -1896,19 +1896,15 @@ class MasterService {
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
-    // Remote HTTP metadata storage client, used when the metadata server is
-    // deployed separately from the master (not co-located). nullptr means no
-    // remote cleanup. Mutually exclusive with http_metadata_server_ in
-    // practice (co-located prefers the in-process pointer).
+    // Remote HTTP metadata client, used when the metadata server is deployed
+    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
     std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;
 
-    // Async cleanup worker for remote HTTP metadata removal.
-    // Segments are enqueued from the client monitor thread and processed
-    // asynchronously so that slow/unreachable metadata servers never block
-    // heartbeat processing or segment operations.
+    // Async worker for remote cleanup: segments are enqueued from the client
+    // monitor thread so a slow/unreachable server never blocks heartbeats.
     std::thread http_metadata_cleanup_thread_;
     std::atomic<bool> http_metadata_cleanup_running_{false};
     std::mutex http_metadata_cleanup_mutex_;

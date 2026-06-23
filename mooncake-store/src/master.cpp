@@ -64,20 +64,14 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
     return parsed_value;
 }
 
-// Derive the metadata server connection string from the cluster's existing
-// configuration so that the master can clean up stale HTTP metadata when the
-// metadata server is deployed separately (not co-located in this process).
-// Sources, in priority order:
-//   1) MOONCAKE_TE_META_DATA_SERVER  (the Transfer Engine metadata connstring
-//      shared cluster-wide, e.g. "http://host:8080/metadata")
-//   2) MOONCAKE_CONFIG_PATH json -> "metadata_server"
-// Returns an empty string if nothing usable is found. The caller is
-// responsible for validating the scheme (only http(s) is supported).
+// Derive the metadata server address for cleanup when it is deployed
+// separately. Priority: MOONCAKE_TE_META_DATA_SERVER, then the
+// "metadata_server" field of MOONCAKE_CONFIG_PATH. Returns "" if none found;
+// the caller validates the scheme (only http(s) is supported).
 std::string ResolveMetadataServerForCleanup() {
     if (const char* env = std::getenv("MOONCAKE_TE_META_DATA_SERVER")) {
         std::string value(env);
-        // "P2PHANDSHAKE" is a peer-to-peer mode with no central metadata
-        // server, so there is nothing to clean up remotely.
+        // P2PHANDSHAKE has no central metadata server, nothing to clean up.
         if (!value.empty() && value != "P2PHANDSHAKE") {
             return value;
         }
@@ -1279,10 +1273,8 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    // Wire metadata cleanup on client timeout into the serving primary. The
-    // stale-metadata problem is identical in HA mode (the primary still handles
-    // heartbeats and unmounts), so prefer the co-located in-process server,
-    // otherwise use the separately-deployed HTTP endpoint derived above.
+    // Metadata cleanup on client timeout (used by both the HA and non-HA
+    // paths): prefer the co-located in-process server, else the separate URL.
     mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
     if (master_config.enable_metadata_cleanup_on_timeout &&
         master_config.enable_http_metadata_server) {

@@ -379,9 +379,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             server.init_ibv();
         }
 
-        // Only the serving primary creates a WrappedMasterService, and it is
-        // the node handling heartbeats/unmounts, so forward the metadata
-        // cleanup configuration here just like the non-HA path does.
+        // The serving primary handles heartbeats/unmounts, so forward the
+        // metadata cleanup config here like the non-HA path does.
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             mooncake::WrappedMasterServiceConfig(
                 config, leadership_session->view.view_version),
