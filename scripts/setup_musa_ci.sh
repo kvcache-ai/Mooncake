@@ -61,6 +61,9 @@ setup_musa_library_compat() {
     "${MUSA_HOME}/mublas/lib"
     "${MUSA_HOME}/musolver/lib"
     "${MUSA_HOME}/musparse/lib"
+    "/driver/usr/local/musa/lib"
+    "/driver/usr/lib/x86_64-linux-gnu"
+    "/usr/lib/x86_64-linux-gnu"
   )
 
   find_musa_library() {
@@ -77,6 +80,14 @@ setup_musa_library_compat() {
         fi
       done
     done
+    candidate=$(find -L /usr/local/musa /driver /usr/lib /lib \
+      -type f \( -name "${soname}" -o -name "${base}" -o -name "${base}.*" \) \
+      -print -quit 2>/dev/null || true)
+    if [[ -n "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      shopt -u nullglob
+      return 0
+    fi
     shopt -u nullglob
     return 1
   }
