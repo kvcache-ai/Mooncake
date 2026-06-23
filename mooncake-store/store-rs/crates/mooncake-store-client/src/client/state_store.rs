@@ -221,22 +221,27 @@ impl StoreState {
         buffer: *mut c_void,
         size: usize,
     ) -> Result<()> {
-        match self.registered_buffers.remove(&(buffer as usize)) {
+        match self.registered_buffers.get(&(buffer as usize)).copied() {
             Some(registered) if registered == size => {
                 transport.unregister_memory(buffer, size)?;
+                self.registered_buffers.remove(&(buffer as usize));
                 Ok(())
             }
-            Some(registered) => {
-                self.registered_buffers.insert(buffer as usize, registered);
-                Err(StoreError::Allocator(format!(
-                    "registered buffer size mismatch: requested={size} registered={registered}"
-                )))
-            }
+            Some(registered) => Err(StoreError::Allocator(format!(
+                "registered buffer size mismatch: requested={size} registered={registered}"
+            ))),
             None => Err(StoreError::NotFound(format!(
                 "registered buffer {:p} not found",
                 buffer
             ))),
         }
+    }
+
+    fn registered_buffer_size(&self, buffer: *mut c_void) -> Result<usize> {
+        self.registered_buffers
+            .get(&(buffer as usize))
+            .copied()
+            .ok_or_else(|| StoreError::NotFound(format!("registered buffer {:p} not found", buffer)))
     }
 
     fn buffer_is_registered(&self, buffer: *mut c_void, size: usize) -> bool {

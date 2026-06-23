@@ -519,10 +519,11 @@ impl PyMooncakeDistributedStore {
         }
     }
 
-    fn unregister_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
+    #[pyo3(signature = (buffer_ptr, size = None))]
+    fn unregister_buffer(&self, buffer_ptr: usize, size: Option<usize>) -> PyResult<i32> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                run_without_gil(move || dummy.unregister_buffer(buffer_ptr, Some(size)))
+                run_without_gil(move || dummy.unregister_buffer(buffer_ptr, size))
                     .map_err(store_error_to_py)
             }
             StoreBackend::Real(dispatcher) => {

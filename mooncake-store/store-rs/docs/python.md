@@ -844,9 +844,11 @@ If hugepage mode is requested, the host kernel must already have compatible huge
 ## BufferPool
 
 `BufferPool` is the recommended Python helper for temporary buffers used with
-`put_from(...)`, `get_into(...)`, and the batch buffer-oriented APIs. It is backed
-by the store client's setup-time local buffer first, and falls back to registered
-overflow memory when the local buffer is exhausted.
+`put_from(...)`, `get_into(...)`, and the batch buffer-oriented APIs. It allocates
+from the store client's setup-time registered local buffer first, so normal pool
+acquire/release operations do not repeatedly register or unregister RDMA memory.
+Only when the local buffer is exhausted does it fall back to dynamically
+registered overflow memory.
 
 Import paths:
 
@@ -911,6 +913,9 @@ Important notes:
 - `BufferPool` requires a real store that was set up with nonzero
   `local_buffer_size`; dummy stores and stores without local buffer capacity
   cannot create a pool.
+- The hot path is local-buffer slice allocation and return. Dynamic
+  `register_buffer(...)` / `unregister_buffer(...)` is only used for overflow
+  allocations after the local buffer is exhausted.
 - A lease exposes `ptr`, `size`, `buffer`, and `release()`. Pass `ptr` and the
   actual payload length to `put_from(...)`; pass `ptr` and destination capacity
   to `get_into(...)`.
