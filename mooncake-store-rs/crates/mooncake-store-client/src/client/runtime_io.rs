@@ -1633,7 +1633,8 @@ impl StoreClient {
             1 => Some(remote_readable[0].clone()),
             n => {
                 remote_readable.sort_by_key(|r| r.priority);
-                let hash = replica_balance_hash(&local_runtime.stable_id.0) as usize;
+                let hash =
+                    replica_balance_hash(&local_runtime.stable_id.0, &route.key.0) as usize;
                 Some(remote_readable[hash % n].clone())
             }
         }
@@ -3998,12 +3999,15 @@ impl StoreClient {
     }
 }
 
-fn replica_balance_hash(reader_id: &str) -> u64 {
-    let mut h = 0u64;
-    for b in reader_id.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(u64::from(b));
-    }
-    h
+fn replica_balance_hash(reader_id: &str, key: &str) -> u64 {
+    use xxhash_rust::xxh3::Xxh3Default;
+
+    let mut hasher = Xxh3Default::new();
+    hasher.update(&(reader_id.len() as u64).to_le_bytes());
+    hasher.update(reader_id.as_bytes());
+    hasher.update(&(key.len() as u64).to_le_bytes());
+    hasher.update(key.as_bytes());
+    hasher.digest()
 }
 
 #[cfg(test)]
