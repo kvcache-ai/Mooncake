@@ -161,3 +161,13 @@ target_include_directories(tent_progress_worker_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_progress_worker_test
          COMMAND tent_progress_worker_test)
+
+# ThreadLocalStorage unit test: per-object isolation, forEach scoping, and that
+# a fresh object does not alias a destroyed one (header-only, CPU-only).
+add_executable(tent_thread_local_storage_test thread_local_storage_test.cpp)
+target_link_libraries(tent_thread_local_storage_test
+                      PRIVATE gtest gtest_main)
+target_include_directories(tent_thread_local_storage_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_thread_local_storage_test
+         COMMAND tent_thread_local_storage_test)
