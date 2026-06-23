@@ -432,10 +432,19 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // reports a failure. We must set both to false here.
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
-            meta_->activeRanks[pollingRank] = false;
-            if (meta_->activeRanksTensor.device().is_cpu()) {
-                meta_->activeRanksTensor[pollingRank] = 0;
-            }
+            // Note that we updated `peerConnecteds` above because they
+            // represent rank-local connection states. However, we do not modify
+            // `activeRanks` here, as it is a membership configuration that must
+            // remain consistent across all ranks in the group.
+            //
+            // When `autoDeactivateOnFailure == true` (default), `activeRanks`
+            // is expected to change when a collective or P2P operation fails,
+            // rather than within the connection poller.
+            // When `autoDeactivateOnFailure == false`, we never modify
+            // `activeRanks` automatically; instead, the user must call
+            // `deactivateRanks` manually.
+            // Therefore, in neither scenario should the connection poller
+            // modify the active ranks.
 
             // Reset store
             try {
