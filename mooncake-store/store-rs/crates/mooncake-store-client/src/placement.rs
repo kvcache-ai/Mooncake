@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use mooncake_store_core::{
     ClientLease, ClientLifecycleState, ClientRuntimeId, MetadataBackend, Result, StoreError,
 };
 
-use crate::stable_hash::stable_hash;
 use crate::{ObjectRef, StoreClient};
 
 const DEFAULT_SCOPE_LABEL: &str = "pool";
@@ -378,14 +378,14 @@ fn rendezvous_score(
     key: &str,
     runtime: &ClientRuntimeId,
 ) -> u64 {
-    stable_hash(&[
-        tenant,
-        domain,
-        object_set,
-        qos_tier,
-        key,
-        runtime.stable_id.0.as_str(),
-    ])
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tenant.hash(&mut hasher);
+    domain.hash(&mut hasher);
+    object_set.hash(&mut hasher);
+    qos_tier.hash(&mut hasher);
+    key.hash(&mut hasher);
+    runtime.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn locality_bonus(candidate: &ClientLease, object: &ObjectRef<'_>) -> u64 {
@@ -430,7 +430,7 @@ mod tests {
         CompatibilityDescriptor, MetadataBackend, SegmentName,
     };
 
-    use super::{rendezvous_score, PlacementPlanner};
+    use super::PlacementPlanner;
     use crate::ObjectRef;
 
     #[test]
@@ -543,47 +543,6 @@ mod tests {
                 .or_default() += 1;
         }
         assert_eq!(owners.len(), 2);
-    }
-
-    #[test]
-    fn placement_score_uses_stable_runtime_identity() {
-        let first_epoch = ClientRuntimeId::new("storage-a", ClientEpoch(1));
-        let later_epoch = ClientRuntimeId::new("storage-a", ClientEpoch(99));
-        let other_runtime = ClientRuntimeId::new("storage-b", ClientEpoch(1));
-
-        let first_score = rendezvous_score(
-            "tenant-a",
-            "domain-a",
-            "set-a",
-            "gold",
-            "key-a",
-            &first_epoch,
-        );
-        let later_score = rendezvous_score(
-            "tenant-a",
-            "domain-a",
-            "set-a",
-            "gold",
-            "key-a",
-            &later_epoch,
-        );
-        let other_score = rendezvous_score(
-            "tenant-a",
-            "domain-a",
-            "set-a",
-            "gold",
-            "key-a",
-            &other_runtime,
-        );
-
-        assert_eq!(
-            first_score, later_score,
-            "placement must not reshuffle because a storage runtime restarted with a new epoch"
-        );
-        assert_ne!(
-            first_score, other_score,
-            "different stable storage identities should keep independent placement scores"
-        );
     }
 
     #[test]

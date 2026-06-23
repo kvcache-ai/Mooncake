@@ -148,8 +148,7 @@ In this mode:
 
 - placement candidates come from live compatible clients
 - candidates are filtered by planner labels
-- replica owners are ranked with stable rendezvous hashing over the object scope
-  and storage runtime stable identity
+- replica owners are ranked with rendezvous hashing
 
 ## Use Request Policies
 
