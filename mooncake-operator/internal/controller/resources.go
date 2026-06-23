@@ -464,7 +464,7 @@ sys.exit(0)
 					Labels: mergeLabels(labels, selector),
 				},
 				Spec: corev1.PodSpec{
-					TerminationGracePeriodSeconds: int64Ptr(3600),
+					TerminationGracePeriodSeconds: int64Ptr(300),
 					Containers:                    []corev1.Container{container},
 					Volumes:                       volumes,
 				},

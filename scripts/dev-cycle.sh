@@ -121,9 +121,26 @@ deploy-store() {
         # build_wheel.sh already put the wheel in dist/ via its own OUTPUT_DIR
     fi
 
-    # Step 4: 构建快速 Docker 镜像（使用预编译 wheel，跳过 C++ 编译）
+    # Step 4: 复制 wheel 到 docker-pip-cache（供 Dockerfile 安装）
+    info "复制 wheel 到 docker-pip-cache..."
+    # build_wheel.sh 将 wheel 输出到 mooncake-wheel/dist/
+    WHL_SRC=$(ls mooncake-wheel/dist/mooncake_transfer_engine-*.whl 2>/dev/null | head -1 || true)
+    if [[ -n "$WHL_SRC" ]]; then
+        cp "$WHL_SRC" docker-pip-cache/
+        ok "Wheel 已复制到 docker-pip-cache/"
+    else
+        WHL_SRC=$(ls dist/mooncake_transfer_engine-*.whl 2>/dev/null | head -1 || true)
+        if [[ -n "$WHL_SRC" ]]; then
+            cp "$WHL_SRC" docker-pip-cache/
+            ok "Wheel 已复制到 docker-pip-cache/"
+        else
+            warn "未找到 wheel 文件，Docker 可能使用缓存的旧 wheel"
+        fi
+    fi
+
+    # Step 5: 构建快速 Docker 镜像（使用预编译 wheel，跳过 C++ 编译）
     info "构建 Store Docker 镜像（快速模式，无 C++ 编译）..."
-    docker build -f docker/mooncake-store-fast.Dockerfile \
+    docker build --no-cache -f docker/mooncake-store-fast.Dockerfile \
         -t mooncake/mooncake-store:latest \
         -t mooncake-store:latest . && ok "Docker 镜像构建完成"
 

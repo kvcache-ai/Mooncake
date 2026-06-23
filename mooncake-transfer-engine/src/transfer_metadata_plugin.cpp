@@ -378,6 +378,10 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
         long code = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (code == 404) {
+            LOG(INFO) << "DELETE " << url << " http=404 (key already deleted)";
+            return true;
+        }
         if (!is_200(code)) {
             LOG(ERROR) << "DELETE " << url << " http=" << code
                        << " body: " << readBody;

@@ -516,13 +516,15 @@ func (r *MooncakeClusterReconciler) reconcileWorkerDeployment(ctx context.Contex
 		return nil
 	}
 
-	// Scale-down detection: orchestrate data migration before reducing replicas
+	// Scale-down detection: patch replicas first to let K8s select pods for termination,
+	// then reconcileTerminatingWorkers will handle drain jobs for the terminating pods.
 	if *desired.Spec.Replicas < *existing.Spec.Replicas {
+		logger := log.FromContext(ctx)
 		terminateCount := int(*existing.Spec.Replicas - *desired.Spec.Replicas)
-		if err := r.orchestrateWorkerScaleDown(ctx, mc, terminateCount); err != nil {
-			r.Recorder.Event(mc, corev1.EventTypeWarning, "WorkerMigrationError",
-				fmt.Sprintf("Worker data migration failed: %v", err))
-		}
+		logger.Info("worker scale-down detected, K8s will terminate pods and operator will drain data",
+			"fromReplicas", *existing.Spec.Replicas,
+			"toReplicas", *desired.Spec.Replicas,
+			"terminateCount", terminateCount)
 	}
 
 	patchBase := client.MergeFrom(existing.DeepCopy())
@@ -609,102 +611,6 @@ func envVarsEqual(a, b []corev1.EnvVar) bool {
 		}
 	}
 	return true
-}
-
-func (r *MooncakeClusterReconciler) orchestrateWorkerScaleDown(
-	ctx context.Context,
-	mc *mooncakev1alpha1.MooncakeCluster,
-	terminateCount int,
-) error {
-	logger := log.FromContext(ctx)
-	logger.Info("worker scale-down detected, draining data before termination",
-		"terminateCount", terminateCount)
-
-	// List all worker pods, sorted by creation timestamp descending (newest first)
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods,
-		client.InNamespace(mc.Namespace),
-		client.MatchingLabels{"app": "mooncake-worker", "cluster": mc.Name},
-	); err != nil {
-		return fmt.Errorf("listing worker pods: %w", err)
-	}
-
-	sort.Slice(pods.Items, func(i, j int) bool {
-		return pods.Items[i].CreationTimestamp.After(pods.Items[j].CreationTimestamp.Time)
-	})
-
-	if len(pods.Items) < terminateCount {
-		return fmt.Errorf("not enough worker pods: need %d, have %d", terminateCount, len(pods.Items))
-	}
-
-	terminatingPods := pods.Items[:terminateCount]
-	logger.Info("terminating worker pods", "count", len(terminatingPods))
-	// Build master HTTP address pointing to the leader master pod
-	masterAddr := getMasterAddr(mc)
-
-	// Read migration config from CRD
-	maxConcurrency := int32(4)
-	bandwidthMBPS := int32(0)
-	timeoutSeconds := int32(300)
-	if mc.Spec.Workers.Migration != nil {
-		if mc.Spec.Workers.Migration.MaxConcurrency > 0 {
-			maxConcurrency = mc.Spec.Workers.Migration.MaxConcurrency
-		}
-		if mc.Spec.Workers.Migration.TimeoutSeconds > 0 {
-			timeoutSeconds = mc.Spec.Workers.Migration.TimeoutSeconds
-		}
-		bandwidthMBPS = mc.Spec.Workers.Migration.BandwidthMBPS
-	}
-
-	transferPort := mc.Spec.Workers.TransferPort
-	if transferPort == 0 {
-		transferPort = 13006
-	}
-
-	// Create drain jobs concurrently
-	type jobResult struct {
-		podName string
-		podIP   string
-		jobID   string
-		err     error
-	}
-
-	var wg sync.WaitGroup
-	results := make(chan jobResult, len(terminatingPods))
-
-	for _, pod := range terminatingPods {
-		pod := pod
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			jobID, err := r.drainWorker(ctx, masterAddr, pod.Status.PodIP, transferPort, maxConcurrency, bandwidthMBPS)
-			results <- jobResult{podName: pod.Name, podIP: pod.Status.PodIP, jobID: jobID, err: err}
-		}()
-	}
-
-	wg.Wait()
-	close(results)
-
-	var jobIDs []string
-	for result := range results {
-		if result.err != nil {
-			logger.Error(result.err, "drain job creation failed", "pod", result.podName)
-			r.Recorder.Event(mc, corev1.EventTypeWarning, "DrainJobCreationFailed",
-				fmt.Sprintf("drain job failed for pod %s (IP: %s): %v", result.podName, result.podIP, result.err))
-			continue
-		}
-		jobIDs = append(jobIDs, result.jobID)
-		logger.Info("drain job created", "pod", result.podName, "jobID", result.jobID)
-		r.Recorder.Event(mc, corev1.EventTypeNormal, "DrainJobCreated",
-			fmt.Sprintf("drain job %s created for pod %s", result.jobID, result.podName))
-	}
-
-	if len(jobIDs) == 0 {
-		return fmt.Errorf("all drain job creations failed")
-	}
-
-	// Wait for all drain jobs to complete
-	return r.waitDrainJobs(ctx, masterAddr, jobIDs, time.Duration(timeoutSeconds)*time.Second)
 }
 
 // drainWorker creates a drain job on the master for a single worker.

@@ -567,7 +567,11 @@ async function handleApiRequest(req, res) {
   // Helper: parse data size string (e.g. "1MB", "512KB", "2GiB") to bytes
   function parseDataSize(str) {
     if (!str || typeof str !== 'string') return null
-    const s = str.trim().toUpperCase()
+    // Normalize: KiB → KIB, MiB → MIB, GiB → GIB, TiB → TIB
+    let s = str.trim()
+    s = s.replace(/([KMGTP])i$/i, '$1IB')
+    s = s.replace(/([KMGTP])i([bB])/i, '$1I$2')
+    s = s.toUpperCase()
     const m = s.match(/^(\d+(?:\.\d+)?)\s*(?:B)?\s*(KB|MB|GB|TB|KIB|MIB|GIB|TIB|K|M|G|T)?$/)
     if (!m) return null
     const val = parseFloat(m[1])
@@ -644,9 +648,10 @@ repeat_count = int(os.environ['TEST_REPEAT_COUNT'])
 key_prefix = os.environ.get('TEST_KEY_PREFIX', 'mooncake-test-')
 
 hostname = os.environ['POD_IP']
+rdma_devices = os.environ.get('MC_RDMA_DEVICES', '')
 
 store = MooncakeDistributedStore()
-retcode = store.setup(hostname, metadata_server, segment_size, local_buffer_size, protocol, "", master_addr)
+retcode = store.setup(hostname, metadata_server, segment_size, local_buffer_size, protocol, rdma_devices, master_addr)
 if retcode != 0:
     print(f"FATAL: store.setup returned {retcode}", flush=True)
     sys.exit(1)
@@ -721,6 +726,7 @@ PYEOF`
       // When RDMA is enabled, grant the test pod privileged access to /dev/infiniband
       if (rdmaEnabled) {
         testContainer.securityContext = { privileged: true }
+        testContainer.env.push({ name: 'MC_RDMA_DEVICES', value: 'rxe-eth0' })
         podSpec.volumes = [{
           name: 'rdma-dev',
           volumeSource: { hostPath: { path: '/dev/infiniband', type: 'DirectoryOrCreate' } },
@@ -864,7 +870,10 @@ PYEOF`
       // Parse data size helpers (reuse from test logic)
       function parseDataSize(str) {
         if (!str || typeof str !== 'string') return null
-        const s = str.trim().toUpperCase()
+        let s = str.trim()
+        s = s.replace(/([KMGTP])i$/i, '$1IB')
+        s = s.replace(/([KMGTP])i([bB])/i, '$1I$2')
+        s = s.toUpperCase()
         const m = s.match(/^(\d+(?:\.\d+)?)\s*(?:B)?\s*(KB|MB|GB|TB|KIB|MIB|GIB|TIB|K|M|G|T)?$/)
         if (!m) return null
         const val = parseFloat(m[1])
