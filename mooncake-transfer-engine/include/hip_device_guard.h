@@ -20,16 +20,14 @@
 
 namespace mooncake {
 
-// RAII guard that restores the calling thread's active HIP device on scope
-// exit. Functions that switch the device with hipSetDevice() (e.g. to pin a
-// transfer to the source GPU) would otherwise leave the caller pinned to the
-// wrong GPU, breaking its next kernel launch with hipErrorInvalidDevice.
+// RAII: saves the active HIP device and restores it on scope exit, so a
+// function that calls hipSetDevice() doesn't leave the caller on the wrong GPU
+// (which would fail its next kernel launch with hipErrorInvalidDevice).
 class HipDeviceGuard {
    public:
-    // Save the current device; the caller switches devices afterwards.
     HipDeviceGuard() { saved_ = (hipGetDevice(&prev_device_) == hipSuccess); }
 
-    // Save the current device and switch to target_device.
+    // Also switch to target_device; set_ok() reports whether that succeeded.
     explicit HipDeviceGuard(int target_device) : HipDeviceGuard() {
         set_ok_ = (hipSetDevice(target_device) == hipSuccess);
     }
@@ -38,7 +36,6 @@ class HipDeviceGuard {
         if (saved_) (void)hipSetDevice(prev_device_);
     }
 
-    // Whether the target device passed to the constructor was set successfully.
     bool set_ok() const { return set_ok_; }
 
     HipDeviceGuard(const HipDeviceGuard&) = delete;

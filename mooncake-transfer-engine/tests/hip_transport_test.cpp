@@ -90,7 +90,7 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     TransferRequest entry;
     entry.opcode = TransferRequest::WRITE;
     entry.length = kLen;
-    entry.source = src;  // on kSourceDevice
+    entry.source = src;
     entry.target_id = segment_id;
     entry.target_offset = reinterpret_cast<uint64_t>(dst);
     Status s = engine->submitTransfer(batch_id, {entry});
@@ -111,7 +111,6 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     } while (status.s == TransferStatusEnum::WAITING);
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 
-    // Still restored after completion polling.
     int active_after_wait = -1;
     ASSERT_EQ(cudaGetDevice(&active_after_wait), cudaSuccess);
     EXPECT_EQ(active_after_wait, kCallerDevice);

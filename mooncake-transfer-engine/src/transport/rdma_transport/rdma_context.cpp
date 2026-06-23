@@ -463,8 +463,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (hipAttr.type == hipMemoryTypeDevice) {
-        // Device memory + kernel support — export dmabuf fd and register.
-        // Pin to the owning device for the duration of the export calls.
+        // Pin to the owning device while exporting the dmabuf fd.
         HipDeviceGuard dev_guard(hipAttr.device);
         if (!dev_guard.set_ok()) {
             LOG(ERROR) << "Failed to set HIP device to " << hipAttr.device

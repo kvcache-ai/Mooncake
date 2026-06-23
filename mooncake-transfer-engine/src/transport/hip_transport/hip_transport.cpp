@@ -252,8 +252,7 @@ static int setDeviceContext(void* source_ptr, int& device_id) {
 }
 
 static void setupP2PAccess(int num_devices) {
-    // The loop below switches the active device per iteration; the guard
-    // restores the caller's device on return so this is transparent to it.
+    // The loop switches devices; the guard restores the caller's on return.
     HipDeviceGuard device_guard;
 
     auto clearStickyPeerAccessError = [](int src_device, int dst_device) {
