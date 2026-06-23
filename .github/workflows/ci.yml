@@ -860,6 +860,18 @@ jobs:
     uses: ./.github/workflows/ci_cu13.yml
     secrets: inherit
 
+  build-wheel-efa:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    uses: ./.github/workflows/ci_efa.yml
+    secrets: inherit
+
   ascend-test:
     needs: [build, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
@@ -885,6 +897,7 @@ jobs:
       - build-docker
       - test-wheel-ubuntu
       - build-wheel-cu13
+      - build-wheel-efa
       - ascend-test
       - integration-test
     runs-on: ubuntu-latest

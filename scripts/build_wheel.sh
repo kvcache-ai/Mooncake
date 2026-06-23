@@ -154,7 +154,7 @@ echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_NON_CUDA_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -164,6 +164,15 @@ done
 if [ "$BUILD_VARIANT_COUNT" -gt 1 ]; then
     echo "Error: only one of $BUILD_VARIANTS can be set"
     exit 1
+fi
+
+# If a previous run was interrupted before the trailing restore (line ~481),
+# pyproject.toml is left in a renamed state and pyproject.toml.backup holds the
+# pristine original. Restore it first so the variant rename below always starts
+# from the clean file and the backup is never overwritten with modified content.
+if [ -f pyproject.toml.backup ]; then
+    echo "Restoring pyproject.toml from leftover backup of a previous run"
+    mv pyproject.toml.backup pyproject.toml
 fi
 
 # Handle package name modification for release build variants
@@ -194,6 +203,24 @@ elif [ "$NPU_BUILD" = "1" ]; then
     sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Ascend NPU version)"/' pyproject.toml
     sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "ascend", "npu"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-npu"
+elif [ "$EFA_BUILD" = "1" ]; then
+    echo "Modifying package name for AWS EFA build (CUDA)"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (AWS EFA, CUDA version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "aws", "efa", "libfabric", "cuda"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-efa"
+elif [ "$EFA_NON_CUDA_BUILD" = "1" ]; then
+    echo "Modifying package name for AWS EFA build (non-CUDA)"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-non-cuda"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (AWS EFA, Non-CUDA version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "aws", "efa", "libfabric", "non-cuda"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-efa-non-cuda"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
