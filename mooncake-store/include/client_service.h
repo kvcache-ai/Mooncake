@@ -647,6 +647,12 @@ class Client {
         return admission_sketch_->increment(key) >= admission_threshold_;
     }
 
+    // Register a cleanup callback invoked by RemoveAll after master metadata
+    // and local storage files have been cleaned (e.g. SSD offload files).
+    void SetRemoveAllCleanup(std::function<void()> callback) {
+        on_remove_all_cleanup_ = std::move(callback);
+    }
+
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
    protected:
