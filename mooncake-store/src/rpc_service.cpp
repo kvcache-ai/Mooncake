@@ -1054,6 +1054,73 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
+WrappedMasterService::ListTenantQuotaSnapshots() {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.ListTenantQuotaSnapshots();
+}
+
+tl::expected<TenantQuotaSnapshot, ErrorCode>
+WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    auto snapshot = master_service_.GetTenantQuotaSnapshot(tenant_id);
+    if (!snapshot.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return snapshot.value();
+}
+
+tl::expected<TenantQuotaSnapshot, ErrorCode>
+WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
+                                              uint64_t requested_quota_bytes) {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.UpsertTenantQuotaPolicy(tenant_id,
+                                                   requested_quota_bytes);
+}
+
+tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    auto before = master_service_.GetTenantQuotaSnapshot(tenant_id);
+    if (!before.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return master_service_.DeleteTenantQuotaPolicy(tenant_id);
+}
+
+tl::expected<uint64_t, ErrorCode>
+WrappedMasterService::GetDefaultTenantQuotaPolicy() {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.GetDefaultTenantQuotaPolicy();
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::SetDefaultTenantQuotaPolicy(
+    uint64_t requested_quota_bytes) {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    master_service_.SetDefaultTenantQuotaPolicy(requested_quota_bytes);
+    return {};
+}
+
+tl::expected<uint64_t, ErrorCode>
+WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.GetTenantQuotaAllocatableCapacityBytes();
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     // Compatibility endpoint: /get_all_keys historically listed only the

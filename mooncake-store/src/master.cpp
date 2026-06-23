@@ -204,7 +204,8 @@ DEFINE_uint64(
 DEFINE_bool(enable_tenant_quota, false,
             "Enable per-tenant memory quota admission");
 DEFINE_uint64(default_tenant_quota_bytes, 0,
-              "Default per-tenant memory quota in bytes (0 = unlimited)");
+              "Default requested per-tenant memory quota in bytes "
+              "(0 is allowed; inherited tenants share remaining capacity)");
 DEFINE_uint64(tenant_quota_pool_capacity_bytes, 0,
               "Capacity used to compute effective tenant quotas "
               "(0 = mounted memory capacity)");
