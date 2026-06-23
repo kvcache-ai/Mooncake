@@ -89,8 +89,7 @@ void RdmaEndPoint::addPendingTokens(
 }
 
 void RdmaEndPoint::removePendingTokens(
-    const std::vector<CompletionToken *> &tokens, size_t start,
-    size_t count) {
+    const std::vector<CompletionToken *> &tokens, size_t start, size_t count) {
     std::lock_guard<std::mutex> guard(pending_slices_mutex_);
     for (size_t i = 0; i < count; ++i) {
         pending_tokens_.erase(tokens[start + i]);
@@ -350,10 +349,9 @@ bool RdmaEndPoint::finishDestroy() {
             }
         }
         if (has_outstanding) {
-            double elapsed =
-                (getCurrentTimeInNano() -
-                 inactive_time_.load(std::memory_order_acquire)) /
-                1e9;
+            double elapsed = (getCurrentTimeInNano() -
+                              inactive_time_.load(std::memory_order_acquire)) /
+                             1e9;
             if (!needs_manual_completion_ &&
                 elapsed < kFinishDestroyTimeoutSec) {
                 return false;
@@ -365,8 +363,7 @@ bool RdmaEndPoint::finishDestroy() {
                     << "Completing " << pending_tokens.size()
                     << " pending RDMA slices as failed during endpoint destroy"
                     << " (elapsed=" << elapsed
-                    << "s, manual_required=" << needs_manual_completion_
-                    << ")";
+                    << "s, manual_required=" << needs_manual_completion_ << ")";
                 completePendingSlicesAsFailed(pending_tokens);
             }
         }
@@ -423,7 +420,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
         // from the same endpoint.
         Status expected = UNCONNECTED;
         if (status_.compare_exchange_strong(expected, CONNECTING,
-                                             std::memory_order_relaxed)) {
+                                            std::memory_order_relaxed)) {
             do_rpc = true;
 
             peer_server_name = getServerNameFromNicPath(peer_nic_path_);
@@ -512,11 +509,11 @@ int RdmaEndPoint::setupConnectionsByActive() {
             RWSpinlock::WriteGuard guard(lock_);
 
             if (!verifyHandshakeVersion(peer_desc.handshake_version)) {
-                LOG(WARNING) << "Rejecting stale handshake response from "
-                             << peer_nic_path_ << ", current_version="
-                             << handshake_version_.load(std::memory_order_relaxed)
-                             << ", response_version="
-                             << peer_desc.handshake_version;
+                LOG(WARNING)
+                    << "Rejecting stale handshake response from "
+                    << peer_nic_path_ << ", current_version="
+                    << handshake_version_.load(std::memory_order_relaxed)
+                    << ", response_version=" << peer_desc.handshake_version;
                 resetConnection("stale active handshake response");
                 return ERR_REJECT_HANDSHAKE;
             }
@@ -532,16 +529,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
             if (!validateHandshakeTimestamp(peer_desc.timestamp)) {
                 LOG(WARNING) << "Rejecting invalid or stale handshake response "
                              << "timestamp=" << peer_desc.timestamp
-                             << ", request_timestamp="
-                             << local_desc.timestamp;
+                             << ", request_timestamp=" << local_desc.timestamp;
                 resetConnection("invalid active handshake timestamp");
                 return ERR_REJECT_HANDSHAKE;
             }
 
-            if (peer_desc.flags &
-                HandShakeDesc::FLAG_PEER_RESTART_DETECTED) {
-                LOG(WARNING) << "Peer reported restart detection for "
-                             << peer_nic_path_;
+            if (peer_desc.flags & HandShakeDesc::FLAG_PEER_RESTART_DETECTED) {
+                LOG(WARNING)
+                    << "Peer reported restart detection for " << peer_nic_path_;
                 resetConnection("peer restart flag in handshake response");
                 return ERR_REJECT_HANDSHAKE;
             }
@@ -706,8 +701,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         if (we_win) {
             local_desc.reply_msg =
                 "Simultaneous handshake rejected by deterministic ordering";
-            LOG(INFO) << local_desc.reply_msg << ": local="
-                      << context_.nicPath()
+            LOG(INFO) << local_desc.reply_msg
+                      << ": local=" << context_.nicPath()
                       << ", peer=" << peer_desc.local_nic_path;
             return ERR_REJECT_HANDSHAKE;
         }
@@ -715,8 +710,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     } else if (current_status != UNCONNECTED) {
         local_desc.reply_msg =
             "Endpoint is not available for passive handshake";
-        LOG(WARNING) << local_desc.reply_msg << ": status="
-                     << current_status;
+        LOG(WARNING) << local_desc.reply_msg << ": status=" << current_status;
         return ERR_REJECT_HANDSHAKE;
     }
 

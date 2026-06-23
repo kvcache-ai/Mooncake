@@ -31,8 +31,7 @@ namespace mooncake {
 
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
 
-static void deleteFallbackCompletedToken(
-    RdmaEndPoint::CompletionToken *token) {
+static void deleteFallbackCompletedToken(RdmaEndPoint::CompletionToken *token) {
     while (!token->fallback_completed.load(std::memory_order_acquire)) {
         PAUSE();
     }
@@ -354,7 +353,8 @@ void WorkerPool::performPollCq(int thread_id) {
             assert(token);
             tokens[i] = token;
 
-            auto *endpoint_ptr = token->endpoint.load(std::memory_order_acquire);
+            auto *endpoint_ptr =
+                token->endpoint.load(std::memory_order_acquire);
             if (!endpoint_ptr) {
                 deleteFallbackCompletedToken(token);
                 tokens[i] = nullptr;

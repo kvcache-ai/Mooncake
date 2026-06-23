@@ -79,8 +79,7 @@ struct TransferHandshakeUtil {
         root["reply_msg"] = desc.reply_msg;
         root["handshake_version"] =
             static_cast<Json::UInt64>(desc.handshake_version);
-        root["handshake_timestamp"] =
-            static_cast<Json::UInt64>(desc.timestamp);
+        root["handshake_timestamp"] = static_cast<Json::UInt64>(desc.timestamp);
         root["handshake_flags"] = desc.flags;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
