@@ -798,8 +798,9 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
                 task, /*allow_over_capacity_for_pulled_task=*/
                 config_.promotion_queue_capacity > 0);
             if (!enqueued) {
-                LOG(WARNING) << "Failed to enqueue promotion task for key="
-                             << task.key << "; releasing master slot";
+                LOG(WARNING)
+                    << "Failed to enqueue promotion task for key=" << task.key
+                    << "; releasing master slot";
                 ReleasePromotionTask(task.key, task.tenant_id);
                 continue;
             }
