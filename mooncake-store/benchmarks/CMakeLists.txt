@@ -33,6 +33,10 @@ target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
 
+# Add CountMinSketch benchmark (header-only, no store dependency)
+add_executable(count_min_sketch_bench count_min_sketch_bench.cpp)
+target_link_libraries(count_min_sketch_bench PRIVATE pthread)
+
 # Add NoF worker pool benchmark executable
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
