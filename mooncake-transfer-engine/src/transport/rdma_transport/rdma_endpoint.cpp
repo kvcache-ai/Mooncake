@@ -914,8 +914,15 @@ int RdmaEndPoint::submitPostSend(
     if (slice_list.empty()) return 0;
     const size_t requested = slice_list.size();
     int cq_remaining = int(globalConfig().max_cqe) - *cq_outstanding_;
-    std::vector<ibv_send_wr> wr_list(requested, ibv_send_wr{});
-    std::vector<ibv_sge> sge_list(requested);
+    if (cq_remaining <= 0) return 0;
+
+    // Only allocate for the max number of WRs we can actually post per QP,
+    // not the entire requested slice count. Each QP iteration reuses the
+    // wr_list/sge_list from index 0, so we only need max_wr_depth_ entries.
+    size_t max_postable_per_qp =
+        std::min({(size_t)max_wr_depth_, (size_t)cq_remaining, requested});
+    std::vector<ibv_send_wr> wr_list(max_postable_per_qp, ibv_send_wr{});
+    std::vector<ibv_sge> sge_list(max_postable_per_qp);
     size_t total_posted = 0;
     size_t cursor = 0;
 

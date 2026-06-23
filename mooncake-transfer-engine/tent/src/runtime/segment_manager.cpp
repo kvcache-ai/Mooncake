@@ -64,7 +64,8 @@ Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
     auto &cache = tl_remote_cache_.get();
     auto current_ts = getCurrentTimeInNano();
     auto current_version = version_.load(std::memory_order_relaxed);
-    if (current_ts - cache.last_refresh > ttl_ms_ * 1000000 ||
+    if (current_ts - cache.last_refresh >
+            static_cast<uint64_t>(TENT_SEGMENT_DESC_TTL_MS) * 1000000 ||
         cache.version != current_version) {
         cache.id_to_desc_map.clear();
         cache.last_refresh = current_ts;
@@ -97,11 +98,16 @@ Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
 }
 
 Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (!id_to_name_map_.count(handle)) {
-        return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
+    // Only the id_to_name lookup needs the lock.
+    std::string segment_name;
+    {
+        RWSpinlock::ReadGuard guard(lock_);
+        auto it = id_to_name_map_.find(handle);
+        if (it == id_to_name_map_.end()) {
+            return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
+        }
+        segment_name = it->second;
     }
-    auto segment_name = id_to_name_map_[handle];
     if (segment_name.starts_with(kLocalFileSegmentPrefix)) {
         CHECK_STATUS(makeFileRemote(desc, segment_name));
     } else {
@@ -169,7 +175,26 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
     return Status::OK();
 }
 
+std::shared_ptr<const std::string> SegmentManager::getLocalDumpedJson() {
+    {
+        std::lock_guard<std::mutex> g(local_json_cache_mu_);
+        if (local_json_cache_) return local_json_cache_;
+    }
+    json j = *local_desc_;
+    auto computed = std::make_shared<const std::string>(j.dump());
+
+    std::lock_guard<std::mutex> g(local_json_cache_mu_);
+    if (!local_json_cache_) {
+        local_json_cache_ = computed;
+    }
+    return local_json_cache_;
+}
+
 Status SegmentManager::synchronizeLocal() {
+    {
+        std::lock_guard<std::mutex> g(local_json_cache_mu_);
+        local_json_cache_.reset();
+    }
     CHECK_STATUS(registry_->putSegmentDesc(local_desc_));
 
     std::vector<std::string> subscribers_snapshot;

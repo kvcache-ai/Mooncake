@@ -16,15 +16,6 @@ jobs:
     if: github.event_name == 'issues'
     runs-on: ubuntu-latest
     steps:
-      - name: Assign issue to reporter
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh issue edit "${{ github.event.issue.number }}" \
-            --repo "${{ github.repository }}" \
-            --add-assignee "${{ github.event.issue.user.login }}" \
-            2>/dev/null || echo "Could not assign (reporter may not be a collaborator)."
-
       - name: Post welcome comment
         uses: actions/github-script@v7
         with:

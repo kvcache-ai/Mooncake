@@ -16,7 +16,7 @@ jobs:
       max-parallel: 2
       matrix:
         arch: [aarch64, x86_64]
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
         include:
           - arch: aarch64
             runner: ubuntu-22.04-arm

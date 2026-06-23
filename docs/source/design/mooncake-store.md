@@ -10,6 +10,7 @@ Mooncake Store provides low-level object storage and management capabilities, in
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
+- **Optional object grouping**: Related objects can carry an optional group ID so that the Master can route their metadata to the same shard and apply best-effort shared lifecycle behavior.
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
 - **Strong consistency**: Mooncake Store guarantees that `Get` operations always return correct and complete data. Once an object has been successfully `Put`, it remains immutable until removal, ensuring that all subsequent `Get` requests retrieve the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
@@ -89,6 +90,36 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 > **Warning: Managed Storage**
 >
 > The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
+
+### Tenant Quota
+
+The Master Service can optionally enforce memory quota admission per tenant. This feature is disabled by default. When `enable_tenant_quota=false`, existing allocation and eviction behavior is preserved, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
+
+When tenant quota is enabled, each tenant has a requested quota policy and an effective quota. Explicit tenant policies are set through the master admin HTTP API. Tenants without an explicit policy inherit the default requested quota. The default policy may be `0`; explicit tenant policies must be positive.
+
+Effective quota is recomputed from the current registered memory capacity and the optional tenant quota pool cap:
+
+- The allocatable capacity is the smaller of total registered memory and `tenant_quota_pool_capacity_bytes`; a pool cap of `0` means total registered memory.
+- If explicit tenant requests fit within the allocatable capacity, explicit tenants receive their requested quotas and the remaining capacity is split evenly among active inherited-default tenants.
+- If explicit tenant requests exceed the allocatable capacity, only explicit tenants receive quota, scaled proportionally by request size. Inherited-default tenants receive `0` effective quota until capacity is available.
+- Remainders are assigned deterministically by tenant ID, so repeated recomputes produce stable results.
+
+`PutStart` and size-changing `UpsertStart` charge quota before memory is allocated. If the first reservation fails, the master performs tenant-scoped memory eviction for the target tenant and retries the reservation. The retry is bounded to two eviction attempts. Tenant quota eviction scans only the target tenant, skips hard-pinned objects, honors soft-pin eviction configuration, and preserves grouped-object lease safety checks.
+
+The admin HTTP API exposes:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/tenant_quotas` | List quota snapshots for active or explicit tenants |
+| `GET` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Query one tenant quota snapshot |
+| `PUT` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Upsert an explicit tenant quota policy |
+| `DELETE` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Delete an explicit tenant quota policy |
+| `GET` | `/api/v1/tenant_quotas/default` | Query the default requested quota policy |
+| `PUT` | `/api/v1/tenant_quotas/default` | Set the default requested quota policy |
+
+Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `over_quota`, and `has_explicit_policy`.
+
+When snapshots are enabled, tenant quota policies are written to a separate `tenant_quota_policy` snapshot object. This file stores only requested policy: the default requested quota and explicit tenant requested quotas. Effective quota, usage, reservations, and committed object charge are rebuilt from restored metadata and current capacity. Older snapshots without `tenant_quota_policy` remain valid and use the configured default quota on restore.
 
 ### Master Service APIs
 
@@ -425,6 +456,24 @@ tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 
 The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
 
+### Optional Object Groups
+
+Object groups are intended for workloads where one logical cache entry is split into multiple Mooncake Store objects, such as separate K/V tensors, parallel shards, or auxiliary index objects. Without grouping, these objects are managed independently, so lease refresh and memory eviction may affect different parts of the same logical entry at different times.
+
+Mooncake Store remains an object-oriented KV cache: objects are still put, queried, and removed by key. For workloads where one logical cache unit is represented by multiple physical objects, callers may attach optional group metadata through `ReplicateConfig::group_ids` during `Put`, `BatchPut`, `Upsert`, or `BatchUpsert`.
+
+For single-object writes, `group_ids` contains one entry. For batch writes, it must have the same length as the key list, and entry `i` is the group ID for key `i`. An empty string stores that key as ungrouped, and leaving the field unset preserves the legacy ungrouped behavior. For an existing object, group membership is immutable: `Upsert` may preserve the existing group, but it cannot move the object to another group or clear its group while the object exists.
+
+On the Master side, group state is tenant-scoped. Objects with a non-empty group ID are routed to the metadata shard selected by `hash(group_id)`, and the Master keeps a tenant-scoped object-to-group routing index so existing key-based APIs can still locate grouped objects. The Master tracks only the current member set of each group; it does not require an expected member count, a member index, or a commit protocol for group completeness.
+
+Group metadata affects lifecycle behavior on a best-effort basis:
+
+- `ExistKey` and `GetReplicaList` refresh the lease, and the soft-pin timeout if present, for the current members of the group.
+- Memory eviction expands a grouped candidate to the group's current members and then applies the existing per-object safety checks. Members with active leases, hard pins, soft pins when soft-pin eviction is disabled, incomplete writes, busy replicas, or unavailable replica states are skipped.
+- Object removal APIs, copy/move tasks, and NoF eviction keep their existing object-level semantics. Group routing and membership metadata are cleaned up when objects are removed.
+
+This design is intentionally lightweight and backward compatible. Grouping should be treated as a lifecycle hint for related objects, not as a transactional guarantee that all members are created, made visible, or evicted atomically.
+
 ## Buffer Allocator
 
 The buffer allocator serves as a low-level memory management component within the Mooncake Store system, primarily responsible for efficient memory allocation and deallocation. It builds upon underlying memory allocators to perform its functions.
@@ -568,9 +617,13 @@ When a `PutStart` request fails due to insufficient memory, or when the eviction
 
 Currently, an approximate LRU policy is adopted, where the least recently used objects are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
 
+For grouped objects, memory eviction resolves the current group membership and attempts to reclaim eligible members together.
+
 ## Lease
 
 To avoid data conflicts, a per-object lease is granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. While the lease is active, the object is protected from `Remove`, `RemoveAll`, and `Eviction` operations. Specifically, a `Remove` request targeting a leased object will fail, and a `RemoveAll` request will only delete objects without an active lease. This ensures that the object’s data can be safely read as long as the lease has not expired.
+
+For grouped objects, a successful `ExistKey` or `GetReplicaList` refreshes the lease for the current members of the group, so recently accessed members are less likely to be separated by memory eviction.
 
 However, if the lease expires before a `Get` operation finishes reading the data, the operation will be considered failed, and no data will be returned, in order to prevent potential data corruption.
 

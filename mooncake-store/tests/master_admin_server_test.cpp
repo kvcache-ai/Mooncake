@@ -12,6 +12,7 @@
 #include <ylt/struct_json/json_writer.h>
 
 #include "ha/ha_types.h"
+#include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -114,6 +115,21 @@ class MasterAdminServerTest : public ::testing::Test {
         coro_http::coro_http_client client;
         auto result = client.post(BaseUrl(port) + path, body,
                                   coro_http::req_content_type::json);
+        return {result.status, std::string(result.resp_body)};
+    }
+
+    HttpResponse HttpPutJson(int port, const std::string& path,
+                             const std::string& body) {
+        coro_http::coro_http_client client;
+        auto result = async_simple::coro::syncAwait(client.async_put(
+            BaseUrl(port) + path, body, coro_http::req_content_type::json));
+        return {result.status, std::string(result.resp_body)};
+    }
+
+    HttpResponse HttpDelete(int port, const std::string& path) {
+        coro_http::coro_http_client client;
+        auto result = async_simple::coro::syncAwait(client.async_delete(
+            BaseUrl(port) + path, "", coro_http::req_content_type::json));
         return {result.status, std::string(result.resp_body)};
     }
 };
@@ -439,6 +455,10 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(seg_status.http_status, 503);
     EXPECT_NE(seg_status.body.find(unavailable_msg), std::string::npos);
 
+    auto tenant_quotas = HttpGet(port, "/api/v1/tenant_quotas");
+    EXPECT_EQ(tenant_quotas.http_status, 503);
+    EXPECT_NE(tenant_quotas.body.find(unavailable_msg), std::string::npos);
+
     auto drain_create = HttpPostJson(port, "/api/v1/drain_jobs", "{}");
     EXPECT_EQ(drain_create.http_status, 503);
 
@@ -452,6 +472,132 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     auto drain_cancel = HttpPostJson(
         port, "/api/v1/drain_jobs/cancel?job_id=" + valid_uuid, "");
     EXPECT_EQ(drain_cancel.http_status, 503);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.enable_tenant_quota = true;
+    svc_config.default_tenant_quota_bytes = 1000;
+    svc_config.tenant_quota_pool_capacity_bytes = 2000;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "quota_admin_segment";
+    segment.base = 0x600000000;
+    segment.size = 2000;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto default_get = HttpGet(port, "/api/v1/tenant_quotas/default");
+    EXPECT_EQ(default_get.http_status, 200);
+    EXPECT_NE(default_get.body.find("\"requested_quota_bytes\":1000"),
+              std::string::npos);
+
+    auto default_put = HttpPutJson(port, "/api/v1/tenant_quotas/default",
+                                   "{\"requested_quota_bytes\":0}");
+    EXPECT_EQ(default_put.http_status, 200);
+    EXPECT_NE(default_put.body.find("\"requested_quota_bytes\":0"),
+              std::string::npos);
+
+    auto upsert = HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
+                              "{\"requested_quota_bytes\":800}");
+    EXPECT_EQ(upsert.http_status, 200);
+    EXPECT_NE(upsert.body.find("\"tenant_id\":\"tenant-a\""),
+              std::string::npos);
+    EXPECT_NE(upsert.body.find("\"requested_quota_bytes\":800"),
+              std::string::npos);
+    EXPECT_NE(upsert.body.find("\"effective_quota_bytes\":800"),
+              std::string::npos);
+    EXPECT_NE(upsert.body.find("\"has_explicit_policy\":true"),
+              std::string::npos);
+
+    auto list = HttpGet(port, "/api/v1/tenant_quotas");
+    EXPECT_EQ(list.http_status, 200);
+    EXPECT_NE(list.body.find("\"tenant_id\":\"tenant-a\""), std::string::npos);
+
+    auto one = HttpGet(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
+    EXPECT_EQ(one.http_status, 200);
+    EXPECT_NE(one.body.find("\"committed_count\":0"), std::string::npos);
+    EXPECT_NE(one.body.find("\"over_quota\":false"), std::string::npos);
+
+    auto deleted = HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
+    EXPECT_EQ(deleted.http_status, 200);
+
+    auto missing = HttpGet(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
+    EXPECT_EQ(missing.http_status, 404);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.enable_tenant_quota = true;
+    svc_config.default_tenant_quota_bytes = 1000;
+    svc_config.tenant_quota_pool_capacity_bytes = 1000;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto missing_tenant = HttpPutJson(port, "/api/v1/tenant_quotas",
+                                      "{\"requested_quota_bytes\":100}");
+    EXPECT_EQ(missing_tenant.http_status, 400);
+
+    auto empty_tenant = HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=",
+                                    "{\"requested_quota_bytes\":100}");
+    EXPECT_EQ(empty_tenant.http_status, 400);
+
+    auto zero_explicit =
+        HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
+                    "{\"requested_quota_bytes\":0}");
+    EXPECT_EQ(zero_explicit.http_status, 400);
+
+    auto reserved_tenant =
+        HttpGet(port, "/api/v1/tenant_quotas?tenant_id=_system");
+    EXPECT_EQ(reserved_tenant.http_status, 400);
+
+    auto missing_query =
+        HttpGet(port, "/api/v1/tenant_quotas?tenant_id=missing");
+    EXPECT_EQ(missing_query.http_status, 404);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, TenantQuotaAdminDisabledModeReturns409) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.enable_tenant_quota = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto list = HttpGet(port, "/api/v1/tenant_quotas");
+    EXPECT_EQ(list.http_status, 409);
+    EXPECT_NE(list.body.find("UNAVAILABLE_IN_CURRENT_MODE"), std::string::npos);
 
     admin.Stop();
 }
