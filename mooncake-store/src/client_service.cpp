@@ -798,7 +798,7 @@ ErrorCode Client::InitTransferEngine(
             try {
                 transport = transfer_engine_->installTransport("cxi", nullptr);
             } catch (std::exception& e) {
-                LOG(ERROR) << "cxl_transport_install_failed error_message=\""
+                LOG(ERROR) << "cxi_transport_install_failed error_message=\""
                            << e.what() << "\"";
             }
         } else if (protocol == "ub") {

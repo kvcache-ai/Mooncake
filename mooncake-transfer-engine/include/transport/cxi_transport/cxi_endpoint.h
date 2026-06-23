@@ -51,13 +51,13 @@ struct CxiOpContext {
 // Per-peer handle in the shared-endpoint SRD model.
 //
 // This class does NOT own an fid_ep.  A single `shared_ep_` on the owning
-// EfaContext services every peer; each EfaEndPoint just carries one
+// CxiTransport services every peer; each CxiEndpoint just carries one
 // fi_addr_t (AV index) plus the handshake state needed to populate it.
 //
 // Lifecycle:
 //   1. construct()            : trivial; no libfabric resources allocated.
 //   2. setupConnectionsByActive(peer): handshake -> fi_av_insert -> CONNECTED.
-//   3. submitPostSend()       : delegates to EfaContext::submitSlicesOnPeer.
+//   3. submitPostSend()       : delegates to CxiTransport::submitSlicesOnPeer.
 //   4. disconnect() / dtor    : fi_av_remove(peer_fi_addr_).
 class CxiEndpoint {
    public:
@@ -92,10 +92,10 @@ class CxiEndpoint {
 
     void disconnect();
 
-    // Called during EfaContext teardown: forget the AV slot WITHOUT calling
+    // Called during CxiTransport teardown: forget the AV slot WITHOUT calling
     // fi_av_remove().  The AV itself is about to be closed, which invalidates
     // every slot in one shot; calling fi_av_remove after the shared endpoint
-    // has been closed trips an assertion inside the EFA provider.
+    // has been closed trips an assertion inside the CXI provider.
     void markDetachedForTeardown();
 
    private:
@@ -106,7 +106,7 @@ class CxiEndpoint {
 
     // Submit a batch of slices bound for this peer.  Internally establishes
     // the connection if needed, then delegates to
-    // EfaContext::submitSlicesOnPeer using this peer's fi_addr_t.
+    // CxiTransport::submitSlicesOnPeer using this peer's fi_addr_t.
     int submitPostSend(std::vector<Transport::Slice*>& slice_list,
                        std::vector<Transport::Slice*>& failed_slice_list);
 

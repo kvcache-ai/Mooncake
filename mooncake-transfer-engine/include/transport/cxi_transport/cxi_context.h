@@ -91,7 +91,7 @@ class CxiContext {
    public:
     // Get or create a per-peer handle.  Does NOT open an fid_ep or call
     // fi_enable — the shared endpoint was created once at construct() time.
-    // The returned EfaEndPoint only carries {peer_fi_addr_t, status, mutex}
+    // The returned CxiEndpoint only carries {peer_fi_addr_t, status, mutex}
     // and, when connected, routes sends through this context's shared_ep_.
     std::shared_ptr<CxiEndpoint> endpoint(const std::string& peer_nic_path);
 
@@ -117,7 +117,7 @@ class CxiContext {
     // Hot-path submit: post a batch of slices to `peer_fi_addr` via the
     // shared endpoint.  Handles WR / CQ reservation, MR descriptor prep,
     // and the fi_write / fi_read burst under post_lock_.  Called by
-    // EfaEndPoint::submitPostSend once the peer is connected.
+    // CxiEndpoint::submitPostSend once the peer is connected.
     int submitSlicesOnPeer(fi_addr_t peer_fi_addr,
                            std::vector<Transport::Slice*>& slice_list,
                            std::vector<Transport::Slice*>& failed_slice_list);
@@ -154,7 +154,7 @@ class CxiContext {
         return local_ep_addr_;
     }
 
-    // Insert a peer's hex-encoded EFA address into this context's AV and
+    // Insert a peer's hex-encoded CXI address into this context's AV and
     // return the resulting fi_addr_t.  Thread-safe (fi_av_insert is safe
     // under libfabric's domain-level threading).
     int insertPeerAddr(const std::string& peer_hex_addr, fi_addr_t& out);
@@ -213,4 +213,4 @@ class CxiContext {
 
 }  // namespace mooncake
 
-#endif  // Cxi_CONTEXT_H
+#endif  // CXI_CONTEXT_H

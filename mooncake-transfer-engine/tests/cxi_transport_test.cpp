@@ -88,7 +88,7 @@ class CXITransportTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    // Helper: create engine, install EFA transport, register memory
+    // Helper: create engine, install CXI transport, register memory
     struct EngineSetup {
         std::unique_ptr<TransferEngine> engine;
         Transport *xport;
@@ -104,7 +104,7 @@ class CXITransportTest : public ::testing::Test {
         s.buffer_size = buffer_size;
 
         s.engine = std::make_unique<TransferEngine>(false);
-        // Manually discover topology to populate EFA device list
+        // Manually discover topology to populate CXI device list
         // (same pattern as the Python binding in transfer_engine_py.cpp)
         s.engine->getLocalTopology()->discover({});
         auto hp = parseHostNameWithPort(local_server_name_);
@@ -146,7 +146,7 @@ class CXITransportTest : public ::testing::Test {
         s.buffer_size = buffer_size;
 
         s.engine = std::make_unique<TransferEngine>(false);
-        // Manually discover topology to populate EFA device list
+        // Manually discover topology to populate CXI device list
         // (same pattern as the Python binding in transfer_engine_py.cpp)
         s.engine->getLocalTopology()->discover({});
         auto hp = parseHostNameWithPort(local_server_name_);
@@ -228,7 +228,7 @@ class CXITransportTest : public ::testing::Test {
     std::string local_server_name_;
 };
 
-// Test 1: Verify EFA transport can be installed
+// Test 1: Verify CXI transport can be installed
 TEST_F(CXITransportTest, InstallTransport) {
     auto engine = std::make_unique<TransferEngine>(false);
     engine->getLocalTopology()->discover({});
@@ -239,7 +239,7 @@ TEST_F(CXITransportTest, InstallTransport) {
 
     Transport *xport = engine->installTransport("cxi", nullptr);
     ASSERT_NE(xport, nullptr)
-        << "EFA transport should be installable on CXI hardware";
+        << "CXI transport should be installable on CXI hardware";
 }
 
 // Test 2: Basic loopback write
@@ -464,27 +464,26 @@ TEST_F(CXITransportTest, StressMultipleBatches) {
 
 // Test 6: warmupSegment on loopback peer
 //
-// Exercises EfaTransport::warmupSegment() which is the C++ entry point
-// behind the warmup_efa_segment() Python binding / warmupEfaSegment() C API.
+// Exercises CxiTransport::warmupSegment() which is the C++ entry point
+// behind the warmup_efa_segment() Python binding / warmupSegment() C API.
 // Loopback is enough to cover the handshake + fi_av_insert path AND the
 // idempotent short-circuit on the second call.
 TEST_F(CXITransportTest, WarmupSegmentLoopback) {
     auto setup = createEngine();
 
-    auto *efa = dynamic_cast<CxiTransport *>(setup.xport);
-    ASSERT_NE(efa, nullptr)
-        << "installTransport did not return an EfaTransport";
+    auto *cxi = dynamic_cast<CxiTransport *>(setup.xport);
+    ASSERT_NE(cxi, nullptr) << "installTransport did not return a CxiTransport";
 
     // First call: should connect every (local NIC x peer NIC) pair.
-    int rc = efa->warmupSegment(setup.engine->getLocalIpAndPort());
+    int rc = cxi->warmupSegment(setup.engine->getLocalIpAndPort());
     EXPECT_EQ(rc, 0) << "warmupSegment should succeed on loopback";
 
     // Second call: should short-circuit (all endpoints already connected).
-    rc = efa->warmupSegment(setup.engine->getLocalIpAndPort());
+    rc = cxi->warmupSegment(setup.engine->getLocalIpAndPort());
     EXPECT_EQ(rc, 0) << "warmupSegment should be idempotent";
 
     // Empty / self-name: short-circuit path returning 0 without touching AV.
-    rc = efa->warmupSegment("");
+    rc = cxi->warmupSegment("");
     EXPECT_EQ(rc, 0) << "warmupSegment(\"\") should be a no-op";
 
     destroyEngine(setup);
@@ -495,10 +494,10 @@ TEST_F(CXITransportTest, WarmupSegmentLoopback) {
 TEST_F(CXITransportTest, WarmupSegmentNotFound) {
     auto setup = createEngine();
 
-    auto *efa = dynamic_cast<CxiTransport *>(setup.xport);
-    ASSERT_NE(efa, nullptr);
+    auto *cxi = dynamic_cast<CxiTransport *>(setup.xport);
+    ASSERT_NE(cxi, nullptr);
 
-    int rc = efa->warmupSegment("127.0.0.1:1");  // not openSegment'd
+    int rc = cxi->warmupSegment("127.0.0.1:1");  // not openSegment'd
     EXPECT_NE(rc, 0) << "warmupSegment should fail for unknown segment";
 
     destroyEngine(setup);
@@ -538,7 +537,7 @@ TEST_F(CXITransportTest, RegisterMemoryBatch) {
 }
 
 // Test 9: Larger transfer (64 MB total split into 1 MB slices) to exercise
-// the WR / CQ pacing logic in EfaContext::submitSlicesOnPeer beyond what the
+// the WR / CQ pacing logic in CxiContext::submitSlicesOnPeer beyond what the
 // 16 x 64 KB MultiWrite test reaches.
 TEST_F(CXITransportTest, LargeTransfer) {
     const size_t kBufSize = 128ull << 20;  // 128 MB

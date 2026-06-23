@@ -171,4 +171,4 @@ class CxiTransport : public Transport {
 
 }  // namespace mooncake
 
-#endif  // Cxi_TRANSPORT_H_
+#endif  // CXI_TRANSPORT_H_

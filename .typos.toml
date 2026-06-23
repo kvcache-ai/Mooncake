@@ -1,5 +1,5 @@
 [default]
-extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa"]
+extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa", "HPE"]
 
 [default.extend-words]
 CANN = "CANN"

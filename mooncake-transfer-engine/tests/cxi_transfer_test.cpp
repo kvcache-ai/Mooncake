@@ -580,7 +580,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Discover topology and install EFA transport (all NICs)
+    // Discover topology and install CXI transport (all NICs)
     engine->getLocalTopology()->discover({});
     auto* xport = engine->installTransport("cxi", nullptr);
     if (!xport) {

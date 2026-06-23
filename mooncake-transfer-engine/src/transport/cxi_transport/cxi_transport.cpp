@@ -162,7 +162,8 @@ int CxiTransport::preTouchMemory(void* addr, size_t length) {
 
     unsigned int hwc = std::thread::hardware_concurrency();
     unsigned int num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
-    num_threads = std::max(num_threads, 1u); // guard in case hardware_concurrency() returns 0
+    num_threads = std::max(
+        num_threads, 1u);  // guard in case hardware_concurrency() returns 0
     size_t block_size = length / num_threads;
     if (block_size == 0) {
         return 0;
@@ -243,8 +244,7 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries = getMemoryLocation(
             addr, length, only_first_page);  // check only first page
-        if (entries.empty()) 
-            return ERR_DEVICE_NOT_FOUND;
+        if (entries.empty()) return ERR_DEVICE_NOT_FOUND;
         resolved_name = entries[0].location;
     } else {
         resolved_name = name;
@@ -259,7 +259,8 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
 
     int selected_device = local_topology_->selectDevice(resolved_name);
     if (selected_device == ERR_DEVICE_NOT_FOUND) {
-        LOG(ERROR) << "could not select a NIC for data, resolved_name=" << resolved_name;
+        LOG(ERROR) << "could not select a NIC for data, resolved_name="
+                   << resolved_name;
         return ERR_DEVICE_NOT_FOUND;
     }
     std::string nic = local_topology_->getHcaList().at(
@@ -901,32 +902,31 @@ int CxiTransport::onSetupCxiConnections(const HandShakeDesc& peer_desc,
 int CxiTransport::initializeCxiResources() {
     auto hca_list = local_topology_->getHcaList();
 
-    // Filter for CXI devices (names typically start with "rdmap" on AWS)
-    std::vector<std::string> efa_devices;
-    std::vector<std::string> non_efa_devices;
+    std::vector<std::string> cxi_devices;
+    std::vector<std::string> non_cxi_devices;
     for (auto& device_name : hca_list) {
         if (device_name.find("cxi") != std::string::npos) {
-            efa_devices.push_back(device_name);
+            cxi_devices.push_back(device_name);
         } else {
-            non_efa_devices.push_back(device_name);
+            non_cxi_devices.push_back(device_name);
         }
     }
 
-    if (efa_devices.empty()) {
+    if (cxi_devices.empty()) {
         LOG(WARNING) << "CxiTransport: No CXI devices found, falling back to "
                         "all devices";
-        efa_devices = hca_list;
-        non_efa_devices.clear();
+        cxi_devices = hca_list;
+        non_cxi_devices.clear();
     }
 
     // Disable non-CXI devices
-    for (auto& device_name : non_efa_devices) {
+    for (auto& device_name : non_cxi_devices) {
         local_topology_->disableDevice(device_name);
         LOG(INFO) << "CxiTransport: Disabled non-CXI device " << device_name
                   << " in topology";
     }
 
-    for (auto& device_name : efa_devices) {
+    for (auto& device_name : cxi_devices) {
         auto context = std::make_shared<CxiContext>(*this, device_name);
         auto& config = globalConfig();
         int ret = context->construct(config.num_cq_per_ctx, config.max_cqe,
