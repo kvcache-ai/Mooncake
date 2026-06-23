@@ -395,6 +395,13 @@ class Transport {
     }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
 
+    // Release this importer's mappings for a remote segment, reclaiming the
+    // exporter's pinned device memory at runtime (NVLink fabric/IPC import).
+    // Returns the number of mappings released. Default no-op for transports
+    // that don't import remote device memory. Caller must drain in-flight
+    // transfers to target_id first.
+    virtual int unregisterRemoteSegment(SegmentID target_id) { return 0; }
+
    protected:
     virtual int install(std::string &local_server_name,
                         std::shared_ptr<TransferMetadata> meta,

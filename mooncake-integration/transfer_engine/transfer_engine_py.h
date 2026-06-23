@@ -123,6 +123,14 @@ class TransferEnginePy {
                           TransferNotify *notify = nullptr,
                           const std::string &transport_hint = "");
 
+    // Release all NVLink fabric/IPC import mappings this process holds for a
+    // remote segment (e.g. a planned drain before the peer restarts),
+    // reclaiming the peer's pinned device memory without restarting this
+    // process. target_hostname is the same session id passed to
+    // batchTransferSync. Returns the number of mappings released (0 if never
+    // imported).
+    int releaseRemoteSegment(const char *target_hostname);
+
     batch_id_t batchTransferAsync(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,

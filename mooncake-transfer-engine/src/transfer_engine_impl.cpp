@@ -547,6 +547,20 @@ int TransferEngineImpl::closeSegment(Transport::SegmentHandle handle) {
     return 0;
 }
 
+int TransferEngineImpl::unregisterRemoteSegment(SegmentID target_id) {
+    // Dispatch to every installed transport; only the ones that import remote
+    // device memory (NvlinkTransport) do anything, the base default is a no-op.
+    int released = 0;
+    if (multi_transports_) {
+        for (Transport* transport : multi_transports_->listTransports()) {
+            if (transport) {
+                released += transport->unregisterRemoteSegment(target_id);
+            }
+        }
+    }
+    return released;
+}
+
 int TransferEngineImpl::removeLocalSegment(const std::string& segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
     std::string trimmed_segment_name = segment_name;

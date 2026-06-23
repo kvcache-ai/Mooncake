@@ -37,6 +37,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define CUmemGenericAllocationHandle MUmemGenericAllocationHandle
 #define CUmemorytype MUmemorytype
 #define CUresult MUresult
+#define cuCtxGetCurrent muCtxGetCurrent
 #define cuDeviceGet muDeviceGet
 #define cuDeviceGetAttribute muDeviceGetAttribute
 #define cuGetErrorString muGetErrorString
