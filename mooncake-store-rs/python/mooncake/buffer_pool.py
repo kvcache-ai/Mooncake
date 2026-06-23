@@ -1,15 +1,10 @@
-"""Public Python entrypoint for Mooncake registered buffer pools."""
+"""Public Python entrypoint for Mooncake local-buffer pools."""
 
 from __future__ import annotations
 
 try:
-    from mooncake.store import RegisteredBufferLease, RegisteredBufferPool
+    from mooncake.store import BufferPool
 except (ImportError, AttributeError):
-    raise ImportError(
-        "mooncake native extension not available; "
-        "run `cargo build -p mooncake-store-py` first"
-    )
+    BufferPool = None  # type: ignore[assignment]
 
-BufferPool = RegisteredBufferPool
-
-__all__ = ["BufferPool", "RegisteredBufferPool", "RegisteredBufferLease"]
+__all__ = ["BufferPool"]

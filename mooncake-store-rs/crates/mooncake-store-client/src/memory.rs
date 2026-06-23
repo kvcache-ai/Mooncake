@@ -841,6 +841,12 @@ pub struct RegionAllocation {
     pub addr: *mut c_void,
 }
 
+// SAFETY: RegionAllocation is a pointer-sized handle into registered local memory.
+// Ownership and reuse are controlled by ScratchReservation's allocator mutex, not
+// by the pointer value itself.
+unsafe impl Send for RegionAllocation {}
+unsafe impl Sync for RegionAllocation {}
+
 fn storage_target_chunks(
     base: *mut c_void,
     capacity: usize,

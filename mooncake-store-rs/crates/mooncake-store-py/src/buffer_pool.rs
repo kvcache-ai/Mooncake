@@ -1,47 +1,41 @@
-//! Registered buffer pool for zero-copy interfaces.
-//!
-//! Keeps a bounded set of registered scratch buffers for repeated zero-copy
-//! operations, eliminating repeated `register_buffer` / `unregister_buffer`
-//! overhead on hot paths.
+//! Python buffer pool backed by the store's setup-time local scratch buffer.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use mooncake_store_client::ScratchReservation;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-// ---------------------------------------------------------------------------
-// Internal types
-// ---------------------------------------------------------------------------
-
-struct Region {
+struct OverflowRegion {
     ptr: *mut u8,
     size: usize,
 }
 
-// SAFETY: Region owns aligned heap memory and is only accessed under Mutex.
-unsafe impl Send for Region {}
-unsafe impl Sync for Region {}
+// SAFETY: OverflowRegion owns an aligned heap allocation. The pointer is only
+// registered/unregistered while the owning BufferLease is being acquired or
+// released, and the lease state is synchronized through PoolShared.
+unsafe impl Send for OverflowRegion {}
+unsafe impl Sync for OverflowRegion {}
 
-/// Shared immutable configuration set once at construction.
+enum LeaseBacking {
+    Local(PyObject),
+    Overflow(OverflowRegion),
+}
+
 struct PoolConfig {
     store: PyObject,
     max_bytes: usize,
-    min_size_class: usize,
-    max_size_class: usize,
     alignment: usize,
     block_on_exhaustion: bool,
     default_timeout: Option<f64>,
     max_regions: Option<usize>,
 }
 
-/// Mutable pool state protected by Mutex.
 struct PoolState {
-    free: HashMap<usize, VecDeque<Region>>,
-    regions: HashMap<usize, usize>, // ptr → region_size
     in_use: HashSet<usize>,
     closed: bool,
     closing: bool,
@@ -51,71 +45,33 @@ struct PoolState {
 }
 
 impl PoolState {
-    fn raise_if_not_open(&self) -> PyResult<()> {
+    fn raise_if_open(&self) -> PyResult<()> {
         if self.closed {
-            return Err(PyRuntimeError::new_err("registered buffer pool is closed"));
+            return Err(PyRuntimeError::new_err("buffer pool is closed"));
         }
         if self.closing {
-            return Err(PyRuntimeError::new_err("registered buffer pool is closing"));
+            return Err(PyRuntimeError::new_err("buffer pool is closing"));
         }
         Ok(())
     }
 
-    fn has_capacity_for(
-        &self,
-        size_class: usize,
-        max_bytes: usize,
-        max_regions: Option<usize>,
-    ) -> bool {
-        let remaining = max_bytes
-            .saturating_sub(self.reserved_bytes)
-            .saturating_sub(self.total_bytes);
-        if size_class > remaining {
+    fn has_capacity_for(&self, size: usize, max_bytes: usize, max_regions: Option<usize>) -> bool {
+        if size > max_bytes {
             return false;
         }
-        match max_regions {
-            Some(max) => self.regions.len() + self.reserved_regions < max,
-            None => true,
+        let Some(available) = max_bytes
+            .checked_sub(self.total_bytes)
+            .and_then(|value| value.checked_sub(self.reserved_bytes))
+        else {
+            return false;
+        };
+        if size > available {
+            return false;
         }
-    }
-
-    fn should_unregister(&self, region_size: usize, max_size_class: usize) -> bool {
-        self.closed || self.closing || region_size > max_size_class
+        max_regions.is_none_or(|max| self.in_use.len() + self.reserved_regions < max)
     }
 }
 
-/// Computes allocation size class from a requested size.
-fn compute_size_class(
-    size: usize,
-    min_size_class: usize,
-    max_size_class: usize,
-    alignment: usize,
-) -> PyResult<(usize, bool)> {
-    let size = size.max(1);
-    if size > max_size_class {
-        return Ok((align_up(size, alignment)?, true));
-    }
-    if size <= min_size_class {
-        return Ok((min_size_class, false));
-    }
-    if size <= alignment {
-        let mut power = 1usize;
-        while power < size {
-            power <<= 1;
-        }
-        return Ok((power, false));
-    }
-    Ok((align_up(size, alignment)?, false))
-}
-
-/// Round `size` up to the next multiple of `alignment`.
-fn align_up(size: usize, alignment: usize) -> PyResult<usize> {
-    size.checked_add(alignment - 1)
-        .map(|s| (s / alignment) * alignment)
-        .ok_or_else(|| PyRuntimeError::new_err("buffer size overflow"))
-}
-
-/// Shared pool handle: config (immutable) + state (Mutex) + condvar.
 struct PoolShared {
     config: PoolConfig,
     state: Mutex<PoolState>,
@@ -123,167 +79,218 @@ struct PoolShared {
 }
 
 impl PoolShared {
-    /// Allocate aligned memory and register it with the store.
-    /// Caller must NOT hold the state mutex.
-    fn allocate_and_register(&self, py: Python<'_>, size_class: usize) -> PyResult<Region> {
+    fn allocate_region(&self, py: Python<'_>, size: usize) -> PyResult<(usize, LeaseBacking)> {
+        let local = self
+            .config
+            .store
+            .call_method1(py, "local_buffer_pool_try_acquire", (size,))?;
+        if local.is_none(py) {
+            return self.allocate_overflow(py, size);
+        }
+        let ptr: usize = local.getattr(py, "ptr")?.extract(py)?;
+        Ok((ptr, LeaseBacking::Local(local)))
+    }
+
+    fn allocate_overflow(&self, py: Python<'_>, size: usize) -> PyResult<(usize, LeaseBacking)> {
         let ptr = unsafe {
-            let mut p: *mut libc::c_void = std::ptr::null_mut();
-            if libc::posix_memalign(&mut p, self.config.alignment, size_class) != 0 || p.is_null() {
+            let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+            if libc::posix_memalign(&mut ptr, self.config.alignment, size) != 0 || ptr.is_null() {
                 return Err(PyRuntimeError::new_err("memory allocation failed"));
             }
-            p as *mut u8
+            ptr as *mut u8
         };
 
         let ret: i32 =
             match self
                 .config
                 .store
-                .call_method1(py, "register_buffer", (ptr as usize, size_class))
+                .call_method1(py, "register_buffer", (ptr as usize, size))
             {
-                Ok(val) => val.extract(py)?,
-                Err(e) => {
+                Ok(value) => value.extract(py)?,
+                Err(error) => {
                     unsafe { libc::free(ptr as *mut libc::c_void) };
-                    return Err(e);
+                    return Err(error);
                 }
             };
-
         if ret != 0 {
             unsafe { libc::free(ptr as *mut libc::c_void) };
-            return Err(PyRuntimeError::new_err("register_buffer failed"));
+            return Err(PyRuntimeError::new_err(
+                "overflow buffer registration failed",
+            ));
         }
 
-        Ok(Region {
-            ptr,
-            size: size_class,
-        })
+        Ok((
+            ptr as usize,
+            LeaseBacking::Overflow(OverflowRegion { ptr, size }),
+        ))
     }
 
-    /// Unregister a region with the store. Only frees memory if unregister succeeds.
-    /// Caller must NOT hold the state mutex.
-    fn unregister_region(&self, py: Python<'_>, region: &Region) -> PyResult<()> {
+    fn unregister_overflow(&self, py: Python<'_>, region: OverflowRegion) -> PyResult<()> {
         let ret: i32 = self
             .config
             .store
             .call_method1(py, "unregister_buffer", (region.ptr as usize, region.size))?
             .extract(py)?;
         if ret != 0 {
-            return Err(PyRuntimeError::new_err("unregister_buffer failed"));
+            return Err(PyRuntimeError::new_err(
+                "overflow buffer unregistration failed",
+            ));
         }
         unsafe { libc::free(region.ptr as *mut libc::c_void) };
         Ok(())
     }
 
-    /// Reserve capacity under lock, allocate+register without lock, update bookkeeping.
-    /// Returns None if capacity was consumed by a concurrent thread.
-    fn reserve_allocate_register(
+    fn reserve_allocate(
         &self,
         py: Python<'_>,
-        size_class: usize,
-    ) -> PyResult<Option<Region>> {
-        // Reserve under lock.
+        size: usize,
+    ) -> PyResult<Option<(usize, LeaseBacking)>> {
         {
             let mut state = self.state.lock().unwrap();
-            state.raise_if_not_open()?;
-            if !state.has_capacity_for(size_class, self.config.max_bytes, self.config.max_regions) {
+            state.raise_if_open()?;
+            if !state.has_capacity_for(size, self.config.max_bytes, self.config.max_regions) {
                 return Ok(None);
             }
-            state.reserved_bytes += size_class;
+            state.reserved_bytes += size;
             state.reserved_regions += 1;
         }
 
-        // Allocate (no lock held, GIL held for register_buffer).
-        let result = self.allocate_and_register(py, size_class);
+        let result = self.allocate_region(py, size);
 
-        // Unreserve and bookkeep under lock.
         let mut state = self.state.lock().unwrap();
-        state.reserved_bytes -= size_class;
+        state.reserved_bytes -= size;
         state.reserved_regions -= 1;
-        self.cvar.notify_one();
+        self.cvar.notify_all();
 
-        if let Ok(ref region) = result {
-            if state.closed || state.closing {
-                drop(state);
-                let _ = self.unregister_region(py, region);
-                return Err(PyRuntimeError::new_err("registered buffer pool is closing"));
+        if state.closed || state.closing {
+            drop(state);
+            if let Ok((_, LeaseBacking::Overflow(region))) = result {
+                let _ = self.unregister_overflow(py, region);
             }
-            state.regions.insert(region.ptr as usize, region.size);
-            state.total_bytes += size_class;
+            return Err(PyRuntimeError::new_err("buffer pool is closing"));
         }
 
-        result.map(Some)
+        match result {
+            Ok((ptr, backing)) => {
+                state.in_use.insert(ptr);
+                state.total_bytes += size;
+                Ok(Some((ptr, backing)))
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Python-exposed types
-// ---------------------------------------------------------------------------
-
-/// A lease on a registered buffer from the pool.
-///
-/// Exposes `ptr`, `size`, and `buffer` (a writable memoryview).
-/// Use as a context manager or call `release()` explicitly.
-/// While any memoryview obtained from `buffer` is alive, `release()` will
-/// raise an error to prevent use-after-free.
 #[pyclass]
-pub struct RegisteredBufferLease {
+pub struct LocalBufferLease {
+    reservation: Option<ScratchReservation>,
+    ptr: usize,
+    size: usize,
+}
+
+#[pymethods]
+impl LocalBufferLease {
+    #[getter]
+    fn ptr(&self) -> PyResult<usize> {
+        if self.reservation.is_none() {
+            return Err(PyRuntimeError::new_err("local buffer lease is closed"));
+        }
+        Ok(self.ptr)
+    }
+
+    #[getter]
+    fn size(&self) -> PyResult<usize> {
+        if self.reservation.is_none() {
+            return Err(PyRuntimeError::new_err("local buffer lease is closed"));
+        }
+        Ok(self.size)
+    }
+
+    fn release(&mut self) {
+        self.reservation.take();
+    }
+}
+
+impl LocalBufferLease {
+    pub fn new(reservation: ScratchReservation, size: usize) -> PyResult<Self> {
+        let ptr = reservation
+            .first()
+            .ok_or_else(|| PyRuntimeError::new_err("local buffer allocation is empty"))?
+            .addr as usize;
+        Ok(Self {
+            reservation: Some(reservation),
+            ptr,
+            size,
+        })
+    }
+}
+
+impl Drop for LocalBufferLease {
+    fn drop(&mut self) {
+        self.reservation.take();
+    }
+}
+
+#[pyclass]
+pub struct BufferLease {
     pool: Arc<PoolShared>,
     ptr: usize,
     requested_size: usize,
     region_size: usize,
+    backing: Option<LeaseBacking>,
     exports: Arc<AtomicUsize>,
     closed: bool,
 }
 
 #[pymethods]
-impl RegisteredBufferLease {
-    /// The registered memory address to pass to zero-copy APIs.
+impl BufferLease {
     #[getter]
     fn ptr(&self) -> PyResult<usize> {
         if self.closed {
-            return Err(PyRuntimeError::new_err("registered buffer lease is closed"));
+            return Err(PyRuntimeError::new_err("buffer lease is closed"));
         }
         Ok(self.ptr)
     }
 
-    /// The requested logical size in bytes.
     #[getter]
     fn size(&self) -> PyResult<usize> {
         if self.closed {
-            return Err(PyRuntimeError::new_err("registered buffer lease is closed"));
+            return Err(PyRuntimeError::new_err("buffer lease is closed"));
         }
         Ok(self.requested_size)
     }
 
-    /// A writable memoryview over the buffer. Do not use after `release()`.
     #[getter]
-    fn buffer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if self.closed {
-            return Err(PyRuntimeError::new_err("registered buffer lease is closed"));
+    fn buffer<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if slf.closed {
+            return Err(PyRuntimeError::new_err("buffer lease is closed"));
         }
-        // Create a LeaseView wrapper that tracks exports.
+        let ptr = slf.ptr;
+        let size = slf.requested_size;
+        let exports = Arc::clone(&slf.exports);
+        let owner = slf.into_pyobject(py)?.unbind().into_any();
+        exports.fetch_add(1, Ordering::Release);
         let view = LeaseView {
-            ptr: self.ptr,
-            size: self.requested_size,
-            exports: Arc::clone(&self.exports),
+            ptr,
+            size,
+            exports: Arc::clone(&exports),
+            _owner: owner,
         };
-        // Increment export count *before* exposing the memoryview.
-        self.exports.fetch_add(1, Ordering::Release);
-        let py_view = Py::new(py, view)?;
-        let mv = unsafe {
-            let obj = py_view.as_ptr();
-            let raw = ffi::PyMemoryView_FromObject(obj);
-            if raw.is_null() {
-                // Undo export count.
-                self.exports.fetch_sub(1, Ordering::Release);
-                return Err(PyErr::fetch(py));
+        let py_view = match Py::new(py, view) {
+            Ok(view) => view,
+            Err(error) => {
+                exports.fetch_sub(1, Ordering::Release);
+                return Err(error);
             }
-            Bound::from_owned_ptr(py, raw)
         };
-        Ok(mv)
+        let raw = unsafe { ffi::PyMemoryView_FromObject(py_view.as_ptr()) };
+        if raw.is_null() {
+            exports.fetch_sub(1, Ordering::Release);
+            return Err(PyErr::fetch(py));
+        }
+        Ok(unsafe { Bound::from_owned_ptr(py, raw) })
     }
 
-    /// Release the buffer back to the pool (or unregister if oversized/closing).
-    /// Raises if memoryviews obtained from `buffer` are still alive.
     fn release(&mut self, py: Python<'_>) -> PyResult<()> {
         self.do_release(py, true)
     }
@@ -303,78 +310,54 @@ impl RegisteredBufferLease {
     }
 }
 
-impl RegisteredBufferLease {
-    /// Core release logic. If `check_exports` is true, raises on active views.
+impl BufferLease {
     fn do_release(&mut self, py: Python<'_>, check_exports: bool) -> PyResult<()> {
         if self.closed {
             return Ok(());
         }
         if check_exports && self.exports.load(Ordering::Acquire) != 0 {
             return Err(PyRuntimeError::new_err(
-                "cannot release registered buffer while exported views exist",
+                "cannot release buffer while exported views exist",
             ));
         }
         self.closed = true;
 
-        let pool = &self.pool;
-        let mut state = pool.state.lock().unwrap();
-        state.in_use.remove(&self.ptr);
-
-        if !state.should_unregister(self.region_size, pool.config.max_size_class) {
-            // Return to free list.
-            state
-                .free
-                .entry(self.region_size)
-                .or_default()
-                .push_back(Region {
-                    ptr: self.ptr as *mut u8,
-                    size: self.region_size,
-                });
-            pool.cvar.notify_one();
-            return Ok(());
+        let backing = self.backing.take();
+        {
+            let mut state = self.pool.state.lock().unwrap();
+            state.in_use.remove(&self.ptr);
+            state.total_bytes = state.total_bytes.saturating_sub(self.region_size);
         }
+        self.pool.cvar.notify_all();
 
-        // Must unregister — drop lock first (Python call ahead).
-        let region = Region {
-            ptr: self.ptr as *mut u8,
-            size: self.region_size,
-        };
-        drop(state);
-
-        let unregister_result = pool.unregister_region(py, &region);
-
-        // Update bookkeeping regardless.
-        let mut state = pool.state.lock().unwrap();
-        state.regions.remove(&self.ptr);
-        state.total_bytes = state.total_bytes.saturating_sub(self.region_size);
-        pool.cvar.notify_one();
-
-        // If unregister failed, memory was NOT freed (by design).
-        // We still mark the lease as closed to avoid double-release.
-        unregister_result
+        match backing {
+            Some(LeaseBacking::Local(lease)) => {
+                let _ = lease.call_method0(py, "release")?;
+                Ok(())
+            }
+            Some(LeaseBacking::Overflow(region)) => self.pool.unregister_overflow(py, region),
+            None => Ok(()),
+        }
     }
 }
 
-impl Drop for RegisteredBufferLease {
+impl Drop for BufferLease {
     fn drop(&mut self) {
         if self.closed {
             return;
         }
-        // Best-effort release without export check (Python is GC'ing us).
-        // We already have the GIL since PyO3 drops #[pyclass] during GC.
         Python::with_gil(|py| {
             let _ = self.do_release(py, false);
         });
     }
 }
 
-/// Internal buffer-protocol wrapper that tracks export lifetime.
-/// When Python releases the memoryview's buffer, the export count decrements.
 #[pyclass]
 struct LeaseView {
     ptr: usize,
     size: usize,
     exports: Arc<AtomicUsize>,
+    _owner: Py<PyAny>,
 }
 
 impl Drop for LeaseView {
@@ -393,10 +376,10 @@ impl LeaseView {
         if view.is_null() {
             return Err(PyRuntimeError::new_err("null Py_buffer pointer"));
         }
-        let buf = &*slf;
+        let buffer = &*slf;
         unsafe {
-            (*view).buf = buf.ptr as *mut std::os::raw::c_void;
-            (*view).len = buf.size as isize;
+            (*view).buf = buffer.ptr as *mut std::os::raw::c_void;
+            (*view).len = buffer.size as isize;
             (*view).itemsize = 1;
             (*view).readonly = 0;
             (*view).ndim = 1;
@@ -425,28 +408,17 @@ impl LeaseView {
     unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
 }
 
-/// A pool of pre-registered buffers for zero-copy operations.
-///
-/// Reuses bounded registered scratch memory for `get_into()`, `get_into_ranges()`,
-/// and `batch_get_into()`, avoiding repeated register/unregister overhead.
-///
-/// Usage:
-///     pool = RegisteredBufferPool(store, max_bytes=256*1024*1024)
-///     with pool.buffer(1024*1024) as lease:
-///         n = store.get_into("key", lease.ptr, lease.size)
-///         view = lease.buffer[:n]
-///     pool.close()
-#[pyclass]
-pub struct RegisteredBufferPool {
+#[pyclass(name = "BufferPool")]
+pub struct BufferPool {
     shared: Arc<PoolShared>,
 }
 
 #[pymethods]
-impl RegisteredBufferPool {
+impl BufferPool {
     #[new]
     #[pyo3(signature = (
         store,
-        max_bytes,
+        max_bytes = 0,
         *,
         min_size_class = 65536,
         max_size_class = None,
@@ -476,9 +448,6 @@ impl RegisteredBufferPool {
                 "MooncakeDistributedStore is not initialized",
             ));
         }
-        if max_bytes == 0 {
-            return Err(PyRuntimeError::new_err("max_bytes must be positive"));
-        }
         if min_size_class == 0 || alignment == 0 {
             return Err(PyRuntimeError::new_err(
                 "min_size_class and alignment must be positive",
@@ -489,24 +458,36 @@ impl RegisteredBufferPool {
                 "alignment must be a power of two and at least sizeof(void*)",
             ));
         }
+        if default_timeout.is_some_and(|timeout| timeout < 0.0) {
+            return Err(PyRuntimeError::new_err("timeout must be non-negative"));
+        }
 
-        let max_size_class = max_size_class.unwrap_or(max_bytes).min(max_bytes);
+        let local_capacity = store
+            .call_method0(py, "local_buffer_pool_capacity")
+            .and_then(|value| value.extract::<usize>(py))?;
+        if local_capacity == 0 {
+            return Err(PyRuntimeError::new_err(
+                "BufferPool requires a store configured with a local buffer",
+            ));
+        }
+        let _ = max_size_class;
+        let max_bytes = if max_bytes == 0 {
+            local_capacity.saturating_mul(2).max(local_capacity)
+        } else {
+            max_bytes.max(local_capacity)
+        };
 
         let pool = Self {
             shared: Arc::new(PoolShared {
                 config: PoolConfig {
                     store,
                     max_bytes,
-                    min_size_class,
-                    max_size_class,
                     alignment,
                     block_on_exhaustion,
                     default_timeout,
                     max_regions,
                 },
                 state: Mutex::new(PoolState {
-                    free: HashMap::new(),
-                    regions: HashMap::new(),
                     in_use: HashSet::new(),
                     closed: false,
                     closing: false,
@@ -517,18 +498,12 @@ impl RegisteredBufferPool {
                 cvar: Condvar::new(),
             }),
         };
-
-        if let Some(size) = prewarm_size {
-            if prewarm_count > 0 {
-                pool.prewarm(py, size, prewarm_count)?;
-            }
+        if prewarm_size.is_some() && prewarm_count > 0 {
+            pool.prewarm(prewarm_size.unwrap(), prewarm_count)?;
         }
-
         Ok(pool)
     }
 
-    /// Acquire a registered buffer of at least `size` bytes.
-    /// Returns a `RegisteredBufferLease` that can be used as a context manager.
     #[pyo3(signature = (size, *, block = None, timeout = None))]
     fn acquire(
         &self,
@@ -536,84 +511,45 @@ impl RegisteredBufferPool {
         size: usize,
         block: Option<bool>,
         timeout: Option<f64>,
-    ) -> PyResult<RegisteredBufferLease> {
-        let cfg = &self.shared.config;
-        let (size_class, oversize) =
-            compute_size_class(size, cfg.min_size_class, cfg.max_size_class, cfg.alignment)?;
-
-        if size_class > cfg.max_bytes {
+    ) -> PyResult<BufferLease> {
+        let allocation_size = size.max(1);
+        if allocation_size > self.shared.config.max_bytes {
             return Err(PyRuntimeError::new_err(
                 "requested buffer size exceeds pool capacity",
             ));
         }
-
-        let should_block = block.unwrap_or(cfg.block_on_exhaustion);
-        let timeout_s = timeout.or(cfg.default_timeout);
-        if let Some(t) = timeout_s {
-            if t < 0.0 {
-                return Err(PyRuntimeError::new_err("timeout must be non-negative"));
-            }
+        let should_block = block.unwrap_or(self.shared.config.block_on_exhaustion);
+        let timeout_s = timeout.or(self.shared.config.default_timeout);
+        if timeout_s.is_some_and(|timeout| timeout < 0.0) {
+            return Err(PyRuntimeError::new_err("timeout must be non-negative"));
         }
+        let deadline = timeout_s.map(|timeout| Instant::now() + Duration::from_secs_f64(timeout));
 
-        let deadline = timeout_s.map(|t| Instant::now() + Duration::from_secs_f64(t));
-
-        // Fast path: try reuse from free list (no GIL release needed).
-        if !oversize {
-            let mut state = self.shared.state.lock().unwrap();
-            state.raise_if_not_open()?;
-            if let Some(queue) = state.free.get_mut(&size_class) {
-                if let Some(region) = queue.pop_back() {
-                    let ptr = region.ptr as usize;
-                    state.in_use.insert(ptr);
-                    return Ok(RegisteredBufferLease {
-                        pool: Arc::clone(&self.shared),
-                        ptr,
-                        requested_size: size,
-                        region_size: region.size,
-                        exports: Arc::new(AtomicUsize::new(0)),
-                        closed: false,
-                    });
-                }
-            }
-        }
-
-        // Slow path: allocate or wait.
         loop {
-            // Try allocate (needs GIL for register_buffer).
-            if let Some(region) = self.shared.reserve_allocate_register(py, size_class)? {
-                let ptr = region.ptr as usize;
-                let mut state = self.shared.state.lock().unwrap();
-                state.in_use.insert(ptr);
-                return Ok(RegisteredBufferLease {
+            if let Some((ptr, backing)) = self.shared.reserve_allocate(py, allocation_size)? {
+                return Ok(BufferLease {
                     pool: Arc::clone(&self.shared),
                     ptr,
                     requested_size: size,
-                    region_size: region.size,
+                    region_size: allocation_size,
+                    backing: Some(backing),
                     exports: Arc::new(AtomicUsize::new(0)),
                     closed: false,
                 });
             }
-
-            // No capacity — block or fail.
             if !should_block {
-                return Err(PyRuntimeError::new_err(
-                    "registered buffer pool is exhausted",
-                ));
+                return Err(PyRuntimeError::new_err("buffer pool is exhausted"));
             }
-
-            // Wait (release GIL during condvar wait).
             py.allow_threads(|| {
                 let state = self.shared.state.lock().unwrap();
-                if let Some(dl) = deadline {
-                    if Instant::now() >= dl {
-                        return Err(PyRuntimeError::new_err(
-                            "timed out waiting for registered buffer",
-                        ));
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        return Err(PyRuntimeError::new_err("timed out waiting for buffer"));
                     }
                     drop(
                         self.shared
                             .cvar
-                            .wait_timeout(state, dl - Instant::now())
+                            .wait_timeout(state, deadline - Instant::now())
                             .unwrap(),
                     );
                 } else {
@@ -621,29 +557,9 @@ impl RegisteredBufferPool {
                 }
                 Ok(())
             })?;
-
-            // After wakeup, retry free list.
-            if !oversize {
-                let mut state = self.shared.state.lock().unwrap();
-                if let Some(queue) = state.free.get_mut(&size_class) {
-                    if let Some(region) = queue.pop_back() {
-                        let ptr = region.ptr as usize;
-                        state.in_use.insert(ptr);
-                        return Ok(RegisteredBufferLease {
-                            pool: Arc::clone(&self.shared),
-                            ptr,
-                            requested_size: size,
-                            region_size: region.size,
-                            exports: Arc::new(AtomicUsize::new(0)),
-                            closed: false,
-                        });
-                    }
-                }
-            }
         }
     }
 
-    /// Alias for `acquire()`.
     #[pyo3(signature = (size, *, block = None, timeout = None))]
     fn buffer(
         &self,
@@ -651,116 +567,45 @@ impl RegisteredBufferPool {
         size: usize,
         block: Option<bool>,
         timeout: Option<f64>,
-    ) -> PyResult<RegisteredBufferLease> {
+    ) -> PyResult<BufferLease> {
         self.acquire(py, size, block, timeout)
     }
 
-    /// Pre-allocate `count` buffers of the given `size` class.
-    fn prewarm(&self, py: Python<'_>, size: usize, count: usize) -> PyResult<()> {
-        let cfg = &self.shared.config;
-        let (size_class, oversize) =
-            compute_size_class(size, cfg.min_size_class, cfg.max_size_class, cfg.alignment)?;
-
-        if oversize {
-            return Err(PyRuntimeError::new_err("cannot prewarm oversize buffers"));
-        }
-
-        for _ in 0..count {
-            let region = self
-                .shared
-                .reserve_allocate_register(py, size_class)?
-                .ok_or_else(|| {
-                    PyRuntimeError::new_err("registered buffer pool capacity exceeded")
-                })?;
-
-            let mut state = self.shared.state.lock().unwrap();
-            if state.closed || state.closing {
-                drop(state);
-                let _ = self.shared.unregister_region(py, &region);
-                return Err(PyRuntimeError::new_err("registered buffer pool is closing"));
-            }
-            state.free.entry(size_class).or_default().push_back(region);
-            self.shared.cvar.notify_one();
-        }
-
+    fn prewarm(&self, _size: usize, _count: usize) -> PyResult<()> {
         Ok(())
     }
 
-    /// Close the pool, unregistering all free buffers.
-    /// Raises if any leases are still active.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let shared = &self.shared;
-
-        // Mark closing and wait for in-flight reservations.
-        {
-            let mut state = shared.state.lock().unwrap();
-            if state.closed {
-                return Ok(());
-            }
-            state.closing = true;
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closed {
+            return Ok(());
         }
-
-        // Wait for reservations to drain (release GIL).
+        state.closing = true;
+        drop(state);
         py.allow_threads(|| {
-            let mut state = shared.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             while state.reserved_regions > 0 {
-                state = shared.cvar.wait(state).unwrap();
+                state = self.shared.cvar.wait(state).unwrap();
             }
         });
-
-        // Drain free list under lock.
-        let to_unregister: Vec<Region>;
-        {
-            let mut state = shared.state.lock().unwrap();
-            if !state.in_use.is_empty() {
-                state.closing = false;
-                shared.cvar.notify_one();
-                return Err(PyRuntimeError::new_err(
-                    "cannot close registered buffer pool with active leases",
-                ));
-            }
-            to_unregister = state.free.drain().flat_map(|(_, q)| q).collect();
-        }
-
-        // Unregister all (no lock held, GIL held).
-        for (i, region) in to_unregister.iter().enumerate() {
-            if let Err(e) = shared.unregister_region(py, region) {
-                // Put remaining back on failure.
-                let mut state = shared.state.lock().unwrap();
-                for remaining in &to_unregister[i + 1..] {
-                    state
-                        .free
-                        .entry(remaining.size)
-                        .or_default()
-                        .push_back(Region {
-                            ptr: remaining.ptr,
-                            size: remaining.size,
-                        });
-                }
-                state.closing = false;
-                shared.cvar.notify_one();
-                return Err(e);
-            }
-            // Bookkeep each successful unregister.
-            let mut state = shared.state.lock().unwrap();
-            state.regions.remove(&(region.ptr as usize));
-            state.total_bytes = state.total_bytes.saturating_sub(region.size);
-        }
-
-        {
-            let mut state = shared.state.lock().unwrap();
-            state.closed = true;
+        let mut state = self.shared.state.lock().unwrap();
+        if !state.in_use.is_empty() {
             state.closing = false;
-            shared.cvar.notify_one();
+            self.shared.cvar.notify_all();
+            return Err(PyRuntimeError::new_err(
+                "cannot close buffer pool with active leases",
+            ));
         }
-
+        state.closed = true;
+        state.closing = false;
+        self.shared.cvar.notify_all();
         Ok(())
     }
 }
 
-/// Register buffer pool classes into the Python module.
 pub fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<RegisteredBufferPool>()?;
-    module.add_class::<RegisteredBufferLease>()?;
+    module.add_class::<LocalBufferLease>()?;
+    module.add_class::<BufferPool>()?;
+    module.add_class::<BufferLease>()?;
     Ok(())
 }

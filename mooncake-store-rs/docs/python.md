@@ -58,15 +58,25 @@ should import the Store-RS RL client and CUDA/NCCL distributed helpers from
 `mooncake_rl.checkpoint_engine.*` instead of depending on an external
 `checkpoint_engine` or `mooncake.engine.TransferEngine` installation.
 
-Store-RS-specific RL weight updates use
-`mooncake_rl.checkpoint_engine.store_rs_checkpoint_engine.MooncakeStoreRSCheckpointEngine`
-for the reusable checkpoint flow and
-`mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient` for Store-RS
-object I/O. Trainer ranks register CUDA tensors with
-the Mooncake-compatible `register_buffer(ptr, size)` API and put bucket objects
-into Store-RS through registered-buffer writes. Rollout ranks read the selected
-buckets from Store-RS into registered CUDA buffers and then broadcast inside the
-rollout process group.
+Store-RS-specific RL weight updates share
+`mooncake_rl.checkpoint_engine.base.WeightSyncBase` for topology setup, process
+group lifecycle, versioned Store-RS key prefixes, and checkpoint-object cleanup.
+The actual transfer behavior is implemented by sibling strategies:
+
+- `mooncake_rl.checkpoint_engine.kimi_ckpt.KimiCkptWeightSync` implements the
+  Kimi-style checkpoint update pipeline: trainer ranks pack weights into
+  Store-RS bucket objects, rollout ranks read assigned buckets into registered
+  CUDA buffers, and rollout ranks broadcast those buckets inside the rollout
+  process group.
+- `mooncake_rl.checkpoint_engine.direct.DirectWeightSync` stores one Store-RS
+  object per tensor. Every rollout rank reads every tensor object directly into
+  its own CUDA buffer and yields the normal VeRL weight stream without the
+  rollout-side broadcast step.
+
+Both strategies use `mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient`
+for Store-RS object I/O. Trainer ranks register CUDA tensors with the
+Mooncake-compatible `register_buffer(ptr, size)` API and write through
+registered-buffer Store-RS calls.
 
 The P2P data path is the same data path as `MooncakeDistributedStore`: the
 Python adapter calls Store-RS registered-buffer APIs, and the Rust transport
@@ -74,9 +84,10 @@ layer uses the Mooncake Transfer Engine built from this repository's submodule.
 No Python-side host pin-memory bridge is used for these RL bucket transfers.
 VeRL integration is provided as an external plugin module,
 `mooncake_rl.checkpoint_engine.verl_backend`; it only adapts VeRL runtime hooks
-and registers the Store-RS checkpoint engine with VeRL's
+and registers the Store-RS weight-sync strategies with VeRL's
 `CheckpointEngineRegistry`, so no Store-RS backend file has to live inside the
-VeRL source tree.
+VeRL source tree. The backend names are `kimi_ckpt` for the Kimi-style
+checkpoint update pipeline and `direct` for the one-object-per-tensor baseline.
 
 ## Execution Modes
 
@@ -830,6 +841,93 @@ Related environment variables:
 
 If hugepage mode is requested, the host kernel must already have compatible hugepages reserved.
 
+## BufferPool
+
+`BufferPool` is the recommended Python helper for temporary buffers used with
+`put_from(...)`, `get_into(...)`, and the batch buffer-oriented APIs. It is backed
+by the store client's setup-time local buffer first, and falls back to registered
+overflow memory when the local buffer is exhausted.
+
+Import paths:
+
+```python
+from mooncake import BufferPool
+# or
+from mooncake.store import BufferPool
+# or
+from mooncake.buffer_pool import BufferPool
+```
+
+Basic usage:
+
+```python
+from mooncake.store import BufferPool, MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    "127.0.0.1",
+    "P2PHANDSHAKE",
+    64 * 1024 * 1024,  # global segment size
+    16 * 1024 * 1024,  # local buffer size used by BufferPool
+    "tcp",
+    "",
+    "redis://127.0.0.1:6379/0",
+)
+
+pool = BufferPool(store, max_bytes=32 * 1024 * 1024)
+
+payload = b"hello mooncake"
+writer = pool.acquire(len(payload))
+try:
+    writer.buffer[: len(payload)] = payload
+    status = store.put_from("example-key", writer.ptr, len(payload))
+    if status != 0:
+        raise RuntimeError(f"put_from failed: {status}")
+finally:
+    writer.release()
+
+reader = pool.acquire(len(payload))
+try:
+    bytes_read = store.get_into("example-key", reader.ptr, reader.size)
+    if bytes_read < 0:
+        raise RuntimeError("get_into missed or failed")
+    value = bytes(reader.buffer[:bytes_read])
+finally:
+    reader.release()
+
+pool.close()
+```
+
+Context-manager usage releases the lease automatically:
+
+```python
+with pool.acquire(4096) as lease:
+    n = store.get_into("example-key", lease.ptr, lease.size)
+    value = bytes(lease.buffer[:n])
+```
+
+Important notes:
+
+- `BufferPool` requires a real store that was set up with nonzero
+  `local_buffer_size`; dummy stores and stores without local buffer capacity
+  cannot create a pool.
+- A lease exposes `ptr`, `size`, `buffer`, and `release()`. Pass `ptr` and the
+  actual payload length to `put_from(...)`; pass `ptr` and destination capacity
+  to `get_into(...)`.
+- Do not call `release()` while any `memoryview` returned by `lease.buffer` is
+  still alive. Drop the view first, or use short-lived slices/copies.
+- `pool.acquire(size, block=True, timeout=None)` waits when the pool reaches its
+  configured capacity. Use `block=False` for immediate failure, or set `timeout`
+  to bound the wait.
+- `max_bytes` limits total active local and overflow leases. When `max_bytes=0`,
+  the pool defaults to a capacity derived from the local buffer size.
+- `max_regions` can bound the number of simultaneously active leases.
+- `pool.close()` fails if leases are still active. Release all leases before
+  closing the pool.
+- `RegisteredBufferPool` is not part of the Store-RS Python API. Use
+  `BufferPool` for pooled temporary buffers, or `MooncakeHostMemAllocator` plus
+  explicit `register_buffer(...)` for caller-owned long-lived memory.
+
 ## Supported Operations
 
 ### Basic I/O
@@ -840,6 +938,7 @@ If hugepage mode is requested, the host kernel must already have compatible huge
 
 ### Buffer-Oriented I/O
 
+- `BufferPool`
 - `register_buffer`, `unregister_buffer`
 - `put_from`
 - `batch_put_from`

@@ -1,6 +1,6 @@
 pub mod admin;
-pub mod build_info;
 pub mod buffer_pool;
+pub mod build_info;
 pub mod config;
 pub mod dispatcher;
 mod dummy_client;
@@ -530,6 +530,38 @@ impl PyMooncakeDistributedStore {
                 run_without_gil(move || dispatcher.unregister_buffer(buffer_ptr, size))
                     .map_err(store_error_to_py)?;
                 Ok(0)
+            }
+        }
+    }
+
+    fn local_buffer_pool_capacity(&self) -> PyResult<usize> {
+        match self.backend_ref()? {
+            StoreBackend::Dummy(_) => Ok(0),
+            StoreBackend::Real(dispatcher) => {
+                run_without_gil(move || dispatcher.local_scratch_capacity_bytes())
+                    .map_err(store_error_to_py)
+            }
+        }
+    }
+
+    fn local_buffer_pool_try_acquire(
+        &self,
+        size: usize,
+    ) -> PyResult<Option<buffer_pool::LocalBufferLease>> {
+        match self.backend_ref()? {
+            StoreBackend::Dummy(_) => Err(PyRuntimeError::new_err(
+                "BufferPool requires a real store configured with a local buffer",
+            )),
+            StoreBackend::Real(dispatcher) => {
+                let reservation = match run_without_gil(move || dispatcher.plan_local_scratch(size))
+                {
+                    Ok(reservation) => reservation,
+                    Err(StoreError::Allocator(message)) if message.contains("exhausted") => {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(store_error_to_py(error)),
+                };
+                buffer_pool::LocalBufferLease::new(reservation, size).map(Some)
             }
         }
     }

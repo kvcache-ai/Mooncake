@@ -14,7 +14,7 @@ pub use client::{
     PutRequest, ReadQueryResultCache, ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
-pub use memory::LocalMemoryConfig;
+pub use memory::{LocalMemoryConfig, ScratchReservation};
 pub use mooncake_store_core::RouteControlMode;
 pub use mooncake_transport::{TransferBatchHints, TransferPacingMode};
 pub use observability::{

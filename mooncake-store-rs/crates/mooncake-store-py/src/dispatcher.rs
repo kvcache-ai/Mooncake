@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mooncake_store_client::{
     record_heartbeat_health, stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate,
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
-    OperationTracker, ReadQueryResultCache, ReplicationPolicy, StoreClient,
+    OperationTracker, ReadQueryResultCache, ReplicationPolicy, ScratchReservation, StoreClient,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
@@ -459,6 +459,14 @@ impl StoreDispatcher {
             client.unregister_buffer(base_ptr as *mut c_void, len)
         })
         .await
+    }
+
+    pub fn local_scratch_capacity_bytes(&self) -> Result<usize, StoreError> {
+        self.run(|client| Ok(client.local_scratch_capacity_bytes()))
+    }
+
+    pub fn plan_local_scratch(&self, len: usize) -> Result<ScratchReservation, StoreError> {
+        self.run(move |client| client.plan_local_scratch(len))
     }
 
     pub(crate) fn registration_timeout_for_bytes(&self, registration_bytes: usize) -> Duration {
