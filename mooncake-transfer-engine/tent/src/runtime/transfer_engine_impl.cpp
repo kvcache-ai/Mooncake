@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <map>
 #include <optional>
 #include <random>
@@ -46,14 +47,42 @@ namespace tent {
 namespace {
 constexpr uint8_t kRedisMaxDbIndex = 255;
 constexpr uint8_t kRedisDefaultDbIndex = 0;
+
+class EngineBatchSink final : public BatchEventSink {
+   public:
+    EngineBatchSink(TransferEngineImpl* impl, BatchID batch_id,
+                    uint64_t generation)
+        : impl_(impl), batch_id_(batch_id), generation_(generation) {}
+
+    void notifyMaybeReady() noexcept override {
+        if (closed_.load(std::memory_order_acquire)) return;
+        impl_->notifyBatchMaybeReady(batch_id_, generation_);
+    }
+
+    void close() noexcept override {
+        closed_.store(true, std::memory_order_release);
+    }
+
+   private:
+    TransferEngineImpl* impl_;
+    BatchID batch_id_;
+    uint64_t generation_;
+    std::atomic<bool> closed_{false};
+};
 }  // namespace
 
 struct Batch {
-    Batch() : max_size(0) { sub_batch.fill(nullptr); }
+    Batch() : max_size(0) {
+        sub_batch.fill(nullptr);
+        sinks.fill(nullptr);
+    }
 
     ~Batch() {}
 
+    uint64_t generation{0};
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
+    std::array<std::shared_ptr<EngineBatchSink>, kSupportedTransportTypes>
+        sinks;
     std::vector<TaskInfo> task_list;
     size_t max_size;
 
@@ -397,6 +426,17 @@ Status TransferEngineImpl::deconstruct() {
     // local_segment_tracker_ and metadata_ to be alive.
     staging_proxy_.reset();
 
+    // Quiesce terminal-event callbacks before freeing any SubBatch memory.
+    // Closing sinks makes already-running callbacks no-op; drain() joins
+    // transport-owned workers while preserving enough state for freeSubBatch().
+    batch_set_.forEach([&](BatchSet& entry) {
+        for (auto& batch : entry.active) closeBatchEventSinks(batch);
+        for (auto& batch : entry.freelist) closeBatchEventSinks(batch);
+    });
+    for (auto& transport : transport_list_) {
+        if (transport) transport->drain();
+    }
+
     if (local_segment_tracker_) {
         local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -421,8 +461,10 @@ Status TransferEngineImpl::deconstruct() {
                 auto& transport = transport_list_[type];
                 auto& sub_batch = batch->sub_batch[type];
                 if (!transport || !sub_batch) continue;
+                closeBatchEventSinks(batch);
                 transport->freeSubBatch(sub_batch);
             }
+            alive_batch_generations_.erase((BatchID)batch);
             Slab<Batch>::Get().deallocate(batch);
         }
         for (auto& batch : entry.freelist) {
@@ -430,8 +472,10 @@ Status TransferEngineImpl::deconstruct() {
                 auto& transport = transport_list_[type];
                 auto& sub_batch = batch->sub_batch[type];
                 if (!transport || !sub_batch) continue;
+                closeBatchEventSinks(batch);
                 transport->freeSubBatch(sub_batch);
             }
+            alive_batch_generations_.erase((BatchID)batch);
             Slab<Batch>::Get().deallocate(batch);
         }
         entry.active.clear();
@@ -728,22 +772,55 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     Batch* batch = Slab<Batch>::Get().allocate();
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
+    batch->generation =
+        next_batch_generation_.fetch_add(1, std::memory_order_relaxed);
+    if (batch->generation == 0) {
+        batch->generation =
+            next_batch_generation_.fetch_add(1, std::memory_order_relaxed);
+    }
     batch_set_.get().active.insert(batch);
     BatchID batch_id = (BatchID)batch;
     {
         std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-        alive_batches_.insert(batch_id);
+        alive_batch_generations_[batch_id] = batch->generation;
     }
     return batch_id;
 }
 
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch* batch = (Batch*)(batch_id);
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batch_generations_.count(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    Batch* batch = (Batch*)(batch_id);
+    closeBatchEventSinks(batch);
     batch_set_.get().freelist.push_back(batch);
     lazyFreeBatch();
     return Status::OK();
+}
+
+void TransferEngineImpl::attachBatchEventSink(Batch* batch,
+                                              TransportType type) {
+    if (!enable_progress_worker_ || !batch || type < 0 ||
+        type >= (TransportType)kSupportedTransportTypes ||
+        !batch->sub_batch[type]) {
+        return;
+    }
+    if (!batch->sinks[type]) {
+        batch->sinks[type] = std::make_shared<EngineBatchSink>(
+            this, (BatchID)batch, batch->generation);
+    }
+    auto& sub_batch = batch->sub_batch[type];
+    sub_batch->batch_id = (BatchID)batch;
+    sub_batch->sink = batch->sinks[type];
+}
+
+void TransferEngineImpl::closeBatchEventSinks(Batch* batch) {
+    if (!batch) return;
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        if (batch->sinks[type]) batch->sinks[type]->close();
+        if (batch->sub_batch[type]) batch->sub_batch[type]->sink.reset();
+    }
 }
 
 Status TransferEngineImpl::lazyFreeBatch() {
@@ -761,10 +838,13 @@ Status TransferEngineImpl::lazyFreeBatch() {
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             auto& transport = transport_list_[type];
             auto& sub_batch = batch->sub_batch[type];
-            if (transport && sub_batch) transport->freeSubBatch(sub_batch);
+            if (transport && sub_batch) {
+                closeBatchEventSinks(batch);
+                transport->freeSubBatch(sub_batch);
+            }
         }
         batch_set.active.erase(batch);
-        alive_batches_.erase((BatchID)batch);
+        alive_batch_generations_.erase((BatchID)batch);
         Slab<Batch>::Get().deallocate(batch);
         it = batch_set.freelist.erase(it);
     }
@@ -1218,6 +1298,9 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batch_generations_.count(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
 
     for (size_t i = 0; i < request_list.size(); ++i) {
@@ -1292,6 +1375,7 @@ Status TransferEngineImpl::submitTransfer(
                 merged_task_id_map[merged_task_id] = task;
                 continue;
             }
+            attachBatchEventSink(batch, task.type);
         }
 
         if (!next_sub_task_id.count(task.type))
@@ -1368,6 +1452,9 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification& notifi) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batch_generations_.count(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     const size_t start_task_id = batch->task_list.size();
     CHECK_STATUS(submitTransfer(batch_id, request_list));
@@ -1417,6 +1504,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     if (!batch->sub_batch[type])
         CHECK_STATUS(transport->allocateSubBatch(batch->sub_batch[type],
                                                  batch->max_size));
+    attachBatchEventSink(batch, type);
     auto& sub_batch = batch->sub_batch[type];
     task.sub_task_id = sub_batch->size();
     task.type = type;
@@ -1502,7 +1590,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                                              TransferStatus& task_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    if (!alive_batch_generations_.count(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
@@ -1525,7 +1613,7 @@ Status TransferEngineImpl::getTransferStatus(
     BatchID batch_id, std::vector<TransferStatus>& status_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    if (!alive_batch_generations_.count(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     status_list.clear();
@@ -1542,7 +1630,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                                           bool allow_failover) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    if (!alive_batch_generations_.count(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     overall_status.s = PENDING;
@@ -1615,8 +1703,26 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
     return getBatchStatus(batch_id, overall_status, true);
 }
 
+Status TransferEngineImpl::progressBatchIfAlive(
+    BatchID batch_id, uint64_t generation, TransferStatus& overall_status) {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (generation != 0) {
+        auto it = alive_batch_generations_.find(batch_id);
+        if (it == alive_batch_generations_.end() || it->second != generation) {
+            return Status::InvalidArgument("Stale batch generation" LOC_MARK);
+        }
+    }
+    return getBatchStatus(batch_id, overall_status, true);
+}
+
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
+}
+
+void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id,
+                                               uint64_t generation) {
+    if (progress_worker_)
+        progress_worker_->notifyBatchMaybeReady(batch_id, generation);
 }
 
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {

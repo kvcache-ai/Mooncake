@@ -155,6 +155,9 @@ class TransferEngineImpl {
 
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
+    Status progressBatchIfAlive(BatchID batch_id, uint64_t generation,
+                                TransferStatus& overall_status);
+
     Status waitTransferCompletion(BatchID batch_id);
 
     Status transferSync(const std::vector<Request>& request_list);
@@ -180,6 +183,8 @@ class TransferEngineImpl {
     // hooks; transports will be migrated to call this in a follow-up PR.
     void notifyBatchMaybeReady(BatchID batch_id);
 
+    void notifyBatchMaybeReady(BatchID batch_id, uint64_t generation);
+
    private:
     Status construct();
 
@@ -196,6 +201,10 @@ class TransferEngineImpl {
         TransportType request_type);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
+
+    void attachBatchEventSink(Batch* batch, TransportType type);
+
+    void closeBatchEventSinks(Batch* batch);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
@@ -264,12 +273,13 @@ class TransferEngineImpl {
     bool enable_auto_failover_on_poll_{true};
     bool enable_progress_worker_{false};
 
-    // Guards alive_batches_ and serializes pollTaskStatus /
+    // Guards alive_batch_generations_ and serializes pollTaskStatus /
     // updateTaskStatusAfterPoll / lazyFreeBatch against the optional
     // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
-    // getTransferStatus can re-enter on the same thread. See issue #2116.
+    // getTransferStatus can re-enter on the same thread.
     std::recursive_mutex progress_mutex_;
-    std::unordered_set<BatchID> alive_batches_;
+    std::unordered_map<BatchID, uint64_t> alive_batch_generations_;
+    std::atomic<uint64_t> next_batch_generation_{1};
     std::unique_ptr<ProgressWorker> progress_worker_;
 };
 }  // namespace tent

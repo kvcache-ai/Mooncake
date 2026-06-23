@@ -53,9 +53,24 @@ class ProgressWorker {
     // Safe from any thread. De-duplicates: enqueueing a batch that is already
     // queued is a no-op. No-op if the worker has been stopped or never
     // started.
-    void notifyBatchMaybeReady(BatchID batch_id);
+    void notifyBatchMaybeReady(BatchID batch_id, uint64_t generation = 0);
 
    private:
+    struct WorkItem {
+        BatchID batch_id{0};
+        uint64_t generation{0};
+        bool operator==(const WorkItem& other) const {
+            return batch_id == other.batch_id && generation == other.generation;
+        }
+    };
+
+    struct WorkItemHash {
+        size_t operator()(const WorkItem& item) const {
+            return std::hash<BatchID>{}(item.batch_id) ^
+                   (std::hash<uint64_t>{}(item.generation) << 1);
+        }
+    };
+
     void runner();
 
     TransferEngineImpl* impl_;
@@ -64,8 +79,8 @@ class ProgressWorker {
 
     std::mutex mu_;
     std::condition_variable cv_;
-    std::unordered_set<BatchID> queued_;
-    std::deque<BatchID> order_;
+    std::unordered_set<WorkItem, WorkItemHash> queued_;
+    std::deque<WorkItem> order_;
 };
 
 }  // namespace tent

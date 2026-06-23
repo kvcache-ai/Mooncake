@@ -274,6 +274,8 @@ Status BufIoTransport::submitTransferTasks(
                                         : TransferStatusEnum::COMPLETED;
     }
 
+    buf_batch->notifyTerminal();
+
     return Status::OK();
 }
 

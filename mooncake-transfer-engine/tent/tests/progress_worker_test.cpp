@@ -81,6 +81,10 @@ class FakeTransport : public Transport {
     std::atomic<int> submit_calls{0};
     std::atomic<int> status_calls{0};
     std::atomic<int> add_mem_calls{0};
+    std::atomic<int> notify_calls{0};
+    std::shared_ptr<BatchEventSink> last_sink;
+
+    void setNotifyOnSubmit(bool ok) { notify_on_submit_ = ok; }
 
     Status install(std::string& /*local_segment_name*/,
                    std::shared_ptr<ControlService> /*metadata*/,
@@ -105,6 +109,7 @@ class FakeTransport : public Transport {
         SubBatchRef batch, const std::vector<Request>& request_list) override {
         ++submit_calls;
         auto* fb = static_cast<FakeSubBatch*>(batch);
+        last_sink = batch->sink;
         for (const auto& req : request_list) {
             if (status_factory_) {
                 fb->statuses.push_back(status_factory_(req));
@@ -115,6 +120,10 @@ class FakeTransport : public Transport {
             fb->requests.push_back(req);
             fb->poll_counts.push_back(0);
             fb->task_count++;
+        }
+        if (notify_on_submit_) {
+            ++notify_calls;
+            batch->notifyTerminal();
         }
         return Status::OK();
     }
@@ -180,6 +189,7 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     StatusFactory status_factory_;
     PollStatusFactory poll_status_factory_;
+    bool notify_on_submit_ = false;
 };
 
 std::shared_ptr<Config> makeMinimalP2PConfig() {
@@ -389,7 +399,7 @@ TEST(ProgressWorker, SingleNotifyAdvancesOneStep) {
 
 // ---------------------------------------------------------------------------
 // 4. freeBatch races with worker notifications. With ASAN/UBSAN this
-// catches missing alive_batches_ / progress_mutex_ coverage.
+// catches missing alive_batch_generations_ / progress_mutex_ coverage.
 // ---------------------------------------------------------------------------
 
 TEST(ProgressWorker, FreeBatchRacesWithWorker) {
@@ -440,8 +450,8 @@ TEST(ProgressWorker, FreeBatchRacesWithWorker) {
         engine.notifyBatchMaybeReady(batch_id);
 
         // Free immediately; the worker may pick the notification up after
-        // free. The progress_mutex_ + alive_batches_ guard must keep this
-        // safe.
+        // free. The progress_mutex_ + alive_batch_generations_ guard must keep
+        // this safe.
         EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     }
 
@@ -472,7 +482,7 @@ TEST(ProgressWorker, EngineDestructorJoinsWorker) {
         engine.swapTransportForTest(TCP, fake_tcp);
 
         // Push some notifies for non-existent batches; worker must reject
-        // them via alive_batches_ check and stay alive.
+        // them via alive_batch_generations_ check and stay alive.
         for (int i = 0; i < 8; ++i) {
             engine.notifyBatchMaybeReady((BatchID)(uintptr_t)0xdeadbeef);
         }
@@ -480,6 +490,292 @@ TEST(ProgressWorker, EngineDestructorJoinsWorker) {
     // If teardown hangs or crashes here, gtest fails this test on timeout
     // / signal — no further assert needed.
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+// 6. Transport-driven progress
+// ---------------------------------------------------------------------------
+
+TEST(TransportTerminalEvent, NotifyDrivesProgressWithoutManualPoke) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    // The primary transport publishes terminal events itself; mirrors the
+    // SHM / bufio integration done in PR 3.
+    fake_rdma->setNotifyOnSubmit(true);
+
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xD1);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+    ASSERT_GE(fake_rdma->notify_calls.load(), 1)
+        << "transport must have invoked notifyTerminal()";
+
+    // Caller never calls notifyBatchMaybeReady, progressBatch, or
+    // getTransferStatus in the wait loop below. The worker should observe the
+    // transport-published terminal event and poll the transport on its own.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (std::chrono::steady_clock::now() < deadline &&
+           fake_rdma->status_calls.load() == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GT(fake_rdma->status_calls.load(), 0)
+        << "transport notifyTerminal() must drive ProgressWorker to poll";
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED)
+        << "transport notifyTerminal() must drive ProgressWorker to terminal";
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 7. Transport-driven failover .
+// ---------------------------------------------------------------------------
+
+TEST(TransportTerminalEvent, NotifyDrivesAutoFailover) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    fake_rdma->setNotifyOnSubmit(true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    fake_tcp->setNotifyOnSubmit(true);
+
+    FaultPolicy rdma_policy;
+    rdma_policy.status_corrupt_rate = 1.0;
+    auto proxied_rdma =
+        std::make_shared<FaultProxyTransport>(fake_rdma, rdma_policy);
+
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(proxied_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, proxied_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xD2);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    // Observation-only loop: getTransferStatus runs with auto-failover-on-poll
+    // disabled, so the only thing that can drive the batch through failover
+    // is the worker, woken by notifyTerminal from the (real) inner transport
+    // beneath the FaultProxy.
+    TransferStatus status{};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (fake_tcp->submit_calls.load() == 0) continue;
+        status = {};
+        ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+        if (status.s == TransferStatusEnum::COMPLETED) break;
+    }
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED)
+        << "worker must drive failover via transport terminal events";
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_GE(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 8. Worker disabled: notifyTerminal is benign.
+// ---------------------------------------------------------------------------
+
+TEST(TransportTerminalEvent, WorkerDisabledNotifyIsNoop) {
+    auto cfg = makeMinimalP2PConfig();
+    // Default: enable_progress_worker not set → worker is off.
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    fake_rdma->setNotifyOnSubmit(true);  // call notifyTerminal anyway
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xD3);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    // The transport invoked notifyTerminal; sink should be null because
+    // enable_progress_worker=false. We can't read SubBatch::sink directly
+    // from the test, but a benign no-op manifests as: status is observable
+    // via the regular getTransferStatus path and nothing crashed.
+    EXPECT_GE(fake_rdma->notify_calls.load(), 1);
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 9. Free-batch races a transport terminal event (PR 3 detach correctness).
+//    Submit + free + concurrent terminal notifications must remain UAF-safe;
+//    detach (sink=nullptr before freeSubBatch) plus single-load semantics in
+//    notifyTerminal guarantee at-most-one-missed-notify, no crash.
+// ---------------------------------------------------------------------------
+
+TEST(TransportTerminalEvent, FreeBatchRaceWithTransportTerminal) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    fake_rdma->setNotifyOnSubmit(true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xD4);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    constexpr int kRounds = 200;
+    for (int i = 0; i < kRounds; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = buf.data();
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+        req.length = kBufLen;
+        ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+        // Free immediately. The transport already invoked notifyTerminal()
+        // synchronously inside submit; the worker may still be picking the
+        // notification up. detach + alive_batch_generations_ guard must keep
+        // this safe.
+        EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    }
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 10. A late transport-owned sink from a freed batch must not be able to
+//     progress a new batch even if the allocator reuses the same BatchID
+//     address. This covers the PR3 ABA/UAF review blocker at the event source.
+// ---------------------------------------------------------------------------
+
+TEST(TransportTerminalEvent, LateSinkAfterFreeDoesNotProgressReusedBatch) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xD5);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+
+    BatchID old_batch = engine.allocateBatch(1);
+    ASSERT_NE(old_batch, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(old_batch, {req}).ok());
+    auto old_sink = fake_rdma->last_sink;
+    ASSERT_TRUE(old_sink != nullptr);
+    ASSERT_TRUE(engine.freeBatch(old_batch).ok());
+
+    BatchID new_batch = engine.allocateBatch(1);
+    ASSERT_NE(new_batch, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(new_batch, {req}).ok());
+
+    // Let any worker item that might have been queued before the reset drain;
+    // the assertion below is specifically about the late old sink notify.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    fake_rdma->status_calls.store(0, std::memory_order_release);
+    old_sink->notifyMaybeReady();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    EXPECT_EQ(fake_rdma->status_calls.load(), 0)
+        << "late notify from a freed batch must be closed/generation-stale";
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(new_batch, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    EXPECT_TRUE(engine.freeBatch(new_batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
 }  // namespace

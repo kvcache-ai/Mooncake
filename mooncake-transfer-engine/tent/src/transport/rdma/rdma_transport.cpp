@@ -320,19 +320,22 @@ Status RdmaTransport::install(std::string& local_segment_name,
 
 Status RdmaTransport::uninstall() {
     if (installed_) {
-        // Stop notification worker thread
-        notify_worker_running_ = false;
-        if (notify_worker_.joinable()) {
-            notify_worker_.join();
-        }
-
-        workers_.reset();
+        drain();
         metadata_.reset();
         local_buffer_manager_.clear();
         context_set_.clear();
         context_name_lookup_.clear();
         installed_ = false;
     }
+    return Status::OK();
+}
+
+Status RdmaTransport::drain() {
+    notify_worker_running_ = false;
+    if (notify_worker_.joinable()) {
+        notify_worker_.join();
+    }
+    workers_.reset();
     return Status::OK();
 }
 
@@ -399,6 +402,7 @@ Status RdmaTransport::submitTransferTasks(
         auto* task = RdmaTaskStorage::Get().allocate();
         rdma_batch->task_list.push_back(task);
         task->request = request;
+        task->terminal_sink = rdma_batch->sink;
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;
