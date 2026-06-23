@@ -58,6 +58,7 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+class BatchEvictBenchTest;
 }  // namespace test
 
 /*
@@ -73,6 +74,7 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class test::BatchEvictBenchTest;
     friend class test::MasterServiceTenantQuotaTest;
 
    public:
