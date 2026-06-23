@@ -78,7 +78,7 @@ class RdmaEndPoint {
     struct CompletionToken {
         std::atomic<RdmaEndPoint *> endpoint{nullptr};
         std::atomic<Transport::Slice *> slice{nullptr};
-        std::atomic<volatile int *> qp_depth{nullptr};
+        std::atomic<std::atomic<int> *> qp_depth{nullptr};
         std::atomic<bool> fallback_completed{false};
     };
 
@@ -225,13 +225,13 @@ class RdmaEndPoint {
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
 
-    volatile int *wr_depth_list_;
+    std::atomic<int> *wr_depth_list_;
     int max_wr_depth_;
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
 
     std::atomic<bool> active_;
-    volatile int *cq_outstanding_;
+    std::atomic<int> *cq_outstanding_;
     std::atomic<uint64_t> inactive_time_{0};
     int finish_destroy_retries_ = 0;
     bool needs_manual_completion_ = false;

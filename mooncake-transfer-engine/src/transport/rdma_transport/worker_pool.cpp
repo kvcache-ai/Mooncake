@@ -330,7 +330,7 @@ void WorkerPool::performPostSend(int thread_id) {
 void WorkerPool::performPollCq(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
-    std::unordered_map<volatile int *, int> qp_depth_set;
+    std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     SliceList failed_slice_list;  // Unified: collect all slices for redispatch
     for (int cq_index = thread_id; cq_index < context_.cqCount();
          cq_index += kTransferWorkerCount) {
@@ -454,12 +454,12 @@ void WorkerPool::performPollCq(int thread_id) {
             delete token;
         }
         if (claimed_completion_count)
-            __sync_fetch_and_sub(context_.cqOutstandingCount(cq_index),
-                                 claimed_completion_count);
+            context_.cqOutstandingCount(cq_index)->fetch_sub(
+                claimed_completion_count, std::memory_order_relaxed);
     }
 
     for (auto &entry : qp_depth_set)
-        __sync_fetch_and_sub(entry.first, entry.second);
+        entry.first->fetch_sub(entry.second, std::memory_order_relaxed);
 
     if (processed_slice_count) {
         processed_slice_count_.fetch_add(processed_slice_count);

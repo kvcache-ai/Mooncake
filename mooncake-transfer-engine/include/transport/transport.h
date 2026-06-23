@@ -132,7 +132,7 @@ class Transport {
                 mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                volatile int *qp_depth;
+                std::atomic<int> *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer

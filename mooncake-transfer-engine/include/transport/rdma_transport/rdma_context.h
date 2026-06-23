@@ -61,8 +61,33 @@ struct GidSelectionSnapshot {
 
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
+    RdmaCq(const RdmaCq &other)
+        : native(other.native),
+          outstanding(other.outstanding.load(std::memory_order_relaxed)) {}
+    RdmaCq &operator=(const RdmaCq &other) {
+        if (this == &other) return *this;
+        native = other.native;
+        outstanding.store(other.outstanding.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        return *this;
+    }
+    RdmaCq(RdmaCq &&other) noexcept
+        : native(other.native),
+          outstanding(other.outstanding.load(std::memory_order_relaxed)) {
+        other.native = nullptr;
+        other.outstanding.store(0, std::memory_order_relaxed);
+    }
+    RdmaCq &operator=(RdmaCq &&other) noexcept {
+        if (this == &other) return *this;
+        native = other.native;
+        outstanding.store(other.outstanding.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        other.native = nullptr;
+        other.outstanding.store(0, std::memory_order_relaxed);
+        return *this;
+    }
     ibv_cq *native;
-    volatile int outstanding;
+    std::atomic<int> outstanding;
 };
 
 struct MemoryRegionMeta {
@@ -192,7 +217,7 @@ class RdmaContext {
 
     ibv_cq *cq();
 
-    volatile int *cqOutstandingCount(int cq_index) {
+    std::atomic<int> *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
     }
 

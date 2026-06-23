@@ -129,9 +129,9 @@ void RdmaEndPoint::completePendingSlicesAsFailed(
         if (!slice) continue;
         auto *qp_depth = token->qp_depth.load(std::memory_order_acquire);
         if (qp_depth) {
-            __sync_fetch_and_sub(qp_depth, 1);
+            qp_depth->fetch_sub(1, std::memory_order_relaxed);
         }
-        __sync_fetch_and_sub(cq_outstanding_, 1);
+        cq_outstanding_->fetch_sub(1, std::memory_order_relaxed);
         slice->markFailed();
         // A CQE may still arrive after the destruction fallback has already
         // completed this slice. Keep the token alive for that late CQE, but
@@ -182,19 +182,19 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
-    cq_outstanding_ = (volatile int *)cq->cq_context;
+    cq_outstanding_ = static_cast<std::atomic<int> *>(cq->cq_context);
 
     max_wr_depth_ = (int)max_wr_depth;
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
-    wr_depth_list_ = new volatile int[num_qp_list]();
+    wr_depth_list_ = new std::atomic<int>[num_qp_list]();
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
     for (size_t i = 0; i < num_qp_list; ++i) {
-        wr_depth_list_[i] = 0;
+        wr_depth_list_[i].store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.send_cq = cq;
@@ -244,15 +244,18 @@ int RdmaEndPoint::deconstructLocked() {
     bool displayed = false;
     if (wr_depth_list_) {
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            auto outstanding =
+                wr_depth_list_[i].load(std::memory_order_relaxed);
+            if (outstanding != 0) {
                 if (!displayed) {
                     LOG(WARNING)
                         << "Outstanding work requests found, CQ will not "
                            "be generated";
                     displayed = true;
                 }
-                __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-                wr_depth_list_[i] = 0;
+                cq_outstanding_->fetch_sub(outstanding,
+                                           std::memory_order_relaxed);
+                wr_depth_list_[i].store(0, std::memory_order_relaxed);
             }
         }
     }
@@ -343,7 +346,7 @@ bool RdmaEndPoint::finishDestroy() {
         // never be flushed; enforce a timeout to avoid leaking forever.
         bool has_outstanding = false;
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
                 has_outstanding = true;
                 break;
             }
@@ -848,12 +851,15 @@ int RdmaEndPoint::disconnectUnlocked() {
 
     if (wr_depth_list_) {
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            auto outstanding =
+                wr_depth_list_[i].load(std::memory_order_relaxed);
+            if (outstanding != 0) {
                 LOG(WARNING)
                     << "Outstanding work requests remained after pending "
                        "completion, correcting counters";
-                __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-                wr_depth_list_[i] = 0;
+                cq_outstanding_->fetch_sub(outstanding,
+                                           std::memory_order_relaxed);
+                wr_depth_list_[i].store(0, std::memory_order_relaxed);
             }
         }
     }
@@ -913,7 +919,8 @@ int RdmaEndPoint::submitPostSend(
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
     const size_t requested = slice_list.size();
-    int cq_remaining = int(globalConfig().max_cqe) - *cq_outstanding_;
+    int cq_remaining = int(globalConfig().max_cqe) -
+                       cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
 
     // Only allocate for the max number of WRs we can actually post per QP,
@@ -929,7 +936,8 @@ int RdmaEndPoint::submitPostSend(
     for (size_t qp_index = 0;
          qp_index < num_qp && cq_remaining > 0 && cursor < requested;
          ++qp_index) {
-        int qp_avail = max_wr_depth_ - wr_depth_list_[qp_index];
+        int qp_avail = max_wr_depth_ -
+                       wr_depth_list_[qp_index].load(std::memory_order_relaxed);
         if (qp_avail <= 0) continue;
 
         size_t remaining_qps = num_qp - qp_index;
@@ -977,8 +985,8 @@ int RdmaEndPoint::submitPostSend(
         addPendingTokens(token_list);
 
         ibv_send_wr *bad_wr = nullptr;
-        __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
-        __sync_fetch_and_add(cq_outstanding_, wr_count);
+        wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_relaxed);
+        cq_outstanding_->fetch_add(wr_count, std::memory_order_relaxed);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
             PLOG(ERROR) << "Failed to ibv_post_send";
@@ -993,8 +1001,9 @@ int RdmaEndPoint::submitPostSend(
                 slice->rdma.qp_depth = nullptr;
                 delete token_list[i];
                 token_list[i] = nullptr;
-                __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
-                __sync_fetch_and_sub(cq_outstanding_, 1);
+                wr_depth_list_[qp_index].fetch_sub(1,
+                                                   std::memory_order_relaxed);
+                cq_outstanding_->fetch_sub(1, std::memory_order_relaxed);
                 bad_wr = bad_wr->next;
             }
             total_posted += wr_count;
