@@ -1,0 +1,64 @@
+# Wire-compatibility CI gate for Mooncake Store.
+#
+# Complement to issue #1920 (rolling-upgrade RFC). #1920 proposes "enforce via
+# code review"; this job enforces mechanically. It rebuilds the wire-contract
+# golden generator from the PR's tree, self-checks the codec against recorded
+# reference codes, then diffs the live wire contract (coro_rpc function-ids +
+# struct_pack argument type-codes for every WrappedMasterService handler) against
+# the checked-in golden. Any drift -- a renamed RPC, a reordered/added bare
+# argument, or a layout change to a serialized struct -- fails the PR.
+#
+# An intentional, reviewed major-version wire break is landed by bumping the
+# protocol version and committing a regenerated golden (./check_wire_contract.sh
+# --update), which makes the break an explicit, reviewable diff.
+
+name: wire-compat-gate
+
+on:
+  pull_request:
+    paths:
+      - "mooncake-store/src/rpc_service.cpp"
+      - "mooncake-store/include/rpc_service.h"
+      - "mooncake-store/include/replica.h"
+      - "mooncake-store/include/types.h"
+      - "mooncake-store/include/allocator.h"
+      - "mooncake-store/src/master_client.cpp"
+      - "docs/rust-rewrite/wire-compat-rfc/gate/**"
+  workflow_dispatch: {}
+
+jobs:
+  wire-contract:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ git ca-certificates
+          g++ --version | head -1
+
+      - name: Fetch yalantinglibs headers
+        run: |
+          # The standalone gate needs only struct_pack + util/function_name.h.
+          # Pin the same yalantinglibs revision the build uses; header-only checkout.
+          git clone --depth 1 https://github.com/alibaba/yalantinglibs.git /tmp/ylt
+          echo "YLT_INCLUDE=/tmp/ylt/include" >> "$GITHUB_ENV"
+
+      - name: Run wire-contract gate (standalone golden)
+        run: |
+          chmod +x docs/rust-rewrite/wire-compat-rfc/gate/check_wire_contract.sh
+          docs/rust-rewrite/wire-compat-rfc/gate/check_wire_contract.sh \
+            --ylt "${YLT_INCLUDE}"
+
+      # Optional second face: the in-build ctest computes the same codes over the
+      # real production structs (Segment, *Request/*Response) and carries the
+      # cross-version interop round-trips. Enable once the test target is wired
+      # into mooncake-store/tests/CMakeLists.txt.
+      #
+      # - name: Build + run in-build wire-contract ctest
+      #   run: |
+      #     cmake -S . -B build -DBUILD_TESTING=ON
+      #     cmake --build build --target wire_contract_test
+      #     ctest --test-dir build -R wire_contract --output-on-failure

@@ -1,0 +1,64 @@
+# Mooncake Store master wire-contract golden
+# source: rpc_service.cpp RegisterRpcService (v0.3.11.post1)
+# function_id = MD5Hash32("mooncake::WrappedMasterService::<M>")
+# arg_type_code = struct_pack::get_type_code<args...> (& 0xFFFFFFFE); OMITTED = covered by in-build gate
+# columns: name function_id arg_type_code
+ExistKey                   0x89385f09 0x9dcffa76
+BatchQueryIp               0x7ce454a9 0xa1eea206
+BatchReplicaClear          0x137b01fc 0x472b2fa2
+GetReplicaListByRegex      0xfe6af93c 0x9dcffa76
+GetReplicaList             0x1f7ef174 0x9dcffa76
+BatchGetReplicaList        0x1b0d20ff 0x8a86e11a
+PutStart                   0x65ea9ac1 0x2b2f212e
+PutEnd                     0x8e8b2099 0x61232de0
+PutRevoke                  0xa0767c44 0x61232de0
+BatchPutStart              0x56be1822 0x4fb9d994
+BatchPutEnd                0x80e020ab 0x3af685d6
+BatchPutRevoke             0xb82567aa 0x3af685d6
+UpsertStart                0xa1335e41 0x2b2f212e
+UpsertEnd                  0x2e20e258 0x61232de0
+UpsertRevoke               0x610b042e 0x61232de0
+BatchUpsertStart           0xd564b423 OMITTED
+BatchUpsertEnd             0xb1bcd72f 0x581e61a4
+BatchUpsertRevoke          0x9093ae79 0x581e61a4
+Remove                     0xf1b09774 0xdbcf8900
+RemoveByRegex              0xfccc1fd3 0xdbcf8900
+RemoveAll                  0xd978ceb0 0x13c8ffd8
+BatchRemove                0x5902407d 0xa389d4d8
+MountSegment               0x3e7ec4bb OMITTED
+MountNoFSegment            0x14d3f74c OMITTED
+ReMountSegment             0x0b053b72 OMITTED
+ReMountNoFSegment          0xc15a1a37 OMITTED
+UnmountSegment             0x6f10b465 0xd4c512e0
+GracefulUnmountSegment     0xa4ec3175 0x8e092e9c
+UnmountNoFSegment          0xbb263e21 0xd4c512e0
+GetAllNoFSegments          0x04eb3c85 OMITTED
+GetNoFSegmentsByName       0x6b194364 0x9dcffa76
+Ping                       0xd6c2dae5 0x3c6d83e0
+GetFsdir                   0x3e585123 OMITTED
+QuerySegmentStatus         0x79b8af8c 0x9dcffa76
+QuerySegmentStatusById     0x573fd453 0x3c6d83e0
+GetStorageConfig           0x8da9b0a6 OMITTED
+BatchExistKey              0xb89fa6b0 0x8a86e11a
+ServiceReady               0x7b81bb56 OMITTED
+MountLocalDiskSegment      0x281fc089 0xbfd50c0e
+OffloadObjectHeartbeat     0x2a9b08f8 0xbfd50c0e
+ReportSsdCapacity          0x7e109a9c 0x70a841e4
+NotifyOffloadSuccess       0x2df85842 OMITTED
+PromotionObjectHeartbeat   0x0a19072a 0x3c6d83e0
+PromotionAllocStart        0x36430f70 0x0e0cafe4
+NotifyPromotionSuccess     0xfe6e3d25 0x1fce199e
+NotifyPromotionFailure     0xcbecf2b4 0x1fce199e
+CopyStart                  0x29836d38 0x14827658
+CopyEnd                    0xf696f1d9 0x1fce199e
+CopyRevoke                 0x1f558b5c 0x1fce199e
+MoveStart                  0x458e4ce0 0x134529b8
+MoveEnd                    0x636a8b47 0x1fce199e
+MoveRevoke                 0x919b315f 0x1fce199e
+EvictDiskReplica           0xd00ac42b 0x61232de0
+BatchEvictDiskReplica      0x74d1e980 0x3af685d6
+CreateCopyTask             0x7801dba0 0xd1dc057a
+CreateMoveTask             0x97200d2c 0xa429cc38
+QueryTask                  0x07816a74 0x3c6d83e0
+FetchTasks                 0xdf141844 0x759a9b84
+MarkTaskToComplete         0xa7060015 OMITTED
