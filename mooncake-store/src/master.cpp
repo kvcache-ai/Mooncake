@@ -1279,9 +1279,21 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    // Wire metadata cleanup on client timeout into the serving primary. The
+    // stale-metadata problem is identical in HA mode (the primary still handles
+    // heartbeats and unmounts), so prefer the co-located in-process server,
+    // otherwise use the separately-deployed HTTP endpoint derived above.
+    mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
+    if (master_config.enable_metadata_cleanup_on_timeout &&
+        master_config.enable_http_metadata_server) {
+        metadata_server_ptr = http_metadata_server.get();
+    }
+
     if (master_config.enable_ha) {
-        mooncake::ha::MasterServiceSupervisor supervisor(
-            mooncake::MasterServiceSupervisorConfig{master_config});
+        mooncake::MasterServiceSupervisorConfig supervisor_config{master_config};
+        supervisor_config.http_metadata_server = metadata_server_ptr;
+        supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
+        mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
         return supervisor.Start();
     } else {
         // version is not used in non-HA mode, just pass a dummy value
@@ -1295,15 +1307,6 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        // Wire metadata cleanup on client timeout. Prefer the co-located
-        // in-process server; otherwise use the separately-deployed HTTP
-        // metadata server derived from the cluster configuration above.
-        mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
-        if (master_config.enable_metadata_cleanup_on_timeout &&
-            master_config.enable_http_metadata_server) {
-            metadata_server_ptr = http_metadata_server.get();
-        }
-
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(
                 mooncake::WrappedMasterServiceConfig(master_config, version),

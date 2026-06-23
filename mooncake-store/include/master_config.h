@@ -11,6 +11,10 @@
 
 namespace mooncake {
 
+// Forward declaration for the optional co-located HTTP metadata server pointer
+// carried through to the HA serve phase (see MasterServiceSupervisorConfig).
+class HttpMetadataServer;
+
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
     std::string_view etcd_endpoints) {
@@ -208,6 +212,18 @@ class MasterServiceSupervisorConfig {
     // Pod identity for K8s label-based routing
     std::string pod_name;
     std::string pod_namespace;
+
+    // Metadata cleanup on client timeout. Not derived from MasterConfig: the
+    // co-located server pointer and the derived remote URL are resolved in
+    // main() and set explicitly before the supervisor starts. The serving
+    // primary forwards them to WrappedMasterService so cleanup works in HA the
+    // same way it does in the non-HA path.
+    // - http_metadata_server: in-process server when co-located
+    //   (enable_http_metadata_server=true); nullptr otherwise.
+    // - http_metadata_remote_url: http(s) endpoint when the metadata server is
+    //   deployed separately; empty otherwise.
+    HttpMetadataServer* http_metadata_server = nullptr;
+    std::string http_metadata_remote_url;
 
     MasterServiceSupervisorConfig() = default;
 
