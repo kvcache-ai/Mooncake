@@ -47,6 +47,51 @@ using gpu_staging::SetDevice;
 
 namespace {
 
+// Rate-limits a repeating log site. Logs immediately on the first call after
+// construction or after a quiet period, then suppresses repeats and reports
+// how many were suppressed at most once per kInterval. This is purely a
+// frequency gate: it changes nothing about control flow, retry cadence, or
+// reconnect behavior. The caller still executes every loop iteration exactly
+// as before; only the LOG() emission is gated. Each hot site uses its own
+// thread_local instance, so the heartbeat/monitor loops (one dedicated thread
+// per client) get an independent counter with no locking and no shared state.
+class LogThrottle {
+   public:
+    // Returns true if the caller should emit the log line now. When it returns
+    // true and *suppressed > 0, the caller should append a
+    // "(repeated N times in last 30s)" suffix describing the gap. When a
+    // condition clears (e.g. ping succeeds), the loop stops hitting this site;
+    // after kInterval of quiet the throttle re-arms so the next failure
+    // episode logs immediately again.
+    bool ShouldLog(uint64_t* suppressed) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!armed_ || now - last_logged_ >= kInterval) {
+            *suppressed = suppressed_;
+            suppressed_ = 0;
+            last_logged_ = now;
+            armed_ = true;
+            return true;
+        }
+        ++suppressed_;
+        return false;
+    }
+
+   private:
+    static constexpr auto kInterval = std::chrono::seconds(30);
+    std::chrono::steady_clock::time_point last_logged_{};
+    uint64_t suppressed_ = 0;
+    bool armed_ = false;
+};
+
+// Builds the " (repeated N times in last 30s)" suffix appended to a throttled
+// log line, or an empty string when nothing was suppressed since last emit.
+std::string ThrottleSuffix(uint64_t suppressed) {
+    if (suppressed == 0) {
+        return std::string();
+    }
+    return " (repeated " + std::to_string(suppressed) + " times in last 30s)";
+}
+
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
     const char* raw_value = std::getenv("MC_STORE_NUMA_SOCKET_ID");
@@ -599,8 +644,13 @@ void Client::LeaderMonitorThreadMain() {
         auto view_change = leader_coordinator_->WaitForViewChange(
             known_version, kViewChangeTimeout);
         if (!view_change) {
-            LOG(WARNING) << "Failed to wait for leader view change: "
-                         << toString(view_change.error());
+            static thread_local LogThrottle wait_view_throttle;
+            uint64_t suppressed = 0;
+            if (wait_view_throttle.ShouldLog(&suppressed)) {
+                LOG(WARNING) << "Failed to wait for leader view change: "
+                             << toString(view_change.error())
+                             << ThrottleSuffix(suppressed);
+            }
             std::this_thread::sleep_for(kErrorRetryInterval);
             continue;
         }
@@ -611,9 +661,14 @@ void Client::LeaderMonitorThreadMain() {
 
         auto err = SwitchLeader(view_change->current_view.value());
         if (err != ErrorCode::OK) {
-            LOG(WARNING) << "Failed to switch to leader "
-                         << view_change->current_view->leader_address << ": "
-                         << toString(err);
+            static thread_local LogThrottle monitor_switch_throttle;
+            uint64_t suppressed = 0;
+            if (monitor_switch_throttle.ShouldLog(&suppressed)) {
+                LOG(WARNING) << "Failed to switch to leader "
+                             << view_change->current_view->leader_address
+                             << ": " << toString(err)
+                             << ThrottleSuffix(suppressed);
+            }
             std::this_thread::sleep_for(kErrorRetryInterval);
         }
     }
@@ -3786,7 +3841,12 @@ void Client::StorageHeartbeatThreadMain() {
         ping_fail_count++;
         last_ping_success_.store(false);
         if (ping_fail_count < max_ping_fail_count) {
-            LOG(ERROR) << "Failed to ping master";
+            static thread_local LogThrottle ping_fail_throttle;
+            uint64_t suppressed = 0;
+            if (ping_fail_throttle.ShouldLog(&suppressed)) {
+                LOG(ERROR) << "Failed to ping master"
+                           << ThrottleSuffix(suppressed);
+            }
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(fail_ping_interval_ms));
             continue;
@@ -3794,19 +3854,34 @@ void Client::StorageHeartbeatThreadMain() {
 
         // Exceeded ping failure threshold. Reconnect based on mode.
         if (leader_coordinator_) {
-            LOG(ERROR)
-                << "Failed to ping master for " << ping_fail_count
-                << " times; fetching latest master view and reconnecting";
+            static thread_local LogThrottle ping_view_throttle;
+            uint64_t suppressed = 0;
+            if (ping_view_throttle.ShouldLog(&suppressed)) {
+                LOG(ERROR)
+                    << "Failed to ping master for " << ping_fail_count
+                    << " times; fetching latest master view and reconnecting"
+                    << ThrottleSuffix(suppressed);
+            }
             auto current_view = leader_coordinator_->ReadCurrentView();
             if (!current_view) {
-                LOG(ERROR) << "Failed to get new master view: "
-                           << toString(current_view.error());
+                static thread_local LogThrottle get_view_throttle;
+                uint64_t suppressed = 0;
+                if (get_view_throttle.ShouldLog(&suppressed)) {
+                    LOG(ERROR) << "Failed to get new master view: "
+                               << toString(current_view.error())
+                               << ThrottleSuffix(suppressed);
+                }
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(fail_ping_interval_ms));
                 continue;
             }
             if (!current_view.value().has_value()) {
-                LOG(WARNING) << "No active master view is published yet";
+                static thread_local LogThrottle no_view_throttle;
+                uint64_t suppressed = 0;
+                if (no_view_throttle.ShouldLog(&suppressed)) {
+                    LOG(WARNING) << "No active master view is published yet"
+                                 << ThrottleSuffix(suppressed);
+                }
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(fail_ping_interval_ms));
                 continue;
@@ -3815,8 +3890,13 @@ void Client::StorageHeartbeatThreadMain() {
             const auto& next_view = current_view.value().value();
             auto err = SwitchLeader(next_view);
             if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to connect to master "
-                           << next_view.leader_address << ": " << toString(err);
+                static thread_local LogThrottle switch_leader_throttle;
+                uint64_t suppressed = 0;
+                if (switch_leader_throttle.ShouldLog(&suppressed)) {
+                    LOG(ERROR) << "Failed to connect to master "
+                               << next_view.leader_address << ": "
+                               << toString(err) << ThrottleSuffix(suppressed);
+                }
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(fail_ping_interval_ms));
                 continue;
@@ -3826,13 +3906,23 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
         } else {
             const std::string current_master_address = direct_master_address_;
-            LOG(ERROR) << "Failed to ping master for " << ping_fail_count
-                       << " times (non-HA); reconnecting to "
-                       << current_master_address;
+            static thread_local LogThrottle non_ha_reconnect_throttle;
+            uint64_t suppressed = 0;
+            if (non_ha_reconnect_throttle.ShouldLog(&suppressed)) {
+                LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+                           << " times (non-HA); reconnecting to "
+                           << current_master_address
+                           << ThrottleSuffix(suppressed);
+            }
             auto err = master_client_.Connect(current_master_address);
             if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Reconnect failed to " << current_master_address
-                           << ": " << toString(err);
+                static thread_local LogThrottle non_ha_fail_throttle;
+                uint64_t suppressed = 0;
+                if (non_ha_fail_throttle.ShouldLog(&suppressed)) {
+                    LOG(ERROR) << "Reconnect failed to "
+                               << current_master_address << ": "
+                               << toString(err) << ThrottleSuffix(suppressed);
+                }
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(fail_ping_interval_ms));
                 continue;
