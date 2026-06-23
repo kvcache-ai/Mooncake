@@ -102,6 +102,45 @@ setup_musa_library_compat() {
     return 1
   }
 
+  write_build_only_stub() {
+    local soname="$1"
+    local source="${MUSA_COMPAT_LIB_DIR}/${soname}.stub.c"
+    case "${soname}" in
+      libmudnn.so.3)
+        cat > "${source}" <<'C'
+void mooncake_musa_ci_mudnn_stub(void) {}
+C
+        ;;
+      libmccl.so.2)
+        cat > "${source}" <<'C'
+const char *mcclGetErrorString() { return "mccl unavailable in build-only CI"; }
+int mcclGetVersion(int *version) { if (version) *version = 0; return 0; }
+int mcclAllGather() { return 0; }
+int mcclAllReduce() { return 0; }
+int mcclBcast() { return 0; }
+int mcclBroadcast() { return 0; }
+int mcclCommAbort() { return 0; }
+int mcclCommCount() { return 0; }
+int mcclCommDestroy() { return 0; }
+int mcclCommGetAsyncError() { return 0; }
+int mcclCommInitRank() { return 0; }
+int mcclCommUserRank() { return 0; }
+int mcclGetUniqueId() { return 0; }
+int mcclGroupEnd() { return 0; }
+int mcclGroupStart() { return 0; }
+int mcclRecv() { return 0; }
+int mcclReduce() { return 0; }
+int mcclReduceScatter() { return 0; }
+int mcclSend() { return 0; }
+C
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    cc -shared -fPIC -Wl,-soname,"${soname}" "${source}" -o "${MUSA_COMPAT_LIB_DIR}/${soname}"
+  }
+
   local soname
   for soname in \
     libmusart.so.4 \
@@ -114,7 +153,13 @@ setup_musa_library_compat() {
     libmusparse.so \
     libmufft.so.1; do
     if ! link_musa_soname "${soname}"; then
-      echo "warning: could not find ${soname} under ${MUSA_HOME}" >&2
+      # The public MUSA devel CI image does not ship every optional runtime
+      # library required by the vendor torch_musa wheel.  These stubs are only
+      # to make torch_musa's build helpers importable; the CI job builds but
+      # does not execute MUDNN or MCCL code paths.
+      if ! write_build_only_stub "${soname}"; then
+        echo "warning: could not find ${soname} under ${MUSA_HOME}" >&2
+      fi
     fi
   done
 }
