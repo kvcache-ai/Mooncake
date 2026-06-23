@@ -90,7 +90,10 @@ func NewEventManager(
 func (m *EventManager) Start() error {
 	slog.Info("Starting KV Event Manager...")
 
-	// Subscribe to all services concurrently
+	// Subscribe to all services concurrently.
+	// m.mu serialises the check-then-act inside subscribeToService and
+	// serialises with concurrent /register HTTP handlers so that
+	// m.subscribers, m.activeConfigs, and m.services stay consistent.
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(m.services))
 
@@ -98,7 +101,10 @@ func (m *EventManager) Start() error {
 		wg.Add(1)
 		go func(service common.ServiceConfig) {
 			defer wg.Done()
-			if err := m.subscribeToService(service); err != nil {
+			m.mu.Lock()
+			_, err := m.subscribeToService(service)
+			m.mu.Unlock()
+			if err != nil {
 				slog.Error("Failed to initiate subscription",
 					"service_type", service.Type,
 					"instance_id", service.InstanceID,
@@ -151,7 +157,7 @@ func makeServiceKey(instanceID string, tenantID string, dpRank int) string {
 	return fmt.Sprintf("%s|%s|%d", instanceID, tenantID, dpRank)
 }
 
-func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
+func (m *EventManager) subscribeToService(svc common.ServiceConfig) (bool, error) {
 	// Use (instance_id, tenant_id) as composite key to support multi-tenant replicas
 	svcKey := makeServiceKey(svc.InstanceID, svc.TenantID, svc.DPRank)
 	if svc.InstanceID == "" {
@@ -159,12 +165,12 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	}
 
 	if _, exists := m.subscribers.Load(svcKey); exists {
-		return nil
+		return false, nil
 	}
 
 	// Validate endpoint
 	if svc.Endpoint == "" {
-		return fmt.Errorf("endpoint is required")
+		return false, fmt.Errorf("endpoint is required")
 	}
 
 	// Use ReplayEndpoint directly, fallback to empty if not provided
@@ -192,12 +198,12 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	}
 
 	if err := zmq.ValidateConfig(zmqConfig); err != nil {
-		return fmt.Errorf("invalid ZMQ config: %w", err)
+		return false, fmt.Errorf("invalid ZMQ config: %w", err)
 	}
 
 	client := zmq.NewZMQClient(zmqConfig, handler)
 	if err := client.Start(); err != nil {
-		return fmt.Errorf("failed to start ZMQ client: %w", err)
+		return false, fmt.Errorf("failed to start ZMQ client: %w", err)
 	}
 
 	m.subscribers.Store(svcKey, client)
@@ -221,28 +227,44 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 		"replay_endpoint", replayEndpoint,
 	)
 
-	return nil
+	return true, nil
 }
 
 func (m *EventManager) unsubscribeFromService(instanceID string, tenantID string, dpRank int) {
 	svcKey := makeServiceKey(instanceID, tenantID, dpRank)
-	if client, exists := m.subscribers.Load(svcKey); exists {
-		client.Stop()
-		m.subscribers.Delete(svcKey)
-		m.activeConfigs.Delete(svcKey)
 
-		// Remove engine_instance from tenant's instance set
-		m.tenantMutex.Lock()
-		if instanceSet, exists := m.tenantInstanceMap[tenantID]; exists {
-			delete(instanceSet, instanceID)
-		}
-		m.tenantMutex.Unlock()
-		slog.Info("Successfully unsubscribed from service",
-			"service_key", svcKey,
-			"instance_id", instanceID,
-			"tenant_id", tenantID,
-		)
+	// Atomically remove from tracking maps under m.mu so that a
+	// concurrent /register sees a consistent (empty) state.
+	m.mu.Lock()
+	client, exists := m.subscribers.LoadAndDelete(svcKey)
+	if exists {
+		m.activeConfigs.Delete(svcKey)
 	}
+	m.mu.Unlock()
+
+	if client == nil {
+		return
+	}
+
+	// Stop the ZMQ client OUTSIDE m.mu to avoid deadlock:
+	// HandleEvent acquires m.mu.RLock().  If the ZMQ event-loop
+	// goroutine is currently inside HandleEvent (or about to
+	// enter it), holding m.mu while waiting for that goroutine to
+	// exit via client.Stop() → wg.Wait() would deadlock.
+	client.Stop()
+
+	// Remove engine_instance from tenant's instance set
+	m.tenantMutex.Lock()
+	if instanceSet, exists := m.tenantInstanceMap[tenantID]; exists {
+		delete(instanceSet, instanceID)
+	}
+	m.tenantMutex.Unlock()
+
+	slog.Info("Successfully unsubscribed from service",
+		"service_key", svcKey,
+		"instance_id", instanceID,
+		"tenant_id", tenantID,
+	)
 }
 
 func (m *EventManager) getIndexer() *prefixindex.PrefixCacheTable {
@@ -388,22 +410,27 @@ func (m *EventManager) StartHTTPServer() error {
 			AdditionalSalt: additionalSalt,
 		}
 
-		if err := m.subscribeToService(svc); err != nil {
+		m.mu.Lock()
+		isNew, err := m.subscribeToService(svc)
+		if err != nil {
+			m.mu.Unlock()
 			slog.Error("Dynamic register failed", "instance_id", req.InstanceID, "err", err)
 			http.Error(w, fmt.Sprintf("Failed to subscribe: %v", err), http.StatusInternalServerError)
 			return
 		}
-		m.services = append(m.services, svc)
-		modelContext := &prefixindex.ModelContext{
-			TenantID:       tenantID,
-			ModelName:      req.ModelName,
-			LoraName:       loraName,
-			BlockSize:      req.BlockSize,
-			AdditionalSalt: additionalSalt,
-			InstanceID:     svc.InstanceID,
+		if isNew {
+			m.services = append(m.services, svc)
+			modelContext := &prefixindex.ModelContext{
+				TenantID:       tenantID,
+				ModelName:      req.ModelName,
+				LoraName:       loraName,
+				BlockSize:      req.BlockSize,
+				AdditionalSalt: additionalSalt,
+				InstanceID:     svc.InstanceID,
+			}
+			m.indexer.AddDpSize(modelContext, int64(svc.DPRank))
 		}
-
-		m.indexer.AddDpSize(modelContext, int64(svc.DPRank))
+		m.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
@@ -433,8 +460,15 @@ func (m *EventManager) StartHTTPServer() error {
 		}
 		targetKey := makeServiceKey(req.InstanceID, targetTenant, req.DPRank)
 
-		// Direct lookup and removal
-		if _, exists := m.activeConfigs.Load(targetKey); !exists {
+		// Direct lookup and removal.
+		// Hold m.mu only for the existence check; unsubscribeFromService
+		// handles map removal under its own m.mu and calls client.Stop()
+		// outside the lock to avoid deadlock with HandleEvent's RLock.
+		m.mu.Lock()
+		_, exists := m.activeConfigs.Load(targetKey)
+		m.mu.Unlock()
+
+		if !exists {
 			http.Error(w, fmt.Sprintf("service not found: %s", targetKey), http.StatusNotFound)
 			return
 		}
