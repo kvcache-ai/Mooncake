@@ -712,8 +712,7 @@ TEST_F(MasterServiceSSDTest, SsdFreeRatioFirstPrefersFresherSsdAfterOffload) {
 
 // Test that EvictDiskReplica decrements ssd_used_bytes so that the evicted
 // segment becomes preferred again for the next allocation.
-TEST_F(MasterServiceSSDTest,
-       EvictDiskReplicaDecrementsLocalDiskUsageTracking) {
+TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsLocalDiskUsageTracking) {
     auto service = CreateSsdAwareOffloadService();
     UUID client1 = generate_uuid();
     UUID client2 = generate_uuid();
@@ -758,15 +757,14 @@ TEST_F(MasterServiceSSDTest,
        SsdFreeRatioFirstVsRandomMasterServicePerformance) {
     constexpr int kNumNodes = 32;
     constexpr size_t kSegmentSize = 8 * 1024 * 1024;  // 8 MiB each
-    constexpr size_t kSliceSize = 512;                 // 512 B – focus on strategy cost
+    constexpr size_t kSliceSize = 512;  // 512 B – focus on strategy cost
     constexpr int kWarmupRounds = 50;
     constexpr int kBenchmarkRounds = 300;
 
     // Build a MasterService with kNumNodes segments. with_ssd=true also
     // mounts LocalDisk and reports varied SSD capacity per node.
     auto buildAndMount =
-        [&](AllocationStrategyType strategy, bool with_ssd,
-            size_t base_start,
+        [&](AllocationStrategyType strategy, bool with_ssd, size_t base_start,
             const std::string& tag) -> std::unique_ptr<MasterService> {
         MasterServiceConfig config;
         config.enable_offload = with_ssd;
@@ -846,19 +844,19 @@ TEST_F(MasterServiceSSDTest,
         << "\n=== MasterService Real-Path Performance (PutStart+PutEnd) ===\n"
         << "Nodes: " << kNumNodes << " | Slice: " << kSliceSize
         << " B | Rounds: " << kBenchmarkRounds << "\n\n"
-        << "  (A) RANDOM, offload=OFF (baseline):         "
-        << elapsed_a.count() << " us  |  " << std::fixed
-        << std::setprecision(3) << us_per_op(elapsed_a) << " us/op\n"
-        << "  (B) RANDOM, offload=ON  (disk replica cost):"
-        << elapsed_b.count() << " us  |  " << us_per_op(elapsed_b)
-        << " us/op  [" << std::setprecision(2) << ratio_b_a << "x vs A]\n"
-        << "  (C) SSD_FREE_RATIO_FIRST, offload=ON:       "
-        << elapsed_c.count() << " us  |  " << us_per_op(elapsed_c)
-        << " us/op  [" << ratio_c_b << "x vs B]\n\n"
+        << "  (A) RANDOM, offload=OFF (baseline):         " << elapsed_a.count()
+        << " us  |  " << std::fixed << std::setprecision(3)
+        << us_per_op(elapsed_a) << " us/op\n"
+        << "  (B) RANDOM, offload=ON  (disk replica cost):" << elapsed_b.count()
+        << " us  |  " << us_per_op(elapsed_b) << " us/op  ["
+        << std::setprecision(2) << ratio_b_a << "x vs A]\n"
+        << "  (C) SSD_FREE_RATIO_FIRST, offload=ON:       " << elapsed_c.count()
+        << " us  |  " << us_per_op(elapsed_c) << " us/op  [" << ratio_c_b
+        << "x vs B]\n\n"
         << "  A→B  disk-replica overhead:   " << std::setprecision(1)
         << (ratio_b_a - 1.0) * 100.0 << "%\n"
-        << "  B→C  SSD-ranking overhead:    "
-        << (ratio_c_b - 1.0) * 100.0 << "%\n"
+        << "  B→C  SSD-ranking overhead:    " << (ratio_c_b - 1.0) * 100.0
+        << "%\n"
         << "  A→C  total overhead vs origin:" << (ratio_c_a - 1.0) * 100.0
         << "%\n\n";
 }
