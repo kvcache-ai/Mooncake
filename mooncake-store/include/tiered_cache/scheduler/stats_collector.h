@@ -51,6 +51,7 @@ inline size_t DefaultSnapshotLimit() { return 4096; }
 enum class AccessStatMetric {
     kRecentHeat,
     kRecencyRank,
+    kFrequency,
 };
 
 /**

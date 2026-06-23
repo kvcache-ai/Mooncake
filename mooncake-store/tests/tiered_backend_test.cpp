@@ -4,12 +4,15 @@
 #include <fstream>
 #include <filesystem>
 #include <cstdlib>
+#include <limits>
+#include <memory>
 
 #ifdef USE_ASCEND_DRAM_TIER
 #include "acl/acl.h"
 #endif
 
 #include "tiered_cache/tiered_backend.h"
+#include "tiered_cache/tiers/cache_tier.h"
 #include "utils/common.h"
 
 // Helper function to parse JSON string using thread-safe CharReaderBuilder
@@ -39,6 +42,36 @@ static constexpr size_t BASIC_CAPACITY = 1024 * 1024 * 1024;         // 1GB
 static constexpr size_t HIGH_PRIORITY_CAPACITY = 512 * 1024 * 1024;  // 512MB
 static constexpr size_t LOW_PRIORITY_CAPACITY = 1024 * 1024 * 1024;  // 1GB
 static constexpr size_t SMALL_CAPACITY = 1 * 1024 * 1024;            // 1MB
+
+// A CacheTier whose capacity/usage are fixed at construction. Lets tests drive
+// otherwise-unreachable accounting states (e.g. a transient usage > capacity)
+// into GetTierViews without depending on a real allocator.
+class FixedStatsTier : public CacheTier {
+   public:
+    FixedStatsTier(UUID id, size_t capacity, size_t usage, MemoryType type)
+        : id_(id), capacity_(capacity), usage_(usage), type_(type) {}
+
+    tl::expected<void, ErrorCode> Init(TieredBackend*,
+                                       TransferEngine*) override {
+        return {};
+    }
+    tl::expected<void, ErrorCode> Allocate(size_t, DataSource&) override {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    tl::expected<void, ErrorCode> Free(DataSource) override { return {}; }
+    UUID GetTierId() const override { return id_; }
+    size_t GetCapacity() const override { return capacity_; }
+    size_t GetUsage() const override { return usage_; }
+    MemoryType GetMemoryType() const override { return type_; }
+    const std::vector<std::string>& GetTags() const override { return tags_; }
+
+   private:
+    UUID id_;
+    size_t capacity_;
+    size_t usage_;
+    MemoryType type_;
+    std::vector<std::string> tags_;
+};
 
 class TieredBackendTest : public ::testing::Test {
    protected:
@@ -127,7 +160,83 @@ class TieredBackendTest : public ::testing::Test {
 
         return handle;
     }
+
+    // Test seam: inject a synthetic tier directly into the backend's tier maps.
+    // TieredBackendTest is a friend of TieredBackend, so this can reach the
+    // private members (the TEST_F body, living in a derived class, cannot).
+    static void InjectTier(TieredBackend& backend,
+                           std::shared_ptr<CacheTier> tier, int priority) {
+        const UUID id = tier->GetTierId();
+        backend.tiers_[id] = std::move(tier);
+        backend.tier_info_[id] = TieredBackend::TierInfo{priority, {}};
+    }
 };
+
+// P0-3: a transient usage > capacity (concurrent accounting can briefly
+// over-report) must not wrap free_space around to ~SIZE_MAX, which would make
+// HasAvailableBytes (free_space >= required) accept any allocation.
+TEST_F(TieredBackendTest, GetTierViewsClampsFreeSpaceWhenUsageExceedsCapacity) {
+    TieredBackend backend;
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{7, 7}, /*capacity=*/1000,
+                                         /*usage=*/1500, MemoryType::DRAM),
+        /*priority=*/10);
+
+    auto views = backend.GetTierViews();
+    ASSERT_EQ(views.size(), 1u);
+    EXPECT_EQ(views[0].capacity, 1000u);
+    EXPECT_EQ(views[0].usage, 1500u);
+    // The bug: 1000 - 1500 underflows to a huge value. The fix saturates to 0,
+    // so the scheduler's free_space >= required_bytes check correctly rejects.
+    EXPECT_EQ(views[0].free_space, 0u);
+    EXPECT_NE(views[0].free_space, std::numeric_limits<size_t>::max());
+}
+
+// Sanity: the normal usage < capacity path still reports the exact remainder.
+TEST_F(TieredBackendTest, GetTierViewsReportsExactFreeSpaceBelowCapacity) {
+    TieredBackend backend;
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{8, 8}, /*capacity=*/1000,
+                                         /*usage=*/400, MemoryType::DRAM),
+        /*priority=*/10);
+
+    auto views = backend.GetTierViews();
+    ASSERT_EQ(views.size(), 1u);
+    EXPECT_EQ(views[0].free_space, 600u);
+}
+
+// P1-4: GetDramTierId underpins the DRAM-only local Put path. It must pick the
+// highest-priority DRAM tier and ignore non-DRAM tiers regardless of priority.
+TEST_F(TieredBackendTest, GetDramTierIdPicksHighestPriorityDram) {
+    TieredBackend backend;
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{1, 1}, 1000, 0, MemoryType::NVME),
+        /*priority=*/100);  // highest priority but NOT DRAM
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{2, 2}, 1000, 0, MemoryType::DRAM),
+        /*priority=*/20);
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{3, 3}, 1000, 0, MemoryType::DRAM),
+        /*priority=*/50);  // highest-priority DRAM
+
+    auto dram = backend.GetDramTierId();
+    ASSERT_TRUE(dram.has_value());
+    EXPECT_EQ(*dram, (UUID{3, 3}));  // DRAM@50, not NVME@100 nor DRAM@20
+}
+
+TEST_F(TieredBackendTest, GetDramTierIdNulloptWhenNoDram) {
+    TieredBackend backend;
+    InjectTier(
+        backend,
+        std::make_shared<FixedStatsTier>(UUID{1, 1}, 1000, 0, MemoryType::NVME),
+        /*priority=*/100);
+    EXPECT_FALSE(backend.GetDramTierId().has_value());
+}
 
 // Test basic DRAM tier initialization
 TEST_F(TieredBackendTest, BasicDRAMTierInit) {

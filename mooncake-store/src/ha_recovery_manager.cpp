@@ -150,8 +150,11 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
         return need_abort->load(std::memory_order_acquire);
     };
 
-    // Phase 1: Hot key sync — enqueue hot keys first for fastest recovery
-    auto hot_stats = data_manager_.value().GetHotKeyStats();
+    // Phase 1: Hot key sync — enqueue hot keys first for fastest recovery.
+    // Request ALL tracked hot keys (0 == all), not the scheduler's default
+    // top-64: recovery must prioritize the entire hot working set, and the
+    // count is capped internally by the collector's snapshot limit.
+    auto hot_stats = data_manager_.value().GetHotKeyStats(/*hot_key_num=*/0);
     std::unordered_set<std::string> synced_keys;
     size_t hot_count = 0;
 

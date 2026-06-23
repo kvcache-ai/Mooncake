@@ -497,10 +497,10 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         return tl::unexpected(validate_result.error());
     }
 
-    // Local Put: allocation follows tier backend policy (not restricted to
-    // DRAM).
+    // Local Put: pin the local replica to DRAM (strict; evict+retry on a full
+    // DRAM, never spill to a slower tier).
     auto prewrite_result =
-        PreWriteInternal(kctx, total_size, std::nullopt, false);
+        PreWriteInternal(kctx, total_size, std::nullopt, /*dram_only=*/true);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaTe: PreWrite failed"
                    << ", key=" << key
@@ -574,9 +574,9 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     const KeyCtx kctx = BuildKeyCtx(key);
     Slice slice = slices[0];
 
-    // Same allocation policy as PutViaTe.
+    // Same allocation policy as PutViaTe: DRAM-only local replica.
     auto prewrite_result =
-        PreWriteInternal(kctx, slice.size, std::nullopt, false);
+        PreWriteInternal(kctx, slice.size, std::nullopt, /*dram_only=*/true);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaMemcpy: PreWrite failed"
                    << ", key=" << key
@@ -873,8 +873,9 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
 
     // Reverse transfer path: still one RPC, but internally use the 3-phase
     // write model (PreWrite -> transfer -> WriteCommit). Target tier may be
-    // non-DRAM.
-    auto prewrite_result = PreWriteInternal(kctx, total_size, tier_id, false);
+    // non-DRAM, so best-effort allocation from tier_id (not DRAM-only).
+    auto prewrite_result =
+        PreWriteInternal(kctx, total_size, tier_id, /*dram_only=*/false);
     if (!prewrite_result) {
         timer.LogResponse("error_code=", prewrite_result.error());
         return tl::make_unexpected(prewrite_result.error());
@@ -904,8 +905,11 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
 
 tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
     std::string_view key, size_t size_bytes, std::optional<UUID> tier_id) {
-    auto internal_result =
-        PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id, true);
+    // Public PreWrite backs the cross-node forward TE path, which requires a
+    // DRAM handle. Pin to DRAM strictly (evict+retry on a full DRAM) rather
+    // than the old allocate-then-reject-if-not-DRAM dance.
+    auto internal_result = PreWriteInternal(BuildKeyCtx(key), size_bytes,
+                                            tier_id, /*dram_only=*/true);
     if (!internal_result) {
         LOG(WARNING) << "PreWrite failed"
                      << ", key=" << key
@@ -920,15 +924,7 @@ tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
 
 tl::expected<DataManager::PreWriteResult, ErrorCode>
 DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
-                              std::optional<UUID> tier_id,
-                              bool enforce_dram_allocation) {
-    // TODO(tiered_backend): `enforce_dram_allocation` is temporary. Today
-    // `tiered_backend_->Allocate()` does not yet allocate from a
-    // caller-selected tier in a way that guarantees DRAM for the cross-node
-    // forward TE path. Public PreWrite passes true to reject non-DRAM handles;
-    // local Put and WriteRemoteData pass false. Remove this parameter once
-    // TieredBackend is refactored to allocate from the intended tier
-    // explicitly.
+                              std::optional<UUID> tier_id, bool dram_only) {
     ScopedVLogTimer timer(1, "DataManager::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 
@@ -966,10 +962,25 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
-    auto handle_result = tiered_backend_->Allocate(size_bytes, tier_id);
+    // Resolve the allocation target. DRAM-only writes pin the local replica to
+    // the DRAM/fast tier with a STRICT allocation: a full DRAM then triggers
+    // the scheduler's fast-tier eviction + retry (TieredBackend::Allocate),
+    // instead of silently spilling the local copy onto a slower tier. Without a
+    // DRAM tier configured we fall back to best-effort allocation.
+    std::optional<UUID> alloc_tier = tier_id;
+    bool strict = false;
+    if (dram_only) {
+        if (auto dram = tiered_backend_->GetDramTierId()) {
+            alloc_tier = *dram;
+            strict = true;
+        }
+    }
+
+    auto handle_result =
+        tiered_backend_->Allocate(size_bytes, alloc_tier, strict);
     if (!handle_result) {
         LOG(ERROR) << "PreWrite: Allocate failed"
-                   << ", key=" << ctx.key
+                   << ", key=" << ctx.key << ", dram_only=" << dram_only
                    << ", error=" << toString(handle_result.error());
         (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
                                       write_operation_id);
@@ -978,17 +989,6 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     }
 
     auto handle = std::move(handle_result.value());
-
-    if (enforce_dram_allocation && handle->loc.data.type != MemoryType::DRAM) {
-        LOG(ERROR) << "PreWrite: DRAM allocation failed"
-                   << ", key=" << ctx.key << ", error="
-                   << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-        (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
-                                      write_operation_id);
-        timer.LogResponse("error_code=",
-                          ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
 
     auto attach_result = AttachPendingWriteHandle(pending_write_shard, ctx.key,
                                                   write_operation_id, handle);
@@ -1901,9 +1901,10 @@ void DataManager::ForEachKeyBatch(
     }
 }
 
-AccessStats DataManager::GetHotKeyStats() const {
+AccessStats DataManager::GetHotKeyStats(
+    std::optional<size_t> hot_key_num) const {
     if (!tiered_backend_) return {};
-    return tiered_backend_->GetHotKeyStats();
+    return tiered_backend_->GetHotKeyStats(hot_key_num);
 }
 
 std::vector<UUID> DataManager::GetReplicaTierIds(std::string_view key) const {

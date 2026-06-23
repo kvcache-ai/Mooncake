@@ -3,6 +3,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <fstream>
 #include <thread>
 #include <vector>
@@ -744,6 +746,129 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_auto_eviction");
+}
+
+// Regression test for the autonomous bucket-eviction metadata-desync bug.
+//
+// When a StorageTier evicts a bucket on its own to reclaim space, the
+// high-level metadata index, the per-tier byte accounting, and Master must all
+// stay consistent with the physical deletion. Before the fix, eviction deleted
+// the bucket files and directly subtracted the freed bytes, but left zombie
+// AllocationHandles in the metadata index and never notified the scheduler or
+// Master. That produced two defects this test guards against:
+//   (#2) the metadata index diverged from disk — evicted keys still appeared
+//        present, so LRU / fast-reclaim could discard the only live copy; and
+//   (#1) the byte counter was decremented twice (once at eviction, once again
+//        when the zombie handle was finally freed), underflowing the unsigned
+//        counter to a huge value.
+TEST_F(StorageTierTest, AutoEvictionSyncsMetadataAndByteAccounting) {
+    const std::string path = "/tmp/mooncake_test_eviction_sync";
+    fs::remove_all(path);
+    fs::create_directories(path);
+
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", path.c_str(), 1);
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 20480,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    // Record every replica Master is told to remove, so we can assert the
+    // reverse-notification path fires for autonomously evicted keys.
+    std::mutex removed_mutex;
+    std::set<std::string> master_removed_keys;
+    RemoveReplicaCallback remove_cb =
+        [&](std::string_view key,
+            const UUID&) -> tl::expected<void, ErrorCode> {
+        std::lock_guard<std::mutex> lock(removed_mutex);
+        master_removed_keys.emplace(key);
+        return {};
+    };
+
+    {
+        TieredBackend backend;
+        ASSERT_TRUE(InitTieredBackendForTest(backend, config, nullptr, nullptr,
+                                             remove_cb)
+                        .has_value());
+
+        auto tier_views = backend.GetTierViews();
+        ASSERT_FALSE(tier_views.empty());
+        const UUID tier_id = tier_views[0].id;
+        auto* tier = const_cast<CacheTier*>(backend.GetTier(tier_id));
+        ASSERT_NE(tier, nullptr);
+
+        constexpr int kNumKeys = 20;
+        constexpr size_t kKeySize = 1024;
+        std::vector<std::string> keys;
+        for (int i = 0; i < kNumKeys; ++i) {
+            std::string key = "key_" + std::to_string(i);
+            keys.push_back(key);
+
+            auto alloc = backend.Allocate(kKeySize);
+            ASSERT_TRUE(alloc.has_value()) << "alloc failed for " << key;
+            AllocationHandle handle = alloc.value();
+
+            DataSource source;
+            source.buffer = std::make_unique<TempDRAMBuffer>(
+                CreateTestBuffer(kKeySize), kKeySize);
+            source.type = MemoryType::DRAM;
+            ASSERT_TRUE(backend.Write(source, handle).has_value());
+            ASSERT_TRUE(backend.Commit(key, handle).has_value());
+        }
+
+        // Persist everything to disk so the keys live in buckets.
+        const_cast<CacheTier*>(tier)->Flush();
+        const size_t usage_before = tier->GetUsage();
+        EXPECT_GT(usage_before, 0u);
+
+        // Allocate beyond the remaining capacity to force bucket eviction.
+        // Drop the handle immediately (uncommitted) so its staging reservation
+        // is released and does not skew the post-eviction accounting check.
+        {
+            auto alloc = backend.Allocate(5 * 1024);
+            ASSERT_TRUE(alloc.has_value())
+                << "allocation should succeed after auto-eviction";
+        }
+
+        // Constraint #2: evicted keys must be removed from the metadata index
+        // and reported to Master. Before the fix they lingered as zombies.
+        int still_present = 0;
+        for (const auto& k : keys) {
+            if (backend.Exist(k, tier_id)) ++still_present;
+        }
+        EXPECT_LT(still_present, kNumKeys)
+            << "bucket eviction must drop evicted keys from the metadata index";
+
+        {
+            std::lock_guard<std::mutex> lock(removed_mutex);
+            EXPECT_EQ(master_removed_keys.size(),
+                      static_cast<size_t>(kNumKeys - still_present))
+                << "every evicted key must be reported to Master";
+        }
+
+        // Constraint #1: deleting every remaining key must not double-free.
+        // Evicted keys are already gone (Delete returns OBJECT_NOT_FOUND).
+        for (const auto& k : keys) {
+            backend.Delete(k);
+        }
+
+        // With the bug, the byte counter underflows to a huge value here.
+        const size_t usage_after = tier->GetUsage();
+        EXPECT_EQ(usage_after, 0u)
+            << "persisted byte accounting underflowed or leaked after eviction";
+    }
+
+    fs::remove_all(path);
 }
 
 // ============================================================

@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "tiered_cache/tiers/storage_tier.h"
+#include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/copier_registry.h"
 #include "utils.h"
 
@@ -434,6 +435,17 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
+
+        // Snapshot the bucket's keys BEFORE the physical eviction so high-level
+        // metadata can be synchronized afterwards (see NotifyBucketEviction).
+        std::vector<std::string> evicted_keys;
+        if (auto keys_res =
+                bucket_backend->GetBucketKeys(bucket_id, evicted_keys);
+            !keys_res) {
+            LOG(WARNING) << "Failed to snapshot keys for bucket " << bucket_id
+                         << " before eviction: " << keys_res.error();
+        }
+
         auto evict_res = bucket_backend->EvictBucket(bucket_id);
         if (!evict_res) {
             LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
@@ -443,10 +455,14 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
 
         total_freed = evict_res.value();
 
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(total_freed,
-                                             std::memory_order_acq_rel);
+        // Synchronize high-level state: release the per-key AllocationHandles
+        // (whose destruction performs the symmetric persisted_live_data_bytes_
+        // decrement via Free) and clear scheduler/Master state. This replaces a
+        // direct fetch_sub here, which would otherwise double-count against the
+        // per-key Free path and underflow the byte counter.
+        if (backend_ && !evicted_keys.empty()) {
+            backend_->NotifyBucketEviction(evicted_keys, tier_id_);
+        }
 
         LOG(INFO) << "Evicted 1 bucket, freed " << total_freed << " bytes";
         return total_freed;
@@ -469,6 +485,17 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
+
+        // Snapshot the bucket's keys BEFORE the physical eviction so high-level
+        // metadata can be synchronized afterwards (see NotifyBucketEviction).
+        std::vector<std::string> evicted_keys;
+        if (auto keys_res =
+                bucket_backend->GetBucketKeys(bucket_id, evicted_keys);
+            !keys_res) {
+            LOG(WARNING) << "Failed to snapshot keys for bucket " << bucket_id
+                         << " before eviction: " << keys_res.error();
+        }
+
         auto evict_res = bucket_backend->EvictBucket(bucket_id);
         if (!evict_res) {
             LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
@@ -482,9 +509,14 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         total_freed += freed;
         attempts++;
 
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(freed, std::memory_order_acq_rel);
+        // Synchronize high-level state: release the per-key AllocationHandles
+        // (whose destruction performs the symmetric persisted_live_data_bytes_
+        // decrement via Free) and clear scheduler/Master state. This replaces a
+        // direct fetch_sub here, which would otherwise double-count against the
+        // per-key Free path and underflow the byte counter.
+        if (backend_ && !evicted_keys.empty()) {
+            backend_->NotifyBucketEviction(evicted_keys, tier_id_);
+        }
 
         LOG(INFO) << "Evicted bucket " << bucket_id << ", freed " << freed
                   << " bytes (total: " << total_freed << "/" << target_free_size

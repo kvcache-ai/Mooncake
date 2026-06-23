@@ -19,8 +19,8 @@
 
 namespace mooncake {
 
-class TieredBackend;    // Forward declaration
-class ClientScheduler;  // Forward declaration
+class TieredBackend;     // Forward declaration
+class IClientScheduler;  // Forward declaration
 
 /**
  * @struct TieredLocation
@@ -228,6 +228,31 @@ class TieredBackend {
         bool notify_master = true);
 
     /**
+     * @brief Reverse-notification hook for bottom-up (tier-initiated) eviction.
+     *
+     * When a tier autonomously evicts a bucket to reclaim space, it physically
+     * removes the underlying files for a batch of keys, bypassing the normal
+     * top-down Delete path. This method re-synchronizes the high-level state
+     * with that fact. For each evicted key whose replica lives on @p tier_id:
+     *   - removes that replica from the metadata index, releasing the owning
+     *     AllocationHandle OUTSIDE all locks so the tier's RAII Free path runs
+     *     exactly once (the single, symmetric per-key byte decrement);
+     *   - notifies the scheduler via OnDelete so LRU / fast-reclaim no longer
+     *     believe a backup exists on the evicted tier;
+     *   - best-effort notifies Master via the remove-replica callback.
+     *
+     * The physical eviction is irreversible, so this cleanup always runs to
+     * completion (it is never gated on shutdown or Master reachability).
+     *
+     * @param keys    Keys that lived in the evicted bucket (snapshot taken
+     *                before the physical eviction).
+     * @param tier_id The tier that performed the eviction.
+     * @return Number of replicas actually removed from the metadata index.
+     */
+    size_t NotifyBucketEviction(const std::vector<std::string>& keys,
+                                const UUID& tier_id);
+
+    /**
      * @brief Remove ALL keys (and all replicas) from the local tiered storage.
      * @return Number of distinct keys removed, or ErrorCode on shutdown.
      */
@@ -235,6 +260,9 @@ class TieredBackend {
 
     // --- Composite Operations ---
 
+    // Allocates strictly on dest_tier_id (triggering its sync eviction on a
+    // full tier; never falls back to another tier), so a successful return
+    // guarantees the new replica landed on dest_tier_id.
     tl::expected<void, ErrorCode> CopyData(
         std::string_view key, const DataSource& source, UUID dest_tier_id,
         std::optional<uint64_t> expected_version = std::nullopt,
@@ -250,6 +278,15 @@ class TieredBackend {
     std::vector<TierView> GetTierViews() const;
     std::vector<UUID> GetReplicaTierIds(std::string_view key) const;
     const CacheTier* GetTier(UUID tier_id) const;
+
+    /**
+     * @brief Id of the DRAM (fast) tier, for DRAM-only local writes.
+     * @return The highest-priority MemoryType::DRAM tier (which coincides with
+     *         the event-driven 'fast' role when that role is DRAM), or nullopt
+     *         if the deployment has no DRAM tier — callers must then fall back
+     *         to best-effort allocation.
+     */
+    std::optional<UUID> GetDramTierId() const;
     const DataCopier& GetDataCopier() const;
 
     /**
@@ -262,11 +299,19 @@ class TieredBackend {
         const;
 
     /**
-     * @brief Get hot key statistics from the scheduler's StatsCollector.
+     * @brief Get hot key statistics from the scheduler (e.g. for HA recovery
+     *        prioritization).
+     * @param hot_key_num see IClientScheduler::GetHotKeyStats. Defaults to
+     *        nullopt, which resolves to the startup config
+     * scheduler.hot_key_num (default 64); set scheduler.hot_key_num=0 to return
+     * all tracked keys (the historical no-arg behavior).
      */
-    AccessStats GetHotKeyStats() const;
+    AccessStats GetHotKeyStats(
+        std::optional<size_t> hot_key_num = std::nullopt) const;
 
    private:
+    friend class TieredBackendTest;  // for unit tests
+
     tl::expected<void, ErrorCode> MountSegment(
         UUID id, size_t capacity, int priority,
         const std::vector<std::string>& tags, MemoryType memory_type);
@@ -335,7 +380,7 @@ class TieredBackend {
     SegmentSyncCallback segment_sync_callback_;
 
     // Scheduler
-    std::unique_ptr<ClientScheduler> scheduler_;
+    std::unique_ptr<IClientScheduler> scheduler_;
 
     // Shutdown flag — once set, all public APIs reject new requests.
     std::atomic<bool> is_shutting_down_{false};

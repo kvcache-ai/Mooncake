@@ -12,8 +12,8 @@
 
 namespace mooncake {
 
-ClientScheduler::ClientScheduler(TieredBackend* backend,
-                                 const Json::Value& config)
+LegacyClientScheduler::LegacyClientScheduler(TieredBackend* backend,
+                                             const Json::Value& config)
     : backend_(backend) {
     std::string policy_type = "SIMPLE";  // Default
     size_t stats_shards = detail::DefaultStatsShardCount();
@@ -36,6 +36,12 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
         const auto configured_limit =
             config["scheduler"]["stats_snapshot_limit"].asUInt64();
         stats_snapshot_limit_ = static_cast<size_t>(configured_limit);
+    }
+
+    if (config.isMember("scheduler") &&
+        config["scheduler"].isMember("hot_key_num")) {
+        hot_key_num_ =
+            static_cast<size_t>(config["scheduler"]["hot_key_num"].asUInt64());
     }
 
     // Read eviction mode configuration
@@ -76,7 +82,7 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
 
         auto lru_policy = std::make_unique<LRUPolicy>(lru_config);
         policy_ = std::move(lru_policy);
-        LOG(INFO) << "ClientScheduler initialized with LRU Policy";
+        LOG(INFO) << "LegacyClientScheduler initialized with LRU Policy";
     } else {
         // Default: SIMPLE
         stats_collector_ = std::make_unique<SimpleStatsCollector>(
@@ -95,13 +101,13 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
 
         auto simple_policy = std::make_unique<SimplePolicy>(simple_config);
         policy_ = std::move(simple_policy);
-        LOG(INFO) << "ClientScheduler initialized with Simple Policy";
+        LOG(INFO) << "LegacyClientScheduler initialized with Simple Policy";
     }
 }
 
-ClientScheduler::~ClientScheduler() { Stop(); }
+LegacyClientScheduler::~LegacyClientScheduler() { Stop(); }
 
-void ClientScheduler::RegisterTier(CacheTier* tier) {
+void LegacyClientScheduler::RegisterTier(CacheTier* tier) {
     tiers_[tier->GetTierId()] = tier;
 
     // Auto-Configuration: If tier is DRAM, set it as Fast Tier
@@ -114,13 +120,13 @@ void ClientScheduler::RegisterTier(CacheTier* tier) {
     }
 }
 
-void ClientScheduler::Start() {
+void LegacyClientScheduler::Start() {
     if (running_) return;
     running_ = true;
-    worker_thread_ = std::thread(&ClientScheduler::WorkerLoop, this);
+    worker_thread_ = std::thread(&LegacyClientScheduler::WorkerLoop, this);
 }
 
-void ClientScheduler::Stop() {
+void LegacyClientScheduler::Stop() {
     running_ = false;
     cv_.notify_all();  // Wake the worker thread immediately.
     if (worker_thread_.joinable()) {
@@ -128,41 +134,60 @@ void ClientScheduler::Stop() {
     }
 }
 
-void ClientScheduler::OnAccess(std::string_view key) {
+void LegacyClientScheduler::OnAccess(const AccessContext& ctx) {
     if (stats_collector_) {
-        stats_collector_->RecordAccess(key);
+        stats_collector_->RecordAccess(ctx.key);
     }
 }
 
-AccessStats ClientScheduler::GetHotKeyStats() const {
-    if (stats_collector_) {
-        return stats_collector_->GetSnapshot();
+AccessStats LegacyClientScheduler::GetHotKeyStats(
+    std::optional<size_t> hot_key_num) const {
+    if (!stats_collector_) {
+        return {};
     }
-    return {};
+    // GetSnapshot() returns keys ordered hottest-first, so truncating keeps the
+    // top-N. nullopt resolves to the configured default (hot_key_num_, 64); a
+    // resolved value of 0 means "return all" (subject to the snapshot limit).
+    AccessStats stats = stats_collector_->GetSnapshot();
+    const size_t n = hot_key_num.value_or(hot_key_num_);
+    if (n != 0 && stats.hot_keys.size() > n) {
+        stats.hot_keys.resize(n);
+    }
+    return stats;
 }
 
-void ClientScheduler::OnCommit(std::string_view key, UUID tier_id,
-                               size_t size_bytes) {
-    auto& shard = GetKeyCacheShard(key);
-    MutexLocker lock(&shard.mutex);
-    TrackReplicaLocked(shard, key, tier_id, size_bytes);
+void LegacyClientScheduler::OnCommit(const CommitContext& ctx) {
+    {
+        auto& shard = GetKeyCacheShard(ctx.key);
+        MutexLocker lock(&shard.mutex);
+        TrackReplicaLocked(shard, ctx.key, ctx.tier_id, ctx.size_bytes);
+    }
+    // When this commit counts as an access, record it too. This reproduces the
+    // old TieredBackend::Commit behavior, which issued a separate,
+    // record_access-guarded OnAccess(key) right after the commit. (Internal
+    // data movement passes record_access=false and is not counted.)
+    if (ctx.record_access && stats_collector_) {
+        stats_collector_->RecordAccess(ctx.key);
+    }
 }
 
-void ClientScheduler::OnDelete(std::string_view key,
-                               std::optional<UUID> tier_id) {
+void LegacyClientScheduler::OnDelete(const DeleteContext& ctx) {
     bool remove_stats = false;
     {
-        auto& shard = GetKeyCacheShard(key);
+        auto& shard = GetKeyCacheShard(ctx.key);
         MutexLocker lock(&shard.mutex);
-        remove_stats = RemoveReplicaLocked(shard, key, tier_id);
+        remove_stats = RemoveReplicaLocked(shard, ctx.key, ctx.tier_id);
     }
 
     if (remove_stats && stats_collector_) {
-        stats_collector_->RemoveKey(key);
+        stats_collector_->RemoveKey(ctx.key);
     }
 }
 
-bool ClientScheduler::OnAllocationFailure(UUID tier_id, size_t required_bytes) {
+bool LegacyClientScheduler::OnAllocationFailure(
+    const AllocationFailureContext& ctx) {
+    const UUID tier_id = ctx.tier_id;
+    const size_t required_bytes = ctx.required_bytes;
     if (TryFastReclaim(tier_id, required_bytes)) {
         LOG(INFO) << "Allocation failed on tier " << tier_id
                   << ", reclaimed pre-replicated cold replicas";
@@ -174,13 +199,13 @@ bool ClientScheduler::OnAllocationFailure(UUID tier_id, size_t required_bytes) {
                   << ", triggering SYNC eviction";
         return TriggerSyncEviction(tier_id, required_bytes);
     } else {
-        VLOG(2) << "Allocation failed on tier " << tier_id
-                << ", ASYNC mode - will handle in next cycle";
+        LOG(ERROR) << "Allocation failed on tier " << tier_id
+                   << ", ASYNC mode - will handle in next cycle";
         return false;
     }
 }
 
-void ClientScheduler::WorkerLoop() {
+void LegacyClientScheduler::WorkerLoop() {
     while (running_) {
         // Use condition_variable so Stop() can wake us immediately.
         {
@@ -201,7 +226,8 @@ void ClientScheduler::WorkerLoop() {
 
         // 3. Make Decision
         if (!policy_) {
-            LOG(ERROR) << "ClientScheduler worker has no policy configured";
+            LOG(ERROR)
+                << "LegacyClientScheduler worker has no policy configured";
             continue;
         }
 
@@ -220,7 +246,8 @@ void ClientScheduler::WorkerLoop() {
     }
 }
 
-std::unordered_map<UUID, TierStats> ClientScheduler::CollectTierStats() const {
+std::unordered_map<UUID, TierStats> LegacyClientScheduler::CollectTierStats()
+    const {
     std::unordered_map<UUID, TierStats> tier_stats_map;
     for (const auto& [id, tier] : tiers_) {
         tier_stats_map[id] = {tier->GetCapacity(), tier->GetUsage()};
@@ -228,7 +255,7 @@ std::unordered_map<UUID, TierStats> ClientScheduler::CollectTierStats() const {
     return tier_stats_map;
 }
 
-std::vector<KeyContext> ClientScheduler::BuildActiveKeys(
+std::vector<KeyContext> LegacyClientScheduler::BuildActiveKeys(
     const AccessStats& access_stats, std::optional<UUID> pinned_tier_id) {
     const size_t reserved_size =
         EstimateActiveKeyReserve(access_stats, pinned_tier_id);
@@ -244,21 +271,21 @@ std::vector<KeyContext> ClientScheduler::BuildActiveKeys(
     return active_keys;
 }
 
-size_t ClientScheduler::KeyCacheShardIndex(std::string_view key) {
+size_t LegacyClientScheduler::KeyCacheShardIndex(std::string_view key) {
     return std::hash<std::string_view>{}(key) % kKeyCacheShardCount;
 }
 
-ClientScheduler::KeyCacheShard& ClientScheduler::GetKeyCacheShard(
+LegacyClientScheduler::KeyCacheShard& LegacyClientScheduler::GetKeyCacheShard(
     std::string_view key) {
     return key_cache_shards_[KeyCacheShardIndex(key)];
 }
 
-const ClientScheduler::KeyCacheShard& ClientScheduler::GetKeyCacheShard(
-    std::string_view key) const {
+const LegacyClientScheduler::KeyCacheShard&
+LegacyClientScheduler::GetKeyCacheShard(std::string_view key) const {
     return key_cache_shards_[KeyCacheShardIndex(key)];
 }
 
-size_t ClientScheduler::EstimateActiveKeyReserve(
+size_t LegacyClientScheduler::EstimateActiveKeyReserve(
     const AccessStats& access_stats, std::optional<UUID> pinned_tier_id) const {
     size_t reserved_size = access_stats.hot_keys.size();
     if (!pinned_tier_id.has_value()) {
@@ -277,7 +304,7 @@ size_t ClientScheduler::EstimateActiveKeyReserve(
     return reserved_size;
 }
 
-void ClientScheduler::AppendHotKeys(
+void LegacyClientScheduler::AppendHotKeys(
     const AccessStats& access_stats, std::vector<KeyContext>& active_keys,
     std::unordered_set<std::string>& seen_keys) const {
     for (const auto& stat_entry : access_stats.hot_keys) {
@@ -299,7 +326,7 @@ void ClientScheduler::AppendHotKeys(
     }
 }
 
-void ClientScheduler::AppendPinnedTierKeys(
+void LegacyClientScheduler::AppendPinnedTierKeys(
     UUID pinned_tier_id, std::vector<KeyContext>& active_keys,
     std::unordered_set<std::string>& seen_keys) const {
     const AccessStats empty_stats{};
@@ -332,7 +359,7 @@ void ClientScheduler::AppendPinnedTierKeys(
     }
 }
 
-std::optional<KeyContext> ClientScheduler::BuildKeyContextLocked(
+std::optional<KeyContext> LegacyClientScheduler::BuildKeyContextLocked(
     const std::string& key, const CachedKeyState& state,
     const AccessStats& access_stats, const AccessStatEntry* stat_entry) const {
     if (state.current_locations.empty()) {
@@ -353,7 +380,7 @@ std::optional<KeyContext> ClientScheduler::BuildKeyContextLocked(
     return key_ctx;
 }
 
-size_t ClientScheduler::GetCachedKeySize(const std::string& key) const {
+size_t LegacyClientScheduler::GetCachedKeySize(const std::string& key) const {
     const auto& shard = GetKeyCacheShard(key);
     MutexLocker lock(&shard.mutex);
     auto key_it = shard.key_cache.find(key);
@@ -363,9 +390,10 @@ size_t ClientScheduler::GetCachedKeySize(const std::string& key) const {
     return key_it->second.size_bytes;
 }
 
-void ClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
-                                         std::string_view key, UUID tier_id,
-                                         size_t size_bytes) {
+void LegacyClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
+                                               std::string_view key,
+                                               UUID tier_id,
+                                               size_t size_bytes) {
     auto cache_it = shard.key_cache.find(key);
     if (cache_it == shard.key_cache.end()) {
         cache_it =
@@ -386,9 +414,9 @@ void ClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
     }
 }
 
-bool ClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
-                                          std::string_view key,
-                                          std::optional<UUID> tier_id) {
+bool LegacyClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
+                                                std::string_view key,
+                                                std::optional<UUID> tier_id) {
     auto cache_it = shard.key_cache.find(key);
     if (cache_it == shard.key_cache.end()) {
         return true;
@@ -430,7 +458,8 @@ bool ClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
     return false;
 }
 
-void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
+void LegacyClientScheduler::ExecuteActions(
+    const std::vector<SchedAction>& actions) {
     // Execute in three phases: EVICT first, then MIGRATE, then REPLICATE.
     // This keeps the fast path biased towards freeing space before background
     // copy work.
@@ -480,9 +509,10 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
                 } else if (res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                     // Insufficient space - mark tier for eviction
                     const size_t key_size = GetCachedKeySize(action.key);
-                    VLOG(2) << "Transfer skipped due to insufficient space for "
-                               "key: "
-                            << action.key << ", will trigger eviction";
+                    LOG(ERROR)
+                        << "Transfer skipped due to insufficient space for "
+                           "key: "
+                        << action.key << ", will trigger eviction";
                     auto& required_bytes =
                         tiers_needing_eviction[action.target_tier_id.value()];
                     required_bytes = std::max(required_bytes, key_size);
@@ -548,8 +578,8 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
         if (!copy_res) {
             if (copy_res.error() == ErrorCode::CAS_FAILED ||
                 copy_res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
-                VLOG(2) << "Replica preparation skipped for key: " << action.key
-                        << ", error: " << copy_res.error();
+                LOG(ERROR) << "Replica preparation skipped for key: "
+                           << action.key << ", error: " << copy_res.error();
             } else {
                 LOG(ERROR) << "Replica preparation failed for key: "
                            << action.key << ", error: " << copy_res.error();
@@ -563,7 +593,8 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
     }
 }
 
-bool ClientScheduler::TriggerSyncEviction(UUID tier_id, size_t required_bytes) {
+bool LegacyClientScheduler::TriggerSyncEviction(UUID tier_id,
+                                                size_t required_bytes) {
     auto tier_stats = CollectTierStats();
     auto access_stats = stats_collector_->GetSnapshot();
     auto active_keys = BuildActiveKeys(access_stats, tier_id);
@@ -585,7 +616,8 @@ bool ClientScheduler::TriggerSyncEviction(UUID tier_id, size_t required_bytes) {
     return reclaimed_bytes >= plan.target_reclaim_bytes && enough_space;
 }
 
-bool ClientScheduler::TryFastReclaim(UUID tier_id, size_t required_bytes) {
+bool LegacyClientScheduler::TryFastReclaim(UUID tier_id,
+                                           size_t required_bytes) {
     auto tier_stats = CollectTierStats();
     auto access_stats = stats_collector_->GetSnapshot();
     auto active_keys = BuildActiveKeys(access_stats, tier_id);
@@ -600,7 +632,7 @@ bool ClientScheduler::TryFastReclaim(UUID tier_id, size_t required_bytes) {
     return reclaimed_bytes >= plan.target_reclaim_bytes && enough_space;
 }
 
-ClientScheduler::PlannedReclaim ClientScheduler::BuildReclaimPlan(
+LegacyClientScheduler::PlannedReclaim LegacyClientScheduler::BuildReclaimPlan(
     UUID tier_id, const std::unordered_map<UUID, TierStats>& tier_stats,
     const std::vector<KeyContext>& active_keys, bool require_existing_replica,
     size_t required_bytes) const {
@@ -663,7 +695,7 @@ ClientScheduler::PlannedReclaim ClientScheduler::BuildReclaimPlan(
     return plan;
 }
 
-size_t ClientScheduler::ExecuteReclaimPlan(const PlannedReclaim& plan) {
+size_t LegacyClientScheduler::ExecuteReclaimPlan(const PlannedReclaim& plan) {
     size_t reclaimed_bytes = 0;
 
     for (const auto& step : plan.steps) {
@@ -708,8 +740,8 @@ size_t ClientScheduler::ExecuteReclaimPlan(const PlannedReclaim& plan) {
     return reclaimed_bytes;
 }
 
-bool ClientScheduler::HasAvailableBytes(UUID tier_id,
-                                        size_t required_bytes) const {
+bool LegacyClientScheduler::HasAvailableBytes(UUID tier_id,
+                                              size_t required_bytes) const {
     auto tier_it = tiers_.find(tier_id);
     if (tier_it == tiers_.end() || !tier_it->second) {
         return false;
@@ -721,7 +753,7 @@ bool ClientScheduler::HasAvailableBytes(UUID tier_id,
     return available_bytes >= required_bytes;
 }
 
-std::optional<UUID> ClientScheduler::SelectDemotionTier(
+std::optional<UUID> LegacyClientScheduler::SelectDemotionTier(
     UUID source_tier_id) const {
     const auto tier_views = backend_->GetTierViews();
     const TierView* source_view = nullptr;
