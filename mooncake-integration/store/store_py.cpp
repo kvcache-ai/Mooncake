@@ -13,12 +13,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
-
-#if defined(USE_SUNRISE)
-#include "sunrise_allocator.h"
 #include "gpu_staging_utils.h"
-#include <tang_runtime_api.h>
-#endif
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -185,23 +180,11 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         exported_data = new char[total_length];
         if (!exported_data) return pybind11::none();
 
-#if defined(USE_SUNRISE)
-        if (sunrise_is_device_memory_range(buffer_handle->ptr())) {
-            SavedTangDevice saved;
-            tangSetDevice(0);
-            tangError_t err = tangMemcpy(exported_data, buffer_handle->ptr(),
-                                         total_length, tangMemcpyDeviceToHost);
-            if (err != tangSuccess) {
-                LOG(ERROR) << "tangMemcpy D2H failed: "
-                           << tangGetErrorString(err);
-                delete[] exported_data;
-                return pybind11::none();
-            }
-            tangDeviceSynchronize();
-        } else
-#endif
-        {
-            memcpy(exported_data, buffer_handle->ptr(), total_length);
+        if (!mooncake::gpu_staging::CopyToHost(
+                exported_data, buffer_handle->ptr(), total_length)) {
+            LOG(ERROR) << "Failed to copy buffer to host memory";
+            delete[] exported_data;
+            return pybind11::none();
         }
     } else {
         exported_data = usr_buffer;
@@ -460,25 +443,18 @@ class MooncakeStorePyWrapper {
             }
 
             py::gil_scoped_acquire acquire_gil;
-#if defined(USE_SUNRISE)
-            if (sunrise_is_device_memory_range(buffer_handle->ptr())) {
+            int device_id = -1;
+            if (mooncake::gpu_staging::IsDevicePointer(buffer_handle->ptr(),
+                                                       &device_id)) {
                 std::string host_buf(buffer_handle->size(), '\0');
-                {
-                    SavedTangDevice saved;
-                    tangSetDevice(0);
-                    tangError_t err = tangMemcpy(
-                        host_buf.data(), buffer_handle->ptr(),
-                        buffer_handle->size(), tangMemcpyDeviceToHost);
-                    if (err != tangSuccess) {
-                        LOG(ERROR) << "tangMemcpy D2H failed: "
-                                   << tangGetErrorString(err);
-                        return pybind11::none();
-                    }
-                    tangDeviceSynchronize();
+                if (!mooncake::gpu_staging::CopyToHost(host_buf.data(),
+                                                       buffer_handle->ptr(),
+                                                       buffer_handle->size())) {
+                    LOG(ERROR) << "Failed to copy buffer to host memory";
+                    return pybind11::none();
                 }
                 return pybind11::bytes(host_buf);
             }
-#endif
             return pybind11::bytes((char *)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
@@ -510,29 +486,21 @@ class MooncakeStorePyWrapper {
                     results.emplace_back(kNullString);
                     continue;
                 }
-#if defined(USE_SUNRISE)
-                if (sunrise_is_device_memory_range(data->ptr())) {
+                int device_id = -1;
+                if (mooncake::gpu_staging::IsDevicePointer(data->ptr(),
+                                                           &device_id)) {
                     std::string host_buf(data->size(), '\0');
-                    {
-                        SavedTangDevice saved;
-                        tangSetDevice(0);
-                        tangError_t err =
-                            tangMemcpy(host_buf.data(), data->ptr(),
-                                       data->size(), tangMemcpyDeviceToHost);
-                        if (err != tangSuccess) {
-                            LOG(ERROR) << "tangMemcpy D2H failed: "
-                                       << tangGetErrorString(err);
-                            results.emplace_back(kNullString);
-                            continue;
-                        }
-                        tangDeviceSynchronize();
+                    if (!mooncake::gpu_staging::CopyToHost(
+                            host_buf.data(), data->ptr(), data->size())) {
+                        LOG(ERROR) << "Failed to copy buffer to host memory";
+                        results.emplace_back(kNullString);
+                        continue;
                     }
                     results.emplace_back(pybind11::bytes(host_buf));
-                    continue;
+                } else {
+                    results.emplace_back(
+                        pybind11::bytes((char *)data->ptr(), data->size()));
                 }
-#endif
-                results.emplace_back(
-                    pybind11::bytes((char *)data->ptr(), data->size()));
             }
             return results;
         }

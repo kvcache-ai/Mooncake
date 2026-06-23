@@ -209,6 +209,27 @@ inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
 #endif
 }
 
+// Copy from a source that may reside in accelerator device memory to a host
+// destination. Handles device detection, device binding, D2H copy, and
+// synchronization. Falls back to plain memcpy for host-resident sources.
+// Returns true on success, false on copy failure.
+inline bool CopyToHost(void* dst, const void* src, size_t size) {
+    int device_id = -1;
+    if (!IsDevicePointer(src, &device_id)) {
+        memcpy(dst, src, size);
+        return true;
+    }
+#if defined(USE_SUNRISE)
+    SavedTangDevice saved;
+#endif
+    SetDevice(device_id);
+    if (!CopyDeviceToHost(dst, src, size)) return false;
+#if defined(USE_SUNRISE)
+    tangDeviceSynchronize();
+#endif
+    return true;
+}
+
 // Detect whether ptr resides in host (CPU) memory.
 // Used together with IsDevicePointer for safe pointer-type dispatching:
 //   if IsDevicePointer  -> CopyHostToDevice / CopyDeviceToHost
