@@ -239,8 +239,24 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         }
     }
 
+    // Export a single dma_buf fd for the buffer and import it into every NIC's
+    // PD below, closing it once after all registrations. One dma_buf object
+    // shared across NICs lets the GPU driver reserve a single BAR1 window for
+    // the buffer instead of one per NIC. Host memory yields an empty export and
+    // takes the plain ibv_reg_mr path. The fd must stay open across all
+    // registrations (each MR takes its own reference); see exportDmabuf().
+    DmabufExport dmabuf_exp;
+    if (!context_list_.empty()) {
+        int eret = RdmaContext::exportDmabuf(addr, dmabuf_exp);
+        if (eret != 0) {
+            LOG(ERROR) << "Failed to export dma_buf for addr=" << addr;
+            return eret;
+        }
+    }
+
     auto reg_start = std::chrono::steady_clock::now();
 
+    int reg_error = 0;
     if (use_parallel_reg) {
         std::vector<std::thread> reg_threads;
         reg_threads.reserve(context_list_.size());
@@ -248,10 +264,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         const int ar = access_rights;  // Local copy for lambda capture
 
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            reg_threads.emplace_back([this, &ret_codes, i, addr, length, ar]() {
-                ret_codes[i] =
-                    context_list_[i]->registerMemoryRegion(addr, length, ar);
-            });
+            reg_threads.emplace_back(
+                [this, &ret_codes, &dmabuf_exp, i, addr, length, ar]() {
+                    ret_codes[i] = context_list_[i]->registerMemoryRegion(
+                        addr, length, ar, dmabuf_exp);
+                });
         }
 
         for (auto &thread : reg_threads) {
@@ -262,19 +279,30 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             if (ret_codes[i] != 0) {
                 LOG(ERROR) << "Failed to register memory region with context "
                            << i;
-                return ret_codes[i];
+                reg_error = ret_codes[i];
+                break;
             }
         }
     } else {
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            int ret = context_list_[i]->registerMemoryRegion(addr, length,
-                                                             access_rights);
+            int ret = context_list_[i]->registerMemoryRegion(
+                addr, length, access_rights, dmabuf_exp);
             if (ret) {
                 LOG(ERROR) << "Failed to register memory region with context "
                            << i;
-                return ret;
+                reg_error = ret;
+                break;
             }
         }
+    }
+
+    // Close the single dma_buf fd now that all NIC registrations are done.
+    // Each successful MR holds its own reference, so the underlying dma_buf
+    // (and its BAR1 window) stays alive until those MRs are deregistered.
+    RdmaContext::closeDmabufExport(dmabuf_exp);
+
+    if (reg_error != 0) {
+        return reg_error;
     }
 
     auto reg_end = std::chrono::steady_clock::now();
