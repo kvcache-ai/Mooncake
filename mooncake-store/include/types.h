@@ -465,6 +465,7 @@ enum class AllocationStrategyType {
     RANDOM = 0,        // Pure random allocation
     FREE_RATIO_FIRST,  // Free-ratio-first allocation
     CXL,               // CXL-specific allocation
+    SIZE_CLASS_AWARE,  // Size-class-aware segment selection
 };
 
 /**
