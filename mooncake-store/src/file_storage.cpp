@@ -797,8 +797,12 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
             const bool enqueued = EnqueuePromotionTask(
                 task, /*allow_over_capacity_for_pulled_task=*/
                 config_.promotion_queue_capacity > 0);
-            CHECK(enqueued)
-                << "Promotion queue capacity changed after pull planning";
+            if (!enqueued) {
+                LOG(WARNING) << "Failed to enqueue promotion task for key="
+                             << task.key << "; releasing master slot";
+                ReleasePromotionTask(task.key, task.tenant_id);
+                continue;
+            }
             ++enqueued_tasks;
         }
     };
