@@ -5,9 +5,6 @@ on:
     branches:
       - main
 
-env:
-  CANN_VERSION: "9.1.0"
-
 jobs:
   build:
     if: ${{ !contains(github.ref_name, '-') }}
@@ -58,8 +55,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CANN_URL="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${{ env.CANN_VERSION }}/Ascend-cann-toolkit_${{ env.CANN_VERSION }}_linux-${{ matrix.cann_arch }}.run"
-          echo "Downloading CANN ${{ env.CANN_VERSION }} from ${CANN_URL}"
+          CANN_BASE_URL="https://ascend.devcloud.huaweicloud.com/cann/run/software"
+          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(?=/)' | sort -V | tail -1)
+          echo "Latest CANN version: ${CANN_VERSION}"
+          CANN_URL="${CANN_BASE_URL}/${CANN_VERSION}/${{ matrix.cann_arch }}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${{ matrix.cann_arch }}.run"
+          echo "Downloading CANN ${CANN_VERSION} from ${CANN_URL}"
           wget -q --show-progress -O /tmp/cann_toolkit.run "${CANN_URL}"
           chmod +x /tmp/cann_toolkit.run
           sudo /tmp/cann_toolkit.run --install --install-for-all --install-path=/usr/local/Ascend --quiet
