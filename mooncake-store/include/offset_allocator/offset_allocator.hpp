@@ -184,7 +184,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     // Internal method to get metrics without locking (caller must hold m_mutex)
     [[nodiscard]]
-    OffsetAllocatorMetrics get_metrics_internal() const REQUIRES(m_mutex);
+    // Caller must hold m_mutex (shared or exclusive)
+    OffsetAllocatorMetrics get_metrics_internal() const;
 
     std::unique_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
     uint64_t m_base;
@@ -192,7 +193,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // m_multiplier
     uint64_t m_multiplier_bits;
     uint64_t m_capacity;
-    mutable Mutex m_mutex;
+    mutable SharedMutex m_mutex;
 
     // Lightweight metrics maintained during allocation/deallocation
     uint64_t m_allocated_size GUARDED_BY(m_mutex) = 0;
@@ -271,7 +272,7 @@ class __Allocator {
 // Template method implementations
 template <typename T>
 void OffsetAllocator::serialize_to(T& serializer) const {
-    MutexLocker guard(&m_mutex);
+    SharedMutexLocker guard(&m_mutex, shared_lock);
 
     if (!m_allocator) {
         serializer.set_error("Allocator is not initialized");
