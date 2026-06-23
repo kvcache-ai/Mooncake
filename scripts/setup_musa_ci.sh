@@ -102,9 +102,15 @@ H
 #pragma once
 #include "mooncake_musa_ci_compat.h"
 #include <musa_runtime_api.h>
+/* Force CUDA-version-gated source to use its portable fallback path in MUSA CI. */
+#ifdef CUDART_VERSION
+#undef CUDART_VERSION
+#endif
+#define CUDART_VERSION 0
 typedef musaError_t cudaError_t;
 typedef musaStream_t cudaStream_t;
 typedef musaEvent_t cudaEvent_t;
+typedef musaIpcMemHandle_t cudaIpcMemHandle_t;
 typedef musaIpcEventHandle_t cudaIpcEventHandle_t;
 typedef enum musaMemcpyKind cudaMemcpyKind;
 typedef enum musaDeviceAttr cudaDeviceAttr;
@@ -114,6 +120,7 @@ typedef struct musaDeviceProp cudaDeviceProp;
 typedef struct musaPointerAttributes cudaPointerAttributes;
 #define cudaSuccess musaSuccess
 #define cudaErrorNotReady musaErrorNotReady
+#define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaDevAttrClockRate musaDevAttrClockRate
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
@@ -127,18 +134,32 @@ typedef struct musaPointerAttributes cudaPointerAttributes;
 #define cudaEventRecordExternal musaEventRecordExternal
 #define cudaEventWaitDefault musaEventWaitDefault
 #define cudaEventWaitExternal musaEventWaitExternal
+#define cudaIpcMemLazyEnablePeerAccess musaIpcMemLazyEnablePeerAccess
+#define cudaStreamDefault musaStreamDefault
+#define cudaStreamNonBlocking musaStreamNonBlocking
+#define cudaStreamPerThread musaStreamPerThread
 #define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
 #define cudaStreamCaptureStatusActive musaStreamCaptureStatusActive
 #define cudaStreamCaptureStatusInvalidated musaStreamCaptureStatusInvalidated
 #define cudaGetErrorString musaGetErrorString
 #define cudaGetLastError musaGetLastError
 #define cudaGetDevice musaGetDevice
+#define cudaGetDeviceCount musaGetDeviceCount
 #define cudaSetDevice musaSetDevice
+#define cudaDeviceCanAccessPeer musaDeviceCanAccessPeer
+#define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
+#define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
+#define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaMalloc musaMalloc
 #define cudaFree musaFree
 #define cudaMallocHost musaMallocHost
 #define cudaFreeHost musaFreeHost
+#define cudaHostRegister musaHostRegister
+#define cudaHostRegisterPortable musaHostRegisterPortable
+#define cudaHostRegisterMapped musaHostRegisterMapped
+#define cudaHostRegisterIoMemory musaHostRegisterIoMemory
+#define cudaHostUnregister musaHostUnregister
 #ifdef __cplusplus
 template <typename T>
 static inline cudaError_t cudaHostAlloc(T **ptr, size_t size, unsigned int flags) {
@@ -160,7 +181,21 @@ static inline cudaError_t cudaHostGetDevicePointer(void **device_ptr, void *host
 #define cudaMemsetAsync musaMemsetAsync
 #define cudaMemcpy musaMemcpy
 #define cudaMemcpyAsync musaMemcpyAsync
+#define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
+#define cudaMemoryTypeHost musaMemoryTypeHost
+#define cudaMemoryTypeUnregistered musaMemoryTypeUnregistered
 #define cudaPointerGetAttributes musaPointerGetAttributes
+#define cudaIpcCloseMemHandle musaIpcCloseMemHandle
+#define cudaIpcGetMemHandle musaIpcGetMemHandle
+#define cudaIpcOpenMemHandle musaIpcOpenMemHandle
+#define cudaStreamCreateWithFlags musaStreamCreateWithFlags
+#define cudaStreamDestroy musaStreamDestroy
+#define cudaLaunchConfig_t musaLaunchConfig_t
+#define cudaLaunchAttribute musaLaunchAttribute
+#define cudaLaunchAttributeCooperative musaLaunchAttributeCooperative
+#define cudaLaunchKernelEx musaLaunchKernelEx
+#define CUDA_R_16BF MUSA_R_16BF
+#define CUDA_R_32F MUSA_R_32F
 static inline cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode *mode) {
   (void)mode;
   return cudaSuccess;
@@ -196,7 +231,54 @@ H
 #include <musa.h>
 #include <cuda_runtime_api.h>
 #define CUresult MUresult
+#define CUcontext MUcontext
+#define CUdevice MUdevice
+#define CUdeviceptr MUdeviceptr
+#define CUmemAccessDesc MUmemAccessDesc
+#define CUmemAllocationProp MUmemAllocationProp
+#define CUmemFabricHandle MUmemFabricHandle
+#define CUmemAllocationHandleType MUmemAllocationHandleType
+#define CUmemGenericAllocationHandle MUmemGenericAllocationHandle
+#define CUmemorytype MUmemorytype
 #define CUDA_SUCCESS MUSA_SUCCESS
+#define CUDA_ERROR_NOT_PERMITTED MUSA_ERROR_NOT_PERMITTED
+#define CUDA_ERROR_NOT_SUPPORTED MUSA_ERROR_NOT_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED MU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_MUSA_VMM_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED MU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED MU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED MU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED
+#define CU_MEM_ACCESS_FLAGS_PROT_READWRITE MU_MEM_ACCESS_FLAGS_PROT_READWRITE
+#define CU_MEM_ALLOC_GRANULARITY_MINIMUM MU_MEM_ALLOC_GRANULARITY_MINIMUM
+#define CU_MEM_ALLOCATION_TYPE_PINNED MU_MEM_ALLOCATION_TYPE_PINNED
+#define CU_MEM_HANDLE_TYPE_FABRIC MU_MEM_HANDLE_TYPE_FABRIC
+#define CU_MEM_LOCATION_TYPE_DEVICE MU_MEM_LOCATION_TYPE_DEVICE
+#define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD MU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD
+#define CU_MEMORYTYPE_DEVICE MU_MEMORYTYPE_DEVICE
+#define CU_MEMORYTYPE_HOST MU_MEMORYTYPE_HOST
+#define CU_POINTER_ATTRIBUTE_MEMORY_TYPE MU_POINTER_ATTRIBUTE_MEMORY_TYPE
+#define CU_POINTER_ATTRIBUTE_RANGE_SIZE MU_POINTER_ATTRIBUTE_RANGE_SIZE
+#define CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL MU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+#define cuInit muInit
+#define cuDeviceGet muDeviceGet
+#define cuDeviceGetAttribute muDeviceGetAttribute
+#define cuDevicePrimaryCtxRetain muDevicePrimaryCtxRetain
+#define cuDevicePrimaryCtxRelease muDevicePrimaryCtxRelease
+#define cuCtxSetCurrent muCtxSetCurrent
+#define cuGetErrorString muGetErrorString
+#define cuMemAddressFree muMemAddressFree
+#define cuMemAddressReserve muMemAddressReserve
+#define cuMemCreate muMemCreate
+#define cuMemExportToShareableHandle muMemExportToShareableHandle
+#define cuMemGetAddressRange muMemGetAddressRange
+#define cuMemGetAllocationGranularity muMemGetAllocationGranularity
+#define cuMemGetHandleForAddressRange muMemGetHandleForAddressRange
+#define cuMemImportFromShareableHandle muMemImportFromShareableHandle
+#define cuMemMap muMemMap
+#define cuMemRelease muMemRelease
+#define cuMemRetainAllocationHandle muMemRetainAllocationHandle
+#define cuMemSetAccess muMemSetAccess
+#define cuMemUnmap muMemUnmap
+#define cuPointerGetAttribute muPointerGetAttribute
 H
   cat > "${CUDA_COMPAT_HOME}/include/cuda_bf16.h" <<'H'
 #pragma once

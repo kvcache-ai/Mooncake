@@ -13,7 +13,7 @@
 #include <musa_fp8.h>
 using ep_fp8_storage_t = __mt_fp8_storage_t;
 using ep_fp8x2_storage_t = __mt_fp8x2_storage_t;
-#if defined(__CUDACC__) || defined(__MUSA_ARCH__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__)
 __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
     return __musa_cvt_float2_to_fp8x2(x, __MT_SATFINITE, __MT_E4M3);
 }
@@ -27,7 +27,7 @@ __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
 #define __activemask() (0xffffffff)
 #endif
 
-#if defined(__CUDACC__) || defined(__MUSA_ARCH__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__)
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #endif
 
@@ -55,14 +55,14 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #include <cuda_fp8.h>
 using ep_fp8_storage_t = __nv_fp8_storage_t;
 using ep_fp8x2_storage_t = __nv_fp8x2_storage_t;
-#if defined(__CUDACC__) || defined(__MUSA_ARCH__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__)
 __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
     return __nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __NV_E4M3);
 }
 #endif
 
 // -- Device intrinsics -------------------------------------------------------
-#if defined(__CUDACC__) || defined(__MUSA_ARCH__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__)
 __forceinline__ __device__ int get_lane_id() {
     int lane_id;
     asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
