@@ -190,6 +190,11 @@ class MasterServiceSupervisorConfig {
     std::string snapshot_catalog_store_type;
     std::string snapshot_catalog_store_connstring;
 
+    // HTTP metadata server configuration
+    bool enable_http_metadata_server = false;
+    uint32_t http_metadata_server_port = 8080;
+    std::string http_metadata_server_host = "0.0.0.0";
+
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
@@ -264,6 +269,11 @@ class MasterServiceSupervisorConfig {
         default_tenant_quota_bytes = config.default_tenant_quota_bytes;
         tenant_quota_pool_capacity_bytes =
             config.tenant_quota_pool_capacity_bytes;
+
+        // Set HTTP metadata server configuration
+        enable_http_metadata_server = config.enable_http_metadata_server;
+        http_metadata_server_port = config.http_metadata_server_port;
+        http_metadata_server_host = config.http_metadata_server_host;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
