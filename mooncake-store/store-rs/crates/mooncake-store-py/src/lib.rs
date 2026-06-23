@@ -3428,25 +3428,25 @@ mod tests {
 
         assert_eq!(
             store
-                .unregister_buffer(write_ptr, 64)
+                .unregister_buffer(write_ptr, Some(64))
                 .expect("first legacy write buffer should unregister"),
             0
         );
         assert_eq!(
             store
-                .unregister_buffer(write_ptr_two, 64)
+                .unregister_buffer(write_ptr_two, Some(64))
                 .expect("second legacy write buffer should unregister"),
             0
         );
         assert_eq!(
             store
-                .unregister_buffer(read_ptr, 64)
+                .unregister_buffer(read_ptr, Some(64))
                 .expect("first legacy read buffer should unregister"),
             0
         );
         assert_eq!(
             store
-                .unregister_buffer(read_ptr_two, 64)
+                .unregister_buffer(read_ptr_two, Some(64))
                 .expect("second legacy read buffer should unregister"),
             0
         );
@@ -3569,13 +3569,13 @@ mod tests {
 
         assert_eq!(
             store
-                .unregister_buffer(write_ptr, 64)
+                .unregister_buffer(write_ptr, Some(64))
                 .expect("dummy write buffer should unregister"),
             0
         );
         assert_eq!(
             store
-                .unregister_buffer(read_ptr, 64)
+                .unregister_buffer(read_ptr, Some(64))
                 .expect("dummy read buffer should unregister"),
             0
         );
@@ -4251,7 +4251,7 @@ mod tests {
             .register_buffer(registered.as_mut_ptr() as usize, registered.len())
             .expect("register_buffer should succeed");
         store
-            .unregister_buffer(registered.as_mut_ptr() as usize, registered.len())
+            .unregister_buffer(registered.as_mut_ptr() as usize, Some(registered.len()))
             .expect("unregister_buffer should succeed");
 
         let source = b"from-buffer".to_vec();
@@ -4318,7 +4318,7 @@ mod tests {
             );
         });
         store
-            .unregister_buffer(source.as_ptr() as usize, source.len())
+            .unregister_buffer(source.as_ptr() as usize, Some(source.len()))
             .expect("source buffer unregister should succeed");
 
         let mut target_a = vec![0u8; 16];
@@ -5226,7 +5226,7 @@ mod tests {
             .is_err());
 
         store
-            .unregister_buffer(read_ptr, 64)
+            .unregister_buffer(read_ptr, Some(64))
             .expect("dummy unregister_buffer should succeed");
         assert!(store.get_into("buffered", read_ptr, 64, None).is_err());
 
@@ -6386,8 +6386,12 @@ mod tests {
             );
         }
 
-        store.unregister_buffer(buf0, 32).expect("unregister buf0");
-        store.unregister_buffer(buf1, 32).expect("unregister buf1");
+        store
+            .unregister_buffer(buf0, Some(32))
+            .expect("unregister buf0");
+        store
+            .unregister_buffer(buf1, Some(32))
+            .expect("unregister buf1");
     }
 
     #[test]
@@ -6486,7 +6490,9 @@ mod tests {
             .expect("zero-size read should succeed");
         assert_eq!(results[0][0][0], 0);
 
-        store.unregister_buffer(buf0, 32).expect("unregister buf0");
+        store
+            .unregister_buffer(buf0, Some(32))
+            .expect("unregister buf0");
     }
 
     /// TP 4→8 split: Trainer produces 4 shards (256 bytes each), Rollouter has 8 ranks
@@ -6595,7 +6601,7 @@ mod tests {
 
         for &buf in &buffer_ptrs {
             store
-                .unregister_buffer(buf, RANK_SIZE)
+                .unregister_buffer(buf, Some(RANK_SIZE))
                 .expect("unregister buffer");
         }
     }
@@ -6718,7 +6724,7 @@ mod tests {
 
         for &buf in &buffer_ptrs {
             store
-                .unregister_buffer(buf, RANK_SIZE)
+                .unregister_buffer(buf, Some(RANK_SIZE))
                 .expect("unregister buffer");
         }
     }
