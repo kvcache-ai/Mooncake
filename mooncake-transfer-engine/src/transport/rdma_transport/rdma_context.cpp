@@ -628,11 +628,24 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
 
     auto endpoint = endpoint_store_->getEndpoint(peer_nic_path);
     if (endpoint) {
-        return endpoint;
+        // Validate endpoint state: if it's already in terminal state, don't
+        // return it. This can happen when another thread detected peer restart
+        // and called beginDestroy.
+        auto status = endpoint->status();
+        if (status == RdmaEndPoint::Status::DESTROYING ||
+            status == RdmaEndPoint::Status::DESTROYED) {
+            LOG(WARNING) << "Found endpoint in terminal state ("
+                         << static_cast<int>(status) << ") for "
+                         << peer_nic_path << ", will create a new one";
+            endpoint_store_->deleteEndpointByPtr(endpoint.get());
+            endpoint.reset();
+        }
     }
 
-    endpoint = endpoint_store_->insertEndpoint(peer_nic_path, this);
-    endpoint_store_->reclaimEndpoint();
+    if (!endpoint) {
+        endpoint = endpoint_store_->insertEndpoint(peer_nic_path, this);
+        endpoint_store_->reclaimEndpoint();
+    }
     return endpoint;
 }
 

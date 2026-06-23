@@ -31,6 +31,14 @@ namespace mooncake {
 
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
 
+static void deleteFallbackCompletedToken(
+    RdmaEndPoint::CompletionToken *token) {
+    while (!token->fallback_completed.load(std::memory_order_acquire)) {
+        PAUSE();
+    }
+    delete token;
+}
+
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
@@ -334,13 +342,71 @@ void WorkerPool::performPollCq(int thread_id) {
             continue;
         }
 
+        struct CompletionGroup {
+            std::shared_ptr<RdmaEndPoint> endpoint;
+            std::vector<int> wc_indices;
+        };
+        std::unordered_map<RdmaEndPoint *, CompletionGroup> completion_by_ep;
+        std::vector<uint8_t> claimed(nr_poll, 0);
+        std::vector<RdmaEndPoint::CompletionToken *> tokens(nr_poll, nullptr);
         for (int i = 0; i < nr_poll; ++i) {
-            Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
-            assert(slice);
-            if (qp_depth_set.count(slice->rdma.qp_depth))
-                qp_depth_set[slice->rdma.qp_depth]++;
+            auto *token = (RdmaEndPoint::CompletionToken *)wc[i].wr_id;
+            assert(token);
+            tokens[i] = token;
+
+            auto *endpoint_ptr = token->endpoint.load(std::memory_order_acquire);
+            if (!endpoint_ptr) {
+                deleteFallbackCompletedToken(token);
+                tokens[i] = nullptr;
+                continue;
+            }
+
+            auto endpoint = context_.getEndpointByPtr(endpoint_ptr);
+            if (!endpoint) {
+                deleteFallbackCompletedToken(token);
+                tokens[i] = nullptr;
+                continue;
+            }
+
+            auto &group = completion_by_ep[endpoint_ptr];
+            if (!group.endpoint) group.endpoint = std::move(endpoint);
+            group.wc_indices.push_back(i);
+        }
+        for (auto &entry : completion_by_ep) {
+            std::vector<RdmaEndPoint::CompletionToken *> endpoint_tokens;
+            endpoint_tokens.reserve(entry.second.wc_indices.size());
+            for (int wc_index : entry.second.wc_indices) {
+                endpoint_tokens.push_back(tokens[wc_index]);
+            }
+            auto claim_results =
+                entry.second.endpoint->claimPendingSlices(endpoint_tokens);
+            for (size_t i = 0; i < claim_results.size(); ++i) {
+                claimed[entry.second.wc_indices[i]] = claim_results[i];
+            }
+        }
+
+        int claimed_completion_count = 0;
+        for (int i = 0; i < nr_poll; ++i) {
+            auto *token = tokens[i];
+            if (!token) continue;
+            if (!claimed[i]) {
+                deleteFallbackCompletedToken(token);
+                continue;
+            }
+
+            Transport::Slice *slice =
+                token->slice.load(std::memory_order_acquire);
+            if (!slice) {
+                delete token;
+                continue;
+            }
+
+            claimed_completion_count++;
+            auto *qp_depth = token->qp_depth.load(std::memory_order_acquire);
+            if (qp_depth_set.count(qp_depth))
+                qp_depth_set[qp_depth]++;
             else
-                qp_depth_set[slice->rdma.qp_depth] = 1;
+                qp_depth_set[qp_depth] = 1;
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
             if (wc[i].status != IBV_WC_SUCCESS) {
                 // Flush errors are generated when QPs transition to ERR state
@@ -354,6 +420,7 @@ void WorkerPool::performPollCq(int thread_id) {
                                   << "), marking failed without retry";
                     slice->markFailed();
                     processed_slice_count++;
+                    delete token;
                     continue;
                 }
 
@@ -371,7 +438,9 @@ void WorkerPool::performPollCq(int thread_id) {
                            << ", retry_cnt: " << slice->rdma.retry_cnt
                            << "): " << ibv_wc_status_str(wc[i].status);
                 // Unified path failure handling
-                handlePathFailure(slice->peer_nic_path, slice->rdma.endpoint);
+                handlePathFailure(
+                    slice->peer_nic_path,
+                    token->endpoint.load(std::memory_order_acquire));
                 if (shouldRetrySlice(slice)) {
                     failed_slice_list.push_back(slice);
                 } else {
@@ -382,10 +451,11 @@ void WorkerPool::performPollCq(int thread_id) {
                 slice->markSuccess();
                 processed_slice_count++;
             }
+            delete token;
         }
-        if (nr_poll)
+        if (claimed_completion_count)
             __sync_fetch_and_sub(context_.cqOutstandingCount(cq_index),
-                                 nr_poll);
+                                 claimed_completion_count);
     }
 
     for (auto &entry : qp_depth_set)

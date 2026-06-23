@@ -15,7 +15,9 @@
 #ifndef RDMA_ENDPOINT_H
 #define RDMA_ENDPOINT_H
 
+#include <mutex>
 #include <queue>
+#include <unordered_set>
 
 #include "rdma_context.h"
 
@@ -33,9 +35,9 @@ namespace mooncake {
 //    service.
 //   After above steps, the RdmaEndPoint state is set to CONNECTED
 //
-// If the user initiates a disconnect() call or an error is detected internally,
-// the connection is closed and the RdmaEndPoint state is set to UNCONNECTED.
-// The handshake can be restarted at this point.
+// If the user initiates a disconnect() call or an error is detected after the
+// endpoint has connected, the endpoint is marked for destruction and cannot be
+// reused. A new endpoint must be created for future connections.
 class RdmaEndPoint {
    public:
     enum Status {
@@ -56,7 +58,6 @@ class RdmaEndPoint {
                   size_t max_wr = 256, size_t max_inline = 64);
 
    private:
-    int reconstruct();
     int deconstruct();
     int deconstructLocked();
 
@@ -74,17 +75,28 @@ class RdmaEndPoint {
     int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                   HandShakeDesc &local_desc);
 
-    bool active() const { return active_; }
+    struct CompletionToken {
+        std::atomic<RdmaEndPoint *> endpoint{nullptr};
+        std::atomic<Transport::Slice *> slice{nullptr};
+        std::atomic<volatile int *> qp_depth{nullptr};
+        std::atomic<bool> fallback_completed{false};
+    };
+
+    bool active() const { return active_.load(std::memory_order_acquire); }
 
     void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag;
-        if (!flag) inactive_time_ = getCurrentTimeInNano();
+        active_.store(flag, std::memory_order_release);
+        if (!flag)
+            inactive_time_.store(getCurrentTimeInNano(),
+                                 std::memory_order_release);
     }
 
     double inactiveTime() {
-        if (active_) return 0.0;
-        return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
+        if (active_.load(std::memory_order_acquire)) return 0.0;
+        return (getCurrentTimeInNano() -
+                inactive_time_.load(std::memory_order_acquire)) /
+               1000000000.0;
     }
 
    public:
@@ -92,9 +104,11 @@ class RdmaEndPoint {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
-    // Interrupts the connection, which can be triggered by user or by internal
-    // error. Use setupConnectionsByActive or setupConnectionsByPassive to
-    // reconnect
+    Status status() const { return status_.load(std::memory_order_relaxed); }
+
+    // Interrupts the connection. Endpoints have unidirectional lifecycle: once
+    // a connected endpoint is disconnected, it is marked for destruction and
+    // cannot be reused.
     void disconnect();
 
     // Destroy QPs before CQs (in RDMA Context)
@@ -110,28 +124,34 @@ class RdmaEndPoint {
     void beginDestroy();
     bool finishDestroy();
 
+    // Claims completion ownership for polled WRs. Each result is false if the
+    // corresponding WR was already completed by the destruction fallback.
+    std::vector<uint8_t> claimPendingSlices(
+        const std::vector<CompletionToken *> &tokens);
+
    private:
+    // Same as beginDestroy but must be called while already holding lock_.
+    void beginDestroyNoLock();
+
+    // Resets only an unestablished endpoint during handshake retry. Connected
+    // endpoints must use beginDestroyNoLock() and be replaced instead.
     int disconnectUnlocked();
 
-    // Resets the connection.
-    //
-    // The main difference between this function and `disconnectUnlocked`
-    // is that it will reconstruct QPs when `CONFIG_ERDMA` is defined.
-    // Without `CONFIG_ERDMA`, it is essentially the same as
-    // `disconnectUnlocked` but with additional logging.
-    //
-    // This serves as a workaround for Aliyun eRDMA devices (i.e., once a QP is
-    // transitioned to the RTS state, it cannot be reset to RTS again directly).
-    // For more details:
-    // https://github.com/kvcache-ai/Mooncake/pull/1733#discussion_r2992088663
-    //
-    // In practice:
-    // - Call `resetConnection` if the QPs' state may have transitioned to RTS.
-    // - Call `disconnectUnlocked` otherwise.
-    //
-    // This is mainly used in `setupConnectionsByActive` or
-    // `setupConnectionsByPassive`. It is NOT invoked in the normal execution
-    // flow, so a `reason` argument is passed for internal logging purposes.
+    void addPendingTokens(const std::vector<CompletionToken *> &tokens);
+    void removePendingTokens(const std::vector<CompletionToken *> &tokens,
+                             size_t start, size_t count);
+    std::vector<CompletionToken *> claimAllPendingTokens();
+    void completePendingSlicesAsFailed(
+        const std::vector<CompletionToken *> &pending_tokens);
+
+    uint64_t beginHandshakeAttempt();
+    bool verifyHandshakeVersion(uint64_t response_version) const;
+    bool validateHandshakeTimestamp(uint64_t timestamp) const;
+    void recordSuccessfulHandshake(const std::vector<uint32_t> &peer_qp_num,
+                                   uint64_t version);
+
+    // Resets a handshake attempt, or destroys the endpoint if it has already
+    // connected. This is mainly used in setupConnectionsByActive/Passive.
     int resetConnection(const std::string &reason);
 
    public:
@@ -186,6 +206,11 @@ class RdmaEndPoint {
     // ibv_modify_qp-to-ERR failures that prevent WR flushing.
     static constexpr double kFinishDestroyTimeoutSec = 30.0;
 
+    static constexpr uint64_t kHandshakeTimeoutNs =
+        30 * 1000000000ULL;  // 30 seconds
+    static constexpr uint64_t kHandshakeStalenessNs =
+        10 * 1000000000ULL;  // 10 seconds
+
     // Maximum number of deconstructLocked retries in finishDestroy before
     // giving up and marking the endpoint as DESTROYED. Prevents infinite
     // retry loops and log flooding when ibv_destroy_qp fails permanently.
@@ -205,10 +230,21 @@ class RdmaEndPoint {
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
 
-    volatile bool active_;
+    std::atomic<bool> active_;
     volatile int *cq_outstanding_;
-    volatile uint64_t inactive_time_;
+    std::atomic<uint64_t> inactive_time_{0};
     int finish_destroy_retries_ = 0;
+    bool needs_manual_completion_ = false;
+
+    std::atomic<uint64_t> handshake_version_{0};
+    struct PeerInfo {
+        uint32_t qp_num = 0;
+        uint64_t handshake_version = 0;
+        uint64_t timestamp = 0;
+    } established_peer_;
+
+    std::mutex pending_slices_mutex_;
+    std::unordered_set<CompletionToken *> pending_tokens_;
 };
 
 }  // namespace mooncake

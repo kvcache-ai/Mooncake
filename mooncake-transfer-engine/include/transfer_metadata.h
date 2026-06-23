@@ -145,6 +145,15 @@ class TransferMetadata {
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
 #endif
+
+        // Enhanced fields for robust handshake protocol
+        uint64_t handshake_version = 0;  // Monotonically increasing version
+        uint64_t timestamp = 0;          // Staleness/replay sanity hint
+        uint32_t flags = 0;              // Handshake flags
+
+        enum Flags : uint32_t {
+            FLAG_PEER_RESTART_DETECTED = 0x1,  // Peer detected restart
+        };
     };
 
     struct NotifyDesc {
