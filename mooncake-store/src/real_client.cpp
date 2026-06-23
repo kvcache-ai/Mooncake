@@ -29,7 +29,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
@@ -263,23 +263,34 @@ void fill_ranged_read_results_with_error(
     }
 }
 
+const device::AcceleratorDevice* FindDeviceForPointer(
+    const void* ptr, device::PointerInfo* out_info = nullptr) {
+    for (auto* accelerator :
+         device::GetAcceleratorRegistry().AvailableDevices()) {
+        auto info = accelerator->QueryPointer(ptr);
+        if (info.kind != device::MemoryKind::kDevice) continue;
+        if (out_info) *out_info = info;
+        return accelerator;
+    }
+    return nullptr;
+}
+
 // Scatter host (CPU) memory to a destination that may be GPU or host.
 // Returns tl::expected<void, ErrorCode> for use in functions returning
 // tl::expected<int64_t, ErrorCode>.
 inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     void *dst, const void *src, size_t size, const std::string &context) {
-    int device_id = -1;
-    if (gpu_staging::IsDevicePointer(dst, &device_id)) {
-        gpu_staging::SetDevice(device_id);
-        if (!gpu_staging::CopyHostToDevice(dst, src, size)) {
+    device::PointerInfo pointer_info;
+    auto* accelerator = FindDeviceForPointer(dst, &pointer_info);
+    if (accelerator) {
+        accelerator->SetContext(pointer_info.device_id);
+        if (!accelerator->Copy(dst, src, size,
+                               device::CopyDirection::kHostToDevice)) {
             LOG(ERROR) << "H2D copy failed: " << context;
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
-    } else if (gpu_staging::IsHostPointer(dst)) {
-        memcpy(dst, src, size);
     } else {
-        LOG(ERROR) << "Unknown memory type for dst buffer: " << context;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        memcpy(dst, src, size);
     }
     return {};
 }
@@ -2604,7 +2615,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // Client::Get's internal FindFirstCompleteReplica can only see
     // the replica we selected, preventing accidental LOCAL_DISK picks.
     if (replica.is_disk_replica() &&
-        gpu_staging::IsDevicePointer(buffer_handle->ptr(), nullptr)) {
+        FindDeviceForPointer(buffer_handle->ptr()) != nullptr) {
         LOG(WARNING) << "DISK replica for key '" << key
                      << "' received a device pointer from the allocator; "
                      << "file I/O cannot write to GPU memory — read will fail. "
@@ -2910,7 +2921,7 @@ RealClient::batch_get_buffer_internal(
         // can only write to CPU-addressable memory.  If the allocator ever
         // returns device memory for DISK, the read will silently fail.
         if (replica.is_disk_replica() &&
-            gpu_staging::IsDevicePointer(buffer_handle->ptr(), nullptr)) {
+            FindDeviceForPointer(buffer_handle->ptr()) != nullptr) {
             LOG(WARNING)
                 << "DISK replica for key '" << key
                 << "' received a device pointer from the allocator; "

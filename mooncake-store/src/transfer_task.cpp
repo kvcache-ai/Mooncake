@@ -10,12 +10,28 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
+
+namespace {
+
+const mooncake::device::AcceleratorDevice* FindDeviceForPointer(
+    const std::vector<const mooncake::device::AcceleratorDevice*>& accelerators,
+    const void* ptr, mooncake::device::PointerInfo* out_info = nullptr) {
+    for (auto* accelerator : accelerators) {
+        auto info = accelerator->QueryPointer(ptr);
+        if (info.kind != mooncake::device::MemoryKind::kDevice) continue;
+        if (out_info) *out_info = info;
+        return accelerator;
+    }
+    return nullptr;
+}
+
+}  // namespace
 
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
@@ -650,22 +666,39 @@ void MemcpyWorkerPool::workerThread() {
         if (task.state) {
             try {
                 bool ok = true;
+                auto accelerators =
+                    device::GetAcceleratorRegistry().AvailableDevices();
                 for (const auto& op : task.operations) {
-                    int src_dev = -1, dst_dev = -1;
-                    bool src_on_gpu =
-                        gpu_staging::IsDevicePointer(op.src, &src_dev);
-                    bool dst_on_gpu =
-                        gpu_staging::IsDevicePointer(op.dest, &dst_dev);
+                    device::PointerInfo src_info;
+                    device::PointerInfo dst_info;
+                    auto* src_device =
+                        FindDeviceForPointer(accelerators, op.src, &src_info);
+                    auto* dst_device =
+                        FindDeviceForPointer(accelerators, op.dest, &dst_info);
 
-                    if (!src_on_gpu && !dst_on_gpu) {
+                    if (!src_device && !dst_device) {
                         std::memcpy(op.dest, op.src, op.size);
                     } else {
-                        int dev = src_on_gpu ? src_dev : dst_dev;
-                        gpu_staging::SetDevice(dev);
-                        if (!gpu_staging::CopyAuto(op.dest, op.src, op.size)) {
+                        if (src_device && dst_device &&
+                            src_device != dst_device) {
                             LOG(ERROR)
-                                << "GPU memcpy failed: src_dev=" << src_dev
-                                << " dst_dev=" << dst_dev
+                                << "GPU memcpy failed: source and destination "
+                                   "belong to different accelerator runtimes"
+                                << " src_dev=" << src_info.device_id
+                                << " dst_dev=" << dst_info.device_id
+                                << " size=" << op.size;
+                            ok = false;
+                            break;
+                        }
+                        auto* accelerator = src_device ? src_device : dst_device;
+                        const auto& info = src_device ? src_info : dst_info;
+                        accelerator->SetContext(info.device_id);
+                        if (!accelerator->Copy(op.dest, op.src, op.size,
+                                               device::CopyDirection::kAuto)) {
+                            LOG(ERROR)
+                                << "GPU memcpy failed: src_dev="
+                                << src_info.device_id
+                                << " dst_dev=" << dst_info.device_id
                                 << " size=" << op.size;
                             ok = false;
                             break;

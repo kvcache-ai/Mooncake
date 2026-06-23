@@ -24,6 +24,8 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <utility>
+#include <vector>
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
@@ -37,15 +39,23 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 
 namespace mooncake {
 
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
-
 namespace {
+
+const device::AcceleratorDevice* FindDeviceForPointer(
+    const std::vector<const device::AcceleratorDevice*>& accelerators,
+    const void* ptr, device::PointerInfo* out_info = nullptr) {
+    for (auto* accelerator : accelerators) {
+        auto info = accelerator->QueryPointer(ptr);
+        if (info.kind != device::MemoryKind::kDevice) continue;
+        if (out_info) *out_info = info;
+        return accelerator;
+    }
+    return nullptr;
+}
 
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
@@ -3342,15 +3352,19 @@ void Client::PutToLocalFile(const std::string& key,
     std::string value;
     value.reserve(total_size);
 
+    auto accelerators = device::GetAcceleratorRegistry().AvailableDevices();
     for (const auto& slice : slices) {
-        int device_id = -1;
-        if (IsDevicePointer(slice.ptr, &device_id)) {
-            SetDevice(device_id);
+        device::PointerInfo pointer_info;
+        auto* accelerator =
+            FindDeviceForPointer(accelerators, slice.ptr, &pointer_info);
+        if (accelerator) {
+            accelerator->SetContext(pointer_info.device_id);
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+            if (!accelerator->Copy(buf.data, slice.ptr, slice.size,
+                                   device::CopyDirection::kDeviceToHost)) {
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
-                pinned_buffer_pool_->Release(buf);
+                pinned_buffer_pool_->Release(std::move(buf));
                 // Must revoke to avoid phantom replica in master
                 auto revoke_result =
                     master_client_.PutRevoke(key, ReplicaType::DISK);
@@ -3361,7 +3375,7 @@ void Client::PutToLocalFile(const std::string& key,
                 return;
             }
             value.append(buf.data, slice.size);
-            pinned_buffer_pool_->Release(buf);
+            pinned_buffer_pool_->Release(std::move(buf));
         } else {
             value.append(static_cast<char*>(slice.ptr), slice.size);
         }
