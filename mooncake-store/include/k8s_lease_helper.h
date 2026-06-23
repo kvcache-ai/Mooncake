@@ -36,6 +36,14 @@ class K8sLeaseHelper {
     static ErrorCode CancelWatch(const std::string& ns,
                                  const std::string& lease);
 
+    static ErrorCode SetPodLabel(const std::string& ns, const std::string& pod,
+                                 const std::string& key,
+                                 const std::string& value);
+
+    static ErrorCode ClearPodLabel(const std::string& ns,
+                                   const std::string& pod,
+                                   const std::string& key);
+
    private:
     static std::mutex init_mutex_;
     static bool initialized_;
