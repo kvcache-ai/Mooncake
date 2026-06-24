@@ -418,6 +418,14 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.enable_dest_device_affinity = false;
     }
 
+    const char* log_rdma_slice_affinity_env =
+        std::getenv("MC_LOG_RDMA_SLICE_AFFINITY");
+    if (log_rdma_slice_affinity_env) {
+        parseBoolConfigEnv(log_rdma_slice_affinity_env,
+                           "MC_LOG_RDMA_SLICE_AFFINITY",
+                           config.log_rdma_slice_affinity);
+    }
+
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
@@ -577,6 +585,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    LOG(INFO) << "log_rdma_slice_affinity = "
+              << (config.log_rdma_slice_affinity ? "true" : "false");
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {

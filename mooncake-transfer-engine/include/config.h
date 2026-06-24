@@ -63,6 +63,7 @@ struct GlobalConfig {
     bool enable_dest_device_affinity = false;
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
+    bool log_rdma_slice_affinity = false;
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;

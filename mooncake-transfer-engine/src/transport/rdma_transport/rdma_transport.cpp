@@ -40,6 +40,17 @@ namespace mooncake {
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
+static std::string resolveBufferLocation(
+    const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
+    std::string location = buffer.name;
+    SegmentsLocationInfo seg_info;
+    if (parseSegmentsLocation(buffer.name, seg_info)) {
+        location = resolveSegmentsLocation(seg_info, buffer.length,
+                                           offset - buffer.addr);
+    }
+    return location;
+}
+
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
 // 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
 static int getIbRelaxedOrderingMode() {
@@ -502,6 +513,7 @@ Status RdmaTransport::submitTransferTask(
             slice->source_addr = (char *)request.source + offset;
             slice->length =
                 merge_final_slice ? request.length - offset : kBlockSize;
+            slice->source_location.clear();
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
@@ -558,6 +570,11 @@ Status RdmaTransport::submitTransferTask(
                 }
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
+                if (globalConfig().log_rdma_slice_affinity) {
+                    slice->source_location = resolveBufferLocation(
+                        local_segment_desc->buffers[buffer_id],
+                        reinterpret_cast<uint64_t>(slice->source_addr));
+                }
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
