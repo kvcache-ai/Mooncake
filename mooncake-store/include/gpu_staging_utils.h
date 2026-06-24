@@ -240,7 +240,7 @@ inline bool TryPinHostMemory(void* ptr, size_t size, const char* name) {
         PinnedHostMemoryBytes() += size;
     }
 
-    auto cuda_ret = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+    auto cuda_ret = cudaHostRegister(ptr, size, 0);
     if (cuda_ret != cudaSuccess) {
         std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
         PinnedHostMemoryBytes() -= size;
