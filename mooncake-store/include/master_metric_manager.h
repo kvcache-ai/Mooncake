@@ -309,6 +309,11 @@ class MasterMetricManager {
     void inc_promotion_rejected_watermark(int64_t val = 1);
     void inc_promotion_rejected_cap(int64_t val = 1);
 
+    // Tenant quota metrics
+    void inc_tenant_quota_reject(const std::string& tenant_id,
+                                 const std::string& reason, int64_t val = 1);
+    void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
+
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
     int64_t get_promotion_admitted();
@@ -669,6 +674,9 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_rejected_frequency_;
     ylt::metric::counter_t promotion_rejected_watermark_;
     ylt::metric::counter_t promotion_rejected_cap_;
+
+    ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
+    ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

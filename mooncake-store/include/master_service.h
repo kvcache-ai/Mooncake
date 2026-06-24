@@ -90,6 +90,17 @@ class MasterService {
         const UUID& segment_id);
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
         const std::string& tenant_id) const;
+    bool IsTenantQuotaEnabled() const;
+    std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
+    std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
+        const std::string& tenant_id) const;
+    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
+        const std::string& tenant_id, uint64_t requested_quota_bytes);
+    std::optional<TenantQuotaSnapshot> DeleteTenantQuotaPolicy(
+        const std::string& tenant_id);
+    uint64_t GetDefaultTenantQuotaPolicy() const;
+    void SetDefaultTenantQuotaPolicy(uint64_t requested_quota_bytes);
+    uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -783,6 +794,12 @@ class MasterService {
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
+    struct TenantQuotaEvictionResult {
+        uint64_t freed_bytes{0};
+        uint64_t evicted_objects{0};
+    };
+    TenantQuotaEvictionResult EvictTenantMemoryForQuota(
+        const std::string& tenant_id, uint64_t target_bytes);
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
@@ -1356,6 +1373,8 @@ class MasterService {
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
+    uint64_t ComputeTenantQuotaDeficit(const std::string& tenant_id,
+                                       uint64_t incoming_quota_charge);
     tl::expected<void, ErrorCode> ReserveTenantQuota(
         const std::string& tenant_id, uint64_t bytes);
     void CommitTenantQuota(const std::string& tenant_id, uint64_t bytes);
@@ -1716,6 +1735,20 @@ class MasterService {
             const msgpack::object& obj);
     };
 
+    class TenantQuotaPolicySerializer {
+       public:
+        TenantQuotaPolicySerializer(MasterService* service)
+            : service_(service) {}
+
+        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+        tl::expected<void, SerializationError> Deserialize(
+            const std::vector<uint8_t>& data);
+        void Reset();
+
+       private:
+        MasterService* service_;
+    };
+
     friend class MetadataAccessor;
     class MetadataAccessorRO {
        public:
@@ -1870,8 +1903,13 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_tenant_quota_;
-    const uint64_t default_tenant_quota_bytes_;
+    // Startup default used when restoring legacy snapshots without
+    // tenant_quota_policy.
+    const uint64_t configured_default_tenant_quota_bytes_;
+    // Runtime default policy, mutable through the tenant quota admin API.
+    std::atomic<uint64_t> default_tenant_quota_bytes_;
     const uint64_t tenant_quota_pool_capacity_bytes_;
+    mutable std::mutex tenant_quota_recompute_mutex_;
 
     bool use_disk_replica_{false};
 
