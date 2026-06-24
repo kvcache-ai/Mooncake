@@ -264,6 +264,34 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         self.inner.batch_replace_routes(request).await
     }
 
+    async fn read_from_cold(
+        &self,
+        request: Request<pb::ReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::ReadFromColdReply>, Status> {
+        self.inner.read_from_cold(request).await
+    }
+
+    async fn batch_read_from_cold(
+        &self,
+        request: Request<pb::BatchReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::BatchReadFromColdReply>, Status> {
+        self.inner.batch_read_from_cold(request).await
+    }
+
+    async fn ack_cold_read_complete(
+        &self,
+        request: Request<pb::AckColdReadCompleteRequest>,
+    ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
+        self.inner.ack_cold_read_complete(request).await
+    }
+
+    async fn pin_for_read(
+        &self,
+        request: Request<pb::PinForReadRequest>,
+    ) -> std::result::Result<Response<pb::PinForReadReply>, Status> {
+        self.inner.pin_for_read(request).await
+    }
+
     async fn reserve_any(
         &self,
         request: Request<pb::ReserveAnyRequest>,
@@ -491,6 +519,34 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
         request: Request<pb::BatchReplaceRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchReplaceRoutesReply>, Status> {
         self.inner.batch_replace_routes(request).await
+    }
+
+    async fn read_from_cold(
+        &self,
+        request: Request<pb::ReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::ReadFromColdReply>, Status> {
+        self.inner.read_from_cold(request).await
+    }
+
+    async fn batch_read_from_cold(
+        &self,
+        request: Request<pb::BatchReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::BatchReadFromColdReply>, Status> {
+        self.inner.batch_read_from_cold(request).await
+    }
+
+    async fn ack_cold_read_complete(
+        &self,
+        request: Request<pb::AckColdReadCompleteRequest>,
+    ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
+        self.inner.ack_cold_read_complete(request).await
+    }
+
+    async fn pin_for_read(
+        &self,
+        request: Request<pb::PinForReadRequest>,
+    ) -> std::result::Result<Response<pb::PinForReadReply>, Status> {
+        self.inner.pin_for_read(request).await
     }
 
     async fn reserve_any(
@@ -721,6 +777,34 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
         request: Request<pb::BatchReplaceRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchReplaceRoutesReply>, Status> {
         self.inner.batch_replace_routes(request).await
+    }
+
+    async fn read_from_cold(
+        &self,
+        request: Request<pb::ReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::ReadFromColdReply>, Status> {
+        self.inner.read_from_cold(request).await
+    }
+
+    async fn batch_read_from_cold(
+        &self,
+        request: Request<pb::BatchReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::BatchReadFromColdReply>, Status> {
+        self.inner.batch_read_from_cold(request).await
+    }
+
+    async fn ack_cold_read_complete(
+        &self,
+        request: Request<pb::AckColdReadCompleteRequest>,
+    ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
+        self.inner.ack_cold_read_complete(request).await
+    }
+
+    async fn pin_for_read(
+        &self,
+        request: Request<pb::PinForReadRequest>,
+    ) -> std::result::Result<Response<pb::PinForReadReply>, Status> {
+        self.inner.pin_for_read(request).await
     }
 
     async fn reserve_any(
@@ -1724,6 +1808,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             canonical_key: String::new(),
             sharing_scope: String::new(),
             qos_tier: String::new(),
+            cold_backing: None,
         };
 
         let cas_reply = service

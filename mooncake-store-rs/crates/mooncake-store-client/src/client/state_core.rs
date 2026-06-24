@@ -327,6 +327,8 @@ struct SegmentTransportMetadata {
 /// (cold_tier_devices, hot_replicas, offload_mode, offload_priority)
 /// are consumed by the offload/restore pipeline.
 #[allow(dead_code)]
+enum DeferredColdTierReconcile {}
+
 struct StorageOwnerState {
     runtime: ClientRuntimeId,
     route_ops: RouteOperations,
@@ -340,8 +342,75 @@ struct StorageOwnerState {
     initial_cold_backing_repair_at_ms: AtomicU64,
     offload_mode: ColdTierOffloadMode,
     offload_priority: ColdTierOffloadPriorityConfig,
+    owner_cold_restore_flights: OwnerColdRestoreFlightMap,
+    cold_restore_io_tracker: ColdRestoreIoTracker,
     /// Signaled by offload when an entry becomes Materialized (clean).
     eviction_ready_signal: EvictionReadySignal,
+    read_pin_registry: ReadPinRegistry,
+    staging_pool: Mutex<Option<Arc<cold_tier::ColdRestoreStagingPool>>>,
+    pending_staging_slots: Mutex<HashMap<(SegmentName, u64), (cold_tier::StagingSlot, Instant)>>,
+    staging_pool_bytes: usize,
+}
+
+/// Notification channel: offload thread signals cold restore waiters
+/// when entries become Materialized (evictable without I/O).
+struct EvictionReadySignal {
+    generation: AtomicU64,
+    condvar: StdCondvar,
+    mutex: StdMutex<()>,
+}
+
+impl Default for EvictionReadySignal {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            condvar: StdCondvar::new(),
+            mutex: StdMutex::new(()),
+        }
+    }
+}
+
+impl EvictionReadySignal {
+    /// Called by offload thread after an entry becomes Materialized.
+    fn notify_materialized(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.condvar.notify_all();
+    }
+
+    fn signal(&self) {
+        self.notify_materialized();
+    }
+
+    /// Wait until a new Materialized entry is available, or timeout.
+    #[allow(dead_code)]
+    fn wait_for_materialized(&self, timeout: Duration) -> bool {
+        let guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let gen_before = self.generation.load(Ordering::Acquire);
+        let (_guard, result) = self
+            .condvar
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|e| e.into_inner());
+        if result.timed_out() {
+            // Check if generation advanced during our wait (spurious wakeup protection)
+            self.generation.load(Ordering::Acquire) != gen_before
+        } else {
+            true
+        }
+    }
+}
+
+#[derive(Default)]
+struct RouteWriteGate {
+    state: Mutex<()>,
+}
+
+struct RouteWritePermit<'a> {
+    guard: Option<parking_lot::MutexGuard<'a, ()>>,
+}
+
+#[derive(Default)]
+struct HotReplicaTracker {
+    clock: Mutex<StorageClockState>,
 }
 
 #[derive(Default)]
@@ -896,6 +965,16 @@ impl ReplicaPlacementTarget {
 struct ReplicaPlacementCandidate {
     target: ReplicaPlacementTarget,
     soft: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ReclaimQueueSnapshot {
+    total_pending: usize,
+    due: usize,
+    cold_backing_reclaims: usize,
+    hot_segment_reclaims: usize,
+    by_qos_tier: BTreeMap<String, usize>,
+    by_policy_rank: BTreeMap<u8, usize>,
 }
 
 #[derive(Clone, Debug)]

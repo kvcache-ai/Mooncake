@@ -2099,18 +2099,27 @@ impl StoreClient {
             Some(replica) => (replica, readable_runtimes.clone()),
             None => {
                 let refreshed_readable = self.readable_runtime_set(true)?;
-                let replica = Self::select_readable_replica(
+                match Self::select_readable_replica(
                     &route,
                     &self.lease.runtime,
                     local_segments,
                     &refreshed_readable,
-                )
-                .ok_or_else(|| {
-                    StoreError::NotFound(format!(
-                        "tenant={tenant} key={logical_key} has no readable replica owner"
-                    ))
-                })?;
-                (replica, refreshed_readable)
+                ) {
+                    Some(replica) => (replica, refreshed_readable),
+                    None if cold_tier::cold_tier_enabled() => {
+                        let cold_backing = cold_tier::materialized_cold_backing(&route).ok_or_else(|| {
+                            StoreError::NotFound(format!(
+                                "tenant={tenant} key={logical_key} has no readable replica owner"
+                            ))
+                        })?;
+                        (cold_tier::cold_backing_placeholder(&cold_backing), refreshed_readable)
+                    }
+                    None => {
+                        return Err(StoreError::NotFound(format!(
+                            "tenant={tenant} key={logical_key} has no readable replica owner"
+                        )));
+                    }
+                }
             }
         };
         if route
@@ -2357,6 +2366,41 @@ impl StoreClient {
                     buffer.len()
                 )));
             }
+        }
+        if resolved
+            .iter()
+            .any(|entry| Self::is_cold_backing_placeholder(&entry.replica))
+        {
+            let total_bytes = lengths.iter().map(|length| *length as u64).sum::<u64>();
+            let attempts = resolved
+                .iter()
+                .map(|entry| 1 + entry.fallback_replicas.len())
+                .max()
+                .unwrap_or(1);
+            let request_deadline = self.request_deadline_for_transfer(total_bytes, attempts);
+            let mut checked_remote_runtimes = BTreeSet::new();
+            let local_segments = self.local_storage_segments();
+            for (entry, buffer) in resolved.iter_mut().zip(buffers.iter_mut()) {
+                if Self::is_cold_backing_placeholder(&entry.replica) {
+                    self.execute_cold_restore_direct(transport, entry, &mut **buffer, request_deadline)?;
+                } else {
+                    self.read_single_object_with_failover(
+                        transport,
+                        entry,
+                        &mut **buffer,
+                        &mut checked_remote_runtimes,
+                        &local_segments,
+                        request_deadline,
+                    )?;
+                }
+            }
+            let payloads = buffers
+                .iter()
+                .zip(lengths.iter())
+                .map(|(buffer, length)| &buffer[..*length])
+                .collect::<Vec<_>>();
+            Self::validate_batch_replica_checksums(resolved, &payloads)?;
+            return Ok(lengths);
         }
         let buffer_ptrs = buffers
             .iter_mut()
@@ -3799,6 +3843,171 @@ impl StoreClient {
         result
     }
 
+    fn is_cold_backing_placeholder(replica: &ReplicaRoute) -> bool {
+        replica.tier == ReplicaTier::File && replica.segment_name.0 == "__cold_backing__"
+    }
+
+    fn execute_cold_restore_direct(
+        &self,
+        transport: &dyn StoreTransport,
+        resolved: &ResolvedObject,
+        buffer: &mut [u8],
+        request_deadline: RequestDeadline,
+    ) -> Result<()> {
+        if cold_tier::cold_tier_disabled() {
+            return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+        }
+        let cold_backing = cold_tier::materialized_cold_backing(&resolved.route).ok_or_else(|| {
+            StoreError::NotFound(format!(
+                "route {} has no materialized cold backing",
+                resolved.route.key.0
+            ))
+        })?;
+        let length = cold_backing.length as usize;
+        if buffer.len() < length {
+            return Err(StoreError::Allocator(format!(
+                "buffer too small for tenant={} key={}: need {length}, have {}",
+                resolved.tenant,
+                resolved.key,
+                buffer.len()
+            )));
+        }
+        if cold_backing.owner == self.lease.runtime {
+            let backend = self.storage_owner.cold_tier_devices.backend_for_with_refresh(
+                self.metadata.as_ref(),
+                &cold_backing,
+                "local_read_cold_restore_backend_refresh",
+            )?;
+            let Some(read_len) = backend.get_object_into(&cold_backing, &mut buffer[..length])? else {
+                return Err(StoreError::NotFound(format!(
+                    "cold backing {}:{} not found",
+                    cold_backing.cold_tier_id, cold_backing.object_locator
+                )));
+            };
+            if read_len != length {
+                return Err(StoreError::InvalidState(format!(
+                    "cold backing {} length mismatch: expected {} actual {}",
+                    cold_backing.object_locator, length, read_len
+                )));
+            }
+            if let Some(expected) = cold_backing.checksum {
+                let actual = payload_checksum(&buffer[..length]);
+                if actual != expected {
+                    return Err(StoreError::InvalidState(format!(
+                        "cold backing {} checksum mismatch: expected {} actual {}",
+                        cold_backing.object_locator, expected, actual
+                    )));
+                }
+            }
+            cold_tier::enqueue_restore_promotion(
+                self,
+                resolved,
+                RestorePromotionPayload::Shared(Arc::new(buffer[..length].to_vec())),
+            );
+            return Ok(());
+        }
+
+        let lease = self.lookup_runtime_lease(&cold_backing.owner)?;
+        let request = pb::ReadFromColdRequest {
+            namespace: self.metadata.route_namespace(),
+            authority: cold_backing.owner.stable_id.0.clone(),
+            tenant: resolved.tenant.clone(),
+            key: resolved
+                .route
+                .logical_key
+                .clone()
+                .unwrap_or_else(|| resolved.key.clone()),
+            domain: resolved
+                .route
+                .namespace
+                .as_ref()
+                .map(|scope| scope.domain.clone())
+                .unwrap_or_default(),
+            object_set: resolved
+                .route
+                .namespace
+                .as_ref()
+                .map(|scope| scope.object_set.clone())
+                .unwrap_or_default(),
+        };
+        let reply = self.control_client.read_from_cold(&lease, request)?;
+        let staging_segment = SegmentName::new(reply.segment_name.clone());
+        if reply.length != cold_backing.length {
+            self.control_client.ack_cold_read_complete(
+                &lease,
+                vec![staging_segment.0.clone()],
+                vec![reply.segment_offset],
+            );
+            return Err(StoreError::InvalidState(format!(
+                "cold read reply length mismatch for {}: expected {} actual {}",
+                resolved.route.key.0, cold_backing.length, reply.length
+            )));
+        }
+        if reply.checksum != cold_backing.checksum {
+            self.control_client.ack_cold_read_complete(
+                &lease,
+                vec![staging_segment.0.clone()],
+                vec![reply.segment_offset],
+            );
+            return Err(StoreError::InvalidState(format!(
+                "cold read reply checksum mismatch for {}: expected {:?} actual {:?}",
+                resolved.route.key.0, cold_backing.checksum, reply.checksum
+            )));
+        }
+        let target_chunks = reply
+            .target_chunks
+            .iter()
+            .map(|chunk| SegmentTargetChunk {
+                logical_offset: chunk.logical_offset,
+                target_offset: chunk.target_offset,
+                length_bytes: chunk.length_bytes,
+            })
+            .collect::<Vec<_>>();
+        self.state.lock().cache_segment_target_metadata(
+            &cold_backing.owner,
+            &staging_segment,
+            &target_chunks,
+            reply.transport_endpoint.clone(),
+            reply.transport_segment_descriptor.clone(),
+        );
+        let staging_replica = ReplicaRoute {
+            owner: cold_backing.owner.clone(),
+            segment_name: staging_segment.clone(),
+            offset: None,
+            segment_offset: reply.segment_offset,
+            length: reply.length,
+            checksum: reply.checksum,
+            tier: ReplicaTier::File,
+            priority: 0,
+        };
+        let staging_resolved = ResolvedObject {
+            tenant: resolved.tenant.clone(),
+            key: resolved.key.clone(),
+            route: resolved.route.clone(),
+            replica: staging_replica,
+            fallback_replicas: VecDeque::new(),
+        };
+        let result = self.execute_remote_get_direct(
+            transport,
+            &staging_resolved,
+            buffer,
+            reply.length as usize,
+            request_deadline,
+        );
+        self.control_client.ack_cold_read_complete(
+            &lease,
+            vec![staging_segment.0],
+            vec![reply.segment_offset],
+        );
+        result?;
+        cold_tier::enqueue_restore_promotion(
+            self,
+            resolved,
+            RestorePromotionPayload::Shared(Arc::new(buffer[..length].to_vec())),
+        );
+        Ok(())
+    }
+
     fn execute_selected_replica_direct(
         &self,
         transport: &dyn StoreTransport,
@@ -3816,7 +4025,9 @@ impl StoreClient {
                 buffer.len()
             )));
         }
-        if !self.copy_local_replica_direct(transport, &resolved.replica, buffer, length)? {
+        if Self::is_cold_backing_placeholder(&resolved.replica) {
+            self.execute_cold_restore_direct(transport, resolved, buffer, request_deadline)?;
+        } else if !self.copy_local_replica_direct(transport, &resolved.replica, buffer, length)? {
             self.ensure_remote_replica_reachable_once(&resolved.replica, checked_runtimes)?;
             self.execute_remote_get_direct(transport, resolved, buffer, length, request_deadline)?;
         }

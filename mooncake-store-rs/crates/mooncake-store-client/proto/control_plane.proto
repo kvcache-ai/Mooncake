@@ -21,6 +21,10 @@ service ControlPlaneService {
   rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
   rpc SubmitMigrationTask(SubmitMigrationTaskRequest) returns (SubmitMigrationTaskReply);
   rpc GetMigrationExecutionStatus(GetMigrationExecutionStatusRequest) returns (GetMigrationExecutionStatusReply);
+  rpc ReadFromCold(ReadFromColdRequest) returns (ReadFromColdReply);
+  rpc BatchReadFromCold(BatchReadFromColdRequest) returns (BatchReadFromColdReply);
+  rpc AckColdReadComplete(AckColdReadCompleteRequest) returns (AckColdReadCompleteReply);
+  rpc PinForRead(PinForReadRequest) returns (PinForReadReply);
   rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
 }
 
@@ -91,6 +95,13 @@ enum MigrationExecutionState {
   MIGRATION_EXECUTION_STATE_CANCELLED = 7;
 }
 
+enum ColdBackingState {
+  COLD_BACKING_STATE_UNSPECIFIED = 0;
+  COLD_BACKING_STATE_PENDING_OFFLOAD = 1;
+  COLD_BACKING_STATE_MATERIALIZED = 2;
+  COLD_BACKING_STATE_PENDING_DELETE = 3;
+}
+
 message ReplicaRoute {
   ClientRuntimeId owner = 1;
   string segment_name = 2;
@@ -100,6 +111,15 @@ message ReplicaRoute {
   optional uint64 checksum = 6;
   ReplicaTier tier = 7;
   uint32 priority = 8;
+}
+
+message ColdBackingRoute {
+  ClientRuntimeId owner = 1;
+  string cold_tier_id = 2;
+  string object_locator = 3;
+  uint64 length = 4;
+  optional uint64 checksum = 5;
+  ColdBackingState state = 6;
 }
 
 message ObjectRoute {
@@ -115,6 +135,7 @@ message ObjectRoute {
   string canonical_key = 10;
   string sharing_scope = 11;
   string qos_tier = 12;
+  ColdBackingRoute cold_backing = 13;
 }
 
 message CasResult {
@@ -355,6 +376,71 @@ message GetMigrationExecutionStatusReply {
   uint32 attempts = 3;
   string last_error = 4;
   ErrorDetail error = 5;
+}
+
+message SegmentTargetChunk {
+  uint64 logical_offset = 1;
+  uint64 target_offset = 2;
+  uint64 length_bytes = 3;
+}
+
+message ReadFromColdRequest {
+  string namespace = 1;
+  string authority = 2;
+  string tenant = 3;
+  string key = 4;
+  string domain = 5;
+  string object_set = 6;
+}
+
+message ReadFromColdReply {
+  string segment_name = 1;
+  uint64 segment_offset = 2;
+  uint64 length = 3;
+  optional uint64 checksum = 4;
+  repeated SegmentTargetChunk target_chunks = 5;
+  optional string transport_endpoint = 6;
+  optional string transport_segment_descriptor = 7;
+  ErrorDetail error = 8;
+  uint64 admission_wait_us = 9;
+  uint64 ssd_read_us = 10;
+  uint64 memcpy_us = 11;
+  uint64 route_update_us = 12;
+  uint64 total_promote_us = 13;
+  bool backpressure = 14;
+}
+
+message ColdReadTarget {
+  string tenant = 1;
+  string key = 2;
+  string domain = 3;
+  string object_set = 4;
+}
+
+message BatchReadFromColdRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated ColdReadTarget targets = 3;
+}
+
+message BatchReadFromColdReply {
+  repeated ReadFromColdReply results = 1;
+}
+
+message AckColdReadCompleteRequest {
+  repeated string segment_names = 1;
+  repeated uint64 segment_offsets = 2;
+}
+
+message AckColdReadCompleteReply {}
+
+message PinForReadRequest {
+  repeated string segment_names = 1;
+  repeated uint64 segment_offsets = 2;
+}
+
+message PinForReadReply {
+  uint64 pinned = 1;
 }
 
 message ControlStreamRequest {

@@ -594,12 +594,19 @@ impl StoreClientBuilder {
                 request_timeout_override: self.request_timeout_override,
                 executions: Arc::new(Mutex::new(BTreeMap::new())),
             }));
+        let cold_tier_control: Arc<dyn crate::control_plane::ColdTierControlService> =
+            if cold_tier_enabled {
+                storage_adapter.clone()
+            } else {
+                Arc::new(UnsupportedColdTierControlService)
+            };
         let control_plane = ControlPlaneHandle::spawn_with_migration(
             &control_bind_host(&endpoints.rpc_address),
             local_authority.clone(),
             storage_adapter.clone(),
-            storage_adapter,
+            storage_adapter.clone(),
             migration_adapter,
+            cold_tier_control,
         )?;
         crate::route_directory::bind_local_authority_service(
             &route_namespace,
@@ -684,16 +691,17 @@ impl StoreClientBuilder {
         )?;
         let cold_tier_configured = cold_tier_enabled && !resolved_cold_tier.is_empty();
         let restore_promotions = Arc::new(RestorePromotionQueue::new(1024, 32, 32));
+        let cold_restore_flights = Arc::new(ColdRestoreSingleflight::default());
         let cold_tier = if cold_tier_configured {
             cold_tier::ColdTierHandle::spawn(
                 &runtime,
                 &lease,
                 &self.local_memory,
                 storage_owner.clone(),
-                restore_promotions,
+                restore_promotions.clone(),
             )?
         } else {
-            cold_tier::ColdTierHandle::disabled(restore_promotions)
+            cold_tier::ColdTierHandle::disabled(restore_promotions.clone())
         };
         Ok(StoreClient {
             metadata: runtime_metadata,
@@ -733,7 +741,10 @@ impl StoreClientBuilder {
             state,
             owns_cold_tier_lifecycle: true,
             cold_tier_shutdown_mode: self.cold_tier_shutdown_mode,
+            restore_promotions,
             cold_tier,
+            cold_restore_flights,
+            deferred_cold_tier_reconciles: Mutex::new(Vec::new()),
         })
     }
 }

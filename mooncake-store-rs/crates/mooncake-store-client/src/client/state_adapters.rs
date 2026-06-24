@@ -18,7 +18,7 @@ impl LocalAuthorityAdapter {
         lifecycle_accepts_writes(&self.lifecycle_state, "route authority")
     }
 
-    fn write_guard(&self) -> Result<parking_lot::MutexGuard<'_, ()>> {
+    fn write_guard(&self) -> Result<RouteWritePermit<'_>> {
         let guard = self.route_write_gate.lock();
         self.ensure_accepting_writes()?;
         Ok(guard)

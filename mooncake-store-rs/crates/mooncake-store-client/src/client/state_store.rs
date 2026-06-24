@@ -1,3 +1,21 @@
+include!("cold_tier_restore_state.rs");
+
+impl RouteWriteGate {
+    fn lock(&self) -> RouteWritePermit<'_> {
+        RouteWritePermit {
+            guard: Some(self.state.lock()),
+        }
+    }
+}
+
+impl Drop for RouteWritePermit<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            parking_lot::MutexGuard::unlock_fair(guard);
+        }
+    }
+}
+
 impl StoreState {
     fn memory_ref(&self) -> Result<&LocalMemoryState> {
         self.memory
@@ -939,15 +957,18 @@ impl StorageOwnerState {
         };
 
         let evicted_replica = route.replicas[replica_index].clone();
-        let next = if route.replicas.len() == 1 {
+        let mut replicas = route.replicas.clone();
+        replicas.remove(replica_index);
+        replicas.sort_by_key(|replica| replica.priority);
+        for (priority, replica) in replicas.iter_mut().enumerate() {
+            replica.priority = priority as u16;
+        }
+        let keeps_materialized_cold_backing = route.cold_backing.as_ref().is_some_and(|backing| {
+            backing.state == mooncake_store_core::ColdBackingState::Materialized
+        });
+        let next = if replicas.is_empty() && !keeps_materialized_cold_backing {
             None
         } else {
-            let mut replicas = route.replicas.clone();
-            replicas.remove(replica_index);
-            replicas.sort_by_key(|replica| replica.priority);
-            for (priority, replica) in replicas.iter_mut().enumerate() {
-                replica.priority = priority as u16;
-            }
             Some(ObjectRoute {
                 key: route.key.clone(),
                 namespace: route.namespace.clone(),
@@ -1033,6 +1054,72 @@ impl StorageOwnerState {
 
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
         self.route_ops.list_routes_by_replica_owner(owner)
+    }
+
+    fn current_materialized_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
+        let Some(route) = self.route_ops.load_route(key)? else {
+            self.hot_replicas.clock.lock().remove_key(key);
+            return Ok(None);
+        };
+        self.sync_route(&route);
+        if route.state == RouteState::Active
+            && route.cold_backing.as_ref().is_some_and(|cold_backing| {
+                cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
+            })
+        {
+            Ok(Some(route))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn reserve_owner_restore_space(
+        &self,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        match self.allocator.lock().reserve_any(&self.runtime, length_bytes) {
+            Ok(reservation) => Ok(reservation),
+            Err(first_error) => {
+                if self.evict_one_blocking(None)? {
+                    self.allocator.lock().reserve_any(&self.runtime, length_bytes)
+                } else {
+                    Err(first_error)
+                }
+            }
+        }
+    }
+
+    fn sweep_expired_staging_slots(&self, ttl: Duration) -> usize {
+        let mut pending = self.pending_staging_slots.lock();
+        let before = pending.len();
+        pending.retain(|(segment, offset), (_, inserted_at)| {
+            if inserted_at.elapsed() < ttl {
+                return true;
+            }
+            self.read_pin_registry.force_unpin(segment, *offset);
+            false
+        });
+        before.saturating_sub(pending.len())
+    }
+
+    pub(in super) fn evict_one_clean_and_reserve_bounded(
+        &self,
+        length_bytes: u64,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        match self.allocator.lock().reserve_any(&self.runtime, length_bytes) {
+            Ok(reservation) => Ok(Some(reservation)),
+            Err(_) => {
+                if self.evict_one_blocking(preferred_segment)? {
+                    self.allocator
+                        .lock()
+                        .reserve_any(&self.runtime, length_bytes)
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 }
 
