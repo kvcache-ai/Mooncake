@@ -88,6 +88,8 @@ class TransferEngine {
 
     int getRpcPort();
 
+    bool isUsingTent() const { return use_tent_; }
+
     SegmentHandle openSegment(const std::string& segment_name);
 
     Status CheckSegmentStatus(SegmentID sid);
