@@ -201,8 +201,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(
-          CreateAllocationStrategy(config.allocation_strategy_type)),
+      allocation_strategy_type_(config.enable_cxl
+                                    ? AllocationStrategyType::CXL
+                                    : config.allocation_strategy_type),
+      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -1353,6 +1355,9 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     const std::function<bool(const Replica&)>& pred_fn) {
     auto erased_replicas =
         PopReplicasWithCacheTotalAccounting(metadata, pred_fn);
+    // Release SSD/local-disk usage for any local-disk replicas being removed.
+    // No-op for memory/noF replicas, so it is safe to call unconditionally.
+    ReleaseLocalDiskUsage(erased_replicas);
     return erased_replicas.size();
 }
 
@@ -1384,6 +1389,7 @@ MasterService::EraseMetadata(
     const std::string key = it->first;
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
+    ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
@@ -1406,6 +1412,35 @@ MasterService::EraseMetadata(
     }
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
     return next;
+}
+
+void MasterService::ReleaseLocalDiskUsage(
+    const std::vector<Replica>& replicas) {
+    std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
+    for (const auto& replica : replicas) {
+        if (!replica.is_local_disk_replica()) {
+            continue;
+        }
+        const auto descriptor =
+            replica.get_descriptor().get_local_disk_descriptor();
+        if (descriptor.object_size > 0) {
+            bytes_by_client[descriptor.client_id] += descriptor.object_size;
+        }
+    }
+    if (bytes_by_client.empty()) {
+        return;
+    }
+
+    ScopedLocalDiskSegmentAccess ssd_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_segments = ssd_access.getClientLocalDiskSegment();
+    for (const auto& [client_id, bytes] : bytes_by_client) {
+        auto disk_it = client_segments.find(client_id);
+        if (disk_it != client_segments.end()) {
+            disk_it->second->ssd_used_bytes.fetch_sub(
+                bytes, std::memory_order_relaxed);
+        }
+    }
 }
 
 void MasterService::RebuildGroupRoutingIndex() {
@@ -2327,9 +2362,18 @@ auto MasterService::AllocateAndInsertMetadata(
             preferred_segments = config.preferred_segments;
         }
 
+        const SsdMetricsProvider* ssd_provider = nullptr;
+        std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
+        if (allocation_strategy_type_ ==
+            AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
+            ssd_access.emplace(segment_manager_.getLocalDiskSegmentAccess());
+            ssd_provider = &*ssd_access;
+        }
+
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
-            preferred_segments);
+            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
+            ssd_provider);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
@@ -2809,6 +2853,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         metadata.reserved_quota_charge_bytes = 0;
     }
 
+    EraseReplicasWithCacheTotalAccounting(
+        metadata, [replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return replica.is_memory_replica() || replica.is_nof_replica();
+            }
+            return replica.type() == replica_type;
+        });
+
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
@@ -3250,12 +3302,16 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
             return r.is_local_disk_replica() && r.is_completed();
         });
-        metadata.EraseReplicas([&client_id](const Replica& replica) {
-            return replica.is_local_disk_replica() &&
-                   replica.get_descriptor()
-                           .get_local_disk_descriptor()
-                           .client_id == client_id;
-        });
+        // PopReplicas (vs EraseReplicas) so we can release the SSD usage of
+        // the removed local-disk replicas; both remove the same matching set.
+        auto erased_replicas =
+            metadata.PopReplicas([&client_id](const Replica& replica) {
+                return replica.is_local_disk_replica() &&
+                       replica.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id;
+            });
+        ReleaseLocalDiskUsage(erased_replicas);
         if (had_completed_disk) {
             auto& shard = accessor.GetShard();
             shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
@@ -4292,6 +4348,17 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    std::shared_ptr<LocalDiskSegment> local_disk_segment;
+    {
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_segments = ssd_access.getClientLocalDiskSegment();
+        auto disk_it = client_segments.find(client_id);
+        if (disk_it != client_segments.end()) {
+            local_disk_segment = disk_it->second;
+        }
+    }
+
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -4321,14 +4388,22 @@ auto MasterService::NotifyOffloadSuccess(
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, object_id.user_key,
                               object_id.tenant_id, replica);
-        if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
+        if (!res) {
+            if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                continue;
+            }
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id
                        << ", tenant_id=" << object_id.tenant_id
                        << ", key=" << object_id.user_key;
             return tl::make_unexpected(res.error());
         }
+        if (local_disk_segment && metadata.data_size > 0) {
+            local_disk_segment->ssd_used_bytes.fetch_add(
+                metadata.data_size, std::memory_order_relaxed);
+        }
     }
+
     return {};
 }
 

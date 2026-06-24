@@ -1381,6 +1381,7 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const std::string& tenant_id);
+    void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
@@ -1963,6 +1964,7 @@ class MasterService {
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
+    const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;
