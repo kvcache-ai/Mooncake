@@ -35,6 +35,7 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
+      parked_worker_count_(0),
       redispatch_counter_(0),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
@@ -188,7 +189,8 @@ int WorkerPool::submitPostSend(
     }
 
     submitted_slice_count_.fetch_add(submitted_slice_count);
-    if (submitted_slice_count) {
+    if (submitted_slice_count &&
+        parked_worker_count_.load(std::memory_order_acquire) > 0) {
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
     }
@@ -207,7 +209,6 @@ int WorkerPool::submitPostSend(
 void WorkerPool::performPostSend(int thread_id) {
     // Fast-fail if context is unhealthy due to catastrophic hardware failure
     if (!contextHealthy()) {
-        auto &local_slice_queue = collective_slice_queue_[thread_id];
         for (int shard_id = thread_id; shard_id < kShardCount;
              shard_id += kTransferWorkerCount) {
             if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) ==
@@ -460,13 +461,16 @@ void WorkerPool::transferWorker(int thread_id) {
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
+                parked_worker_count_.fetch_add(1, std::memory_order_acq_rel);
                 // Double-check condition after acquiring lock to avoid lost
-                // wakeup
+                // wakeup. parked_worker_count_ is set before this check so
+                // producers that submit after it will notify this worker.
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
                         submitted_slice_count_.load() &&
                     !hasOutstandingCq()) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
+                parked_worker_count_.fetch_sub(1, std::memory_order_acq_rel);
                 last_wait_ts = curr_wait_ts;
             }
             continue;

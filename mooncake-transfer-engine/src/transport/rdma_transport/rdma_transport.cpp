@@ -703,7 +703,7 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     int ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
-    if (ret == ERR_ENDPOINT) context->deleteEndpointByPtr(endpoint.get());
+    if (endpoint->retired()) context->deleteEndpointByPtr(endpoint.get());
     return ret;
 }
 

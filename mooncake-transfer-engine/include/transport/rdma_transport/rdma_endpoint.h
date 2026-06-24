@@ -93,6 +93,11 @@ class RdmaEndPoint {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
+    bool retired() const {
+        auto status = status_.load(std::memory_order_relaxed);
+        return status == DESTROYING || status == DESTROYED;
+    }
+
     // Interrupts the connection, which can be triggered by user or by internal
     // error. Use setupConnectionsByActive or setupConnectionsByPassive to
     // reconnect

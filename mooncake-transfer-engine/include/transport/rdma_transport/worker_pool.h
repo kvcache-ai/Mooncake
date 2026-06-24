@@ -89,6 +89,7 @@ class WorkerPool {
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
 
+    std::atomic<int> parked_worker_count_;
     std::atomic<int> redispatch_counter_;
 
     std::mutex cond_mutex_;
