@@ -204,8 +204,8 @@ bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
     return impl_->checkOverlap(addr, length);
 }
 
-bool TransferEngine::isLocalMemoryRegistered(const void* addr) {
-    return impl_->isLocalMemoryRegistered(addr);
+bool TransferEngine::isLocalMemoryRegistered(const void* addr, size_t length) {
+    return impl_->isLocalMemoryRegistered(addr, length);
 }
 
 void TransferEngine::setAutoDiscover(bool auto_discover) {
@@ -641,8 +641,8 @@ bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
     return false;
 }
 
-bool TransferEngine::isLocalMemoryRegistered(const void* addr) {
-    if (!use_tent_) return impl_->isLocalMemoryRegistered(addr);
+bool TransferEngine::isLocalMemoryRegistered(const void* addr, size_t length) {
+    if (!use_tent_) return impl_->isLocalMemoryRegistered(addr, length);
     return false;  // Conservative for TENT mode
 }
 

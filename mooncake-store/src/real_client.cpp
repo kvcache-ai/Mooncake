@@ -1114,6 +1114,11 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+        gpu_staging::UnpinHostMemory(client_buffer_allocator_->getBase(),
+                                     "client staging buffer");
+#endif
         auto unregister_result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {
@@ -3612,8 +3617,9 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
     const std::string &key, void *buffer, size_t size,
     const ReplicateConfig &config) {
-    // NOTE: The buffer address must resolve to Store-managed registered
-    // memory for zero-copy RDMA operations to work correctly
+    // Registered buffers are used directly for RDMA writes. Unregistered
+    // buffers are staged in the transfer layer when RDMA requires registered
+    // source memory.
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -4593,8 +4599,9 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
                                        size_t metadata_size,
                                        const ReplicateConfig &config) {
     const auto start_time = std::chrono::steady_clock::now();
-    // NOTE: The buffer address must resolve to Store-managed registered
-    // memory for zero-copy RDMA operations to work correctly
+    // Registered buffers are used directly for RDMA writes. Unregistered
+    // buffers are staged in the transfer layer when RDMA requires registered
+    // source memory.
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return -1;

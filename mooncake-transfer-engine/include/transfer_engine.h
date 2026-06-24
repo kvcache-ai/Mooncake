@@ -184,7 +184,7 @@ class TransferEngine {
 
     bool checkOverlap(void* addr, uint64_t length);
 
-    bool isLocalMemoryRegistered(const void* addr);
+    bool isLocalMemoryRegistered(const void* addr, size_t length);
 
     void setAutoDiscover(bool auto_discover);
 

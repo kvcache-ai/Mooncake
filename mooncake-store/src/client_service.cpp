@@ -2822,6 +2822,17 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+            gpu_staging::UnpinHostMemory((void*)buffer, "segment");
+#endif
+            int unregister_rc =
+                transfer_engine_->unregisterLocalMemory((void*)buffer);
+            if (unregister_rc != 0) {
+                LOG(WARNING) << "Failed to unregister transfer buffer after "
+                                "mount failure, ret="
+                             << unregister_rc;
+            }
             return tl::unexpected(err);
         }
 

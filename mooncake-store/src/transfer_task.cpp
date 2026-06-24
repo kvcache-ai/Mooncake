@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -956,7 +957,12 @@ TransferSubmitter::ensureRegisteredForRDMA(const std::vector<Slice>& slices) {
     size_t total_staging = 0;
     std::vector<bool> needs_staging(slices.size(), false);
     for (size_t i = 0; i < slices.size(); ++i) {
-        if (!engine_.isLocalMemoryRegistered(slices[i].ptr)) {
+        if (!engine_.isLocalMemoryRegistered(slices[i].ptr, slices[i].size)) {
+            if (slices[i].size > std::numeric_limits<size_t>::max() - total_staging) {
+                LOG(ERROR) << "RDMA staging size overflow";
+                return std::make_pair(std::vector<Slice>{},
+                                      std::vector<BufferHandle>{});
+            }
             needs_staging[i] = true;
             total_staging += slices[i].size;
         }
