@@ -214,6 +214,10 @@ class PlainStore(MinimalStore):
     get_into_ranges = None
 
 
+class PutTensorOnlyStore(InMemoryStore):
+    get_tensor = None
+
+
 class FailingPutStore(InMemoryStore):
     def __init__(self, fail_on_put: int) -> None:
         super().__init__()
@@ -347,6 +351,17 @@ def test_put_object_roundtrips_wrapped_numpy_and_torch_values() -> None:
     assert torch.equal(transfer.get_object(transfer.put_object(tensor)), tensor)
     assert store.put_tensor_calls == 1
     assert store.get_tensor_calls == 1
+
+
+def test_get_object_requires_get_tensor_for_tensor_payload() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer(PutTensorOnlyStore())
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    ref = transfer.put_object({"tensor": tensor})
+
+    with pytest.raises(RuntimeError, match="does not support get_tensor"):
+        transfer.get_object(ref)
 
 
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:

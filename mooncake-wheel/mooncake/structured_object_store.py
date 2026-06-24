@@ -374,8 +374,12 @@ class _StructuredObjectLayer:
             )
         if payload_spec.get("kind") == "tensor":
             get_tensor = getattr(self._bundle_store._store, "get_tensor", None)
-            if callable(get_tensor):
-                return get_tensor(payload_spec["key"])
+            if not callable(get_tensor):
+                raise RuntimeError(
+                    f"structured tensor member {name} was stored using put_tensor, "
+                    "but the current store does not support get_tensor"
+                )
+            return get_tensor(payload_spec["key"])
         dtype = _torch_dtype_to_numpy(field_spec["dtype"])
         shape = tuple(int(dim) for dim in field_spec["shape"])
         data = self._bundle_store.read_payload(payload_spec)
