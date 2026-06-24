@@ -581,7 +581,14 @@ def _fault_detection_worker(
 
     # Step 1: All ranks participate in first collective
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+    work.wait()
+
+    # Verify failedRanks = all 0s when all healthy
+    failed_ranks = pg.get_failed_ranks(work)
+    assert (
+        failed_ranks.cpu().tolist() == [0] * ctx.world_size
+    ), f"rank {ctx.rank}: pre-failure failed_ranks={failed_ranks.cpu().tolist()}"
 
     if ctx.rank == BROKEN_RANK:
         # Step 2: Broken rank exits after first collective
@@ -595,7 +602,26 @@ def _fault_detection_worker(
     # Step 4: Survivors run collective without broken rank
     # This should not hang - verifies fault detection works
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+    work.wait()
+
+    # Verify failedRanks shows broken rank as 1
+    failed_ranks = pg.get_failed_ranks(work)
+    expected_failed_ranks = [0] * ctx.world_size
+    expected_failed_ranks[BROKEN_RANK] = 1
+    assert failed_ranks.cpu().tolist() == expected_failed_ranks, (
+        f"rank {ctx.rank}: post-failure failed_ranks={failed_ranks.cpu().tolist()}, "
+        f"expected {expected_failed_ranks}"
+    )
+
+    # Verify activeRanks also deactivates broken rank (auto_deactivate=True default)
+    active_ranks = pg.get_active_ranks(dist.group.WORLD)
+    expected_active_ranks = [1] * ctx.world_size
+    expected_active_ranks[BROKEN_RANK] = 0
+    assert active_ranks.cpu().tolist() == expected_active_ranks, (
+        f"rank {ctx.rank}: post-failure active_ranks={active_ranks.cpu().tolist()}, "
+        f"expected {expected_active_ranks}"
+    )
 
     ctx.record_result({"role": "survivor"})
 
@@ -615,7 +641,10 @@ def _replacement_recovery_worker(
 
         # First collective with all ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+        work.wait()
+        failed_ranks = pg.get_failed_ranks(work)
+        assert failed_ranks.cpu().tolist() == [0] * ctx.world_size
 
         if logical_rank == BROKEN_RANK:
             # Broken rank exits
@@ -627,9 +656,14 @@ def _replacement_recovery_worker(
         broken_exited.wait()
         backend = ctx.get_backend()
 
-        # Run collective without broken rank
+        # Run collective with broken rank
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+        work.wait()
+        failed_ranks = pg.get_failed_ranks(work)
+        expected_failed_ranks = [0] * ctx.world_size
+        expected_failed_ranks[BROKEN_RANK] = 1
+        assert failed_ranks.cpu().tolist() == expected_failed_ranks
 
         # Signal that we're ready for replacement
         if logical_rank == 0:
@@ -652,7 +686,10 @@ def _replacement_recovery_worker(
 
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+        work.wait()
+        failed_ranks = pg.get_failed_ranks(work)
+        assert failed_ranks.cpu().tolist() == [0] * ctx.world_size
 
         ctx.record_result({"role": "survivor"})
     else:
@@ -675,6 +712,78 @@ def _replacement_recovery_worker(
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         ctx.record_result({"role": "replacement"})
+
+
+def _manual_deactivate_worker(
+    ctx: MooncakePGWorkerContext,
+    broken_exited: mp.Event,
+) -> None:
+    """Multi-round test with auto_deactivate_on_failure=False:
+    Round 1 (all healthy): failedRanks = all 0s, activeRanks = all 1s.
+    Round 2 (rank died, not yet deactivated): activeRanks unchanged.
+    --- Survivors deactivate the dead rank. ---
+    Round 3 (after deactivate): failedRanks = all 0s for reduced group,
+      activeRanks reflects the deactivation.
+    """
+    device = ctx.init_group(auto_deactivate_on_failure=False)
+    backend = ctx.get_backend()
+
+    # Round 1: all healthy
+    expected_all = ctx.world_size * (ctx.world_size + 1) // 2
+    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+    work.wait()
+    assert int(tensor.cpu().item()) == expected_all
+
+    failed_ranks = pg.get_failed_ranks(work)
+    assert failed_ranks.cpu().tolist() == [0] * ctx.world_size
+
+    active_ranks = pg.get_active_ranks(backend)
+    assert active_ranks.cpu().tolist() == [1] * ctx.world_size
+
+    if ctx.rank == BROKEN_RANK:
+        ctx.record_result({"role": "broken"})
+        broken_exited.set()
+        os._exit(0)
+
+    broken_exited.wait()
+
+    # Round 2: rank died, auto_deactivate=False ==> activeRanks unchanged
+    # Verify activeRanks still has the dead rank.
+    expected_reduced = expected_all - (BROKEN_RANK + 1)
+    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+    work.wait()
+    assert int(tensor.cpu().item()) == expected_reduced
+
+    failed_ranks = pg.get_failed_ranks(work)
+    expected_failed_ranks = [0] * ctx.world_size
+    expected_failed_ranks[BROKEN_RANK] = 1
+    assert failed_ranks.cpu().tolist() == expected_failed_ranks
+
+    active_ranks = pg.get_active_ranks(backend)
+    assert active_ranks.cpu().tolist() == [1] * ctx.world_size
+
+    # Survivors deactivate the dead rank before issuing new collectives.
+    pg.deactivate_rank(backend, [BROKEN_RANK], disconnect=True)
+
+    active_ranks = pg.get_active_ranks(backend)
+    expected_active_ranks = [1] * ctx.world_size
+    expected_active_ranks[BROKEN_RANK] = 0
+    assert active_ranks.cpu().tolist() == expected_active_ranks
+
+    # Round 3: after deactivate, collective with reduced group
+    expected_reduced = expected_all - (BROKEN_RANK + 1)
+    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+    work.wait()
+    assert int(tensor.cpu().item()) == expected_reduced
+
+    # Round 3: deactivated rank doesn't participate, thus no failures.
+    failed_ranks = pg.get_failed_ranks(work)
+    assert failed_ranks.cpu().tolist() == [0] * ctx.world_size
+
+    ctx.record_result({"role": "survivor"})
 
 
 class _ElasticMixin:
@@ -825,6 +934,30 @@ class _ElasticMixin:
         broken_rows = [r for r in rows if r.get("role") == "broken"]
         self.assertEqual(len(survivor_rows), self.world_size - 1)
         self.assertEqual(len(replacement_rows), 1)
+        self.assertGreaterEqual(len(broken_rows), 1)
+
+    def test_manual_evict(self) -> None:
+        """Test multi-round manual evict with auto_deactivate_on_failure=False.
+
+        Round 1: all healthy, failedRanks = all 0s.
+        Round 2: rank died, activeRanks unchanged, manually deactivate.
+        Round 3: after deactivate, collective succeeds with reduced group.
+        """
+        spawn_ctx = mp.get_context("spawn")
+        broken_exited = spawn_ctx.Event()
+
+        rows = self.spawn_backend_and_collect(
+            _manual_deactivate_worker,
+            broken_exited,
+            timeout_s=30.0,
+        )
+
+        # All survivors should complete
+        survivor_rows = [r for r in rows if r.get("role") == "survivor"]
+        self.assertEqual(len(survivor_rows), self.world_size - 1)
+
+        # Broken rank should have exited (may not have result)
+        broken_rows = [r for r in rows if r.get("role") == "broken"]
         self.assertGreaterEqual(len(broken_rows), 1)
 
 
