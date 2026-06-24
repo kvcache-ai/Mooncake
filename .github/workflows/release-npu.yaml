@@ -4,10 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        type: string
 
 jobs:
   build:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
 
     strategy:
       max-parallel: 2
@@ -35,6 +41,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Setup Python ${{ matrix.python-version }}
@@ -56,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           CANN_BASE_URL="https://ascend.devcloud.huaweicloud.com/cann/run/software"
-          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(?=/)' | sort -V | tail -1)
+          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(?=/)' | sort -V | tail -1)
           echo "Latest CANN version: ${CANN_VERSION}"
           CANN_URL="${CANN_BASE_URL}/${CANN_VERSION}/${{ matrix.cann_arch }}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${{ matrix.cann_arch }}.run"
           echo "Downloading CANN ${CANN_VERSION} from ${CANN_URL}"
@@ -148,7 +155,7 @@ jobs:
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi
@@ -160,6 +167,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -177,6 +186,7 @@ jobs:
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI
