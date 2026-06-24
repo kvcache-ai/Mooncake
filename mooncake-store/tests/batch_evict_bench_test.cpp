@@ -159,8 +159,8 @@ class BatchEvictBenchTest : public ::testing::Test {
         return stats;
     }
 
-    static void MountBenchSegment(MasterService& service,
-                                  const UUID& client_id, size_t num_objects) {
+    static void MountBenchSegment(MasterService& service, const UUID& client_id,
+                                  size_t num_objects) {
         auto segment = MakeSegment(num_objects);
         auto mount_result = service.MountSegment(segment, client_id);
         ASSERT_TRUE(mount_result.has_value())
@@ -241,9 +241,8 @@ class BatchEvictBenchTest : public ::testing::Test {
         const uint64_t freed_bytes =
             used_before >= used_after ? used_before - used_after : 0;
 
-        const size_t lowerbound = static_cast<size_t>(
-            std::ceil(static_cast<double>(objects_before) *
-                      kEvictRatioLowerbound));
+        const size_t lowerbound = static_cast<size_t>(std::ceil(
+            static_cast<double>(objects_before) * kEvictRatioLowerbound));
         EXPECT_GE(evicted_count, lowerbound);
         EXPECT_EQ(evicted_count * kObjectSize, freed_bytes);
 
@@ -284,9 +283,8 @@ class BatchEvictBenchTest : public ::testing::Test {
 
         const size_t objects_after = service.GetKeyCount();
         const size_t evicted_count = objects_before - objects_after;
-        const size_t lowerbound = static_cast<size_t>(
-            std::ceil(static_cast<double>(objects_before) *
-                      kEvictRatioLowerbound));
+        const size_t lowerbound = static_cast<size_t>(std::ceil(
+            static_cast<double>(objects_before) * kEvictRatioLowerbound));
         EXPECT_GE(evicted_count, lowerbound);
 
         total_us_out =
@@ -330,8 +328,8 @@ TEST_F(BatchEvictBenchTest, SingleWaiterSnapshotMutexProbe) {
         ReadEnvSize("MOONCAKE_EVICT_BENCH_LOCK_OBJECTS", 1000000);
     const size_t trials = std::max<size_t>(
         1, ReadEnvSize("MOONCAKE_EVICT_BENCH_LOCK_TRIALS", 30));
-    const auto waiter_delay = std::chrono::microseconds(
-        static_cast<std::chrono::microseconds::rep>(
+    const auto waiter_delay =
+        std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(
             ReadEnvSize("MOONCAKE_EVICT_BENCH_LOCK_DELAY_US", 1000)));
 
     std::vector<uint64_t> total_us;
