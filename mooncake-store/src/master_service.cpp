@@ -2805,12 +2805,45 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(
-            PutRevoke(client_id, key, tenant_id, replica_type));
+    const size_t n = keys.size();
+    std::vector<tl::expected<void, ErrorCode>> results(n);
+
+    // Group keys by shard index — same parallelisation strategy as BatchPutEnd.
+    std::unordered_map<size_t, std::vector<std::pair<size_t, std::string>>>
+        shard_groups;
+    for (size_t i = 0; i < n; ++i) {
+        size_t shard_idx = getMetadataShardIndex(tenant_id, keys[i]);
+        shard_groups[shard_idx].emplace_back(i, keys[i]);
     }
+
+    // Single shard or few keys: skip parallel overhead.
+    if (shard_groups.size() <= 1) {
+        for (size_t i = 0; i < n; ++i) {
+            results[i] = PutRevoke(client_id, keys[i], tenant_id, replica_type);
+        }
+        return results;
+    }
+
+    // Process each shard group in parallel; keys within a shard remain
+    // sequential to preserve lock ordering.
+    std::vector<std::future<void>> futures;
+    futures.reserve(shard_groups.size());
+    for (auto& [shard_idx, indexed_keys] : shard_groups) {
+        futures.emplace_back(std::async(
+            std::launch::async,
+            [this, &client_id, &tenant_id, replica_type,
+             indexed_keys = std::move(indexed_keys), &results]() {
+                for (const auto& [orig_idx, key] : indexed_keys) {
+                    results[orig_idx] =
+                        PutRevoke(client_id, key, tenant_id, replica_type);
+                }
+            }));
+    }
+
+    for (auto& fut : futures) {
+        fut.get();
+    }
+
     return results;
 }
 

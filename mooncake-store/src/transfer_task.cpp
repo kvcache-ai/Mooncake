@@ -1010,6 +1010,12 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    // Pre-allocate to avoid repeated vector growth.
+    size_t total_slices = 0;
+    for (const auto& slices : all_slices) {
+        total_slices += slices.size();
+    }
+    requests.reserve(total_slices);
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
@@ -1053,6 +1059,12 @@ TransferSubmitter::submit_batch_get_offload_object(
     const std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    // Pre-allocate to avoid repeated vector growth.
+    size_t total_slices = 0;
+    for (const auto& [key, slices] : batched_slices) {
+        total_slices += slices.size();
+    }
+    requests.reserve(total_slices);
     // Open the segment once — all keys share the same transfer_engine_addr.
     SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
     if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
