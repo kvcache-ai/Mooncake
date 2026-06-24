@@ -2512,7 +2512,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 } else {
                     auto& metadata = it->second;
                     if (metadata.HasReplica(&Replica::fn_is_completed) ||
-                        metadata.put_start_time + put_start_discard_timeout_sec_ >=
+                        metadata.put_start_time +
+                                put_start_discard_timeout_sec_ >=
                             now) {
                         LOG(INFO)
                             << "key=" << key << ", info=object_already_exists";
@@ -2906,7 +2907,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             if (it != tenant_state.metadata.end() &&
                 CleanupStaleHandles(it->second, alive_clients, &shard)) {
                 tenant_state.processing_keys.erase(key);
-                ErasePromotionTaskIfPresent(tenant_state, key, object_id.tenant_id);
+                ErasePromotionTaskIfPresent(tenant_state, key,
+                                            object_id.tenant_id);
                 EraseMetadata(tenant_state, it, object_id.tenant_id,
                               QuotaEraseMode::kFull, &shard);
                 it = tenant_state.metadata.end();
@@ -3077,7 +3079,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.committed_quota_charge_bytes != 0
                         ? metadata.committed_quota_charge_bytes
                         : CompletedMemoryQuotaCharge(metadata);
-                auto old_replicas = PopReplicasWithCacheTotalAccounting(metadata);
+                auto old_replicas =
+                    PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
                     std::lock_guard lock(discarded_replicas_mutex_);
                     discarded_replicas_.emplace_back(
