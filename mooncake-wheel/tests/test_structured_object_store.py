@@ -218,6 +218,11 @@ class PutTensorOnlyStore(InMemoryStore):
     get_tensor = None
 
 
+class NoTensorFastPathStore(InMemoryStore):
+    put_tensor = None
+    get_tensor = None
+
+
 class FailingPutStore(InMemoryStore):
     def __init__(self, fail_on_put: int) -> None:
         super().__init__()
@@ -362,6 +367,17 @@ def test_get_object_requires_get_tensor_for_tensor_payload() -> None:
 
     with pytest.raises(RuntimeError, match="does not support get_tensor"):
         transfer.get_object(ref)
+
+
+def test_put_object_torch_tensor_raw_fallback_roundtrip() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    result = transfer.get_object(transfer.put_object({"tensor": tensor}))
+
+    assert torch.equal(result["tensor"], tensor)
+    assert store.batch_get_into_calls > 0
 
 
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:

@@ -382,9 +382,13 @@ class _StructuredObjectLayer:
             return get_tensor(payload_spec["key"])
         dtype = _torch_dtype_to_numpy(field_spec["dtype"])
         shape = tuple(int(dim) for dim in field_spec["shape"])
-        data = self._bundle_store.read_payload(payload_spec)
-        array = np.frombuffer(data, dtype=dtype).reshape(shape)
-        return _torch.from_numpy(array.copy())
+        array = np.empty(shape, dtype=dtype)
+        self._bundle_store.read_payload_range_into_destination(
+            payload_spec,
+            array.view(np.uint8).reshape(-1),
+            0,
+        )
+        return _torch.from_numpy(array)
 
     def _read_bytes_member(
         self,
@@ -1357,7 +1361,7 @@ def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
 
 def _tensor_payload_bytes_view(value: _TensorPayload) -> memoryview:
     tensor = value.tensor.detach().cpu().contiguous()
-    return tensor.numpy().view(np.uint8).reshape(-1).data
+    return memoryview(tensor.numpy()).cast("B")
 
 
 def _torch_dtype_to_numpy(dtype: Any) -> np.dtype[Any]:
