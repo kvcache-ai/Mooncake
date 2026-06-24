@@ -40,7 +40,7 @@ impl ColdTierHandle {
         storage_owner: Arc<StorageOwnerState>,
         lease: &ClientLease,
     ) -> Result<()> {
-        if !self.active || super::cold_tier_offload_disabled() {
+        if !self.active || super::cold_tier_disabled() {
             return Ok(());
         }
         if !serves_storage(lease) {
@@ -58,7 +58,7 @@ impl ColdTierHandle {
     }
 
     pub(in super::super) fn repair_owned_state(storage_owner: &StorageOwnerState) -> Result<()> {
-        if super::cold_tier_offload_disabled() {
+        if super::cold_tier_disabled() {
             return Ok(());
         }
         Self::drain_pending_offloads(storage_owner)?;
@@ -69,7 +69,7 @@ impl ColdTierHandle {
         &self,
         storage_owner: &StorageOwnerState,
     ) -> Result<()> {
-        if !self.active || super::cold_tier_offload_disabled() {
+        if !self.active || super::cold_tier_disabled() {
             return Ok(());
         }
         if !storage_owner.pending_offloads.is_materializing() {
@@ -80,7 +80,7 @@ impl ColdTierHandle {
     }
 
     pub(in super::super) fn background_tick(storage_owner: &StorageOwnerState) {
-        if super::cold_tier_offload_disabled() {
+        if super::cold_tier_disabled() {
             storage_owner.record_cold_tier_observability_snapshots();
             return;
         }
@@ -111,7 +111,7 @@ impl ColdTierHandle {
         storage_owner: &StorageOwnerState,
         route: &ObjectRoute,
     ) -> Option<ObjectRoute> {
-        if !self.active || super::cold_tier_offload_disabled() {
+        if !self.active || super::cold_tier_disabled() {
             return None;
         }
         storage_owner.track_route(route);
@@ -123,7 +123,7 @@ impl ColdTierHandle {
         routes: &[ObjectRoute],
     ) -> RouteTrafficReport {
         let report = storage_owner.track_routes(routes);
-        if super::cold_tier_offload_disabled() {
+        if super::cold_tier_disabled() {
             return report;
         }
         for route in routes {
@@ -133,7 +133,7 @@ impl ColdTierHandle {
     }
 
     pub(in super::super) fn kick_offload_for_allocator_eviction(storage_owner: &StorageOwnerState) {
-        if super::cold_tier_offload_disabled() {
+        if super::cold_tier_disabled() {
             return;
         }
         if let Err(error) = storage_owner.materialize_pending_offloads_foreground_kick() {
@@ -149,7 +149,7 @@ impl ColdTierHandle {
         storage_owner: &StorageOwnerState,
         route: &ObjectRoute,
     ) -> Option<ObjectRoute> {
-        if super::cold_tier_offload_disabled() {
+        if super::cold_tier_disabled() {
             return None;
         }
         storage_owner.enqueue_pending_offload(route);
@@ -239,7 +239,7 @@ impl ColdTierHandle {
         storage_owner: Arc<StorageOwnerState>,
         restore_promotions: SharedRestorePromotionQueue,
     ) -> Result<Self> {
-        let async_offload = if super::cold_tier_offload_disabled() {
+        let async_offload = if super::cold_tier_disabled() {
             AsyncOffloadHandle::disabled()
         } else {
             AsyncOffloadHandle::spawn(runtime, lease, local_memory, storage_owner)?

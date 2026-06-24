@@ -664,6 +664,10 @@ pub(crate) fn refresh_cold_tier_device_cache(
     cold_tier_device_cache: &SharedColdTierDeviceCache,
     operation: &'static str,
 ) -> Result<Vec<ColdTierDeviceRecord>> {
+    if cold_tier::cold_tier_disabled() {
+        cold_tier_device_cache.lock().store(Vec::new());
+        return Ok(Vec::new());
+    }
     let tracker = OperationTracker::new(operation);
     let result =
         metadata.list_cold_tier_devices(&mooncake_store_core::ColdTierDeviceFilter::default());

@@ -768,9 +768,11 @@ impl StoreClient {
                     }
                     Err(error) => return Err(error),
                 }
-                cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
-                    self.storage_owner.as_ref(),
-                );
+                if cold_tier::cold_tier_enabled() {
+                    cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
+                        self.storage_owner.as_ref(),
+                    );
+                }
                 if !self.storage_owner.evict_one(segment_name)? {
                     break;
                 }

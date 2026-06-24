@@ -119,7 +119,7 @@ impl StorageOwnerState {
         length: u64,
         checksum: u64,
     ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
-        if super::cold_tier_offload_disabled() {
+        if super::cold_tier_disabled() {
             return Ok(None);
         }
         match self.offload_mode {
@@ -141,7 +141,7 @@ impl StorageOwnerState {
         length: u64,
         checksum: u64,
     ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
-        if super::cold_tier_offload_disabled() {
+        if super::cold_tier_disabled() {
             return Ok(None);
         }
         let replica_count = cold_tier_replica_count();
