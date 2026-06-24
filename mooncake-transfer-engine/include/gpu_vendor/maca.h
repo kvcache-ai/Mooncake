@@ -133,6 +133,7 @@ static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
 #define cudaStreamDestroy mcStreamDestroy
 #define cudaStreamNonBlocking mcStreamNonBlocking
 #define cudaStreamPerThread mcStreamPerThread
+#define cudaStreamQuery mcStreamQuery
 #define cudaStreamSynchronize mcStreamSynchronize
 #define cudaStream_t mcStream_t
 #define cudaStreamWaitEvent mcStreamWaitEvent
