@@ -900,12 +900,11 @@ TransferStrategy TransferFuture::strategy() const {
 // TransferSubmitter Implementation
 // ============================================================================
 
-TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     std::shared_ptr<StorageBackend>& backend,
-                                     const std::string& local_hostname,
-                                     std::shared_ptr<ClientBufferAllocator> staging_allocator,
-                                     TransferMetric* transfer_metric,
-                                     int numa_socket_id)
+TransferSubmitter::TransferSubmitter(
+    TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+    const std::string& local_hostname,
+    std::shared_ptr<ClientBufferAllocator> staging_allocator,
+    TransferMetric* transfer_metric, int numa_socket_id)
     : engine_(engine),
       local_endpoint_(engine.getLocalIpAndPort()),
       staging_allocator_(std::move(staging_allocator)),
@@ -977,14 +976,16 @@ TransferSubmitter::ensureRegisteredForRDMA(const std::vector<Slice>& slices) {
 
     if (!staging_allocator_) {
         LOG(ERROR) << "No staging allocator for unregistered RDMA slices";
-        return std::make_pair(std::vector<Slice>{}, std::vector<BufferHandle>{});
+        return std::make_pair(std::vector<Slice>{},
+                              std::vector<BufferHandle>{});
     }
 
     // Allocate ONE contiguous staging buffer for all unregistered data.
     auto staging_alloc = staging_allocator_->allocate(total_staging);
     if (!staging_alloc) {
         LOG(ERROR) << "Staging alloc failed, total_size=" << total_staging;
-        return std::make_pair(std::vector<Slice>{}, std::vector<BufferHandle>{});
+        return std::make_pair(std::vector<Slice>{},
+                              std::vector<BufferHandle>{});
     }
 
     char* staging_base = static_cast<char*>(staging_alloc->ptr());
@@ -993,7 +994,6 @@ TransferSubmitter::ensureRegisteredForRDMA(const std::vector<Slice>& slices) {
     std::vector<Slice> prepared;
     std::vector<BufferHandle> staging_handles;
     prepared.reserve(slices.size());
-
 
     // Sync path (default): copy each unregistered slice into the contiguous
     // staging buffer. MemcpySafe auto-detects GPU vs CPU pointers.
@@ -1009,7 +1009,8 @@ TransferSubmitter::ensureRegisteredForRDMA(const std::vector<Slice>& slices) {
             if (!gpu_staging::MemcpySafe(staged_ptr, slices[i].ptr,
                                          slices[i].size)) {
                 LOG(ERROR) << "MemcpySafe failed during RDMA staging";
-                return std::make_pair(std::vector<Slice>{}, std::vector<BufferHandle>{});
+                return std::make_pair(std::vector<Slice>{},
+                                      std::vector<BufferHandle>{});
             }
             // Split staged data by kMaxSliceSize for RDMA transfer limits.
             auto sub = split_into_slices(staged_ptr, slices[i].size);
@@ -1043,14 +1044,13 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE: {
-                    auto [prepared, staging] =
-                        ensureRegisteredForRDMA(slices);
+                    auto [prepared, staging] = ensureRegisteredForRDMA(slices);
                     if (prepared.empty() && !slices.empty()) {
                         LOG(ERROR) << "ensureRegisteredForRDMA failed";
                         return std::nullopt;
                     }
-                    future = submitTransferEngineOperation(
-                        handle, prepared, op_code);
+                    future = submitTransferEngineOperation(handle, prepared,
+                                                           op_code);
                     if (future && !staging.empty()) {
                         future->attachStagingHandles(std::move(staging));
                     }

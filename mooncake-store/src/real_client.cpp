@@ -765,24 +765,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     defined(USE_HYGON) || defined(USE_COREX)
         {
             // Pin staging buffer by default so GPU→host copies use DMA
-            // instead of CUDA's internal staging.  Opt out: MC_STORE_PIN_MEMORY=0
-            const char* pin_env = std::getenv("MC_STORE_PIN_MEMORY");
-            bool pin_memory = !(pin_env &&
-                (std::string(pin_env) == "0" ||
-                 std::string(pin_env) == "false"));
-            if (pin_memory && local_buffer_size > 0) {
-                auto cuda_ret = cudaHostRegister(
-                    client_buffer_allocator_->getBase(), local_buffer_size,
-                    cudaHostRegisterDefault);
-                if (cuda_ret != cudaSuccess) {
-                    LOG(WARNING)
-                        << "cudaHostRegister staging buffer failed: "
-                        << cudaGetErrorString(cuda_ret);
-                } else {
-                    LOG(INFO) << "cudaHostRegister staging buffer OK, size="
-                              << local_buffer_size;
-                }
-            }
+            // instead of CUDA's internal staging. Opt out: MC_STORE_PIN_MEMORY=0.
+            // Limit total pinned bytes: MC_STORE_PIN_MEMORY_MAX_BYTES=N.
+            gpu_staging::TryPinHostMemory(client_buffer_allocator_->getBase(),
+                                          local_buffer_size,
+                                          "client staging buffer");
         }
 #endif
         {
@@ -1715,8 +1702,8 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     // the total work is the same (staging just happens later).
     (void)client_buffer_allocator;
 
-    std::vector<Slice> slices = split_into_slices(
-        const_cast<char *>(value.data()), value.size_bytes());
+    std::vector<Slice> slices =
+        split_into_slices(const_cast<char *>(value.data()), value.size_bytes());
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
@@ -1846,8 +1833,8 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     std::vector<Slice> slices;
     for (const auto &value : values) {
         if (value.size_bytes() == 0) continue;
-        auto part_slices = split_into_slices(
-            const_cast<char *>(value.data()), value.size_bytes());
+        auto part_slices =
+            split_into_slices(const_cast<char *>(value.data()), value.size_bytes());
         slices.insert(slices.end(), part_slices.begin(), part_slices.end());
     }
 
@@ -3688,8 +3675,8 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
     }
     (void)client_buffer_allocator;
 
-    std::vector<Slice> slices = split_into_slices(
-        const_cast<char *>(value.data()), value.size_bytes());
+    std::vector<Slice> slices =
+        split_into_slices(const_cast<char *>(value.data()), value.size_bytes());
 
     auto result = client_->Upsert(key, slices, config);
     if (!result) {
@@ -3913,8 +3900,8 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     std::vector<Slice> slices;
     for (const auto &value : values) {
         if (value.size_bytes() == 0) continue;
-        auto part_slices = split_into_slices(
-            const_cast<char *>(value.data()), value.size_bytes());
+        auto part_slices =
+            split_into_slices(const_cast<char *>(value.data()), value.size_bytes());
         slices.insert(slices.end(), part_slices.begin(), part_slices.end());
     }
 

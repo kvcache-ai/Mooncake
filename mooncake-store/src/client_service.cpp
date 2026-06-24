@@ -34,6 +34,7 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.hpp"
+#include "gpu_staging_utils.h"
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
@@ -2717,8 +2718,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
     defined(USE_HYGON) || defined(USE_COREX)
-    cudaHostUnregister(reinterpret_cast<void*>(it->second.base));
-    // Ignore failure — may not have been registered
+    gpu_staging::UnpinHostMemory(reinterpret_cast<void*>(it->second.base),
+                                 "segment");
 #endif
 
     int rc = transfer_engine_->unregisterLocalMemory(
@@ -2798,23 +2799,9 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     defined(USE_HYGON) || defined(USE_COREX)
         {
             // Pin segment buffer by default so GPU→host copies use DMA
-            // instead of CUDA's internal staging.  Opt out: MC_STORE_PIN_MEMORY=0
-            const char* pin_env = std::getenv("MC_STORE_PIN_MEMORY");
-            bool pin_memory = !(pin_env &&
-                (std::string(pin_env) == "0" ||
-                 std::string(pin_env) == "false"));
-            if (pin_memory) {
-                auto cuda_ret = cudaHostRegister((void*)buffer, size,
-                                                  cudaHostRegisterDefault);
-                if (cuda_ret != cudaSuccess) {
-                    LOG(WARNING)
-                        << "cudaHostRegister failed for segment (size=" << size
-                        << "): " << cudaGetErrorString(cuda_ret)
-                        << "; GPU copies will use pageable fallback";
-                } else {
-                    LOG(INFO) << "cudaHostRegister segment OK, size=" << size;
-                }
-            }
+            // instead of CUDA's internal staging. Opt out: MC_STORE_PIN_MEMORY=0.
+            // Limit total pinned bytes: MC_STORE_PIN_MEMORY_MAX_BYTES=N.
+            gpu_staging::TryPinHostMemory((void*)buffer, size, "segment");
         }
 #endif
 

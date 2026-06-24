@@ -538,12 +538,11 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
-    explicit TransferSubmitter(TransferEngine& engine,
-                               std::shared_ptr<StorageBackend>& backend,
-                               const std::string& local_hostname,
-                               std::shared_ptr<ClientBufferAllocator> staging_allocator,
-                               TransferMetric* transfer_metric = nullptr,
-                               int numa_socket_id = 0);
+    explicit TransferSubmitter(
+        TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+        const std::string& local_hostname,
+        std::shared_ptr<ClientBufferAllocator> staging_allocator,
+        TransferMetric* transfer_metric = nullptr, int numa_socket_id = 0);
 
     /**
      * @brief Submit an asynchronous transfer operation
