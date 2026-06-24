@@ -1,6 +1,7 @@
 mod cleanup;
 mod control;
 mod device;
+mod eviction;
 mod helpers;
 mod offload;
 mod restore;
@@ -34,6 +35,46 @@ fn env_flag_enabled(name: &str) -> bool {
         })
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(super) use device::cold_tier_free_percentage;
+pub(super) use eviction::{
+    route_after_replica_eviction, should_delete_route_after_last_replica_eviction,
+};
+pub(super) use helpers::{
+    backend_load_cold_payload_batch_into, backend_remove_cold_payload,
+    backend_remove_cold_payload_batch, backend_remove_pending_source,
+    backend_store_cold_payload_batch, backend_store_pending_source, cold_backing_placeholder,
+    cold_restore_flight_key, is_cold_backing_placeholder, materialized_cold_backing,
+    read_local_hot_replica_payload, same_cold_payload, validate_cold_restore_payload,
+    with_disjoint_restore_caller_buffers,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(super) use offload::{checked_add_cold_tier_bytes, is_stale_pending_cold_backing_error};
+#[allow(unused_imports)] // publish_pending_cold_backing_for_eviction used by PR6
+pub(super) use offload::{
+    enqueue_pending_offload, materialize_pending_offloads_bounded,
+    materialize_prepared_pending_offload_batch, prepare_pending_offload_entries,
+    prepare_pending_offload_entry, publish_initial_write_cold_backing,
+    publish_pending_cold_backing_for_eviction,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(super) use restore::restore_payload_from_cold_backing;
+#[allow(unused_imports)]
+pub(super) use restore::{
+    batch_read_from_cold_staged, enqueue_restore_promotion, execute_local_restore_batch_reads,
+    execute_owner_cold_restore_promote_phase, execute_owner_cold_restore_ssd_phase_staging,
+    promote_owned_materialized_route_by_key, read_from_cold_one_shot,
+    trigger_remote_owner_cold_restore, try_init_staging_pool, wait_for_restore_promotions,
+    PromoteTimingBreakdown,
+};
+pub(super) use scheduler::ColdTierHandle;
+pub(super) use staging_pool::{ColdRestoreStagingPool, StagingSlot};
+pub(super) use target_selection::select_cold_backing_target;
+pub(super) use worker::{AsyncOffloadHandle, AsyncRestorePromotionHandle};
 
 #[cfg(test)]
 mod tests {
@@ -73,36 +114,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(super) use device::cold_tier_free_percentage;
-pub(super) use helpers::{
-    backend_remove_cold_payload, backend_remove_cold_payload_batch, backend_remove_pending_source,
-    backend_store_cold_payload_batch, backend_store_pending_source, cold_backing_placeholder,
-    materialized_cold_backing, read_local_hot_replica_payload, same_cold_payload,
-};
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(super) use offload::{checked_add_cold_tier_bytes, is_stale_pending_cold_backing_error};
-#[allow(unused_imports)] // publish_pending_cold_backing_for_eviction used by PR6
-pub(super) use offload::{
-    enqueue_pending_offload, materialize_pending_offloads_bounded,
-    materialize_prepared_pending_offload_batch, prepare_pending_offload_entries,
-    prepare_pending_offload_entry, publish_initial_write_cold_backing,
-    publish_pending_cold_backing_for_eviction,
-};
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(super) use restore::restore_payload_from_cold_backing;
-#[allow(unused_imports)]
-pub(super) use restore::{
-    batch_read_from_cold_staged, enqueue_restore_promotion, execute_local_restore_batch_reads,
-    execute_owner_cold_restore_promote_phase, execute_owner_cold_restore_ssd_phase_staging,
-    promote_owned_materialized_route_by_key, read_from_cold_one_shot,
-    trigger_remote_owner_cold_restore, try_init_staging_pool, wait_for_restore_promotions,
-    PromoteTimingBreakdown,
-};
-pub(super) use scheduler::ColdTierHandle;
-pub(super) use staging_pool::{ColdRestoreStagingPool, StagingSlot};
-pub(super) use worker::{AsyncOffloadHandle, AsyncRestorePromotionHandle};

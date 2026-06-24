@@ -763,7 +763,7 @@ mod state_store_tests {
 
         clock.track_fresh_route(&hot_route, &runtime);
         clock.track_fresh_route(&fresh_route, &runtime);
-        clock.mark_hot_keys(&[hot_route.key.clone()]);
+        clock.mark_hot_keys(std::slice::from_ref(&hot_route.key));
 
         let victim = clock
             .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
@@ -785,7 +785,7 @@ mod state_store_tests {
         clock.track_fresh_route(&hot_route, &runtime);
         clock.track_fresh_route(&fresh_a, &runtime);
         clock.track_fresh_route(&fresh_b, &runtime);
-        clock.mark_hot_keys(&[hot_route.key.clone()]);
+        clock.mark_hot_keys(std::slice::from_ref(&hot_route.key));
 
         let first = clock
             .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
@@ -957,10 +957,8 @@ impl StorageOwnerState {
         };
 
         let evicted_replica = route.replicas[replica_index].clone();
-        let delete_empty_route = !route.cold_backing.as_ref().is_some_and(|backing| {
-            backing.state == mooncake_store_core::ColdBackingState::Materialized
-        });
-        let next = self.route_after_replica_eviction(&route, replica_index, delete_empty_route);
+        let delete_empty_route = cold_tier::should_delete_route_after_last_replica_eviction(&route);
+        let next = cold_tier::route_after_replica_eviction(&route, replica_index, delete_empty_route);
 
         let cas = match next.as_ref() {
             Some(next_route) => self
@@ -1008,29 +1006,6 @@ impl StorageOwnerState {
             );
         }
         Ok(true)
-    }
-
-    fn route_after_replica_eviction(
-        &self,
-        route: &ObjectRoute,
-        replica_index: usize,
-        delete_empty_route: bool,
-    ) -> Option<ObjectRoute> {
-        if route.replicas.len() == 1 && delete_empty_route {
-            return None;
-        }
-        let mut next = route.clone();
-        next.version = next.version.next();
-        if route.replicas.len() == 1 {
-            next.replicas = Vec::new();
-            return Some(next);
-        }
-        next.replicas.remove(replica_index);
-        next.replicas.sort_by_key(|replica| replica.priority);
-        for (priority, replica) in next.replicas.iter_mut().enumerate() {
-            replica.priority = priority as u16;
-        }
-        Some(next)
     }
 
     fn rebuild_clock(&self) -> Result<()> {

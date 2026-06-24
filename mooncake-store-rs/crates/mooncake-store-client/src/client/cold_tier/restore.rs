@@ -1,7 +1,5 @@
 use super::super::{
-    backend_load_cold_payload_batch_into, cold_restore_flight_key, cold_tier_device_id,
-    compatibility_matches, materialized_cold_backing, payload_checksum, registry,
-    validate_cold_restore_payload, with_disjoint_restore_caller_buffers, AsyncEvictionHandle,
+    cold_tier_device_id, compatibility_matches, payload_checksum, registry, AsyncEvictionHandle,
     AsyncReplicaTrackHandle, AsyncRouteHitReportHandle, ColdObjectRead, ColdRestoreFlightLeader,
     ColdRestoreFlightRegistration, ColdTierHandle, ColdTierRateLimitConfig, ControlPlaneHandle,
     LocalAllocatorState, MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker,
@@ -9,6 +7,11 @@ use super::super::{
     RestorePromotionKey, RestorePromotionPayload, RestorePromotionPushOutcome,
     RestorePromotionQueue, RestorePromotionTask, Result, RouteState, StorageOwnerState,
     StoreClient, StoreError, DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
+};
+use super::{
+    backend_load_cold_payload_batch_into, cold_restore_flight_key, materialized_cold_backing,
+    select_cold_backing_target, validate_cold_restore_payload,
+    with_disjoint_restore_caller_buffers,
 };
 use std::{
     sync::{
@@ -1028,7 +1031,7 @@ fn restore_batch_payloads_from_cold_backing_grouped(
                 // Ensure primary is local (swap with a local replica if needed),
                 // then drop all remote replicas so select_target only sees
                 // local devices.
-                super::super::select_cold_backing_target(cold_backing, |id| is_local(id));
+                select_cold_backing_target(cold_backing, |id| is_local(id));
                 cold_backing.replicas.retain(|r| is_local(&r.cold_tier_id));
                 let result = selector.select_target(cold_backing);
                 if result.cold_tier_id != cold_backing.cold_tier_id

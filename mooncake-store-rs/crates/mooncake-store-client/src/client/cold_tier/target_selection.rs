@@ -2,6 +2,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mooncake_store_core::ClientRuntimeId;
 
+/// Resolve-stage target selection for cold-backed objects with multiple replicas.
+///
+/// Priority:
+///   1. Local target — any target whose `cold_tier_id` has a local backend gets
+///      absolute preference.
+///   2. Remote targets — if no local target exists, keep the primary unchanged.
+///
+/// When a non-primary target is selected, rewrites `cold_backing` primary fields
+/// (`owner`, `cold_tier_id`, `object_locator`) so that the cold placeholder points
+/// at the selected local/remote target.
+pub(in super::super) fn select_cold_backing_target(
+    cold_backing: &mut mooncake_store_core::ColdBackingRoute,
+    is_local: impl Fn(&str) -> bool,
+) {
+    if cold_backing.replicas.is_empty() {
+        return;
+    }
+    if is_local(&cold_backing.cold_tier_id) {
+        return;
+    }
+    let local_idx = cold_backing
+        .replicas
+        .iter()
+        .position(|r| is_local(&r.cold_tier_id));
+    let Some(idx) = local_idx else {
+        return;
+    };
+    let local_replica = cold_backing.replicas.swap_remove(idx);
+    let old_primary = mooncake_store_core::ColdBackingReplica {
+        owner: std::mem::replace(&mut cold_backing.owner, local_replica.owner),
+        cold_tier_id: std::mem::replace(&mut cold_backing.cold_tier_id, local_replica.cold_tier_id),
+        object_locator: std::mem::replace(
+            &mut cold_backing.object_locator,
+            local_replica.object_locator,
+        ),
+    };
+    cold_backing.replicas.push(old_primary);
+}
+
 /// Per-batch target selector for multi-replica cold-tier reads.
 ///
 /// Three-layer load balancing (inspired by 3FS `LoadBalanceStrategy`):
