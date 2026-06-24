@@ -113,7 +113,7 @@ impl ControlPlaneClient {
         })
     }
 
-    fn with_runtime<T>(&self, f: impl FnOnce(&Runtime) -> T) -> T {
+    pub(super) fn with_runtime<T>(&self, f: impl FnOnce(&Runtime) -> T) -> T {
         let runtime = self
             .runtime
             .as_ref()
@@ -739,94 +739,6 @@ impl ControlPlaneClient {
         })?
     }
 
-    pub(crate) fn read_from_cold(
-        &self,
-        lease: &ClientLease,
-        request: pb::ReadFromColdRequest,
-    ) -> Result<pb::ReadFromColdReply> {
-        let tracker = OperationTracker::new("control_read_from_cold");
-        let result = (|| {
-            let channel = self.channel_for(lease)?;
-            let reply = self.rpc(
-                |mut client| async move { client.read_from_cold(Request::new(request)).await },
-                channel,
-            )?;
-            if reply.backpressure {
-                return Err(StoreError::Backpressure(
-                    "cold tier owner reported restore backpressure".to_string(),
-                ));
-            }
-            decode_error(reply.error.clone())?;
-            Ok(reply)
-        })();
-        tracker.finish(&result, 0);
-        result
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn batch_read_from_cold(
-        &self,
-        lease: &ClientLease,
-        request: pb::BatchReadFromColdRequest,
-    ) -> Result<pb::BatchReadFromColdReply> {
-        let tracker = OperationTracker::new("control_batch_read_from_cold");
-        let result = (|| {
-            let channel = self.channel_for(lease)?;
-            self.rpc(
-                |mut client| async move { client.batch_read_from_cold(Request::new(request)).await },
-                channel,
-            )
-        })();
-        tracker.finish(&result, 0);
-        result
-    }
-
-    pub(crate) fn ack_cold_read_complete(
-        &self,
-        lease: &ClientLease,
-        segment_names: Vec<String>,
-        segment_offsets: Vec<u64>,
-    ) {
-        let Ok(channel) = self.channel_for(lease) else {
-            return;
-        };
-        let request = pb::AckColdReadCompleteRequest {
-            segment_names,
-            segment_offsets,
-        };
-        let request_timeout = self.request_timeout;
-        self.with_runtime(|runtime| {
-            runtime.spawn(async move {
-                let mut client =
-                    pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
-                let _ = tokio::time::timeout(
-                    request_timeout,
-                    client.ack_cold_read_complete(Request::new(request)),
-                )
-                .await;
-            });
-        });
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn pin_for_read(
-        &self,
-        lease: &ClientLease,
-        segment_names: Vec<String>,
-        segment_offsets: Vec<u64>,
-    ) -> Result<u64> {
-        let channel = self.channel_for(lease)?;
-        let request = pb::PinForReadRequest {
-            segment_names,
-            segment_offsets,
-        };
-        let reply = self.rpc(
-            |mut client| async move { client.pin_for_read(Request::new(request)).await },
-            channel,
-        )?;
-        Ok(reply.pinned)
-    }
-
     #[allow(dead_code)]
     pub(crate) fn release_cached_channel(&self, lease: &ClientLease) {
         if let Ok(address) = control_address(lease) {
@@ -1261,7 +1173,7 @@ impl ControlPlaneClient {
             .unwrap_or_else(|| StoreError::Transport("control stream request failed".to_string())))
     }
 
-    fn channel_for(&self, lease: &ClientLease) -> Result<Channel> {
+    pub(super) fn channel_for(&self, lease: &ClientLease) -> Result<Channel> {
         let address = control_address(lease)?;
         if let Some(channel) = self.channels.lock().get(&address).cloned() {
             return Ok(channel);
@@ -1286,7 +1198,7 @@ impl ControlPlaneClient {
         Ok(channel)
     }
 
-    fn rpc<F, Fut, T>(&self, f: F, channel: Channel) -> Result<T>
+    pub(super) fn rpc<F, Fut, T>(&self, f: F, channel: Channel) -> Result<T>
     where
         F: FnOnce(pb::control_plane_service_client::ControlPlaneServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<Response<T>, Status>>,

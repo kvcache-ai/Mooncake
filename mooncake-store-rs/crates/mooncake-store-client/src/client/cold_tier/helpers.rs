@@ -221,6 +221,19 @@ pub(in super::super) fn is_cold_backing_placeholder(replica: &ReplicaRoute) -> b
     replica.tier == ReplicaTier::File && replica.segment_name.0 == "__cold_backing__"
 }
 
+pub(in super::super) fn cold_only_read_placeholder(
+    route: &ObjectRoute,
+    tenant: &str,
+    logical_key: &str,
+) -> Result<ReplicaRoute> {
+    let cold_backing = materialized_cold_backing(route).ok_or_else(|| {
+        StoreError::NotFound(format!(
+            "tenant={tenant} key={logical_key} has no readable replica owner"
+        ))
+    })?;
+    Ok(cold_backing_placeholder(&cold_backing))
+}
+
 pub(in super::super) fn with_disjoint_restore_caller_buffers(
     buffers: &mut [&mut [u8]],
     read_requests: &[(usize, mooncake_store_core::ColdBackingRoute)],
