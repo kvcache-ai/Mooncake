@@ -638,6 +638,7 @@ The Transfer Engine respects the following environment variables:
 - `MC_TE_FILTERS`: Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on"). **Note:** Not supported when using Transfer Engine TENT.
 - `MC_TE_METRIC_INTERVAL_SECONDS`: Sets metrics reporting interval in seconds
+- `MC_TRANSFER_ON_CUDA_SLOW_BW_GBPS`: Warns (via `LOG(WARNING)`) when the end-to-end effective bandwidth of a CUDA-stream-triggered transfer (the `transfer_*_on_cuda` / `batch_transfer_*_on_cuda` APIs) falls below this many Gb/s. Bandwidth covers the full host-callback span — both `submitTransfer` (CPU enqueue) and the wire wait — so a slow submit stalling the CUDA stream is also surfaced. The log includes `submit_ms` / `wait_ms` breakdown for root-causing. `0` or unset disables the warning (default: unset).
 
 ## Usage Examples
 

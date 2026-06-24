@@ -109,6 +109,14 @@ TransferEnginePy::TransferEnginePy() {
     } else {
         transfer_timeout_nsec_ = 30 * kNanosPerSecond;
     }
+    // MC_TRANSFER_ON_CUDA_SLOW_BW_GBPS: warn when the effective bandwidth of a
+    // CUDA-stream-triggered transfer falls below this many Gb/s. 0 disables.
+    const char* slow_bw_env = getenv("MC_TRANSFER_ON_CUDA_SLOW_BW_GBPS");
+    if (slow_bw_env) {
+        transfer_slow_threshold_gbps_ = std::max(0.0, atof(slow_bw_env));
+    } else {
+        transfer_slow_threshold_gbps_ = 0.0;
+    }
 }
 
 TransferEnginePy::~TransferEnginePy() {
@@ -823,6 +831,9 @@ struct TransferOnCudaContext {
     Transport::BatchID batch_id;
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
+    bool is_write;
+    std::string target_hostname;
+    double slow_threshold_gbps;
 };
 
 /**
@@ -837,12 +848,16 @@ struct TransferOnCudaContext {
 void CUDART_CB transfer_on_cuda_callback(void* data) {
     auto* ctx = reinterpret_cast<TransferOnCudaContext*>(data);
 
+    const uint64_t start_ts = getCurrentTimeInNano();
+    uint64_t submit_done_ts = 0;
+
     auto status = ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
     if (!status.ok()) {
         LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString()
                    << " | BatchID: " << ctx->batch_id;
         goto error_exit;
     }
+    submit_done_ts = getCurrentTimeInNano();
 
     Transport::TransferStatus t_status;
     while (true) {
@@ -863,6 +878,29 @@ void CUDART_CB transfer_on_cuda_callback(void* data) {
             LOG(ERROR) << "[Mooncake Cuda] Transfer timeout | BatchID: "
                        << ctx->batch_id;
             goto error_exit;
+        }
+    }
+
+    if (ctx->slow_threshold_gbps > 0.0 && ctx->total_bytes > 0) {
+        const uint64_t end_ts = getCurrentTimeInNano();
+        const uint64_t total_ns = end_ts - start_ts;
+        // End-to-end BW covers both submit (CPU enqueue) and wait (wire):
+        // bytes * 8 bits/byte / (total_ns * 1e-9 s) / 1e9 Gb = bytes * 8 /
+        // total_ns.
+        const double bw_gbps =
+            total_ns > 0 ? (ctx->total_bytes * 8.0) / total_ns : 0.0;
+        if (total_ns > 0 && bw_gbps < ctx->slow_threshold_gbps) {
+            const uint64_t submit_ns = submit_done_ts - start_ts;
+            const uint64_t wait_ns = end_ts - submit_done_ts;
+            LOG(WARNING) << "[Mooncake Cuda] Slow "
+                         << (ctx->is_write ? "write" : "read")
+                         << " | target=" << ctx->target_hostname
+                         << " batch_id=" << ctx->batch_id
+                         << " bytes=" << ctx->total_bytes
+                         << " total_ms=" << total_ns / 1e6
+                         << " submit_ms=" << submit_ns / 1e6
+                         << " wait_ms=" << wait_ns / 1e6
+                         << " bw_gbps=" << bw_gbps;
         }
     }
 
@@ -939,8 +977,13 @@ void TransferEnginePy::batchTransferOnCuda(
     }
 
     auto batch_id = engine_->allocateBatchID(batch_size);
-    auto* ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
-                                          total_bytes};
+    auto* ctx = new TransferOnCudaContext{engine_,
+                                          batch_id,
+                                          std::move(entries),
+                                          total_bytes,
+                                          opcode == TransferOpcode::WRITE,
+                                          target_hostname,
+                                          transfer_slow_threshold_gbps_};
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err =
