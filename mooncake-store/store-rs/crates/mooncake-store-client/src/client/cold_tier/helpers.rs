@@ -1,10 +1,12 @@
 use super::super::{
-    validate_replica_checksum, ColdObjectWrite, LocalAllocatorState, ObjectRoute,
-    PendingOffloadPayload, PersistentStorageBackend, ReplicaRoute, ReplicaTier, Result,
-    SegmentName, StoreError, StoreState,
+    validate_replica_checksum, ColdObjectPayload, ColdObjectPinnedRead, ColdObjectRead,
+    ColdObjectWrite, ColdRestoreFlightKey, LocalAllocatorState, ObjectRoute, PendingOffloadPayload,
+    PersistentStorageBackend, ReplicaRoute, ReplicaTier, ResolvedObject, Result, SegmentName,
+    StoreError, StoreState,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tracing::warn;
 
 #[allow(dead_code)]
 pub(in super::super) fn backend_store_cold_payload_batch(
@@ -12,6 +14,35 @@ pub(in super::super) fn backend_store_cold_payload_batch(
     writes: &[ColdObjectWrite<'_>],
 ) -> Vec<Result<mooncake_store_core::ColdBackingRoute>> {
     backend.put_objects_batch(writes)
+}
+
+pub(in super::super) fn backend_load_cold_payload_batch_into(
+    backend: &dyn PersistentStorageBackend,
+    reads: &mut [ColdObjectRead<'_, '_>],
+) -> Vec<Result<Option<usize>>> {
+    backend.get_objects_into_batch(reads)
+}
+
+#[allow(dead_code)]
+pub(in super::super) fn backend_load_cold_payload_batch_pinned(
+    backend: &dyn PersistentStorageBackend,
+    reads: &[ColdObjectPinnedRead<'_>],
+) -> Vec<Result<Option<ColdObjectPayload>>> {
+    backend.get_objects_pinned_batch(reads)
+}
+
+pub(in super::super) fn cold_restore_flight_key(
+    route: &ObjectRoute,
+    cold_backing: &mooncake_store_core::ColdBackingRoute,
+) -> ColdRestoreFlightKey {
+    ColdRestoreFlightKey {
+        route_key: route.key.clone(),
+        route_version: route.version,
+        cold_tier_id: cold_backing.cold_tier_id.clone(),
+        object_locator: cold_backing.object_locator.clone(),
+        length: cold_backing.length,
+        checksum: cold_backing.checksum,
+    }
 }
 
 #[allow(dead_code)]
@@ -75,6 +106,101 @@ pub(in super::super) fn materialized_cold_backing(
         .filter(|cold| cold.state == mooncake_store_core::ColdBackingState::Materialized)
 }
 
+pub(in super::super) fn validate_cold_restore_payload(
+    resolved: &ResolvedObject,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() != resolved.replica.length as usize {
+        warn!(
+            tenant = %resolved.tenant,
+            key = %resolved.key,
+            expected = resolved.replica.length,
+            actual = payload.len(),
+            "cold restore payload length mismatch"
+        );
+        return Err(StoreError::InvalidState(format!(
+            "tenant={} key={} cold backing length mismatch: expected {} actual {}",
+            resolved.tenant,
+            resolved.key,
+            resolved.replica.length,
+            payload.len()
+        )));
+    }
+    validate_replica_checksum(&resolved.replica, payload).map_err(|e| {
+        warn!(
+            tenant = %resolved.tenant,
+            key = %resolved.key,
+            error = %e,
+            "cold restore payload checksum failed"
+        );
+        e
+    })
+}
+
+#[allow(dead_code)]
+pub(in super::super) fn validate_resolved_payload_checksum(
+    resolved: &ResolvedObject,
+    payload: &[u8],
+) -> Result<()> {
+    if let Some(cold_backing) = materialized_cold_backing(&resolved.route) {
+        if payload.len() != cold_backing.length as usize {
+            warn!(
+                tenant = %resolved.tenant,
+                key = %resolved.key,
+                expected = cold_backing.length,
+                actual = payload.len(),
+                "resolved payload cold backing length mismatch"
+            );
+            return Err(StoreError::InvalidState(format!(
+                "tenant={} key={} payload length mismatch: expected {} actual {}",
+                resolved.tenant,
+                resolved.key,
+                cold_backing.length,
+                payload.len()
+            )));
+        }
+        return validate_replica_checksum(&cold_backing_placeholder(&cold_backing), payload)
+            .map_err(|e| {
+                warn!(
+                    tenant = %resolved.tenant,
+                    key = %resolved.key,
+                    error = %e,
+                    "resolved payload cold backing checksum failed"
+                );
+                e
+            });
+    }
+    if payload.len() != resolved.replica.length as usize {
+        warn!(
+            tenant = %resolved.tenant,
+            key = %resolved.key,
+            expected = resolved.replica.length,
+            actual = payload.len(),
+            segment = %resolved.replica.segment_name.0,
+            owner = %resolved.replica.owner,
+            "resolved payload replica length mismatch"
+        );
+        return Err(StoreError::InvalidState(format!(
+            "tenant={} key={} payload length mismatch: expected {} actual {}",
+            resolved.tenant,
+            resolved.key,
+            resolved.replica.length,
+            payload.len()
+        )));
+    }
+    validate_replica_checksum(&resolved.replica, payload).map_err(|e| {
+        warn!(
+            tenant = %resolved.tenant,
+            key = %resolved.key,
+            segment = %resolved.replica.segment_name.0,
+            owner = %resolved.replica.owner,
+            error = %e,
+            "resolved payload replica checksum failed"
+        );
+        e
+    })
+}
+
 #[allow(dead_code)]
 pub(in super::super) fn cold_backing_placeholder(
     cold_backing: &mooncake_store_core::ColdBackingRoute,
@@ -89,6 +215,40 @@ pub(in super::super) fn cold_backing_placeholder(
         tier: ReplicaTier::File,
         priority: 0,
     }
+}
+
+pub(in super::super) fn is_cold_backing_placeholder(replica: &ReplicaRoute) -> bool {
+    replica.tier == ReplicaTier::File && replica.segment_name.0 == "__cold_backing__"
+}
+
+pub(in super::super) fn with_disjoint_restore_caller_buffers(
+    buffers: &mut [&mut [u8]],
+    read_requests: &[(usize, mooncake_store_core::ColdBackingRoute)],
+    f: impl FnOnce(&mut [ColdObjectRead<'_, '_>]) -> Vec<Result<Option<usize>>>,
+) -> Vec<(usize, Result<Option<usize>>)> {
+    let indices = read_requests
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    let cold_backings = read_requests
+        .iter()
+        .map(|(_, cold_backing)| cold_backing.clone())
+        .collect::<Vec<_>>();
+    let mut slots = buffers
+        .iter_mut()
+        .map(|buffer| Some(&mut **buffer))
+        .collect::<Vec<_>>();
+    let mut reads = indices
+        .iter()
+        .zip(cold_backings.iter())
+        .map(|(index, cold_backing)| ColdObjectRead {
+            cold_backing,
+            dst: slots[*index]
+                .take()
+                .expect("each restore read index should be unique"),
+        })
+        .collect::<Vec<_>>();
+    indices.into_iter().zip(f(&mut reads)).collect()
 }
 
 pub(in super::super) fn read_local_hot_replica_payload(

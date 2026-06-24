@@ -2369,7 +2369,7 @@ impl StoreClient {
         }
         if resolved
             .iter()
-            .any(|entry| Self::is_cold_backing_placeholder(&entry.replica))
+            .any(|entry| cold_tier::is_cold_backing_placeholder(&entry.replica))
         {
             let total_bytes = lengths.iter().map(|length| *length as u64).sum::<u64>();
             let attempts = resolved
@@ -2381,13 +2381,13 @@ impl StoreClient {
             let mut checked_remote_runtimes = BTreeSet::new();
             let local_segments = self.local_storage_segments();
             for (entry, buffer) in resolved.iter_mut().zip(buffers.iter_mut()) {
-                if Self::is_cold_backing_placeholder(&entry.replica) {
-                    self.execute_cold_restore_direct(transport, entry, &mut **buffer, request_deadline)?;
+                if cold_tier::is_cold_backing_placeholder(&entry.replica) {
+                    self.execute_cold_restore_direct(transport, entry, buffer, request_deadline)?;
                 } else {
                     self.read_single_object_with_failover(
                         transport,
                         entry,
-                        &mut **buffer,
+                        buffer,
                         &mut checked_remote_runtimes,
                         &local_segments,
                         request_deadline,
@@ -3843,10 +3843,6 @@ impl StoreClient {
         result
     }
 
-    fn is_cold_backing_placeholder(replica: &ReplicaRoute) -> bool {
-        replica.tier == ReplicaTier::File && replica.segment_name.0 == "__cold_backing__"
-    }
-
     fn execute_cold_restore_direct(
         &self,
         transport: &dyn StoreTransport,
@@ -4025,7 +4021,7 @@ impl StoreClient {
                 buffer.len()
             )));
         }
-        if Self::is_cold_backing_placeholder(&resolved.replica) {
+        if cold_tier::is_cold_backing_placeholder(&resolved.replica) {
             self.execute_cold_restore_direct(transport, resolved, buffer, request_deadline)?;
         } else if !self.copy_local_replica_direct(transport, &resolved.replica, buffer, length)? {
             self.ensure_remote_replica_reachable_once(&resolved.replica, checked_runtimes)?;

@@ -71,20 +71,16 @@ impl ControlPlaneHandle {
                 StoreError::Transport(format!("control plane server runtime init failed: {error}"))
             })?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let services = ControlPlaneServices {
+            authority,
+            allocator,
+            eviction,
+            migration,
+            cold_tier,
+        };
         let thread = thread::Builder::new()
             .name(format!("store-control-{address}"))
-            .spawn(move || {
-                run_server(
-                    runtime,
-                    listener,
-                    shutdown_rx,
-                    authority,
-                    allocator,
-                    eviction,
-                    migration,
-                    cold_tier,
-                )
-            })
+            .spawn(move || run_server(runtime, listener, shutdown_rx, services))
             .map_err(|error| {
                 StoreError::Transport(format!("control plane spawn failed: {error}"))
             })?;
@@ -129,6 +125,14 @@ pub(super) fn control_plane_server_threads_from_env() -> usize {
     }
 }
 
+struct ControlPlaneServices {
+    authority: Arc<dyn AuthorityService>,
+    allocator: Arc<dyn AllocatorService>,
+    eviction: Arc<dyn EvictionService>,
+    migration: Arc<dyn MigrationService>,
+    cold_tier: Arc<dyn ColdTierControlService>,
+}
+
 #[derive(Default)]
 struct ControlPlaneServerStats {
     active_streams: AtomicUsize,
@@ -155,14 +159,14 @@ fn run_server(
     runtime: Runtime,
     listener: std::net::TcpListener,
     shutdown: oneshot::Receiver<()>,
-    authority: Arc<dyn AuthorityService>,
-    allocator: Arc<dyn AllocatorService>,
-    eviction: Arc<dyn EvictionService>,
-    migration: Arc<dyn MigrationService>,
-    cold_tier: Arc<dyn ColdTierControlService>,
+    services: ControlPlaneServices,
 ) {
     let service = GrpcControlPlaneService::new_with_migration(
-        authority, allocator, eviction, migration, cold_tier,
+        services.authority,
+        services.allocator,
+        services.eviction,
+        services.migration,
+        services.cold_tier,
     );
     let result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
