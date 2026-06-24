@@ -1467,12 +1467,28 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 				fmt.Sprintf("Drain job for pod %s failed, retry %d/%d",
 					job.PodName, newRetryCount, maxDrainRetries))
 		} else if job.Status == 4 && podStillExists {
-			logger.Info("drain job FAILED, max retries reached",
+			logger.Info("drain job FAILED, max retries reached, force-deleting pod",
 				"pod", job.PodName, "segment", job.SegmentName,
 				"retryCount", job.RetryCount, "error", job.Error)
+			// Force-delete the pod with a 1-second grace period to
+			// bypass the PreStop hook's 600-second wait. The drain
+			// has been exhausted (hard-pinned keys, no targets, etc.)
+			// and further waiting cannot recover the data.
+			var podToDelete corev1.Pod
+			if getErr := r.Get(ctx, types.NamespacedName{
+				Namespace: mc.Namespace, Name: job.PodName,
+			}, &podToDelete); getErr != nil {
+				logger.Error(getErr, "failed to get pod for force-delete after drain exhausted",
+					"pod", job.PodName)
+			} else {
+				if delErr := r.Delete(ctx, &podToDelete, client.GracePeriodSeconds(1)); delErr != nil {
+					logger.Error(delErr, "failed to force-delete pod after drain exhausted",
+						"pod", job.PodName)
+				}
+			}
 			r.Recorder.Event(mc, corev1.EventTypeWarning, "AutoDrainExhausted",
-				fmt.Sprintf("Drain job for pod %s max retries %d reached: %s",
-					job.PodName, maxDrainRetries, job.Error))
+				fmt.Sprintf("Max retries %d reached for pod %s: %s",
+					maxDrainRetries, job.PodName, job.Error))
 		}
 	}
 

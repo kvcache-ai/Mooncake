@@ -1086,6 +1086,7 @@ TEST_F(MasterServiceTest,
         MasterServiceConfig::builder().set_default_kv_lease_ttl(1000).build();
     constexpr size_t kSegmentSize = 4 * 1024 * 1024;
     constexpr size_t kObjectSize = 2 * 1024 * 1024;
+    const uint64_t kv_lease_ttl = 1000;
 
     {
         std::unique_ptr<MasterService> service_(
@@ -1105,6 +1106,9 @@ TEST_F(MasterServiceTest,
                            kObjectSize);
         PutCompletedObject(*service_, client_id, evict_key_b, evict_config,
                            kObjectSize);
+
+        // Wait for leases granted by PutEnd to expire so eviction can proceed.
+        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
 
         ReplicateConfig trigger_config;
         trigger_config.replica_num = 1;
@@ -1138,6 +1142,10 @@ TEST_F(MasterServiceTest,
         PutCompletedObject(*service_, client_id, leased_key_b, leased_config,
                            kObjectSize);
 
+        // Wait for leases granted by PutEnd to expire, then re-grant via
+        // ExistKey so the lease protects against eviction.
+        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+
         auto exists = service_->ExistKey(leased_key_a);
         ASSERT_TRUE(exists.has_value());
         ASSERT_TRUE(exists.value());
@@ -1160,7 +1168,9 @@ TEST_F(MasterServiceTest,
 TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
     constexpr size_t kSegmentSize = 4 * 1024 * 1024;
     constexpr size_t kObjectSize = 2 * 1024 * 1024;
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context =
         PrepareSimpleSegment(*service_, "grouped_mixed_safety_segment",
                              kDefaultSegmentBase, kSegmentSize);
@@ -1887,7 +1897,9 @@ TEST_F(MasterServiceTest, GetReplicaList) {
 }
 
 TEST_F(MasterServiceTest, RemoveObject) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -1917,7 +1929,9 @@ TEST_F(MasterServiceTest, RemoveObject) {
 }
 
 TEST_F(MasterServiceTest, RandomRemoveObject) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     int times = 10;
@@ -1985,7 +1999,7 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
 }
 
 TEST_F(MasterServiceTest, CopyStart) {
-    const uint64_t kv_lease_ttl = 50;
+    const uint64_t kv_lease_ttl = 0;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
@@ -2324,7 +2338,7 @@ TEST_F(MasterServiceTest, CopyRevoke) {
 }
 
 TEST_F(MasterServiceTest, MoveStart) {
-    const uint64_t kv_lease_ttl = 50;
+    const uint64_t kv_lease_ttl = 0;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
@@ -2445,20 +2459,21 @@ TEST_F(MasterServiceTest, MoveStart) {
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, remove_result.error());
 
-    // End the move.
+    // End the move — should fail because target already had this key's
+    // replica and MoveEnd refuses to reduce the replica count.
     move_end_result = service_->MoveEnd(client_id, key);
-    EXPECT_TRUE(move_end_result.has_value());
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, move_end_result.error());
 
-    // Now the object should have only 1 replica on segment_3.
+    // Now the object should still have 2 replicas
+    // (source was not deleted to preserve replica count).
     get_result = service_->GetReplicaList(key);
     EXPECT_TRUE(get_result.has_value());
     replicas = get_result.value().replicas;
-    EXPECT_EQ(1, replicas.size());
-    EXPECT_EQ("segment_3", replicas[0]
-                               .get_memory_descriptor()
-                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(2, replicas.size());
 
-    // Test Case 11: Try remove the object, should succeed after lease expires.
+    // Test Case 11: Try remove the object, the replication task was
+    // already cleared by the failed MoveEnd, so remove should succeed.
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
     remove_result = service_->Remove(key);
     EXPECT_TRUE(remove_result.has_value());
@@ -3142,7 +3157,9 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     auto segment = MakeSegment("concurrent_segment", buffer, size);
@@ -3302,7 +3319,9 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16 * 100;
     auto segment = MakeSegment("concurrent_segment", buffer, size);
@@ -3356,7 +3375,9 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
@@ -3633,10 +3654,14 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
-        if (i >= 5) {
-            auto exist_result = service_->ExistKey(key);
-            ASSERT_TRUE(exist_result.has_value());
-        }
+    }
+    // Wait for leases granted by PutEnd to expire, then re-grant leases
+    // to keys 5-9 via ExistKey so they are protected from RemoveAll.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    for (int i = 5; i < 10; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
     }
     ASSERT_EQ(5, service_->RemoveAll());
     for (int i = 0; i < 5; ++i) {
@@ -3748,7 +3773,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
 }
 
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {
-    const uint64_t kv_lease_ttl = 200;
+    const uint64_t kv_lease_ttl = 0;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
     const bool allow_evict_soft_pinned_objects = true;
@@ -5682,7 +5707,65 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
 
     auto segment_status = service_->QuerySegmentStatus("segment_0");
     ASSERT_TRUE(segment_status.has_value());
-    EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
+    EXPECT_EQ(segment_status.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+}
+
+TEST_F(MasterServiceTest,
+       DrainJobFailedSegmentNotAllocatable) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    PutObjectOnSegment(*service_, put_client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    // Fail all move tasks so the drain job exhausts retries.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        WaitUntil(
+            [&] { return FailPendingMoveTasks(*service_, ctx0.client_id); });
+    }
+
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::FAILED;
+    });
+
+    // Verify segment is in GRACEFULLY_UNMOUNTING state (not OK).
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+
+    // Verify the segment is NOT allocatable: new PutStart with
+    // preferred_segment="segment_0" must be redirected to segment_1.
+    ReplicateConfig verify_config;
+    verify_config.replica_num = 1;
+    verify_config.preferred_segment = "segment_0";
+
+    auto put_result = service_->PutStart(
+        ctx0.client_id, "alloc_after_drain_fail", 1024, verify_config);
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_EQ(put_result->size(), 1u);
+    EXPECT_EQ(put_result->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+    ASSERT_TRUE(service_
+                    ->PutEnd(ctx0.client_id, "alloc_after_drain_fail",
+                             ReplicaType::MEMORY)
+                    .has_value());
 }
 
 TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {

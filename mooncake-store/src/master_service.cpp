@@ -7324,8 +7324,13 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
             if (segment_access.GetSegmentStatusByName(segment_name, status) ==
                     ErrorCode::OK &&
                 status != SegmentStatus::UNMOUNTING) {
-                (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                            SegmentStatus::OK);
+                // Do NOT restore to OK — the pod is still terminating and will
+                // be killed soon. Set to GRACEFULLY_UNMOUNTING to:
+                // 1. Remove the allocator (prevent new writes to dying pod)
+                // 2. Keep the segment readable for existing reads
+                // 3. Let downstream unmount logic clean it up
+                (void)segment_access.SetSegmentStatusByName(
+                    segment_name, SegmentStatus::GRACEFULLY_UNMOUNTING);
             }
         }
     }
