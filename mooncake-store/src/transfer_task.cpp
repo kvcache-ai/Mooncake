@@ -1011,16 +1011,9 @@ TransferSubmitter::ensureRegisteredForRDMA(const std::vector<Slice>& slices) {
                 LOG(ERROR) << "MemcpySafe failed during RDMA staging";
                 return std::make_pair(std::vector<Slice>{}, std::vector<BufferHandle>{});
             }
-            // Split staged data by kMaxSliceSize for RDMA transfer limits
-            size_t remaining = slices[i].size;
-            size_t split_offset = 0;
-            while (remaining > 0) {
-                size_t chunk = std::min(remaining, kMaxSliceSize);
-                prepared.emplace_back(
-                    Slice{static_cast<char*>(staged_ptr) + split_offset, chunk});
-                split_offset += chunk;
-                remaining -= chunk;
-            }
+            // Split staged data by kMaxSliceSize for RDMA transfer limits.
+            auto sub = split_into_slices(staged_ptr, slices[i].size);
+            prepared.insert(prepared.end(), sub.begin(), sub.end());
         }
     }
     staging_handles.push_back(std::move(*staging_alloc));
@@ -1209,6 +1202,13 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
     uint64_t offset = src_offset;
 
+    int base_dev = -1;
+    bool base_on_gpu = false;
+    if (base_address != 0) {
+        base_on_gpu = gpu_staging::IsDevicePointer(
+            reinterpret_cast<void*>(base_address), &base_dev);
+    }
+
     // Execute memcpy inline on the calling thread instead of going through
     // the worker pool. This eliminates thread synchronization overhead and
     // keeps data on the same NUMA node. The worker pool (1 thread) added
@@ -1216,7 +1216,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     bool ok = true;
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
-        if (slice.ptr == nullptr) continue;
+        if (slice.ptr == nullptr || slice.size == 0) continue;
 
         void* dest;
         const void* src;
@@ -1229,9 +1229,15 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         }
         offset += slice.size;
 
-        int src_dev = -1, dst_dev = -1;
-        bool src_on_gpu = gpu_staging::IsDevicePointer(src, &src_dev);
-        bool dst_on_gpu = gpu_staging::IsDevicePointer(dest, &dst_dev);
+        int slice_dev = -1;
+        bool slice_on_gpu = gpu_staging::IsDevicePointer(slice.ptr, &slice_dev);
+
+        bool src_on_gpu =
+            (op_code == TransferRequest::READ) ? base_on_gpu : slice_on_gpu;
+        int src_dev = (op_code == TransferRequest::READ) ? base_dev : slice_dev;
+        bool dst_on_gpu =
+            (op_code == TransferRequest::READ) ? slice_on_gpu : base_on_gpu;
+        int dst_dev = (op_code == TransferRequest::READ) ? slice_dev : base_dev;
 
         if (!src_on_gpu && !dst_on_gpu) {
             std::memcpy(dest, src, slice.size);

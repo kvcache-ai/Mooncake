@@ -166,6 +166,7 @@ inline bool IsHostPointer(const void* ptr) {
 /// GPU-safe memcpy: auto-detects pointer types and dispatches to CopyAuto
 /// for GPU pointers, std::memcpy for host pointers.
 inline bool MemcpySafe(void* dst, const void* src, size_t size) {
+    if (size == 0) return true;
     int src_dev = -1, dst_dev = -1;
     bool src_gpu = IsDevicePointer(src, &src_dev);
     bool dst_gpu = IsDevicePointer(dst, &dst_dev);

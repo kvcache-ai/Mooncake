@@ -770,7 +770,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             bool pin_memory = !(pin_env &&
                 (std::string(pin_env) == "0" ||
                  std::string(pin_env) == "false"));
-            if (pin_memory) {
+            if (pin_memory && local_buffer_size > 0) {
                 auto cuda_ret = cudaHostRegister(
                     client_buffer_allocator_->getBase(), local_buffer_size,
                     cudaHostRegisterDefault);
