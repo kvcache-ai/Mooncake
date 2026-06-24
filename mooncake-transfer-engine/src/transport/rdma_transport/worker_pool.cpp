@@ -556,6 +556,9 @@ void WorkerPool::monitorWorker() {
             // from RdmaContext::endpoint() and the waiting list grows
             // unboundedly under failure load. See issue #1845.
             context_.reclaimEndpoints();
+            // Drop expired active-connect pause entries so the map doesn't grow
+            // for peers that are never re-attempted after their pause lapses.
+            context_.pruneConnectPause();
             last_reset_ts = current_ts;
         }
         struct epoll_event event;

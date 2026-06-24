@@ -113,6 +113,14 @@ class RdmaEndPoint {
    private:
     int disconnectUnlocked();
 
+    // Bounded wait for this endpoint's outstanding WRs to drain to zero
+    // (i.e. all flush CQEs from a prior disconnectUnlocked have been polled).
+    // Caller must hold lock_. Returns true if fully drained, false on timeout
+    // (globalConfig().qp_drain_timeout_ms). Called before doSetupConnection
+    // transitions QPs back through RESET so in-flight WRs are not re-orphaned;
+    // on a fresh endpoint the counters are already zero and this is a no-op.
+    bool drainWrDepthLocked();
+
     // Resets the connection.
     //
     // The main difference between this function and `disconnectUnlocked`

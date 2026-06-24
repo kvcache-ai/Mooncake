@@ -43,6 +43,15 @@ if (UNIX AND NOT APPLE)
         "-Wl,--wrap=ibv_modify_qp"
         "-Wl,--wrap=ibv_query_gid"
         "-Wl,--wrap=_ibv_query_gid_ex")
+    # ibv_create_qp is wrapped only for non-eRDMA builds, where the
+    # DisconnectIssuesErrBeforeResetOnReconnect test tracks QP generations.
+    # The matching __wrap_ibv_create_qp is guarded by #ifndef CONFIG_ERDMA, so
+    # the flag must be gated identically or the link fails on an undefined wrap.
+    if (NOT USE_ERDMA)
+        target_link_options(rdma_endpoint_reestablish_test PRIVATE
+            "-Wl,--wrap=ibv_create_qp"
+            "-Wl,--wrap=ibv_query_qp")
+    endif()
 endif()
 add_test(NAME rdma_endpoint_reestablish_test COMMAND rdma_endpoint_reestablish_test)
 set_tests_properties(rdma_endpoint_reestablish_test PROPERTIES LABELS "rdma")
@@ -68,6 +77,13 @@ endif()
 add_executable(tcp_address_validation_test ${WORKSPACE}/tcp_address_validation_test.cpp)
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
+
+# Hardware-free unit test for the active-connect circuit-breaker state
+# (ConnectPauseTracker is header-only and clock-injectable), runs on every CI
+# runner.
+add_executable(connect_pause_tracker_test ${WORKSPACE}/connect_pause_tracker_test.cpp)
+target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main pthread)
+add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
 
 if (USE_MNNVL)
     add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
