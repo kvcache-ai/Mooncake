@@ -66,9 +66,9 @@ constexpr int kMaxTenantQuotaEvictionRetries = 2;
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
 // this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
-// falls back according to `offload_force_evict_`. A future change may expose
-// this as a configurable parameter if workloads demand tuning.
-constexpr double kOffloadCapRatio = 0.5;
+// falls back according to `offload_force_evict_`.
+// NOTE: Both offloading_queue_limit_ and offload_cap_ratio_ are now
+// configurable via --offloading_queue_limit and --offload_cap_ratio flags.
 
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
@@ -217,7 +217,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      offloading_queue_limit_(config.offloading_queue_limit),
+      offload_cap_ratio_(config.offload_cap_ratio) {
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -264,6 +266,25 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << "Eviction high watermark ratio must be between 0.0 and 1.0, "
             << "current value: " << eviction_high_watermark_ratio_;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
+
+    // Validate offload tuning knobs here (not only via gflags validator),
+    // because values loaded from a configuration file bypass the gflags
+    // validator chain.
+    if (offload_cap_ratio_ < 0.0 || offload_cap_ratio_ > 1.0) {
+        LOG(ERROR) << "offload_cap_ratio must be between 0.0 and 1.0, "
+                   << "current value: " << offload_cap_ratio_;
+        throw std::invalid_argument("Invalid offload_cap_ratio");
+    }
+    if (offloading_queue_limit_ == 0) {
+        LOG(ERROR) << "offloading_queue_limit must be greater than 0";
+        throw std::invalid_argument("Invalid offloading_queue_limit");
+    }
+    if (offloading_queue_limit_ > 100'000'000ULL) {
+        LOG(ERROR) << "offloading_queue_limit must be <= 100000000 to avoid "
+                   << "overflow when computing offload_cap, current value: "
+                   << offloading_queue_limit_;
+        throw std::invalid_argument("Invalid offloading_queue_limit");
     }
 
     if (put_start_release_timeout_sec_ <= put_start_discard_timeout_sec_) {
@@ -6269,7 +6290,7 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
     long offload_push_failed_forced = 0;
     const long offload_cap =
         offload_on_evict_
-            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
     auto try_evict_or_offload =
@@ -6499,7 +6520,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
     const long offload_cap =
         offload_on_evict_
-            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
