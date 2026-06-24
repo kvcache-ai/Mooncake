@@ -231,9 +231,9 @@ inline bool TryPinHostMemory(void* ptr, size_t size, const char* name) {
         size_t current = PinnedHostMemoryBytes();
         if (max_bytes > 0 &&
             (current > max_bytes || size > max_bytes - current)) {
-            LOG(WARNING) << "Skip cudaHostRegister for " << name << " size="
-                         << size << " because MC_STORE_PIN_MEMORY_MAX_BYTES="
-                         << max_bytes << " current_pinned=" << current;
+            LOG(WARNING) << "Skip cudaHostRegister for " << name << " size=" << size
+                         << " because MC_STORE_PIN_MEMORY_MAX_BYTES=" << max_bytes
+                         << " current_pinned=" << current;
             return false;
         }
         PinnedHostMemoryBytes() += size;
@@ -243,8 +243,8 @@ inline bool TryPinHostMemory(void* ptr, size_t size, const char* name) {
     if (cuda_ret != cudaSuccess) {
         std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
         PinnedHostMemoryBytes() -= size;
-        LOG(WARNING) << "cudaHostRegister failed for " << name << " size="
-                     << size << ": " << cudaGetErrorString(cuda_ret)
+        LOG(WARNING) << "cudaHostRegister failed for " << name << " size=" << size
+                     << ": " << cudaGetErrorString(cuda_ret)
                      << "; GPU copies will use pageable fallback";
         return false;
     }

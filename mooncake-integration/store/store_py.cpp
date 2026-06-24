@@ -818,11 +818,10 @@ class MooncakeStorePyWrapper {
                     continue;
                 }
                 valid_keys.push_back(keys[i]);
-                all_buffers.push_back({const_cast<void *>(
-                                           reinterpret_cast<const void *>(
-                                               &infos[i].metadata)),
-                                       reinterpret_cast<void *>(
-                                           infos[i].data_ptr)});
+                all_buffers.push_back(
+                    {const_cast<void *>(
+                         reinterpret_cast<const void *>(&infos[i].metadata)),
+                     reinterpret_cast<void *>(infos[i].data_ptr)});
                 all_sizes.push_back({infos[i].metadata.header.data_offset,
                                      infos[i].tensor_size});
                 original_indices.push_back(i);
@@ -1412,11 +1411,10 @@ class MooncakeStorePyWrapper {
                 if (!infos[i].valid()) continue;
 
                 valid_keys.push_back(keys[i]);
-                all_buffers.push_back({const_cast<void *>(
-                                           reinterpret_cast<const void *>(
-                                               &infos[i].metadata)),
-                                       reinterpret_cast<void *>(
-                                           infos[i].data_ptr)});
+                all_buffers.push_back(
+                    {const_cast<void *>(
+                         reinterpret_cast<const void *>(&infos[i].metadata)),
+                     reinterpret_cast<void *>(infos[i].data_ptr)});
                 all_sizes.push_back({infos[i].metadata.header.data_offset,
                                      infos[i].tensor_size});
                 original_indices.push_back(i);

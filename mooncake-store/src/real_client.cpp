@@ -764,9 +764,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
     defined(USE_HYGON) || defined(USE_COREX)
         {
-            // Pin staging buffer by default so GPU→host copies use DMA
-            // instead of CUDA's internal staging. Opt out: MC_STORE_PIN_MEMORY=0.
-            // Limit total pinned bytes: MC_STORE_PIN_MEMORY_MAX_BYTES=N.
+            // Pin staging buffer by default so GPU→host copies use DMA.
+            // Opt out with MC_STORE_PIN_MEMORY=0.
+            // Cap with MC_STORE_PIN_MEMORY_MAX_BYTES=N.
             gpu_staging::TryPinHostMemory(client_buffer_allocator_->getBase(),
                                           local_buffer_size,
                                           "client staging buffer");
@@ -1838,8 +1838,8 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     std::vector<Slice> slices;
     for (const auto &value : values) {
         if (value.size_bytes() == 0) continue;
-        auto part_slices =
-            split_into_slices(const_cast<char *>(value.data()), value.size_bytes());
+        auto part_slices = split_into_slices(const_cast<char *>(value.data()),
+                                             value.size_bytes());
         slices.insert(slices.end(), part_slices.begin(), part_slices.end());
     }
 
@@ -3906,8 +3906,8 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     std::vector<Slice> slices;
     for (const auto &value : values) {
         if (value.size_bytes() == 0) continue;
-        auto part_slices =
-            split_into_slices(const_cast<char *>(value.data()), value.size_bytes());
+        auto part_slices = split_into_slices(const_cast<char *>(value.data()),
+                                             value.size_bytes());
         slices.insert(slices.end(), part_slices.begin(), part_slices.end());
     }
 

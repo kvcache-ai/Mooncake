@@ -2798,9 +2798,9 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
     defined(USE_HYGON) || defined(USE_COREX)
         {
-            // Pin segment buffer by default so GPU→host copies use DMA
-            // instead of CUDA's internal staging. Opt out: MC_STORE_PIN_MEMORY=0.
-            // Limit total pinned bytes: MC_STORE_PIN_MEMORY_MAX_BYTES=N.
+            // Pin segment buffer by default so GPU→host copies use DMA.
+            // Opt out with MC_STORE_PIN_MEMORY=0.
+            // Cap with MC_STORE_PIN_MEMORY_MAX_BYTES=N.
             gpu_staging::TryPinHostMemory((void*)buffer, size, "segment");
         }
 #endif
