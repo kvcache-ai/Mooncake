@@ -83,7 +83,7 @@ class StructuredMemberSlice:
 @dataclass(frozen=True)
 class _TensorPayload:
     tensor: Any
-    array: np.ndarray
+    nbytes: int
 
 
 @dataclass(frozen=True)
@@ -563,7 +563,7 @@ class _BundleManifestStore:
             tensor_spec = self._put_tensor_payload(key, value)
             if tensor_spec is not None:
                 return tensor_spec, [key]
-            value = value.array.view(np.uint8).reshape(-1).data
+            value = _tensor_payload_bytes_view(value)
         chunks = _split_view(value, chunk_bytes)
         chunk_keys = [
             key if len(chunks) == 1 else f"{key}/chunk/{index}"
@@ -595,10 +595,10 @@ class _BundleManifestStore:
         return {
             "key": key,
             "kind": "tensor",
-            "bytes": int(value.array.nbytes),
+            "bytes": value.nbytes,
             "dtype": str(value.tensor.dtype),
             "shape": list(value.tensor.shape),
-            "chunks": [{"key": key, "bytes": int(value.array.nbytes)}],
+            "chunks": [{"key": key, "bytes": value.nbytes}],
         }
 
     def _policy(
@@ -1344,13 +1344,16 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
 
 
 def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
-    tensor = value.detach().cpu().contiguous()
-    array = tensor.numpy()
     return {
         "encoding": "torch_tensor",
-        "dtype": str(tensor.dtype),
-        "shape": list(tensor.shape),
-    }, _TensorPayload(tensor=tensor, array=array)
+        "dtype": str(value.dtype),
+        "shape": list(value.shape),
+    }, _TensorPayload(tensor=value, nbytes=int(value.numel() * value.element_size()))
+
+
+def _tensor_payload_bytes_view(value: _TensorPayload) -> memoryview:
+    tensor = value.tensor.detach().cpu().contiguous()
+    return tensor.numpy().view(np.uint8).reshape(-1).data
 
 
 def _torch_dtype_to_numpy(dtype: Any) -> np.dtype[Any]:
