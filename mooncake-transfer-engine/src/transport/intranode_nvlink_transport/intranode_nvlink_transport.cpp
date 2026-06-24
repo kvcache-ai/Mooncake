@@ -46,50 +46,32 @@ namespace mooncake {
 
 namespace {
 
-/// Per-device CUDA stream + event pool (thread-local).
-/// Each thread maintains a map of device_id → (stream, event).
-/// When submitTransfer is called, the source buffer's device is queried via
-/// cudaPointerGetAttributes, and the stream for THAT device is used.
-/// This ensures that DMA copies are submitted to the correct GPU's KMD
-/// queue, avoiding the problem where all copies pile up on GPU 0.
-struct CudaStreamEventPair {
+/// Per-device CUDA stream pool (thread-local).
+struct CudaStreamEntry {
     cudaStream_t stream;
-    cudaEvent_t event;
     int device_id;
 };
 
 class PerDeviceStreamPool {
    public:
-    CudaStreamEventPair getOrCreate(int device_id) {
+    CudaStreamEntry getOrCreate(int device_id) {
         auto it = pool_.find(device_id);
-        if (it != pool_.end()) {
-            return it->second;
-        }
-
+        if (it != pool_.end()) return it->second;
         int saved_device = 0;
         cudaGetDevice(&saved_device);
         if (cudaSetDevice(device_id) != cudaSuccess) {
             LOG(ERROR) << "IntraNodeNvlinkTransport: cudaSetDevice("
-                       << device_id << ") failed when creating stream";
-            return {nullptr, nullptr, -1};
+                       << device_id << ") failed";
+            return {nullptr, -1};
         }
-
-        CudaStreamEventPair pair;
-        pair.device_id = device_id;
-        cudaError_t err = cudaStreamCreateWithFlags(&pair.stream,
+        CudaStreamEntry entry;
+        entry.device_id = device_id;
+        cudaError_t err = cudaStreamCreateWithFlags(&entry.stream,
                                                     cudaStreamNonBlocking);
-        if (err != cudaSuccess) {
+        if (err != cudaSuccess)
             LOG(FATAL) << "Failed to create NVLink CUDA stream on device "
                        << device_id << ": " << cudaGetErrorString(err);
-        }
-        err = cudaEventCreateWithFlags(&pair.event, cudaEventDisableTiming);
-        if (err != cudaSuccess) {
-            LOG(FATAL) << "Failed to create NVLink CUDA event on device "
-                       << device_id << ": " << cudaGetErrorString(err);
-        }
-
         cudaSetDevice(saved_device);
-
         cudaDeviceProp prop;
         std::string pci = "unknown";
         if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess) {
@@ -103,42 +85,52 @@ class PerDeviceStreamPool {
                   << "] CUDA_VISIBLE_DEVICES="
                   << (visible ? visible : "(not set)")
                   << " pid=" << getpid();
-
-        pool_[device_id] = pair;
-        return pair;
+        pool_[device_id] = entry;
+        return entry;
     }
-
     ~PerDeviceStreamPool() {
         int saved_device = 0;
         cudaGetDevice(&saved_device);
         for (auto &kv : pool_) {
             cudaSetDevice(kv.first);
             if (kv.second.stream) cudaStreamDestroy(kv.second.stream);
-            if (kv.second.event) cudaEventDestroy(kv.second.event);
         }
         cudaSetDevice(saved_device);
     }
-
    private:
-    std::unordered_map<int, CudaStreamEventPair> pool_;
+    std::unordered_map<int, CudaStreamEntry> pool_;
 };
 
 static thread_local PerDeviceStreamPool tl_device_stream_pool;
 
+static thread_local cudaEvent_t tl_caller_sync_event = nullptr;
+static thread_local int tl_caller_sync_event_device = -1;
+
+static cudaEvent_t getCallerSyncEvent() {
+    int current_device = 0;
+    cudaGetDevice(&current_device);
+    if (tl_caller_sync_event_device != current_device) {
+        if (tl_caller_sync_event) cudaEventDestroy(tl_caller_sync_event);
+        cudaError_t err = cudaEventCreateWithFlags(&tl_caller_sync_event,
+                                                    cudaEventDisableTiming);
+        if (err != cudaSuccess)
+            LOG(FATAL) << "Failed to create NVLink sync event on device "
+                       << current_device << ": " << cudaGetErrorString(err);
+        tl_caller_sync_event_device = current_device;
+    }
+    return tl_caller_sync_event;
+}
+
 static int getDeviceForPointer(const void *ptr) {
     cudaPointerAttributes attr;
-    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
-    if (err != cudaSuccess) {
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
         cudaGetLastError();
         return -1;
     }
-    if (attr.type == cudaMemoryTypeDevice) {
-        return attr.device;
-    }
-    return -1;
+    return (attr.type == cudaMemoryTypeDevice) ? attr.device : -1;
 }
 
-static CudaStreamEventPair getStreamForRequest(const void *source) {
+static CudaStreamEntry getStreamForRequest(const void *source) {
     int device_id = getDeviceForPointer(source);
     if (device_id < 0) {
         cudaGetDevice(&device_id);
@@ -411,42 +403,29 @@ Status IntraNodeNvlinkTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    // Determine the source buffer's device and get the per-device stream.
-    // This ensures DMA copies are submitted to the correct GPU's KMD queue,
-    // not all piled up on GPU 0.
-    CudaStreamEventPair stream_event =
+    // Get per-device transfer stream for the source buffer's device.
+    CudaStreamEntry stream_entry =
         getStreamForRequest(entries.empty() ? nullptr : entries[0].source);
-    cudaStream_t stream = stream_event.stream;
-    cudaEvent_t sync_event = stream_event.event;
-    if (!stream || !sync_event) {
-        return Status::Context("Failed to create NVLink CUDA stream/event");
-    }
-    // Switch to the stream's device before recording the event.
-    int saved_device = 0;
-    cudaGetDevice(&saved_device);
-    if (stream_event.device_id != saved_device) {
-        cudaSetDevice(stream_event.device_id);
-    }
+    cudaStream_t stream = stream_entry.stream;
+    if (!stream)
+        return Status::Context("Failed to create NVLink CUDA stream");
+    // Synchronize with caller's GPU work via cudaEventSynchronize (CPU-blocking)
+    // to avoid expensive cross-device cudaStreamWaitEvent on non-NVIDIA GPUs.
+    cudaEvent_t sync_event = getCallerSyncEvent();
     cudaError_t sync_err =
         cudaEventRecord(sync_event, cudaStreamPerThread);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord on "
-                      "cudaStreamPerThread failed: "
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(sync_err);
-        cudaSetDevice(saved_device);
         return Status::Context("cudaEventRecord failed: " +
                                std::string(cudaGetErrorString(sync_err)));
     }
-    sync_err = cudaStreamWaitEvent(stream, sync_event, 0);
+    sync_err = cudaEventSynchronize(sync_event);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaStreamWaitEvent failed: "
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventSynchronize failed: "
                    << cudaGetErrorString(sync_err);
-        cudaSetDevice(saved_device);
-        return Status::Context("cudaStreamWaitEvent failed: " +
+        return Status::Context("cudaEventSynchronize failed: " +
                                std::string(cudaGetErrorString(sync_err)));
-    }
-    if (stream_event.device_id != saved_device) {
-        cudaSetDevice(saved_device);
     }
 
     // Phase 1: Prepare slices and collect memcpy parameters
@@ -507,51 +486,25 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
     }
     auto &task = batch_desc.task_list[task_id];
     // Poll POSTED slices for async completion via cudaStreamQuery.
-    // Cache the query result per stream to avoid redundant driver calls,
-    // since multiple slices typically share the same CUDA stream.
-    //
-    // IMPORTANT: cudaStreamQuery must be called from the correct device
-    // context. On non-NVIDIA GPUs, querying a stream created on device N
-    // while the active device is 0 may return an error instead of
-    // cudaErrorNotReady, causing false failures.
-    struct StreamQueryResult {
-        cudaError_t err;
-        int device_id;
-    };
-    std::unordered_map<cudaStream_t, StreamQueryResult> stream_status_cache;
-    int saved_device = 0;
-    cudaGetDevice(&saved_device);
+    std::unordered_map<cudaStream_t, cudaError_t> stream_status_cache;
     for (auto *slice : task.slice_list) {
         if (slice && slice->status == Slice::POSTED) {
             cudaStream_t stream = (cudaStream_t)slice->local.cuda_stream;
             auto it = stream_status_cache.find(stream);
             cudaError_t cuda_err;
-            int stream_device = -1;
             if (it == stream_status_cache.end()) {
-#if CUDART_VERSION >= 12000
-                cudaStreamGetDevice(stream, &stream_device);
-#else
-                cudaGetDevice(&stream_device);
-#endif
-                if (stream_device >= 0 && stream_device != saved_device) {
-                    cudaSetDevice(stream_device);
-                }
                 cuda_err = cudaStreamQuery(stream);
-                stream_status_cache[stream] = {cuda_err, stream_device};
+                stream_status_cache[stream] = cuda_err;
             } else {
-                cuda_err = it->second.err;
-                stream_device = it->second.device_id;
+                cuda_err = it->second;
             }
             if (cuda_err == cudaSuccess) {
                 slice->markSuccess();
             } else if (cuda_err != cudaErrorNotReady) {
                 slice->markFailed();
             }
-            // cudaErrorNotReady means still in progress, keep POSTED
         }
     }
-    // Restore the caller's device.
-    cudaSetDevice(saved_device);
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -570,41 +523,27 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
 
 Status IntraNodeNvlinkTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    // Determine the source buffer's device and get the per-device stream.
-    // See submitTransfer() for detailed rationale.
-    CudaStreamEventPair stream_event = getStreamForRequest(
+    // Get per-device transfer stream. See submitTransfer() for rationale.
+    CudaStreamEntry stream_entry = getStreamForRequest(
         task_list.empty() ? nullptr : task_list[0]->request->source);
-    cudaStream_t stream = stream_event.stream;
-    cudaEvent_t sync_event = stream_event.event;
-    if (!stream || !sync_event) {
-        return Status::Context("Failed to create NVLink CUDA stream/event");
-    }
-    // Switch to the stream's device before recording the event.
-    int saved_device = 0;
-    cudaGetDevice(&saved_device);
-    if (stream_event.device_id != saved_device) {
-        cudaSetDevice(stream_event.device_id);
-    }
+    cudaStream_t stream = stream_entry.stream;
+    if (!stream)
+        return Status::Context("Failed to create NVLink CUDA stream");
+    cudaEvent_t sync_event = getCallerSyncEvent();
     cudaError_t sync_err =
         cudaEventRecord(sync_event, cudaStreamPerThread);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord on "
-                      "cudaStreamPerThread failed: "
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(sync_err);
-        cudaSetDevice(saved_device);
         return Status::Context("cudaEventRecord failed: " +
                                std::string(cudaGetErrorString(sync_err)));
     }
-    sync_err = cudaStreamWaitEvent(stream, sync_event, 0);
+    sync_err = cudaEventSynchronize(sync_event);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaStreamWaitEvent failed: "
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventSynchronize failed: "
                    << cudaGetErrorString(sync_err);
-        cudaSetDevice(saved_device);
-        return Status::Context("cudaStreamWaitEvent failed: " +
+        return Status::Context("cudaEventSynchronize failed: " +
                                std::string(cudaGetErrorString(sync_err)));
-    }
-    if (stream_event.device_id != saved_device) {
-        cudaSetDevice(saved_device);
     }
 
     // Phase 1: Prepare slices and collect memcpy parameters
