@@ -45,10 +45,11 @@ Status UbTentTransport::install(std::string& local_segment_name,
     te_topology_->discover();
 
     // Build the bridge that replaces the standalone te_metadata_.
-    // The bridge uses P2P mode for local-segment operations (no external store)
-    // and delegates remote lookups to the TENT SegmentManager.
+    // Use P2PHANDSHAKE so old-TE TransferMetadata stays in local-only mode
+    // (no etcd/http storage plugin).  Remote lookups go through TENT
+    // ControlService instead.
     te_metadata_bridge_ =
-        std::make_shared<UbTentMetadataBridge>(control_service_, "p2p");
+        std::make_shared<UbTentMetadataBridge>(control_service_, P2PHANDSHAKE);
 
     // Instantiate and install UbTransport, using the bridge as metadata.
     ub_transport_ = std::make_unique<mooncake::UbTransport>(URMA_ENDPOINT);

@@ -52,11 +52,11 @@ namespace tent {
 //     the URMA connection setup uses TENT's RPC channel.
 class UbTentMetadataBridge : public mooncake::TransferMetadata {
    public:
-    // conn_string is used to initialize the base-class local cache in P2P mode
-    // (no external metadata store).  Pass "p2p" for TENT-integrated operation.
+    // conn_string passed to old-TE TransferMetadata base.  Use P2PHANDSHAKE for
+    // local-only mode (no external metadata store).
     explicit UbTentMetadataBridge(
         std::shared_ptr<tent::ControlService> control_service,
-        const std::string& conn_string = "p2p");
+        const std::string& conn_string = P2PHANDSHAKE);
 
     ~UbTentMetadataBridge() override = default;
 

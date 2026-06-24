@@ -25,9 +25,9 @@ extern "C" {
 #define tent_batch_id_t uint64_t
 #define tent_segment_id_t uint64_t
 
-#ifndef LOCAL_SEGMENT_ID
-#define LOCAL_SEGMENT_ID (0ull)
-#endif
+// C API local-segment sentinel.  Do not alias to LOCAL_SEGMENT_ID here: that
+// name is used by mooncake::tent (constexpr) and mooncake (old TE const).
+#define TENT_LOCAL_SEGMENT_ID 0ull
 
 #define OPCODE_READ (0)
 #define OPCODE_WRITE (1)

@@ -39,9 +39,10 @@ struct Notification {
     std::string msg;
 };
 
-#ifndef LOCAL_SEGMENT_ID
-#define LOCAL_SEGMENT_ID (0ull)
-#endif
+// Local segment handle.  Use constexpr (not #define) so this does not clash
+// with mooncake::LOCAL_SEGMENT_ID in common.h when USE_UB pulls in old-TE
+// headers in the same translation unit.
+static constexpr SegmentID LOCAL_SEGMENT_ID = 0;
 
 enum TransportType : int {
     UNSPEC = 0,

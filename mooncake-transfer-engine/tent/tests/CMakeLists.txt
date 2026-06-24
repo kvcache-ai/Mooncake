@@ -1,5 +1,14 @@
 # TENT Tests and Examples
 
+# tent_xport_ub embeds old-TE ub_transport objects.  Executables that link
+# tent_link_group must also link transfer_engine for TransferMetadata and
+# related symbols.  Keep this at the test executable level to avoid a CMake
+# target cycle (transfer_engine already links tent_link_group when USE_TENT).
+set(TENT_GTEST_LINK_LIBS gtest gtest_main tent_link_group)
+if(USE_UB AND TARGET transfer_engine)
+  list(APPEND TENT_GTEST_LINK_LIBS transfer_engine)
+endif()
+
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
 # asio_shared must be linked explicitly for executables:
@@ -34,8 +43,7 @@ target_include_directories(tent_ip_utils_test
 add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
 
 add_executable(request_merge_test request_merge_test.cpp)
-target_link_libraries(request_merge_test PRIVATE gtest gtest_main
-                                                 tent_link_group)
+target_link_libraries(request_merge_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(request_merge_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME request_merge_test COMMAND request_merge_test)
@@ -43,7 +51,7 @@ add_test(NAME request_merge_test COMMAND request_merge_test)
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
-                      PRIVATE gtest gtest_main tent_link_group)
+                      PRIVATE ${TENT_GTEST_LINK_LIBS})
 if(TARGET asio_shared)
   target_link_libraries(transfer_engine_config_override_test
                         PRIVATE asio_shared)
@@ -54,15 +62,13 @@ add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
 
 add_executable(tent_tcp_transport_test tcp_transport_test.cpp)
-target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
-                                                      tent_link_group)
+target_link_libraries(tent_tcp_transport_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
 
 add_executable(tent_failover_test failover_test.cpp)
-target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
-                                                 tent_link_group)
+target_link_libraries(tent_failover_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(tent_failover_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_failover_test COMMAND tent_failover_test)
@@ -74,8 +80,8 @@ add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
 if(USE_HIP)
   find_package(HIP REQUIRED)
   add_executable(tent_rocm_platform_test rocm_platform_test.cpp)
-  target_link_libraries(tent_rocm_platform_test
-                        PRIVATE gtest gtest_main tent_link_group hip::host)
+  target_link_libraries(tent_rocm_platform_test PRIVATE ${TENT_GTEST_LINK_LIBS}
+                                                        hip::host)
   target_include_directories(tent_rocm_platform_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_rocm_platform_test COMMAND tent_rocm_platform_test)
@@ -85,7 +91,7 @@ if(USE_SUNRISE)
   add_executable(tent_sunrise_link_transport_test
                  sunrise_link_transport_test.cpp)
   target_link_libraries(tent_sunrise_link_transport_test
-                        PRIVATE gtest gtest_main tent_link_group)
+                        PRIVATE ${TENT_GTEST_LINK_LIBS})
   target_include_directories(
     tent_sunrise_link_transport_test
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
@@ -94,23 +100,21 @@ if(USE_SUNRISE)
            COMMAND tent_sunrise_link_transport_test)
 endif()
 add_executable(tent_fault_proxy_test fault_proxy_test.cpp)
-target_link_libraries(tent_fault_proxy_test PRIVATE gtest gtest_main
-                                                    tent_link_group)
+target_link_libraries(tent_fault_proxy_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(tent_fault_proxy_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_fault_proxy_test COMMAND tent_fault_proxy_test)
 
 add_executable(tent_rail_monitor_test rail_monitor_test.cpp)
-target_link_libraries(tent_rail_monitor_test PRIVATE gtest gtest_main
-                                                     tent_link_group)
+target_link_libraries(tent_rail_monitor_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
 # Transport Selector Unit Test
 add_executable(tent_transport_selector_test transport_selector_test.cpp)
-target_link_libraries(tent_transport_selector_test PRIVATE gtest gtest_main
-                                                           tent_link_group)
+target_link_libraries(tent_transport_selector_test
+                      PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(tent_transport_selector_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
@@ -118,8 +122,8 @@ add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
 # End-to-end failover test: drives real TransferEngineImpl with
 # FaultProxyTransport-wrapped fakes to exercise resubmitTransferTask.
 add_executable(tent_engine_failover_e2e_test engine_failover_e2e_test.cpp)
-target_link_libraries(tent_engine_failover_e2e_test PRIVATE gtest gtest_main
-                                                            tent_link_group)
+target_link_libraries(tent_engine_failover_e2e_test
+                      PRIVATE ${TENT_GTEST_LINK_LIBS})
 if(TARGET asio_shared)
   target_link_libraries(tent_engine_failover_e2e_test PRIVATE asio_shared)
 endif()
@@ -131,8 +135,7 @@ add_test(NAME tent_engine_failover_e2e_test
 # Per-request transport_hint: validates submitTransfer parameter, routing,
 # disabled-transport rejection, out-of-range rejection, mixed-hint batches.
 add_executable(tent_transport_hint_test transport_hint_test.cpp)
-target_link_libraries(tent_transport_hint_test PRIVATE gtest gtest_main
-                                                       tent_link_group)
+target_link_libraries(tent_transport_hint_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 if(TARGET asio_shared)
   target_link_libraries(tent_transport_hint_test PRIVATE asio_shared)
 endif()
@@ -143,8 +146,7 @@ add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
 # ProgressWorker skeleton test: covers default-off behavior, event-driven
 # progress without poll-failover, and freeBatch races (issue #2116).
 add_executable(tent_progress_worker_test progress_worker_test.cpp)
-target_link_libraries(tent_progress_worker_test PRIVATE gtest gtest_main
-                                                        tent_link_group)
+target_link_libraries(tent_progress_worker_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 if(TARGET asio_shared)
   target_link_libraries(tent_progress_worker_test PRIVATE asio_shared)
 endif()
@@ -155,8 +157,7 @@ add_test(NAME tent_progress_worker_test COMMAND tent_progress_worker_test)
 # UB TENT transport unit test (mock URMA; no real Kunpeng hardware required).
 if(USE_UB)
   add_executable(tent_ub_transport_test ub_tent_transport_test.cpp)
-  target_link_libraries(tent_ub_transport_test PRIVATE gtest gtest_main
-                                                       tent_link_group)
+  target_link_libraries(tent_ub_transport_test PRIVATE ${TENT_GTEST_LINK_LIBS})
   if(TARGET asio_shared)
     target_link_libraries(tent_ub_transport_test PRIVATE asio_shared)
   endif()
