@@ -213,8 +213,9 @@ class MasterServiceSupervisorConfig {
     std::string pod_namespace;
 
     // Metadata cleanup on client timeout. Resolved in main() (not from
-    // MasterConfig) and forwarded to the serving primary's WrappedMasterService.
-    // Co-located: in-process server pointer; separate: derived http(s) URL.
+    // MasterConfig) and forwarded to the serving primary's
+    // WrappedMasterService. Co-located: in-process server pointer; separate:
+    // derived http(s) URL.
     HttpMetadataServer* http_metadata_server = nullptr;
     std::string http_metadata_remote_url;
 

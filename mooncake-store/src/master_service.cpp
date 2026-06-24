@@ -375,7 +375,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
     // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
-    // since that happens after this constructor returns (in WrappedMasterService).
+    // since that happens after this constructor returns (in
+    // WrappedMasterService).
 
     job_dispatch_running_ = true;
     job_dispatch_thread_ =
@@ -8784,10 +8785,11 @@ void MasterService::setHttpMetadataRemoteUrl(
             LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
                          "(remote metadata server "
                       << metadata_connstring << ")";
-            // Start async cleanup worker now that http_metadata_remote_ is ready
+            // Start async cleanup worker now that http_metadata_remote_ is
+            // ready
             http_metadata_cleanup_running_ = true;
-            http_metadata_cleanup_thread_ =
-                std::thread(&MasterService::HttpMetadataCleanupThreadFunc, this);
+            http_metadata_cleanup_thread_ = std::thread(
+                &MasterService::HttpMetadataCleanupThreadFunc, this);
             LOG(INFO) << "HTTP metadata cleanup worker thread started";
         } catch (const std::exception& e) {
             LOG(WARNING) << "Failed to initialize remote HTTP metadata client "

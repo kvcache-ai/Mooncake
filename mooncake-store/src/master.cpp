@@ -95,9 +95,8 @@ std::string ResolveMetadataServerForCleanup() {
                                      << cfg << "): " << errs;
                     }
                 } else {
-                    LOG(WARNING)
-                        << "Cannot open MOONCAKE_CONFIG_PATH (" << cfg
-                        << "): file does not exist or is not readable";
+                    LOG(WARNING) << "Cannot open MOONCAKE_CONFIG_PATH (" << cfg
+                                 << "): file does not exist or is not readable";
                 }
             } catch (const std::exception& e) {
                 LOG(WARNING) << "Error reading MOONCAKE_CONFIG_PATH (" << cfg
@@ -1282,7 +1281,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
-        mooncake::MasterServiceSupervisorConfig supervisor_config{master_config};
+        mooncake::MasterServiceSupervisorConfig supervisor_config{
+            master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
