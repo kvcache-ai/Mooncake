@@ -89,8 +89,10 @@ def _parse_bool(value) -> bool:
     """Interpret a config boolean that may arrive as a real bool, number, or string.
 
     Config files and environment variables sometimes carry booleans as strings
-    ("true", "false", "0", "1"). Using bool() directly would treat any non-empty
-    string (including "false") as True, so parse the common textual forms.
+    ("true", "false", "yes", "no", "on", "off", "0", "1"). Using bool() directly
+    would treat any non-empty string (including "false") as True, so parse the
+    common textual forms and reject anything unrecognized instead of silently
+    defaulting to False, mirroring how _parse_segment_size rejects bad input.
     """
     if isinstance(value, bool):
         return value
@@ -98,7 +100,14 @@ def _parse_bool(value) -> bool:
         return bool(value)
     if value is None:
         return False
-    return str(value).strip().lower() in ("true", "1")
+    s = str(value).strip().lower()
+    if not s:
+        return False
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
 
 
 @dataclass
