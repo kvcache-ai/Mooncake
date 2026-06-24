@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <string>
 #include <sys/uio.h>
@@ -55,6 +56,12 @@ tl::expected<size_t, ErrorCode> PosixFile::write(std::span<const char> data,
         ssize_t written = ::write(fd_, ptr, remaining);
         if (written == -1) {
             if (errno == EINTR) continue;
+            int saved_errno = errno;
+            LOG(ERROR) << "write failed for file: " << filename_
+                       << ", errno=" << saved_errno
+                       << " (" << strerror(saved_errno) << ")"
+                       << ", fd=" << fd_
+                       << ", remaining=" << remaining;
             return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
         remaining -= written;
@@ -86,6 +93,13 @@ tl::expected<size_t, ErrorCode> PosixFile::read(std::string &buffer,
         ssize_t n = ::read(fd_, ptr, length - read_bytes);
         if (n == -1) {
             if (errno == EINTR) continue;
+            int saved_errno = errno;
+            LOG(ERROR) << "read failed for file: " << filename_
+                       << ", errno=" << saved_errno
+                       << " (" << strerror(saved_errno) << ")"
+                       << ", fd=" << fd_
+                       << ", length=" << length
+                       << ", read_bytes=" << read_bytes;
             buffer.clear();
             return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
@@ -108,12 +122,40 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
 
-    ssize_t ret = ::pwritev(fd_, iov, iovcnt, offset);
-    if (ret < 0) {
+    size_t total_bytes = 0;
+    for (int i = 0; i < iovcnt; ++i) total_bytes += iov[i].iov_len;
+
+    size_t written_total = 0;
+    off_t cur_offset = offset;
+
+    for (int idx = 0; idx < iovcnt; idx += UIO_MAXIOV) {
+        int chunk_cnt = std::min(iovcnt - idx, UIO_MAXIOV);
+        ssize_t ret = ::pwritev(fd_, iov + idx, chunk_cnt, cur_offset);
+        if (ret < 0) {
+            int saved_errno = errno;
+            LOG(ERROR) << "pwritev failed for file: " << filename_
+                       << ", errno=" << saved_errno
+                       << " (" << strerror(saved_errno) << ")"
+                       << ", fd=" << fd_
+                       << ", iovcnt=" << iovcnt
+                       << ", total_bytes=" << total_bytes
+                       << ", offset=" << offset
+                       << ", chunk_start=" << idx
+                       << ", chunk_cnt=" << chunk_cnt;
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written_total += ret;
+        cur_offset += ret;
+    }
+
+    if (written_total != total_bytes) {
+        LOG(ERROR) << "pwritev partial write for file: " << filename_
+                   << ", expected=" << total_bytes
+                   << ", written=" << written_total;
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    return ret;
+    return written_total;
 }
 
 tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
@@ -123,12 +165,34 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
 
-    ssize_t ret = ::preadv(fd_, iov, iovcnt, offset);
-    if (ret < 0) {
-        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+    size_t total_bytes = 0;
+    for (int i = 0; i < iovcnt; ++i) total_bytes += iov[i].iov_len;
+
+    size_t read_total = 0;
+    off_t cur_offset = offset;
+
+    for (int idx = 0; idx < iovcnt; idx += UIO_MAXIOV) {
+        int chunk_cnt = std::min(iovcnt - idx, UIO_MAXIOV);
+        ssize_t ret = ::preadv(fd_, iov + idx, chunk_cnt, cur_offset);
+        if (ret < 0) {
+            int saved_errno = errno;
+            LOG(ERROR) << "preadv failed for file: " << filename_
+                       << ", errno=" << saved_errno
+                       << " (" << strerror(saved_errno) << ")"
+                       << ", fd=" << fd_
+                       << ", iovcnt=" << iovcnt
+                       << ", total_bytes=" << total_bytes
+                       << ", offset=" << offset
+                       << ", chunk_start=" << idx
+                       << ", chunk_cnt=" << chunk_cnt;
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+        }
+        read_total += ret;
+        cur_offset += ret;
+        if (ret == 0) break;  // EOF
     }
 
-    return ret;
+    return read_total;
 }
 
 }  // namespace mooncake
