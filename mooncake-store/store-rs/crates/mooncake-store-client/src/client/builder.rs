@@ -463,11 +463,15 @@ impl StoreClientBuilder {
             lifecycle_state: lifecycle_state.clone(),
             route_write_gate: route_write_gate.clone(),
         });
-        let resolved_cold_tier = self
-            .cold_tier_targets
-            .iter()
-            .map(resolve_cold_tier_target)
-            .collect::<Result<Vec<_>>>()?;
+        let cold_tier_enabled = cold_tier::cold_tier_enabled();
+        let resolved_cold_tier = if cold_tier_enabled {
+            self.cold_tier_targets
+                .iter()
+                .map(resolve_cold_tier_target)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let route_directory = build_route_directory(
             effective_route_control,
             effective_route_topk,
@@ -532,18 +536,20 @@ impl StoreClientBuilder {
                 cold_tier_handles.entry(old_id.clone()).or_insert(backend);
             }
         }
-        cold_tier_handles
-            .entry(default_cold_tier_id.clone())
-            .or_insert_with(|| {
-                let fallback_root = default_cold_tier_root();
-                warn!(
-                    path = %fallback_root.display(),
-                    "no cold tier target configured for default device, using ephemeral PID-based path"
-                );
-                Arc::new(LocalDirPersistentStorageBackend::new_with_root(
-                    fallback_root,
-                ))
-            });
+        if cold_tier_enabled {
+            cold_tier_handles
+                .entry(default_cold_tier_id.clone())
+                .or_insert_with(|| {
+                    let fallback_root = default_cold_tier_root();
+                    warn!(
+                        path = %fallback_root.display(),
+                        "no cold tier target configured for default device, using ephemeral PID-based path"
+                    );
+                    Arc::new(LocalDirPersistentStorageBackend::new_with_root(
+                        fallback_root,
+                    ))
+                });
+        }
         let cold_tier_resolver =
             ColdTierBackendResolver::from_handles(default_cold_tier_id, cold_tier_handles);
         let storage_owner = Arc::new(StorageOwnerState::new(
@@ -642,11 +648,13 @@ impl StoreClientBuilder {
                 .unwrap_or_default()
                 .as_millis() as u64,
         );
-        refresh_cold_tier_device_cache(
-            runtime_metadata.as_ref(),
-            &cold_tier_device_cache,
-            "cold_tier_device_snapshot_prewarm",
-        )?;
+        if cold_tier_enabled {
+            refresh_cold_tier_device_cache(
+                runtime_metadata.as_ref(),
+                &cold_tier_device_cache,
+                "cold_tier_device_snapshot_prewarm",
+            )?;
+        }
         let membership_sync = MembershipSyncHandle::spawn(
             &runtime,
             runtime_metadata.clone(),
@@ -674,7 +682,7 @@ impl StoreClientBuilder {
             control_client.clone(),
             live_client_cache.clone(),
         )?;
-        let cold_tier_configured = !resolved_cold_tier.is_empty();
+        let cold_tier_configured = cold_tier_enabled && !resolved_cold_tier.is_empty();
         let restore_promotions = Arc::new(RestorePromotionQueue::new(1024, 32, 32));
         let cold_tier = if cold_tier_configured {
             cold_tier::ColdTierHandle::spawn(

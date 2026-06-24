@@ -341,12 +341,14 @@ impl StoreClient {
     ) -> Result<Option<ObjectRoute>> {
         self.finalize_tenant_quota_put(reservation, route, value_len)?;
         log_route_publish_sample(&self.lease.runtime, route, value_len, operation);
-        // Fire-and-forget: the cold tier scheduler may CAS a PendingOffload
-        // cold_backing onto the authoritative route, but the caller should not
-        // observe that — the put writer is not necessarily the offload owner.
-        let _ = self
-            .cold_tier
-            .on_route_published(self.storage_owner.as_ref(), route);
+        if cold_tier::cold_tier_enabled() {
+            // Fire-and-forget: the cold tier scheduler may CAS a PendingOffload
+            // cold_backing onto the authoritative route, but the caller should not
+            // observe that — the put writer is not necessarily the offload owner.
+            let _ = self
+                .cold_tier
+                .on_route_published(self.storage_owner.as_ref(), route);
+        }
         Ok(None)
     }
 

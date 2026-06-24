@@ -5,12 +5,18 @@ mod offload;
 mod scheduler;
 mod worker;
 
+const ENABLE_COLD_TIER_ENV: &str = "MC_STORE_RS_ENABLE_COLD_TIER";
 const DISABLE_COLD_TIER_OFFLOAD_ENV: &str = "MC_STORE_RS_DISABLE_COLD_TIER_OFFLOAD";
 const LEGACY_SHORT_CIRCUIT_COLD_PATHS_ENV: &str = "MC_SHORT_CIRCUIT_COLD_PATHS";
 
-pub(super) fn cold_tier_offload_disabled() -> bool {
-    env_flag_enabled(DISABLE_COLD_TIER_OFFLOAD_ENV)
-        || std::env::var_os(LEGACY_SHORT_CIRCUIT_COLD_PATHS_ENV).is_some()
+pub(super) fn cold_tier_enabled() -> bool {
+    env_flag_enabled(ENABLE_COLD_TIER_ENV)
+        && !env_flag_enabled(DISABLE_COLD_TIER_OFFLOAD_ENV)
+        && std::env::var_os(LEGACY_SHORT_CIRCUIT_COLD_PATHS_ENV).is_none()
+}
+
+pub(super) fn cold_tier_disabled() -> bool {
+    !cold_tier_enabled()
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -28,15 +34,21 @@ fn env_flag_enabled(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn with_offload_env<T>(
-        disable_value: Option<&str>,
+    fn with_cold_tier_env<T>(
+        enable_value: Option<&str>,
+        disable_offload_value: Option<&str>,
         legacy_value: Option<&str>,
         f: impl FnOnce() -> T,
     ) -> T {
         let _guard = crate::observability::test_process_lock().lock();
+        let previous_enable = std::env::var(ENABLE_COLD_TIER_ENV).ok();
         let previous_disable = std::env::var(DISABLE_COLD_TIER_OFFLOAD_ENV).ok();
         let previous_legacy = std::env::var(LEGACY_SHORT_CIRCUIT_COLD_PATHS_ENV).ok();
-        match disable_value {
+        match enable_value {
+            Some(value) => std::env::set_var(ENABLE_COLD_TIER_ENV, value),
+            None => std::env::remove_var(ENABLE_COLD_TIER_ENV),
+        }
+        match disable_offload_value {
             Some(value) => std::env::set_var(DISABLE_COLD_TIER_OFFLOAD_ENV, value),
             None => std::env::remove_var(DISABLE_COLD_TIER_OFFLOAD_ENV),
         }
@@ -45,6 +57,10 @@ mod tests {
             None => std::env::remove_var(LEGACY_SHORT_CIRCUIT_COLD_PATHS_ENV),
         }
         let result = f();
+        match previous_enable {
+            Some(value) => std::env::set_var(ENABLE_COLD_TIER_ENV, value),
+            None => std::env::remove_var(ENABLE_COLD_TIER_ENV),
+        }
         match previous_disable {
             Some(value) => std::env::set_var(DISABLE_COLD_TIER_OFFLOAD_ENV, value),
             None => std::env::remove_var(DISABLE_COLD_TIER_OFFLOAD_ENV),
@@ -57,22 +73,32 @@ mod tests {
     }
 
     #[test]
-    fn offload_disable_env_parses_truthy_values() {
+    fn cold_tier_enable_env_defaults_to_disabled() {
+        with_cold_tier_env(None, None, None, || assert!(cold_tier_disabled()));
+    }
+
+    #[test]
+    fn cold_tier_enable_env_parses_truthy_values() {
         for value in ["1", "true", "TRUE", "yes", "on"] {
-            with_offload_env(Some(value), None, || assert!(cold_tier_offload_disabled()));
+            with_cold_tier_env(Some(value), None, None, || assert!(cold_tier_enabled()));
         }
     }
 
     #[test]
-    fn offload_disable_env_ignores_falsey_values() {
+    fn cold_tier_enable_env_ignores_falsey_values() {
         for value in ["0", "false", "FALSE", "no", "off", ""] {
-            with_offload_env(Some(value), None, || assert!(!cold_tier_offload_disabled()));
+            with_cold_tier_env(Some(value), None, None, || assert!(cold_tier_disabled()));
         }
     }
 
     #[test]
-    fn legacy_short_circuit_env_disables_offload() {
-        with_offload_env(None, Some("1"), || assert!(cold_tier_offload_disabled()));
+    fn legacy_short_circuit_env_disables_cold_tier() {
+        with_cold_tier_env(Some("1"), None, Some("1"), || assert!(cold_tier_disabled()));
+    }
+
+    #[test]
+    fn offload_disable_env_disables_cold_tier() {
+        with_cold_tier_env(Some("1"), Some("1"), None, || assert!(cold_tier_disabled()));
     }
 }
 

@@ -25,7 +25,7 @@ pub(in super::super) fn enqueue_pending_offload(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
 ) {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         return;
     }
     let Some(cold_backing) = route.cold_backing.as_ref() else {
@@ -48,7 +48,7 @@ pub(in super::super) fn publish_initial_write_cold_backing(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
 ) -> Result<Option<ObjectRoute>> {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         return Ok(None);
     }
     if route.state != RouteState::Active || route.cold_backing.is_some() {
@@ -106,7 +106,7 @@ pub(in super::super) fn repair_initial_write_cold_backings(
     storage_owner: &StorageOwnerState,
     publish_limit: usize,
 ) -> Result<usize> {
-    if super::cold_tier_offload_disabled()
+    if super::cold_tier_disabled()
         || storage_owner.offload_mode != ColdTierOffloadMode::Passthrough
         || storage_owner
             .cold_tier_devices
@@ -157,7 +157,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
 ) -> Result<Option<ObjectRoute>> {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         return Ok(None);
     }
     if route.state != RouteState::Active || route.cold_backing.is_some() {
@@ -211,7 +211,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
 pub(in super::super) fn rebuild_pending_offload_queue(
     storage_owner: &StorageOwnerState,
 ) -> Result<usize> {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         return Ok(0);
     }
     rebuild_pending_offload_queue_with(
@@ -225,7 +225,7 @@ pub(in super::super) fn materialize_pending_offloads_bounded(
     storage_owner: &StorageOwnerState,
     max_tasks: usize,
 ) -> Result<usize> {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         return Ok(0);
     }
     let max_tasks = max_tasks.max(1);
@@ -359,7 +359,7 @@ pub(in super::super) fn prepare_pending_offload_entries(
     storage_owner: &StorageOwnerState,
     entries: Vec<PendingOffloadEntry>,
 ) -> Result<Vec<PendingOffloadMaterialization>> {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         for entry in entries {
             storage_owner.pending_offloads.retry(entry);
         }
@@ -436,7 +436,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
     route: Option<ObjectRoute>,
     devices: &BTreeMap<String, ColdTierDeviceRecord>,
 ) -> Result<PendingOffloadPrepareOutcome> {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
     }
     let Some(route) = route else {
@@ -607,7 +607,7 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     pending: &[PendingOffloadMaterialization],
     first_error: &mut Option<StoreError>,
 ) -> Result<usize> {
-    if super::cold_tier_offload_disabled() {
+    if super::cold_tier_disabled() {
         retry_pending_offload_batch(storage_owner, pending);
         return Ok(0);
     }
