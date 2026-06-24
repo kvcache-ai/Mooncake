@@ -410,6 +410,17 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertIn("exist check crashed", body["error"])
 
+    async def test_handle_exist_store_error(self):
+        # is_exist returns -1 when the store is unhealthy; this should surface
+        # as HTTP 500, not as HTTP 200 {"exists": true} (bool(-1) == True).
+        self.fake_store.is_exist = lambda key: -1
+        request = FakeRequest({})
+        request.match_info = {"key": "some_key"}
+        resp = await self.service.handle_exist(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertIn("error", body)
+
     # ==================== /api/remove/{key} tests ====================
 
     async def test_handle_remove_success(self):
