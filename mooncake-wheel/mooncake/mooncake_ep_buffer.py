@@ -69,6 +69,12 @@ class Buffer:
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
+        if self.group_size <= 0:
+            raise ValueError("num_ranks must be greater than 0")
+        if self.rank < 0 or self.rank >= self.group_size:
+            raise ValueError("rank must be in [0, num_ranks)")
+        if num_ep_buffer_bytes <= 0:
+            raise ValueError("num_ep_buffer_bytes must be greater than 0")
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group

@@ -30,6 +30,10 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       comm_stream(at::cuda::getStreamFromPool(true)) {
+    EP_HOST_ASSERT(num_ranks > 0);
+    EP_HOST_ASSERT(rank >= 0 && rank < num_ranks);
+    EP_HOST_ASSERT(num_ep_buffer_bytes > 0);
+
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
