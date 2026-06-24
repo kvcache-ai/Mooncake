@@ -497,7 +497,7 @@ class MooncakeStoreService:
             key = request.match_info['key']
             value = self.store.get(key)
 
-            if not value:
+            if value is None:
                 return web.Response(
                     status=404,
                     text=json.dumps({'error': 'Key not found'}),

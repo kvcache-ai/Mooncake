@@ -16,9 +16,10 @@ except ModuleNotFoundError:
     web_module = types.ModuleType("aiohttp.web")
 
     class Response:
-        def __init__(self, status=200, text="", content_type=None):
+        def __init__(self, status=200, text="", body=None, content_type=None):
             self.status = status
             self.text = text
+            self.body = body
             self.content_type = content_type
 
     web_module.Response = Response
@@ -327,9 +328,8 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         request = FakeRequest({})
         request.match_info = {"key": "empty_value_key"}
         resp = await self.service.handle_get(request)
-        self.assertEqual(resp.status, 404)
-        body = json.loads(resp.text)
-        self.assertIn("Key not found", body["error"])
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.body, b"")
 
     async def test_handle_get_store_exception(self):
         def raise_error(key):
