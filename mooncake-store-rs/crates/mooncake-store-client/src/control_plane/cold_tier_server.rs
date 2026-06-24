@@ -1,6 +1,14 @@
 use super::codec::pb_error;
-use super::server::run_blocking_control;
 use super::*;
+
+async fn run_blocking_control<T: Send + 'static>(
+    operation: &'static str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, Status> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|error| Status::internal(format!("{operation} worker failed: {error}")))
+}
 
 pub(super) async fn handle_read_from_cold(
     cold_tier: Arc<dyn ColdTierControlService>,

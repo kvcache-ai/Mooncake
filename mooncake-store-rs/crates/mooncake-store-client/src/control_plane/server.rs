@@ -201,15 +201,6 @@ pub(super) struct GrpcControlPlaneService {
     stats: Arc<ControlPlaneServerStats>,
 }
 
-pub(super) async fn run_blocking_control<T: Send + 'static>(
-    operation: &'static str,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> std::result::Result<T, Status> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|error| Status::internal(format!("{operation} worker failed: {error}")))
-}
-
 impl GrpcControlPlaneService {
     pub(super) fn new(
         authority: Arc<dyn AuthorityService>,

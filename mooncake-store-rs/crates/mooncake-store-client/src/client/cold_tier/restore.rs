@@ -11,6 +11,7 @@ use super::super::{
 };
 use super::{
     backend_load_cold_payload_batch_into, cold_restore_flight_key, materialized_cold_backing,
+    record_cold_restore_batch_duration, record_cold_restore_batch_items,
     select_cold_backing_target, validate_cold_restore_payload,
     with_disjoint_restore_caller_buffers,
 };
@@ -21,8 +22,90 @@ use std::{
         Arc,
     },
     thread::sleep,
+    time::Duration,
 };
 use tracing::{debug, info, warn};
+
+impl StorageOwnerState {
+    pub(in super::super) fn current_materialized_route(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>> {
+        let Some(route) = self.route_ops.load_route(key)? else {
+            self.hot_replicas.clock.lock().remove_key(key);
+            return Ok(None);
+        };
+        self.sync_route(&route);
+        if route.state == RouteState::Active
+            && route.cold_backing.as_ref().is_some_and(|cold_backing| {
+                cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
+            })
+        {
+            Ok(Some(route))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(in super::super) fn reserve_owner_restore_space(
+        &self,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        match self
+            .allocator
+            .lock()
+            .reserve_any(&self.runtime, length_bytes)
+        {
+            Ok(reservation) => Ok(reservation),
+            Err(first_error) => {
+                if self.evict_one_blocking(None)? {
+                    self.allocator
+                        .lock()
+                        .reserve_any(&self.runtime, length_bytes)
+                } else {
+                    Err(first_error)
+                }
+            }
+        }
+    }
+
+    pub(in super::super) fn sweep_expired_staging_slots(&self, ttl: Duration) -> usize {
+        let mut pending = self.pending_staging_slots.lock();
+        let before = pending.len();
+        pending.retain(|(segment, offset), (_, inserted_at)| {
+            if inserted_at.elapsed() < ttl {
+                return true;
+            }
+            self.read_pin_registry.force_unpin(segment, *offset);
+            false
+        });
+        before.saturating_sub(pending.len())
+    }
+
+    pub(in super::super) fn evict_one_clean_and_reserve_bounded(
+        &self,
+        length_bytes: u64,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        match self
+            .allocator
+            .lock()
+            .reserve_any(&self.runtime, length_bytes)
+        {
+            Ok(reservation) => Ok(Some(reservation)),
+            Err(_) => {
+                if self.evict_one_blocking(preferred_segment)? {
+                    self.allocator
+                        .lock()
+                        .reserve_any(&self.runtime, length_bytes)
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
 
 pub(in super::super) fn batch_contains_cold_backing_placeholder(
     resolved: &[ResolvedObject],
@@ -1673,7 +1756,7 @@ fn promote_materialized_cold_backing(
     })();
     let ssd_read_elapsed = t_ssd.elapsed();
     let ssd_read_us = ssd_read_elapsed.as_micros() as u64;
-    super::super::registry::record_cold_tier_ssd_read(
+    super::record_cold_tier_ssd_read(
         if ssd_read_result.is_ok() {
             "ok"
         } else {
@@ -1922,9 +2005,6 @@ pub(in super::super) fn batch_read_from_cold_staged(
     }
 
     if batch_entries.is_empty() {
-        use crate::observability::registry::{
-            record_cold_restore_batch_duration, record_cold_restore_batch_items,
-        };
         record_cold_restore_batch_duration("wall", started.elapsed());
         record_cold_restore_batch_items("resolved_no_ssd", target_count as u64);
         return results
@@ -1996,9 +2076,6 @@ pub(in super::super) fn batch_read_from_cold_staged(
     }
 
     // Record cold restore batch metrics
-    use crate::observability::registry::{
-        record_cold_restore_batch_duration, record_cold_restore_batch_items,
-    };
     record_cold_restore_batch_duration("parallel", parallel_start.elapsed());
     record_cold_restore_batch_duration("wall", started.elapsed());
     record_cold_restore_batch_items("complete", target_count as u64);
@@ -2733,7 +2810,7 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
     })();
     let ssd_read_elapsed = t_ssd.elapsed();
     let ssd_read_us = ssd_read_elapsed.as_micros() as u64;
-    super::super::registry::record_cold_tier_ssd_read(
+    super::record_cold_tier_ssd_read(
         if ssd_read_result.is_ok() {
             "ok"
         } else {

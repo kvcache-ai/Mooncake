@@ -41,7 +41,7 @@ impl ColdRestoreSingleflight {
                 )
             }
         };
-        crate::observability::registry::record_cold_restore_singleflight("begin", metric_result);
+        crate::client::cold_tier::record_cold_restore_singleflight("begin", metric_result);
         registration
     }
 
@@ -60,7 +60,7 @@ impl ColdRestoreSingleflight {
             .unwrap_or_else(|| Err(StoreError::InvalidState(
                 "cold restore flight result missing after wake".to_string(),
             )));
-        crate::observability::registry::record_cold_restore_singleflight(
+        crate::client::cold_tier::record_cold_restore_singleflight(
             "wait",
             if result.is_ok() { "ok" } else { "error" },
         );
@@ -83,7 +83,7 @@ impl ColdRestoreSingleflight {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.flights.remove(key);
         }
-        crate::observability::registry::record_cold_restore_singleflight("finish", metric_result);
+        crate::client::cold_tier::record_cold_restore_singleflight("finish", metric_result);
     }
 
 }
