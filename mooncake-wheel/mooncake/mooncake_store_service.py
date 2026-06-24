@@ -495,14 +495,42 @@ class MooncakeStoreService:
     async def handle_get(self, request):
         try:
             key = request.match_info['key']
-            value = self.store.get(key)
+            exists = self.store.is_exist(key)
 
-            if value is None:
+            if exists == 0:
                 return web.Response(
                     status=404,
                     text=json.dumps({'error': 'Key not found'}),
                     content_type='application/json'
                 )
+            if exists < 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({'error': 'Exist check failed'}),
+                    content_type='application/json'
+                )
+
+            value = self.store.get(key)
+            if value is None:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({'error': 'GET operation failed'}),
+                    content_type='application/json'
+                )
+            if value == b"":
+                exists = self.store.is_exist(key)
+                if exists == 0:
+                    return web.Response(
+                        status=404,
+                        text=json.dumps({'error': 'Key not found'}),
+                        content_type='application/json'
+                    )
+                if exists < 0:
+                    return web.Response(
+                        status=500,
+                        text=json.dumps({'error': 'Exist check failed'}),
+                        content_type='application/json'
+                    )
 
             return web.Response(
                 status=200,

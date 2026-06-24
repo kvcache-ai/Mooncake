@@ -307,6 +307,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     # ==================== /api/get/{key} tests ====================
 
     async def test_handle_get_success(self):
+        self.fake_store.is_exist = lambda key: True
         self.fake_store.get = lambda key: b"payload_bytes"
         request = FakeRequest({})
         request.match_info = {"key": "my_key"}
@@ -315,7 +316,8 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.body, b"payload_bytes")
 
     async def test_handle_get_not_found(self):
-        self.fake_store.get = lambda key: None
+        self.fake_store.is_exist = lambda key: 0
+        self.fake_store.get = lambda key: b""
         request = FakeRequest({})
         request.match_info = {"key": "missing_key"}
         resp = await self.service.handle_get(request)
@@ -323,7 +325,18 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertIn("Key not found", body["error"])
 
+    async def test_handle_get_exist_check_failure(self):
+        self.fake_store.is_exist = lambda key: -1
+        self.fake_store.get = lambda key: b""
+        request = FakeRequest({})
+        request.match_info = {"key": "error_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertIn("Exist check failed", body["error"])
+
     async def test_handle_get_empty_bytes(self):
+        self.fake_store.is_exist = lambda key: True
         self.fake_store.get = lambda key: b""
         request = FakeRequest({})
         request.match_info = {"key": "empty_value_key"}
@@ -331,10 +344,32 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(resp.body, b"")
 
+    async def test_handle_get_empty_bytes_rechecks_existence(self):
+        existence_results = iter([1, 0])
+        self.fake_store.is_exist = lambda key: next(existence_results)
+        self.fake_store.get = lambda key: b""
+        request = FakeRequest({})
+        request.match_info = {"key": "empty_value_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 404)
+        body = json.loads(resp.text)
+        self.assertIn("Key not found", body["error"])
+
+    async def test_handle_get_none_value_is_store_failure(self):
+        self.fake_store.is_exist = lambda key: True
+        self.fake_store.get = lambda key: None
+        request = FakeRequest({})
+        request.match_info = {"key": "empty_value_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertIn("GET operation failed", body["error"])
+
     async def test_handle_get_store_exception(self):
         def raise_error(key):
             raise RuntimeError("store crashed")
 
+        self.fake_store.is_exist = lambda key: True
         self.fake_store.get = raise_error
         request = FakeRequest({})
         request.match_info = {"key": "crash_key"}
