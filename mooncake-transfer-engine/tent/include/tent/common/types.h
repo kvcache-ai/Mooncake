@@ -54,6 +54,7 @@ enum TransportType : int {
     TCP,
     AscendDirect,
     SUNRISE_LINK,
+    UB,  // Kunpeng UB / URMA transport
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };

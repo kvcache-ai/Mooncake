@@ -299,6 +299,7 @@ PYBIND11_MODULE(tent, m) {
         .value("TCP", TransportType::TCP)
         .value("AscendDirect", TransportType::AscendDirect)
         .value("SUNRISE_LINK", TransportType::SUNRISE_LINK)
+        .value("UB", TransportType::UB)
         .export_values();
 
     py::enum_<SegmentInfo::Type>(m, "SegmentInfoType")

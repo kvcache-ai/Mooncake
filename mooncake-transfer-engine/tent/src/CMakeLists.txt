@@ -28,7 +28,8 @@ if(USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
   message(STATUS "ROCm/HIP: Enabled")
-  target_compile_definitions(tent_interface INTERFACE USE_HIP __HIP_PLATFORM_AMD__)
+  target_compile_definitions(tent_interface INTERFACE USE_HIP
+                                                      __HIP_PLATFORM_AMD__)
   target_include_directories(tent_interface INTERFACE ${HIP_INCLUDE_DIRS})
   target_link_libraries(tent_interface INTERFACE hip::host)
 else()
@@ -83,6 +84,13 @@ if(USE_SUNRISE)
   target_link_directories(tent_interface INTERFACE
                           /usr/local/tangrt/lib/linux-x86_64)
   target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
+endif()
+
+if(USE_UB)
+  target_compile_definitions(tent_interface INTERFACE USE_UB)
+  message(STATUS "UB (Kunpeng URMA): Enabled")
+else()
+  message(STATUS "UB (Kunpeng URMA): Disabled")
 endif()
 
 set(YALANTING_TARGET yalantinglibs::yalantinglibs)
@@ -140,6 +148,7 @@ foreach(
   tent_xport_tcp
   tent_xport_ascend_direct
   tent_xport_sunrise_link
+  tent_xport_ub
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})

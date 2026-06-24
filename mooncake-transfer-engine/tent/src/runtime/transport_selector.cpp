@@ -29,20 +29,32 @@ namespace tent {
 // Transport type name mapping
 static const std::unordered_map<std::string, TransportType> kTransportNameMap =
     {
-        {"unspec", UNSPEC},       {"rdma", RDMA},
-        {"mnnvl", MNNVL},         {"shm", SHM},
-        {"nvlink", NVLINK},       {"gds", GDS},
-        {"io_uring", IOURING},    {"tcp", TCP},
-        {"ascend", AscendDirect}, {"sunrise_link", SUNRISE_LINK},
+        {"unspec", UNSPEC},
+        {"rdma", RDMA},
+        {"mnnvl", MNNVL},
+        {"shm", SHM},
+        {"nvlink", NVLINK},
+        {"gds", GDS},
+        {"io_uring", IOURING},
+        {"tcp", TCP},
+        {"ascend", AscendDirect},
+        {"sunrise_link", SUNRISE_LINK},
+        {"ub", UB},
 };
 
 static const std::unordered_map<TransportType, std::string>
     kTransportTypeNames = {
-        {UNSPEC, "unspec"},       {RDMA, "rdma"},
-        {MNNVL, "mnnvl"},         {SHM, "shm"},
-        {NVLINK, "nvlink"},       {GDS, "gds"},
-        {IOURING, "io_uring"},    {TCP, "tcp"},
-        {AscendDirect, "ascend"}, {SUNRISE_LINK, "sunrise_link"},
+        {UNSPEC, "unspec"},
+        {RDMA, "rdma"},
+        {MNNVL, "mnnvl"},
+        {SHM, "shm"},
+        {NVLINK, "nvlink"},
+        {GDS, "gds"},
+        {IOURING, "io_uring"},
+        {TCP, "tcp"},
+        {AscendDirect, "ascend"},
+        {SUNRISE_LINK, "sunrise_link"},
+        {UB, "ub"},
 };
 
 // Memory type name mapping for pattern matching
