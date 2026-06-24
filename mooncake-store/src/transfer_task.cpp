@@ -662,7 +662,7 @@ void MemcpyWorkerPool::workerThread() {
                         std::memcpy(op.dest, op.src, op.size);
                     } else {
                         int dev = src_on_gpu ? src_dev : dst_dev;
-                        gpu_staging::SetDevice(dev);
+                        gpu_staging::DeviceGuard guard(dev);
                         if (!gpu_staging::CopyAuto(op.dest, op.src, op.size)) {
                             LOG(ERROR)
                                 << "GPU memcpy failed: src_dev=" << src_dev

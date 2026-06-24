@@ -258,38 +258,29 @@ inline bool TryPinHostMemory(void* ptr, size_t size, const char* name) {
     defined(USE_HYGON) || defined(USE_COREX)
     if (!PinMemoryEnabled() || ptr == nullptr || size == 0) return false;
 
-    {
-        std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
-        auto& regions = PinnedHostMemoryRegions();
-        if (regions.find(ptr) != regions.end()) return true;
+    std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
+    auto& regions = PinnedHostMemoryRegions();
+    if (regions.find(ptr) != regions.end()) return true;
 
-        size_t max_bytes = PinMemoryMaxBytes();
-        size_t current = PinnedHostMemoryBytes();
-        if (max_bytes > 0 &&
-            (current > max_bytes || size > max_bytes - current)) {
-            LOG(WARNING) << "Skip cudaHostRegister for " << name
-                         << " size=" << size
-                         << " because MC_STORE_PIN_MEMORY_MAX_BYTES="
-                         << max_bytes << " current_pinned=" << current;
-            return false;
-        }
-        PinnedHostMemoryBytes() += size;
+    size_t max_bytes = PinMemoryMaxBytes();
+    size_t current = PinnedHostMemoryBytes();
+    if (max_bytes > 0 && (current > max_bytes || size > max_bytes - current)) {
+        LOG(WARNING) << "Skip cudaHostRegister for " << name << " size=" << size
+                     << " because MC_STORE_PIN_MEMORY_MAX_BYTES=" << max_bytes
+                     << " current_pinned=" << current;
+        return false;
     }
 
     auto cuda_ret = cudaHostRegister(ptr, size, 0);
     if (cuda_ret != cudaSuccess) {
-        std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
-        PinnedHostMemoryBytes() -= size;
         LOG(WARNING) << "cudaHostRegister failed for " << name
                      << " size=" << size << ": " << cudaGetErrorString(cuda_ret)
                      << "; GPU copies will use pageable fallback";
         return false;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
-        PinnedHostMemoryRegions()[ptr] = size;
-    }
+    PinnedHostMemoryBytes() += size;
+    regions[ptr] = size;
     LOG(INFO) << "cudaHostRegister OK for " << name << ", size=" << size;
     return true;
 #else
@@ -305,23 +296,22 @@ inline void UnpinHostMemory(void* ptr, const char* name) {
     defined(USE_HYGON) || defined(USE_COREX)
     if (ptr == nullptr) return;
 
-    size_t size = 0;
-    {
-        std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
-        auto& regions = PinnedHostMemoryRegions();
-        auto it = regions.find(ptr);
-        if (it == regions.end()) return;
-        size = it->second;
-        regions.erase(it);
-        PinnedHostMemoryBytes() -= size;
-    }
+    std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
+    auto& regions = PinnedHostMemoryRegions();
+    auto it = regions.find(ptr);
+    if (it == regions.end()) return;
 
+    size_t size = it->second;
     auto cuda_ret = cudaHostUnregister(ptr);
     if (cuda_ret != cudaSuccess) {
         LOG(WARNING) << "cudaHostUnregister failed for " << name
                      << " size=" << size << ": "
                      << cudaGetErrorString(cuda_ret);
+        return;
     }
+
+    regions.erase(it);
+    PinnedHostMemoryBytes() -= size;
 #else
     (void)ptr;
     (void)name;

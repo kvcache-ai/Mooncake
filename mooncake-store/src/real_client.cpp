@@ -270,7 +270,7 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     void *dst, const void *src, size_t size, const std::string &context) {
     int device_id = -1;
     if (gpu_staging::IsDevicePointer(dst, &device_id)) {
-        gpu_staging::SetDevice(device_id);
+        gpu_staging::DeviceGuard guard(device_id);
         if (!gpu_staging::CopyHostToDevice(dst, src, size)) {
             LOG(ERROR) << "H2D copy failed: " << context;
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
@@ -788,6 +788,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // ensureRegisteredForRDMA can stage unregistered user buffers for RDMA.
     client_->setStagingAllocator(client_buffer_allocator_);
 
+    auto cleanup_on_setup_failure = [this](ErrorCode error) {
+        tearDownAll_internal();
+        return tl::unexpected(error);
+    };
+
     // If global_segment_size is 0, skip mount segment;
     // If global_segment_size is larger than max_mr_size, split to multiple
     // mapped_shms.
@@ -801,7 +806,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 cxl_dev_size = static_cast<size_t>(val);
         } else {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            return cleanup_on_setup_failure(ErrorCode::INVALID_PARAMS);
         }
 
         void *ptr = client_->GetBaseAddr();
@@ -811,7 +816,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
-            return tl::unexpected(mount_result.error());
+            return cleanup_on_setup_failure(mount_result.error());
         }
 
     } else {
@@ -870,7 +875,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             if (!ptr) {
                 LOG(ERROR) << "Failed to allocate segment memory";
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                return cleanup_on_setup_failure(ErrorCode::INVALID_PARAMS);
             }
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
@@ -891,7 +896,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
-                return tl::unexpected(mount_result.error());
+                return cleanup_on_setup_failure(mount_result.error());
             }
         }
         if (total_glbseg_size == 0) {
@@ -903,7 +908,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (!ipc_socket_path_.empty()) {
         if (start_ipc_server() != 0) {
             LOG(ERROR) << "Failed to start IPC server at " << ipc_socket_path_;
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            return cleanup_on_setup_failure(ErrorCode::INTERNAL_ERROR);
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
@@ -922,7 +927,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "Failed to start offload RPC server: "
                        << err.message();
             offload_rpc_server_.reset();
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            return cleanup_on_setup_failure(ErrorCode::INTERNAL_ERROR);
         }
         offload_rpc_port_ = offload_rpc_server_->port();
         LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
@@ -943,7 +948,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (!init_result) {
             LOG(ERROR) << "file storage init failed with error: "
                        << init_result.error();
-            return init_result;
+            return cleanup_on_setup_failure(init_result.error());
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
