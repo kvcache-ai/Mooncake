@@ -80,7 +80,6 @@ add_store_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
 add_store_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
 add_store_test(p2p_oplog_test ha/oplog/p2p_oplog_test.cpp)
 add_subdirectory(e2e)
-
 add_executable(high_availability_test high_availability_test.cpp)
 target_link_libraries(high_availability_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if (STORE_USE_ETCD)
