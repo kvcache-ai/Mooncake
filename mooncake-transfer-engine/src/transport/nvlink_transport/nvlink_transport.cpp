@@ -70,8 +70,8 @@ class PerDeviceStreamPool {
         }
         CudaStreamEntry entry;
         entry.device_id = device_id;
-        cudaError_t err = cudaStreamCreateWithFlags(&entry.stream,
-                                                    cudaStreamNonBlocking);
+        cudaError_t err =
+            cudaStreamCreateWithFlags(&entry.stream, cudaStreamNonBlocking);
         if (err != cudaSuccess)
             LOG(FATAL) << "Failed to create NVLink CUDA stream on device "
                        << device_id << ": " << cudaGetErrorString(err);
@@ -84,12 +84,11 @@ class PerDeviceStreamPool {
                   std::to_string(prop.pciBusID) + ":" +
                   std::to_string(prop.pciDeviceID);
         }
-        const char* visible = getenv("CUDA_VISIBLE_DEVICES");
+        const char *visible = getenv("CUDA_VISIBLE_DEVICES");
         LOG(INFO) << "NvlinkTransport: NVLink CUDA stream created on device "
                   << device_id << " [physical: " << pci
                   << "] CUDA_VISIBLE_DEVICES="
-                  << (visible ? visible : "(not set)")
-                  << " pid=" << getpid();
+                  << (visible ? visible : "(not set)") << " pid=" << getpid();
         pool_[device_id] = entry;
         return entry;
     }
@@ -102,6 +101,7 @@ class PerDeviceStreamPool {
         }
         cudaSetDevice(saved_device);
     }
+
    private:
     std::unordered_map<int, CudaStreamEntry> pool_;
 };
@@ -121,7 +121,7 @@ static cudaEvent_t getCallerSyncEvent() {
     if (tl_caller_sync_event_device != current_device) {
         if (tl_caller_sync_event) cudaEventDestroy(tl_caller_sync_event);
         cudaError_t err = cudaEventCreateWithFlags(&tl_caller_sync_event,
-                                                    cudaEventDisableTiming);
+                                                   cudaEventDisableTiming);
         if (err != cudaSuccess)
             LOG(FATAL) << "Failed to create NVLink sync event on device "
                        << current_device << ": " << cudaGetErrorString(err);
@@ -442,8 +442,7 @@ Status NvlinkTransport::submitTransfer(
     CudaStreamEntry stream_entry =
         getStreamForRequest(entries.empty() ? nullptr : entries[0].source);
     cudaStream_t stream = stream_entry.stream;
-    if (!stream)
-        return Status::Context("Failed to create NVLink CUDA stream");
+    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
 
     // Synchronize with the caller's GPU work (e.g., PyTorch gather operations)
     // that produced the source data. We use cudaEventSynchronize (CPU-blocking)
@@ -451,8 +450,7 @@ Status NvlinkTransport::submitTransfer(
     // operations on non-NVIDIA GPUs. The CPU blocking is acceptable because
     // the transfer depends on the caller's work anyway — they cannot overlap.
     cudaEvent_t sync_event = getCallerSyncEvent();
-    cudaError_t sync_err =
-        cudaEventRecord(sync_event, cudaStreamPerThread);
+    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
     if (sync_err != cudaSuccess) {
         LOG(ERROR) << "NvlinkTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(sync_err);
@@ -568,12 +566,10 @@ Status NvlinkTransport::submitTransferTask(
     CudaStreamEntry stream_entry = getStreamForRequest(
         task_list.empty() ? nullptr : task_list[0]->request->source);
     cudaStream_t stream = stream_entry.stream;
-    if (!stream)
-        return Status::Context("Failed to create NVLink CUDA stream");
+    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
     // Synchronize with caller's GPU work via cudaEventSynchronize.
     cudaEvent_t sync_event = getCallerSyncEvent();
-    cudaError_t sync_err =
-        cudaEventRecord(sync_event, cudaStreamPerThread);
+    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
     if (sync_err != cudaSuccess) {
         LOG(ERROR) << "NvlinkTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(sync_err);
