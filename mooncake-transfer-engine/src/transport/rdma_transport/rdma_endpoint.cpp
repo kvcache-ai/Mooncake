@@ -668,6 +668,10 @@ int RdmaEndPoint::disconnectUnlocked() {
         // no user WR has been posted yet. eRDMA still needs fresh QPs because
         // a QP that reached RTS cannot be reliably reset back to RTS.
 #ifdef CONFIG_ERDMA
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            CHECK_EQ(wr_depth_list_[i], 0)
+                << "Pre-connected endpoint must not have outstanding WRs";
+        }
         return reconstruct();
 #else
         ibv_qp_attr attr;
