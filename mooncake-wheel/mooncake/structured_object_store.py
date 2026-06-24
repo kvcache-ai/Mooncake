@@ -385,7 +385,7 @@ class _StructuredObjectLayer:
         array = np.empty(shape, dtype=dtype)
         self._bundle_store.read_payload_range_into_destination(
             payload_spec,
-            array.view(np.uint8).reshape(-1),
+            array.reshape(-1).view(np.uint8),
             0,
         )
         return _torch.from_numpy(array)
@@ -1361,7 +1361,7 @@ def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
 
 def _tensor_payload_bytes_view(value: _TensorPayload) -> memoryview:
     tensor = value.tensor.detach().cpu().contiguous()
-    return memoryview(tensor.numpy()).cast("B")
+    return memoryview(tensor.numpy().reshape(-1).view(np.uint8)).cast("B")
 
 
 def _torch_dtype_to_numpy(dtype: Any) -> np.dtype[Any]:

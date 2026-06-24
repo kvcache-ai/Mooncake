@@ -337,13 +337,26 @@ def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
     store, transfer = make_transfer()
     array = np.arange(6, dtype=np.float32).reshape(2, 3)
     tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    scalar_tensor = torch.tensor(1.5, dtype=torch.float32)
+    bool_tensor = torch.tensor([True, False], dtype=torch.bool)
 
-    result = transfer.get_object(transfer.put_object({"array": array, "tensor": tensor}))
+    result = transfer.get_object(
+        transfer.put_object(
+            {
+                "array": array,
+                "tensor": tensor,
+                "scalar": scalar_tensor,
+                "bool_tensor": bool_tensor,
+            }
+        )
+    )
 
     assert np.array_equal(result["array"], array)
     assert torch.equal(result["tensor"], tensor)
-    assert store.put_tensor_calls == 1
-    assert store.get_tensor_calls == 1
+    assert torch.equal(result["scalar"], scalar_tensor)
+    assert torch.equal(result["bool_tensor"], bool_tensor)
+    assert store.put_tensor_calls == 3
+    assert store.get_tensor_calls == 3
 
 
 def test_put_object_roundtrips_wrapped_numpy_and_torch_values() -> None:
@@ -373,10 +386,22 @@ def test_put_object_torch_tensor_raw_fallback_roundtrip() -> None:
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer(NoTensorFastPathStore())
     tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    scalar_tensor = torch.tensor(1.5, dtype=torch.float32)
+    bool_tensor = torch.tensor([True, False], dtype=torch.bool)
 
-    result = transfer.get_object(transfer.put_object({"tensor": tensor}))
+    result = transfer.get_object(
+        transfer.put_object(
+            {
+                "tensor": tensor,
+                "scalar": scalar_tensor,
+                "bool_tensor": bool_tensor,
+            }
+        )
+    )
 
     assert torch.equal(result["tensor"], tensor)
+    assert torch.equal(result["scalar"], scalar_tensor)
+    assert torch.equal(result["bool_tensor"], bool_tensor)
     assert store.batch_get_into_calls > 0
 
 
