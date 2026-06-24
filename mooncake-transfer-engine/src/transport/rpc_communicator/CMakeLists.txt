@@ -11,9 +11,6 @@ target_link_libraries(rpc_communicator
     glog::glog 
     pthread 
 )
-if(WIN32)
-    target_link_libraries(rpc_communicator PRIVATE ${Python3_LIBRARIES})
-endif()
 
 target_include_directories(rpc_communicator 
     PRIVATE 
