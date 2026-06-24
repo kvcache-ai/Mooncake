@@ -5,8 +5,9 @@ use super::super::{
     LocalAllocatorState, MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker,
     ReplicaRoute, ReplicaTier, ReplicationPolicy, RequestDeadline, ResolvedObject,
     RestorePromotionKey, RestorePromotionPayload, RestorePromotionPushOutcome,
-    RestorePromotionQueue, RestorePromotionTask, Result, RouteState, StorageOwnerState,
-    StoreClient, StoreError, DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
+    RestorePromotionQueue, RestorePromotionTask, Result, RouteState, SegmentName,
+    SegmentTargetChunk, StorageOwnerState, StoreClient, StoreError, StoreTransport,
+    DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
 };
 use super::{
     backend_load_cold_payload_batch_into, cold_restore_flight_key, materialized_cold_backing,
@@ -14,6 +15,7 @@ use super::{
     with_disjoint_restore_caller_buffers,
 };
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
         Arc,
@@ -21,6 +23,170 @@ use std::{
     thread::sleep,
 };
 use tracing::{debug, info, warn};
+
+pub(in super::super) fn execute_cold_restore_direct(
+    client: &StoreClient,
+    transport: &dyn StoreTransport,
+    resolved: &ResolvedObject,
+    buffer: &mut [u8],
+    request_deadline: RequestDeadline,
+) -> Result<()> {
+    if super::cold_tier_disabled() {
+        return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+    }
+    let cold_backing = materialized_cold_backing(&resolved.route).ok_or_else(|| {
+        StoreError::NotFound(format!(
+            "route {} has no materialized cold backing",
+            resolved.route.key.0
+        ))
+    })?;
+    let length = cold_backing.length as usize;
+    if buffer.len() < length {
+        return Err(StoreError::Allocator(format!(
+            "buffer too small for tenant={} key={}: need {length}, have {}",
+            resolved.tenant,
+            resolved.key,
+            buffer.len()
+        )));
+    }
+    if cold_backing.owner == client.lease.runtime {
+        let backend = client
+            .storage_owner
+            .cold_tier_devices
+            .backend_for_with_refresh(
+                client.metadata.as_ref(),
+                &cold_backing,
+                "local_read_cold_restore_backend_refresh",
+            )?;
+        let Some(read_len) = backend.get_object_into(&cold_backing, &mut buffer[..length])? else {
+            return Err(StoreError::NotFound(format!(
+                "cold backing {}:{} not found",
+                cold_backing.cold_tier_id, cold_backing.object_locator
+            )));
+        };
+        if read_len != length {
+            return Err(StoreError::InvalidState(format!(
+                "cold backing {} length mismatch: expected {} actual {}",
+                cold_backing.object_locator, length, read_len
+            )));
+        }
+        if let Some(expected) = cold_backing.checksum {
+            let actual = payload_checksum(&buffer[..length]);
+            if actual != expected {
+                return Err(StoreError::InvalidState(format!(
+                    "cold backing {} checksum mismatch: expected {} actual {}",
+                    cold_backing.object_locator, expected, actual
+                )));
+            }
+        }
+        enqueue_restore_promotion(
+            client,
+            resolved,
+            RestorePromotionPayload::Shared(Arc::new(buffer[..length].to_vec())),
+        );
+        return Ok(());
+    }
+
+    let lease = client.lookup_runtime_lease(&cold_backing.owner)?;
+    let request = crate::control_plane::pb::ReadFromColdRequest {
+        namespace: client.metadata.route_namespace(),
+        authority: cold_backing.owner.stable_id.0.clone(),
+        tenant: resolved.tenant.clone(),
+        key: resolved
+            .route
+            .logical_key
+            .clone()
+            .unwrap_or_else(|| resolved.key.clone()),
+        domain: resolved
+            .route
+            .namespace
+            .as_ref()
+            .map(|scope| scope.domain.clone())
+            .unwrap_or_default(),
+        object_set: resolved
+            .route
+            .namespace
+            .as_ref()
+            .map(|scope| scope.object_set.clone())
+            .unwrap_or_default(),
+    };
+    let reply = client.control_client.read_from_cold(&lease, request)?;
+    let staging_segment = SegmentName::new(reply.segment_name.clone());
+    if reply.length != cold_backing.length {
+        client.control_client.ack_cold_read_complete(
+            &lease,
+            vec![staging_segment.0.clone()],
+            vec![reply.segment_offset],
+        );
+        return Err(StoreError::InvalidState(format!(
+            "cold read reply length mismatch for {}: expected {} actual {}",
+            resolved.route.key.0, cold_backing.length, reply.length
+        )));
+    }
+    if reply.checksum != cold_backing.checksum {
+        client.control_client.ack_cold_read_complete(
+            &lease,
+            vec![staging_segment.0.clone()],
+            vec![reply.segment_offset],
+        );
+        return Err(StoreError::InvalidState(format!(
+            "cold read reply checksum mismatch for {}: expected {:?} actual {:?}",
+            resolved.route.key.0, cold_backing.checksum, reply.checksum
+        )));
+    }
+    let target_chunks = reply
+        .target_chunks
+        .iter()
+        .map(|chunk| SegmentTargetChunk {
+            logical_offset: chunk.logical_offset,
+            target_offset: chunk.target_offset,
+            length_bytes: chunk.length_bytes,
+        })
+        .collect::<Vec<_>>();
+    client.state.lock().cache_segment_target_metadata(
+        &cold_backing.owner,
+        &staging_segment,
+        &target_chunks,
+        reply.transport_endpoint.clone(),
+        reply.transport_segment_descriptor.clone(),
+    );
+    let staging_replica = ReplicaRoute {
+        owner: cold_backing.owner.clone(),
+        segment_name: staging_segment.clone(),
+        offset: None,
+        segment_offset: reply.segment_offset,
+        length: reply.length,
+        checksum: reply.checksum,
+        tier: ReplicaTier::File,
+        priority: 0,
+    };
+    let staging_resolved = ResolvedObject {
+        tenant: resolved.tenant.clone(),
+        key: resolved.key.clone(),
+        route: resolved.route.clone(),
+        replica: staging_replica,
+        fallback_replicas: VecDeque::new(),
+    };
+    let result = client.execute_remote_get_direct(
+        transport,
+        &staging_resolved,
+        buffer,
+        reply.length as usize,
+        request_deadline,
+    );
+    client.control_client.ack_cold_read_complete(
+        &lease,
+        vec![staging_segment.0],
+        vec![reply.segment_offset],
+    );
+    result?;
+    enqueue_restore_promotion(
+        client,
+        resolved,
+        RestorePromotionPayload::Shared(Arc::new(buffer[..length].to_vec())),
+    );
+    Ok(())
+}
 
 pub(in super::super) fn enqueue_restore_promotion(
     client: &StoreClient,

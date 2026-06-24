@@ -125,7 +125,10 @@ use cold_tier_storage_backend::*;
 /// Cold tier device management, admission control, offload pipeline, and cleanup.
 #[allow(dead_code)]
 mod cold_tier;
-use self::cold_tier::ColdTierHandle;
+use self::cold_tier::{
+    ClockEntry, ClockEntryId, ColdTierHandle, EvictionReadySignal, HotReplicaTracker,
+    StorageClockState,
+};
 
 type SharedRouteWriteGate = Arc<RouteWriteGate>;
 

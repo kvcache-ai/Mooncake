@@ -352,53 +352,6 @@ struct StorageOwnerState {
     staging_pool_bytes: usize,
 }
 
-/// Notification channel: offload thread signals cold restore waiters
-/// when entries become Materialized (evictable without I/O).
-struct EvictionReadySignal {
-    generation: AtomicU64,
-    condvar: StdCondvar,
-    mutex: StdMutex<()>,
-}
-
-impl Default for EvictionReadySignal {
-    fn default() -> Self {
-        Self {
-            generation: AtomicU64::new(0),
-            condvar: StdCondvar::new(),
-            mutex: StdMutex::new(()),
-        }
-    }
-}
-
-impl EvictionReadySignal {
-    /// Called by offload thread after an entry becomes Materialized.
-    fn notify_materialized(&self) {
-        self.generation.fetch_add(1, Ordering::Release);
-        self.condvar.notify_all();
-    }
-
-    fn signal(&self) {
-        self.notify_materialized();
-    }
-
-    /// Wait until a new Materialized entry is available, or timeout.
-    #[allow(dead_code)]
-    fn wait_for_materialized(&self, timeout: Duration) -> bool {
-        let guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
-        let gen_before = self.generation.load(Ordering::Acquire);
-        let (_guard, result) = self
-            .condvar
-            .wait_timeout(guard, timeout)
-            .unwrap_or_else(|e| e.into_inner());
-        if result.timed_out() {
-            // Check if generation advanced during our wait (spurious wakeup protection)
-            self.generation.load(Ordering::Acquire) != gen_before
-        } else {
-            true
-        }
-    }
-}
-
 #[derive(Default)]
 struct RouteWriteGate {
     state: Mutex<()>,
@@ -406,36 +359,6 @@ struct RouteWriteGate {
 
 struct RouteWritePermit<'a> {
     guard: Option<parking_lot::MutexGuard<'a, ()>>,
-}
-
-#[derive(Default)]
-struct HotReplicaTracker {
-    clock: Mutex<StorageClockState>,
-}
-
-#[derive(Default)]
-struct StorageClockState {
-    entries: Vec<Option<ClockEntry>>,
-    by_id: BTreeMap<ClockEntryId, usize>,
-    by_key: BTreeMap<ObjectKey, Vec<usize>>,
-    pending_hot_keys: BTreeSet<ObjectKey>,
-    hand: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct ClockEntryId {
-    route_key: ObjectKey,
-    segment_name: SegmentName,
-    segment_offset: u64,
-}
-
-#[derive(Clone, Debug)]
-struct ClockEntry {
-    id: ClockEntryId,
-    length_bytes: u64,
-    hot: bool,
-    hot_credit: u8,
-    fresh_write: bool,
 }
 
 #[derive(Default)]
