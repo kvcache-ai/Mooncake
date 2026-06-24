@@ -4,6 +4,26 @@ import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.upper() in {"1", "ON", "TRUE", "YES"}
+
+
+_USE_MACA = (
+    _env_enabled("MOONCAKE_EP_USE_MACA")
+    or bool(getattr(torch.version, "maca", None))
+)
+_USE_SPLIT_SEND_RECV = (
+    _env_enabled("MOONCAKE_EP_USE_MUSA")
+    or _USE_MACA
+)
+_MACA_PHASE_FENCE = os.getenv("MOONCAKE_EP_MACA_PHASE_FENCE", "p2p").lower()
+_USE_TORCH_ALLTOALL = _env_enabled("MOONCAKE_EP_USE_TORCH_ALLTOALL")
+_PROFILE_TORCH_ALLTOALL = _env_enabled("MOONCAKE_EP_PROFILE_TORCH_ALLTOALL")
+
+
 class EventOverlap:
     """
     A wrapper class to manage CUDA events, also for better overlapping convenience.
@@ -64,27 +84,106 @@ class EventOverlap:
 
 class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
-        from mooncake import ep
-
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group
-        # NIC auto-detection happens inside ep.Buffer via Topology::discover().
-        self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes
-        )
+        self._use_torch_alltoall = _USE_TORCH_ALLTOALL
+        if self._use_torch_alltoall:
+            self.runtime = None
+        else:
+            from mooncake import ep
+
+            # NIC auto-detection happens inside ep.Buffer via Topology::discover().
+            self.runtime = ep.Buffer(
+                self.rank, self.group_size, num_ep_buffer_bytes
+            )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
-        self._use_fallback = bool(self.runtime.ibgda_disabled())
+        self._use_fallback = self._use_torch_alltoall or bool(
+            self.runtime is not None and self.runtime.ibgda_disabled()
+        )
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
+        self._torch_alltoall_profile = {}
+        self._torch_alltoall_state = {}
+        self._maca_phase_token: Optional[torch.Tensor] = None
+        self._maca_phase_recv_tokens: Optional[List[torch.Tensor]] = None
         self.connect()
+
+    def _maca_phase_fence(self) -> None:
+        if not _USE_MACA or _MACA_PHASE_FENCE in {"", "0", "off", "none"}:
+            return
+
+        # Compatibility fence between SEND and RECV.  The EP payload still
+        # uses the P2P fast path; this only keeps rank phases aligned on MACA.
+        if _MACA_PHASE_FENCE == "barrier":
+            torch.cuda.synchronize()
+            dist.barrier(self.group)
+            return
+        if _MACA_PHASE_FENCE == "p2p":
+            if self._maca_phase_token is None:
+                self._maca_phase_token = torch.empty(
+                    1, dtype=torch.int32, device="cuda"
+                )
+            if self._maca_phase_recv_tokens is None:
+                self._maca_phase_recv_tokens = [
+                    torch.empty(1, dtype=torch.int32, device="cuda")
+                    for _ in range(self.group_size)
+                ]
+            self._maca_phase_token.fill_(1)
+            ops = []
+            for peer in range(self.group_size):
+                if peer == self.rank:
+                    continue
+                ops.append(
+                    dist.P2POp(
+                        dist.isend, self._maca_phase_token, peer, self.group
+                    )
+                )
+                ops.append(
+                    dist.P2POp(
+                        dist.irecv,
+                        self._maca_phase_recv_tokens[peer],
+                        peer,
+                        self.group,
+                    )
+                )
+            if not ops:
+                return
+            for work in dist.batch_isend_irecv(ops):
+                work.wait()
+            return
+        if _MACA_PHASE_FENCE != "allreduce":
+            raise ValueError(
+                "MOONCAKE_EP_MACA_PHASE_FENCE must be one of: "
+                "p2p, allreduce, barrier, none"
+            )
+        if self._maca_phase_token is None:
+            self._maca_phase_token = torch.empty(
+                1, dtype=torch.int32, device="cuda"
+            )
+        self._maca_phase_token.fill_(1)
+        dist.all_reduce(
+            self._maca_phase_token, op=dist.ReduceOp.SUM, group=self.group
+        )
+
+    def _wrap_maca_recv_hook(self, hook: Optional[Callable]) -> Callable:
+        def wrapped_hook() -> None:
+            self._maca_phase_fence()
+            if hook is not None:
+                hook()
+
+        return wrapped_hook
     
     def connect(self, is_update: bool = False):
         from mooncake import ep
+
+        if self._use_torch_alltoall:
+            self._use_fallback = True
+            return
 
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
@@ -200,7 +299,25 @@ class Buffer:
 
 
     def update_ep_member(self):
+        if self._use_torch_alltoall:
+            return
         self.connect(True)
+
+    def _active_ranks_tensor(
+        self, device: torch.device, dtype: torch.dtype = torch.int32
+    ) -> torch.Tensor:
+        if self._use_torch_alltoall:
+            return torch.ones((self.group_size,), dtype=dtype, device=device)
+
+        try:
+            from mooncake.ep import get_active_ranks
+
+            return get_active_ranks(self.backend).to(device=device, dtype=dtype)
+        except Exception:
+            return torch.ones((self.group_size,), dtype=dtype, device=device)
+
+    def _active_ranks_list(self, device: torch.device) -> List[int]:
+        return self._active_ranks_tensor(device=device, dtype=torch.int32).tolist()
 
     @staticmethod
     def get_ep_buffer_size_hint(
@@ -209,6 +326,15 @@ class Buffer:
         num_ranks: int,
         num_experts: int,
     ) -> int:
+        if _USE_TORCH_ALLTOALL:
+            return (
+                4
+                * num_experts
+                * num_max_dispatch_tokens_per_rank
+                * (32 + hidden * 2)
+                + 4 * num_experts * 4
+            )
+
         from mooncake.ep import get_ep_buffer_size_hint
 
         return get_ep_buffer_size_hint(
@@ -224,7 +350,7 @@ class Buffer:
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
         timeout_us: int,
-        use_fp8: bool = True,
+        use_fp8: Optional[bool] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ) -> Tuple[
@@ -234,23 +360,30 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
-        # MUSA does not support cooperative grid sync, so the C++ runtime
+        if use_fp8 is None:
+            use_fp8 = not _USE_MACA
+        elif _USE_MACA and use_fp8:
+            raise NotImplementedError("FP8 dispatch is not supported on MACA")
+
+        # MUSA/MACA do not support cooperative grid sync, so the C++ runtime
         # splits no-hook calls into SEND -> phase-ack -> RECV instead of using
         # a single cooperative kernel.  async_finish still returns a stream
         # event, but it is not the CUDA single-kernel cooperative path.
-        if os.getenv("MOONCAKE_EP_USE_MUSA") and async_finish:
+        if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
 
             warnings.warn(
-                "MUSA async_finish uses split SEND/RECV kernels plus a stream "
+                "async_finish uses split SEND/RECV kernels plus a stream "
                 "event, not CUDA cooperative single-kernel async semantics.",
                 RuntimeWarning,
                 stacklevel=2,
             )
 
-        if self._use_fallback:
-            from mooncake.ep import get_active_ranks
+        runtime_return_recv_hook = return_recv_hook or (
+            _USE_MACA and not self._use_fallback
+        )
 
+        if self._use_fallback:
             (
                 packed_recv_x,
                 packed_recv_x_scales,
@@ -267,7 +400,7 @@ class Buffer:
                 use_fp8,
                 return_recv_hook,
             )
-            backend_active_ranks = get_active_ranks(self.backend).to(
+            backend_active_ranks = self._active_ranks_tensor(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
             if active_ranks.numel() == backend_active_ranks.numel():
@@ -290,8 +423,13 @@ class Buffer:
                 timeout_us,
                 use_fp8,
                 async_finish,
-                return_recv_hook,
+                runtime_return_recv_hook,
             )
+            if _USE_MACA:
+                hook = self._wrap_maca_recv_hook(hook)
+                if not return_recv_hook:
+                    hook()
+                    hook = None
         handle = (
             packed_recv_src_info,
             packed_recv_layout_range,
@@ -330,12 +468,12 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
-        # Same MUSA split-kernel behavior as dispatch().
-        if os.getenv("MOONCAKE_EP_USE_MUSA") and async_finish:
+        # Same split-kernel behavior as dispatch().
+        if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
 
             warnings.warn(
-                "MUSA async_finish uses split SEND/RECV kernels plus a stream "
+                "async_finish uses split SEND/RECV kernels plus a stream "
                 "event, not CUDA cooperative single-kernel async semantics.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -348,9 +486,11 @@ class Buffer:
             hidden,
             num_experts,
         ) = handle
-        if self._use_fallback:
-            from mooncake.ep import get_active_ranks
+        runtime_return_recv_hook = return_recv_hook or (
+            _USE_MACA and not self._use_fallback
+        )
 
+        if self._use_fallback:
             combined_x, event, hook = self._fallback_combine(
                 x,
                 topk_idx,
@@ -363,7 +503,7 @@ class Buffer:
                 return_recv_hook,
                 out,
             )
-            backend_active_ranks = get_active_ranks(self.backend).to(
+            backend_active_ranks = self._active_ranks_tensor(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
             if active_ranks.numel() == backend_active_ranks.numel():
@@ -381,9 +521,14 @@ class Buffer:
                 timeout_us,
                 zero_copy,
                 async_finish,
-                return_recv_hook,
+                runtime_return_recv_hook,
                 out,
             )
+            if _USE_MACA:
+                hook = self._wrap_maca_recv_hook(hook)
+                if not return_recv_hook:
+                    hook()
+                    hook = None
         tensors_to_record = (
             x,
             topk_idx,
@@ -437,6 +582,23 @@ class Buffer:
         def current_stream_wait(self):
             torch.cuda.synchronize()
 
+    class _CudaTimer:
+        def __init__(self, enabled: bool) -> None:
+            self.enabled = enabled
+            self.samples = {}
+
+        def measure(self, name: str, fn: Callable[[], Any]) -> Any:
+            if not self.enabled:
+                return fn()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            result = fn()
+            end.record()
+            torch.cuda.synchronize()
+            self.samples[name] = start.elapsed_time(end) / 1000.0
+            return result
+
     @staticmethod
     def _fp8_cast(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         assert x.dim() == 2 and x.size(1) % 128 == 0
@@ -449,6 +611,185 @@ class Buffer:
         x_scales = (x_amax / 448.0).view(m, -1)
         return x_fp8, x_scales
 
+    def _torch_alltoall_routed_dispatch(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        return_recv_hook: bool,
+    ):
+        with torch.profiler.record_function("dispatch.torch_alltoall_routed"):
+            timer = Buffer._CudaTimer(_PROFILE_TORCH_ALLTOALL)
+            num_tokens = x.size(0)
+            num_topk = topk_idx.size(1)
+            num_ranks = self.group_size
+            num_local_experts = num_experts // num_ranks
+            max_messages_per_rank = num_tokens * num_topk
+
+            if x.dtype != torch.bfloat16:
+                raise NotImplementedError(
+                    "torch all-to-all fallback currently supports bfloat16 only"
+                )
+
+            from mooncake import ep
+
+            send_payload, send_route = timer.measure(
+                "dispatch_pack",
+                lambda: ep.torch_alltoall_pack_dispatch_fused(
+                    x.contiguous(),
+                    topk_idx.contiguous(),
+                    num_experts,
+                    num_ranks,
+                ),
+            )
+            recv_payload = torch.empty_like(send_payload)
+            timer.measure(
+                "dispatch_a2a_payload",
+                lambda: dist.all_to_all_single(
+                    recv_payload, send_payload, group=self.group
+                ),
+            )
+            if _PROFILE_TORCH_ALLTOALL:
+                timer.samples["dispatch_a2a_meta"] = 0.0
+            (
+                packed_recv_x,
+                packed_recv_src_info,
+                packed_recv_layout_range,
+                packed_recv_count,
+                return_src_pos,
+            ) = timer.measure(
+                "dispatch_compact",
+                lambda: ep.torch_alltoall_compact_dispatch_fused(
+                    recv_payload,
+                    num_local_experts,
+                    num_max_dispatch_tokens_per_rank,
+                ),
+            )
+            self._torch_alltoall_state = {
+                "send_route": send_route,
+                "return_src_pos": return_src_pos,
+                "num_tokens": num_tokens,
+                "num_topk": num_topk,
+                "max_messages_per_rank": max_messages_per_rank,
+            }
+            self._fallback_next_combine_buffer = torch.empty_like(packed_recv_x)
+            self._torch_alltoall_profile = timer.samples
+            hook = (lambda: None) if return_recv_hook else (lambda: None)
+            event = Buffer._DummyEvent()
+            return (
+                packed_recv_x,
+                None,
+                packed_recv_count,
+                packed_recv_src_info,
+                packed_recv_layout_range,
+                event,
+                hook,
+            )
+
+    def _torch_alltoall_routed_combine(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        layout_range: torch.Tensor,
+        zero_copy: bool,
+        return_recv_hook: bool,
+        out: Optional[torch.Tensor],
+    ):
+        with torch.profiler.record_function("combine.torch_alltoall_routed"):
+            timer = Buffer._CudaTimer(_PROFILE_TORCH_ALLTOALL)
+            expert_buffers = self._fallback_next_combine_buffer if zero_copy else x
+            if expert_buffers is None:
+                raise RuntimeError(
+                    "zero_copy combine called before dispatch buffer allocation"
+                )
+            if expert_buffers.dtype != torch.bfloat16:
+                expert_buffers = expert_buffers.to(torch.bfloat16)
+
+            num_tokens, num_topk = topk_idx.shape
+            num_ranks = self.group_size
+            max_messages_per_rank = num_tokens * num_topk
+            state = self._torch_alltoall_state
+            if not state:
+                raise RuntimeError("combine called without torch all-to-all dispatch state")
+
+            from mooncake import ep
+
+            send_payload = timer.measure(
+                "combine_pack",
+                lambda: ep.torch_alltoall_pack_combine(
+                    expert_buffers.contiguous(),
+                    state["return_src_pos"],
+                    num_ranks,
+                    max_messages_per_rank,
+                ),
+            )
+            recv_payload = torch.empty_like(send_payload)
+            timer.measure(
+                "combine_a2a_payload",
+                lambda: dist.all_to_all_single(
+                    recv_payload, send_payload, group=self.group
+                ),
+            )
+            combined = timer.measure(
+                "combine_reduce",
+                lambda: ep.torch_alltoall_reduce_combine(
+                    recv_payload,
+                    state["send_route"],
+                    topk_weights.contiguous(),
+                    out,
+                ),
+            )
+            self._torch_alltoall_profile = timer.samples
+            hook = (lambda: None) if return_recv_hook else (lambda: None)
+            event = Buffer._DummyEvent()
+            return combined, event, hook
+
+    def _torch_alltoall_dispatch(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        use_fp8: bool,
+        return_recv_hook: bool,
+    ):
+        if use_fp8:
+            raise NotImplementedError(
+                "FP8 dispatch is not supported by torch all-to-all fallback"
+            )
+        return self._torch_alltoall_routed_dispatch(
+            x,
+            topk_idx,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            return_recv_hook,
+        )
+
+    def _torch_alltoall_combine(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        src_info: torch.Tensor,
+        layout_range: torch.Tensor,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        zero_copy: bool,
+        return_recv_hook: bool,
+        out: Optional[torch.Tensor],
+    ):
+        return self._torch_alltoall_routed_combine(
+            x,
+            topk_idx,
+            topk_weights,
+            layout_range,
+            zero_copy,
+            return_recv_hook,
+            out,
+        )
+
     def _fallback_dispatch(
         self,
         x: torch.Tensor,
@@ -458,7 +799,15 @@ class Buffer:
         use_fp8: bool,
         return_recv_hook: bool,
     ):
-        from mooncake.ep import get_active_ranks
+        if self._use_torch_alltoall:
+            return self._torch_alltoall_dispatch(
+                x,
+                topk_idx,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+                use_fp8,
+                return_recv_hook,
+            )
 
         with torch.profiler.record_function("dispatch"):
             num_tokens, hidden = x.shape
@@ -476,7 +825,7 @@ class Buffer:
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
-            backend_active_ranks = get_active_ranks(self.backend).tolist()
+            backend_active_ranks = self._active_ranks_list(x.device)
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0
@@ -682,7 +1031,19 @@ class Buffer:
         return_recv_hook: bool,
         out: Optional[torch.Tensor],
     ):
-        from mooncake.ep import get_active_ranks
+        if self._use_torch_alltoall:
+            return self._torch_alltoall_combine(
+                x,
+                topk_idx,
+                topk_weights,
+                src_info,
+                layout_range,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+                zero_copy,
+                return_recv_hook,
+                out,
+            )
 
         with torch.profiler.record_function("combine"):
             num_tokens = topk_idx.size(0)
@@ -702,7 +1063,7 @@ class Buffer:
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
-            backend_active_ranks = get_active_ranks(self.backend).tolist()
+            backend_active_ranks = self._active_ranks_list(topk_idx.device)
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0

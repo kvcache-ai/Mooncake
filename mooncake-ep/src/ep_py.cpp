@@ -1,4 +1,5 @@
 #include <mooncake_ep_buffer.h>
+#include <mooncake_ep_alltoall.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
@@ -13,6 +14,12 @@ namespace mooncake {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
+    m.def("torch_alltoall_pack_dispatch_fused",
+          &torch_alltoall_pack_dispatch_fused);
+    m.def("torch_alltoall_compact_dispatch_fused",
+          &torch_alltoall_compact_dispatch_fused);
+    m.def("torch_alltoall_pack_combine", &torch_alltoall_pack_combine);
+    m.def("torch_alltoall_reduce_combine", &torch_alltoall_reduce_combine);
 
     py::class_<EventHandle>(m, "EventHandle")
         .def(py::init<>())
