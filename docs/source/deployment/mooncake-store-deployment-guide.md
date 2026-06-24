@@ -380,6 +380,56 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 | `--enable_http_metadata_server` | `false` | Enable embedded HTTP metadata server |
 | `--http_metadata_server_host` | `0.0.0.0` | Metadata bind host |
 | `--http_metadata_server_port` | `8080` | Metadata TCP port |
+| `--enable_metadata_cleanup_on_timeout` | `false` | Delete a client's stale HTTP metadata (`mooncake/[<cluster>/]ram/<segment>` and `mooncake/[<cluster>/]rpc_meta/<segment>`) when its heartbeat times out (see below) |
+
+### Stale Metadata Cleanup on Client Timeout
+
+When a client crashes or is force-killed (`kill -9`, OOM, node failure), it cannot
+run its normal cleanup, leaving stale entries on the HTTP metadata server
+(`mooncake/[<cluster>/]ram/<segment>` and `mooncake/[<cluster>/]rpc_meta/<segment>`).
+The HTTP metadata server has no heartbeat of its own, so these entries linger and
+can mislead nodes that later connect or restart with different RDMA parameters.
+
+With `--enable_metadata_cleanup_on_timeout=true`, the Master Service reuses its
+existing client-heartbeat monitor: when a client's `--client_ttl` expires, in
+addition to unmounting the segment it also removes that client's `ram/` and
+`rpc_meta/` keys from the HTTP metadata server. It supports both deployment
+topologies:
+
+- **Co-located** (`--enable_http_metadata_server=true`): the master removes the
+  keys via a direct in-process call (no network overhead).
+- **Separately deployed** HTTP metadata server: the master derives the metadata
+  server address from the cluster's existing configuration and removes the keys
+  via HTTP `DELETE`. The address is read, in priority order, from:
+  1. the `MOONCAKE_TE_META_DATA_SERVER` environment variable (the same Transfer
+     Engine metadata connection string the clients use, e.g.
+     `http://host:8080/metadata`), then
+  2. the `metadata_server` field of the JSON file pointed to by
+     `MOONCAKE_CONFIG_PATH`.
+
+Notes:
+- Only `http(s)` metadata servers are supported; `etcd`/`redis`/`P2PHANDSHAKE`
+  backends are not cleaned up (a warning is logged and cleanup stays disabled).
+- The feature is opt-in and best-effort: if no co-located server is enabled and
+  no HTTP metadata address can be derived, the master logs a warning and
+  disables cleanup. Remote `DELETE` failures are logged but never block the
+  client-monitor thread or the main process.
+- Respects `MC_METADATA_CLUSTER_ID` for custom key prefixes (matching the
+  Transfer Engine).
+
+```bash
+# Co-located metadata server
+mooncake_master \
+  --enable_http_metadata_server=true \
+  --enable_metadata_cleanup_on_timeout=true \
+  --client_ttl=10
+
+# Separately-deployed HTTP metadata server (address derived from the env var)
+export MOONCAKE_TE_META_DATA_SERVER=http://metadata-host:8080/metadata
+mooncake_master \
+  --enable_metadata_cleanup_on_timeout=true \
+  --client_ttl=10
+```
 
 ### Memory Allocator
 

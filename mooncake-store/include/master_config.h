@@ -11,6 +11,9 @@
 
 namespace mooncake {
 
+// Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
+class HttpMetadataServer;
+
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
     std::string_view etcd_endpoints) {
@@ -62,6 +65,11 @@ struct MasterConfig {
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
+    // Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*)
+    // when client heartbeat times out. Works in two modes: (1) co-located
+    // (enable_http_metadata_server=true) via in-process removal, or
+    // (2) separately-deployed metadata server via async HTTP DELETE.
+    bool enable_metadata_cleanup_on_timeout;
 
     // Pod identity for K8s label-based routing
     std::string pod_name;
@@ -203,6 +211,13 @@ class MasterServiceSupervisorConfig {
     // Pod identity for K8s label-based routing
     std::string pod_name;
     std::string pod_namespace;
+
+    // Metadata cleanup on client timeout. Resolved in main() (not from
+    // MasterConfig) and forwarded to the serving primary's
+    // WrappedMasterService. Co-located: in-process server pointer; separate:
+    // derived http(s) URL.
+    HttpMetadataServer* http_metadata_server = nullptr;
+    std::string http_metadata_remote_url;
 
     MasterServiceSupervisorConfig() = default;
 

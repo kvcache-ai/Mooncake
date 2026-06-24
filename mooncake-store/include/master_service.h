@@ -46,6 +46,8 @@ class EtcdOpLogStore;
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+class HttpMetadataServer;
+struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
 namespace test {
@@ -742,6 +744,24 @@ class MasterService {
      */
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const UUID& client_id, const TaskCompleteRequest& request);
+
+    /**
+     * @brief Set the HttpMetadataServer pointer for cleanup on client timeout.
+     * @param server Pointer to HttpMetadataServer. If nullptr, cleanup is
+     * disabled.
+     */
+    void setHttpMetadataServer(HttpMetadataServer* server);
+
+    /**
+     * @brief Configure cleanup against a separately-deployed HTTP metadata
+     * server (not co-located in the master process). The master sends HTTP
+     * DELETE requests to this endpoint when a client times out. Only http://
+     * and https:// connection strings are supported; other schemes (etcd /
+     * redis / P2PHANDSHAKE) are ignored with a warning and leave cleanup
+     * disabled.
+     * @param metadata_connstring e.g. "http://host:8080/metadata".
+     */
+    void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
     void SnapshotThreadFunc();
@@ -1910,6 +1930,32 @@ class MasterService {
     std::atomic<uint64_t> default_tenant_quota_bytes_;
     const uint64_t tenant_quota_pool_capacity_bytes_;
     mutable std::mutex tenant_quota_recompute_mutex_;
+
+    // HTTP metadata server pointer for cleanup on client timeout
+    // nullptr means cleanup is disabled
+    HttpMetadataServer* http_metadata_server_{nullptr};
+
+    // Remote HTTP metadata client, used when the metadata server is deployed
+    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
+    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+
+    // Cached HTTP metadata key prefix (initialized once at startup)
+    std::string http_metadata_prefix_;
+
+    // Async worker for remote cleanup: segments are enqueued from the client
+    // monitor thread so a slow/unreachable server never blocks heartbeats.
+    std::thread http_metadata_cleanup_thread_;
+    std::atomic<bool> http_metadata_cleanup_running_{false};
+    std::mutex http_metadata_cleanup_mutex_;
+    std::condition_variable http_metadata_cleanup_cv_;
+    std::vector<std::string> http_metadata_cleanup_queue_;
+
+    void HttpMetadataCleanupThreadFunc();
+
+    // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
+    // segment. For the co-located case this is synchronous (no network I/O);
+    // for the remote case it enqueues to the async cleanup worker.
+    void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
 
