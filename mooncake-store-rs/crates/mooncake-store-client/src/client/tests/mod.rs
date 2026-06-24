@@ -14435,6 +14435,158 @@ fn true_client_shrink_ignores_unreachable_route_authority() {
 }
 
 #[test]
+fn true_client_shrink_skips_unavailable_old_replica_owner_during_reclaim() {
+    let metadata = Arc::new(RecoverableMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let store_a_transport = Arc::new(TestTransport::new("shrink-dead-reclaim-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("shrink-dead-reclaim-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("shrink-dead-reclaim-c-segment"));
+    let store_d_transport = Arc::new(store_a_transport.peer("shrink-dead-reclaim-d-segment"));
+    let router_transport = Arc::new(store_a_transport.peer("shrink-dead-reclaim-router-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("shrink-dead-reclaim-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-c build should succeed");
+    let store_d = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-d")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_d_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-d build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    store_d
+        .register_local_memory()
+        .expect("store-d memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[
+        &store_a, &store_b, &store_c, &store_d, &router, &reader,
+    ]);
+
+    let key = "shrink-dead-reclaim-key";
+    let value = b"shrink-dead-reclaim-payload";
+    let initial = router
+        .put_with_policy(
+            key,
+            value,
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("seed route should succeed");
+    let initial_owners = initial
+        .replicas
+        .iter()
+        .map(|replica| replica.owner.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(initial.replicas.len(), 2);
+    assert!(
+        initial_owners.contains(store_a.runtime_id()),
+        "seed route should include the draining owner"
+    );
+    assert!(
+        initial_owners.contains(store_b.runtime_id()),
+        "seed route should include the later-unavailable replica owner"
+    );
+
+    metadata.hide_runtime_metadata(store_b.runtime_id());
+
+    let migrated = store_a
+        .evacuate_owned_replicas()
+        .expect("true client shrink should skip reclaim for unavailable old replica owners");
+    assert_eq!(migrated, 1);
+
+    let route = router
+        .query_route(key)
+        .expect("post-shrink route query should succeed")
+        .expect("post-shrink route should exist");
+    let owners = route
+        .replicas
+        .iter()
+        .map(|replica| replica.owner.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !owners.contains(store_a.runtime_id()),
+        "post-shrink route should not keep the draining runtime"
+    );
+    assert!(
+        !owners.contains(store_b.runtime_id()),
+        "post-shrink route should not keep the unavailable runtime"
+    );
+    assert_eq!(
+        reader.get(key).expect("reader get should succeed after shrink"),
+        value
+    );
+}
+
+#[test]
 fn remote_get_recomputes_segment_base_after_restart() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_transport = Arc::new(TestTransport::new("restart-read-store-segment"));

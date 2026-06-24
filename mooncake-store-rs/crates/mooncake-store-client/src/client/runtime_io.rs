@@ -1321,7 +1321,15 @@ impl StoreClient {
             ) {
                 Ok(next) => {
                     writer.ensure_object_route_at_least(&next)?;
-                    self.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
+                    if let Err(error) = self.reclaim_route(&confirmed, ReclaimMode::Immediate) {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            tenant = %object_id.scope.tenant,
+                            key = %object_id.logical_key,
+                            error = %error,
+                            "owned route reclaim failed after authoritative shrink publish"
+                        );
+                    }
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
                         "migrate",
@@ -1424,7 +1432,15 @@ impl StoreClient {
             ) {
                 Ok(next) => {
                     writer.ensure_object_route_at_least(&next)?;
-                    self.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
+                    if let Err(error) = self.reclaim_route(&confirmed, ReclaimMode::Immediate) {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            tenant = %object_id.scope.tenant,
+                            key = %object_id.logical_key,
+                            error = %error,
+                            "targeted handoff reclaim failed after authoritative shrink publish"
+                        );
+                    }
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
                         "migrate",
