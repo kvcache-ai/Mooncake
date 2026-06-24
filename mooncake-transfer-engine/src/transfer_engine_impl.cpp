@@ -211,7 +211,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         Transport* tcp_transport =
             multi_transports_->installTransport("tcp", nullptr);
         if (!tcp_transport) {
-            LOG(ERROR) << "MC_FORCE_TCP is set but failed to install TCP transport";
+            LOG(ERROR)
+                << "MC_FORCE_TCP is set but failed to install TCP transport";
             return -1;
         }
         LOG(INFO) << "MC_FORCE_TCP is set, using TCP transport only";
