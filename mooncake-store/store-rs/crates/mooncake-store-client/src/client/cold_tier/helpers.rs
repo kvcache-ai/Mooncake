@@ -7,6 +7,13 @@ use super::super::{
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tracing::warn;
+use xxhash_rust::xxh3::xxh3_64;
+
+pub(in super::super) fn payload_checksum(payload: &[u8]) -> u64 {
+    // Keep checksum validation on the hot read/write path cheap enough for
+    // large restore batches. The stored route field remains a stable u64.
+    xxh3_64(payload)
+}
 
 #[allow(dead_code)]
 pub(in super::super) fn backend_store_cold_payload_batch(

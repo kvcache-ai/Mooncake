@@ -2363,40 +2363,10 @@ impl StoreClient {
                 )));
             }
         }
-        if resolved
-            .iter()
-            .any(|entry| cold_tier::is_cold_backing_placeholder(&entry.replica))
-        {
-            let total_bytes = lengths.iter().map(|length| *length as u64).sum::<u64>();
-            let attempts = resolved
-                .iter()
-                .map(|entry| 1 + entry.fallback_replicas.len())
-                .max()
-                .unwrap_or(1);
-            let request_deadline = self.request_deadline_for_transfer(total_bytes, attempts);
-            let mut checked_remote_runtimes = BTreeSet::new();
-            let local_segments = self.local_storage_segments();
-            for (entry, buffer) in resolved.iter_mut().zip(buffers.iter_mut()) {
-                if cold_tier::is_cold_backing_placeholder(&entry.replica) {
-                    cold_tier::execute_cold_restore_direct(self, transport, entry, buffer, request_deadline)?;
-                } else {
-                    self.read_single_object_with_failover(
-                        transport,
-                        entry,
-                        buffer,
-                        &mut checked_remote_runtimes,
-                        &local_segments,
-                        request_deadline,
-                    )?;
-                }
-            }
-            let payloads = buffers
-                .iter()
-                .zip(lengths.iter())
-                .map(|(buffer, length)| &buffer[..*length])
-                .collect::<Vec<_>>();
-            Self::validate_batch_replica_checksums(resolved, &payloads)?;
-            return Ok(lengths);
+        if cold_tier::batch_contains_cold_backing_placeholder(resolved) {
+            return cold_tier::execute_batch_get_with_cold_restore(
+                self, transport, resolved, buffers, lengths,
+            );
         }
         let buffer_ptrs = buffers
             .iter_mut()
@@ -3838,6 +3808,7 @@ impl StoreClient {
         }
         result
     }
+
 
     fn execute_selected_replica_direct(
         &self,

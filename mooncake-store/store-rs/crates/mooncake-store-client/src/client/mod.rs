@@ -126,7 +126,7 @@ use cold_tier_storage_backend::*;
 #[allow(dead_code)]
 mod cold_tier;
 use self::cold_tier::{
-    ClockEntry, ClockEntryId, ColdTierHandle, EvictionReadySignal, HotReplicaTracker,
+    payload_checksum, ClockEntryId, ColdTierHandle, EvictionReadySignal, HotReplicaTracker,
     StorageClockState,
 };
 
