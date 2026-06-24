@@ -69,6 +69,8 @@ impl StorageOwnerState {
     ) -> Self {
         let offload_mode = cold_tier.offload_mode;
         let offload_priority = cold_tier.offload_priority;
+        let staging_pool_bytes = cold_tier.rate_limits.staging_pool_bytes;
+        let restore_max_distinct_flights = cold_tier.rate_limits.restore_max_distinct_flights;
         Self {
             runtime,
             route_ops,
@@ -82,7 +84,15 @@ impl StorageOwnerState {
             initial_cold_backing_repair_at_ms: std::sync::atomic::AtomicU64::new(0),
             offload_mode,
             offload_priority,
+            owner_cold_restore_flights: super::super::OwnerColdRestoreFlightMap::new(
+                restore_max_distinct_flights,
+            ),
+            cold_restore_io_tracker: super::super::ColdRestoreIoTracker::default(),
             eviction_ready_signal: super::super::EvictionReadySignal::default(),
+            read_pin_registry: super::super::ReadPinRegistry::default(),
+            staging_pool: parking_lot::Mutex::new(None),
+            pending_staging_slots: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            staging_pool_bytes,
         }
     }
 
@@ -895,9 +905,7 @@ impl ColdTierDeviceManager {
         self.devices.lock().upsert(device);
     }
 
-    pub(in super::super) fn observability_snapshot(
-        &self,
-    ) -> super::super::ColdTierDeviceCacheSummary {
+    pub(in super::super) fn observability_snapshot(&self) -> super::super::ColdTierDeviceSnapshot {
         self.devices.lock().observability_snapshot()
     }
 

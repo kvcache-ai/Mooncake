@@ -7,7 +7,7 @@ use std::time::Duration;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor,
     ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteVersion,
-    SegmentName, SegmentReservation, StoreError, CONTROL_ADDR_LABEL,
+    SegmentName, SegmentReservation, SegmentTargetChunk, StoreError, CONTROL_ADDR_LABEL,
 };
 use parking_lot::Mutex;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
@@ -120,6 +120,73 @@ pub(crate) trait MigrationService: Send + Sync {
     fn get_execution_status(&self, execution_id: &str) -> Result<MigrationExecutionStatus>;
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ColdReadResult {
+    pub segment_name: String,
+    pub segment_offset: u64,
+    pub length: u64,
+    pub checksum: Option<u64>,
+    pub target_chunks: Vec<SegmentTargetChunk>,
+    pub transport_endpoint: Option<String>,
+    pub transport_segment_descriptor: Option<String>,
+    pub admission_wait_us: u64,
+    pub ssd_read_us: u64,
+    pub memcpy_us: u64,
+    pub route_update_us: u64,
+    pub total_promote_us: u64,
+}
+
+pub(crate) struct ColdReadResponse {
+    pub result: Result<ColdReadResult>,
+    pub deferred_promote: Option<Box<dyn FnOnce() + Send>>,
+}
+
+pub(crate) struct ColdReadTarget {
+    pub tenant: String,
+    pub key: String,
+    pub domain: String,
+    pub object_set: String,
+}
+
+pub(crate) trait ColdTierControlService: Send + Sync {
+    fn read_from_cold(
+        &self,
+        namespace: &str,
+        authority: &str,
+        tenant: &str,
+        key: &str,
+        domain: &str,
+        object_set: &str,
+    ) -> ColdReadResponse;
+
+    fn batch_read_from_cold(
+        &self,
+        namespace: &str,
+        authority: &str,
+        targets: Vec<ColdReadTarget>,
+    ) -> Vec<ColdReadResponse> {
+        targets
+            .into_iter()
+            .map(|target| {
+                self.read_from_cold(
+                    namespace,
+                    authority,
+                    &target.tenant,
+                    &target.key,
+                    &target.domain,
+                    &target.object_set,
+                )
+            })
+            .collect()
+    }
+
+    fn ack_cold_read_complete(&self, slots: &[(SegmentName, u64)]);
+
+    fn pin_for_read(&self, _slots: &[(SegmentName, u64)]) -> u64 {
+        0
+    }
+}
+
 struct UnsupportedMigrationService;
 
 impl MigrationService for UnsupportedMigrationService {
@@ -134,6 +201,29 @@ impl MigrationService for UnsupportedMigrationService {
             "migration execution status is not wired yet".to_string(),
         ))
     }
+}
+
+pub(crate) struct UnsupportedColdTierControlService;
+
+impl ColdTierControlService for UnsupportedColdTierControlService {
+    fn read_from_cold(
+        &self,
+        _namespace: &str,
+        _authority: &str,
+        _tenant: &str,
+        _key: &str,
+        _domain: &str,
+        _object_set: &str,
+    ) -> ColdReadResponse {
+        ColdReadResponse {
+            result: Err(StoreError::Unsupported(
+                "cold tier read control is not wired yet".to_string(),
+            )),
+            deferred_promote: None,
+        }
+    }
+
+    fn ack_cold_read_complete(&self, _slots: &[(SegmentName, u64)]) {}
 }
 
 #[derive(Clone, Debug)]

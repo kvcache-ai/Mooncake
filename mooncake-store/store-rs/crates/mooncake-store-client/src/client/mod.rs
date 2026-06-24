@@ -5,7 +5,7 @@ use std::ptr;
 use std::slice;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-    Arc, OnceLock,
+    Arc, Condvar as StdCondvar, Mutex as StdMutex, OnceLock,
 };
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +24,8 @@ use mooncake_store_core::{
 };
 use mooncake_store_route::{RouteHitReporter, RouteOperations};
 use mooncake_transport::{
-    Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
+    Opcode, SegmentBuffer, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode,
+    TransferRequest,
 };
 use parking_lot::Mutex;
 use tracing::{debug, info, info_span, trace, warn};
@@ -33,7 +34,7 @@ use crate::control_plane::pb;
 use crate::control_plane::{
     control_address_label, AllocatorService, ControlPlaneClient, ControlPlaneHandle,
     EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp, ReserveSpecificOp,
-    RouteTrafficReport,
+    RouteTrafficReport, UnsupportedColdTierControlService,
 };
 use crate::memory::{
     execute_copy_instructions, LocalMemoryConfig, LocalMemoryState, PreparedCopy, RegionAllocation,
@@ -63,6 +64,7 @@ const DEFAULT_REQUEST_TIMEOUT_CAP: Duration = Duration::from_secs(60);
 const DEFAULT_REQUEST_FAILOVER_SLACK: Duration = Duration::from_millis(250);
 const DEFAULT_REQUEST_THROUGHPUT_FLOOR_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 const DEFAULT_ROUTE_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
+const DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY: Duration = Duration::from_millis(10);
 const DEFAULT_PUT_WRITE_RETRY_LIMIT: usize = 4;
 const DEFAULT_SEGMENT_PUBLISH_LEASE_TTL_MS: u64 = 30_000;
 const DEFAULT_TENANT_QUOTA_RESERVATION_TTL_MS: u64 = 60_000;
@@ -123,6 +125,7 @@ use cold_tier_storage_backend::*;
 /// Cold tier device management, admission control, offload pipeline, and cleanup.
 #[allow(dead_code)]
 mod cold_tier;
+use self::cold_tier::ColdTierHandle;
 
 type SharedRouteWriteGate = Arc<RouteWriteGate>;
 
@@ -167,7 +170,11 @@ pub struct StoreClient {
     /// Controls cleanup behavior during client shutdown (Restart vs Decommission).
     #[allow(dead_code)] // used in Drop impl for shutdown cleanup
     cold_tier_shutdown_mode: ColdTierShutdownMode,
+    restore_promotions: SharedRestorePromotionQueue,
     cold_tier: cold_tier::ColdTierHandle,
+    cold_restore_flights: SharedColdRestoreSingleflight,
+    #[allow(dead_code)]
+    deferred_cold_tier_reconciles: Mutex<Vec<DeferredColdTierReconcile>>,
 }
 
 enum HealthUpdateKind {

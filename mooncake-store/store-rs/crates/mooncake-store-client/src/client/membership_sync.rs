@@ -226,6 +226,14 @@ struct AsyncReplicaTrackHandle {
 }
 
 impl AsyncReplicaTrackHandle {
+    fn disabled() -> Self {
+        Self {
+            sender: None,
+            shutdown: None,
+            thread: None,
+        }
+    }
+
     fn spawn(
         runtime: &ClientRuntimeId,
         metadata: Arc<dyn MetadataBackend>,
@@ -329,6 +337,14 @@ struct AsyncRouteHitReportHandle {
 }
 
 impl AsyncRouteHitReportHandle {
+    fn disabled() -> Self {
+        Self {
+            sender: None,
+            shutdown: None,
+            thread: None,
+        }
+    }
+
     fn spawn(
         runtime: &ClientRuntimeId,
         metadata: Arc<dyn MetadataBackend>,

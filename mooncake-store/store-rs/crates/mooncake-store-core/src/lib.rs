@@ -18,8 +18,8 @@ pub use error::{Result, StoreError};
 pub use hugepage::{parse_hugepage_size, HugePageConfig};
 pub use identity::{
     ClientEndpointSet, ClientEpoch, ClientRuntimeId, ClientStableId, LogicalObjectId,
-    NamespaceScope, ReuseIdentity, CONTROL_ADDR_LABEL, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
-    DEFAULT_QOS_TIER, DEFAULT_TENANT, METRICS_PORT_LABEL,
+    NamespaceScope, ReuseIdentity, COLD_TIER_MIGRATION_SOURCE_SEGMENT, CONTROL_ADDR_LABEL,
+    DEFAULT_DOMAIN, DEFAULT_OBJECT_SET, DEFAULT_QOS_TIER, DEFAULT_TENANT, METRICS_PORT_LABEL,
 };
 pub use identity_codec::{
     apply_route_identity, parse_legacy_scoped_key, route_logical_object_id, route_reuse_identity,

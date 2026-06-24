@@ -11,6 +11,7 @@ pub const DEFAULT_OBJECT_SET: &str = "default";
 pub const DEFAULT_QOS_TIER: &str = "default";
 pub const CONTROL_ADDR_LABEL: &str = "control_addr";
 pub const METRICS_PORT_LABEL: &str = "metrics_port";
+pub const COLD_TIER_MIGRATION_SOURCE_SEGMENT: &str = "__cold_tier__";
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ClientStableId(pub String);

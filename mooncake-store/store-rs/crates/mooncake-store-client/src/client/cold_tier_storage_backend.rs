@@ -402,8 +402,8 @@ pub(super) struct ColdObjectWrite<'a> {
 
 /// A batched cold tier read request that copies the payload into a caller-provided buffer.
 pub(super) struct ColdObjectRead<'a, 'b> {
-    cold_backing: &'a mooncake_store_core::ColdBackingRoute,
-    dst: &'b mut [u8],
+    pub(super) cold_backing: &'a mooncake_store_core::ColdBackingRoute,
+    pub(super) dst: &'b mut [u8],
 }
 
 /// A batched cold tier read request that returns an owned or pinned payload without copying.

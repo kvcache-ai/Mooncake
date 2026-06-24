@@ -27,11 +27,11 @@ use super::{
     flatten_slices, now_ms, payload_checksum, record_success_metric, route_topk_from_tenant_spec,
     run_bounded_parallel_jobs, scatter_into_buffers, shared_cold_tier_device_cache,
     shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
-    ColdTierBackendResolver, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
-    ColdTierRateLimitConfig, ColdTierWatermarkConfig, LiveClientCache, LocalAllocatorAdapter,
-    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, ResolvedObject,
-    RouteWriteGate, SegmentAllocator, StorageOwnerColdTierConfig, StorageOwnerState, StoreState,
-    SuspectRuntimeCache,
+    ColdTierBackendResolver, ColdTierKind, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
+    ColdTierRateLimitConfig, ColdTierTargetConfig, ColdTierWatermarkConfig, LiveClientCache,
+    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
+    ReplicaWriteTarget, ResolvedObject, RouteWriteGate, SegmentAllocator,
+    StorageOwnerColdTierConfig, StorageOwnerState, StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -2512,6 +2512,71 @@ fn resolved_object_for_route(
 fn test_future_expiry_ms() -> u64 {
     now_ms().saturating_add(30_000)
 }
+
+fn cold_tier_test_root(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "mooncake-store-client-cold-tier-test-{}-{name}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    root
+}
+
+#[allow(dead_code)]
+fn cold_tier_test_config(name: &str) -> ColdTierTargetConfig {
+    ColdTierTargetConfig::directory(name, ColdTierKind::Ssd, cold_tier_test_root(name))
+}
+
+fn cold_tier_test_config_with_root(name: &str, root: std::path::PathBuf) -> ColdTierTargetConfig {
+    ColdTierTargetConfig::directory(name, ColdTierKind::Ssd, root)
+}
+
+fn wait_for_materialized_cold_backing(
+    client: &StoreClient,
+    key: &str,
+) -> mooncake_store_core::ColdBackingRoute {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let route = client
+            .query_route(key)
+            .expect("route query should succeed")
+            .expect("route should exist");
+        if let Some(cold_backing) = route.cold_backing.as_ref() {
+            if cold_backing.state == mooncake_store_core::ColdBackingState::Materialized {
+                return cold_backing.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cold backing did not materialize in time: route={route:?}"
+        );
+        sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_route_replica_on_owner(
+    client: &StoreClient,
+    key: &str,
+    owner: &ClientRuntimeId,
+) -> ObjectRoute {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let route = client
+            .query_route(key)
+            .expect("route query should succeed")
+            .expect("route should exist after restore");
+        if route.replicas.len() == 1 && route.replicas[0].owner == *owner {
+            return route;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "route was not promoted onto expected owner in time"
+        );
+        sleep(Duration::from_millis(10));
+    }
+}
+
+include!("cold_tier_restore_flow_tests.rs");
 
 fn test_storage_owner_state(
     runtime: &ClientRuntimeId,

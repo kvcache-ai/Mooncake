@@ -16,6 +16,14 @@ pub(crate) struct ControlPlaneHandle {
 }
 
 impl ControlPlaneHandle {
+    pub(crate) fn detached() -> Self {
+        Self {
+            address: String::new(),
+            shutdown: None,
+            thread: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn spawn(
         bind_host: &str,
@@ -29,6 +37,7 @@ impl ControlPlaneHandle {
             allocator,
             eviction,
             Arc::new(UnsupportedMigrationService),
+            Arc::new(UnsupportedColdTierControlService),
         )
     }
 
@@ -38,6 +47,7 @@ impl ControlPlaneHandle {
         allocator: Arc<dyn AllocatorService>,
         eviction: Arc<dyn EvictionService>,
         migration: Arc<dyn MigrationService>,
+        cold_tier: Arc<dyn ColdTierControlService>,
     ) -> Result<Self> {
         let listener = std::net::TcpListener::bind((bind_host, 0)).map_err(|error| {
             StoreError::Transport(format!("control plane bind on {bind_host} failed: {error}"))
@@ -72,6 +82,7 @@ impl ControlPlaneHandle {
                     allocator,
                     eviction,
                     migration,
+                    cold_tier,
                 )
             })
             .map_err(|error| {
@@ -148,9 +159,11 @@ fn run_server(
     allocator: Arc<dyn AllocatorService>,
     eviction: Arc<dyn EvictionService>,
     migration: Arc<dyn MigrationService>,
+    cold_tier: Arc<dyn ColdTierControlService>,
 ) {
-    let service =
-        GrpcControlPlaneService::new_with_migration(authority, allocator, eviction, migration);
+    let service = GrpcControlPlaneService::new_with_migration(
+        authority, allocator, eviction, migration, cold_tier,
+    );
     let result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
             StoreError::Transport(format!("control plane listener conversion failed: {error}"))
@@ -176,7 +189,81 @@ pub(super) struct GrpcControlPlaneService {
     allocator: Arc<dyn AllocatorService>,
     eviction: Arc<dyn EvictionService>,
     migration: Arc<dyn MigrationService>,
+    cold_tier: Arc<dyn ColdTierControlService>,
     stats: Arc<ControlPlaneServerStats>,
+}
+
+fn cold_read_response_to_pb(
+    response: ColdReadResponse,
+) -> (pb::ReadFromColdReply, Option<Box<dyn FnOnce() + Send>>) {
+    let reply = match response.result {
+        Ok(result) => pb::ReadFromColdReply {
+            segment_name: result.segment_name,
+            segment_offset: result.segment_offset,
+            length: result.length,
+            checksum: result.checksum,
+            target_chunks: result
+                .target_chunks
+                .into_iter()
+                .map(|chunk| pb::SegmentTargetChunk {
+                    logical_offset: chunk.logical_offset,
+                    target_offset: chunk.target_offset,
+                    length_bytes: chunk.length_bytes,
+                })
+                .collect(),
+            transport_endpoint: result.transport_endpoint,
+            transport_segment_descriptor: result.transport_segment_descriptor,
+            error: None,
+            admission_wait_us: result.admission_wait_us,
+            ssd_read_us: result.ssd_read_us,
+            memcpy_us: result.memcpy_us,
+            route_update_us: result.route_update_us,
+            total_promote_us: result.total_promote_us,
+            backpressure: false,
+        },
+        Err(StoreError::Backpressure(_)) => pb::ReadFromColdReply {
+            segment_name: String::new(),
+            segment_offset: 0,
+            length: 0,
+            checksum: None,
+            target_chunks: Vec::new(),
+            transport_endpoint: None,
+            transport_segment_descriptor: None,
+            error: None,
+            admission_wait_us: 0,
+            ssd_read_us: 0,
+            memcpy_us: 0,
+            route_update_us: 0,
+            total_promote_us: 0,
+            backpressure: true,
+        },
+        Err(error) => pb::ReadFromColdReply {
+            segment_name: String::new(),
+            segment_offset: 0,
+            length: 0,
+            checksum: None,
+            target_chunks: Vec::new(),
+            transport_endpoint: None,
+            transport_segment_descriptor: None,
+            error: Some(pb_error(error)),
+            admission_wait_us: 0,
+            ssd_read_us: 0,
+            memcpy_us: 0,
+            route_update_us: 0,
+            total_promote_us: 0,
+            backpressure: false,
+        },
+    };
+    (reply, response.deferred_promote)
+}
+
+async fn run_blocking_control<T: Send + 'static>(
+    operation: &'static str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, Status> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|error| Status::internal(format!("{operation} worker failed: {error}")))
 }
 
 impl GrpcControlPlaneService {
@@ -190,6 +277,7 @@ impl GrpcControlPlaneService {
             allocator,
             eviction,
             Arc::new(UnsupportedMigrationService),
+            Arc::new(UnsupportedColdTierControlService),
         )
     }
 
@@ -198,12 +286,14 @@ impl GrpcControlPlaneService {
         allocator: Arc<dyn AllocatorService>,
         eviction: Arc<dyn EvictionService>,
         migration: Arc<dyn MigrationService>,
+        cold_tier: Arc<dyn ColdTierControlService>,
     ) -> Self {
         Self {
             authority,
             allocator,
             eviction,
             migration,
+            cold_tier,
             stats: Arc::new(ControlPlaneServerStats::default()),
         }
     }
@@ -269,6 +359,122 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             },
         };
         Ok(Response::new(reply))
+    }
+
+    async fn read_from_cold(
+        &self,
+        request: Request<pb::ReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::ReadFromColdReply>, Status> {
+        let request = request.into_inner();
+        if request.tenant.is_empty() || request.key.is_empty() {
+            return Err(Status::invalid_argument(
+                "read_from_cold requires non-empty tenant and key",
+            ));
+        }
+        let cold_tier = self.cold_tier.clone();
+        let (reply, deferred_promote) = run_blocking_control("read_from_cold", move || {
+            cold_read_response_to_pb(cold_tier.read_from_cold(
+                &request.namespace,
+                &request.authority,
+                &request.tenant,
+                &request.key,
+                &request.domain,
+                &request.object_set,
+            ))
+        })
+        .await?;
+        if let Some(promote) = deferred_promote {
+            tokio::task::spawn_blocking(promote);
+        }
+        Ok(Response::new(reply))
+    }
+
+    async fn batch_read_from_cold(
+        &self,
+        request: Request<pb::BatchReadFromColdRequest>,
+    ) -> std::result::Result<Response<pb::BatchReadFromColdReply>, Status> {
+        let request = request.into_inner();
+        for target in &request.targets {
+            if target.tenant.is_empty() || target.key.is_empty() {
+                return Err(Status::invalid_argument(
+                    "batch_read_from_cold requires non-empty tenant and key for every target",
+                ));
+            }
+        }
+        let cold_tier = self.cold_tier.clone();
+        let namespace = request.namespace;
+        let authority = request.authority;
+        let targets = request
+            .targets
+            .into_iter()
+            .map(|target| ColdReadTarget {
+                tenant: target.tenant,
+                key: target.key,
+                domain: target.domain,
+                object_set: target.object_set,
+            })
+            .collect::<Vec<_>>();
+        let responses = run_blocking_control("batch_read_from_cold", move || {
+            cold_tier.batch_read_from_cold(&namespace, &authority, targets)
+        })
+        .await?;
+        let mut results = Vec::with_capacity(responses.len());
+        for response in responses {
+            let (reply, deferred_promote) = cold_read_response_to_pb(response);
+            results.push(reply);
+            if let Some(promote) = deferred_promote {
+                tokio::task::spawn_blocking(promote);
+            }
+        }
+        Ok(Response::new(pb::BatchReadFromColdReply { results }))
+    }
+
+    async fn ack_cold_read_complete(
+        &self,
+        request: Request<pb::AckColdReadCompleteRequest>,
+    ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
+        let request = request.into_inner();
+        if request.segment_names.len() != request.segment_offsets.len() {
+            return Err(Status::invalid_argument(
+                "ack_cold_read_complete requires equal segment_names and segment_offsets lengths",
+            ));
+        }
+        let cold_tier = self.cold_tier.clone();
+        run_blocking_control("ack_cold_read_complete", move || {
+            let slots = request
+                .segment_names
+                .into_iter()
+                .zip(request.segment_offsets)
+                .map(|(name, offset)| (SegmentName::new(name), offset))
+                .collect::<Vec<_>>();
+            cold_tier.ack_cold_read_complete(&slots);
+        })
+        .await?;
+        Ok(Response::new(pb::AckColdReadCompleteReply {}))
+    }
+
+    async fn pin_for_read(
+        &self,
+        request: Request<pb::PinForReadRequest>,
+    ) -> std::result::Result<Response<pb::PinForReadReply>, Status> {
+        let request = request.into_inner();
+        if request.segment_names.len() != request.segment_offsets.len() {
+            return Err(Status::invalid_argument(
+                "pin_for_read requires equal segment_names and segment_offsets lengths",
+            ));
+        }
+        let cold_tier = self.cold_tier.clone();
+        let pinned = run_blocking_control("pin_for_read", move || {
+            let slots = request
+                .segment_names
+                .into_iter()
+                .zip(request.segment_offsets)
+                .map(|(name, offset)| (SegmentName::new(name), offset))
+                .collect::<Vec<_>>();
+            cold_tier.pin_for_read(&slots)
+        })
+        .await?;
+        Ok(Response::new(pb::PinForReadReply { pinned }))
     }
 
     async fn get_route(
