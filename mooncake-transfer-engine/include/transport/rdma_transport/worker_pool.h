@@ -40,6 +40,8 @@ class WorkerPool {
 
     void transferWorker(int thread_id);
 
+    bool hasOutstandingCq();
+
     void monitorWorker();
 
     int doProcessContextEvents();
@@ -86,7 +88,6 @@ class WorkerPool {
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
-    std::atomic<int> suspended_flag_;
 
     std::atomic<int> redispatch_counter_;
 

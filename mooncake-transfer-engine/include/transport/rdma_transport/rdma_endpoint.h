@@ -59,6 +59,7 @@ class RdmaEndPoint {
     int reconstruct();
     int deconstruct();
     int deconstructLocked();
+    void beginDestroyLocked();
 
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
@@ -113,25 +114,8 @@ class RdmaEndPoint {
    private:
     int disconnectUnlocked();
 
-    // Resets the connection.
-    //
-    // The main difference between this function and `disconnectUnlocked`
-    // is that it will reconstruct QPs when `CONFIG_ERDMA` is defined.
-    // Without `CONFIG_ERDMA`, it is essentially the same as
-    // `disconnectUnlocked` but with additional logging.
-    //
-    // This serves as a workaround for Aliyun eRDMA devices (i.e., once a QP is
-    // transitioned to the RTS state, it cannot be reset to RTS again directly).
-    // For more details:
-    // https://github.com/kvcache-ai/Mooncake/pull/1733#discussion_r2992088663
-    //
-    // In practice:
-    // - Call `resetConnection` if the QPs' state may have transitioned to RTS.
-    // - Call `disconnectUnlocked` otherwise.
-    //
-    // This is mainly used in `setupConnectionsByActive` or
-    // `setupConnectionsByPassive`. It is NOT invoked in the normal execution
-    // flow, so a `reason` argument is passed for internal logging purposes.
+    // Resets only pre-connected handshake attempts. Once an endpoint has ever
+    // reached CONNECTED, it is retired instead of being reused.
     int resetConnection(const std::string &reason);
 
    public:
@@ -199,6 +183,7 @@ class RdmaEndPoint {
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
+    bool has_connected_;
 
     volatile int *wr_depth_list_;
     int max_wr_depth_;

@@ -35,7 +35,6 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
-      suspended_flag_(0),
       redispatch_counter_(0),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
@@ -189,7 +188,7 @@ int WorkerPool::submitPostSend(
     }
 
     submitted_slice_count_.fetch_add(submitted_slice_count);
-    if (suspended_flag_.load()) {
+    if (submitted_slice_count) {
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
     }
@@ -440,6 +439,13 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 }
 
+bool WorkerPool::hasOutstandingCq() {
+    for (int cq_index = 0; cq_index < context_.cqCount(); ++cq_index) {
+        if (*context_.cqOutstandingCount(cq_index) > 0) return true;
+    }
+    return false;
+}
+
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
@@ -449,18 +455,18 @@ void WorkerPool::transferWorker(int thread_id) {
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
             submitted_slice_count_.load(std::memory_order_relaxed);
-        if (processed_slice_count == submitted_slice_count) {
+        if (processed_slice_count == submitted_slice_count &&
+            !hasOutstandingCq()) {
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
-                suspended_flag_.fetch_add(1);
                 // Double-check condition after acquiring lock to avoid lost
                 // wakeup
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
-                    submitted_slice_count_.load()) {
+                        submitted_slice_count_.load() &&
+                    !hasOutstandingCq()) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
-                suspended_flag_.fetch_sub(1);
                 last_wait_ts = curr_wait_ts;
             }
             continue;

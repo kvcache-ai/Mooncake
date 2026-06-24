@@ -67,6 +67,7 @@ static void rememberAutoGidSelection(
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
+      has_connected_(false),
       wr_depth_list_(nullptr),
       active_(true),
       cq_outstanding_(nullptr) {}
@@ -202,6 +203,10 @@ int RdmaEndPoint::destroyQP() { return deconstruct(); }
 
 void RdmaEndPoint::beginDestroy() {
     RWSpinlock::WriteGuard guard(lock_);
+    beginDestroyLocked();
+}
+
+void RdmaEndPoint::beginDestroyLocked() {
     auto current_status = status_.load(std::memory_order_relaxed);
     if (current_status == DESTROYING || current_status == DESTROYED) return;
 
@@ -285,9 +290,12 @@ bool RdmaEndPoint::finishDestroy() {
 
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (connected()) {
-        LOG(WARNING) << "Previous connection will be discarded";
-        disconnectUnlocked();
+    auto curr_status = status_.load(std::memory_order_relaxed);
+    if (curr_status != INITIALIZING && curr_status != UNCONNECTED) {
+        LOG(ERROR) << "Cannot change peer NIC path after endpoint lifecycle "
+                      "has started: "
+                   << toString();
+        return;
     }
     peer_nic_path_ = peer_nic_path;
 }
@@ -655,51 +663,56 @@ int RdmaEndPoint::disconnectUnlocked() {
     auto curr_status = status_.load(std::memory_order_acquire);
     if (curr_status != CONNECTED && curr_status != CONNECTING) return 0;
 
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    int ret = 0;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (curr_ret) {
-            PLOG(ERROR) << "Failed to modify QP to RESET";
-            ret = ERR_ENDPOINT;
-        }
-        // After resetting QP, the wr_depth_list_ won't change
-        bool displayed = false;
-        if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
+    if (!has_connected_) {
+        // Pre-connected handshake retries are allowed to reuse this endpoint:
+        // no user WR has been posted yet. eRDMA still needs fresh QPs because
+        // a QP that reached RTS cannot be reliably reset back to RTS.
+#ifdef CONFIG_ERDMA
+        return reconstruct();
+#else
+        ibv_qp_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_RESET;
+        int ret = 0;
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
+            if (curr_ret) {
+                PLOG(ERROR) << "Failed to modify pre-connected QP to RESET";
+                ret = ERR_ENDPOINT;
             }
-            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-            wr_depth_list_[i] = 0;
+            CHECK_EQ(wr_depth_list_[i], 0)
+                << "Pre-connected endpoint must not have outstanding WRs";
         }
+        peer_qp_num_list_.clear();
+        status_.store(UNCONNECTED, std::memory_order_release);
+        return ret;
+#endif
     }
-    peer_qp_num_list_.clear();
-    status_.store(UNCONNECTED, std::memory_order_release);
-    return ret;
+
+    beginDestroyLocked();
+    return 0;
 }
 
 int RdmaEndPoint::resetConnection(const std::string &reason) {
     auto curr_status = status_.load(std::memory_order_acquire);
     if (curr_status != CONNECTING && curr_status != CONNECTED) return 0;
 
-#ifdef CONFIG_ERDMA
-    int ret = reconstruct();
-#else
-    int ret = disconnectUnlocked();
-#endif
-
-    if (ret) {
-        LOG(ERROR) << "Failed to reset the endpoint (triggered by: " << reason
-                   << "): error=" << ret;
-    } else {
-        LOG(INFO) << "Successfully reset the endpoint (triggered by: " << reason
-                  << ").";
+    if (!has_connected_) {
+        int ret = disconnectUnlocked();
+        if (ret) {
+            LOG(ERROR) << "Failed to reset pre-connected endpoint "
+                       << "(triggered by: " << reason << "): error=" << ret;
+        } else {
+            LOG(INFO) << "Successfully reset pre-connected endpoint "
+                      << "(triggered by: " << reason << ").";
+        }
+        return ret;
     }
-    return ret;
+
+    LOG(WARNING) << "Retiring endpoint instead of resetting it (triggered by: "
+                 << reason << "): " << toString();
+    beginDestroyLocked();
+    return ERR_ENDPOINT;
 }
 
 const std::string RdmaEndPoint::toString() const {
@@ -896,6 +909,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
     }
 
     peer_qp_num_list_ = std::move(peer_qp_num_list);
+    has_connected_ = true;
     status_.store(CONNECTED, std::memory_order_relaxed);
     return 0;
 }
