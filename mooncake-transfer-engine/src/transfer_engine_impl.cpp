@@ -202,6 +202,26 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
+    // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
+    // transport installation logic and use TCP transport only. This allows
+    // running metadata-only instances without requiring specialized hardware
+    // (e.g., NPU for Ascend Direct, RDMA HCAs, etc.).
+    if (getenv("MC_FORCE_TCP")) {
+#ifdef USE_TCP
+        Transport* tcp_transport =
+            multi_transports_->installTransport("tcp", nullptr);
+        if (!tcp_transport) {
+            LOG(ERROR) << "MC_FORCE_TCP is set but failed to install TCP transport";
+            return -1;
+        }
+        LOG(INFO) << "MC_FORCE_TCP is set, using TCP transport only";
+        return 0;
+#else
+        LOG(ERROR) << "MC_FORCE_TCP is set but USE_TCP is not compiled in";
+        return -1;
+#endif
+    }
+
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     Transport* ascend_transport =
         multi_transports_->installTransport("ascend", local_topology_);
