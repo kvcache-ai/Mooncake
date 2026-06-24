@@ -483,7 +483,10 @@ class _BundleManifestStore:
             written_keys.extend(meta_keys)
             for name, value in buffers.items():
                 _validate_key_segment(name, "buffer name")
-                payload_value = value if isinstance(value, _TensorPayload) else _bytes_view(value, name)
+                if isinstance(value, _TensorPayload):
+                    payload_value = value
+                else:
+                    payload_value = _bytes_view(value, name)
                 payload_spec, payload_keys = self._put_payload(
                     f"{base_key}/buffer/{name}",
                     payload_value,
