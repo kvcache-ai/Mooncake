@@ -249,6 +249,80 @@ curl -s http://<master_host>:9003/metrics
 curl -s http://<master_host>:9003/metrics/summary
 ```
 
+When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges and quota counters:
+
+- `mooncake_tenant_quota_requested_bytes{tenant_id}`
+- `mooncake_tenant_quota_effective_bytes{tenant_id}`
+- `mooncake_tenant_quota_used_bytes{tenant_id}`
+- `mooncake_tenant_quota_reserved_bytes{tenant_id}`
+- `mooncake_tenant_quota_committed_count{tenant_id}`
+- `mooncake_tenant_quota_over_quota{tenant_id}`
+- `mooncake_tenant_quota_explicit_policy{tenant_id}`
+- `mooncake_tenant_quota_reject_total{tenant_id,reason}`
+- `mooncake_tenant_evict_bytes_total{tenant_id}`
+- `mooncake_tenant_quota_allocatable_capacity_bytes`
+- `mooncake_tenant_quota_requested_bytes_sum`
+- `mooncake_tenant_quota_effective_bytes_sum`
+
+---
+
+## Tenant Quota Management
+
+Tenant quota admission is disabled by default. Enable it on the master when you want memory writes admitted against per-tenant quota:
+
+```bash
+mooncake_master \
+  --enable_tenant_quota=true \
+  --default_tenant_quota_bytes=1073741824 \
+  --tenant_quota_pool_capacity_bytes=0
+```
+
+`tenant_quota_pool_capacity_bytes=0` uses the full registered memory capacity as the quota allocation pool. A nonzero value caps the capacity used to compute effective tenant quotas.
+
+The same HTTP port used for metrics exposes the tenant quota admin API:
+
+```bash
+# List tenant quota snapshots
+curl -s http://<master_host>:9003/api/v1/tenant_quotas
+
+# Query one tenant
+curl -s "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
+
+# Upsert an explicit policy. Explicit tenant policies must be positive.
+curl -s -X PUT "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a" \
+  -H 'Content-Type: application/json' \
+  -d '{"requested_quota_bytes":2147483648}'
+
+# Delete an explicit policy so the tenant inherits the default policy again.
+curl -s -X DELETE "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
+
+# Query or update the default requested quota. The default may be 0.
+curl -s http://<master_host>:9003/api/v1/tenant_quotas/default
+curl -s -X PUT http://<master_host>:9003/api/v1/tenant_quotas/default \
+  -H 'Content-Type: application/json' \
+  -d '{"requested_quota_bytes":1073741824}'
+```
+
+Each tenant quota snapshot returns:
+
+```json
+{
+  "success": true,
+  "data": {
+    "tenant_id": "tenant-a",
+    "requested_quota_bytes": 2147483648,
+    "effective_quota_bytes": 2147483648,
+    "used_bytes": 0,
+    "reserved_bytes": 0,
+    "committed_count": 0,
+    "over_quota": false,
+    "has_explicit_policy": true
+  }
+}
+```
+
+In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If tenant quota is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`.
+
 ---
 
 ## Quick Tips
@@ -336,6 +410,14 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.95` | Usage ratio triggering eviction |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
+
+### Tenant Quota
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_tenant_quota` | `false` | Enable per-tenant memory quota admission |
+| `--default_tenant_quota_bytes` | `0` | Default requested quota for tenants without explicit policy; `0` is allowed and inherited-default tenants still share capacity left by explicit tenants |
+| `--tenant_quota_pool_capacity_bytes` | `0` | Capacity used to compute effective tenant quotas; `0` means total registered memory capacity |
 
 ### High Availability
 

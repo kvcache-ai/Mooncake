@@ -183,6 +183,29 @@ prompt_ids = result.objects["prompt_ids"]
 metadata = result.metadata
 ```
 
+### Structured object transfer policy
+
+By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. This keeps the existing behavior: Mooncake uses the zero-copy `batch_put_from` fast path when buffer registration is available, and falls back to ordinary `store.put` when the fast path is unavailable.
+
+For very large tensors, buffer registration capacity can be exhausted. If the upper layer does not handle this failure mode yet, force the non-zero-copy path with `copy_mode="copy"`:
+
+```python
+from mooncake.structured_object_store import BundleTransferPolicy
+
+ref = transfer.put_structured_object(
+    payload,
+    policy=BundleTransferPolicy(copy_mode="copy"),
+)
+```
+
+Available modes:
+
+- `auto`: prefer zero-copy and fall back to regular `store.put` when zero-copy support is unavailable;
+- `copy`: force the non-zero-copy `store.put` path;
+- `zero_copy`: require the zero-copy `batch_put_from` path and raise an error if it is unavailable.
+
+If a caller has already registered a structured member buffer, pass `pre_registered_buffers={"member_name": True}` to avoid duplicate registration. The buffer must be the same writable, contiguous buffer used for transfer; read-only, non-contiguous, or internally copied buffers are rejected.
+
 ### Partial reads
 
 Read narrowing happens on top of `read_spec(ref)`:
