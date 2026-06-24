@@ -147,6 +147,7 @@ design/ssd-free-ratio-first-allocation
 api-reference/python/index
 api-reference/cpp/index
 api-reference/http/index
+api-reference/rust/index
 :::
 
 % Q&A for Mooncake

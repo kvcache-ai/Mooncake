@@ -97,7 +97,7 @@ After allocating from the SSD-ranked candidates, any remaining replicas that cou
 `LocalDiskSegment` maintains `ssd_total_capacity_bytes`, updated by `ReportSsdCapacity`, and an atomic counter `ssd_used_bytes` that tracks the total number of bytes currently occupied by offloaded replicas on the segment's SSD. `ssd_used_bytes` is updated alongside metadata changes:
 
 - **Increment**: `NotifyOffloadSuccess` increments `ssd_used_bytes` by the object size only after the master successfully adds a `LOCAL_DISK` replica to the object entry. If the object has already disappeared from metadata, the notification is ignored and the counter is not changed.
-- **Decrement**: The master decrements `ssd_used_bytes` when a `LOCAL_DISK` replica is actually removed from metadata. Full object deletion releases all associated local-disk usage through `EraseMetadata`, while partial replica deletion uses `EraseReplicasAndTrackSsdUsage` to pop erased replicas and release usage for removed `LOCAL_DISK` entries.
+- **Decrement**: The master decrements `ssd_used_bytes` via `ReleaseLocalDiskUsage` whenever a `LOCAL_DISK` replica is removed from metadata — on full object deletion (`EraseMetadata`), and on partial replica removal through the shared erase helper (`EraseReplicasWithCacheTotalAccounting`, used by batch clear, revoke, and stale-handle cleanup) and the local-disk eviction path. `ReleaseLocalDiskUsage` iterates only `LOCAL_DISK` replicas and is a no-op for other replica types, so it is safe to call on any replica set.
 
 The counter is atomic to allow concurrent updates from multiple RPC handler threads without requiring a separate lock. The allocation strategy treats it as an eventually consistent placement signal and clamps it before computing the free ratio.
 
