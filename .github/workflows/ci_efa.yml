@@ -55,9 +55,9 @@ jobs:
 
     - name: Install CUDA Toolkit
       if: matrix.use_cuda == 'ON'
-      uses: Jimver/cuda-toolkit@v0.2.29
+      uses: Jimver/cuda-toolkit@v0.2.24
       with:
-        cuda: '12.4.1'
+        cuda: '12.8.1'
         method: 'network'
         sub-packages: '["nvcc", "nvrtc-dev"]'
         non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
