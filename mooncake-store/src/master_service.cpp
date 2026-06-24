@@ -94,12 +94,17 @@ size_t RandomIndex(size_t upper_bound) {
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
+    const auto write_mode = DetermineReplicaWriteMode(config);
+    if (write_mode == ReplicaWriteMode::RELIABLE_MULTI_REPLICA) {
+        return allocated_memory_replicas == config.replica_num &&
+               allocated_nof_replicas == config.nof_replica_num;
+    }
+    if (write_mode == ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        return allocated_memory_replicas + allocated_nof_replicas > 0;
+    }
+    // SINGLE_REPLICA
     if (config.nof_replica_num == 0) {
         return allocated_memory_replicas > 0;
-    }
-    if (DetermineReplicaWriteMode(config) ==
-        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
-        return allocated_memory_replicas + allocated_nof_replicas > 0;
     }
     return allocated_memory_replicas == config.replica_num &&
            allocated_nof_replicas == config.nof_replica_num;

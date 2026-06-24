@@ -167,14 +167,19 @@ struct ReplicaTransferSummary {
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
-    if (config.nof_replica_num == 0) {
-        return summary.allocated_memory_replicas > 0;
+    const auto write_mode = DetermineReplicaWriteMode(config);
+    if (write_mode == ReplicaWriteMode::RELIABLE_MULTI_REPLICA) {
+        return summary.allocated_memory_replicas == config.replica_num &&
+               summary.allocated_nof_replicas == config.nof_replica_num;
     }
-    if (DetermineReplicaWriteMode(config) ==
-        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+    if (write_mode == ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
         return summary.allocated_memory_replicas +
                    summary.allocated_nof_replicas >
                0;
+    }
+    // SINGLE_REPLICA
+    if (config.nof_replica_num == 0) {
+        return summary.allocated_memory_replicas > 0;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
            summary.allocated_nof_replicas == config.nof_replica_num;

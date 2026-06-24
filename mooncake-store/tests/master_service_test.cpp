@@ -4093,8 +4093,10 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(
         *service_, "single_segment", kBaseAddr, kSegmentSize);
 
-    // Request replication factor 2 with a single 1KB slice.
-    // With best-effort semantics, should succeed with 1 replica.
+    // Request replication factor 2 with a single 1KB slice and only one
+    // segment mounted. RELIABLE_MULTI_REPLICA mode requires the exact
+    // requested replica count, so this must fail with
+    // NO_AVAILABLE_HANDLE rather than silently returning only 1 replica.
     const std::string key = "replication_factor_two_single_segment";
     uint64_t slice_length = 1024;
     ReplicateConfig config;
@@ -4102,17 +4104,8 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
 
     auto put_start_result =
         service_->PutStart(client_id, key, slice_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
-    auto replicas = put_start_result.value();
-
-    // Should get 1 replica instead of the requested 2 (best-effort).
-    EXPECT_EQ(1u, replicas.size());
-    EXPECT_TRUE(replicas[0].is_memory_replica());
-
-    // Verify the replica is properly allocated on the single segment.
-    auto mem_desc = replicas[0].get_memory_descriptor();
-    EXPECT_EQ("single_segment", mem_desc.buffer_descriptor.transport_endpoint_);
-    EXPECT_EQ(1024u, mem_desc.buffer_descriptor.size_);
+    EXPECT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTest) {

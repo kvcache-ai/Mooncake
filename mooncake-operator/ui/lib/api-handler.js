@@ -707,7 +707,7 @@ PYEOF`
         env: [
           { name: 'MC_MASTER_ADDR', value: masterAddr },
           { name: 'MC_METADATA_SERVER', value: metadataServer },
-          { name: 'MC_SEGMENT_SIZE', value: String(segmentBytes) },
+          { name: 'MC_SEGMENT_SIZE', value: '0' },
           { name: 'MC_LOCAL_BUFFER_SIZE', value: String(512 * 1024 * 1024) },
           { name: 'MC_PROTOCOL', value: protocol },
           { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },

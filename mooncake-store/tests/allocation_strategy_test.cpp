@@ -746,6 +746,70 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
               << "Time elapsed: " << elapsed_us.count() << " us\n\n";
 }
 
+// Test that simulates writing 16 keys with 3 replicas across 3 workers.
+// This reproduces the real-world scenario where some keys were ending up
+// with only 2 replicas instead of the requested 3.
+TEST_P(AllocationStrategyParameterizedTest, MultipleKeysWithReplicas) {
+    const size_t kNumSegments = 3;
+    const size_t kSegmentSize = 128 * MiB;  // 128MB per segment
+    const size_t kSliceLength = 4 * MiB;    // 4MB per value
+    const size_t kNumKeys = 16;
+    const size_t kReplicaNum = 3;
+
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = "worker-" + std::to_string(i);
+        allocator_manager.addAllocator(
+            name, CreateTestAllocator(name, i * 256 * MiB, kSegmentSize));
+    }
+
+    // Track replication counts per key.
+    size_t keys_with_3_replicas = 0;
+    size_t keys_with_2_replicas = 0;
+    size_t keys_with_1_replica = 0;
+    size_t keys_with_0_replicas = 0;
+
+    // Store allocations to prevent deallocation during the test.
+    std::vector<std::vector<Replica>> all_replicas;
+    all_replicas.reserve(kNumKeys);
+
+    for (size_t i = 0; i < kNumKeys; i++) {
+        auto result = strategy_->Allocate(allocator_manager, kSliceLength,
+                                          kReplicaNum, {}, {});
+        ASSERT_TRUE(result.has_value())
+            << "Allocation " << i << " should succeed (best-effort)";
+        size_t num_replicas = result.value().size();
+        EXPECT_GE(num_replicas, 1)
+            << "Allocation " << i << " should have at least 1 replica";
+
+        switch (num_replicas) {
+            case 3: keys_with_3_replicas++; break;
+            case 2: keys_with_2_replicas++; break;
+            case 1: keys_with_1_replica++; break;
+            case 0: keys_with_0_replicas++; break;
+        }
+
+        all_replicas.push_back(std::move(result.value()));
+    }
+
+    std::cout << "\nMultipleKeysWithReplicas Results (" << kNumKeys
+              << " keys, " << kReplicaNum << " replicas requested, "
+              << kNumSegments << " segments):\n"
+              << "  Keys with 3 replicas: " << keys_with_3_replicas << "\n"
+              << "  Keys with 2 replicas: " << keys_with_2_replicas << "\n"
+              << "  Keys with 1 replica:  " << keys_with_1_replica << "\n"
+              << "  Keys with 0 replicas: " << keys_with_0_replicas << "\n";
+
+    // With 3 segments of 128MB each and 16 keys of 4MB each with 3 replicas,
+    // total allocation is 16*4MB*3 = 192MB, which is 64MB per segment.
+    // This is well within 128MB per segment, so ALL keys should get 3 replicas.
+    EXPECT_EQ(keys_with_3_replicas, kNumKeys)
+        << "All " << kNumKeys << " keys should have " << kReplicaNum
+        << " replicas. Got: 3r=" << keys_with_3_replicas
+        << " 2r=" << keys_with_2_replicas
+        << " 1r=" << keys_with_1_replica;
+}
+
 // Note: The following unit tests for internal helper methods have been removed
 // because those methods (allocateSingleBuffer, tryRandomAllocate,
 // allocateSlice, resetRetryCount, getRetryCount) are no longer part of the

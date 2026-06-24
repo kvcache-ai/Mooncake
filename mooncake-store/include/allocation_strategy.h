@@ -269,11 +269,14 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         // If replica_num is not satisfied, allocate the remaining replicas
-        // randomly.
+        // randomly. We iterate through segments in round-robin fashion.
+        // Each segment is tried at most once; after a full rotation the loop
+        // exits regardless of whether replica_num was reached — this is
+        // best-effort allocation for the random fallback path.
         std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
         size_t start_idx = distribution(generator);
 
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        const size_t max_retry = std::min(kMaxRetryLimit, replica_num * names.size());
         size_t try_count = 0;
 
         while (replicas.size() < replica_num && try_count < max_retry) {
@@ -281,7 +284,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             start_idx++;
             try_count++;
 
-            // Skip excluded and used segments
+            // Skip excluded and already-used segments
             if (excluded_segments.contains(names[index]) ||
                 used_segments.contains(names[index])) {
                 continue;
@@ -292,9 +295,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
-                // Nit: no need to insert names[index] into used_segments here
-                // because we only traverse all names once, thus there is no
-                // chance to try allocating from a segment for the second time.
+                used_segments.insert(names[index]);
             }
         }
 
@@ -485,7 +486,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         // --- Fallback: Random allocation for any remaining replicas ---
         std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
         size_t fallback_idx = distribution(generator);
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        const size_t max_retry = std::min(kMaxRetryLimit, replica_num * names.size());
         size_t try_count = 0;
 
         while (replicas.size() < replica_num && try_count < max_retry) {
