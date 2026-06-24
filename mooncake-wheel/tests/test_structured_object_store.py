@@ -20,6 +20,7 @@ from mooncake.structured_object_store import (
 class InMemoryStore:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.tensor_objects: dict[str, object] = {}
         self.lock = threading.Lock()
         self.registered: set[int] = set()
         self.register_buffer_calls = 0
@@ -33,6 +34,8 @@ class InMemoryStore:
         self.batch_get_into_calls = 0
         self.batch_put_from_calls = 0
         self.batch_remove_calls = 0
+        self.put_tensor_calls = 0
+        self.get_tensor_calls = 0
 
     def _enter_put(self) -> None:
         with self.lock:
@@ -74,7 +77,19 @@ class InMemoryStore:
     def remove(self, key: str, force: bool = False) -> int:
         with self.lock:
             self.objects.pop(key, None)
+            self.tensor_objects.pop(key, None)
         return 0
+
+    def put_tensor(self, key: str, value) -> int:
+        self.put_tensor_calls += 1
+        with self.lock:
+            self.tensor_objects[key] = value.detach().clone()
+        return 0
+
+    def get_tensor(self, key: str):
+        self.get_tensor_calls += 1
+        with self.lock:
+            return self.tensor_objects[key].clone()
 
     def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
         self.batch_remove_calls += 1
@@ -306,6 +321,32 @@ def write_manifest(
     store.objects[manifest_key] = json.dumps(manifest, separators=(",", ":")).encode(
         "utf-8"
     )
+
+
+def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    array = np.arange(6, dtype=np.float32).reshape(2, 3)
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    result = transfer.get_object(transfer.put_object({"array": array, "tensor": tensor}))
+
+    assert np.array_equal(result["array"], array)
+    assert torch.equal(result["tensor"], tensor)
+    assert store.put_tensor_calls == 1
+    assert store.get_tensor_calls == 1
+
+
+def test_put_object_roundtrips_wrapped_numpy_and_torch_values() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    array = np.arange(6, dtype=np.float32).reshape(2, 3)
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    assert np.array_equal(transfer.get_object(transfer.put_object(array)), array)
+    assert torch.equal(transfer.get_object(transfer.put_object(tensor)), tensor)
+    assert store.put_tensor_calls == 1
+    assert store.get_tensor_calls == 1
 
 
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:

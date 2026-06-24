@@ -81,6 +81,12 @@ class StructuredMemberSlice:
 
 
 @dataclass(frozen=True)
+class _TensorPayload:
+    tensor: Any
+    array: np.ndarray
+
+
+@dataclass(frozen=True)
 class StructuredObjectReadSpec:
     """Lazy read plan for structured object materialization."""
 
@@ -198,6 +204,37 @@ class MooncakeBundleTransfer:
             pre_registered_buffers=pre_registered_buffers,
         )
 
+    def put_object(
+        self,
+        obj: Any,
+        partition: str = "default",
+        chunk_bytes: Optional[int] = None,
+        policy: Optional[BundleTransferPolicy] = None,
+        max_inflight_put: Optional[int] = None,
+    ) -> RemoteBundleRef:
+        """Store a mapping object or a single tensor/array value."""
+        if isinstance(obj, Mapping):
+            payload = StructuredObjectPayload(metadata={}, buffers=obj)
+        else:
+            payload = StructuredObjectPayload(
+                metadata={"__mooncake_wrapped_object__": True},
+                buffers={"value": obj},
+            )
+        return self.put_structured_object(
+            payload,
+            partition=partition,
+            chunk_bytes=chunk_bytes,
+            policy=policy,
+            max_inflight_put=max_inflight_put,
+        )
+
+    def get_object(self, ref: RemoteBundleRef | Mapping[str, Any]) -> Any:
+        """Materialize an object stored by put_object()."""
+        result = self.materialize(self.read_spec(ref))
+        if result.metadata.get("__mooncake_wrapped_object__"):
+            return result.objects["value"]
+        return result.objects
+
     def read_spec(
         self, ref: RemoteBundleRef | Mapping[str, Any]
     ) -> StructuredObjectReadSpec:
@@ -309,11 +346,41 @@ class _StructuredObjectLayer:
             return self._read_bytes_member(
                 name, payload_spec, member_slice, destination
             )
+        if encoding == "torch_tensor":
+            return self._read_torch_tensor_member(
+                name, payload_spec, field_spec, member_slice, destination
+            )
         if encoding != "ndarray":
             raise ValueError(f"unsupported structured field encoding: {encoding}")
         return self._read_ndarray_member(
             name, payload_spec, field_spec, member_slice, destination
         )
+
+    def _read_torch_tensor_member(
+        self,
+        name: str,
+        payload_spec: Mapping[str, Any],
+        field_spec: Mapping[str, Any],
+        member_slice: StructuredMemberSlice | None,
+        destination: Any,
+    ) -> Any:
+        if _torch is None:
+            raise RuntimeError("torch is required to materialize structured tensor fields")
+        if member_slice is not None:
+            raise ValueError(f"structured tensor member {name} does not support slicing")
+        if destination is not None:
+            raise ValueError(
+                f"structured tensor member {name} does not support materialize_into"
+            )
+        if payload_spec.get("kind") == "tensor":
+            get_tensor = getattr(self._bundle_store._store, "get_tensor", None)
+            if callable(get_tensor):
+                return get_tensor(payload_spec["key"])
+        dtype = _torch_dtype_to_numpy(field_spec["dtype"])
+        shape = tuple(int(dim) for dim in field_spec["shape"])
+        data = self._bundle_store.read_payload(payload_spec)
+        array = np.frombuffer(data, dtype=dtype).reshape(shape)
+        return _torch.from_numpy(array.copy())
 
     def _read_bytes_member(
         self,
@@ -416,10 +483,10 @@ class _BundleManifestStore:
             written_keys.extend(meta_keys)
             for name, value in buffers.items():
                 _validate_key_segment(name, "buffer name")
-                payload_view = _bytes_view(value, name)
+                payload_value = value if isinstance(value, _TensorPayload) else _bytes_view(value, name)
                 payload_spec, payload_keys = self._put_payload(
                     f"{base_key}/buffer/{name}",
-                    payload_view,
+                    payload_value,
                     target_chunk_bytes,
                     transfer_policy,
                     pre_registered=bool(pre_registered_map.get(name, False)),
@@ -484,11 +551,16 @@ class _BundleManifestStore:
     def _put_payload(
         self,
         key: str,
-        value: memoryview,
+        value: memoryview | _TensorPayload,
         chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
         pre_registered: bool,
     ) -> tuple[dict[str, Any], list[str]]:
+        if isinstance(value, _TensorPayload):
+            tensor_spec = self._put_tensor_payload(key, value)
+            if tensor_spec is not None:
+                return tensor_spec, [key]
+            value = value.array.view(np.uint8).reshape(-1).data
         chunks = _split_view(value, chunk_bytes)
         chunk_keys = [
             key if len(chunks) == 1 else f"{key}/chunk/{index}"
@@ -509,6 +581,22 @@ class _BundleManifestStore:
             ],
         }
         return payload_spec, written_keys
+
+    def _put_tensor_payload(
+        self, key: str, value: _TensorPayload
+    ) -> dict[str, Any] | None:
+        put_tensor = getattr(self._store, "put_tensor", None)
+        if not callable(put_tensor):
+            return None
+        _check_status(put_tensor(key, value.tensor), "put_tensor", key)
+        return {
+            "key": key,
+            "kind": "tensor",
+            "bytes": int(value.array.nbytes),
+            "dtype": str(value.tensor.dtype),
+            "shape": list(value.tensor.shape),
+            "chunks": [{"key": key, "bytes": int(value.array.nbytes)}],
+        }
 
     def _policy(
         self,
@@ -1240,6 +1328,8 @@ def _encode_structured_fields(
 
 
 def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
+    if _torch is not None and isinstance(value, _torch.Tensor):
+        return _encode_torch_tensor_field(value)
     if isinstance(value, np.ndarray):
         array = np.ascontiguousarray(value)
         return {
@@ -1248,6 +1338,34 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
             "shape": list(array.shape),
         }, array.view(np.uint8).reshape(-1)
     return {"encoding": "bytes"}, value
+
+
+def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
+    tensor = value.detach().cpu().contiguous()
+    array = tensor.numpy()
+    return {
+        "encoding": "torch_tensor",
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+    }, _TensorPayload(tensor=tensor, array=array)
+
+
+def _torch_dtype_to_numpy(dtype: Any) -> np.dtype[Any]:
+    dtype_name = str(dtype).removeprefix("torch.")
+    mapping = {
+        "bool": np.bool_,
+        "uint8": np.uint8,
+        "int8": np.int8,
+        "int16": np.int16,
+        "int32": np.int32,
+        "int64": np.int64,
+        "float16": np.float16,
+        "float32": np.float32,
+        "float64": np.float64,
+    }
+    if dtype_name not in mapping:
+        raise ValueError(f"unsupported tensor dtype for raw field codec: {dtype}")
+    return np.dtype(mapping[dtype_name])
 
 
 def _validate_pre_registered_structured_buffers(
