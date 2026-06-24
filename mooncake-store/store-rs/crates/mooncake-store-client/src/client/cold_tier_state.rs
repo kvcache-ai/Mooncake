@@ -818,7 +818,7 @@ impl ColdRestoreIoTracker {
         // (current > 1), keeping the normal path lock-free.
         if current > 1 {
             self.max_concurrent.fetch_max(current, Ordering::Relaxed);
-            crate::observability::registry::set_cold_restore_max_concurrent_io_per_object(current);
+            crate::client::cold_tier::set_cold_restore_max_concurrent_io_per_object(current);
         }
         ColdRestoreIoGuard {
             tracker: self,

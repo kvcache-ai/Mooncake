@@ -1,36 +1,6 @@
 pub(crate) type SharedLiveClientCache = Arc<Mutex<LiveClientCache>>;
 pub(crate) type SharedSuspectRuntimeCache = Arc<Mutex<SuspectRuntimeCache>>;
 
-#[derive(Default)]
-struct HotReplicaTracker {
-    clock: Mutex<StorageClockState>,
-}
-
-#[derive(Default)]
-struct StorageClockState {
-    entries: Vec<Option<ClockEntry>>,
-    by_id: BTreeMap<ClockEntryId, usize>,
-    by_key: BTreeMap<ObjectKey, Vec<usize>>,
-    pending_hot_keys: BTreeSet<ObjectKey>,
-    hand: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct ClockEntryId {
-    route_key: ObjectKey,
-    segment_name: SegmentName,
-    segment_offset: u64,
-}
-
-#[derive(Clone, Debug)]
-struct ClockEntry {
-    id: ClockEntryId,
-    length_bytes: u64,
-    hot: bool,
-    hot_credit: u8,
-    fresh_write: bool,
-}
-
 include!("cold_tier_state.rs");
 
 #[derive(Default)]
@@ -921,15 +891,6 @@ struct ReplicaPlacementCandidate {
     soft: bool,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct ReclaimQueueSnapshot {
-    total_pending: usize,
-    due: usize,
-    cold_backing_reclaims: usize,
-    hot_segment_reclaims: usize,
-    by_qos_tier: BTreeMap<String, usize>,
-    by_policy_rank: BTreeMap<u8, usize>,
-}
 
 #[derive(Clone, Debug)]
 struct PendingReclaim {

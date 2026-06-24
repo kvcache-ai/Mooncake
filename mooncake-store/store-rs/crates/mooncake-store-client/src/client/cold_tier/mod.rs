@@ -3,6 +3,7 @@ mod control;
 mod device;
 mod eviction;
 mod helpers;
+mod metrics;
 mod offload;
 mod restore;
 mod scheduler;
@@ -50,6 +51,11 @@ pub(super) use helpers::{
     cold_restore_flight_key, is_cold_backing_placeholder, materialized_cold_backing,
     payload_checksum, read_local_hot_replica_payload, same_cold_payload,
     validate_cold_restore_payload, with_disjoint_restore_caller_buffers,
+};
+pub(super) use metrics::{
+    record_cold_restore_batch_duration, record_cold_restore_batch_items,
+    record_cold_restore_singleflight, record_cold_tier_ssd_read,
+    set_cold_restore_max_concurrent_io_per_object,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
