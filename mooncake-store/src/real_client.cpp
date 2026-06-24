@@ -4152,15 +4152,6 @@ RealClient::batch_get_into_dummy_helper(
     const std::vector<uint64_t> &dummy_buffers,
     const std::vector<size_t> &sizes, int32_t device_id,
     const UUID &client_id) {
-#ifdef USE_ASCEND_DIRECT
-    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
-            device_id)) {
-        LOG(ERROR) << "Failed to set context for physical device " << device_id;
-        co_return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-#endif
-
     // Hold shared_lock for the entire operation to prevent SHM from being
     // unmapped while batch_get_into_internal is using the translated buffers.
     auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(
@@ -4205,12 +4196,11 @@ RealClient::batch_get_into_dummy_helper(
     auto *s = state.get();
     auto try_result = co_await coro_io::post([this, s]() {
 #ifdef USE_ASCEND_DIRECT
-        if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
-                s->device_id)) {
-            LOG(ERROR) << "Failed to set context for physical device "
-                       << s->device_id << " in batch_get worker";
+        auto context_result =
+            set_context_if_needed(protocol, s->device_id, "batch_get worker");
+        if (!context_result) {
             return std::vector<tl::expected<int64_t, ErrorCode>>(
-                s->keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+                s->keys.size(), tl::unexpected(context_result.error()));
         }
 #endif
         return batch_get_into_internal(s->keys, s->buffers, s->sizes);
