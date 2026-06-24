@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -60,6 +61,8 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+    bool enable_hca_peer_affinity = false;
+    std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;

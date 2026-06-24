@@ -14,11 +14,15 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
+#include <strings.h>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <ctype.h>
@@ -31,6 +35,7 @@
 #include <sys/stat.h>
 
 #include "cuda_alike.h"
+#include "config.h"
 #include "memory_location.h"
 #include "topology.h"
 #ifdef USE_UB
@@ -141,6 +146,220 @@ struct InfinibandDevice {
     std::string pci_bus_id;
     int numa_node;
 };
+
+static std::string trim(const std::string &value) {
+    const auto begin = value.find_first_not_of(" \t\n\r");
+    if (begin == std::string::npos) return "";
+    const auto end = value.find_last_not_of(" \t\n\r");
+    return value.substr(begin, end - begin + 1);
+}
+
+static std::vector<std::string> splitString(const std::string &value,
+                                            char delim) {
+    std::vector<std::string> result;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, delim)) {
+        result.push_back(trim(item));
+    }
+    return result;
+}
+
+static bool parseTrailingHcaIndex(const std::string &hca_name, int &index) {
+    if (hca_name.empty() || !isdigit(hca_name.back())) return false;
+
+    size_t begin = hca_name.size() - 1;
+    while (begin > 0 && isdigit(hca_name[begin - 1])) begin--;
+
+    index = atoi(hca_name.c_str() + begin);
+    return true;
+}
+
+static bool isDigits(const std::string &value) {
+    return !value.empty() &&
+           std::all_of(value.begin(), value.end(),
+                       [](unsigned char ch) { return isdigit(ch); });
+}
+
+static std::string normalizeGpuLocation(const std::string &gpu_token) {
+    auto token = trim(gpu_token);
+    if (token.rfind(GPU_PREFIX, 0) == 0) return token;
+
+    const std::string gpu_prefix = "gpu";
+    if (token.size() > gpu_prefix.size() &&
+        strncasecmp(token.c_str(), gpu_prefix.c_str(), gpu_prefix.size()) ==
+            0) {
+        token = token.substr(gpu_prefix.size());
+    }
+
+    if (!isDigits(token)) return "";
+    return GPU_PREFIX + token;
+}
+
+static std::string resolveHcaName(const std::string &hca_token,
+                                  const std::vector<InfinibandDevice> &all_hca,
+                                  const std::unordered_set<std::string> &hcas) {
+    auto token = trim(hca_token);
+    if (token.empty()) return "";
+    if (hcas.count(token)) return token;
+
+    std::string numeric_token = token;
+    const std::string nic_prefix = "nic";
+    if (numeric_token.size() > nic_prefix.size() &&
+        strncasecmp(numeric_token.c_str(), nic_prefix.c_str(),
+                    nic_prefix.size()) == 0) {
+        numeric_token = numeric_token.substr(nic_prefix.size());
+    }
+    if (!isDigits(numeric_token)) return "";
+
+    auto mlx5_name = "mlx5_" + numeric_token;
+    if (hcas.count(mlx5_name)) return mlx5_name;
+
+    std::string matched_name;
+    int target_index = atoi(numeric_token.c_str());
+    for (const auto &hca : all_hca) {
+        int hca_index;
+        if (!parseTrailingHcaIndex(hca.name, hca_index) ||
+            hca_index != target_index) {
+            continue;
+        }
+        if (!matched_name.empty()) {
+            LOG(WARNING) << "Ambiguous HCA token '" << hca_token
+                         << "' in MC_GPU_HCA_AFFINITY; use exact HCA name.";
+            return "";
+        }
+        matched_name = hca.name;
+    }
+    return matched_name;
+}
+
+static void applyGpuHcaAffinityOverride(
+    TopologyMatrix &matrix, const std::vector<InfinibandDevice> &all_hca) {
+    const char *env = getenv("MC_GPU_HCA_AFFINITY");
+    if (!env || env[0] == '\0') return;
+
+    std::vector<std::string> all_hca_names;
+    std::unordered_set<std::string> all_hca_name_set;
+    for (const auto &hca : all_hca) {
+        all_hca_names.push_back(hca.name);
+        all_hca_name_set.insert(hca.name);
+    }
+
+    if (all_hca_names.empty()) {
+        LOG(WARNING) << "MC_GPU_HCA_AFFINITY is set, but no HCA was found.";
+        return;
+    }
+
+    for (const auto &raw_rule : splitString(env, ';')) {
+        const auto rule = trim(raw_rule);
+        if (rule.empty()) continue;
+
+        auto delim = rule.find('=');
+        if (delim == std::string::npos) delim = rule.find(':');
+        if (delim == std::string::npos) {
+            LOG(WARNING) << "Invalid MC_GPU_HCA_AFFINITY rule '" << rule
+                         << "'. Expected gpu:hca[,hca] or cuda:N=hca[,hca].";
+            continue;
+        }
+
+        auto gpu_location = normalizeGpuLocation(rule.substr(0, delim));
+        if (gpu_location.empty()) {
+            LOG(WARNING) << "Invalid GPU token in MC_GPU_HCA_AFFINITY rule '"
+                         << rule << "'.";
+            continue;
+        }
+
+        auto entry_it = matrix.find(gpu_location);
+        if (entry_it == matrix.end()) {
+            LOG(WARNING) << "MC_GPU_HCA_AFFINITY rule '" << rule
+                         << "' ignored because topology has no " << gpu_location
+                         << " entry.";
+            continue;
+        }
+
+        std::vector<std::string> preferred_hca;
+        std::unordered_set<std::string> preferred_set;
+        for (const auto &hca_token : splitString(rule.substr(delim + 1), ',')) {
+            auto hca_name =
+                resolveHcaName(hca_token, all_hca, all_hca_name_set);
+            if (hca_name.empty()) {
+                LOG(WARNING)
+                    << "Unknown HCA token '" << hca_token
+                    << "' in MC_GPU_HCA_AFFINITY rule '" << rule << "'.";
+                continue;
+            }
+            if (preferred_set.insert(hca_name).second) {
+                preferred_hca.push_back(hca_name);
+            }
+        }
+
+        if (preferred_hca.empty()) {
+            LOG(WARNING) << "MC_GPU_HCA_AFFINITY rule '" << rule
+                         << "' has no valid HCA and is ignored.";
+            continue;
+        }
+
+        std::vector<std::string> avail_hca;
+        for (const auto &hca_name : all_hca_names) {
+            if (!preferred_set.count(hca_name)) avail_hca.push_back(hca_name);
+        }
+
+        entry_it->second.preferred_hca = std::move(preferred_hca);
+        entry_it->second.avail_hca = std::move(avail_hca);
+    }
+}
+
+static void applyHcaPeerAffinity(TopologyMatrix &matrix) {
+    const auto &config = globalConfig();
+    if (!config.enable_hca_peer_affinity) return;
+    if (config.nic_peer_affinity.empty()) {
+        LOG(WARNING) << "MC_ENABLE_HCA_PEER_AFFINITY is set, but "
+                        "MC_NIC_PEER_AFFINITY has no valid mappings.";
+        return;
+    }
+
+    for (auto &entry : matrix) {
+        if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
+
+        std::vector<std::string> all_hca = entry.second.preferred_hca;
+        all_hca.insert(all_hca.end(), entry.second.avail_hca.begin(),
+                       entry.second.avail_hca.end());
+
+        std::unordered_set<std::string> preferred_set(
+            entry.second.preferred_hca.begin(),
+            entry.second.preferred_hca.end());
+        std::vector<std::string> peer_preferred_hca;
+        std::unordered_set<std::string> peer_preferred_set;
+
+        for (const auto &local_hca : entry.second.preferred_hca) {
+            const auto mapping_it = config.nic_peer_affinity.find(local_hca);
+            if (mapping_it == config.nic_peer_affinity.end()) continue;
+
+            for (const auto &peer_hca : mapping_it->second) {
+                if (!preferred_set.count(peer_hca)) continue;
+                if (peer_preferred_set.insert(peer_hca).second) {
+                    peer_preferred_hca.push_back(peer_hca);
+                }
+            }
+        }
+
+        if (peer_preferred_hca.empty()) {
+            LOG(WARNING) << "No MC_NIC_PEER_AFFINITY intersection for "
+                         << entry.first << "; keep existing preferred HCAs.";
+            continue;
+        }
+
+        std::vector<std::string> avail_hca;
+        std::unordered_set<std::string> seen_hca;
+        for (const auto &hca : all_hca) {
+            if (!seen_hca.insert(hca).second) continue;
+            if (!peer_preferred_set.count(hca)) avail_hca.push_back(hca);
+        }
+
+        entry.second.preferred_hca = std::move(peer_preferred_hca);
+        entry.second.avail_hca = std::move(avail_hca);
+    }
+}
 
 static std::vector<InfinibandDevice> listInfiniBandDevices(
     const std::vector<std::string> &filter) {
@@ -484,6 +703,7 @@ int Topology::discover(const std::vector<std::string> &filter) {
         matrix_[ent.name] = ent;
     }
 #endif
+    applyGpuHcaAffinityOverride(matrix_, all_hca);
 #ifdef USE_UB
     auto ub_all_hca = listUBDevices(filter);
     for (auto &ent : discoverCpuTopology(ub_all_hca)) {
@@ -533,6 +753,7 @@ int Topology::parse(const std::string &topology_json) {
         }
     }
 
+    applyHcaPeerAffinity(matrix_);
     return resolve();
 }
 
