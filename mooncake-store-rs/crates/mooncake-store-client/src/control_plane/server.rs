@@ -1,6 +1,7 @@
 use super::codec::*;
 use super::cold_tier_server::{
-    cold_read_response_to_pb, cold_read_slots_from_pb, cold_read_targets_from_pb,
+    handle_ack_cold_read_complete, handle_batch_read_from_cold, handle_pin_for_read,
+    handle_read_from_cold,
 };
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
@@ -200,7 +201,7 @@ pub(super) struct GrpcControlPlaneService {
     stats: Arc<ControlPlaneServerStats>,
 }
 
-async fn run_blocking_control<T: Send + 'static>(
+pub(super) async fn run_blocking_control<T: Send + 'static>(
     operation: &'static str,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> std::result::Result<T, Status> {
@@ -308,97 +309,28 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         &self,
         request: Request<pb::ReadFromColdRequest>,
     ) -> std::result::Result<Response<pb::ReadFromColdReply>, Status> {
-        let request = request.into_inner();
-        if request.tenant.is_empty() || request.key.is_empty() {
-            return Err(Status::invalid_argument(
-                "read_from_cold requires non-empty tenant and key",
-            ));
-        }
-        let cold_tier = self.cold_tier.clone();
-        let (reply, deferred_promote) = run_blocking_control("read_from_cold", move || {
-            cold_read_response_to_pb(cold_tier.read_from_cold(
-                &request.namespace,
-                &request.authority,
-                &request.tenant,
-                &request.key,
-                &request.domain,
-                &request.object_set,
-            ))
-        })
-        .await?;
-        if let Some(promote) = deferred_promote {
-            tokio::task::spawn_blocking(promote);
-        }
-        Ok(Response::new(reply))
+        handle_read_from_cold(self.cold_tier.clone(), request).await
     }
 
     async fn batch_read_from_cold(
         &self,
         request: Request<pb::BatchReadFromColdRequest>,
     ) -> std::result::Result<Response<pb::BatchReadFromColdReply>, Status> {
-        let request = request.into_inner();
-        for target in &request.targets {
-            if target.tenant.is_empty() || target.key.is_empty() {
-                return Err(Status::invalid_argument(
-                    "batch_read_from_cold requires non-empty tenant and key for every target",
-                ));
-            }
-        }
-        let cold_tier = self.cold_tier.clone();
-        let namespace = request.namespace;
-        let authority = request.authority;
-        let targets = cold_read_targets_from_pb(request.targets);
-        let responses = run_blocking_control("batch_read_from_cold", move || {
-            cold_tier.batch_read_from_cold(&namespace, &authority, targets)
-        })
-        .await?;
-        let mut results = Vec::with_capacity(responses.len());
-        for response in responses {
-            let (reply, deferred_promote) = cold_read_response_to_pb(response);
-            results.push(reply);
-            if let Some(promote) = deferred_promote {
-                tokio::task::spawn_blocking(promote);
-            }
-        }
-        Ok(Response::new(pb::BatchReadFromColdReply { results }))
+        handle_batch_read_from_cold(self.cold_tier.clone(), request).await
     }
 
     async fn ack_cold_read_complete(
         &self,
         request: Request<pb::AckColdReadCompleteRequest>,
     ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
-        let request = request.into_inner();
-        if request.segment_names.len() != request.segment_offsets.len() {
-            return Err(Status::invalid_argument(
-                "ack_cold_read_complete requires equal segment_names and segment_offsets lengths",
-            ));
-        }
-        let cold_tier = self.cold_tier.clone();
-        run_blocking_control("ack_cold_read_complete", move || {
-            let slots = cold_read_slots_from_pb(request.segment_names, request.segment_offsets);
-            cold_tier.ack_cold_read_complete(&slots);
-        })
-        .await?;
-        Ok(Response::new(pb::AckColdReadCompleteReply {}))
+        handle_ack_cold_read_complete(self.cold_tier.clone(), request).await
     }
 
     async fn pin_for_read(
         &self,
         request: Request<pb::PinForReadRequest>,
     ) -> std::result::Result<Response<pb::PinForReadReply>, Status> {
-        let request = request.into_inner();
-        if request.segment_names.len() != request.segment_offsets.len() {
-            return Err(Status::invalid_argument(
-                "pin_for_read requires equal segment_names and segment_offsets lengths",
-            ));
-        }
-        let cold_tier = self.cold_tier.clone();
-        let pinned = run_blocking_control("pin_for_read", move || {
-            let slots = cold_read_slots_from_pb(request.segment_names, request.segment_offsets);
-            cold_tier.pin_for_read(&slots)
-        })
-        .await?;
-        Ok(Response::new(pb::PinForReadReply { pinned }))
+        handle_pin_for_read(self.cold_tier.clone(), request).await
     }
 
     async fn get_route(

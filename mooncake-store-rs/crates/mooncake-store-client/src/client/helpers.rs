@@ -36,12 +36,6 @@ fn next_route_versions(
     route_ops.next_route_versions(current, keys)
 }
 
-fn payload_checksum(payload: &[u8]) -> u64 {
-    // Keep checksum validation on the hot read/write path cheap enough for
-    // large restore batches. The stored route field remains a stable u64.
-    xxh3_64(payload)
-}
-
 fn validate_replica_checksum(replica: &ReplicaRoute, payload: &[u8]) -> Result<()> {
     let Some(expected) = replica.checksum else {
         registry::record_checksum_validation("missing");
@@ -147,4 +141,3 @@ impl RouteHitReporter for StoreClient {
         self.report_route_hits_best_effort(routes.iter().copied());
     }
 }
-use xxhash_rust::xxh3::xxh3_64;

@@ -15,7 +15,7 @@ use super::{
     with_disjoint_restore_caller_buffers,
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicUsize},
         Arc,
@@ -23,6 +23,53 @@ use std::{
     thread::sleep,
 };
 use tracing::{debug, info, warn};
+
+pub(in super::super) fn batch_contains_cold_backing_placeholder(
+    resolved: &[ResolvedObject],
+) -> bool {
+    resolved
+        .iter()
+        .any(|entry| super::is_cold_backing_placeholder(&entry.replica))
+}
+
+pub(in super::super) fn execute_batch_get_with_cold_restore(
+    client: &StoreClient,
+    transport: &dyn StoreTransport,
+    resolved: &mut [ResolvedObject],
+    buffers: &mut [&mut [u8]],
+    lengths: Vec<usize>,
+) -> Result<Vec<usize>> {
+    let total_bytes = lengths.iter().map(|length| *length as u64).sum::<u64>();
+    let attempts = resolved
+        .iter()
+        .map(|entry| 1 + entry.fallback_replicas.len())
+        .max()
+        .unwrap_or(1);
+    let request_deadline = client.request_deadline_for_transfer(total_bytes, attempts);
+    let mut checked_remote_runtimes = BTreeSet::new();
+    let local_segments = client.local_storage_segments();
+    for (entry, buffer) in resolved.iter_mut().zip(buffers.iter_mut()) {
+        if super::is_cold_backing_placeholder(&entry.replica) {
+            execute_cold_restore_direct(client, transport, entry, buffer, request_deadline)?;
+        } else {
+            client.read_single_object_with_failover(
+                transport,
+                entry,
+                buffer,
+                &mut checked_remote_runtimes,
+                &local_segments,
+                request_deadline,
+            )?;
+        }
+    }
+    let payloads = buffers
+        .iter()
+        .zip(lengths.iter())
+        .map(|(buffer, length)| &buffer[..*length])
+        .collect::<Vec<_>>();
+    StoreClient::validate_batch_replica_checksums(resolved, &payloads)?;
+    Ok(lengths)
+}
 
 pub(in super::super) fn execute_cold_restore_direct(
     client: &StoreClient,
