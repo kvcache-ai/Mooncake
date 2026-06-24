@@ -1503,44 +1503,11 @@ class MasterService {
                                        ? ReplicationTaskIterator{}
                                        : tenant_state_->replication_tasks.find(
                                              object_id_.user_key)) {
-            // Automatically clean up invalid handles (memory replicas only).
-            // Note: We only check memory replicas here to avoid lock order
-            // violation (client_mutex_ must be acquired before metadata shard).
-            // local_disk replicas are cleaned up by ClearInvalidHandles() in
-            // ClientMonitorFunc.
-            if (tenant_state_ != nullptr &&
-                it_ != tenant_state_->metadata.end()) {
-                // Erase invalid memory replicas (those with unmounted
-                // segments). No client_mutex_ needed since we only check memory
-                // replicas.
-                const uint64_t before_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
-                service_->EraseReplicasWithCacheTotalAccounting(
-                    it_->second, [](const Replica& replica) {
-                        return replica.has_invalid_mem_handle();
-                    });
-                const uint64_t after_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
-                if (before_charge > after_charge) {
-                    service_->ReleaseCommittedQuotaCharge(
-                        it_->second, before_charge - after_charge);
-                }
-                // If no valid replicas remain, delete the whole object.
-                if (!it_->second.IsValid()) {
-                    const bool had_processing =
-                        processing_it_ != tenant_state_->processing_keys.end();
-                    this->Erase();
-                    if (tenant_state_ != nullptr && had_processing) {
-                        this->EraseFromProcessing();
-                    }
-                    if (tenant_state_ != nullptr) {
-                        service_->ErasePromotionTaskIfPresent(
-                            *tenant_state_, object_id_.user_key,
-                            object_id_.tenant_id);
-                        MaybeEraseEmptyTenant();
-                    }
-                }
-            }
+            // Deferred cleanup: invalid replicas are NOT erased during
+            // construction to avoid lock hold time on the hot path.
+            // Invalid memory replicas (unmounted segments) and invalid
+            // local_disk replicas are cleaned up asynchronously by
+            // ClearInvalidHandles() in ClientMonitorFunc.
         }
 
         // Check if metadata exists

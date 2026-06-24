@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <random>
 #include <shared_mutex>
@@ -2753,11 +2754,51 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
+    const size_t n = keys.size();
+    std::vector<tl::expected<void, ErrorCode>> results(n);
+
+    // Group keys by shard index. Keys in different shards are independent
+    // and can be processed in parallel.
+    // shard_idx -> vector of (original_index, key)
+    std::unordered_map<size_t, std::vector<std::pair<size_t, std::string>>>
+        shard_groups;
+    for (size_t i = 0; i < n; ++i) {
+        size_t shard_idx =
+            getMetadataShardIndex(tenant_id, keys[i]);
+        shard_groups[shard_idx].emplace_back(i, keys[i]);
     }
+
+    // If all keys land in a single shard or there are very few keys,
+    // skip the parallel overhead and process sequentially.
+    if (shard_groups.size() <= 1) {
+        for (size_t i = 0; i < n; ++i) {
+            results[i] = PutEnd(client_id, keys[i], tenant_id, replica_type);
+        }
+        return results;
+    }
+
+    // Process each shard group in parallel. Within a shard, keys are
+    // processed sequentially to preserve lock ordering (each PutEnd call
+    // acquires the shard's exclusive lock internally).
+    std::vector<std::future<void>> futures;
+    futures.reserve(shard_groups.size());
+    for (auto& [shard_idx, indexed_keys] : shard_groups) {
+        futures.emplace_back(std::async(
+            std::launch::async,
+            [this, &client_id, &tenant_id, replica_type,
+             indexed_keys = std::move(indexed_keys), &results]() {
+                for (const auto& [orig_idx, key] : indexed_keys) {
+                    results[orig_idx] =
+                        PutEnd(client_id, key, tenant_id, replica_type);
+                }
+            }));
+    }
+
+    // Wait for all shard groups to complete.
+    for (auto& fut : futures) {
+        fut.get();
+    }
+
     return results;
 }
 
