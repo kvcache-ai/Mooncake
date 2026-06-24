@@ -1118,6 +1118,17 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 
         struct_pb::from_pb(kv, kv_buf);
 
+        // The loaded value must match the destination slice exactly. The other
+        // BatchLoad backends reject a size mismatch (see BucketStorageBackend
+        // and OffsetAllocatorStorageBackend); without the same guard a stored
+        // value larger than slice.size overruns slice.ptr in the memcpy below.
+        if (kv.value.size() != slice.size) {
+            LOG(ERROR) << "Size mismatch for key: " << key
+                       << ", expected: " << kv.value.size()
+                       << ", got: " << slice.size;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
         if (!kv.value.empty()) {
             std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
         }

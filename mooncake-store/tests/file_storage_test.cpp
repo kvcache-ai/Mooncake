@@ -428,6 +428,46 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     }
 }
 
+TEST_F(FileStorageTest, BatchLoad_RejectsSliceSizeMismatch) {
+    // Loading into a slice whose size differs from the stored value must be
+    // rejected, the same way BucketStorageBackend and
+    // OffsetAllocatorStorageBackend do. Otherwise StorageBackendAdaptor copies
+    // the stored value regardless of slice.size and overruns slice.ptr.
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_backend_type = StorageBackendType::kFilePerKey;
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "FileStorageTestDir";
+
+    auto total_path = fs::path(data_path) / file_per_key_config.fsdir;
+    fs::create_directories(total_path);
+
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data))
+        << "FileStorageBatchOffload failed";
+    ASSERT_FALSE(keys.empty());
+
+    const std::string& key = keys.front();
+    const size_t stored_size = batch_data.at(key).size();
+
+    // Ask for one more byte than was stored. The backing buffer is
+    // over-allocated so the test never depends on the unguarded copy happening
+    // to stay in bounds; we only assert that the mismatch is refused.
+    std::vector<char> dst(stored_size + 16);
+    std::unordered_map<std::string, Slice> mismatched;
+    mismatched[key] = Slice{dst.data(), stored_size + 1};
+
+    auto load_res = FileStorageBatchLoad(fileStorage, mismatched);
+    ASSERT_FALSE(load_res) << "BatchLoad accepted a size-mismatched slice";
+    EXPECT_EQ(load_res.error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {
     // Setup: write data to storage backend via BatchOffloadUtil
     std::vector<std::string> keys;
