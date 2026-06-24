@@ -14522,9 +14522,7 @@ fn true_client_shrink_skips_unavailable_old_replica_owner_during_reclaim() {
         .register_local_memory()
         .expect("reader memory should register");
 
-    wait_for_membership_convergence(&[
-        &store_a, &store_b, &store_c, &store_d, &router, &reader,
-    ]);
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &store_d, &router, &reader]);
 
     let key = "shrink-dead-reclaim-key";
     let value = b"shrink-dead-reclaim-payload";
@@ -14581,7 +14579,9 @@ fn true_client_shrink_skips_unavailable_old_replica_owner_during_reclaim() {
         "post-shrink route should not keep the unavailable runtime"
     );
     assert_eq!(
-        reader.get(key).expect("reader get should succeed after shrink"),
+        reader
+            .get(key)
+            .expect("reader get should succeed after shrink"),
         value
     );
 }
