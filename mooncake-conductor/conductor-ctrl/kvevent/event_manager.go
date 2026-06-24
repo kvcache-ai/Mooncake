@@ -499,6 +499,37 @@ func (m *EventManager) StartHTTPServer() error {
 		}
 	})
 
+	// List all registered services
+	mux.HandleFunc("/services", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		slog.Debug(
+			"receive req",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+		)
+
+		services := make([]common.ServiceConfig, 0)
+		m.activeConfigs.Range(func(key string, svc common.ServiceConfig) bool {
+			services = append(services, svc)
+			return true
+		})
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":     len(services),
+			"services": services,
+		}); err != nil {
+			slog.Error("Failed to encode services response", "err", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+	})
+
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", m.httpserverport),
 		Handler: mux,
