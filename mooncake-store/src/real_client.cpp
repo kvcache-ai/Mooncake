@@ -4722,13 +4722,13 @@ RealClient::batch_put_from_multi_buffers_internal(
 std::vector<int> RealClient::batch_upsert_from_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &sizes,
+    const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
                 return batch_upsert_from_multi_buffers_internal(
-                    keys, all_buffers, sizes, config);
+                    keys, all_buffers, all_sizes, config);
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -4740,7 +4740,8 @@ std::vector<int> RealClient::batch_upsert_from_multi_buffers(
                 client_->ObserveTransferOperation(
                     TransferOperationKind::kWrite,
                     "batch_upsert_from_multi_buffers",
-                    sum_successful_nested_sizes(py_results, sizes), latency_us);
+                    sum_successful_nested_sizes(py_results, all_sizes),
+                    latency_us);
             });
     std::vector<int> results;
     results.reserve(internal_results.size());

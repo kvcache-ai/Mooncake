@@ -1250,7 +1250,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
             std::memcpy(dest, src, slice.size);
         } else {
             int dev = src_on_gpu ? src_dev : dst_dev;
-            gpu_staging::SetDevice(dev);
+            gpu_staging::DeviceGuard guard(dev);
             if (!gpu_staging::CopyAuto(dest, src, slice.size)) {
                 LOG(ERROR) << "GPU memcpy failed: src_dev=" << src_dev
                            << " dst_dev=" << dst_dev << " size=" << slice.size;

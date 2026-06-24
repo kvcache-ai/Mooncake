@@ -113,6 +113,51 @@ inline void SetDevice(int device_id) {
 #endif
 }
 
+class DeviceGuard {
+   public:
+    explicit DeviceGuard(int device_id) {
+        if (device_id < 0) return;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+        if (cudaGetDevice(&previous_device_) == cudaSuccess) {
+            active_ = true;
+        }
+        cudaSetDevice(device_id);
+#elif defined(USE_HIP)
+        if (hipGetDevice(&previous_device_) == hipSuccess) {
+            active_ = true;
+        }
+        hipSetDevice(device_id);
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+        if (aclrtGetDevice(&previous_device_) == ACL_SUCCESS) {
+            active_ = true;
+        }
+        aclrtSetDevice(device_id);
+#else
+        (void)device_id;
+#endif
+    }
+
+    ~DeviceGuard() {
+        if (!active_) return;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+        cudaSetDevice(previous_device_);
+#elif defined(USE_HIP)
+        hipSetDevice(previous_device_);
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+        aclrtSetDevice(previous_device_);
+#endif
+    }
+
+    DeviceGuard(const DeviceGuard&) = delete;
+    DeviceGuard& operator=(const DeviceGuard&) = delete;
+
+   private:
+    int previous_device_{-1};
+    bool active_{false};
+};
+
 // Copy host memory to device. Caller must have called SetDevice first.
 inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
@@ -180,7 +225,7 @@ inline bool MemcpySafe(void* dst, const void* src, size_t size) {
         return true;
     }
     int dev = src_gpu ? src_dev : dst_dev;
-    SetDevice(dev);
+    DeviceGuard guard(dev);
     return CopyAuto(dst, src, size);
 }
 
@@ -202,20 +247,11 @@ inline size_t PinMemoryMaxBytes() {
     return static_cast<size_t>(value);
 }
 
-inline std::mutex& PinnedHostMemoryMutex() {
-    static std::mutex mutex;
-    return mutex;
-}
+std::mutex& PinnedHostMemoryMutex();
 
-inline size_t& PinnedHostMemoryBytes() {
-    static size_t bytes = 0;
-    return bytes;
-}
+size_t& PinnedHostMemoryBytes();
 
-inline std::unordered_map<void*, size_t>& PinnedHostMemoryRegions() {
-    static std::unordered_map<void*, size_t> regions;
-    return regions;
-}
+std::unordered_map<void*, size_t>& PinnedHostMemoryRegions();
 
 inline bool TryPinHostMemory(void* ptr, size_t size, const char* name) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
