@@ -18,9 +18,12 @@
 
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_manager.h"
+#include "tent/thirdparty/nlohmann/json.h"
 
 namespace mooncake {
 namespace tent {
+
+using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -35,56 +38,136 @@ Status UbTentTransport::install(std::string& local_segment_name,
     local_segment_name_ = local_segment_name;
     control_service_ = metadata;
 
-    // --- Build old-TE Topology -------------------------------------------
     // Discover UB HCAs on this host.  Falls back to mock_urma_device when no
     // real HCAs are present (handled inside
     // UbTransport::initializeUbResources).
     te_topology_ = std::make_shared<mooncake::Topology>();
-    te_topology_->discover();  // non-fatal: empty list → mock device
+    te_topology_->discover();
 
-    // --- Build old-TE TransferMetadata ------------------------------------
-    // Derive the connection string from TENT config so that UbTransport can
-    // publish its UB-specific segment info (tseg handles, device EIDs) to the
-    // same metadata store that TENT uses.
-    std::string metadata_type = "p2p";
-    std::string metadata_servers = "";
-    if (conf) {
-        metadata_type = conf->get("metadata_type", "p2p");
-        metadata_servers = conf->get("metadata_servers", "");
-    }
-    std::string conn_string = metadata_servers.empty()
-                                  ? metadata_type
-                                  : (metadata_type + "://" + metadata_servers);
+    // Build the bridge that replaces the standalone te_metadata_.
+    // The bridge uses P2P mode for local-segment operations (no external store)
+    // and delegates remote lookups to the TENT SegmentManager.
+    te_metadata_bridge_ =
+        std::make_shared<UbTentMetadataBridge>(control_service_, "p2p");
 
-    te_metadata_ = std::make_shared<mooncake::TransferMetadata>(conn_string);
-
-    // --- Instantiate and install UbTransport ------------------------------
+    // Instantiate and install UbTransport, using the bridge as metadata.
     ub_transport_ = std::make_unique<mooncake::UbTransport>(URMA_ENDPOINT);
-    int rc =
-        ub_transport_->install(local_segment_name_, te_metadata_, te_topology_);
+    int rc = ub_transport_->install(local_segment_name_, te_metadata_bridge_,
+                                    te_topology_);
     if (rc != 0) {
         LOG(ERROR) << "UbTentTransport: UbTransport::install() failed, rc="
                    << rc;
         ub_transport_.reset();
-        te_metadata_.reset();
+        te_metadata_bridge_.reset();
         te_topology_.reset();
-        return Status::Internal(
+        return Status::InternalError(
             "UbTentTransport: UbTransport install failed, rc=" +
-            std::to_string(rc));
+            std::to_string(rc) + LOC_MARK);
     }
 
-    // Only claim DRAM↔DRAM capability in Phase 1.  GPU/NPU paths are enabled
-    // later once confirmed safe via real Kunpeng validation.
+    // Register the UB bootstrap callback so that incoming BootstrapUb RPCs
+    // (from remote nodes initiating URMA connections) are dispatched to
+    // UbTransport::onSetupConnections.
+    if (control_service_) {
+        auto cb = te_metadata_bridge_->handshakeCallback();
+        if (cb) {
+            control_service_->setBootstrapUbCallback(
+                [cb](const UbBootstrapDesc& peer,
+                     UbBootstrapDesc& local) -> int {
+                    mooncake::TransferMetadata::HandShakeDesc peer_hs, local_hs;
+                    peer_hs.local_nic_path = peer.local_nic_path;
+                    peer_hs.peer_nic_path = peer.peer_nic_path;
+#ifdef USE_UB
+                    peer_hs.jetty_num = peer.jetty_num;
+#endif
+                    int ret = cb(peer_hs, local_hs);
+                    local.local_nic_path = local_hs.local_nic_path;
+                    local.peer_nic_path = local_hs.peer_nic_path;
+                    local.reply_msg = local_hs.reply_msg;
+#ifdef USE_UB
+                    local.jetty_num = local_hs.jetty_num;
+#endif
+                    return ret;
+                });
+        }
+    }
+
     caps.dram_to_dram = true;
+
+    // Publish UB device EIDs to the TENT local segment.
+    Status s = setupUbLocalSegment();
+    if (!s.ok()) {
+        LOG(WARNING) << "UbTentTransport: setupUbLocalSegment() failed: "
+                     << s.message()
+                     << " (non-fatal; remote nodes may lack UB device info)";
+    }
 
     LOG(INFO) << "UbTentTransport: installed on segment '"
               << local_segment_name_ << "'";
     return Status::OK();
 }
 
+// ---------------------------------------------------------------------------
+// setupUbLocalSegment
+//
+// Writes UB device EIDs into the TENT local MemorySegmentDesc so that remote
+// nodes can extract them via the bridge's convertFromTent().
+// ---------------------------------------------------------------------------
+
+Status UbTentTransport::setupUbLocalSegment() {
+    if (!control_service_ || !ub_transport_) {
+        return Status::InternalError(
+            "UbTentTransport: setupUbLocalSegment: not ready" LOC_MARK);
+    }
+
+    auto& manager = control_service_->segmentManager();
+    auto segment = manager.getLocal();
+    if (!segment) {
+        return Status::InternalError(
+            "UbTentTransport: setupUbLocalSegment: local segment not "
+            "found" LOC_MARK);
+    }
+
+    if (segment->type != tent::SegmentType::Memory) {
+        return Status::InvalidArgument(
+            "UbTentTransport: local segment is not a memory segment" LOC_MARK);
+    }
+
+    auto& detail = std::get<tent::MemorySegmentDesc>(segment->detail);
+
+    // The old-TE local SegmentDesc (built by allocateLocalSegmentID) already
+    // has devices with EIDs.  Mirror them into the TENT MemorySegmentDesc.
+    auto local_te_desc =
+        te_metadata_bridge_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (local_te_desc) {
+        for (const auto& te_dev : local_te_desc->devices) {
+            // Check if this device is already present in the TENT descriptor.
+            bool found = false;
+            for (auto& tent_dev : detail.devices) {
+                if (tent_dev.name == te_dev.name) {
+                    tent_dev.transport_attrs[TransportType::UB] = te_dev.eid;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                tent::DeviceDesc d;
+                d.name = te_dev.name;
+                d.transport_attrs[TransportType::UB] = te_dev.eid;
+                detail.devices.push_back(std::move(d));
+            }
+        }
+    }
+
+    // Tag the segment so remote nodes know UB is available.
+    detail.transport_attrs[static_cast<int>(TransportType::UB)] = "ub";
+
+    return manager.synchronizeLocal();
+}
+
 Status UbTentTransport::uninstall() {
     ub_transport_.reset();
-    te_metadata_.reset();
+    te_metadata_bridge_.reset();
     te_topology_.reset();
     control_service_.reset();
     {
@@ -101,7 +184,7 @@ Status UbTentTransport::uninstall() {
 Status UbTentTransport::addMemoryBuffer(BufferDesc& desc,
                                         const MemoryOptions& options) {
     if (!ub_transport_) {
-        return Status::Internal("UbTentTransport: not installed" LOC_MARK);
+        return Status::InternalError("UbTentTransport: not installed" LOC_MARK);
     }
 
     void* addr = reinterpret_cast<void*>(desc.addr);
@@ -115,9 +198,30 @@ Status UbTentTransport::addMemoryBuffer(BufferDesc& desc,
     if (rc != 0) {
         LOG(ERROR) << "UbTentTransport: registerLocalMemory failed, rc=" << rc
                    << " addr=" << addr << " length=" << length;
-        return Status::Internal(
+        return Status::InternalError(
             "UbTentTransport: registerLocalMemory failed, rc=" +
-            std::to_string(rc));
+            std::to_string(rc) + LOC_MARK);
+    }
+
+    // After registration, the old-TE local SegmentDesc (accessible via bridge)
+    // contains the tseg handles for this buffer.  Serialize them into the TENT
+    // BufferDesc so that remote nodes can extract them via convertFromTent().
+    auto local_te_desc =
+        te_metadata_bridge_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (local_te_desc) {
+        for (const auto& te_buf : local_te_desc->buffers) {
+            if (te_buf.addr == desc.addr && !te_buf.tseg.empty()) {
+                try {
+                    json j(te_buf.tseg);
+                    desc.transport_attrs[TransportType::UB] = j.dump();
+                } catch (const std::exception& e) {
+                    LOG(WARNING)
+                        << "UbTentTransport: failed to serialize tseg: "
+                        << e.what();
+                }
+                break;
+            }
+        }
     }
 
     desc.transports.push_back(TransportType::UB);
@@ -126,7 +230,7 @@ Status UbTentTransport::addMemoryBuffer(BufferDesc& desc,
 
 Status UbTentTransport::removeMemoryBuffer(BufferDesc& desc) {
     if (!ub_transport_) {
-        return Status::Internal("UbTentTransport: not installed" LOC_MARK);
+        return Status::InternalError("UbTentTransport: not installed" LOC_MARK);
     }
 
     void* addr = reinterpret_cast<void*>(desc.addr);
@@ -149,14 +253,14 @@ Status UbTentTransport::removeMemoryBuffer(BufferDesc& desc) {
 
 Status UbTentTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     if (!ub_transport_) {
-        return Status::Internal("UbTentTransport: not installed" LOC_MARK);
+        return Status::InternalError("UbTentTransport: not installed" LOC_MARK);
     }
 
     auto* ub_batch = new UbSubBatch();
     ub_batch->ub_batch_id = ub_transport_->allocateBatchID(max_size);
     if (ub_batch->ub_batch_id == 0) {
         delete ub_batch;
-        return Status::Internal(
+        return Status::InternalError(
             "UbTentTransport: allocateBatchID failed" LOC_MARK);
     }
     // Pre-reserve request storage to avoid reallocation after submit.
@@ -198,7 +302,7 @@ Status UbTentTransport::submitTransferTasks(
             "UbTentTransport: invalid sub-batch" LOC_MARK);
     }
     if (!ub_transport_) {
-        return Status::Internal("UbTentTransport: not installed" LOC_MARK);
+        return Status::InternalError("UbTentTransport: not installed" LOC_MARK);
     }
 
     auto& batch_desc = mooncake::Transport::toBatchDesc(ub_batch->ub_batch_id);
@@ -212,9 +316,6 @@ Status UbTentTransport::submitTransferTasks(
     // The converted requests are stored inside ub_batch->te_requests so that
     // the raw pointers assigned to TransferTask::request remain valid until
     // freeSubBatch() is called.
-    //
-    // IMPORTANT: reserve() was called in allocateSubBatch(); never call
-    // push_back() again after pointers are handed to submitTransferTask().
     size_t first_new = ub_batch->te_requests.size();
     for (const auto& req : request_list) {
         mooncake::Transport::TransferRequest te_req{};
@@ -224,10 +325,19 @@ Status UbTentTransport::submitTransferTasks(
         te_req.source = req.source;
         te_req.target_offset = req.target_offset;
         te_req.length = req.length;
-        te_req.target_id =
-            (req.target_id == LOCAL_SEGMENT_ID)
-                ? static_cast<mooncake::Transport::SegmentID>(LOCAL_SEGMENT_ID)
-                : getTESegmentID(req.target_id);
+
+        if (req.target_id == LOCAL_SEGMENT_ID) {
+            te_req.target_id =
+                static_cast<mooncake::Transport::SegmentID>(LOCAL_SEGMENT_ID);
+        } else {
+            auto te_id = getTESegmentID(req.target_id);
+            if (te_id == static_cast<mooncake::Transport::SegmentID>(-1)) {
+                return Status::InvalidArgument(
+                    "UbTentTransport: cannot resolve TENT segment ID " +
+                    std::to_string(req.target_id) + LOC_MARK);
+            }
+            te_req.target_id = te_id;
+        }
         ub_batch->te_requests.push_back(te_req);
     }
 
@@ -246,7 +356,13 @@ Status UbTentTransport::submitTransferTasks(
 
     ub_batch->task_count_ += request_list.size();
 
-    return ub_transport_->submitTransferTask(task_ptrs);
+    auto old_s = ub_transport_->submitTransferTask(task_ptrs);
+    if (!old_s.ok()) {
+        return Status::InternalError(
+            "UbTentTransport: submitTransferTask failed: " +
+            std::string(old_s.message()) + LOC_MARK);
+    }
+    return Status::OK();
 }
 
 Status UbTentTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -257,13 +373,17 @@ Status UbTentTransport::getTransferStatus(SubBatchRef batch, int task_id,
             "UbTentTransport: invalid sub-batch" LOC_MARK);
     }
     if (!ub_transport_) {
-        return Status::Internal("UbTentTransport: not installed" LOC_MARK);
+        return Status::InternalError("UbTentTransport: not installed" LOC_MARK);
     }
 
     mooncake::Transport::TransferStatus te_status{};
-    auto s = ub_transport_->getTransferStatus(
+    auto old_s = ub_transport_->getTransferStatus(
         ub_batch->ub_batch_id, static_cast<size_t>(task_id), te_status);
-    if (!s.ok()) return s;
+    if (!old_s.ok()) {
+        return Status::InternalError(
+            "UbTentTransport: getTransferStatus failed: " +
+            std::string(old_s.message()) + LOC_MARK);
+    }
 
     status.transferred_bytes = te_status.transferred_bytes;
 
@@ -308,28 +428,33 @@ mooncake::Transport::SegmentID UbTentTransport::getTESegmentID(
         if (it != tent_to_te_seg_id_.end()) return it->second;
     }
 
-    // Look up the TENT segment name from the segment manager.
-    if (control_service_) {
-        tent::SegmentDesc* desc = nullptr;
-        auto s =
-            control_service_->segmentManager().getRemoteCached(desc, tent_id);
-        if (s.ok() && desc) {
-            // The segment name is the same string both TENT and old-TE use as
-            // the key in the metadata store.
-            auto old_te_id = ub_transport_->getSegmentID(desc->name);
-            std::lock_guard<std::mutex> lock(seg_id_cache_mutex_);
-            tent_to_te_seg_id_[tent_id] = old_te_id;
-            return old_te_id;
-        }
-        LOG(WARNING) << "UbTentTransport: cannot resolve TENT segment ID "
-                     << tent_id << " (status: " << s.message() << ")";
+    if (!control_service_ || !te_metadata_bridge_) {
+        LOG(ERROR) << "UbTentTransport: cannot resolve TENT segment ID "
+                   << tent_id << " (not installed)";
+        return static_cast<mooncake::Transport::SegmentID>(-1);
     }
 
-    // Fallback: pass through unchanged.  This works when both sides use the
-    // same integer ID space (e.g. mock / single-process tests).
-    LOG(WARNING) << "UbTentTransport: falling back to raw TENT segment ID "
-                 << tent_id << " as old-TE segment ID";
-    return static_cast<mooncake::Transport::SegmentID>(tent_id);
+    // Look up the TENT segment name from the segment manager.
+    tent::SegmentDesc* tent_desc = nullptr;
+    auto s =
+        control_service_->segmentManager().getRemoteCached(tent_desc, tent_id);
+    if (!s.ok() || !tent_desc) {
+        LOG(ERROR) << "UbTentTransport: cannot resolve TENT segment ID "
+                   << tent_id << ": " << s.message();
+        return static_cast<mooncake::Transport::SegmentID>(-1);
+    }
+
+    // Obtain the old-TE ID via the bridge (which maps name → TENT SegmentID).
+    auto old_te_id = te_metadata_bridge_->getSegmentID(tent_desc->name);
+    if (old_te_id == static_cast<mooncake::Transport::SegmentID>(-1)) {
+        LOG(ERROR) << "UbTentTransport: bridge could not resolve segment '"
+                   << tent_desc->name << "'";
+        return static_cast<mooncake::Transport::SegmentID>(-1);
+    }
+
+    std::lock_guard<std::mutex> lock(seg_id_cache_mutex_);
+    tent_to_te_seg_id_[tent_id] = old_te_id;
+    return old_te_id;
 }
 
 }  // namespace tent

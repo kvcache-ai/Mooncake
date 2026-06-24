@@ -45,6 +45,18 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     return Status::OK();
 }
 
+Status ControlClient::bootstrapUb(const std::string& server_addr,
+                                  const UbBootstrapDesc& request,
+                                  UbBootstrapDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(
+        tl_rpc_agent.call(server_addr, BootstrapUb, request_raw, response_raw));
+    response = json::parse(response_raw).get<UbBootstrapDesc>();
+    return Status::OK();
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
@@ -176,6 +188,11 @@ ControlService::ControlService(const std::string& type,
             onBootstrapRdma(request, response);
         });
     rpc_server_->registerFunction(
+        BootstrapUb,
+        [this](const std::string_view& request, std::string& response) {
+            onBootstrapUb(request, response);
+        });
+    rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
@@ -237,6 +254,17 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
         json::parse(std::string(request)).get<BootstrapDesc>();
     BootstrapDesc response_desc;
     if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onBootstrapUb(const std::string_view& request,
+                                   std::string& response) {
+    UbBootstrapDesc request_desc =
+        json::parse(std::string(request)).get<UbBootstrapDesc>();
+    UbBootstrapDesc response_desc;
+    if (ub_bootstrap_callback_)
+        ub_bootstrap_callback_(request_desc, response_desc);
     json j = response_desc;
     response = j.dump();
 }

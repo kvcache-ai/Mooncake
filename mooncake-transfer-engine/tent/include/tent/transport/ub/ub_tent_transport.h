@@ -15,17 +15,19 @@
 #ifndef UB_TENT_TRANSPORT_H
 #define UB_TENT_TRANSPORT_H
 
+// Old-TE headers first so that common.h declares LOCAL_SEGMENT_ID as a
+// static const before tent/common/types.h redefines it as a macro.
+#include "topology.h"
+#include "transport/transport.h"
+#include "transport/kunpeng_transport/ub_transport.h"
+
+// TENT headers (tent/common/types.h defines #define LOCAL_SEGMENT_ID)
 #include "tent/runtime/transport.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/common/types.h"
 #include "tent/common/config.h"
 #include "tent/common/status.h"
-
-// Old TE headers (mooncake:: namespace, not mooncake::tent::)
-#include "transport/transport.h"
-#include "transport/kunpeng_transport/ub_transport.h"
-#include "transfer_metadata.h"
-#include "topology.h"
+#include "tent/transport/ub/ub_tent_metadata_bridge.h"
 
 #include <memory>
 #include <mutex>
@@ -94,16 +96,23 @@ class UbTentTransport : public Transport {
    private:
     // Translate a TENT SegmentID to the corresponding old-TE SegmentID by
     // looking up the segment name via the TENT SegmentManager and querying
-    // the old-TE metadata for the matching ID.
+    // the bridge for the matching ID.
     mooncake::Transport::SegmentID getTESegmentID(SegmentID tent_id);
 
+    // Publish UB device EIDs and buffer tseg handles to the TENT local segment
+    // so that remote nodes can read them via the SegmentManager.
+    Status setupUbLocalSegment();
+
    private:
-    // Old-TE UbTransport instance and its required metadata/topology.
+    // Old-TE UbTransport instance and the topology used during install.
     std::unique_ptr<mooncake::UbTransport> ub_transport_;
-    std::shared_ptr<mooncake::TransferMetadata> te_metadata_;
     std::shared_ptr<mooncake::Topology> te_topology_;
 
-    // TENT control plane (for segment name lookup during submit).
+    // Bridge: replaces the standalone te_metadata_; routes remote lookups to
+    // the TENT SegmentManager and makes the handshake daemon a no-op.
+    std::shared_ptr<UbTentMetadataBridge> te_metadata_bridge_;
+
+    // TENT control plane (for segment synchronization and RPC).
     std::shared_ptr<ControlService> control_service_;
 
     std::string local_segment_name_;
