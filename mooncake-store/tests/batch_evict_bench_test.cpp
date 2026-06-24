@@ -100,7 +100,7 @@ class BatchEvictBenchTest : public ::testing::Test {
         return static_cast<size_t>(parsed);
     }
 
-    static uint64_t PercentileValue(std::vector<uint64_t> values,
+    static uint64_t PercentileValue(std::vector<uint64_t>& values,
                                     double percentile) {
         if (values.empty()) {
             return 0;
