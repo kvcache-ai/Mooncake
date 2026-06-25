@@ -65,7 +65,9 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
 
 func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.BlockStoredEvent, dpRank int64) error {
 	if event.BlockSize != h.blockSize {
-		slog.Warn("handleBlockStored: Block size mismatch", "expected", h.blockSize, "actual", event.BlockSize)
+		slog.Warn("handleBlockStored: Block size mismatch, the event will be discarded.",
+				  "expected", h.blockSize,
+				  "actual", event.BlockSize)
 		return nil
 	}
 	// Convert to kvindexer event
