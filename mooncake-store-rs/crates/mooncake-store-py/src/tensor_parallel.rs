@@ -304,8 +304,9 @@ impl PyMooncakeDistributedStore {
                     .as_ref()
                     .expect("parallelism routes must have par_spec");
 
-                // Auto-slice: if TP axis present, narrow the full tensor to the TP shard
-                let (shard_info, global_shape) = if let Some(tp) = spec.tp_axis() {
+                // Auto-slice: if TP axis present, narrow the full tensor to the TP shard.
+                // Keep the sliced tensor alive until put_tensor_object has copied from data_ptr.
+                if let Some(tp) = spec.tp_axis() {
                     let dim = tp.split_dim as usize;
                     if dim >= info.shape.len() {
                         return Err(PyValueError::new_err(
@@ -320,38 +321,31 @@ impl PyMooncakeDistributedStore {
                         .call_method1("narrow", (dim as i64, start, chunk))?
                         .call_method0("contiguous")?;
                     let shard_info = extract_tensor_info(&shard_tensor)?;
-                    (shard_info, info.shape.clone())
-                } else {
-                    // No TP axis (pure DP/PP/EP): store as-is
-                    let global = info.shape.clone();
-                    (info, global)
-                };
+                    let global_shape = info.shape.clone();
+                    let storage_key = get_parallelism_key_name(key, spec);
+                    let metadata = TensorMetadata::build_shard(
+                        shard_info.dtype as i32,
+                        &global_shape,
+                        &shard_info.shape,
+                        &spec.canonicalize().axes,
+                        shard_info.data_bytes as u64,
+                    );
+                    let status = self.put_tensor_object(
+                        &storage_key,
+                        &metadata,
+                        &shard_info,
+                        tenant,
+                        replica_count,
+                    )?;
+                    if status != 0 {
+                        return Ok(status);
+                    }
 
-                let storage_key = get_parallelism_key_name(key, spec);
-                let metadata = TensorMetadata::build_shard(
-                    shard_info.dtype as i32,
-                    &global_shape,
-                    &shard_info.shape,
-                    &spec.canonicalize().axes,
-                    shard_info.data_bytes as u64,
-                );
-                let status = self.put_tensor_object(
-                    &storage_key,
-                    &metadata,
-                    &shard_info,
-                    tenant,
-                    replica_count,
-                )?;
-                if status != 0 {
-                    return Ok(status);
-                }
-
-                if let Some(tp_axis) = spec.tp_axis() {
                     let manifest = WriterShardManifest::new(
                         shard_info.dtype as i32,
                         global_shape.len() as i32,
-                        tp_axis.split_dim,
-                        tp_axis.size,
+                        tp.split_dim,
+                        tp.size,
                         &global_shape,
                     );
                     let manifest_key = get_parallelism_manifest_key(key);
@@ -368,8 +362,21 @@ impl PyMooncakeDistributedStore {
                         false,
                         false,
                     )?;
+
+                    Ok(status)
+                } else {
+                    // No TP axis (pure DP/PP/EP): store as-is
+                    let global = info.shape.clone();
+                    let storage_key = get_parallelism_key_name(key, spec);
+                    let metadata = TensorMetadata::build_shard(
+                        info.dtype as i32,
+                        &global,
+                        &info.shape,
+                        &spec.canonicalize().axes,
+                        info.data_bytes as u64,
+                    );
+                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)
                 }
-                Ok(status)
             }
             WriteRoute::WriterPartition => {
                 let wp = wp_spec.expect("WriterPartition route must have wp_spec");
@@ -391,6 +398,7 @@ impl PyMooncakeDistributedStore {
                     .call_method0("contiguous")?;
                 let shard_info = extract_tensor_info(&shard_tensor)?;
 
+                // Keep shard_tensor in scope until put_tensor_object has copied the shard bytes.
                 let storage_key =
                     get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim);
                 let metadata = TensorMetadata::build_shard(
