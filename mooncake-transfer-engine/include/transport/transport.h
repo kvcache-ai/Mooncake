@@ -107,6 +107,9 @@ class Transport {
         return *reinterpret_cast<BatchDesc *>(id);
     }
 
+    static inline void publishTaskCompletion(TransferTask &task,
+                                             bool is_failed);
+
     // Slice must be allocated on heap, as it will delete self on markSuccess
     // or markFailed.
     struct Slice {
@@ -211,19 +214,7 @@ class Transport {
                 &task->completed_slice_count, 1, __ATOMIC_RELAXED);
             if (prev_completed + 1 != task->slice_count) return;
 
-            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
-            batch_desc.finished_task_count_fetch_add_release(1);
-
-            ::syscall(SYS_futex, batch_desc.finished_task_count_futex_word(),
-                      FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
-
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-            {
-                std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
-                batch_desc.publish_completion_if_ready_locked();
-            }
-            batch_desc.completion_cv.notify_all();
-#endif
+            publishTaskCompletion(*task, false);
         }
     };
 
@@ -418,6 +409,29 @@ class Transport {
 
     virtual const char *getName() const = 0;
 };
+
+inline void Transport::publishTaskCompletion(TransferTask &task,
+                                             bool is_failed) {
+    auto &batch_desc = toBatchDesc(task.batch_id);
+    if (is_failed) {
+        batch_desc.has_failure.store(true, std::memory_order_relaxed);
+    }
+    if (__atomic_exchange_n(&task.is_finished, true, __ATOMIC_ACQ_REL)) {
+        return;
+    }
+    batch_desc.finished_task_count_fetch_add_release(1);
+
+    ::syscall(SYS_futex, batch_desc.finished_task_count_futex_word(),
+              FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    {
+        std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+        batch_desc.publish_completion_if_ready_locked();
+    }
+    batch_desc.completion_cv.notify_all();
+#endif
+}
 }  // namespace mooncake
 
 #endif  // TRANSPORT_H_

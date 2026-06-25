@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>

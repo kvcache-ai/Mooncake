@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <tuple>
 

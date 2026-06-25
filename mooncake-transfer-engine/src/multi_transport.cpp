@@ -246,6 +246,15 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
         }
+
+        if (status.s == Transport::TransferStatusEnum::COMPLETED) {
+            Transport::publishTaskCompletion(task, false);
+        } else if (status.s == Transport::TransferStatusEnum::FAILED ||
+                   status.s == Transport::TransferStatusEnum::TIMEOUT ||
+                   status.s == Transport::TransferStatusEnum::CANCELED ||
+                   status.s == Transport::TransferStatusEnum::INVALID) {
+            Transport::publishTaskCompletion(task, true);
+        }
         return Status::OK();
     }
 
@@ -257,10 +266,11 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = Transport::TransferStatusEnum::FAILED;
+            Transport::publishTaskCompletion(task, true);
         } else {
             status.s = Transport::TransferStatusEnum::COMPLETED;
+            Transport::publishTaskCompletion(task, false);
         }
-        task.is_finished = true;
     } else {
         if (checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
@@ -311,9 +321,15 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        batch_desc.is_finished.store(true, std::memory_order_release);
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
                                                  std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+            batch_desc.publish_completion_if_ready_locked();
+        }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        batch_desc.completion_cv.notify_all();
+#endif
     } else if (status.s == Transport::TransferStatusEnum::FAILED) {
         batch_desc.has_failure.store(true, std::memory_order_release);
     }
