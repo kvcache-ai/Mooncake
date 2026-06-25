@@ -1,13 +1,32 @@
 use super::codec::pb_error;
 use super::*;
 
+const MAX_ADMIN_OFFLOAD_TASKS: u64 = 1024;
+const MAX_ADMIN_GC_BACKINGS: u64 = 1024;
+const MAX_ADMIN_FREE_VICTIMS: u64 = 1024;
+const MAX_ADMIN_BLOCKING_CONTROLS: usize = 8;
+
+static ADMIN_BLOCKING_CONTROL: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_ADMIN_BLOCKING_CONTROLS));
+
 async fn run_blocking_control<T: Send + 'static>(
     operation: &'static str,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> std::result::Result<T, Status> {
+    let _permit = ADMIN_BLOCKING_CONTROL
+        .acquire()
+        .await
+        .map_err(|_| Status::unavailable("cold tier admin control is shutting down"))?;
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|error| Status::internal(format!("{operation} worker failed: {error}")))
+}
+
+fn bounded_admin_limit(value: u64, max: u64) -> Option<usize> {
+    if value > max {
+        return None;
+    }
+    Some(value.max(1) as usize)
 }
 
 pub(super) async fn handle_trigger_cold_tier_offload(
@@ -15,8 +34,13 @@ pub(super) async fn handle_trigger_cold_tier_offload(
     request: Request<pb::TriggerColdTierOffloadRequest>,
 ) -> std::result::Result<Response<pb::TriggerColdTierOffloadReply>, Status> {
     let request = request.into_inner();
+    let Some(max_tasks) = bounded_admin_limit(request.max_tasks, MAX_ADMIN_OFFLOAD_TASKS) else {
+        return Err(Status::invalid_argument(format!(
+            "trigger_cold_tier_offload.max_tasks exceeds maximum {MAX_ADMIN_OFFLOAD_TASKS}"
+        )));
+    };
     let reply = run_blocking_control("trigger_cold_tier_offload", move || {
-        match cold_tier.trigger_offload(request.max_tasks as usize) {
+        match cold_tier.trigger_offload(max_tasks) {
             Ok(materialized) => pb::TriggerColdTierOffloadReply {
                 materialized: materialized as u64,
                 error: None,
@@ -41,8 +65,14 @@ pub(super) async fn handle_manual_cold_tier_gc(
             "manual_cold_tier_gc requires device_id",
         ));
     }
+    let Some(max_backings) = bounded_admin_limit(request.max_backings, MAX_ADMIN_GC_BACKINGS)
+    else {
+        return Err(Status::invalid_argument(format!(
+            "manual_cold_tier_gc.max_backings exceeds maximum {MAX_ADMIN_GC_BACKINGS}"
+        )));
+    };
     let reply = run_blocking_control("manual_cold_tier_gc", move || {
-        match cold_tier.manual_gc(&request.device_id, request.max_backings as usize) {
+        match cold_tier.manual_gc(&request.device_id, max_backings) {
             Ok(collected) => pb::ManualColdTierGcReply {
                 collected: collected as u64,
                 error: None,
@@ -67,8 +97,13 @@ pub(super) async fn handle_manual_cold_tier_free(
             "manual_cold_tier_free requires device_id",
         ));
     }
+    let Some(max_victims) = bounded_admin_limit(request.max_victims, MAX_ADMIN_FREE_VICTIMS) else {
+        return Err(Status::invalid_argument(format!(
+            "manual_cold_tier_free.max_victims exceeds maximum {MAX_ADMIN_FREE_VICTIMS}"
+        )));
+    };
     let reply = run_blocking_control("manual_cold_tier_free", move || {
-        match cold_tier.manual_free(&request.device_id, request.max_victims as usize) {
+        match cold_tier.manual_free(&request.device_id, max_victims) {
             Ok(result) => pb::ManualColdTierFreeReply {
                 attempted_victims: result.attempted_victims as u64,
                 freed_backings: result.freed_backings as u64,

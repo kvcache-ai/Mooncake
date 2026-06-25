@@ -2009,6 +2009,12 @@ impl StoreClient {
 }
 
 impl StoreClient {
+    fn cold_backing_on_local_device(&self, cold_backing: &mooncake_store_core::ColdBackingRoute) -> bool {
+        self.storage_owner
+            .cold_tier_devices
+            .has_local_backend(&cold_backing.cold_tier_id)
+    }
+
     fn cleanup_owned_routes_on_shutdown(&self) {
         let routes = match self.collect_routes_by_replica_owner(&self.lease.runtime) {
             Ok(routes) => routes,
@@ -2029,14 +2035,35 @@ impl StoreClient {
             next.version = route.version.next();
             next.replicas.retain(|replica| replica.owner != self.lease.runtime);
 
-            let should_delete = match mode {
-                ColdTierShutdownMode::Decommission => next.replicas.is_empty(),
-                ColdTierShutdownMode::Restart => false,
-            };
+            if mode == ColdTierShutdownMode::Restart
+                && next.replicas.is_empty()
+                && !route.cold_backing.as_ref().is_some_and(|cold_backing| {
+                    cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
+                })
+            {
+                continue;
+            }
 
+            if mode == ColdTierShutdownMode::Decommission
+                && route
+                    .cold_backing
+                    .as_ref()
+                    .is_some_and(|cold_backing| self.cold_backing_on_local_device(cold_backing))
+            {
+                next.cold_backing = route.cold_backing.clone();
+                if let Some(cold_backing) = next.cold_backing.as_mut() {
+                    cold_backing.state = mooncake_store_core::ColdBackingState::PendingDelete;
+                }
+            }
+
+            let should_delete = mode == ColdTierShutdownMode::Decommission
+                && next.replicas.is_empty()
+                && next.cold_backing.is_none();
             let cas_result = if should_delete {
                 self.route_ops().delete_route(&route.key, Some(route.version))
-            } else if next.replicas.len() < route.replicas.len() {
+            } else if next.replicas.len() < route.replicas.len()
+                || next.cold_backing != route.cold_backing
+            {
                 self.route_ops()
                     .prune_route(&route.key, Some(route.version), &next)
             } else {
@@ -2059,7 +2086,7 @@ impl StoreClient {
         }
 
         if mode == ColdTierShutdownMode::Decommission {
-            self.delete_cold_payloads_on_decommission();
+            self.mark_local_cold_backings_pending_delete_on_decommission();
         }
 
         if cleaned > 0 {
@@ -2073,12 +2100,15 @@ impl StoreClient {
         }
     }
 
-    fn delete_cold_payloads_on_decommission(&self) {
+    fn mark_local_cold_backings_pending_delete_on_decommission(&self) {
+        const MAX_DECOMMISSION_COLD_BACKINGS: usize = 1024;
+
         let device_ids = self.storage_owner.cold_tier_devices.local_device_ids();
         for device_id in &device_ids {
             let routes = match self.metadata.as_ref().list_object_routes_by_cold_backing(
                 &mooncake_store_core::ColdBackingRouteFilter {
                     device_id: Some(device_id.clone()),
+                    limit: Some(MAX_DECOMMISSION_COLD_BACKINGS),
                     ..Default::default()
                 },
             ) {
@@ -2092,14 +2122,43 @@ impl StoreClient {
                     continue;
                 }
             };
-            for route in routes {
+            for route in &routes {
                 let Some(cold_backing) = route.cold_backing.as_ref() else {
                     continue;
                 };
-                if let Ok(backend) = self.storage_owner.cold_tier_devices.backend_for(cold_backing) {
-                    let _ = cold_tier::backend_remove_cold_payload(backend.as_ref(), cold_backing);
+                if cold_backing.state == mooncake_store_core::ColdBackingState::PendingDelete {
+                    continue;
                 }
-                let _ = self.route_ops().delete_route(&route.key, Some(route.version));
+                let mut next = route.clone();
+                next.version = route.version.next();
+                if let Some(next_backing) = next.cold_backing.as_mut() {
+                    next_backing.state = mooncake_store_core::ColdBackingState::PendingDelete;
+                }
+                let Err(error) = self
+                    .route_ops()
+                    .prune_route(&route.key, Some(route.version), &next)
+                else {
+                    continue;
+                };
+                tracing::warn!(
+                    key = %route.key.0,
+                    device_id,
+                    error = %error,
+                    "decommission: failed to mark cold backing pending delete"
+                );
+            }
+            if let Err(error) = self
+                .storage_owner
+                .garbage_collect_pending_delete_backings_for_device_bounded(
+                    device_id,
+                    routes.len().min(MAX_DECOMMISSION_COLD_BACKINGS),
+                )
+            {
+                tracing::warn!(
+                    device_id,
+                    error = %error,
+                    "decommission: failed to garbage collect pending-delete cold backings"
+                );
             }
         }
     }
@@ -2110,19 +2169,18 @@ impl Drop for StoreClient {
         self.membership_sync.shutdown();
         self.async_replica_tracking.shutdown();
         self.async_route_hit_reporting.shutdown();
+        if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart {
+            self.flush_pending_offloads_before_drain();
+        }
         self.cold_tier.shutdown();
+        if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart {
+            self.flush_pending_offloads_before_drain();
+        }
         if self.owns_cold_tier_lifecycle {
             self.cleanup_owned_routes_on_shutdown();
             self.storage_owner.unregister_cold_tier_devices_on_shutdown();
         }
-        match self.cold_tier_shutdown_mode {
-            ColdTierShutdownMode::Restart => {
-                let _ = self.flush_all_reclaims_preserve_cold_tier();
-            }
-            ColdTierShutdownMode::Decommission => {
-                let _ = self.flush_all_reclaims();
-            }
-        }
+        let _ = self.flush_all_reclaims();
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {

@@ -735,28 +735,6 @@ impl StoreClient {
         self.release_reclaim_allocations_best_effort(&releases, true, "flush_all_reclaims")
     }
 
-    fn flush_all_reclaims_preserve_cold_tier(&self) -> Result<()> {
-        let pending = {
-            let mut state = self.state.lock();
-            std::mem::take(&mut state.pending_reclaims)
-        };
-        let releases = pending
-            .into_iter()
-            .filter(|reclaim| reclaim.cold_backing.is_none())
-            .map(|reclaim| AllocationReleaseRequest {
-                storage_runtime: reclaim.storage_runtime,
-                segment_name: reclaim.segment_name,
-                offset_bytes: reclaim.offset_bytes,
-                length_bytes: reclaim.length_bytes,
-            })
-            .collect::<Vec<_>>();
-        self.release_reclaim_allocations_best_effort(
-            &releases,
-            true,
-            "flush_all_reclaims_preserve_cold_tier",
-        )
-    }
-
     fn flush_pending_offloads_before_drain(&self) {
         const MAX_ROUNDS: usize = 64;
         const BATCH_SIZE: usize = 32;
