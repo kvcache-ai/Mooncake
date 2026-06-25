@@ -79,6 +79,12 @@ struct Request {
     TransportType transport_hint =
         UNSPEC;  // UNSPEC = follow policy; otherwise pin this request to the
                  // name transport.
+    // Optional SLO deadline as an absolute steady_clock timestamp in
+    // nanoseconds. 0 = no deadline (default), behaves exactly as today.
+    // When set, the engine emits an observability-only feasibility metric
+    // (MLU = actual transfer time / available window) on completion; it does
+    // not yet drive any admission or scheduling decision. See RFC #2519.
+    uint64_t deadline_ns = 0;
 };
 
 enum TransferStatusEnum {
