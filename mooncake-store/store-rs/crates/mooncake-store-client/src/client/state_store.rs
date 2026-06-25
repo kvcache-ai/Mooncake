@@ -936,7 +936,13 @@ impl StorageOwnerState {
     }
 
     fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
-        let Some(route) = self.route_ops.load_route(&victim.route_key)? else {
+        let Some(route) = self
+            .route_ops
+            .load_routes_bounded(std::slice::from_ref(&victim.route_key))?
+            .into_iter()
+            .next()
+            .flatten()
+        else {
             self.hot_replicas.clock.lock().remove_id(victim);
             return Ok(false);
         };
@@ -970,6 +976,9 @@ impl StorageOwnerState {
     }
 
     fn has_usable_cold_tier_device(&self) -> Result<bool> {
+        if cold_tier::cold_tier_disabled() {
+            return Ok(false);
+        }
         self.cold_tier_devices
             .has_usable_device(self.metadata.as_ref())
     }

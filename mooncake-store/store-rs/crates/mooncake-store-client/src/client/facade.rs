@@ -2011,6 +2011,7 @@ impl StoreClient {
 impl Drop for StoreClient {
     fn drop(&mut self) {
         self.membership_sync.shutdown();
+        self._async_eviction.shutdown();
         self.async_replica_tracking.shutdown();
         self.async_route_hit_reporting.shutdown();
         if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart {
