@@ -189,6 +189,9 @@ struct Request {
     SegmentID target_id;
     uint64_t target_offset;
     size_t length;
+    int priority = PRIO_HIGH;
+    std::optional<std::string> policy_name;
+    TransportType transport_hint = UNSPEC;
 };
 ```
 
@@ -197,6 +200,9 @@ struct Request {
 - `target_id`: Segment ID obtained from `openSegment`.
 - `target_offset`: Offset within the target segment.
 - `length`: Number of bytes to transfer.
+- `priority`: Scheduling priority. Used by the QoS layer; see [qos.md](qos.md).
+- `policy_name`: Optional. When set, the request matches the named entry instead of the first-matching policy.
+- `transport_hint`: Optional. `UNSPEC` (default) defers to `TransportSelector`. Any other `TransportType` pins this request onto that transport for its first try.
 
 #### TransferStatus
 
@@ -522,7 +528,8 @@ Location strings identify device affinity: `"cpu:0"`, `"cuda:0"`, `"cuda:1"`, et
 
 ```cpp
 enum TransportType {
-    RDMA = 0,
+    UNSPEC = 0,
+    RDMA,
     MNNVL,
     SHM,
     NVLINK,
@@ -530,7 +537,7 @@ enum TransportType {
     IOURING,
     TCP,
     AscendDirect,
-    UNSPEC
+    SUNRISE_LINK,
 };
 ```
 

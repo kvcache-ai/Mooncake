@@ -67,6 +67,7 @@ static void rememberAutoGidSelection(
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
+      wr_depth_list_(nullptr),
       active_(true),
       cq_outstanding_(nullptr) {}
 
@@ -95,7 +96,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
-    wr_depth_list_ = new volatile int[num_qp_list];
+    wr_depth_list_ = new volatile int[num_qp_list]();
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
@@ -162,15 +163,18 @@ int RdmaEndPoint::deconstructLocked() {
     // Adjust cq_outstanding_ before destroying QPs, so the counter is
     // always corrected even if ibv_destroy_qp fails and we return early.
     bool displayed = false;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
+    if (wr_depth_list_) {
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            if (wr_depth_list_[i] != 0) {
+                if (!displayed) {
+                    LOG(WARNING)
+                        << "Outstanding work requests found, CQ will not "
+                           "be generated";
+                    displayed = true;
+                }
+                __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
+                wr_depth_list_[i] = 0;
             }
-            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-            wr_depth_list_[i] = 0;
         }
     }
 
@@ -726,8 +730,15 @@ int RdmaEndPoint::submitPostSend(
     if (slice_list.empty()) return 0;
     const size_t requested = slice_list.size();
     int cq_remaining = int(globalConfig().max_cqe) - *cq_outstanding_;
-    std::vector<ibv_send_wr> wr_list(requested, ibv_send_wr{});
-    std::vector<ibv_sge> sge_list(requested);
+    if (cq_remaining <= 0) return 0;
+
+    // Only allocate for the max number of WRs we can actually post per QP,
+    // not the entire requested slice count. Each QP iteration reuses the
+    // wr_list/sge_list from index 0, so we only need max_wr_depth_ entries.
+    size_t max_postable_per_qp =
+        std::min({(size_t)max_wr_depth_, (size_t)cq_remaining, requested});
+    std::vector<ibv_send_wr> wr_list(max_postable_per_qp, ibv_send_wr{});
+    std::vector<ibv_sge> sge_list(max_postable_per_qp);
     size_t total_posted = 0;
     size_t cursor = 0;
 
@@ -893,7 +904,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
                                     int local_gid_index, std::string *reply_msg,
                                     SetupConnectionFailureInfo *failure_info) {
-    if (qp_index < 0 || qp_index > (int)qp_list_.size())
+    if (qp_index < 0 || qp_index >= (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
     auto &qp = qp_list_[qp_index];
 
@@ -951,7 +962,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
     attr.ah_attr.dlid = peer_lid;
+    // Set service level if configured (-1 means use default)
     attr.ah_attr.sl = 0;
+    if (globalConfig().ib_service_level >= 0) {
+        attr.ah_attr.sl = static_cast<uint8_t>(globalConfig().ib_service_level);
+    }
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.static_rate = 0;
     attr.ah_attr.is_global = 1;

@@ -16,6 +16,13 @@ enum WorkerTaskStatus {
 
 static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
 
+static void setActiveRanksTensorValue(TransferGroupMeta* group, int rank,
+                                      int value) {
+    if (group->activeRanksTensor.device().is_cpu()) {
+        group->activeRanksTensor[rank] = value;
+    }
+}
+
 void MooncakeWorker::Start() {
     bool expected = false;
     if (started_.compare_exchange_strong(expected, true)) {
@@ -209,7 +216,7 @@ void MooncakeWorker::startWorker() {
                                     // connection poller to reconnect it.
                                     group->peerConnected[j] = false;
                                     group->activeRanks[j] = false;
-                                    group->activeRanksTensor[j] = 0;
+                                    setActiveRanksTensorValue(group, j, 0);
                                 } else {
                                     batch_done = false;
                                     break;
@@ -298,7 +305,7 @@ void MooncakeWorker::startWorker() {
                                 // connection poller to reconnect it.
                                 group->peerConnected[j] = false;
                                 group->activeRanks[j] = false;
-                                group->activeRanksTensor[j] = 0;
+                                setActiveRanksTensorValue(group, j, 0);
                             } else {
                                 task_done = false;
                                 break;

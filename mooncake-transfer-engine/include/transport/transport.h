@@ -35,6 +35,8 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+
+class RdmaEndPoint;
 class TransferMetadata;
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
@@ -64,6 +66,8 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        // Per-request transport pin, TENT only.
+        int transport_hint = 0;
     };
 
     enum TransferStatusEnum {
@@ -111,19 +115,27 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
-        std::vector<uint32_t> dest_rkeys;
+        // EFA's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
+        // are 32-bit. Use a scoped alias so the width is defined in one place.
+#ifdef USE_EFA
+        using mr_key_t = uint64_t;
+#else
+        using mr_key_t = uint32_t;
+#endif
+        std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
 
         union {
             struct {
                 uint64_t dest_addr;
-                uint32_t source_lkey;
-                uint32_t dest_rkey;
+                mr_key_t source_lkey;
+                mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
                 volatile int *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
+                RdmaEndPoint *endpoint;  // Endpoint used for this transfer
             } rdma;
             struct {
                 uint64_t dest_addr;

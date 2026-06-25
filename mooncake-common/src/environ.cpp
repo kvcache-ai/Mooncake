@@ -3,6 +3,7 @@
 #include <climits>
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 #include <iostream>
 
 namespace mooncake {
@@ -52,7 +53,8 @@ bool Environ::GetBool(const char* name, bool default_value) {
     const char* val = std::getenv(name);
     if (val) {
         std::string s(val);
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
         return s == "1" || s == "true" || s == "on" || s == "yes";
     }
     return default_value;

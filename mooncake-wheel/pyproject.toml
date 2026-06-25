@@ -30,7 +30,7 @@ mooncake_master = "mooncake.cli:main"
 mooncake_client = "mooncake.cli_client:main"
 transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
-mc_store_rest_server = "mooncake.mooncake_store_service:main"
+mc_store_rest_server = "mooncake.mooncake_store_service:sync_main"
 transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
 
 [tool.setuptools]

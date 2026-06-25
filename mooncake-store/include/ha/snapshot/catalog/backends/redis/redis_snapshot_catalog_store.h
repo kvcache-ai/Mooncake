@@ -26,6 +26,10 @@ class RedisSnapshotCatalogStore final : public SnapshotCatalogStore {
 
     ErrorCode Delete(const SnapshotId& snapshot_id) override;
 
+    const std::string& GetSnapshotRoot() const override {
+        return snapshot_root_;
+    }
+
    private:
     static ClusterNamespace ResolveClusterNamespace(
         const ClusterNamespace& cluster_namespace);
@@ -36,6 +40,7 @@ class RedisSnapshotCatalogStore final : public SnapshotCatalogStore {
     SnapshotObjectStore* object_store_;
     std::string connstring_;
     ClusterNamespace cluster_namespace_;
+    std::string snapshot_root_;
     std::string latest_key_;
     std::string index_key_;
 };

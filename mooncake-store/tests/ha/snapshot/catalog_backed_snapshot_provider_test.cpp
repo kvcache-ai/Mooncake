@@ -44,7 +44,7 @@ class CatalogBackedSnapshotProviderTest
             GetParam(), object_store_.get(), cluster_id_, FLAGS_redis_endpoint);
         ASSERT_NE(catalog_store_, nullptr);
 
-        descriptor_ = MakeTestSnapshotDescriptor();
+        descriptor_ = MakeTestSnapshotDescriptor(cluster_id_);
     }
 
     void TearDown() override {

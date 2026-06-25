@@ -8,6 +8,10 @@
 // First-stage MACA integration: provide a CUDA-like API surface.
 const static std::string GPU_PREFIX = "maca:";
 
+// torch-maca's cu-bridge already defines CUDA/CU compatibility macros after
+// ATen/cuda headers are included. Keep this fallback mapping for translation
+// units that include Mooncake's cuda_alike.h without cu-bridge first.
+#ifndef __CUDA_TO_MACA_ADAPTOR_H__
 #define CUdevice MCdevice
 #define CUdeviceptr mcDeviceptr_t
 #define CUmemorytype MCmemorytype
@@ -70,16 +74,36 @@ static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
 
 #define cudaDeviceCanAccessPeer mcDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess mcDeviceEnablePeerAccess
+#define cudaDeviceGetAttribute mcDeviceGetAttribute
 #define cudaDeviceGetPCIBusId mcDeviceGetPCIBusId
+#define cudaDeviceSynchronize mcDeviceSynchronize
+#define cudaDevAttrMultiProcessorCount mcDeviceAttributeMultiProcessorCount
+#define cudaErrorNotReady mcErrorNotReady
 #define cudaErrorPeerAccessAlreadyEnabled mcErrorPeerAccessAlreadyEnabled
 #define cudaError_t mcError_t
+#define cudaEvent_t mcEvent_t
+#define cudaEventCreate mcEventCreate
+#define cudaEventCreateWithFlags mcEventCreateWithFlags
+#define cudaEventDestroy mcEventDestroy
+#define cudaEventDisableTiming mcEventDisableTiming
+#define cudaEventElapsedTime mcEventElapsedTime
+#define cudaEventQuery mcEventQuery
+#define cudaEventRecord mcEventRecord
+#define cudaEventSynchronize mcEventSynchronize
 #define cudaFree mcFree
 #define cudaFreeHost mcFreeHost
+#define cudaFuncAttributes mcFuncAttributes
 #define cudaGetDevice mcGetDevice
 #define cudaGetDeviceCount mcGetDeviceCount
 #define cudaGetErrorString mcGetErrorString
 #define cudaGetLastError mcGetLastError
+#define cudaHostAlloc mcMallocHost
+#define cudaHostAllocDefault mcMallocHostDefault
+#define cudaHostAllocMapped mcMallocHostMapped
+#define cudaHostAllocPortable mcMallocHostPortable
+#define cudaHostAllocWriteCombined mcMallocHostWriteCombined
 #define cudaHostRegister mcHostRegister
+#define cudaHostRegisterMapped mcHostRegisterMapped
 #define cudaHostRegisterPortable mcHostRegisterPortable
 #define cudaHostUnregister mcHostUnregister
 #define cudaIpcCloseMemHandle mcIpcCloseMemHandle
@@ -92,8 +116,10 @@ static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
 #define cudaMemcpy mcMemcpy
 #define cudaMemcpyAsync mcMemcpyAsync
 #define cudaMemcpyDefault mcMemcpyDefault
+#define cudaMemcpyDeviceToDevice mcMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost mcMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice mcMemcpyHostToDevice
+#define cudaMemcpyKind mcMemcpyKind
 #define cudaMemset mcMemset
 #define cudaMemsetAsync mcMemsetAsync
 #define cudaMemoryTypeDevice mcMemoryTypeDevice
@@ -103,7 +129,36 @@ static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
 #define cudaPointerGetAttributes mcPointerGetAttributes
 #define cudaSetDevice mcSetDevice
 #define cudaStreamCreate mcStreamCreate
+#define cudaStreamCreateWithFlags mcStreamCreateWithFlags
 #define cudaStreamDestroy mcStreamDestroy
+#define cudaStreamNonBlocking mcStreamNonBlocking
+#define cudaStreamPerThread mcStreamPerThread
 #define cudaStreamSynchronize mcStreamSynchronize
 #define cudaStream_t mcStream_t
+#define cudaStreamWaitEvent mcStreamWaitEvent
 #define cudaSuccess mcSuccess
+
+static inline mcError_t cudaFuncGetAttributes(mcFuncAttributes *attr,
+                                              const void *func) {
+    return mcFuncGetAttributes(attr, func);
+}
+
+#ifdef __cplusplus
+template <class T>
+static inline mcError_t cudaFuncGetAttributes(mcFuncAttributes *attr, T func) {
+    return mcFuncGetAttributes(attr, reinterpret_cast<const void *>(func));
+}
+
+template <class T>
+static inline mcError_t cudaHostGetDevicePointer(T **dev_ptr, void *host_ptr,
+                                                 unsigned int flags) {
+    return mcHostGetDevicePointer(reinterpret_cast<void **>(dev_ptr), host_ptr,
+                                  flags);
+}
+#else
+static inline mcError_t cudaHostGetDevicePointer(void **dev_ptr, void *host_ptr,
+                                                 unsigned int flags) {
+    return mcHostGetDevicePointer(dev_ptr, host_ptr, flags);
+}
+#endif
+#endif  // __CUDA_TO_MACA_ADAPTOR_H__

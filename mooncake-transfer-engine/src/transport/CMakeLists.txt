@@ -52,6 +52,11 @@ if (USE_MACA)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:maca_transport>)
 endif()
 
+if (USE_SUNRISE)
+  add_subdirectory(sunrise_link)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:sunrise_link_transport>)
+endif()
+
 if (USE_MNNVL AND NOT USE_HIP)
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)

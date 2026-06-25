@@ -22,3 +22,43 @@ Mooncake EP:
 Installation:
   - changed-files:
     - any-glob-to-any-file: 'mooncake-wheel/**/*'
+
+P2P Store:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-p2p-store/**/*'
+
+Integration:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-integration/**/*'
+
+Common:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-common/**/*'
+
+CI/Build:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '.github/**/*'
+      - 'CMakeLists.txt'
+      - '.pre-commit-config.yaml'
+      - 'dependencies.sh'
+
+Documentation:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'docs/**/*'
+      - '*.md'
+
+Tests:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'scripts/test_*'
+      - 'mooncake-wheel/tests/**/*'
+      - 'scripts/tone_tests/**/*'
+
+Ascend/NPU:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/ascend*/**'
+      - 'scripts/ascend/**'
+      - '.github/workflows/*ascend*'

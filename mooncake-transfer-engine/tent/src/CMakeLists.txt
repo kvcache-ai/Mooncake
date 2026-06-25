@@ -79,9 +79,10 @@ endif()
 
 if(USE_SUNRISE)
   target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
-  target_include_directories(tent_interface INTERFACE /usr/local/tangrt/include)
+  target_include_directories(tent_interface INTERFACE ${MC_TANGRT_ROOT}/include)
   target_link_directories(tent_interface INTERFACE
-                          /usr/local/tangrt/lib/linux-x86_64)
+                          ${MC_TANGRT_ROOT}/lib/linux-x86_64
+                          ${MC_TANGRT_ROOT}/lib)
   target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
 endif()
 

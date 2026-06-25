@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include "connection_poller.h"
 #include "memory_location.h"
@@ -14,6 +15,18 @@
 #include "pg_utils.h"
 
 namespace mooncake {
+namespace {
+
+#ifdef USE_MACA
+static void requireMacaHostTransport() {
+    TORCH_CHECK(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
+                "MACA PG requires MC_MACA_HOST_TRANSPORT=1 so the transfer "
+                "engine uses a host transport.");
+}
+
+#endif
+
+}  // namespace
 
 constexpr const char* REGISTER_BUFFER_ERROR_MSG =
     "Failed to register local memory.";
@@ -211,6 +224,9 @@ MooncakeBackend::MooncakeBackend(
         engine_ = externalEngine_;
         engineInitialized_ = true;
     } else if (!engineInitialized_) {
+#ifdef USE_MACA
+        requireMacaHostTransport();
+#endif
         engine_->init(P2PHANDSHAKE, hostIp_);
         engineInitialized_ = true;
     }
@@ -253,6 +269,28 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
+#ifdef USE_MACA
+    } else {
+        for (size_t i = 0; i < 2; i++) {
+            cudaError_t err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err,
+                        c10::str("Failed to allocate MACA GPU send buffer"));
+
+            int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
+                                                  location);
+            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+        }
+
+        for (size_t i = 0; i < 2; i++) {
+            cudaError_t err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err,
+                        c10::str("Failed to allocate MACA GPU recv buffer"));
+
+            int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
+                                                  location);
+            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+        }
+#else
     } else {
         for (size_t i = 0; i < 2; i++) {
             cudaError_t err = cudaMalloc(&send_buffer_[i], kBufferSize);
@@ -271,6 +309,7 @@ MooncakeBackend::MooncakeBackend(
                                                   location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
+#endif
     }
 
     // Register CPU sync regions

@@ -23,6 +23,7 @@
 #include <queue>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
@@ -45,6 +46,13 @@ struct MnnvlSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
+    // Completion events created in startTransfer (one per submit). Destroyed by
+    // the destructor (RAII); Slab<T>::deallocate() invokes ~MnnvlSubBatch()
+    // before reusing the storage, so this runs on every free.
+    std::vector<cudaEvent_t> completion_events;
+    ~MnnvlSubBatch() {
+        for (auto event : completion_events) cudaEventDestroy(event);
+    }
     virtual size_t size() const { return task_list.size(); }
 };
 

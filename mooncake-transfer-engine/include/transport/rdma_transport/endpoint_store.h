@@ -43,6 +43,7 @@ class EndpointStore {
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
+    virtual int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) = 0;
     virtual void evictEndpoint() = 0;
     // Takes endpoint_map_lock_; caller must not hold it (RWSpinlock is
     // non-reentrant, so recursive acquisition deadlocks).
@@ -76,6 +77,7 @@ class FIFOEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
+    int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -115,6 +117,7 @@ class SIEVEEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
+    int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;

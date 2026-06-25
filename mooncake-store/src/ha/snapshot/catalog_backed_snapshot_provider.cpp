@@ -335,7 +335,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
             case SnapshotCatalogBackendKind::kEmbedded:
                 catalog_store_ = std::make_unique<
                     ha::backends::embedded::EmbeddedSnapshotCatalogStore>(
-                    object_store_.get());
+                    object_store_.get(), cluster_id_);
                 break;
             case SnapshotCatalogBackendKind::kRedis: {
 #ifndef STORE_USE_REDIS
@@ -385,7 +385,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         if (object_prefix.empty()) {
             object_prefix =
                 ha::snapshot_catalog_store_detail::BuildSnapshotPrefix(
-                    descriptor.snapshot_id);
+                    catalog_store_->GetSnapshotRoot(), descriptor.snapshot_id);
         }
 
         std::string manifest_path = descriptor.manifest_key;

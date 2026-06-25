@@ -207,7 +207,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                   IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ;
 
-    static int access_rights = kBaseAccessRights;
+    int access_rights = kBaseAccessRights;
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
@@ -506,7 +506,17 @@ Status RdmaTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask *> task_list;
-    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    for (auto &request : entries) {
+        auto &task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest *>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 

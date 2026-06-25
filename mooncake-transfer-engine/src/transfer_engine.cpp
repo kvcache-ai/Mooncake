@@ -460,6 +460,8 @@ Status TransferEngine::submitTransfer(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -484,6 +486,8 @@ Status TransferEngine::submitTransferWithNotify(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;

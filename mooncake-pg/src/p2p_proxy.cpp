@@ -320,7 +320,9 @@ void P2PProxy::reportBrokenPeer(int peer_rank) {
     // Set peerConnected to notify the connection poller to reconnect it.
     meta_->peerConnected[peer_rank] = false;
     meta_->activeRanks[peer_rank] = false;
-    meta_->activeRanksTensor[peer_rank] = 0;
+    if (meta_->activeRanksTensor.device().is_cpu()) {
+        meta_->activeRanksTensor[peer_rank] = 0;
+    }
     LOG(ERROR) << "Rank " << meta_->rank << " marking peer " << peer_rank
                << " as broken during P2P transfer.";
 }

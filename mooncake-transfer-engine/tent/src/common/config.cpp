@@ -16,6 +16,8 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 
 namespace mooncake {
@@ -105,6 +107,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
     setConfig(config, "MC_MTU", "transports/rdma/endpoint/path_mtu");
     setConfig(config, "MC_IB_TC", "transports/rdma/endpoint/traffic_class");
+    setConfig(config, "MC_IB_SL", "transports/rdma/endpoint/service_level");
     setConfig(config, "MC_IB_PCI_RELAXED_ORDERING",
               "transports/rdma/pci_relaxed_ordering");
     setConfig(config, "MC_WORKERS_PER_CTX",
@@ -120,7 +123,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {
     std::string lower_str = str;
     std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(),
-                   ::tolower);
+                   [](unsigned char c) { return std::tolower(c); });
 
     if (lower_str == "true" || lower_str == "1" || lower_str == "yes" ||
         lower_str == "on") {

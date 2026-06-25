@@ -3,13 +3,13 @@
 #include <atomic>
 #include <csignal>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
-#include "pyclient.h"
-#include "real_client.h"
-#include "shm_helper.h"
 #include "client_metric.h"
+#include "pyclient.h"
+#include "shm_helper.h"
 #include <memory>
 
 namespace mooncake {
@@ -61,8 +61,11 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
-        override;
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) override;
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,

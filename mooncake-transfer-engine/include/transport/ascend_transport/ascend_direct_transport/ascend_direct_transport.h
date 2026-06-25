@@ -77,8 +77,22 @@ class AscendDirectTransport : public Transport {
                                const std::string &host_ip, SegmentDesc *desc);
 
     int32_t base_port_ = 20000;
-    bool dummy_real_mode_{false};
+    // Mirrors globalConfig().ascend_agent_mode. ascend_agent_mode is enabled
+    // both by the dummy client (inference/GPU process) and by the standalone
+    // real client (real_client_main). The dummy client never installs this
+    // transport, so within AscendDirectTransport this flag effectively means
+    // "I am the independently-launched real client". In this mode the local
+    // segment enumerates every local NPU device via ContextManager (the real
+    // client owns all devices) instead of using the single current-device
+    // context.
+    bool agent_mode_{false};
     bool roce_mode_{false};
+    // Whether this TE uses Ascend fabric memory (host mem for Store, e.g. RoCE
+    // D2H/H2D). Captured once at install time from globalConfig() and gated on
+    // ascend_store_te_init, so a non-Store (e.g. P2P/HCCS) TE never inherits a
+    // Store TE's fabric setting that leaked into the process-global flag. All
+    // transfer-time decisions read this member, not the global.
+    bool use_fabric_mem_{false};
     std::vector<aclrtContext> local_engine_contexts_;
 
     std::unique_ptr<TransferExecutorBase> transfer_executor_;

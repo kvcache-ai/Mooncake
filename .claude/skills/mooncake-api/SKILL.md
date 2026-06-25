@@ -1,4 +1,7 @@
-<!-- Let's perfect this skill together. -->
+---
+name: mooncake-api
+description: Help users work with the Mooncake Python APIs for distributed storage and high-performance data transfer. Use when working with Mooncake Store (distributed KV cache), Transfer Engine (RDMA/TCP transfers), service setup (master, metadata server), PyTorch tensors in the Store, zero-copy/buffer management, batch operations and replication, or Mooncake EP / Backend (Expert Parallelism). Trigger on questions about MooncakeDistributedStore, TransferEngine, put/get, put_tensor, register_buffer, ReplicateConfig, or the mooncake.store / mooncake.engine / mooncake.pg Python modules.
+---
 
 # Mooncake Python API Skill
 

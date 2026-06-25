@@ -8,14 +8,15 @@ Install the Mooncake Transfer Engine package from PyPI, which includes both Moon
 
 **For CUDA-enabled systems:**
 ```bash
-pip install mooncake-transfer-engine
+pip install mooncake-transfer-engine numpy pyzmq
 ```
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
 
 **For non-CUDA systems:**
 ```bash
-pip install mooncake-transfer-engine-non-cuda
+pip install mooncake-transfer-engine-non-cuda numpy pyzmq
 ```
+
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
 
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
@@ -42,7 +43,7 @@ def main():
     METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
     PROTOCOL = "rdma" # [rdma, tcp, ...]
     DEVICE_NAME = "" # auto discovery if empty
-    
+
     # Initialize server engine
     server_engine = TransferEngine()
     server_engine.initialize(
@@ -52,12 +53,12 @@ def main():
         DEVICE_NAME
     )
     session_id = f"{HOSTNAME}:{server_engine.get_rpc_port()}"
-    
+
     # Allocate memory on server side (1MB buffer)
     server_buffer = np.zeros(1024 * 1024, dtype=np.uint8)
     server_ptr = server_buffer.ctypes.data
     server_len = server_buffer.nbytes
-    
+
     # Register memory with Mooncake
     if PROTOCOL == "rdma":
         ret_value = server_engine.register_memory(server_ptr, server_len)
@@ -67,7 +68,7 @@ def main():
 
     print(f"Server initialized with session ID: {session_id}")
     print(f"Server buffer address: {server_ptr}, length: {server_len}")
-    
+
     # Send buffer info to client
     buffer_info = {
         "session_id": session_id,
@@ -76,7 +77,7 @@ def main():
     }
     socket.send_json(buffer_info)
     print("Buffer information sent to client")
-    
+
     # Keep server running
     try:
         while True:
@@ -95,8 +96,8 @@ def main():
         context.term()
 
 if __name__ == "__main__":
-    main() 
- 
+    main()
+
 ```
 
 ### Start Transfer Engine Sender (Client)
@@ -113,7 +114,7 @@ def main():
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
     socket.connect(f"tcp://localhost:5555")
-    
+
     # Wait for buffer info from server
     print("Waiting for server buffer information...")
     buffer_info = socket.recv_json()
@@ -122,7 +123,7 @@ def main():
     server_len = buffer_info["len"]
     print(f"Received server info - Session ID: {server_session_id}")
     print(f"Server buffer address: {server_ptr}, length: {server_len}")
-    
+
     # Initialize client engine
     HOSTNAME = "localhost" # localhost for simple demo
     METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
@@ -137,18 +138,18 @@ def main():
         DEVICE_NAME
     )
     session_id = f"{HOSTNAME}:{client_engine.get_rpc_port()}"
-    
+
     # Allocate and initialize client buffer (1MB)
     client_buffer = np.ones(1024 * 1024, dtype=np.uint8)  # Fill with ones
     client_ptr = client_buffer.ctypes.data
     client_len = client_buffer.nbytes
-    
+
     # Register memory with Mooncake
     if PROTOCOL == "rdma":
         ret_value = client_engine.register_memory(client_ptr, client_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
+        if ret_value != 0:
+            print("Mooncake memory registration failed.")
+            raise RuntimeError("Mooncake memory registration failed.")
 
     print(f"Client initialized with session ID: {session_id}")
 
@@ -161,12 +162,12 @@ def main():
             server_ptr,
             min(client_len, server_len)  # Transfer minimum of both lengths
         )
-    
+
         if ret >= 0:
             print("Transfer successful!")
         else:
             print("Transfer failed!")
-    
+
     # Cleanup
     if PROTOCOL == "rdma":
         ret_value = client_engine.unregister_memory(client_ptr)
@@ -178,7 +179,7 @@ def main():
     context.term()
 
 if __name__ == "__main__":
-    main() 
+    main()
 
 ```
 
@@ -245,4 +246,25 @@ store.close()
 
 ### More Examples and Documentation
 
-Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md) and [Mooncake Store Deployment & Operations Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
+Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md) and [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
+
+## Skills for AI Coding Assistants
+
+Mooncake ships a set of **built-in skills** under [`.claude/skills`](https://github.com/kvcache-ai/Mooncake/tree/main/.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command:
+
+| Skill | Description |
+|-------|-------------|
+| `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
+| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
+| `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
+
+Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
+
+```text
+/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
+/plugin install mooncake-troubleshoot@mooncake
+/plugin install mooncake-ci-local@mooncake
+/plugin install mooncake-api@mooncake
+```
+
+The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.

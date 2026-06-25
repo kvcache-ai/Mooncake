@@ -18,6 +18,7 @@
 #include <queue>
 #include <unordered_set>
 
+#include "config.h"
 #include "rdma_context.h"
 
 namespace mooncake {
@@ -42,6 +43,42 @@ class WorkerPool {
     void monitorWorker();
 
     int doProcessContextEvents();
+
+    // Simplified rail monitor: pause problematic paths for a cooldown period
+    struct RailState {
+        int error_count = 0;
+        uint64_t pause_until_ns = 0;  // Timestamp (ns) when pause expires
+    };
+
+    void markRailFailed(const std::string &peer_nic_path);
+    bool isRailAvailable(const std::string &peer_nic_path);
+
+    // Retry helper: increment retry count and return whether retry is allowed
+    static bool shouldRetrySlice(Transport::Slice *slice);
+
+    // Unified path failure handler: marks rail failed, notifies other workers,
+    // and optionally deletes the endpoint
+    void handlePathFailure(const std::string &peer_nic_path,
+                           RdmaEndPoint *endpoint = nullptr);
+
+    // Context-level health tracking for catastrophic hardware failure.
+    // When all rails through a local RNIC are unavailable, increment the
+    // failure counter. Reset on any success. Mark context inactive after
+    // consecutive failures exceed threshold.
+    bool contextHealthy() const {
+        return context_failure_count_ < kContextFailureThreshold;
+    }
+    void markContextSuccess() { context_failure_count_ = 0; }
+    void markContextFailure() {
+        context_failure_count_++;
+        if (context_failure_count_ >= kContextFailureThreshold) {
+            LOG(WARNING) << "All rails failed for context "
+                         << context_.deviceName() << " for "
+                         << context_failure_count_
+                         << " consecutive attempts, marking inactive";
+            context_.set_active(false);
+        }
+    }
 
    private:
     RdmaContext &context_;
@@ -68,7 +105,18 @@ class WorkerPool {
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
 
-    uint64_t success_nr_polls = 0, failed_nr_polls = 0;
+    // Rail state management: peer_nic_path -> RailState
+    std::unordered_map<std::string, RailState> rail_states_;
+    std::mutex rail_state_lock_;
+
+    // Rail monitor configuration
+    const static int kRailErrorThreshold = 5;            // Errors before pause
+    const static uint64_t kRailPauseNs = 1000000000ull;  // 1 second pause
+
+    // Context-level health tracking
+    int context_failure_count_ = 0;
+    const static int kContextFailureThreshold =
+        32;  // consecutive all-rails-failed
 };
 }  // namespace mooncake
 

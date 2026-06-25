@@ -16,10 +16,6 @@ namespace mooncake {
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
-    // Explicitly initialize HA metric manager to ensure thread safety
-    // during metric registration.
-    HAMetricManager::Init();
-
     metadata_store_ = std::make_unique<StandbyMetadataStore>();
     // OpLogApplier will be re-created in Start() with the resolved cluster_id
     // to enable etcd-based operations (e.g. requesting missing OpLog entries).

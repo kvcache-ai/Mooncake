@@ -70,7 +70,8 @@ class MasterServicePromotionSnapshotTest
     bool InjectLocalDiskReplica(const UUID& client_id, const std::string& key,
                                 int64_t size,
                                 const std::string& transport_endpoint) {
-        std::vector<std::string> keys{key};
+        std::vector<OffloadTaskItem> tasks{
+            OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
         StorageObjectMetadata sm;
         sm.bucket_id = 0;
         sm.offset = 0;
@@ -78,7 +79,7 @@ class MasterServicePromotionSnapshotTest
         sm.data_size = size;
         sm.transport_endpoint = transport_endpoint;
         std::vector<StorageObjectMetadata> metas{sm};
-        return service_->NotifyOffloadSuccess(client_id, keys, metas)
+        return service_->NotifyOffloadSuccess(client_id, tasks, metas)
             .has_value();
     }
 };
@@ -95,7 +96,7 @@ TEST_F(MasterServicePromotionSnapshotTest, LocalDiskReplicaRoundTrip) {
     ASSERT_TRUE(
         InjectLocalDiskReplica(client_id, "k_cold", 1024, "seg_a_endpoint"));
 
-    auto before = service_->GetReplicaList("k_cold");
+    auto before = service_->GetReplicaList("k_cold", "default");
     ASSERT_TRUE(before.has_value());
     ASSERT_EQ(before->replicas.size(), 1u);
     EXPECT_TRUE(before->replicas[0].is_local_disk_replica());
@@ -111,15 +112,17 @@ TEST_F(MasterServicePromotionSnapshotTest, MixedMemoryAndLocalDiskRoundTrip) {
     // Put a MEMORY replica.
     ReplicateConfig rc;
     rc.replica_num = 1;
-    ASSERT_TRUE(service_->PutStart(client_id, "k_mixed", 1024, rc).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, "k_mixed", ReplicaType::MEMORY)
+    ASSERT_TRUE(service_->PutStart(client_id, "k_mixed", "default", 1024, rc)
                     .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "k_mixed", "default", ReplicaType::MEMORY)
+            .has_value());
 
     // Add LOCAL_DISK alongside.
     ASSERT_TRUE(
         InjectLocalDiskReplica(client_id, "k_mixed", 1024, "seg_a_endpoint"));
 
-    auto descs = service_->GetReplicaList("k_mixed");
+    auto descs = service_->GetReplicaList("k_mixed", "default");
     ASSERT_TRUE(descs.has_value());
     EXPECT_EQ(descs->replicas.size(), 2u);
 }
@@ -150,8 +153,8 @@ TEST_F(MasterServicePromotionSnapshotTest, MultipleLocalDiskHoldersRoundTrip) {
     ASSERT_TRUE(
         InjectLocalDiskReplica(client_b, "k_b", 2048, "seg_b_endpoint"));
 
-    auto a = service_->GetReplicaList("k_a");
-    auto b = service_->GetReplicaList("k_b");
+    auto a = service_->GetReplicaList("k_a", "default");
+    auto b = service_->GetReplicaList("k_b", "default");
     ASSERT_TRUE(a.has_value());
     ASSERT_TRUE(b.has_value());
     EXPECT_EQ(a->replicas[0].get_local_disk_descriptor().client_id, client_a);
@@ -174,7 +177,7 @@ TEST_F(MasterServicePromotionSnapshotTest, InFlightPromotionTaskSnapshotSafe) {
     // Trigger promotion gate to enqueue a task. This pins the source
     // replica's refcnt and adds a per-shard PromotionTask plus a per-
     // segment promotion_objects entry.
-    auto get = service_->GetReplicaList("k_cold");
+    auto get = service_->GetReplicaList("k_cold", "default");
     ASSERT_TRUE(get.has_value());
 
     // The visible replica list should still expose exactly one LOCAL_DISK
