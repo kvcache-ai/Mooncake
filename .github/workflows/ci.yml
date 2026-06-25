@@ -500,6 +500,7 @@ jobs:
       BUILD_WITH_EP: "1"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
+      PIP_NO_CACHE_DIR: "1"
 
     steps:
     - uses: actions/checkout@v4
