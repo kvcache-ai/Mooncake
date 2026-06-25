@@ -465,7 +465,7 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
 device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
     int num_ranks) {
     if (!p2p_transport_) {
@@ -476,10 +476,15 @@ device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
 
 device::RdmaTransport* TransferEngineImpl::getOrCreateRdmaTransport(
     const std::vector<std::string>& device_filter) {
+#if defined(USE_MACA) && !defined(USE_CUDA) && !defined(USE_MUSA)
+    (void)device_filter;
+    return nullptr;
+#else
     if (!rdma_transport_) {
         rdma_transport_ = device::createIbgdaDeviceTransport(device_filter);
     }
     return rdma_transport_.get();
+#endif
 }
 #endif
 

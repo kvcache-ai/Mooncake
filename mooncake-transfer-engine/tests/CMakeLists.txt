@@ -81,6 +81,14 @@ if (USE_HIP)
     add_test(NAME hip_transport_test COMMAND hip_transport_test)
 endif()
 
+if (USE_CUDA OR USE_MUSA OR USE_MACA)
+    add_executable(device_p2p_transport_smoke_test
+        ${WORKSPACE}/device_p2p_transport_smoke_test.cpp)
+    target_link_libraries(device_p2p_transport_smoke_test PUBLIC transfer_engine)
+    add_test(NAME device_p2p_transport_smoke_test
+        COMMAND device_p2p_transport_smoke_test)
+endif()
+
 if (USE_UBSHMEM)
     add_executable(ubshmem_transport_test ${WORKSPACE}/ubshmem_transport_test.cpp)
     target_link_libraries(ubshmem_transport_test PUBLIC transfer_engine gtest gtest_main ascendcl)

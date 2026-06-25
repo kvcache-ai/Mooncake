@@ -5,7 +5,7 @@
 // The kernel itself has zero platform #ifdef branches.
 #pragma once
 
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
 #include "transport/device/musa/musa_ops.cuh"
 #else
 #include "transport/device/cuda/cuda_ops.cuh"
