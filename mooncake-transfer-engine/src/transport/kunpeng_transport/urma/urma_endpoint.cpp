@@ -282,6 +282,21 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
                       << "shrink it to " << globalConfig().max_seg_size;
         length = (size_t)globalConfig().max_seg_size;
     }
+
+    // urma_register_seg on Kunpeng hardware requires a page-aligned start
+    // address.  Round down to the page boundary and extend the length to cover
+    // the original range, then round the length up to the next page boundary.
+    static const uint64_t kPageMask = ~(uint64_t)(4096 - 1);
+    uint64_t aligned_va = va & kPageMask;
+    if (aligned_va != va) {
+        LOG(WARNING) << "registerMemoryRegion: va " << va
+                     << " is not page-aligned, rounding down to " << aligned_va;
+        length += (va - aligned_va);
+        va = aligned_va;
+    }
+    // Round length up to a multiple of the page size.
+    length = (length + 4095) & (size_t)kPageMask;
+
     LOG(INFO) << "Register memory region " << va << " length " << length;
     urma_reg_seg_flag_t flag = {};
     flag.bs.token_policy = URMA_TOKEN_NONE;

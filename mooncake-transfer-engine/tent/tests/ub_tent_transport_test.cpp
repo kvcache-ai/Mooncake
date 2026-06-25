@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -159,10 +160,14 @@ TEST(UbTentTransportTest, AddAndRemoveMemoryBuffer) {
         GTEST_SKIP() << "install failed: " << status.message();
     }
 
-    // Allocate a small CPU buffer.
+    // Allocate a page-aligned CPU buffer.  urma_register_seg on Kunpeng
+    // hardware requires the start address to be page-aligned (4 KiB).
+    // std::vector uses malloc which only guarantees 16-byte alignment, so we
+    // use posix_memalign here instead.
     const size_t kBufLen = 4096;
-    std::vector<char> buf(kBufLen, 0);
-    void* addr = buf.data();
+    void* addr = nullptr;
+    ASSERT_EQ(posix_memalign(&addr, 4096, kBufLen), 0);
+    std::memset(addr, 0, kBufLen);
 
     BufferDesc desc;
     desc.addr = reinterpret_cast<uint64_t>(addr);
@@ -187,6 +192,8 @@ TEST(UbTentTransportTest, AddAndRemoveMemoryBuffer) {
     it = std::find(desc.transports.begin(), desc.transports.end(), UB);
     EXPECT_EQ(it, desc.transports.end())
         << "UB still present in desc.transports after removeMemoryBuffer()";
+
+    free(addr);
 }
 
 TEST(UbTentTransportTest, AllocateAndFreeSubBatch) {
@@ -218,13 +225,18 @@ TEST(UbTentTransportTest, SubmitAndPollMockTransfer) {
         GTEST_SKIP() << "install failed: " << status.message();
     }
 
-    // Register source buffer.
+    // Allocate page-aligned buffers (urma_register_seg requires 4 KiB
+    // alignment).
     const size_t kBufLen = 4096;
-    std::vector<char> src(kBufLen, 0xAB);
-    std::vector<char> dst(kBufLen, 0x00);
+    void* src_raw = nullptr;
+    void* dst_raw = nullptr;
+    ASSERT_EQ(posix_memalign(&src_raw, 4096, kBufLen), 0);
+    ASSERT_EQ(posix_memalign(&dst_raw, 4096, kBufLen), 0);
+    std::memset(src_raw, 0xAB, kBufLen);
+    std::memset(dst_raw, 0x00, kBufLen);
 
     BufferDesc src_desc;
-    src_desc.addr = reinterpret_cast<uint64_t>(src.data());
+    src_desc.addr = reinterpret_cast<uint64_t>(src_raw);
     src_desc.length = kBufLen;
     src_desc.location = "*";
 
@@ -244,9 +256,9 @@ TEST(UbTentTransportTest, SubmitAndPollMockTransfer) {
     // Build a local WRITE request (LOCAL_SEGMENT_ID).
     Request req{};
     req.opcode = Request::WRITE;
-    req.source = src.data();
+    req.source = src_raw;
     req.target_id = LOCAL_SEGMENT_ID;
-    req.target_offset = reinterpret_cast<uint64_t>(dst.data());
+    req.target_offset = reinterpret_cast<uint64_t>(dst_raw);
     req.length = kBufLen;
 
     auto sub_s = transport.submitTransferTasks(batch, {req});
@@ -275,6 +287,8 @@ TEST(UbTentTransportTest, SubmitAndPollMockTransfer) {
 
     transport.removeMemoryBuffer(src_desc);
     transport.freeSubBatch(batch);
+    free(src_raw);
+    free(dst_raw);
 }
 
 // Calling uninstall() twice must not crash.
