@@ -606,7 +606,9 @@ batch_id_t TransferEnginePy::batchTransferAsync(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            if (handle == (Transport::SegmentHandle)-1) return -1;
+            // batch_id_t is unsigned; 0 is the documented failure sentinel
+            // (-1 would surface as 2^64 - 1 in Python).
+            if (handle == (Transport::SegmentHandle)-1) return 0;
             handle_map_[target_hostname] = handle;
         }
     }
@@ -730,7 +732,9 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            if (handle == (Transport::SegmentHandle)-1) return -1;
+            // batch_id_t is unsigned; 0 is the documented failure sentinel
+            // (-1 would surface as 2^64 - 1 in Python).
+            if (handle == (Transport::SegmentHandle)-1) return 0;
             handle_map_[target_hostname] = handle;
         }
     }
@@ -745,7 +749,10 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     entry.transport_hint = parseTransportHint(transport_hint);
 
     Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) return -1;
+    if (!s.ok()) {
+        engine_->freeBatchID(batch_id);
+        return 0;
+    }
 
     return batch_id;
 }

@@ -553,11 +553,15 @@ vllm-router --policy round_robin \
   --prefill http://<prefill_ip>:8010 \
   --decode  http://<decode_ip>:8020 \
   --kv-connector mooncake \
-  --host 0.0.0.0 --port 30000 \
-  --intra-node-data-parallel-size 8
+  --host 0.0.0.0 --port 30000
 ```
 
-`--intra-node-data-parallel-size` should match the per-node DP size of your prefill / decode instances (8 in this example, matching `-tp 8`).
+> **Do not add `--intra-node-data-parallel-size` here.** The prefill / decode
+> instances above are launched with `-tp 8` (pure tensor parallelism, data
+> parallel size = 1), so there is no intra-node DP to advertise. Only pass
+> `--intra-node-data-parallel-size N` when your instances actually run `N`-way
+> data parallelism per node (e.g. you launched them with `--data-parallel-size N`);
+> setting it to match `-tp 8` is wrong and will misroute requests.
 
 ## Usage with SGLang
 
@@ -567,7 +571,7 @@ SGLang's PD-disaggregation Mooncake integration reads the transport from `MOONCA
 
 Older SGLang releases hardcode `"rdma"` in the transfer engine init. [SGLang PR #25083](https://github.com/sgl-project/sglang/pull/25083) has been **merged into SGLang `main`**, so the protocol is now read from `MOONCAKE_PROTOCOL`. If your SGLang build includes that PR (any recent `main` or release built after it), **this step is unnecessary** — skip to step 2.
 
-Only if you are pinned to an older release that predates PR #25083, apply the [patch script](https://github.com/whn09/kimi-k2-sglang):
+Only if you are pinned to an older release that predates PR #25083, apply the [patch script](https://github.com/whn09/kimi-k2-sglang/blob/main/patch_sglang_efa.sh):
 
 ```bash
 bash patch_sglang_efa.sh
@@ -647,9 +651,18 @@ The trailing `8998` after `--prefill` must match the prefill's `--disaggregation
 
 ### Why libfabric instead of ibverbs?
 
-AWS EFA exposes RDMA-like devices through the ibverbs interface, but does not support the full ibverbs API. Specifically:
-- Queue Pair (QP) creation fails with "Operation not supported" (error 95)
-- EFA requires using libfabric's `FI_EP_RDM` (Reliable Datagram Message) endpoint type
+AWS EFA exposes an RDMA-capable device through the ibverbs interface, but it does
+**not** implement the full ibverbs API. In particular, EFA only supports
+**SRD** (Scalable Reliable Datagram) and **UD** (Unreliable Datagram) queue
+pairs — it does **not** support the **RC** (Reliable Connection) queue pairs
+that Mooncake's RDMA (`rdma`) transport is built on. Attempting to create an RC
+QP on an EFA device fails (`EOPNOTSUPP`), and SRD has no one-sided RC-style
+`ibv_post_send(RDMA_WRITE)` verb in the public ibverbs API.
+
+The portable way to drive EFA's SRD transport is libfabric, whose EFA provider
+exposes SRD through the `FI_EP_RDM` (Reliable Datagram Message) endpoint type and
+implements `fi_write` / `fi_read` (one-sided RMA) on top of it. Mooncake's EFA
+transport therefore targets libfabric directly rather than ibverbs.
 
 ### EFA Transport Architecture
 
@@ -667,7 +680,9 @@ Under the SRD shared-endpoint model every peer is addressed through one `fid_ep`
 │  ├── fid_mr         (memory regions)                      │
 │  ├── shared_ep_     (the single fid_ep that serves every  │
 │  │                   peer via fi_addr_t lookup in the AV) │
-│  └── peer_map_      (normalized nic_path -> EfaEndPoint)  │
+│  └── peer_map_      (full "host:port@nic" path ->         │
+│                      EfaEndPoint; the RPC port is NOT     │
+│                      stripped — see note below)           │
 ├───────────────────────────────────────────────────────────┤
 │  EfaEndPoint (per peer)                                   │
 │  └── peer_fi_addr_  (AV slot index for this peer; sends   │
@@ -676,6 +691,16 @@ Under the SRD shared-endpoint model every peer is addressed through one `fid_ep`
 └───────────────────────────────────────────────────────────┘
 ```
 
+> **Peer-map keying.** `peer_map_` is keyed by the **full** `host:port@nic`
+> path, *not* a port-stripped form. Under SGLang DP > 1 each DP worker on a
+> peer host is a separate process with its own Mooncake `TransferEngine` and
+> its own P2PHANDSHAKE RPC port; they share host + NIC but have distinct EFA
+> addresses. Normalizing the port away would collapse every DP worker on that
+> host onto one `EfaEndPoint`, so each arriving handshake would look like a
+> "peer reconnected" to the previous holder and trigger `fi_av_remove` +
+> `fi_av_insert` churn on every KV transfer. Keeping the port in the key costs
+> nothing in steady state (the port is stable for a worker's lifetime).
+
 ### Thread Safety
 
 The EFA transport requests `FI_THREAD_SAFE` at the domain level and guards the shared endpoint with a single `post_lock_` spinlock (one per `EfaContext`, i.e. one per local NIC) to serialize `fi_write`/`fi_read` calls. This is necessary because:
@@ -683,19 +708,32 @@ The EFA transport requests `FI_THREAD_SAFE` at the domain level and guards the s
 - Multiple submission threads may route slices through the same shared endpoint concurrently.
 - libfabric's EFA RDM endpoints are not thread-safe for concurrent `fi_write`/`fi_read` even under `FI_THREAD_SAFE` at the domain level — concurrent posts corrupt provider internals and completions silently vanish.
 
-CQ completion queues are polled by dedicated worker threads (one per EFA device) that run independently of submission threads.
+CQ completion queues are polled by dedicated worker threads that run
+independently of submission threads. The poller count is `min(MC_EFA_CQ_THREADS,
+num_EFA_devices)`; `MC_EFA_CQ_THREADS` defaults to `1`, so a single poller
+round-robins every context's CQ (which already reaches ~99.9% of peak — see the
+SGLang env-var note above). Set `MC_EFA_CQ_THREADS=0` to lift the cap and spawn
+one poller per EFA device (the legacy behavior).
 
 ### EFA vs RoCE RDMA
 
 | Feature | EFA (libfabric SRD) | RoCE (ibverbs) |
 |---------|--------------------|--------------------|
-| Protocol | Scalable Reliable Datagram | RDMA over Converged Ethernet |
-| Endpoint type | `FI_EP_RDM` (message-based) | Queue Pairs (true RDMA) |
-| Write operation | Software-emulated via messages + ACKs | Hardware-offloaded one-sided RDMA |
-| CPU overhead | Moderate (provider processes ACKs) | Minimal (NIC handles everything) |
+| Protocol | Scalable Reliable Datagram (SRD) | RDMA over Converged Ethernet |
+| QP type | SRD / UD (no RC) | RC (Reliable Connection) |
+| Endpoint type | `FI_EP_RDM` (connectionless) | Queue Pairs (connection-oriented) |
+| Reliability / ordering | Reliable delivery, **unordered** (SRD sprays across paths) | Reliable, in-order |
+| Write operation | One-sided `fi_write` over SRD; device-RDMA-offloaded by default (`FI_EFA_USE_DEVICE_RDMA=1`), falls back to libfabric's emulated RMA only if device RDMA is disabled | Hardware-offloaded one-sided RDMA |
 | Throughput GPU-to-GPU (16×200G, p5en) | 365 GB/s (tuned) | N/A |
 | Throughput CPU-to-CPU (16×200G, p5en) | 213 GB/s (tuned) | — |
 | AWS availability | All EFA-enabled instances | Not available on AWS |
+
+> Mooncake requests libfabric API ≥ 1.18 at `fi_getinfo`, which makes
+> `FI_EFA_USE_DEVICE_RDMA=1` the default on every supported EFA generation
+> (p5/p5e included). On this path `fi_write` / `fi_read` are hardware-offloaded
+> one-sided RMA over SRD — the host CPU is not in the data path. The
+> software-emulated RMA path only applies if you explicitly set
+> `FI_EFA_USE_DEVICE_RDMA=0`.
 
 ### Supported AWS Instance Types
 

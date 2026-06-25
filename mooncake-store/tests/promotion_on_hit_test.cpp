@@ -205,6 +205,54 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
     service->RemoveAll();
 }
 
+TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+
+    const std::string single_key = "k_single_get_promote";
+    const std::string batch_key = "k_batch_get_promote";
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, single_key,
+                                       1024, ctx.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, batch_key, 1024,
+                                       ctx.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+
+    auto single_result = service->GetReplicaList(single_key, "default");
+    ASSERT_TRUE(single_result.has_value());
+    ASSERT_EQ(single_result->replicas.size(), 1u);
+    EXPECT_TRUE(single_result->replicas[0].is_local_disk_replica());
+
+    auto batch_result = service->BatchGetReplicaList(
+        std::vector<std::string>{batch_key}, "default");
+    ASSERT_EQ(batch_result.size(), 1u);
+    ASSERT_TRUE(batch_result[0].has_value());
+    ASSERT_EQ(batch_result[0]->replicas.size(), 1u);
+    EXPECT_TRUE(batch_result[0]->replicas[0].is_local_disk_replica());
+
+    EXPECT_EQ(mm.get_promotion_admitted() - admitted_pre, 2);
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 2);
+
+    auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 2u);
+    EXPECT_EQ(CountPromotionTask(*pending, single_key), 1u);
+    EXPECT_EQ(CountPromotionTask(*pending, batch_key), 1u);
+
+    service->RemoveAll();
+}
+
 // PromotionObjectHeartbeat returns an empty task list when called against a
 // client that has no LocalDiskSegment registered.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {

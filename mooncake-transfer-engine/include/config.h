@@ -85,6 +85,13 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
+    // Transient flag scoped to a single TE init: set true by the Store entry
+    // (Client::InitTransferEngine) before installing the ascend transport, and
+    // reset to false right after. Lets ascend_direct distinguish a Store-init
+    // TE from a normal/P2P TE so each can resolve its own
+    // ASCEND_GLOBAL_RESOURCE_CONFIG (e.g. Store=RoCE, P2P=HCCS). Assumes TE
+    // inits are serialized within the process.
+    bool ascend_store_te_init = false;
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;

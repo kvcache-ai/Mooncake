@@ -310,6 +310,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
+- `MC_TE_FILTERS` Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `WITH_NVIDIA_PEERMEM` When set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). By default (unset or `0`), Mooncake uses the DMA-BUF path which does not require `nvidia-peermem`.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.

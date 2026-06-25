@@ -126,6 +126,8 @@ performance/mooncake/index
 design/architecture
 design/mooncake-store
 design/p2p-store
+design/mooncake-backend-pg
+design/mooncake-ep
 design/transfer-engine/index
 design/hicache-design
 design/engram
@@ -144,6 +146,7 @@ design/conductor/conductor-architecture-design
 api-reference/python/index
 api-reference/cpp/index
 api-reference/http/index
+api-reference/rust/index
 :::
 
 % Q&A for Mooncake
@@ -154,6 +157,7 @@ api-reference/http/index
 
 troubleshooting/error-code
 troubleshooting/troubleshooting
+troubleshooting/pg-ep-troubleshooting
 :::
 
 

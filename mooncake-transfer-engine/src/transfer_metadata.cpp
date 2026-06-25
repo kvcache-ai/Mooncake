@@ -430,7 +430,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip" ||
                segmentJSON["protocol"] == "maca" ||
-               segmentJSON["protocol"] == "ubshmem") {
+               segmentJSON["protocol"] == "ubshmem" ||
+               segmentJSON["protocol"] == "sunrise_link") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -573,9 +574,13 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.protocol = buffer_protocol;
             for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt());
+                buffer.rkey.push_back(
+                    static_cast<decltype(buffer.rkey)::value_type>(
+                        rkeyJSON.asUInt64()));
             for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt());
+                buffer.lkey.push_back(
+                    static_cast<decltype(buffer.lkey)::value_type>(
+                        lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
@@ -683,9 +688,13 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt());
+                buffer.rkey.push_back(
+                    static_cast<decltype(buffer.rkey)::value_type>(
+                        rkeyJSON.asUInt64()));
             for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt());
+                buffer.lkey.push_back(
+                    static_cast<decltype(buffer.lkey)::value_type>(
+                        lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
@@ -756,7 +765,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
                desc->protocol == "hip" || desc->protocol == "maca" ||
-               desc->protocol == "ubshmem") {
+               desc->protocol == "ubshmem" ||
+               desc->protocol == "sunrise_link") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();

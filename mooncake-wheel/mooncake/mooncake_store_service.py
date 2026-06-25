@@ -640,5 +640,11 @@ async def main():
         await service.stop()
         raise
 
+
+def sync_main():
+    """Synchronous entry point for ``mc_store_rest_server`` CLI."""
+    return asyncio.run(main())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    sync_main()

@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <cstdlib>
 
 #include "transfer_metadata.h"
 #include "memory_location.h"
@@ -14,6 +15,13 @@ TEST(ToplogyTest, GetTopologyMatrix) {
     topology.clear();
     topology.parse(json_str);
     ASSERT_EQ(topology.toString(), json_str);
+}
+
+TEST(ToplogyTest, DiscoverWithMcTeFilters) {
+    ASSERT_EQ(::setenv("MC_TE_FILTERS", "erdma_0", 1), 0);
+    mooncake::Topology topology;
+    EXPECT_EQ(topology.discover(), 0);
+    ::unsetenv("MC_TE_FILTERS");
 }
 
 TEST(ToplogyTest, TestEmpty) {
