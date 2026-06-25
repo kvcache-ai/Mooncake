@@ -3497,6 +3497,12 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", copy source becomes invalid during data transfer";
+        // Release the refcnt taken in CopyStart. The success path below does
+        // this once the copy completes; this error path must do it too, or the
+        // source replica stays pinned and can never be evicted.
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
         // Discard target replicas and clear the replication task.
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&task](const Replica& replica) {
@@ -3724,6 +3730,12 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", move source becomes invalid during data transfer";
+        // Release the refcnt taken in MoveStart. The success path below does
+        // this once the move completes; this error path must do it too, or the
+        // source replica stays pinned and can never be evicted.
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
         // Discard target replica and clear the replication task.
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&task](const Replica& replica) {
