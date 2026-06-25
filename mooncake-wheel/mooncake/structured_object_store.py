@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -112,7 +113,9 @@ class _TensorObjectBufferPayload:
 
     def __len__(self) -> int:
         if self.batch_size is None:
-            raise TypeError("tensor object buffer requires batch_size for DataProto use")
+            raise TypeError(
+                "tensor object buffer requires batch_size for DataProto use"
+            )
         return self.batch_size
 
 
@@ -176,6 +179,154 @@ class _NdarrayReadPlan:
     byte_length: int
     step: int
     cover_row_count: int
+
+
+DATAPROTO_REF_HANDLE_TYPE = "mooncake_dataproto_ref"
+DATAPROTO_REF_HANDLE_VERSION = 1
+DataProtoRefLike = MooncakeDataProtoRef | Mapping[str, Any]
+
+
+def is_dataproto_ref_handle(value: Any) -> bool:
+    return isinstance(value, Mapping) and value.get("type") == DATAPROTO_REF_HANDLE_TYPE
+
+
+def export_dataproto_ref(ref: MooncakeDataProtoRef) -> dict[str, Any]:
+    """Export a DataProto ref as a JSON-safe transport handle."""
+    if not isinstance(ref, MooncakeDataProtoRef):
+        raise TypeError(f"expected MooncakeDataProtoRef, got {type(ref).__name__}")
+    handle = {
+        "type": DATAPROTO_REF_HANDLE_TYPE,
+        "version": DATAPROTO_REF_HANDLE_VERSION,
+        "kind": "bundle_stages",
+        "batch_size": int(ref.batch_size),
+        "namespace": ref.namespace,
+        "partition": ref.partition,
+        "global_indexes": _json_safe_value(ref.global_indexes),
+        "stage_refs": {
+            stage: {"manifest_key": stage_ref.manifest_key}
+            for stage, stage_ref in ref.stage_refs.items()
+        },
+        "field_index": {
+            name: {
+                "stage": location.stage,
+                "member": location.member,
+                "section": location.section,
+            }
+            for name, location in ref.field_index.items()
+        },
+        "meta_info": _json_safe_value(ref.meta_info),
+        "encoded_non_tensor": _json_safe_value(ref.encoded_non_tensor),
+    }
+    json.dumps(handle, ensure_ascii=False)
+    return handle
+
+
+def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
+    """Import a JSON-safe DataProto transport handle into a lazy ref."""
+    if not is_dataproto_ref_handle(handle):
+        raise ValueError("not a Mooncake DataProto ref handle")
+    if int(handle.get("version", -1)) != DATAPROTO_REF_HANDLE_VERSION:
+        raise ValueError(
+            f"unsupported DataProto ref handle version: {handle.get('version')!r}"
+        )
+    if handle.get("kind") != "bundle_stages":
+        raise ValueError(
+            f"unsupported DataProto ref handle kind: {handle.get('kind')!r}"
+        )
+    stage_refs: dict[str, RemoteBundleRef] = {}
+    for stage, stage_ref in _require_mapping(
+        handle.get("stage_refs"), "stage_refs"
+    ).items():
+        manifest_key = _require_mapping(stage_ref, f"stage_refs[{stage!r}]").get(
+            "manifest_key"
+        )
+        if not isinstance(stage, str) or not isinstance(manifest_key, str):
+            raise ValueError(
+                "DataProto ref handle stage refs must contain string manifest_key values"
+            )
+        stage_refs[stage] = RemoteBundleRef(manifest_key=manifest_key, manifest={})
+    field_index: dict[str, StructuredFieldLocation] = {}
+    for name, raw_location in _require_mapping(
+        handle.get("field_index"), "field_index"
+    ).items():
+        location = _require_mapping(raw_location, f"field_index[{name!r}]")
+        section = location.get("section")
+        if section not in {"batch", "non_tensor_batch"}:
+            raise ValueError(f"invalid DataProto field section: {section!r}")
+        stage = location.get("stage")
+        member = location.get("member")
+        if (
+            not isinstance(name, str)
+            or not isinstance(stage, str)
+            or not isinstance(member, str)
+        ):
+            raise ValueError("DataProto ref handle field locations must be strings")
+        if stage not in stage_refs:
+            raise ValueError(
+                f"DataProto ref handle field {name!r} references unknown stage {stage!r}"
+            )
+        field_index[name] = StructuredFieldLocation(
+            stage=stage, member=member, section=section
+        )
+    return MooncakeDataProtoRef(
+        batch_size=int(handle["batch_size"]),
+        stage_refs=stage_refs,
+        field_index=field_index,
+        meta_info=dict(_require_mapping(handle.get("meta_info", {}), "meta_info")),
+        namespace=str(handle.get("namespace", "default")),
+        partition=str(handle.get("partition", "default")),
+        global_indexes=_import_global_indexes(handle.get("global_indexes")),
+        encoded_non_tensor=dict(
+            _require_mapping(handle.get("encoded_non_tensor", {}), "encoded_non_tensor")
+        ),
+    )
+
+
+def _resolve_dataproto_ref(ref: DataProtoRefLike) -> MooncakeDataProtoRef:
+    if isinstance(ref, MooncakeDataProtoRef):
+        return ref
+    if is_dataproto_ref_handle(ref):
+        return import_dataproto_ref(ref)
+    raise TypeError(
+        f"expected MooncakeDataProtoRef or DataProto handle, got {type(ref).__name__}"
+    )
+
+
+def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"DataProto ref handle {name} must be a mapping")
+    return value
+
+
+def _import_global_indexes(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("DataProto ref handle global_indexes must be a list or null")
+    indexes: list[int] = []
+    for index in value:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError(
+                "DataProto ref handle global_indexes must contain integers"
+            )
+        indexes.append(index)
+    return indexes
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return _json_safe_value(value.tolist())
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_value(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    raise TypeError(
+        f"DataProto ref handles support only JSON-safe values, got {type(value).__name__}"
+    )
 
 
 class MooncakeBundleTransfer:
@@ -318,7 +469,7 @@ class MooncakeBundleTransfer:
 
     def append_dataproto_fields(
         self,
-        ref: MooncakeDataProtoRef,
+        ref: DataProtoRefLike,
         data: Any,
         *,
         stage: str,
@@ -327,6 +478,7 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy] = None,
     ) -> MooncakeDataProtoRef:
         """Append fields from a later DataProto stage without rewriting previous stages."""
+        ref = _resolve_dataproto_ref(ref)
         return self._put_dataproto_stage(
             ref,
             data,
@@ -338,9 +490,13 @@ class MooncakeBundleTransfer:
             overwrite=overwrite,
         )
 
+    def dataproto_manifest_view(self, ref: DataProtoRefLike) -> dict[str, Any]:
+        """Return a DataProto field view derived from stage structured-object manifests."""
+        return _dataproto_manifest_view(self, _resolve_dataproto_ref(ref))
+
     def get_dataproto(
         self,
-        ref: MooncakeDataProtoRef,
+        ref: DataProtoRefLike,
         *,
         fields: Optional[Sequence[str]] = None,
         batch_fields: Optional[Sequence[str]] = None,
@@ -350,6 +506,7 @@ class MooncakeBundleTransfer:
         destinations: Optional[Mapping[str, Any]] = None,
     ) -> Any:
         """Materialize selected DataProto fields from structured object refs."""
+        ref = _resolve_dataproto_ref(ref)
         batch_names, non_tensor_names = _resolve_dataproto_field_selection(
             ref, fields, batch_fields, non_tensor_fields
         )
@@ -364,7 +521,10 @@ class MooncakeBundleTransfer:
         encoded_requests: list[tuple[str, StructuredFieldLocation]] = []
         for _section, name in requested:
             location = ref.field_index[name]
-            if location.section == "non_tensor_batch" and name in ref.encoded_non_tensor:
+            if (
+                location.section == "non_tensor_batch"
+                and name in ref.encoded_non_tensor
+            ):
                 encoded_requests.append((name, location))
                 continue
             by_stage.setdefault(location.stage, []).append((name, location))
@@ -400,14 +560,13 @@ class MooncakeBundleTransfer:
             array[:] = values
             non_tensor_batch[name] = array
         meta_info = _select_mapping(ref.meta_info, meta_info_keys)
-        if data_cls is None:
-            return {"batch": batch, "non_tensor_batch": non_tensor_batch, "meta_info": meta_info}
-        if hasattr(data_cls, "from_dict"):
-            return data_cls.from_dict(batch, non_tensor_batch, meta_info=meta_info)
-        return data_cls(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+        return _build_dataproto_like_result(
+            batch, non_tensor_batch, meta_info, data_cls
+        )
 
-    def cleanup_dataproto(self, ref: MooncakeDataProtoRef) -> None:
+    def cleanup_dataproto(self, ref: DataProtoRefLike) -> None:
         """Remove all structured object stages referenced by a DataProto handle."""
+        ref = _resolve_dataproto_ref(ref)
         seen: set[str] = set()
         for stage_ref in ref.stage_refs.values():
             if stage_ref.manifest_key in seen:
@@ -432,6 +591,11 @@ class MooncakeBundleTransfer:
         if ref is not None and batch_size != ref.batch_size:
             raise ValueError(
                 f"DataProto append batch size {batch_size} does not match ref batch size {ref.batch_size}"
+            )
+        cross_section_fields = sorted(set(batch) & set(non_tensor_batch))
+        if cross_section_fields:
+            raise ValueError(
+                f"DataProto batch and non_tensor_batch fields overlap: {cross_section_fields}"
             )
         buffers: dict[str, Any] = {}
         field_updates: dict[str, StructuredFieldLocation] = {}
@@ -462,7 +626,9 @@ class MooncakeBundleTransfer:
                 continue
             member = f"non_tensor_batch.{name}"
             buffers[member] = value
-            field_updates[name] = StructuredFieldLocation(stage, member, "non_tensor_batch")
+            field_updates[name] = StructuredFieldLocation(
+                stage, member, "non_tensor_batch"
+            )
         if not buffers:
             if ref is not None:
                 merged_meta_info = dict(ref.meta_info)
@@ -486,7 +652,9 @@ class MooncakeBundleTransfer:
                 partition=partition,
                 encoded_non_tensor={},
             )
-        duplicates = sorted(set(ref.field_index) & set(field_updates)) if ref is not None else []
+        duplicates = (
+            sorted(set(ref.field_index) & set(field_updates)) if ref is not None else []
+        )
         if duplicates and not overwrite:
             raise ValueError(f"DataProto fields already exist: {duplicates}")
         if ref is not None and overwrite:
@@ -512,12 +680,20 @@ class MooncakeBundleTransfer:
             },
             buffers=buffers,
         )
+        old_stage_ref = (
+            ref.stage_refs.get(stage) if ref is not None and overwrite else None
+        )
         stage_ref = self.put_structured_object(
             payload,
             partition=partition,
             chunk_bytes=chunk_bytes,
             policy=policy,
         )
+        if (
+            old_stage_ref is not None
+            and old_stage_ref.manifest_key != stage_ref.manifest_key
+        ):
+            self.remove_bundle(old_stage_ref)
         if ref is None:
             stage_refs = {stage: stage_ref}
             field_index = dict(field_updates)
@@ -546,11 +722,132 @@ class MooncakeBundleTransfer:
         )
 
 
-def _split_dataproto_like(data: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _copy_transfer_policy(policy: BundleTransferPolicy) -> BundleTransferPolicy:
+    if policy.copy_mode == "copy":
+        return policy
+    return BundleTransferPolicy(
+        max_inflight_put=policy.max_inflight_put,
+        put_mode=policy.put_mode,
+        copy_mode="copy",
+    )
+
+
+def _dataproto_manifest_view(
+    transfer: MooncakeBundleTransfer, ref: MooncakeDataProtoRef
+) -> dict[str, Any]:
+    stage_manifests = {
+        stage: transfer._bundle_store.resolve_manifest(stage_ref)
+        for stage, stage_ref in ref.stage_refs.items()
+    }
+    stage_metadata = {
+        stage: _decode_structured_metadata(
+            transfer._bundle_store.read_payload(stage_manifest["meta"])
+        )
+        for stage, stage_manifest in stage_manifests.items()
+    }
+    fields: dict[str, dict[str, Any]] = {}
+    for name, location in ref.field_index.items():
+        metadata = stage_metadata[location.stage]
+        field_specs = _structured_field_specs(metadata)
+        member_spec = dict(field_specs.get(location.member, {"encoding": "bytes"}))
+        encoded = ref.encoded_non_tensor.get(name)
+        if encoded is not None:
+            member_spec = {
+                "encoding": "structured_non_tensor",
+                "codec": encoded["codec"],
+                "metadata": encoded.get("metadata"),
+                "payload_members": dict(encoded["payload_members"]),
+                "payload_specs": {
+                    payload_name: dict(field_specs.get(member, {"encoding": "bytes"}))
+                    for payload_name, member in encoded["payload_members"].items()
+                },
+            }
+        fields[name] = {
+            "section": location.section,
+            "stage": location.stage,
+            "member": location.member,
+            "spec": member_spec,
+        }
+    return {
+        "namespace": ref.namespace,
+        "partition": ref.partition,
+        "batch_size": ref.batch_size,
+        "batch_fields": {
+            name: info for name, info in fields.items() if info["section"] == "batch"
+        },
+        "non_tensor_fields": {
+            name: info
+            for name, info in fields.items()
+            if info["section"] == "non_tensor_batch"
+        },
+        "meta_info_keys": list(ref.meta_info),
+        "stages": {
+            stage: {
+                "manifest_key": stage_ref.manifest_key,
+                "dataproto": stage_metadata[stage].get("dataproto", {}),
+            }
+            for stage, stage_ref in ref.stage_refs.items()
+        },
+    }
+
+
+def _build_dataproto_like_result(
+    batch: dict[str, Any],
+    non_tensor_batch: dict[str, Any],
+    meta_info: dict[str, Any],
+    data_cls: Optional[Any],
+) -> Any:
+    payload = {
+        "batch": batch,
+        "non_tensor_batch": non_tensor_batch,
+        "meta_info": meta_info,
+    }
+    if data_cls is None or data_cls is dict:
+        return payload
+    from_dict = getattr(data_cls, "from_dict", None)
+    try:
+        if callable(from_dict):
+            return from_dict(batch, non_tensor_batch, meta_info=meta_info)
+        return data_cls(
+            batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info
+        )
+    except TypeError as error:
+        raise TypeError(
+            f"{getattr(data_cls, '__name__', data_cls)!r} cannot be constructed from "
+            "batch, non_tensor_batch, and meta_info"
+        ) from error
+
+
+def _split_dataproto_like(
+    data: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if isinstance(data, Mapping):
+        if _is_dataproto_envelope_mapping(data):
+            return (
+                _mapping_to_dict(data.get("batch")),
+                _mapping_to_dict(data.get("non_tensor_batch")),
+                _mapping_to_dict(data.get("meta_info")),
+            )
+        return dict(data), {}, {}
     batch = _mapping_to_dict(getattr(data, "batch", None))
     non_tensor_batch = _mapping_to_dict(getattr(data, "non_tensor_batch", None))
     meta_info = _mapping_to_dict(getattr(data, "meta_info", None))
     return batch, non_tensor_batch, meta_info
+
+
+def _is_dataproto_envelope_mapping(data: Mapping[str, Any]) -> bool:
+    envelope_keys = {"batch", "non_tensor_batch", "meta_info"}
+    if not data or not set(data).issubset(envelope_keys):
+        return False
+    return all(_is_mapping_like_or_none(value) for value in data.values())
+
+
+def _is_mapping_like_or_none(value: Any) -> bool:
+    return (
+        value is None
+        or isinstance(value, Mapping)
+        or callable(getattr(value, "items", None))
+    )
 
 
 def _mapping_to_dict(value: Any) -> dict[str, Any]:
@@ -568,14 +865,14 @@ def _dataproto_batch_size(
     batch: Mapping[str, Any], non_tensor_batch: Mapping[str, Any]
 ) -> int:
     sizes = {
-        len(value)
-        for values in (batch, non_tensor_batch)
-        for value in values.values()
+        len(value) for values in (batch, non_tensor_batch) for value in values.values()
     }
     if not sizes:
         return 0
     if len(sizes) != 1:
-        raise ValueError(f"DataProto fields have inconsistent batch sizes: {sorted(sizes)}")
+        raise ValueError(
+            f"DataProto fields have inconsistent batch sizes: {sorted(sizes)}"
+        )
     return sizes.pop()
 
 
@@ -585,14 +882,22 @@ def _resolve_dataproto_field_selection(
     batch_fields: Optional[Sequence[str]],
     non_tensor_fields: Optional[Sequence[str]],
 ) -> tuple[list[str], list[str]]:
-    if fields is not None and (batch_fields is not None or non_tensor_fields is not None):
-        raise ValueError("fields cannot be combined with batch_fields or non_tensor_fields")
+    if fields is not None and (
+        batch_fields is not None or non_tensor_fields is not None
+    ):
+        raise ValueError(
+            "fields cannot be combined with batch_fields or non_tensor_fields"
+        )
     if fields is not None:
         requested = list(fields)
         _validate_dataproto_fields_exist(ref, requested)
         return (
             [name for name in requested if ref.field_index[name].section == "batch"],
-            [name for name in requested if ref.field_index[name].section == "non_tensor_batch"],
+            [
+                name
+                for name in requested
+                if ref.field_index[name].section == "non_tensor_batch"
+            ],
         )
     if batch_fields is None:
         batch_names = [
@@ -634,7 +939,9 @@ def _should_encode_non_tensor_field(value: Any) -> bool:
     return isinstance(value, np.ndarray) and value.dtype == object
 
 
-def _encode_structured_non_tensor_field(path: str, value: np.ndarray) -> _EncodedStructuredLeaf:
+def _encode_structured_non_tensor_field(
+    path: str, value: np.ndarray
+) -> _EncodedStructuredLeaf:
     values = list(value)
     decision = _choose_leaf_codec(values)
     return _encode_structured_leaf(values, decision)
@@ -667,7 +974,9 @@ def _encode_structured_leaf(
             [
                 None
                 if value is None
-                else json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                else json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
                 for value in values
             ]
         )
@@ -675,13 +984,17 @@ def _encode_structured_leaf(
         raise ValueError(f"unsupported structured non-tensor codec: {codec}")
     metadata.update(
         {
-            "schema_source": "inferred_from_runtime_values" if decision.accepted else "fallback",
+            "schema_source": "inferred_from_runtime_values"
+            if decision.accepted
+            else "fallback",
             "decision_reason": decision.reason,
             "normalized_type": decision.normalized_type,
             **decision.metadata,
         }
     )
-    return _EncodedStructuredLeaf(codec=codec, rows=len(values), payload=payload, metadata=metadata)
+    return _EncodedStructuredLeaf(
+        codec=codec, rows=len(values), payload=payload, metadata=metadata
+    )
 
 
 def _decode_structured_leaf(
@@ -703,13 +1016,21 @@ def _decode_structured_leaf(
     if codec == "bytes_ragged":
         return _decode_bytes_like_values(payload, rows)
     if codec == "utf8_ragged":
-        return [None if value is None else value.decode("utf-8") for value in _decode_bytes_like_values(payload, rows)]
+        return [
+            None if value is None else value.decode("utf-8")
+            for value in _decode_bytes_like_values(payload, rows)
+        ]
     if codec == "json_ragged":
-        return [None if value is None else json.loads(value.decode("utf-8")) for value in _decode_bytes_like_values(payload, rows)]
+        return [
+            None if value is None else json.loads(value.decode("utf-8"))
+            for value in _decode_bytes_like_values(payload, rows)
+        ]
     raise ValueError(f"unknown structured non-tensor codec: {codec}")
 
 
-def _encode_ragged_tensor_values(values: list[Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _encode_ragged_tensor_values(
+    values: list[Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if _torch is None:
         raise RuntimeError("torch is required to encode ragged tensor fields")
     tensors: list[Any] = []
@@ -743,9 +1064,13 @@ def _encode_ragged_tensor_values(values: list[Any]) -> tuple[dict[str, Any], dic
         offsets[row + 1] = offset
         ndims[row] = tensor.dim()
         if tensor.dim() > 0:
-            shapes[row, : tensor.dim()] = _torch.tensor(list(tensor.shape), dtype=_torch.int64)
+            shapes[row, : tensor.dim()] = _torch.tensor(
+                list(tensor.shape), dtype=_torch.int64
+            )
     data_dtype = dtype or _torch.float32
-    data = _torch.cat(flat_parts) if flat_parts else _torch.empty((0,), dtype=data_dtype)
+    data = (
+        _torch.cat(flat_parts) if flat_parts else _torch.empty((0,), dtype=data_dtype)
+    )
     payload = {
         "data": data.numpy(),
         "offsets": offsets.numpy(),
@@ -753,7 +1078,11 @@ def _encode_ragged_tensor_values(values: list[Any]) -> tuple[dict[str, Any], dic
         "ndims": ndims.numpy(),
         "nulls": nulls,
     }
-    return payload, {"dtype": str(data_dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"}
+    return payload, {
+        "dtype": str(data_dtype),
+        "max_ndim": int(max_ndim),
+        "shape_policy": "ragged",
+    }
 
 
 def _decode_ragged_tensor_values(payload: dict[str, Any], rows: int) -> list[Any]:
@@ -777,11 +1106,15 @@ def _decode_ragged_tensor_values(payload: dict[str, Any], rows: int) -> list[Any
     return values
 
 
-def _encode_typed_ragged_values(values: list[Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _encode_typed_ragged_values(
+    values: list[Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     source_arrays = [np.asarray(value) for value in values if value is not None]
     dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(np.int64)
     arrays = [
-        np.asarray([], dtype=dtype) if value is None else np.ascontiguousarray(np.asarray(value, dtype=dtype))
+        np.asarray([], dtype=dtype)
+        if value is None
+        else np.ascontiguousarray(np.asarray(value, dtype=dtype))
         for value in values
     ]
     max_ndim = max((array.ndim for array in arrays), default=0)
@@ -801,7 +1134,13 @@ def _encode_typed_ragged_values(values: list[Any]) -> tuple[dict[str, Any], dict
             shapes[row, : array.ndim] = array.shape
     data = np.concatenate(flat_arrays) if flat_arrays else np.asarray([], dtype=dtype)
     return (
-        {"data": data, "offsets": offsets, "shapes": shapes, "ndims": ndims, "nulls": nulls},
+        {
+            "data": data,
+            "offsets": offsets,
+            "shapes": shapes,
+            "ndims": ndims,
+            "nulls": nulls,
+        },
         {"dtype": str(data.dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
     )
 
@@ -834,7 +1173,10 @@ def _encode_numeric_scalar_values(
     data = np.asarray(
         [fill_value if value is None else value for value in values], dtype=dtype
     )
-    return {"data": data, "nulls": nulls}, {"dtype": str(data.dtype), "shape": list(data.shape)}
+    return {"data": data, "nulls": nulls}, {
+        "dtype": str(data.dtype),
+        "shape": list(data.shape),
+    }
 
 
 def _decode_numeric_scalar_values(payload: dict[str, Any]) -> list[Any]:
@@ -853,16 +1195,25 @@ def _value_to_media_bytes(value: Any) -> tuple[bytes, str | None, dict[str, Any]
     if _is_bytes_like(value):
         return bytes(value), None, {"kind": "bytes"}
     if _is_pil_image(value):
-        image = value.convert(value.mode) if getattr(value, "readonly", False) else value
+        image = (
+            value.convert(value.mode) if getattr(value, "readonly", False) else value
+        )
         return (
             image.tobytes(),
             "image/raw",
-            {"kind": "pil_raw", "mode": image.mode, "size": list(image.size), "format": getattr(value, "format", None)},
+            {
+                "kind": "pil_raw",
+                "mode": image.mode,
+                "size": list(image.size),
+                "format": getattr(value, "format", None),
+            },
         )
     return bytes(value), None, {"kind": "bytes"}
 
 
-def _encode_bytes_like_values(values: list[Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _encode_bytes_like_values(
+    values: list[Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     offsets = [0]
     parts = []
     media_types = []
@@ -877,12 +1228,18 @@ def _encode_bytes_like_values(values: list[Any]) -> tuple[dict[str, Any], dict[s
     metadata: dict[str, Any] = {}
     if any(encoding.get("kind") == "pil_raw" for encoding in encodings):
         metadata["media_encodings"] = encodings
-    non_null_media_types = sorted({media_type for media_type in media_types if media_type})
+    non_null_media_types = sorted(
+        {media_type for media_type in media_types if media_type}
+    )
     if non_null_media_types:
         metadata["media_types"] = non_null_media_types
         metadata["encode_source"] = "raw_pixels_from_object"
     return (
-        {"data": payload_bytes, "offsets": np.asarray(offsets, dtype=np.int64), "nulls": np.asarray([value is None for value in values], dtype=np.bool_)},
+        {
+            "data": payload_bytes,
+            "offsets": np.asarray(offsets, dtype=np.int64),
+            "nulls": np.asarray([value is None for value in values], dtype=np.bool_),
+        },
         metadata,
     )
 
@@ -894,7 +1251,9 @@ def _decode_media_bytes(data: Any, encoding: Optional[Mapping[str, Any]]) -> Any
         from PIL import Image
     except ImportError:
         return bytes(data)
-    image = Image.frombuffer(encoding["mode"], tuple(encoding["size"]), data, "raw", encoding["mode"], 0, 1)
+    image = Image.frombuffer(
+        encoding["mode"], tuple(encoding["size"]), data, "raw", encoding["mode"], 0, 1
+    )
     image.format = encoding.get("format")
     return image
 
@@ -917,7 +1276,9 @@ def _decode_bytes_like_values(
     return values
 
 
-def _encode_media_list_values(values: list[Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _encode_media_list_values(
+    values: list[Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     row_offsets = [0]
     byte_offsets = [0]
     parts = []
@@ -932,8 +1293,13 @@ def _encode_media_list_values(values: list[Any]) -> tuple[dict[str, Any], dict[s
             encodings.append(encoding)
             byte_offsets.append(byte_offsets[-1] + len(data))
         row_offsets.append(row_offsets[-1] + len(items))
-    metadata: dict[str, Any] = {"encode_source": "raw_pixels_from_object", "media_encodings": encodings}
-    non_null_media_types = sorted({media_type for media_type in media_types if media_type})
+    metadata: dict[str, Any] = {
+        "encode_source": "raw_pixels_from_object",
+        "media_encodings": encodings,
+    }
+    non_null_media_types = sorted(
+        {media_type for media_type in media_types if media_type}
+    )
     if non_null_media_types:
         metadata["media_types"] = non_null_media_types
     return (
@@ -962,7 +1328,9 @@ def _decode_media_list_values(
             continue
         items = []
         for item_index in range(int(row_offsets[row]), int(row_offsets[row + 1])):
-            item = memoryview(data)[int(byte_offsets[item_index]) : int(byte_offsets[item_index + 1])]
+            item = memoryview(data)[
+                int(byte_offsets[item_index]) : int(byte_offsets[item_index + 1])
+            ]
             encoding = encodings[item_index] if item_index < len(encodings) else None
             items.append(_decode_media_bytes(item, encoding))
         values.append(items)
@@ -1063,7 +1431,7 @@ class _StructuredObjectLayer:
             )
         if encoding == "torch_tensor":
             return self._read_torch_tensor_member(
-                name, payload_spec, member_slice, destination
+                name, payload_spec, field_spec, member_slice, destination
             )
         if encoding != "ndarray":
             raise ValueError(f"unsupported structured field encoding: {encoding}")
@@ -1075,16 +1443,77 @@ class _StructuredObjectLayer:
         self,
         name: str,
         payload_spec: Mapping[str, Any],
+        field_spec: Mapping[str, Any],
         member_slice: StructuredMemberSlice | None,
         destination: Any,
     ) -> Any:
         if member_slice is not None:
-            raise ValueError(f"structured tensor member {name} does not support slicing")
-        if destination is not None:
-            raise ValueError(
-                f"structured tensor member {name} does not support materialize_into"
+            if destination is not None:
+                raise ValueError(
+                    f"structured tensor member {name} does not support sliced materialize_into"
+                )
+            return self._read_sliced_torch_tensor_member(
+                name, payload_spec, field_spec, member_slice
             )
-        return _deserialize_tensor_payload(self._bundle_store.read_payload(payload_spec))
+        if destination is not None:
+            if not isinstance(destination, _TensorObjectBufferPayload):
+                raise ValueError(
+                    f"structured tensor member {name} only supports tensor_object_buffer destinations"
+                )
+            materialized = self._bundle_store.read_tensor_payload_into(
+                payload_spec, destination
+            )
+            return destination if materialized is None else materialized
+        if payload_spec.get("kind") == "tensor":
+            return self._bundle_store.read_tensor_payload(payload_spec)
+        if payload_spec.get("format") == "torch_save":
+            return _deserialize_torch_save_payload(
+                self._bundle_store.read_payload(payload_spec)
+            )
+        return _deserialize_tensor_payload(
+            self._bundle_store.read_payload(payload_spec)
+        )
+
+    def _read_sliced_torch_tensor_member(
+        self,
+        name: str,
+        payload_spec: Mapping[str, Any],
+        field_spec: Mapping[str, Any],
+        member_slice: StructuredMemberSlice,
+    ) -> Any:
+        if payload_spec.get("kind") == "tensor":
+            raise ValueError(
+                f"structured tensor member {name} does not support slicing"
+            )
+        metadata_bytes = int(payload_spec.get("metadata_bytes", -1))
+        shape = field_spec.get("shape")
+        element_size = int(field_spec.get("element_size", 0))
+        if metadata_bytes < 0 or not isinstance(shape, list) or element_size <= 0:
+            raise ValueError(
+                f"structured tensor field {name} is missing slice metadata"
+            )
+        if member_slice.axis != 0:
+            raise ValueError("structured tensor slicing currently supports axis=0 only")
+        if not shape:
+            raise ValueError(
+                "structured tensor slicing requires at least one dimension"
+            )
+        start, end, step = _normalized_member_slice(member_slice, int(shape[0]))
+        if step != 1:
+            raise ValueError("structured tensor slicing currently requires step=1")
+        row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
+        data_offset = metadata_bytes + start * row_width
+        data_length = (end - start) * row_width
+        metadata = self._bundle_store.read_payload_range(
+            payload_spec, 0, metadata_bytes
+        )
+        data = self._bundle_store.read_payload_range(
+            payload_spec, data_offset, data_length
+        )
+        return _deserialize_tensor_payload(
+            _slice_tensor_metadata(metadata, (end - start, *shape[1:]), data_length)
+            + data
+        )
 
     def _read_bytes_member(
         self,
@@ -1181,7 +1610,7 @@ class _BundleManifestStore:
                 f"{base_key}/meta",
                 meta_view,
                 target_chunk_bytes,
-                transfer_policy,
+                _copy_transfer_policy(transfer_policy),
                 pre_registered=False,
             )
             written_keys.extend(meta_keys)
@@ -1232,6 +1661,8 @@ class _BundleManifestStore:
     ) -> dict[str, Any]:
         if isinstance(ref, RemoteBundleRef):
             manifest = ref.manifest
+            if not manifest:
+                manifest = _decode_manifest(self._store.get(ref.manifest_key))
         else:
             manifest = ref.get("manifest")
             if manifest is None:
@@ -1244,6 +1675,21 @@ class _BundleManifestStore:
 
     def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
         return self._transport.read_payload(payload_spec)
+
+    def read_payload_range(
+        self, payload_spec: Mapping[str, Any], byte_offset: int, byte_length: int
+    ) -> bytes:
+        return self._transport.read_payload_range(
+            payload_spec, byte_offset, byte_length
+        )
+
+    def read_tensor_payload(self, payload_spec: Mapping[str, Any]) -> Any:
+        return self._transport.read_tensor_payload(payload_spec)
+
+    def read_tensor_payload_into(
+        self, payload_spec: Mapping[str, Any], destination: _TensorObjectBufferPayload
+    ) -> Any:
+        return self._transport.read_tensor_payload_into(payload_spec, destination)
 
     def read_payload_range_into_destination(
         self,
@@ -1277,6 +1723,9 @@ class _BundleManifestStore:
                 raise ValueError(
                     "zero-copy structured tensor fields require a BufferPool tensor-object buffer"
                 )
+            tensor_spec = self._transport.put_tensor_payload_direct(key, value)
+            if tensor_spec is not None:
+                return tensor_spec, [key]
             try:
                 total_bytes = self._transport.put_tensor_payload_from_pool(key, value)
                 return {
@@ -1285,16 +1734,28 @@ class _BundleManifestStore:
                     "chunks": [{"key": key, "bytes": total_bytes}],
                 }, [key]
             except RuntimeError:
-                if transfer_policy.copy_mode == "zero_copy":
-                    raise
-        payload = _tensor_payload_bytes(value)
-        return self._put_payload(
+                pass
+        if not _has_tensor_codec_helpers() or value.tensor.dim() == 0:
+            payload = _torch_save_payload_bytes(value.tensor)
+            payload_spec, payload_keys = self._put_payload(
+                key,
+                memoryview(payload),
+                len(payload) or 1,
+                transfer_policy,
+                pre_registered=False,
+            )
+            payload_spec["format"] = "torch_save"
+            return payload_spec, payload_keys
+        payload, metadata_bytes = _tensor_payload_bytes(value)
+        payload_spec, payload_keys = self._put_payload(
             key,
             memoryview(payload),
             len(payload) or 1,
             transfer_policy,
             pre_registered=False,
         )
+        payload_spec["metadata_bytes"] = metadata_bytes
+        return payload_spec, payload_keys
 
     def _put_payload(
         self,
@@ -1324,22 +1785,6 @@ class _BundleManifestStore:
             ],
         }
         return payload_spec, written_keys
-
-    def _put_tensor_payload(
-        self, key: str, value: _TensorPayload
-    ) -> dict[str, Any] | None:
-        put_tensor = getattr(self._store, "put_tensor", None)
-        if not callable(put_tensor):
-            return None
-        _check_status(put_tensor(key, value.tensor), "put_tensor", key)
-        return {
-            "key": key,
-            "kind": "tensor",
-            "bytes": value.nbytes,
-            "dtype": str(value.tensor.dtype),
-            "shape": list(value.tensor.shape),
-            "chunks": [{"key": key, "bytes": value.nbytes}],
-        }
 
     def _policy(
         self,
@@ -1485,6 +1930,13 @@ class _MooncakePayloadTransport:
         self.read_payload_into(payload_spec, data)
         return bytes(data)
 
+    def read_tensor_payload(self, payload_spec: Mapping[str, Any]) -> Any:
+        get_tensor = getattr(self._store, "get_tensor", None)
+        key = payload_spec["key"]
+        if not callable(get_tensor):
+            raise RuntimeError("structured tensor payload does not support get_tensor")
+        return get_tensor(key)
+
     def read_payload_into(
         self, payload_spec: Mapping[str, Any], destination: bytearray | np.ndarray
     ) -> None:
@@ -1494,6 +1946,61 @@ class _MooncakePayloadTransport:
             return
         for offset, chunk in zip(offsets, chunks):
             self._read_chunk_with_get(chunk, destination, offset)
+
+    def read_tensor_payload_into(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination: _TensorObjectBufferPayload,
+    ) -> Any:
+        if payload_spec.get("kind") == "tensor":
+            get_tensor_into = getattr(self._store, "get_tensor_into", None)
+            if not callable(get_tensor_into):
+                raise RuntimeError(
+                    "structured tensor payload does not support get_tensor_into"
+                )
+            result = get_tensor_into(
+                payload_spec["key"], destination.ptr, destination.size
+            )
+            _ = destination.owner
+            return result
+        expected_bytes = int(payload_spec["bytes"])
+        if destination.size < expected_bytes:
+            raise ValueError(
+                f"tensor destination has {destination.size} bytes, expected at least {expected_bytes}"
+            )
+        chunks = payload_spec["chunks"]
+        if not self._read_payload_range_into_raw_destination(
+            chunks, destination.ptr, 0, expected_bytes, allow_get_into=False
+        ):
+            offset = 0
+            for chunk in chunks:
+                data = self._store.get(chunk["key"])
+                size = int(chunk["bytes"])
+                if len(data) != size:
+                    raise RuntimeError(
+                        f"get failed for {chunk['key']}: expected {size} bytes, got {len(data)}"
+                    )
+                ctypes.memmove(destination.ptr + offset, data, size)
+                offset += size
+        _ = destination.owner
+        return None
+
+    def read_payload_range(
+        self,
+        payload_spec: Mapping[str, Any],
+        byte_offset: int,
+        byte_length: int,
+    ) -> bytes:
+        if byte_length == 0:
+            return b""
+        data = bytearray(byte_length)
+        if not self._read_payload_range_into_registered_destination(
+            payload_spec["chunks"], data, byte_offset, byte_length, False
+        ):
+            self._copy_payload_range_into_bytearray(
+                payload_spec["chunks"], data, byte_offset, byte_length
+            )
+        return bytes(data)
 
     def read_payload_range_into_destination(
         self,
@@ -1523,9 +2030,34 @@ class _MooncakePayloadTransport:
         put_tensor_from = self._put_tensor_from
         if not callable(put_tensor_from):
             raise RuntimeError("put_tensor_from is unavailable")
-        _check_status(put_tensor_from(key, value.ptr, value.size), "put_tensor_from", key)
+        _check_status(
+            put_tensor_from(key, value.ptr, value.size), "put_tensor_from", key
+        )
         _ = value.owner
         return value.size
+
+    def put_tensor_payload_direct(
+        self,
+        key: str,
+        value: _TensorPayload,
+    ) -> dict[str, Any] | None:
+        put_tensor = getattr(self._store, "put_tensor", None)
+        if not callable(put_tensor):
+            return None
+        tensor = value.tensor
+        nbytes = int(getattr(tensor, "nbytes", 0))
+        metadata_bytes = _tensor_metadata_size()
+        total_bytes = metadata_bytes + nbytes
+        _check_status(put_tensor(key, tensor), "put_tensor", key)
+        return {
+            "key": key,
+            "kind": "tensor",
+            "bytes": total_bytes,
+            "dtype": str(getattr(tensor, "dtype", "")),
+            "shape": list(getattr(tensor, "shape", ())),
+            "chunks": [{"key": key, "bytes": total_bytes}],
+            "metadata_bytes": metadata_bytes,
+        }
 
     def put_tensor_payload_from_pool(
         self,
@@ -1548,7 +2080,9 @@ class _MooncakePayloadTransport:
                 ctypes.memmove(lease.ptr + len(metadata), data_ptr, tensor_nbytes)
             view.release()
             view = None
-            _check_status(put_tensor_from(key, lease.ptr, total_bytes), "put_tensor_from", key)
+            _check_status(
+                put_tensor_from(key, lease.ptr, total_bytes), "put_tensor_from", key
+            )
             _ = owner
             return total_bytes
         finally:
@@ -1706,71 +2240,96 @@ class _MooncakePayloadTransport:
         byte_length: int,
         destination_pre_registered: bool,
     ) -> bool:
-        get_into = self._get_into
-        can_use_get_into = len(chunks) == 1 and byte_offset == 0 and callable(get_into)
-        get_into_ranges = self._get_into_ranges
-        can_use_get_into_ranges = callable(get_into_ranges)
         if not self._has_buffer_registration_support():
-            return False
-        if not can_use_get_into and not can_use_get_into_ranges:
             return False
         with self._registered_buffer(
             destination,
             "structured ndarray payload",
             pre_registered=destination_pre_registered,
         ) as base_ptr:
-            if can_use_get_into and int(chunks[0]["bytes"]) == byte_length:
-                expected_size = int(chunks[0]["bytes"])
+            return self._read_payload_range_into_raw_destination(
+                chunks, base_ptr, byte_offset, byte_length
+            )
+
+    def _read_payload_range_into_raw_destination(
+        self,
+        chunks: Sequence[Mapping[str, Any]],
+        base_ptr: int,
+        byte_offset: int,
+        byte_length: int,
+        allow_get_into: bool = True,
+    ) -> bool:
+        get_into = self._get_into
+        if (
+            allow_get_into
+            and len(chunks) == 1
+            and byte_offset == 0
+            and callable(get_into)
+        ):
+            expected_size = int(chunks[0]["bytes"])
+            if expected_size == byte_length:
                 read_size = get_into(chunks[0]["key"], base_ptr, expected_size)
                 if read_size != expected_size:
                     raise RuntimeError(
                         f"get_into failed for {chunks[0]['key']}: expected {expected_size}, got {read_size}"
                     )
                 return True
-            if not can_use_get_into_ranges:
-                return False
-            fragments = _payload_range_fragments(chunks, byte_offset, byte_length)
-            if not fragments:
-                return True
-            keys = [
-                key
-                for key, _chunk_size, _destination_offset, _source_offset, _size in fragments
-            ]
-            dst_offsets = [
-                [destination_offset]
-                for _key, _chunk_size, destination_offset, _source_offset, _size in fragments
-            ]
-            src_offsets = [
-                [source_offset]
-                for _key, _chunk_size, _destination_offset, source_offset, _size in fragments
-            ]
-            sizes = [
-                [size]
-                for _key, _chunk_size, _destination_offset, _source_offset, size in fragments
-            ]
-            results = get_into_ranges(
-                [base_ptr], [keys], [dst_offsets], [src_offsets], [sizes]
-            )
-            if len(results) != 1 or len(results[0]) != len(keys):
-                raise RuntimeError(
-                    f"get_into_ranges returned invalid ranged result shape for {len(keys)} chunks"
-                )
-            for key, expected_sizes, actual_sizes in zip(keys, sizes, results[0]):
-                if len(actual_sizes) != len(expected_sizes):
-                    raise RuntimeError(
-                        f"get_into_ranges returned invalid ranged fragment count for {key}"
-                    )
-                for expected_size, actual_size in zip(expected_sizes, actual_sizes):
-                    if actual_size != expected_size:
-                        raise RuntimeError(
-                            f"get_into_ranges failed for {key}: expected {expected_size}, got {actual_size}"
-                        )
+        get_into_ranges = self._get_into_ranges
+        if not callable(get_into_ranges):
+            return False
+        fragments = _payload_range_fragments(chunks, byte_offset, byte_length)
+        if not fragments:
             return True
+        keys = [
+            key
+            for key, _chunk_size, _destination_offset, _source_offset, _size in fragments
+        ]
+        dst_offsets = [
+            [destination_offset]
+            for _key, _chunk_size, destination_offset, _source_offset, _size in fragments
+        ]
+        src_offsets = [
+            [source_offset]
+            for _key, _chunk_size, _destination_offset, source_offset, _size in fragments
+        ]
+        sizes = [
+            [size]
+            for _key, _chunk_size, _destination_offset, _source_offset, size in fragments
+        ]
+        results = get_into_ranges(
+            [base_ptr], [keys], [dst_offsets], [src_offsets], [sizes]
+        )
+        if len(results) != 1 or len(results[0]) != len(keys):
+            raise RuntimeError(
+                f"get_into_ranges returned invalid ranged result shape for {len(keys)} chunks"
+            )
+        for key, expected_sizes, actual_sizes in zip(keys, sizes, results[0]):
+            if len(actual_sizes) != len(expected_sizes):
+                raise RuntimeError(
+                    f"get_into_ranges returned invalid ranged fragment count for {key}"
+                )
+            for expected_size, actual_size in zip(expected_sizes, actual_sizes):
+                if actual_size != expected_size:
+                    raise RuntimeError(
+                        f"get_into_ranges failed for {key}: expected {expected_size}, got {actual_size}"
+                    )
+        return True
 
     def _copy_payload_range_into_destination(
         self,
         chunks: Sequence[Mapping[str, Any]],
         destination: np.ndarray,
+        byte_offset: int,
+        byte_length: int,
+    ) -> None:
+        data = bytearray(byte_length)
+        self._copy_payload_range_into_bytearray(chunks, data, byte_offset, byte_length)
+        destination[:byte_length] = np.frombuffer(data, dtype=np.uint8)
+
+    def _copy_payload_range_into_bytearray(
+        self,
+        chunks: Sequence[Mapping[str, Any]],
+        destination: bytearray,
         byte_offset: int,
         byte_length: int,
     ) -> None:
@@ -1780,21 +2339,15 @@ class _MooncakePayloadTransport:
             destination_offset,
             source_offset,
             size,
-        ) in _payload_range_fragments(
-            chunks,
-            byte_offset,
-            byte_length,
-        ):
+        ) in _payload_range_fragments(chunks, byte_offset, byte_length):
             data = self._store.get(key)
             if len(data) != chunk_size:
                 raise RuntimeError(
                     f"get failed for {key}: expected {chunk_size} bytes, got {len(data)}"
                 )
-            fragment = memoryview(data)[source_offset : source_offset + size]
-            target_end = destination_offset + size
-            destination[destination_offset:target_end] = np.frombuffer(
-                fragment, dtype=np.uint8
-            )
+            destination[destination_offset : destination_offset + size] = data[
+                source_offset : source_offset + size
+            ]
 
     def _register_buffers(
         self,
@@ -2137,21 +2690,72 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
 
 
 def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
-    return {"encoding": "torch_tensor"}, _TensorPayload(tensor=value)
+    return {
+        "encoding": "torch_tensor",
+        "dtype": str(value.dtype),
+        "shape": list(value.shape),
+        "element_size": int(value.element_size()),
+    }, _TensorPayload(tensor=value)
 
 
 def _tensor_payload_parts(value: _TensorPayload) -> tuple[bytes, int, int, Any]:
-    metadata, data_ptr, tensor_nbytes, owner = _tensor_codec_helper("_serialize_tensor")(
-        value.tensor
-    )
+    metadata, data_ptr, tensor_nbytes, owner = _tensor_codec_helper(
+        "_serialize_tensor"
+    )(value.tensor)
     return bytes(metadata), int(data_ptr), int(tensor_nbytes), owner
 
 
-def _tensor_payload_bytes(value: _TensorPayload) -> bytes:
+def _has_tensor_codec_helpers() -> bool:
+    return (
+        _mooncake_store is not None
+        and callable(getattr(_mooncake_store, "_serialize_tensor", None))
+        and callable(getattr(_mooncake_store, "_deserialize_tensor", None))
+    )
+
+
+def _tensor_metadata_size() -> int:
+    helper = (
+        None
+        if _mooncake_store is None
+        else getattr(_mooncake_store, "_tensor_metadata_size", None)
+    )
+    if callable(helper):
+        return int(helper())
+    return 0
+
+
+def _torch_save_payload_bytes(value: Any) -> bytes:
+    buffer = io.BytesIO()
+    _torch.save(value, buffer)
+    return buffer.getvalue()
+
+
+def _deserialize_torch_save_payload(payload: bytes) -> Any:
+    return _torch.load(io.BytesIO(payload), weights_only=False)
+
+
+def _slice_tensor_metadata(
+    metadata: bytes, shape: Sequence[int], data_bytes: int
+) -> bytes:
+    patched = bytearray(metadata)
+    ctypes.c_uint64.from_buffer(patched, 32).value = int(data_bytes)
+    global_shape_offset = 40
+    local_shape_offset = global_shape_offset + 8 * 8
+    for index, dim in enumerate(shape):
+        ctypes.c_int64.from_buffer(
+            patched, global_shape_offset + index * 8
+        ).value = int(dim)
+        ctypes.c_int64.from_buffer(patched, local_shape_offset + index * 8).value = int(
+            dim
+        )
+    return bytes(patched)
+
+
+def _tensor_payload_bytes(value: _TensorPayload) -> tuple[bytes, int]:
     metadata, data_ptr, tensor_nbytes, _owner = _tensor_payload_parts(value)
     if tensor_nbytes == 0:
-        return metadata
-    return metadata + ctypes.string_at(data_ptr, tensor_nbytes)
+        return metadata, len(metadata)
+    return metadata + ctypes.string_at(data_ptr, tensor_nbytes), len(metadata)
 
 
 def _deserialize_tensor_payload(payload: bytes) -> Any:
@@ -2333,9 +2937,12 @@ class _EncodedStructuredLeaf:
 
 class _Missing:
     """Sentinel for dict keys absent from a row (distinct from value-is-None)."""
+
     __slots__ = ()
+
     def __repr__(self) -> str:
         return "<MISSING>"
+
 
 MISSING = _Missing()
 
@@ -2380,31 +2987,53 @@ def _check_all(
     if not nn:
         return _CodecDecision(False, codec, "all rows are null", normalized_type)
     if not all(predicate(v) for v in nn):
-        return _CodecDecision(False, codec, f"not all rows are {normalized_type}", normalized_type)
-    return _CodecDecision(True, codec, f"all non-null rows are {normalized_type}", normalized_type)
+        return _CodecDecision(
+            False, codec, f"not all rows are {normalized_type}", normalized_type
+        )
+    return _CodecDecision(
+        True, codec, f"all non-null rows are {normalized_type}", normalized_type
+    )
 
 
 def _can_tensor(values: list[Any]) -> _CodecDecision:
     if _torch is None:
-        return _CodecDecision(False, "ragged_tensor", "torch is not available", "torch.Tensor")
+        return _CodecDecision(
+            False, "ragged_tensor", "torch is not available", "torch.Tensor"
+        )
     nn = _non_null(values)
     if not nn:
-        return _CodecDecision(False, "ragged_tensor", "all rows are null", "torch.Tensor")
+        return _CodecDecision(
+            False, "ragged_tensor", "all rows are null", "torch.Tensor"
+        )
     if not all(isinstance(v, _torch.Tensor) for v in nn):
-        return _CodecDecision(False, "ragged_tensor", "not all rows are Tensor", "torch.Tensor")
+        return _CodecDecision(
+            False, "ragged_tensor", "not all rows are Tensor", "torch.Tensor"
+        )
     dtypes = sorted({str(v.dtype) for v in nn})
     if len(dtypes) != 1:
-        return _CodecDecision(False, "ragged_tensor", f"mixed dtypes: {dtypes}", "torch.Tensor")
+        return _CodecDecision(
+            False, "ragged_tensor", f"mixed dtypes: {dtypes}", "torch.Tensor"
+        )
     ndims = {v.ndim for v in nn}
     if len(ndims) != 1:
-        return _CodecDecision(False, "ragged_tensor", f"mixed dimensions: {ndims}", "torch.Tensor")
-    return _CodecDecision(True, "ragged_tensor", "all non-null rows are Tensor", "torch.Tensor", {"dtype": dtypes[0]})
+        return _CodecDecision(
+            False, "ragged_tensor", f"mixed dimensions: {ndims}", "torch.Tensor"
+        )
+    return _CodecDecision(
+        True,
+        "ragged_tensor",
+        "all non-null rows are Tensor",
+        "torch.Tensor",
+        {"dtype": dtypes[0]},
+    )
 
 
 def _can_numeric_sequence(values: list[Any]) -> _CodecDecision:
     nn = _non_null(values)
     if not nn:
-        return _CodecDecision(False, "typed_ragged", "all rows are null", "numeric sequence")
+        return _CodecDecision(
+            False, "typed_ragged", "all rows are null", "numeric sequence"
+        )
     dtypes = []
     for v in nn:
         if isinstance(v, np.ndarray):
@@ -2413,17 +3042,37 @@ def _can_numeric_sequence(values: list[Any]) -> _CodecDecision:
             try:
                 arr = np.asarray(v)
             except (ValueError, TypeError):
-                return _CodecDecision(False, "typed_ragged", "row cannot be converted to ndarray", "numeric sequence")
+                return _CodecDecision(
+                    False,
+                    "typed_ragged",
+                    "row cannot be converted to ndarray",
+                    "numeric sequence",
+                )
         else:
-            return _CodecDecision(False, "typed_ragged", "row is not array-like", "numeric sequence")
+            return _CodecDecision(
+                False, "typed_ragged", "row is not array-like", "numeric sequence"
+            )
         if arr.dtype == object or not np.issubdtype(arr.dtype, np.number):
-            return _CodecDecision(False, "typed_ragged", f"non-numeric dtype: {arr.dtype}", "numeric sequence")
+            return _CodecDecision(
+                False,
+                "typed_ragged",
+                f"non-numeric dtype: {arr.dtype}",
+                "numeric sequence",
+            )
         dtypes.append(arr.dtype)
     try:
         dtype = np.result_type(*dtypes)
     except (TypeError, ValueError, OverflowError):
-        return _CodecDecision(False, "typed_ragged", "cannot determine common dtype", "numeric sequence")
-    return _CodecDecision(True, "typed_ragged", "all rows promote to common numeric dtype", "numeric sequence", {"dtype": str(dtype)})
+        return _CodecDecision(
+            False, "typed_ragged", "cannot determine common dtype", "numeric sequence"
+        )
+    return _CodecDecision(
+        True,
+        "typed_ragged",
+        "all rows promote to common numeric dtype",
+        "numeric sequence",
+        {"dtype": str(dtype)},
+    )
 
 
 def _can_numeric_scalar(values: list[Any]) -> _CodecDecision:
@@ -2431,14 +3080,26 @@ def _can_numeric_scalar(values: list[Any]) -> _CodecDecision:
     if not nn:
         return _CodecDecision(False, "ndarray", "all rows are null", "numeric scalar")
     if not all(isinstance(v, (bool, int, float, np.number)) for v in nn):
-        return _CodecDecision(False, "ndarray", "not all rows are numeric scalar", "numeric scalar")
+        return _CodecDecision(
+            False, "ndarray", "not all rows are numeric scalar", "numeric scalar"
+        )
     try:
         dtype = np.result_type(*nn)
     except (TypeError, ValueError, OverflowError):
-        return _CodecDecision(False, "ndarray", "cannot determine common dtype", "numeric scalar")
+        return _CodecDecision(
+            False, "ndarray", "cannot determine common dtype", "numeric scalar"
+        )
     if not np.issubdtype(dtype, np.number) and not np.issubdtype(dtype, np.bool_):
-        return _CodecDecision(False, "ndarray", f"non-numeric dtype: {dtype}", "numeric scalar")
-    return _CodecDecision(True, "ndarray", "all rows are numeric scalar", "numeric scalar", {"dtype": str(dtype)})
+        return _CodecDecision(
+            False, "ndarray", f"non-numeric dtype: {dtype}", "numeric scalar"
+        )
+    return _CodecDecision(
+        True,
+        "ndarray",
+        "all rows are numeric scalar",
+        "numeric scalar",
+        {"dtype": str(dtype)},
+    )
 
 
 def _can_json(values: list[Any]) -> _CodecDecision:
@@ -2448,14 +3109,18 @@ def _can_json(values: list[Any]) -> _CodecDecision:
     sampled_bytes = 0
     for i, v in enumerate(nn):
         try:
-            encoded = json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            encoded = json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
         except (TypeError, ValueError, OverflowError, RecursionError):
             return _CodecDecision(False, "json_ragged", "serialization failed", "json")
         if i < _INFER_MAX_SAMPLE_ROWS:
             sampled_bytes += len(encoded)
     if sampled_bytes > _INFER_MAX_JSON_BYTES:
         return _CodecDecision(False, "json_ragged", "sampled payload too large", "json")
-    return _CodecDecision(True, "json_ragged", "all rows pass JSON serialization", "json")
+    return _CodecDecision(
+        True, "json_ragged", "all rows pass JSON serialization", "json"
+    )
 
 
 _CODEC_PREDICATES: tuple[Any, ...] = (
@@ -2475,7 +3140,9 @@ def _choose_leaf_codec(values: list[Any]) -> _CodecDecision:
         decision = predicate(values)
         if decision.accepted:
             return decision
-    return _CodecDecision(False, "pickle_ragged_fallback", "no optimized codec matched", "python object")
+    return _CodecDecision(
+        False, "pickle_ragged_fallback", "no optimized codec matched", "python object"
+    )
 
 
 def _try_expand_dict(values: list[Any]) -> list[str] | None:
@@ -2495,7 +3162,9 @@ def _try_expand_list(values: list[Any]) -> tuple[int, list[int]] | None:
     max_len = max(len(v) for v in nn)
     if max_len > _INFER_MAX_LIST_LEN:
         return None
-    if not all(item is None or isinstance(item, (dict, list, tuple)) for v in nn for item in v):
+    if not all(
+        item is None or isinstance(item, (dict, list, tuple)) for v in nn for item in v
+    ):
         return None
     lengths = [len(v) if isinstance(v, (list, tuple)) else 0 for v in values]
     return max_len, lengths
@@ -2521,24 +3190,35 @@ def infer_structure(
     ``row_mask`` that records which rows had a real parent container.
     """
     if _depth > _INFER_MAX_DEPTH:
-        raise ValueError(f"infer_structure exceeded max depth {_INFER_MAX_DEPTH} at {path!r}")
+        raise ValueError(
+            f"infer_structure exceeded max depth {_INFER_MAX_DEPTH} at {path!r}"
+        )
     dict_keys = _try_expand_dict(values)
     if dict_keys is not None:
         row_mask = [isinstance(v, dict) for v in values]
         nodes.append(_InferredNode(path, "dict", dict_keys, row_mask=row_mask))
         for key in dict_keys:
-            child = [v.get(key, MISSING) if isinstance(v, dict) else None for v in values]
-            infer_structure(f"{path}.{_escape_key(key)}", child, leaves, nodes, _depth=_depth + 1)
+            child = [
+                v.get(key, MISSING) if isinstance(v, dict) else None for v in values
+            ]
+            infer_structure(
+                f"{path}.{_escape_key(key)}", child, leaves, nodes, _depth=_depth + 1
+            )
         return
     list_result = _try_expand_list(values)
     if list_result is not None:
         max_len, lengths = list_result
         row_mask = [isinstance(v, (list, tuple)) for v in values]
-        nodes.append(_InferredNode(path, "list", list(range(max_len)), lengths, row_mask=row_mask))
+        nodes.append(
+            _InferredNode(
+                path, "list", list(range(max_len)), lengths, row_mask=row_mask
+            )
+        )
         for index in range(max_len):
             child = [
-                v[index] if isinstance(v, (list, tuple)) and index < len(v) else
-                (MISSING if isinstance(v, (list, tuple)) else None)
+                v[index]
+                if isinstance(v, (list, tuple)) and index < len(v)
+                else (MISSING if isinstance(v, (list, tuple)) else None)
                 for v in values
             ]
             infer_structure(f"{path}[{index}]", child, leaves, nodes, _depth=_depth + 1)

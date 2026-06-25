@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import threading
 import time
 
@@ -14,6 +15,9 @@ from mooncake.structured_object_store import (
     RemoteBundleRef,
     StructuredObjectPayload,
     StructuredObjectReadSpec,
+    export_dataproto_ref,
+    import_dataproto_ref,
+    is_dataproto_ref_handle,
     tensor_object_buffer,
 )
 
@@ -27,6 +31,11 @@ class SimpleDataProto:
     @classmethod
     def from_dict(cls, batch, non_tensor_batch=None, meta_info=None):
         return cls(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+
+
+class BadDataProto:
+    def __init__(self) -> None:
+        pass
 
 
 class InMemoryStore:
@@ -549,8 +558,8 @@ def test_structured_object_pre_registered_buffers_passthrough() -> None:
     )
 
     assert store.batch_put_from_calls > 0
-    assert store.register_buffer_calls == 1
-    assert store.unregister_buffer_calls == 1
+    assert store.register_buffer_calls == 0
+    assert store.unregister_buffer_calls == 0
     assert payload_ptr in store.registered
 
     result = transfer.materialize(transfer.read_spec(ref))
@@ -1032,25 +1041,70 @@ def test_bundle_rejects_tampered_manifest() -> None:
         )
 
 
-
-
 def test_structured_object_torch_tensor_falls_back_without_buffer_pool() -> None:
     torch = pytest.importorskip("torch")
     mooncake_store = pytest.importorskip("mooncake.store")
-    if (
-        not hasattr(mooncake_store, "_serialize_tensor")
-        or not hasattr(mooncake_store, "_deserialize_tensor")
+    if not hasattr(mooncake_store, "_serialize_tensor") or not hasattr(
+        mooncake_store, "_deserialize_tensor"
     ):
         pytest.skip("built mooncake.store lacks tensor serialization helpers")
     store, transfer = make_transfer()
     tensor = torch.arange(12, dtype=torch.int64).reshape(3, 4)
 
-    ref = transfer.put_structured_object(StructuredObjectPayload(buffers={"tensor": tensor}))
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"tensor": tensor})
+    )
     result = transfer.materialize(transfer.read_spec(ref))
 
     assert store.put_tensor_from_calls == 0
-    assert store.batch_put_from_calls == 1
+    assert store.batch_put_from_calls == 0
     assert torch.equal(result.objects["tensor"], tensor)
+
+
+def test_structured_object_direct_torch_tensor_materialize_into_uses_real_store() -> (
+    None
+):
+    torch = pytest.importorskip("torch")
+    mooncake_store = pytest.importorskip("mooncake.store")
+    if not hasattr(mooncake_store, "get_tensor_into") and not hasattr(
+        mooncake_store.MooncakeDistributedStore, "get_tensor_into"
+    ):
+        pytest.skip("built mooncake.store lacks get_tensor_into")
+    store = mooncake_store.MooncakeDistributedStore()
+    rc = store.setup(
+        os.getenv("LOCAL_HOSTNAME", "localhost"),
+        os.getenv("MC_METADATA_SERVER", "P2PHANDSHAKE"),
+        16 * 1024 * 1024,
+        4 * 1024 * 1024,
+        os.getenv("PROTOCOL", "tcp"),
+        os.getenv("DEVICE_NAME", ""),
+        os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+    )
+    if rc != 0:
+        pytest.skip(f"MooncakeDistributedStore setup failed: {rc}")
+    transfer = MooncakeBundleTransfer(store, key_prefix="structured-test-direct")
+    tensor = torch.arange(12, dtype=torch.int64).reshape(3, 4)
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"tensor": tensor})
+    )
+    total_bytes = int(ref.manifest["buffers"]["tensor"]["bytes"])
+    destination = ctypes.create_string_buffer(total_bytes)
+
+    try:
+        result = transfer.materialize_into(
+            transfer.read_spec(ref),
+            {
+                "tensor": tensor_object_buffer(
+                    ctypes.addressof(destination),
+                    total_bytes,
+                    destination,
+                    batch_size=3,
+                )
+            },
+        )
+        assert torch.equal(result.objects["tensor"], tensor)
+    finally:
+        transfer.remove_bundle(ref)
 
 
 def test_structured_object_torch_tensor_zero_copy_rejects_plain_tensor() -> None:
@@ -1068,6 +1122,85 @@ def test_structured_object_torch_tensor_zero_copy_rejects_plain_tensor() -> None
         )
 
 
+def test_structured_object_torch_tensor_slice_uses_range_reads() -> None:
+    torch = pytest.importorskip("torch")
+    mooncake_store = pytest.importorskip("mooncake.store")
+    if not hasattr(mooncake_store, "_serialize_tensor") or not hasattr(
+        mooncake_store, "_deserialize_tensor"
+    ):
+        pytest.skip("built mooncake.store lacks tensor serialization helpers")
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    tensor = torch.arange(48, dtype=torch.int64).reshape(12, 4)
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"tensor": tensor}), chunk_bytes=40
+    )
+
+    result = transfer.materialize(
+        transfer.read_spec(ref)
+        .select_members(["tensor"])
+        .slice_member("tensor", axis=0, start=3, end=9)
+    )
+
+    assert torch.equal(result.objects["tensor"], tensor[3:9])
+    assert store.get_into_ranges_calls >= 2
+
+
+def test_structured_object_tensor_object_buffer_uses_put_tensor_from() -> None:
+    store, transfer = make_transfer()
+    source = ctypes.create_string_buffer(b"tensor-payload")
+    store.register_buffer(ctypes.addressof(source), len(source.raw))
+
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(
+            buffers={
+                "tensor": tensor_object_buffer(
+                    ctypes.addressof(source), len(source.raw), source, batch_size=1
+                )
+            }
+        ),
+        policy=BundleTransferPolicy(copy_mode="zero_copy"),
+    )
+
+    payload = ref.manifest["buffers"]["tensor"]
+    assert store.put_tensor_from_calls == 1
+    assert store.batch_put_from_calls == 0
+    assert payload["bytes"] == len(source.raw)
+    assert payload["chunks"] == [{"key": payload["key"], "bytes": len(source.raw)}]
+
+
+def test_structured_object_tensor_object_buffer_materialize_into_uses_ranges() -> None:
+    store, transfer = make_transfer()
+    source = ctypes.create_string_buffer(b"tensor-payload")
+    store.register_buffer(ctypes.addressof(source), len(source.raw))
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(
+            buffers={
+                "tensor": tensor_object_buffer(
+                    ctypes.addressof(source), len(source.raw), source, batch_size=1
+                )
+            }
+        ),
+        policy=BundleTransferPolicy(copy_mode="zero_copy"),
+    )
+    destination = ctypes.create_string_buffer(len(source.raw))
+
+    result = transfer.materialize_into(
+        transfer.read_spec(ref),
+        {
+            "tensor": tensor_object_buffer(
+                ctypes.addressof(destination),
+                len(destination.raw),
+                destination,
+                batch_size=1,
+            )
+        },
+    )
+
+    assert result.objects["tensor"].ptr == ctypes.addressof(destination)
+    assert destination.raw == source.raw
+    assert store.get_into_ranges_calls == 1
+
+
 def test_structured_object_torch_tensor_zero_copy_uses_real_buffer_pool() -> None:
     torch = pytest.importorskip("torch")
     mooncake_store = pytest.importorskip("mooncake.store")
@@ -1079,18 +1212,20 @@ def test_structured_object_torch_tensor_zero_copy_uses_real_buffer_pool() -> Non
         pytest.skip("built mooncake.store lacks BufferPool tensor helpers")
     store = mooncake_store.MooncakeDistributedStore()
     rc = store.setup(
-        "localhost",
-        "P2PHANDSHAKE",
+        os.getenv("LOCAL_HOSTNAME", "localhost"),
+        os.getenv("MC_METADATA_SERVER", "P2PHANDSHAKE"),
         16 * 1024 * 1024,
         4 * 1024 * 1024,
-        "tcp",
-        "",
-        "127.0.0.1:50051",
+        os.getenv("PROTOCOL", "tcp"),
+        os.getenv("DEVICE_NAME", ""),
+        os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
     )
     if rc != 0:
         pytest.skip(f"MooncakeDistributedStore setup failed: {rc}")
     pool = mooncake_store.BufferPool(store, min_size_class=4096, alignment=4096)
-    transfer = MooncakeBundleTransfer(store, key_prefix="structured-test", buffer_pool=pool)
+    transfer = MooncakeBundleTransfer(
+        store, key_prefix="structured-test", buffer_pool=pool
+    )
     tensor = torch.arange(12, dtype=torch.int64).reshape(3, 4)
     metadata, data_ptr, tensor_nbytes, owner = mooncake_store._serialize_tensor(tensor)
     total_bytes = len(metadata) + int(tensor_nbytes)
@@ -1103,7 +1238,11 @@ def test_structured_object_torch_tensor_zero_copy_uses_real_buffer_pool() -> Non
     try:
         ref = transfer.put_structured_object(
             StructuredObjectPayload(
-                buffers={"tensor": tensor_object_buffer(lease.ptr, total_bytes, lease, batch_size=3)}
+                buffers={
+                    "tensor": tensor_object_buffer(
+                        lease.ptr, total_bytes, lease, batch_size=3
+                    )
+                }
             ),
             policy=BundleTransferPolicy(copy_mode="zero_copy"),
         )
@@ -1127,21 +1266,57 @@ def test_dataproto_helper_roundtrip_uses_structured_object() -> None:
     store, transfer = make_transfer()
     data = SimpleDataProto(
         batch={"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)},
-        non_tensor_batch={"reward": np.asarray([1.0, 0.0, 0.5, -1.0], dtype=np.float32)},
+        non_tensor_batch={
+            "reward": np.asarray([1.0, 0.0, 0.5, -1.0], dtype=np.float32)
+        },
         meta_info={"step": 7, "source": "unit"},
     )
 
-    ref = transfer.put_dataproto(data, namespace="roll", partition="train", stage="rollout")
+    ref = transfer.put_dataproto(
+        data, namespace="roll", partition="train", stage="rollout"
+    )
     result = transfer.get_dataproto(ref, data_cls=SimpleDataProto)
 
     assert ref.batch_size == 4
     assert set(ref.stage_refs) == {"rollout"}
     assert set(ref.field_index) == {"input_ids", "reward"}
     assert np.array_equal(result.batch["input_ids"], data.batch["input_ids"])
-    assert np.array_equal(result.non_tensor_batch["reward"], data.non_tensor_batch["reward"])
+    assert np.array_equal(
+        result.non_tensor_batch["reward"], data.non_tensor_batch["reward"]
+    )
     assert result.meta_info == data.meta_info
-    stage_metadata = transfer.materialize(transfer.read_spec(ref.stage_refs["rollout"]).select_members(["batch.input_ids"])).metadata
+    stage_metadata = transfer.materialize(
+        transfer.read_spec(ref.stage_refs["rollout"]).select_members(
+            ["batch.input_ids"]
+        )
+    ).metadata
     assert stage_metadata["dataproto"]["stage"] == "rollout"
+
+
+def test_dataproto_manifest_view_reuses_structured_manifest_specs() -> None:
+    _store, transfer = make_transfer()
+    data = SimpleDataProto(
+        batch={"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)},
+        non_tensor_batch={
+            "reward": np.asarray([1.0, 0.0, 0.5, -1.0], dtype=np.float32)
+        },
+        meta_info={"step": 7},
+    )
+
+    ref = transfer.put_dataproto(
+        data, namespace="roll", partition="train", stage="rollout"
+    )
+    view = transfer.dataproto_manifest_view(ref)
+
+    assert view["namespace"] == "roll"
+    assert view["partition"] == "train"
+    assert view["batch_size"] == 4
+    assert view["stages"]["rollout"]["dataproto"]["stage"] == "rollout"
+    assert view["batch_fields"]["input_ids"]["member"] == "batch.input_ids"
+    assert view["batch_fields"]["input_ids"]["spec"]["encoding"] == "ndarray"
+    assert view["batch_fields"]["input_ids"]["spec"]["shape"] == [4, 3]
+    assert view["non_tensor_fields"]["reward"]["spec"]["dtype"] == "<f4"
+    assert view["meta_info_keys"] == ["step"]
 
 
 def test_dataproto_helper_selects_fields_and_meta() -> None:
@@ -1169,7 +1344,133 @@ def test_dataproto_helper_selects_fields_and_meta() -> None:
     assert set(result["non_tensor_batch"]) == {"reward"}
     assert result["meta_info"] == {"step": 7}
     assert np.array_equal(result["batch"]["input_ids"], data.batch["input_ids"])
-    assert np.array_equal(result["non_tensor_batch"]["reward"], data.non_tensor_batch["reward"])
+    assert np.array_equal(
+        result["non_tensor_batch"]["reward"], data.non_tensor_batch["reward"]
+    )
+
+
+def test_dataproto_helper_supports_dict_cls_and_reports_bad_cls() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"input_ids": np.arange(4)}, meta_info={"step": 1})
+    )
+
+    result = transfer.get_dataproto(ref, data_cls=dict)
+
+    assert result["meta_info"] == {"step": 1}
+    assert np.array_equal(result["batch"]["input_ids"], np.arange(4))
+    with pytest.raises(TypeError, match="cannot be constructed"):
+        transfer.get_dataproto(ref, data_cls=BadDataProto)
+
+
+def test_dataproto_helper_accepts_legacy_dict_inputs() -> None:
+    _store, transfer = make_transfer()
+    plain_ref = transfer.put_dataproto({"input_ids": np.arange(4)})
+    envelope_ref = transfer.put_dataproto(
+        {
+            "batch": {"tokens": np.arange(6).reshape(3, 2)},
+            "non_tensor_batch": {"uid": np.asarray(["a", "b", "c"], dtype=object)},
+            "meta_info": {"step": 3},
+        }
+    )
+
+    plain = transfer.get_dataproto(plain_ref)
+    envelope = transfer.get_dataproto(envelope_ref)
+
+    assert np.array_equal(plain["batch"]["input_ids"], np.arange(4))
+    assert np.array_equal(envelope["batch"]["tokens"], np.arange(6).reshape(3, 2))
+    assert envelope["non_tensor_batch"]["uid"].tolist() == ["a", "b", "c"]
+    assert envelope["meta_info"] == {"step": 3}
+
+
+def test_dataproto_helper_treats_reserved_plain_dict_keys_as_batch_fields() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_dataproto({"batch": np.arange(4), "meta_info": np.arange(4)})
+
+    result = transfer.get_dataproto(ref)
+
+    assert np.array_equal(result["batch"]["batch"], np.arange(4))
+    assert np.array_equal(result["batch"]["meta_info"], np.arange(4))
+    assert result["meta_info"] == {}
+
+
+def test_dataproto_helper_rejects_cross_section_field_name_collision() -> None:
+    _store, transfer = make_transfer()
+
+    with pytest.raises(ValueError, match="overlap"):
+        transfer.put_dataproto(
+            {
+                "batch": {"uid": np.arange(4)},
+                "non_tensor_batch": {"uid": np.asarray(["a", "b", "c", "d"])},
+            }
+        )
+
+
+def test_dataproto_ref_handle_roundtrip_materializes_and_cleans_up() -> None:
+    store, transfer = make_transfer()
+    input_ids = np.arange(6, dtype=np.int64).reshape(3, 2)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(
+            batch={"input_ids": input_ids},
+            non_tensor_batch={"uid": np.asarray(["a", "b", "c"], dtype=object)},
+            meta_info={"step": 3, "tags": ["rollout"]},
+        ),
+        namespace="roll",
+        partition="train",
+        stage="rollout",
+    )
+    handle = export_dataproto_ref(ref)
+
+    assert is_dataproto_ref_handle(handle)
+    assert handle["stage_refs"] == {
+        "rollout": {"manifest_key": ref.stage_refs["rollout"].manifest_key}
+    }
+    imported = import_dataproto_ref(handle)
+    assert imported.stage_refs["rollout"].manifest == {}
+
+    result = transfer.get_dataproto(handle)
+    assert np.array_equal(result["batch"]["input_ids"], input_ids)
+    assert result["non_tensor_batch"]["uid"].tolist() == ["a", "b", "c"]
+    assert result["meta_info"] == {"step": 3, "tags": ["rollout"]}
+    assert transfer.dataproto_manifest_view(handle)["meta_info_keys"] == [
+        "step",
+        "tags",
+    ]
+
+    transfer.cleanup_dataproto(handle)
+    assert store.objects == {}
+
+
+def test_dataproto_ref_handle_exports_numpy_meta_and_validates_indexes() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_dataproto(
+        SimpleDataProto(
+            batch={"input_ids": np.arange(4)},
+            meta_info={"scores": np.asarray([1, 2], dtype=np.int64)},
+        )
+    )
+    ref.global_indexes = [0, 2]
+
+    handle = export_dataproto_ref(ref)
+    imported = import_dataproto_ref(handle)
+
+    assert handle["meta_info"] == {"scores": [1, 2]}
+    assert imported.global_indexes == [0, 2]
+    bad_indexes = dict(handle)
+    bad_indexes["global_indexes"] = "0,2"
+    with pytest.raises(ValueError, match="global_indexes"):
+        import_dataproto_ref(bad_indexes)
+
+
+def test_dataproto_ref_handle_rejects_unknown_field_stage() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"input_ids": np.arange(4)}))
+    handle = export_dataproto_ref(ref)
+    handle["field_index"]["input_ids"] = dict(handle["field_index"]["input_ids"])
+    handle["field_index"]["input_ids"]["stage"] = "missing"
+
+    with pytest.raises(ValueError, match="unknown stage"):
+        import_dataproto_ref(handle)
 
 
 def test_dataproto_helper_appends_stage_fields_without_rewriting_existing() -> None:
@@ -1191,7 +1492,9 @@ def test_dataproto_helper_appends_stage_fields_without_rewriting_existing() -> N
     assert set(ref.stage_refs) == {"rollout", "old_log_prob"}
     assert len(store.objects) > initial_object_count
     assert np.array_equal(result["batch"]["input_ids"], rollout.batch["input_ids"])
-    assert np.array_equal(result["batch"]["old_log_probs"], old_log_prob.batch["old_log_probs"])
+    assert np.array_equal(
+        result["batch"]["old_log_probs"], old_log_prob.batch["old_log_probs"]
+    )
     assert result["meta_info"] == {"step": 1, "stage": "old_log_prob"}
 
     with pytest.raises(ValueError, match="already exist"):
@@ -1230,13 +1533,14 @@ def test_dataproto_helper_overwrite_rejects_partial_stage_replacement() -> None:
 
 
 def test_dataproto_helper_overwrite_replaces_encoded_metadata() -> None:
-    _store, transfer = make_transfer()
+    store, transfer = make_transfer()
     ref = transfer.put_dataproto(
         SimpleDataProto(
             non_tensor_batch={"text": np.asarray(["a", None], dtype=object)}
         ),
         stage="meta",
     )
+    old_manifest_key = ref.stage_refs["meta"].manifest_key
     ref = transfer.append_dataproto_fields(
         ref,
         SimpleDataProto(non_tensor_batch={"text": np.asarray([1, 2], dtype=np.int64)}),
@@ -1246,6 +1550,8 @@ def test_dataproto_helper_overwrite_replaces_encoded_metadata() -> None:
     result = transfer.get_dataproto(ref)
 
     assert "text" not in ref.encoded_non_tensor
+    assert old_manifest_key not in store.objects
+    assert ref.stage_refs["meta"].manifest_key in store.objects
     assert np.array_equal(result["non_tensor_batch"]["text"], np.asarray([1, 2]))
 
 
@@ -1267,15 +1573,18 @@ def test_dataproto_helper_cleanup_removes_all_stage_objects() -> None:
     assert store.objects == {}
 
 
-
 def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     _store, transfer = make_transfer()
     data = SimpleDataProto(
         batch={"input_ids": np.arange(4, dtype=np.int64)},
         non_tensor_batch={
             "text": np.asarray(["hello", None, "world", "moon"], dtype=object),
-            "json": np.asarray([{"a": 1}, None, {"b": [2, 3]}, {"c": "x"}], dtype=object),
-            "blob": np.asarray([b"a", None, bytearray(b"bc"), memoryview(b"def")], dtype=object),
+            "json": np.asarray(
+                [{"a": 1}, None, {"b": [2, 3]}, {"c": "x"}], dtype=object
+            ),
+            "blob": np.asarray(
+                [b"a", None, bytearray(b"bc"), memoryview(b"def")], dtype=object
+            ),
             "nullable_int": np.asarray([1, None, 3, 4], dtype=object),
         },
     )
@@ -1284,8 +1593,18 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     result = transfer.get_dataproto(ref)
 
     assert set(ref.encoded_non_tensor) == {"text", "json", "blob", "nullable_int"}
-    assert result["non_tensor_batch"]["text"].tolist() == ["hello", None, "world", "moon"]
-    assert result["non_tensor_batch"]["json"].tolist() == [{"a": 1}, None, {"b": [2, 3]}, {"c": "x"}]
+    assert result["non_tensor_batch"]["text"].tolist() == [
+        "hello",
+        None,
+        "world",
+        "moon",
+    ]
+    assert result["non_tensor_batch"]["json"].tolist() == [
+        {"a": 1},
+        None,
+        {"b": [2, 3]},
+        {"c": "x"},
+    ]
     assert result["non_tensor_batch"]["blob"].tolist() == [b"a", None, b"bc", b"def"]
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
 
@@ -1304,7 +1623,12 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     torch = pytest.importorskip("torch")
     _store, transfer = make_transfer()
     ragged = np.asarray(
-        [torch.arange(1, dtype=torch.float32), None, torch.arange(3, dtype=torch.float32), torch.arange(2, dtype=torch.float32)],
+        [
+            torch.arange(1, dtype=torch.float32),
+            None,
+            torch.arange(3, dtype=torch.float32),
+            torch.arange(2, dtype=torch.float32),
+        ],
         dtype=object,
     )
     data = SimpleDataProto(non_tensor_batch={"ragged": ragged})
