@@ -623,7 +623,7 @@ fn spawn_restore_promotion_worker_if_needed(client: &StoreClient, resolved: &Res
         .spawn(move || run_tasks(tasks));
     if let Err(error) = spawn_result {
         queue.abort_worker_batch(tasks_for_abort);
-        debug!(
+        warn!(
             runtime = %client.lease.runtime,
             tenant = %resolved.tenant,
             key = %resolved.key,
@@ -886,6 +886,24 @@ fn restore_payload_from_cold_backing_singleflight_into(
                 );
                 let length = match read_result {
                     Ok(Some(length)) => {
+                        if length > buffer.len() {
+                            warn!(
+                                runtime = %client.lease.runtime,
+                                tenant = %resolved.tenant,
+                                key = %resolved.key,
+                                bytes = length,
+                                buffer_len = buffer.len(),
+                                "cold restore backend read exceeded caller buffer"
+                            );
+                            permit.complete_error();
+                            return Err(StoreError::Allocator(format!(
+                                "buffer too small for tenant={} key={}: need {}, have {}",
+                                resolved.tenant,
+                                resolved.key,
+                                length,
+                                buffer.len()
+                            )));
+                        }
                         debug!(
                             runtime = %client.lease.runtime,
                             tenant = %resolved.tenant,
@@ -2510,8 +2528,7 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
         // Pool exhausted — sweep expired entries before blocking.
         // Reclaims slots whose readers crashed without ACK.
         let util_before = staging_pool.utilization();
-        let reclaimed = storage_owner
-            .sweep_expired_staging_slots(std::time::Duration::from_secs(30));
+        let reclaimed = storage_owner.sweep_expired_staging_slots(storage_owner.staging_slot_ttl);
         if reclaimed > 0 {
             // Retry fast path after sweep freed slots.
             if let Some(slot) = staging_pool.try_allocate(needed) {
