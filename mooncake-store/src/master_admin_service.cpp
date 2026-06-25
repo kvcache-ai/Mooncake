@@ -178,12 +178,13 @@ struct HttpTenantQuotaSnapshot {
     uint64_t used_bytes{0};
     uint64_t reserved_bytes{0};
     uint64_t committed_count{0};
+    uint64_t metadata_object_count{0};
     bool over_quota{false};
     bool has_explicit_policy{false};
 };
 YLT_REFL(HttpTenantQuotaSnapshot, tenant_id, requested_quota_bytes,
          effective_quota_bytes, used_bytes, reserved_bytes, committed_count,
-         over_quota, has_explicit_policy);
+         metadata_object_count, over_quota, has_explicit_policy);
 
 HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
     const TenantQuotaSnapshot& snapshot) {
@@ -194,6 +195,7 @@ HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
         .used_bytes = snapshot.used_bytes,
         .reserved_bytes = snapshot.reserved_bytes,
         .committed_count = snapshot.committed_count,
+        .metadata_object_count = snapshot.metadata_object_count,
         .over_quota = snapshot.over_quota,
         .has_explicit_policy = snapshot.has_explicit_policy,
     };
@@ -398,6 +400,9 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
         << "# HELP mooncake_tenant_quota_committed_count Tenant committed "
            "object count\n"
         << "# TYPE mooncake_tenant_quota_committed_count gauge\n"
+        << "# HELP mooncake_tenant_quota_metadata_object_count Tenant "
+           "metadata object count\n"
+        << "# TYPE mooncake_tenant_quota_metadata_object_count gauge\n"
         << "# HELP mooncake_tenant_quota_over_quota Tenant over-quota flag\n"
         << "# TYPE mooncake_tenant_quota_over_quota gauge\n"
         << "# HELP mooncake_tenant_quota_explicit_policy Tenant explicit "
@@ -419,6 +424,9 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
                        << tenant << "\"} " << snapshot.reserved_bytes << "\n";
         tenant_metrics << "mooncake_tenant_quota_committed_count{tenant_id=\""
                        << tenant << "\"} " << snapshot.committed_count << "\n";
+        tenant_metrics
+            << "mooncake_tenant_quota_metadata_object_count{tenant_id=\""
+            << tenant << "\"} " << snapshot.metadata_object_count << "\n";
         tenant_metrics << "mooncake_tenant_quota_over_quota{tenant_id=\""
                        << tenant << "\"} " << (snapshot.over_quota ? 1 : 0)
                        << "\n";

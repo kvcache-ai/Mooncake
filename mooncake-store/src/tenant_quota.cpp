@@ -25,7 +25,8 @@ uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
 
 bool IsLazyEmptyTenant(const TenantQuotaState& state) {
     return !state.has_explicit_policy && state.used_bytes == 0 &&
-           state.reserved_bytes == 0 && state.committed_count == 0;
+           state.reserved_bytes == 0 && state.committed_count == 0 &&
+           state.metadata_object_count == 0;
 }
 
 TenantQuotaResult AccountingMismatch(const char* operation,
@@ -306,15 +307,18 @@ TenantQuotaSnapshot TenantQuotaTable::MakeSnapshot(
         .used_bytes = state.used_bytes,
         .reserved_bytes = state.reserved_bytes,
         .committed_count = state.committed_count,
+        .metadata_object_count = state.metadata_object_count,
         .has_explicit_policy = state.has_explicit_policy,
         .over_quota = state.over_quota,
     };
 }
 
 void TenantQuotaTable::RefreshOverQuota(TenantQuotaState* state) const {
-    state->over_quota = static_cast<unsigned __int128>(state->used_bytes) +
-                            state->reserved_bytes >
-                        state->effective_quota_bytes;
+    state->over_quota =
+        (!state->has_explicit_policy && state->metadata_object_count > 0) ||
+        static_cast<unsigned __int128>(state->used_bytes) +
+                state->reserved_bytes >
+            state->effective_quota_bytes;
 }
 
 }  // namespace mooncake

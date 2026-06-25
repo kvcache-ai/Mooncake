@@ -1156,6 +1156,7 @@ class MasterService {
         } type;
         ReplicaID source_id;
         std::vector<ReplicaID> replica_ids;
+        uint64_t reserved_quota_charge_bytes{0};
     };
 
     struct OffloadingTask {
@@ -1411,6 +1412,12 @@ class MasterService {
     void ReleaseTenantQuota(const std::string& tenant_id, uint64_t bytes);
     void ReleaseTenantQuotaPartial(const std::string& tenant_id,
                                    uint64_t bytes);
+    void CommitAdditionalTenantQuota(const std::string& tenant_id,
+                                     uint64_t bytes);
+    void AbortReplicationTaskQuota(const std::string& tenant_id,
+                                   const ReplicationTask& task);
+    void IncrementTenantMetadataObjectCount(const std::string& tenant_id);
+    void DecrementTenantMetadataObjectCount(const std::string& tenant_id);
     void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
@@ -1685,6 +1692,10 @@ class MasterService {
                     enable_soft_pin, enable_hard_pin, data_type, group_id,
                     object_id_.tenant_id, object_id_.user_key));
             it_ = result.first;
+            if (result.second) {
+                service_->IncrementTenantMetadataObjectCount(
+                    object_id_.tenant_id);
+            }
         }
 
        private:

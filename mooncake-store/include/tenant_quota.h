@@ -16,6 +16,7 @@ struct TenantQuotaState {
     uint64_t used_bytes = 0;
     uint64_t reserved_bytes = 0;
     uint64_t committed_count = 0;
+    uint64_t metadata_object_count = 0;
     bool has_explicit_policy = false;
     bool over_quota = false;
 };
@@ -27,6 +28,7 @@ struct TenantQuotaSnapshot {
     uint64_t used_bytes = 0;
     uint64_t reserved_bytes = 0;
     uint64_t committed_count = 0;
+    uint64_t metadata_object_count = 0;
     bool has_explicit_policy = false;
     bool over_quota = false;
 };

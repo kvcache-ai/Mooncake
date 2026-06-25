@@ -114,7 +114,7 @@ Effective quota is recomputed from the current registered memory capacity:
 - If explicit tenant requests fit within the registered memory capacity, tenants receive their requested quotas and remaining capacity stays unallocated.
 - If explicit tenant requests exceed registered memory capacity, explicit tenants receive quota scaled proportionally by request size.
 - Remainders are assigned deterministically by tenant ID, so repeated recomputes produce stable results.
-- Tenants present in restored metadata but missing from the connector policy become in-memory orphans with requested quota `0`, effective quota `0`, and `over_quota=true` when they still own memory. Reads and removals are allowed so operators can clean them up; writes remain blocked until the tenant is re-registered or emptied.
+- Tenants present in restored metadata but missing from the connector policy become in-memory orphans with requested quota `0`, effective quota `0`, and `over_quota=true` while they still own metadata. Reads and removals are allowed so operators can clean them up; writes remain blocked until the tenant is re-registered or emptied.
 
 `PutStart` and size-changing `UpsertStart` charge quota before memory is allocated. If the first reservation fails, the master performs tenant-scoped memory eviction for the target tenant and retries the reservation. The retry is bounded to two eviction attempts. Tenant quota eviction scans only the target tenant, skips hard-pinned objects, honors soft-pin eviction configuration, and preserves grouped-object lease safety checks.
 
