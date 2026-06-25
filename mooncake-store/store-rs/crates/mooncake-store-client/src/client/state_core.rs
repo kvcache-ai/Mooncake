@@ -350,6 +350,7 @@ struct StorageOwnerState {
     staging_pool: Mutex<Option<Arc<cold_tier::ColdRestoreStagingPool>>>,
     pending_staging_slots: Mutex<HashMap<(SegmentName, u64), (cold_tier::StagingSlot, Instant)>>,
     staging_pool_bytes: usize,
+    staging_slot_ttl: Duration,
 }
 
 #[derive(Default)]

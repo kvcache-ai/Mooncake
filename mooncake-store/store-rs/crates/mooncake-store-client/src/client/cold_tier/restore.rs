@@ -70,16 +70,31 @@ impl StorageOwnerState {
     }
 
     pub(in super::super) fn sweep_expired_staging_slots(&self, ttl: Duration) -> usize {
-        let mut pending = self.pending_staging_slots.lock();
-        let before = pending.len();
-        pending.retain(|(segment, offset), (_, inserted_at)| {
-            if inserted_at.elapsed() < ttl {
-                return true;
-            }
+        let expired = {
+            let mut pending = self.pending_staging_slots.lock();
+            let mut expired = Vec::new();
+            pending.retain(|(segment, offset), (_, inserted_at)| {
+                if inserted_at.elapsed() < ttl {
+                    return true;
+                }
+                expired.push((segment.clone(), *offset));
+                false
+            });
+            expired
+        };
+        for (segment, offset) in &expired {
             self.read_pin_registry.force_unpin(segment, *offset);
-            false
-        });
-        before.saturating_sub(pending.len())
+        }
+        if !expired.is_empty() {
+            record_cold_restore_batch_items("staging_slots_swept", expired.len() as u64);
+            info!(
+                runtime = %self.runtime,
+                swept = expired.len(),
+                ttl_ms = ttl.as_millis() as u64,
+                "swept expired cold restore staging slots"
+            );
+        }
+        expired.len()
     }
 
     pub(in super::super) fn evict_one_clean_and_reserve_bounded(
@@ -838,28 +853,48 @@ fn spawn_restore_promotion_worker_if_needed(client: &StoreClient, resolved: &Res
     let run_tasks = move |mut tasks: Vec<RestorePromotionTask>| {
         loop {
             for task in tasks {
-                let promote_result = execute_restore_promotion(&promoter, &task);
-                registry::record_cold_tier_operation_result("restore_promote", &promote_result);
+                let promote_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute_restore_promotion(&promoter, &task)
+                }));
                 match promote_result {
-                    Ok(()) => {
-                        debug!(
-                            tenant = %task.tenant,
-                            key = %task.object_id.logical_key,
-                            route_key = %task.current.key.0,
-                            route_version = task.current.version.0,
-                            payload_bytes = task.payload.len(),
-                            "cold tier restored payload promoted"
+                    Ok(promote_result) => {
+                        registry::record_cold_tier_operation_result(
+                            "restore_promote",
+                            &promote_result,
                         );
+                        match promote_result {
+                            Ok(()) => {
+                                debug!(
+                                    tenant = %task.tenant,
+                                    key = %task.object_id.logical_key,
+                                    route_key = %task.current.key.0,
+                                    route_version = task.current.version.0,
+                                    payload_bytes = task.payload.len(),
+                                    "cold tier restored payload promoted"
+                                );
+                            }
+                            Err(error) => {
+                                debug!(
+                                    tenant = %task.tenant,
+                                    key = %task.object_id.logical_key,
+                                    route_key = %task.current.key.0,
+                                    route_version = task.current.version.0,
+                                    payload_bytes = task.payload.len(),
+                                    error = %error,
+                                    "restore promotion failed after cold read"
+                                );
+                            }
+                        }
                     }
-                    Err(error) => {
-                        debug!(
+                    Err(_) => {
+                        registry::record_cold_tier_operation("restore_promote", "error", "panic");
+                        warn!(
                             tenant = %task.tenant,
                             key = %task.object_id.logical_key,
                             route_key = %task.current.key.0,
                             route_version = task.current.version.0,
                             payload_bytes = task.payload.len(),
-                            error = %error,
-                            "restore promotion failed after cold read"
+                            "restore promotion worker recovered from task panic"
                         );
                     }
                 }
@@ -880,7 +915,7 @@ fn spawn_restore_promotion_worker_if_needed(client: &StoreClient, resolved: &Res
         .spawn(move || run_tasks(tasks));
     if let Err(error) = spawn_result {
         queue.abort_worker_batch(tasks_for_abort);
-        debug!(
+        warn!(
             runtime = %client.lease.runtime,
             tenant = %resolved.tenant,
             key = %resolved.key,
@@ -2159,7 +2194,7 @@ fn process_device_group(
         let needed = entry.cold_backing.length as usize;
         let slot = staging_pool.try_allocate(needed).or_else(|| {
             let reclaimed =
-                storage_owner.sweep_expired_staging_slots(std::time::Duration::from_secs(30));
+                storage_owner.sweep_expired_staging_slots(storage_owner.staging_slot_ttl);
             if reclaimed > 0 {
                 if let Some(slot) = staging_pool.try_allocate(needed) {
                     return Some(slot);
@@ -2732,8 +2767,7 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
         // Pool exhausted — sweep expired entries before blocking.
         // Reclaims slots whose readers crashed without ACK.
         let util_before = staging_pool.utilization();
-        let reclaimed = storage_owner
-            .sweep_expired_staging_slots(std::time::Duration::from_secs(30));
+        let reclaimed = storage_owner.sweep_expired_staging_slots(storage_owner.staging_slot_ttl);
         if reclaimed > 0 {
             // Retry fast path after sweep freed slots.
             if let Some(slot) = staging_pool.try_allocate(needed) {
