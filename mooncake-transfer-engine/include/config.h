@@ -59,6 +59,11 @@ struct GlobalConfig {
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
     bool metacache = true;
+    // 0 keeps the historical behavior: cached segment descriptors never expire
+    // unless callers request force_update. Positive values enable
+    // stale-while-refresh: the first caller after TTL expiry refreshes metadata
+    // synchronously while concurrent callers can keep using stale cache.
+    uint64_t metadata_cache_ttl_ms = 1000;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;

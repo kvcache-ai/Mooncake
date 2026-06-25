@@ -22,6 +22,7 @@ void TransferMetadata::SegmentDesc::dump() const {
         LOG(INFO) << "  rdma server name: " << rdma_server_name;
     }
     LOG(INFO) << "  protocol: " << protocol;
+    LOG(INFO) << "  metadata version: " << metadata_version;
     LOG(INFO) << "  topology: " << topology.toString();
     LOG(INFO) << "  devices: ";
     for (auto& device : devices) {
@@ -32,7 +33,9 @@ void TransferMetadata::SegmentDesc::dump() const {
     for (auto& buffer : buffers) {
         LOG(INFO) << "    buffer type " << buffer.name << ", address "
                   << (void*)buffer.addr << "--"
-                  << (void*)(buffer.addr + buffer.length);
+                  << (void*)(buffer.addr + buffer.length)
+                  << ", state "
+                  << (buffer.state.empty() ? "READY" : buffer.state);
     }
     LOG(INFO) << "  nvmeof buffers: " << nvmeof_buffers.size() << " items";
     LOG(INFO) << "  timestamp: " << timestamp;
@@ -67,6 +70,8 @@ void TransferMetadata::dumpMetadataContent(const std::string& segment_name,
 void TransferMetadata::dumpMetadataContentUnlocked() {
     LOG(INFO) << "-----------------------------------------------------------";
     LOG(INFO) << "TransferMetadata::dumpMetadataContent";
+    LOG(INFO) << "remote metadata version changes observed: "
+              << segmentMetadataVersionChangeCount();
     LOG(INFO) << "-----------------------------------------------------------";
     LOG(INFO) << "=== Cached Segment Descriptors ===";
     for (auto& entry : segment_id_to_desc_map_) {
