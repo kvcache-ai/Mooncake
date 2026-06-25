@@ -264,6 +264,34 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         self.inner.batch_replace_routes(request).await
     }
 
+    async fn trigger_cold_tier_offload(
+        &self,
+        request: Request<pb::TriggerColdTierOffloadRequest>,
+    ) -> std::result::Result<Response<pb::TriggerColdTierOffloadReply>, Status> {
+        self.inner.trigger_cold_tier_offload(request).await
+    }
+
+    async fn manual_cold_tier_gc(
+        &self,
+        request: Request<pb::ManualColdTierGcRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierGcReply>, Status> {
+        self.inner.manual_cold_tier_gc(request).await
+    }
+
+    async fn manual_cold_tier_free(
+        &self,
+        request: Request<pb::ManualColdTierFreeRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierFreeReply>, Status> {
+        self.inner.manual_cold_tier_free(request).await
+    }
+
+    async fn probe_cold_tier_device(
+        &self,
+        request: Request<pb::ProbeColdTierDeviceRequest>,
+    ) -> std::result::Result<Response<pb::ProbeColdTierDeviceReply>, Status> {
+        self.inner.probe_cold_tier_device(request).await
+    }
+
     async fn read_from_cold(
         &self,
         request: Request<pb::ReadFromColdRequest>,
@@ -519,6 +547,34 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
         request: Request<pb::BatchReplaceRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchReplaceRoutesReply>, Status> {
         self.inner.batch_replace_routes(request).await
+    }
+
+    async fn trigger_cold_tier_offload(
+        &self,
+        request: Request<pb::TriggerColdTierOffloadRequest>,
+    ) -> std::result::Result<Response<pb::TriggerColdTierOffloadReply>, Status> {
+        self.inner.trigger_cold_tier_offload(request).await
+    }
+
+    async fn manual_cold_tier_gc(
+        &self,
+        request: Request<pb::ManualColdTierGcRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierGcReply>, Status> {
+        self.inner.manual_cold_tier_gc(request).await
+    }
+
+    async fn manual_cold_tier_free(
+        &self,
+        request: Request<pb::ManualColdTierFreeRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierFreeReply>, Status> {
+        self.inner.manual_cold_tier_free(request).await
+    }
+
+    async fn probe_cold_tier_device(
+        &self,
+        request: Request<pb::ProbeColdTierDeviceRequest>,
+    ) -> std::result::Result<Response<pb::ProbeColdTierDeviceReply>, Status> {
+        self.inner.probe_cold_tier_device(request).await
     }
 
     async fn read_from_cold(
@@ -777,6 +833,34 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
         request: Request<pb::BatchReplaceRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchReplaceRoutesReply>, Status> {
         self.inner.batch_replace_routes(request).await
+    }
+
+    async fn trigger_cold_tier_offload(
+        &self,
+        request: Request<pb::TriggerColdTierOffloadRequest>,
+    ) -> std::result::Result<Response<pb::TriggerColdTierOffloadReply>, Status> {
+        self.inner.trigger_cold_tier_offload(request).await
+    }
+
+    async fn manual_cold_tier_gc(
+        &self,
+        request: Request<pb::ManualColdTierGcRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierGcReply>, Status> {
+        self.inner.manual_cold_tier_gc(request).await
+    }
+
+    async fn manual_cold_tier_free(
+        &self,
+        request: Request<pb::ManualColdTierFreeRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierFreeReply>, Status> {
+        self.inner.manual_cold_tier_free(request).await
+    }
+
+    async fn probe_cold_tier_device(
+        &self,
+        request: Request<pb::ProbeColdTierDeviceRequest>,
+    ) -> std::result::Result<Response<pb::ProbeColdTierDeviceReply>, Status> {
+        self.inner.probe_cold_tier_device(request).await
     }
 
     async fn read_from_cold(

@@ -21,6 +21,10 @@ service ControlPlaneService {
   rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
   rpc SubmitMigrationTask(SubmitMigrationTaskRequest) returns (SubmitMigrationTaskReply);
   rpc GetMigrationExecutionStatus(GetMigrationExecutionStatusRequest) returns (GetMigrationExecutionStatusReply);
+  rpc TriggerColdTierOffload(TriggerColdTierOffloadRequest) returns (TriggerColdTierOffloadReply);
+  rpc ManualColdTierGc(ManualColdTierGcRequest) returns (ManualColdTierGcReply);
+  rpc ManualColdTierFree(ManualColdTierFreeRequest) returns (ManualColdTierFreeReply);
+  rpc ProbeColdTierDevice(ProbeColdTierDeviceRequest) returns (ProbeColdTierDeviceReply);
   rpc ReadFromCold(ReadFromColdRequest) returns (ReadFromColdReply);
   rpc BatchReadFromCold(BatchReadFromColdRequest) returns (BatchReadFromColdReply);
   rpc AckColdReadComplete(AckColdReadCompleteRequest) returns (AckColdReadCompleteReply);
@@ -382,6 +386,54 @@ message SegmentTargetChunk {
   uint64 logical_offset = 1;
   uint64 target_offset = 2;
   uint64 length_bytes = 3;
+}
+
+message TriggerColdTierOffloadRequest {
+  uint64 max_tasks = 1;
+}
+
+message TriggerColdTierOffloadReply {
+  uint64 materialized = 1;
+  ErrorDetail error = 2;
+}
+
+message ManualColdTierGcRequest {
+  string device_id = 1;
+  uint64 max_backings = 2;
+}
+
+message ManualColdTierGcReply {
+  uint64 collected = 1;
+  ErrorDetail error = 2;
+}
+
+message ManualColdTierFreeRequest {
+  string device_id = 1;
+  uint64 max_victims = 2;
+}
+
+message ManualColdTierFreeReply {
+  uint64 attempted_victims = 1;
+  uint64 freed_backings = 2;
+  uint64 skipped_backings = 3;
+  bool reached_low_watermark = 4;
+  ErrorDetail error = 5;
+  uint64 collected_backings = 6;
+}
+
+message ProbeColdTierDeviceRequest {
+  string device_id = 1;
+}
+
+message ProbeColdTierDeviceReply {
+  string device_id = 1;
+  uint64 capacity_bytes = 2;
+  uint64 used_bytes = 3;
+  uint64 reserved_bytes = 4;
+  bool schedulable = 5;
+  string state = 6;
+  string last_error = 7;
+  ErrorDetail error = 8;
 }
 
 message ReadFromColdRequest {

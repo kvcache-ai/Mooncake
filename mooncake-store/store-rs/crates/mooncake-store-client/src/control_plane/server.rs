@@ -1,7 +1,8 @@
 use super::codec::*;
 use super::cold_tier_server::{
-    handle_ack_cold_read_complete, handle_batch_read_from_cold, handle_pin_for_read,
-    handle_read_from_cold,
+    handle_ack_cold_read_complete, handle_batch_read_from_cold, handle_manual_cold_tier_free,
+    handle_manual_cold_tier_gc, handle_pin_for_read, handle_probe_cold_tier_device,
+    handle_read_from_cold, handle_trigger_cold_tier_offload,
 };
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
@@ -294,6 +295,34 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             },
         };
         Ok(Response::new(reply))
+    }
+
+    async fn trigger_cold_tier_offload(
+        &self,
+        request: Request<pb::TriggerColdTierOffloadRequest>,
+    ) -> std::result::Result<Response<pb::TriggerColdTierOffloadReply>, Status> {
+        handle_trigger_cold_tier_offload(self.cold_tier.clone(), request).await
+    }
+
+    async fn manual_cold_tier_gc(
+        &self,
+        request: Request<pb::ManualColdTierGcRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierGcReply>, Status> {
+        handle_manual_cold_tier_gc(self.cold_tier.clone(), request).await
+    }
+
+    async fn manual_cold_tier_free(
+        &self,
+        request: Request<pb::ManualColdTierFreeRequest>,
+    ) -> std::result::Result<Response<pb::ManualColdTierFreeReply>, Status> {
+        handle_manual_cold_tier_free(self.cold_tier.clone(), request).await
+    }
+
+    async fn probe_cold_tier_device(
+        &self,
+        request: Request<pb::ProbeColdTierDeviceRequest>,
+    ) -> std::result::Result<Response<pb::ProbeColdTierDeviceReply>, Status> {
+        handle_probe_cold_tier_device(self.cold_tier.clone(), request).await
     }
 
     async fn read_from_cold(

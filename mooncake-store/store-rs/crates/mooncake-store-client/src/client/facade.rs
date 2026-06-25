@@ -1978,6 +1978,14 @@ impl StoreClient {
         )
     }
 
+    pub fn flush_pending_cold_tier_offloads(&self) {
+        self.flush_pending_offloads_before_drain();
+    }
+
+    pub fn set_cold_tier_shutdown_mode(&mut self, mode: ColdTierShutdownMode) {
+        self.cold_tier_shutdown_mode = mode;
+    }
+
     pub fn prepare_heartbeat(&mut self, expires_at_ms: u64) -> HeartbeatLease {
         self.lease.state = self.lifecycle_state();
         self.lease.expires_at_ms = expires_at_ms;
@@ -2000,12 +2008,121 @@ impl StoreClient {
     }
 }
 
+impl StoreClient {
+    fn cleanup_owned_routes_on_shutdown(&self) {
+        let routes = match self.collect_routes_by_replica_owner(&self.lease.runtime) {
+            Ok(routes) => routes,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    runtime = %self.lease.runtime,
+                    "shutdown route cleanup: failed to list owned routes"
+                );
+                return;
+            }
+        };
+
+        let mode = self.cold_tier_shutdown_mode;
+        let mut cleaned = 0usize;
+        for route in &routes {
+            let mut next = route.clone();
+            next.version = route.version.next();
+            next.replicas.retain(|replica| replica.owner != self.lease.runtime);
+
+            let should_delete = match mode {
+                ColdTierShutdownMode::Decommission => next.replicas.is_empty(),
+                ColdTierShutdownMode::Restart => false,
+            };
+
+            let cas_result = if should_delete {
+                self.route_ops().delete_route(&route.key, Some(route.version))
+            } else if next.replicas.len() < route.replicas.len() {
+                self.route_ops()
+                    .prune_route(&route.key, Some(route.version), &next)
+            } else {
+                continue;
+            };
+
+            match cas_result {
+                Ok(cas) if cas.applied => {
+                    cleaned = cleaned.saturating_add(1);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        key = %route.key.0,
+                        error = %error,
+                        "shutdown route cleanup CAS failed"
+                    );
+                }
+            }
+        }
+
+        if mode == ColdTierShutdownMode::Decommission {
+            self.delete_cold_payloads_on_decommission();
+        }
+
+        if cleaned > 0 {
+            tracing::info!(
+                runtime = %self.lease.runtime,
+                cleaned,
+                total = routes.len(),
+                mode = ?mode,
+                "shutdown route cleanup complete"
+            );
+        }
+    }
+
+    fn delete_cold_payloads_on_decommission(&self) {
+        let device_ids = self.storage_owner.cold_tier_devices.local_device_ids();
+        for device_id in &device_ids {
+            let routes = match self.metadata.as_ref().list_object_routes_by_cold_backing(
+                &mooncake_store_core::ColdBackingRouteFilter {
+                    device_id: Some(device_id.clone()),
+                    ..Default::default()
+                },
+            ) {
+                Ok(routes) => routes,
+                Err(error) => {
+                    tracing::warn!(
+                        device_id,
+                        error = %error,
+                        "decommission: failed to list cold routes"
+                    );
+                    continue;
+                }
+            };
+            for route in routes {
+                let Some(cold_backing) = route.cold_backing.as_ref() else {
+                    continue;
+                };
+                if let Ok(backend) = self.storage_owner.cold_tier_devices.backend_for(cold_backing) {
+                    let _ = cold_tier::backend_remove_cold_payload(backend.as_ref(), cold_backing);
+                }
+                let _ = self.route_ops().delete_route(&route.key, Some(route.version));
+            }
+        }
+    }
+}
+
 impl Drop for StoreClient {
     fn drop(&mut self) {
         self.membership_sync.shutdown();
         self.async_replica_tracking.shutdown();
         self.async_route_hit_reporting.shutdown();
-        let _ = self.flush_all_reclaims();
+        self.cold_tier.shutdown();
+        if self.owns_cold_tier_lifecycle {
+            self.cleanup_owned_routes_on_shutdown();
+            self.storage_owner.unregister_cold_tier_devices_on_shutdown();
+        }
+        match self.cold_tier_shutdown_mode {
+            ColdTierShutdownMode::Restart => {
+                let _ = self.flush_all_reclaims_preserve_cold_tier();
+            }
+            ColdTierShutdownMode::Decommission => {
+                let _ = self.flush_all_reclaims();
+            }
+        }
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {

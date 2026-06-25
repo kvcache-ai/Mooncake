@@ -2,11 +2,72 @@ use super::super::LocalAllocatorAdapter;
 use super::{
     batch_read_from_cold_staged, execute_owner_cold_restore_promote_phase, read_from_cold_one_shot,
 };
-use crate::control_plane::{ColdReadResponse, ColdReadTarget, ColdTierControlService};
+use crate::control_plane::{
+    ColdReadResponse, ColdReadTarget, ColdTierControlService, ColdTierFreeResult,
+    ColdTierProbeResult,
+};
 use mooncake_store_core::{SegmentName, StoreError};
 use std::sync::Arc;
 
 impl ColdTierControlService for LocalAllocatorAdapter {
+    fn trigger_offload(&self, max_tasks: usize) -> mooncake_store_core::Result<usize> {
+        self.ensure_accepting_writes()?;
+        self.storage_owner
+            .materialize_pending_offloads_bounded(max_tasks)
+    }
+
+    fn manual_gc(
+        &self,
+        device_id: &str,
+        max_backings: usize,
+    ) -> mooncake_store_core::Result<usize> {
+        self.ensure_accepting_writes()?;
+        self.storage_owner
+            .garbage_collect_pending_delete_backings_for_device_bounded(device_id, max_backings)
+    }
+
+    fn manual_free(
+        &self,
+        device_id: &str,
+        max_victims: usize,
+    ) -> mooncake_store_core::Result<ColdTierFreeResult> {
+        self.ensure_accepting_writes()?;
+        let result = self
+            .storage_owner
+            .manual_free_cold_tier_device_bounded(device_id, max_victims)?;
+        let collected = if result.freed_backings > 0 {
+            self.storage_owner
+                .garbage_collect_pending_delete_backings_for_device_bounded(
+                    device_id,
+                    result.freed_backings,
+                )?
+        } else {
+            0
+        };
+        let _ = self.storage_owner.compact_cold_tier_backends();
+        Ok(ColdTierFreeResult {
+            attempted_victims: result.attempted_victims,
+            freed_backings: result.freed_backings,
+            collected_backings: collected,
+            skipped_backings: result.skipped_backings,
+            reached_low_watermark: result.reached_low_watermark,
+        })
+    }
+
+    fn probe_device(&self, device_id: &str) -> mooncake_store_core::Result<ColdTierProbeResult> {
+        let device = self.storage_owner.probe_cold_tier_device(device_id)?;
+        let schedulable = device.schedulable();
+        Ok(ColdTierProbeResult {
+            device_id: device.device_id,
+            capacity_bytes: device.capacity_bytes,
+            used_bytes: device.used_bytes,
+            reserved_bytes: device.reserved_bytes,
+            schedulable,
+            state: format!("{:?}", device.state),
+            last_error: device.last_error,
+        })
+    }
+
     fn read_from_cold(
         &self,
         namespace: &str,

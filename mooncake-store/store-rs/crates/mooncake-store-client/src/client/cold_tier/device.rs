@@ -158,11 +158,23 @@ impl StorageOwnerState {
             return Ok(None);
         }
         let replica_count = cold_tier_replica_count();
-        let devices = if replica_count > 1 {
-            self.select_cold_tier_devices(length, replica_count)?
-        } else {
-            self.select_cold_tier_device(length)?.into_iter().collect()
+        let select_devices = |storage_owner: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
+            if replica_count > 1 {
+                storage_owner.select_cold_tier_devices(length, replica_count)
+            } else {
+                Ok(storage_owner
+                    .select_cold_tier_device(length)?
+                    .into_iter()
+                    .collect())
+            }
         };
+        let mut devices = select_devices(self)?;
+        if devices.is_empty() {
+            let freed = self.try_inline_gc_for_offload(length)?;
+            if freed > 0 {
+                devices = select_devices(self)?;
+            }
+        }
         let Some(primary) = devices.first() else {
             tracing::debug!(
                 runtime = %self.runtime,

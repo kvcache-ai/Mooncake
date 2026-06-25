@@ -936,10 +936,7 @@ impl StorageOwnerState {
     }
 
     fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
-        let Some(route) = self
-            .route_ops
-            .load_route(&victim.route_key)?
-        else {
+        let Some(route) = self.route_ops.load_route(&victim.route_key)? else {
             self.hot_replicas.clock.lock().remove_id(victim);
             return Ok(false);
         };
@@ -947,19 +944,53 @@ impl StorageOwnerState {
             self.hot_replicas.clock.lock().remove_id(victim);
             return Ok(false);
         }
-        let Some(replica_index) = route.replicas.iter().position(|replica| {
-            replica.owner == self.runtime
-                && replica.segment_name == victim.segment_name
-                && replica.segment_offset == victim.segment_offset
-        }) else {
+        if self.replica_index_for_victim(&route, victim).is_none() {
+            self.sync_route(&route);
+            return Ok(false);
+        }
+        let has_usable_cold_tier_device = self.has_usable_cold_tier_device()?;
+        let cold_backing_not_on_disk = route.cold_backing.is_none()
+            || route.cold_backing.as_ref().is_some_and(|backing| {
+                backing.state == mooncake_store_core::ColdBackingState::PendingOffload
+            });
+        let delete_empty_route = cold_backing_not_on_disk && !has_usable_cold_tier_device;
+        let route = if delete_empty_route {
+            route
+        } else {
+            let Some(route) = self.ensure_materialized_cold_backing_for_eviction(&route)? else {
+                return Ok(false);
+            };
+            route
+        };
+        let Some(replica_index) = self.replica_index_for_victim(&route, victim) else {
             self.sync_route(&route);
             return Ok(false);
         };
+        self.evict_route_replica(victim, &route, replica_index, delete_empty_route)
+    }
 
+    fn has_usable_cold_tier_device(&self) -> Result<bool> {
+        self.cold_tier_devices
+            .has_usable_device(self.metadata.as_ref())
+    }
+
+    fn replica_index_for_victim(&self, route: &ObjectRoute, victim: &ClockEntryId) -> Option<usize> {
+        route.replicas.iter().position(|replica| {
+            replica.owner == self.runtime
+                && replica.segment_name == victim.segment_name
+                && replica.segment_offset == victim.segment_offset
+        })
+    }
+
+    fn evict_route_replica(
+        &self,
+        victim: &ClockEntryId,
+        route: &ObjectRoute,
+        replica_index: usize,
+        delete_empty_route: bool,
+    ) -> Result<bool> {
         let evicted_replica = route.replicas[replica_index].clone();
-        let delete_empty_route = cold_tier::should_delete_route_after_last_replica_eviction(&route);
-        let next = cold_tier::route_after_replica_eviction(&route, replica_index, delete_empty_route);
-
+        let next = cold_tier::route_after_replica_eviction(route, replica_index, delete_empty_route);
         let cas = match next.as_ref() {
             Some(next_route) => self
                 .route_ops
@@ -984,13 +1015,16 @@ impl StorageOwnerState {
         if let Some(next_route) = &next {
             self.sync_route(next_route);
         }
-        trace!(
+        info!(
             runtime = %self.runtime,
             key = %route.key.0,
             segment = %evicted_replica.segment_name.0,
             offset_bytes = evicted_replica.segment_offset,
             length_bytes = evicted_replica.length,
-            "storage-owner evicted replica via route-owner cas"
+            delete_empty_route,
+            cold_backing_state = ?route.cold_backing.as_ref().map(|backing| backing.state),
+            route_deleted = next.is_none(),
+            "dram_eviction_complete"
         );
         if stable_debug_log_sample(&[
             "storage_owner_evicted_replica",
@@ -1006,6 +1040,117 @@ impl StorageOwnerState {
             );
         }
         Ok(true)
+    }
+
+    fn ensure_materialized_cold_backing_for_eviction(
+        &self,
+        route: &ObjectRoute,
+    ) -> Result<Option<ObjectRoute>> {
+        let cold_state = route.cold_backing.as_ref().map(|backing| backing.state);
+        match cold_state {
+            Some(mooncake_store_core::ColdBackingState::Materialized) => Ok(Some(route.clone())),
+            Some(mooncake_store_core::ColdBackingState::PendingOffload) => {
+                if !self.materialize_pending_offload_route_for_eviction(route)? {
+                    warn!(
+                        runtime = %self.runtime,
+                        key = %route.key.0,
+                        "eviction_inline_offload_failed: PendingOffload materialization failed, eviction skipped"
+                    );
+                    return Ok(None);
+                }
+                self.current_materialized_route(&route.key)
+            }
+            Some(mooncake_store_core::ColdBackingState::PendingDelete) => {
+                self.sync_route(route);
+                Ok(None)
+            }
+            None => {
+                let Some(route) = self.publish_pending_cold_backing_for_eviction(route)? else {
+                    warn!(
+                        runtime = %self.runtime,
+                        key = %route.key.0,
+                        "eviction_publish_cold_backing_failed: cannot create PendingOffload, eviction skipped"
+                    );
+                    return Ok(None);
+                };
+                if !self.materialize_pending_offload_route_for_eviction(&route)? {
+                    warn!(
+                        runtime = %self.runtime,
+                        key = %route.key.0,
+                        "eviction_inline_offload_failed_after_publish: eviction skipped"
+                    );
+                    return Ok(None);
+                }
+                self.current_materialized_route(&route.key)
+            }
+        }
+    }
+
+    fn publish_pending_cold_backing_for_eviction(
+        &self,
+        route: &ObjectRoute,
+    ) -> Result<Option<ObjectRoute>> {
+        crate::client::cold_tier::publish_pending_cold_backing_for_eviction(self, route)
+    }
+
+    fn materialize_pending_offload_route_for_eviction(&self, route: &ObjectRoute) -> Result<bool> {
+        let tracker = OperationTracker::new("storage_owner_eviction_forced_offload");
+        let result = (|| {
+            let devices = match self.cold_tier_devices.devices.lock().snapshot() {
+                Some(devices) => devices,
+                None => refresh_cold_tier_device_cache(
+                    self.metadata.as_ref(),
+                    &self.cold_tier_devices.devices,
+                    "cold_tier_device_snapshot_eviction_offload_prepare",
+                )?,
+            };
+            let devices = devices
+                .into_iter()
+                .map(|device| (device.device_id.clone(), device))
+                .collect::<BTreeMap<_, _>>();
+            let Some(entry) = self.pending_offloads.claim(&route.key, route.version) else {
+                return Ok(false);
+            };
+            let key = entry.key.clone();
+            let prepare_result =
+                self.prepare_pending_offload_entry(entry.clone(), Some(route.clone()), &devices);
+            let materialization = match prepare_result {
+                Ok(PendingOffloadPrepareOutcome::Ready(materialization)) => *materialization,
+                Ok(PendingOffloadPrepareOutcome::Retry(entry)) => {
+                    self.pending_offloads.retry(entry);
+                    return Ok(false);
+                }
+                Ok(PendingOffloadPrepareOutcome::RetryAfter(entry, delay)) => {
+                    self.pending_offloads.retry_after(entry, delay);
+                    return Ok(false);
+                }
+                Ok(PendingOffloadPrepareOutcome::Refreshed(entry)) => {
+                    self.pending_offloads.retry_after(entry, Duration::ZERO);
+                    return Ok(false);
+                }
+                Ok(PendingOffloadPrepareOutcome::Skipped) => {
+                    self.pending_offloads.complete(&key);
+                    return Ok(false);
+                }
+                Err(error) => {
+                    self.pending_offloads.retry(entry);
+                    return Err(error);
+                }
+            };
+            let mut first_error = None;
+            let materialized = self.materialize_prepared_pending_offload_batch(
+                std::slice::from_ref(&materialization),
+                &mut first_error,
+            )?;
+            if materialized == 0 {
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+            }
+            Ok(materialized > 0)
+        })();
+        tracker.finish(&result, u64::from(result.as_ref().copied().unwrap_or(false)));
+        result
     }
 
     fn rebuild_clock(&self) -> Result<()> {
