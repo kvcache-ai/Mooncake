@@ -157,6 +157,9 @@ pub(in super::super) fn trigger_remote_owner_cold_restore(
     entry: &mut ResolvedObject,
     request_deadline: RequestDeadline,
 ) -> Result<()> {
+    if super::cold_tier_disabled() {
+        return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+    }
     let owner = entry.replica.owner.clone();
     let resolved_lease = match client.metadata.get_client_lease(&owner)? {
         Some(lease) => Some(lease),
@@ -387,6 +390,9 @@ pub(in super::super) fn execute_local_restore_batch_reads(
     if cold_indices.is_empty() {
         return Ok(());
     }
+    if super::cold_tier_disabled() {
+        return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+    }
     info!(
         runtime = %client.lease.runtime,
         items = cold_indices.len(),
@@ -438,6 +444,9 @@ pub(in super::super) fn restore_payload_from_cold_backing(
     resolved: &ResolvedObject,
     buffer: &mut [u8],
 ) -> Result<Option<Arc<Vec<u8>>>> {
+    if super::cold_tier_disabled() {
+        return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+    }
     if super::cold_paths_short_circuited() {
         return Err(StoreError::NotFound(
             "cold restore short-circuited for abort isolation".to_string(),
@@ -477,6 +486,9 @@ pub(in super::super) fn restore_batch_payloads_from_cold_backing(
     buffers: &mut [&mut [u8]],
     indices: &[usize],
 ) -> Result<Vec<(usize, Arc<Vec<u8>>)>> {
+    if super::cold_tier_disabled() {
+        return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+    }
     if super::cold_paths_short_circuited() {
         debug!(
             runtime = %client.lease.runtime,
@@ -2151,6 +2163,12 @@ pub(in super::super) fn read_from_cold_one_shot(
     Result<crate::control_plane::ColdReadResult>,
     Option<OwnerColdRestoreStagingContext>,
 ) {
+    if super::cold_tier_disabled() {
+        return (
+            Err(StoreError::Unsupported("cold tier is disabled".to_string())),
+            None,
+        );
+    }
     let scope = mooncake_store_core::NamespaceScope::with_defaults(
         Some(tenant),
         if domain.is_empty() {

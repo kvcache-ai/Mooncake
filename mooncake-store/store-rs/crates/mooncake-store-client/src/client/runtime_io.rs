@@ -873,6 +873,9 @@ impl StoreClient {
                     ))
                 }),
             ReplicaReadSelector::ColdBacking => {
+                if cold_tier::cold_tier_disabled() {
+                    return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+                }
                 let Some(_cold_backing) = cold_tier::materialized_cold_backing(current) else {
                     return Err(StoreError::NotFound(format!(
                         "route {} has no materialized cold backing source",
@@ -961,6 +964,9 @@ impl StoreClient {
             return Ok(payload);
         }
 
+        if cold_tier::cold_tier_disabled() {
+            return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
+        }
         let cold_backing = cold_tier::materialized_cold_backing(route).ok_or_else(|| {
             StoreError::NotFound(format!(
                 "route {} has no materialized cold backing source",
@@ -2342,18 +2348,27 @@ impl StoreClient {
             Some(replica) => (replica, readable_runtimes.clone()),
             None => {
                 let refreshed_readable = self.readable_runtime_set(true)?;
-                let replica = Self::select_readable_replica(
+                match Self::select_readable_replica(
                     &route,
                     &self.lease.runtime,
                     local_segments,
                     &refreshed_readable,
-                )
-                .ok_or_else(|| {
-                    StoreError::NotFound(format!(
-                        "tenant={tenant} key={logical_key} has no readable replica owner"
-                    ))
-                })?;
-                (replica, refreshed_readable)
+                ) {
+                    Some(replica) => (replica, refreshed_readable),
+                    None if cold_tier::cold_tier_enabled() => {
+                        return self.resolve_cold_backing_read(
+                            route,
+                            tenant,
+                            logical_key,
+                            &refreshed_readable,
+                        );
+                    }
+                    None => {
+                        return Err(StoreError::NotFound(format!(
+                            "tenant={tenant} key={logical_key} has no readable replica owner"
+                        )));
+                    }
+                }
             }
         };
         if route
