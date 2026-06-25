@@ -96,8 +96,7 @@ class LocalTransferAdmissionQueue {
     enum class QueueState {
         Queued,
         Dispatching,
-        Completed,
-        Failed,
+        Terminal,
     };
 
     struct QueueOwner {
@@ -105,6 +104,7 @@ class LocalTransferAdmissionQueue {
         Request request{};
         QueueOwnerKind kind{QueueOwnerKind::User};
         QueueState state{QueueState::Queued};
+        TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
 
     QueueLimits limits_;

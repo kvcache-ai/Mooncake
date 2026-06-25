@@ -1753,6 +1753,94 @@ TEST_F(AscendDirectTransportTest, RemoteTransfer_Async_TransferTimeout) {
                                   "(GetTransferStatus stays WAITING)";
 }
 
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Sync_FailureWithAutoConnect_SkipsDisconnect) {
+    setenv("ASCEND_AUTO_CONNECT", "1", 1);
+    adxl_mock::set_transfer_result(adxl::FAILED);
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_SubmitFailureWithAutoConnect_SkipsDisconnect) {
+    setenv("ASCEND_AUTO_CONNECT", "1", 1);
+    adxl_mock::set_transfer_async_result(adxl::FAILED);
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_GetStatusFailureWithAutoConnect_SkipsDisconnect) {
+    setenv("ASCEND_AUTO_CONNECT", "1", 1);
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::FAILED);
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_TimeoutWithAutoConnect_StillDisconnects) {
+    setenv("ASCEND_AUTO_CONNECT", "1", 1);
+    setenv("ASCEND_TRANSFER_TIMEOUT", "100", 1);
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::WAITING);
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+}
+
 // -----------------------------------------------------------------------------
 // Standalone mode tests (non-dummy-real, non-fabric-mem)
 // -----------------------------------------------------------------------------
