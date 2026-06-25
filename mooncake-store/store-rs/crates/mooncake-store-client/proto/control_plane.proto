@@ -389,6 +389,7 @@ message SegmentTargetChunk {
 }
 
 message TriggerColdTierOffloadRequest {
+  // Server treats 0 as 1 and rejects values above 1024.
   uint64 max_tasks = 1;
 }
 
@@ -399,6 +400,7 @@ message TriggerColdTierOffloadReply {
 
 message ManualColdTierGcRequest {
   string device_id = 1;
+  // Server treats 0 as 1 and rejects values above 1024.
   uint64 max_backings = 2;
 }
 
@@ -409,6 +411,7 @@ message ManualColdTierGcReply {
 
 message ManualColdTierFreeRequest {
   string device_id = 1;
+  // Server treats 0 as 1 and rejects values above 1024.
   uint64 max_victims = 2;
 }
 

@@ -1622,12 +1622,7 @@ impl StoreClient {
         {
             self.drain_segment_internal(&segment.segment_name, true)?;
         }
-        let flush_reclaims = if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart {
-            Self::flush_all_reclaims_preserve_cold_tier
-        } else {
-            Self::flush_all_reclaims
-        };
-        flush_reclaims(self)?;
+        self.flush_all_reclaims()?;
 
         let mut migrated = 0usize;
         loop {
@@ -1640,10 +1635,10 @@ impl StoreClient {
                 }
             }
 
-            flush_reclaims(self)?;
+            self.flush_all_reclaims()?;
             let live_allocations = self.current_owned_allocations()?;
             let _ = self.release_stale_local_allocations(&live_allocations)?;
-            flush_reclaims(self)?;
+            self.flush_all_reclaims()?;
             self.retire_empty_draining_segments()?;
 
             let remaining = self.remaining_live_segments()?;
