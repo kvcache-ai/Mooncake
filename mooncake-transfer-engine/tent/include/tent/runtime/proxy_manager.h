@@ -31,6 +31,7 @@ struct StageBufferCache;
 
 struct StagingTask {
     TaskInfo* native{nullptr};
+    BatchID batch{0};
     std::vector<std::string> params;
 };
 
@@ -51,7 +52,8 @@ class ProxyManager {
 
     Status deconstruct();
 
-    Status submit(TaskInfo* task, const std::vector<std::string>& params);
+    Status submit(TaskInfo* task, BatchID batch,
+                  const std::vector<std::string>& params);
 
     Status getStatus(TaskInfo* task, TransferStatus& task_status);
 

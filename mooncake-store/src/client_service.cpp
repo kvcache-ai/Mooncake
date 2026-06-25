@@ -648,9 +648,10 @@ ErrorCode Client::InitTransferEngine(
     }
 
     // Check if using TENT mode - TENT handles transport configuration
-    // internally
-    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
-                    (std::getenv("MC_USE_TEV1") != nullptr);
+    // internally. Use the engine's own check rather than the raw env var:
+    // if Mooncake was built without USE_TENT, the env var has no effect on
+    // the TransferEngine, so the store must still install transports.
+    bool use_tent = transfer_engine_->isUsingTent();
 
     bool auto_discover = false;
     if (!use_tent) {

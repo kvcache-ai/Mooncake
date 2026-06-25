@@ -20,8 +20,11 @@ from mooncake.structured_object_store import (
 class InMemoryStore:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.tensor_objects: dict[str, object] = {}
         self.lock = threading.Lock()
         self.registered: set[int] = set()
+        self.register_buffer_calls = 0
+        self.unregister_buffer_calls = 0
         self.max_active_puts = 0
         self.max_active_gets = 0
         self.active_puts = 0
@@ -29,7 +32,10 @@ class InMemoryStore:
         self.get_into_calls = 0
         self.get_into_ranges_calls = 0
         self.batch_get_into_calls = 0
+        self.batch_put_from_calls = 0
         self.batch_remove_calls = 0
+        self.put_tensor_calls = 0
+        self.get_tensor_calls = 0
 
     def _enter_put(self) -> None:
         with self.lock:
@@ -71,7 +77,19 @@ class InMemoryStore:
     def remove(self, key: str, force: bool = False) -> int:
         with self.lock:
             self.objects.pop(key, None)
+            self.tensor_objects.pop(key, None)
         return 0
+
+    def put_tensor(self, key: str, value) -> int:
+        self.put_tensor_calls += 1
+        with self.lock:
+            self.tensor_objects[key] = value.detach().clone()
+        return 0
+
+    def get_tensor(self, key: str):
+        self.get_tensor_calls += 1
+        with self.lock:
+            return self.tensor_objects[key].clone()
 
     def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
         self.batch_remove_calls += 1
@@ -82,6 +100,7 @@ class InMemoryStore:
     def batch_put_from(
         self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]
     ) -> list[int]:
+        self.batch_put_from_calls += 1
         results: list[int] = []
         for key, ptr, size in zip(keys, buffer_ptrs, sizes):
             data = ctypes.string_at(ptr, size)
@@ -89,10 +108,12 @@ class InMemoryStore:
         return results
 
     def register_buffer(self, buffer_ptr: int, size: int) -> int:
+        self.register_buffer_calls += 1
         self.registered.add(buffer_ptr)
         return 0
 
     def unregister_buffer(self, buffer_ptr: int) -> int:
+        self.unregister_buffer_calls += 1
         self.registered.remove(buffer_ptr)
         return 0
 
@@ -191,6 +212,15 @@ class ReadFastPathWithoutRegisterStore(MinimalStore):
 class PlainStore(MinimalStore):
     get_into = None
     get_into_ranges = None
+
+
+class PutTensorOnlyStore(InMemoryStore):
+    get_tensor = None
+
+
+class NoTensorFastPathStore(InMemoryStore):
+    put_tensor = None
+    get_tensor = None
 
 
 class FailingPutStore(InMemoryStore):
@@ -302,6 +332,79 @@ def write_manifest(
     )
 
 
+def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    array = np.arange(6, dtype=np.float32).reshape(2, 3)
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    scalar_tensor = torch.tensor(1.5, dtype=torch.float32)
+    bool_tensor = torch.tensor([True, False], dtype=torch.bool)
+
+    result = transfer.get_object(
+        transfer.put_object(
+            {
+                "array": array,
+                "tensor": tensor,
+                "scalar": scalar_tensor,
+                "bool_tensor": bool_tensor,
+            }
+        )
+    )
+
+    assert np.array_equal(result["array"], array)
+    assert torch.equal(result["tensor"], tensor)
+    assert torch.equal(result["scalar"], scalar_tensor)
+    assert torch.equal(result["bool_tensor"], bool_tensor)
+    assert store.put_tensor_calls == 3
+    assert store.get_tensor_calls == 3
+
+
+def test_put_object_roundtrips_wrapped_numpy_and_torch_values() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    array = np.arange(6, dtype=np.float32).reshape(2, 3)
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    assert np.array_equal(transfer.get_object(transfer.put_object(array)), array)
+    assert torch.equal(transfer.get_object(transfer.put_object(tensor)), tensor)
+    assert store.put_tensor_calls == 1
+    assert store.get_tensor_calls == 1
+
+
+def test_get_object_requires_get_tensor_for_tensor_payload() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer(PutTensorOnlyStore())
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    ref = transfer.put_object({"tensor": tensor})
+
+    with pytest.raises(RuntimeError, match="does not support get_tensor"):
+        transfer.get_object(ref)
+
+
+def test_put_object_torch_tensor_raw_fallback_roundtrip() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    scalar_tensor = torch.tensor(1.5, dtype=torch.float32)
+    bool_tensor = torch.tensor([True, False], dtype=torch.bool)
+
+    result = transfer.get_object(
+        transfer.put_object(
+            {
+                "tensor": tensor,
+                "scalar": scalar_tensor,
+                "bool_tensor": bool_tensor,
+            }
+        )
+    )
+
+    assert torch.equal(result["tensor"], tensor)
+    assert torch.equal(result["scalar"], scalar_tensor)
+    assert torch.equal(result["bool_tensor"], bool_tensor)
+    assert store.batch_get_into_calls > 0
+
+
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:
     store, transfer = make_transfer()
     array = np.arange(16, dtype=np.int32).reshape(4, 4)
@@ -364,6 +467,111 @@ def test_bundle_uses_configurable_default_chunk_size() -> None:
 
     assert len(ref.manifest["buffers"]["payload"]["chunks"]) > 1
     assert ref.manifest["buffers"]["payload"]["chunks"][0]["bytes"] == 17
+
+
+def test_bundle_copy_mode_forces_store_put() -> None:
+    store, transfer = make_transfer()
+    payload = bytes(range(128))
+
+    ref = transfer.put_structured_object(
+        structured_payload(payload=payload),
+        chunk_bytes=17,
+        policy=BundleTransferPolicy(copy_mode="copy"),
+    )
+
+    assert store.batch_put_from_calls == 0
+    assert store.register_buffer_calls == 0
+    assert store.unregister_buffer_calls == 0
+
+    result = transfer.materialize(transfer.read_spec(ref))
+    assert result.objects["payload"] == payload
+
+
+def test_structured_object_copy_mode_skips_pre_registered_validation() -> None:
+    store, transfer = make_transfer()
+    payload = np.arange(64, dtype=np.uint8).reshape(8, 8).T
+
+    ref = transfer.put_structured_object(
+        structured_payload(payload=payload),
+        policy=BundleTransferPolicy(copy_mode="copy"),
+        pre_registered_buffers={"payload": True},
+    )
+
+    assert store.batch_put_from_calls == 0
+    assert store.register_buffer_calls == 0
+    assert store.unregister_buffer_calls == 0
+
+    result = transfer.materialize(transfer.read_spec(ref))
+    assert np.array_equal(result.objects["payload"], payload)
+
+
+def test_bundle_zero_copy_mode_requires_batch_put_support() -> None:
+    _store, transfer = make_transfer(MinimalStore())
+
+    with pytest.raises(RuntimeError, match="zero-copy put requested"):
+        transfer.put_structured_object(
+            structured_payload(payload=b"data"),
+            policy=BundleTransferPolicy(copy_mode="zero_copy"),
+        )
+
+
+def test_structured_object_pre_registered_buffers_passthrough() -> None:
+    store, transfer = make_transfer()
+    payload = np.arange(64, dtype=np.uint8).reshape(8, 8)
+    payload_ptr = ctypes.addressof(ctypes.c_char.from_buffer(payload))
+    assert store.register_buffer(payload_ptr, int(payload.nbytes)) == 0
+    store.register_buffer_calls = 0
+    store.unregister_buffer_calls = 0
+
+    ref = transfer.put_structured_object(
+        structured_payload(payload=payload),
+        pre_registered_buffers={"payload": True},
+    )
+
+    assert store.batch_put_from_calls > 0
+    assert store.register_buffer_calls == 1
+    assert store.unregister_buffer_calls == 1
+    assert payload_ptr in store.registered
+
+    result = transfer.materialize(transfer.read_spec(ref))
+    assert np.array_equal(result.objects["payload"], payload)
+    store.unregister_buffer(payload_ptr)
+
+
+def test_structured_object_pre_registered_rejects_copied_buffers() -> None:
+    _store, transfer = make_transfer()
+    non_contiguous = np.arange(64, dtype=np.uint8).reshape(8, 8).T
+
+    with pytest.raises(ValueError, match="pre-registered structured buffer"):
+        transfer.put_structured_object(
+            structured_payload(payload=non_contiguous),
+            pre_registered_buffers={"payload": True},
+        )
+
+    with pytest.raises(ValueError, match="pre-registered structured buffer"):
+        transfer.put_structured_object(
+            structured_payload(payload=b"readonly"),
+            pre_registered_buffers={"payload": True},
+        )
+
+    with pytest.raises(ValueError, match="unknown pre-registered"):
+        transfer.put_structured_object(
+            structured_payload(payload=bytearray(b"data")),
+            pre_registered_buffers={"missing": True},
+        )
+
+
+def test_structured_object_pre_registered_empty_buffer() -> None:
+    _store, transfer = make_transfer()
+    payload = bytearray()
+
+    ref = transfer.put_structured_object(
+        structured_payload(payload=payload),
+        pre_registered_buffers={"payload": True},
+    )
+
+    result = transfer.materialize(transfer.read_spec(ref))
+    assert result.objects["payload"] == b""
 
 
 def test_structured_object_roundtrip() -> None:
@@ -706,6 +914,12 @@ def test_bundle_invalid_policy_and_chunk_size_raise() -> None:
         )
     with pytest.raises(ValueError, match="chunk_bytes"):
         transfer.put_bundle(b"meta", {"payload": b"data"}, chunk_bytes=0)
+    with pytest.raises(ValueError, match="copy_mode"):
+        transfer.put_bundle(
+            b"meta",
+            {"payload": b"data"},
+            policy=BundleTransferPolicy(copy_mode="invalid"),
+        )
 
 
 def test_bundle_invalid_name_and_prefix_raise() -> None:

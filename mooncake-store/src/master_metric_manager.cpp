@@ -368,6 +368,13 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_rejected_cap_total",
           "Promotion attempts rejected because promotion_in_flight was at "
           "promotion_queue_limit"),
+      tenant_quota_reject_total_(
+          "mooncake_tenant_quota_reject_total",
+          "Total number of tenant quota admission rejects",
+          {"tenant_id", "reason"}),
+      tenant_evict_bytes_total_(
+          "mooncake_tenant_evict_bytes_total",
+          "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
@@ -1113,6 +1120,17 @@ void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
     promotion_rejected_cap_.inc(val);
 }
 
+void MasterMetricManager::inc_tenant_quota_reject(const std::string& tenant_id,
+                                                  const std::string& reason,
+                                                  int64_t val) {
+    tenant_quota_reject_total_.inc({tenant_id, reason}, val);
+}
+
+void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
+                                                 int64_t bytes) {
+    tenant_evict_bytes_total_.inc({tenant_id}, bytes);
+}
+
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
     snapshot_duration_ms_.observe(size);
 }
@@ -1780,6 +1798,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_rejected_frequency_);
     serialize_metric(promotion_rejected_watermark_);
     serialize_metric(promotion_rejected_cap_);
+    serialize_metric(tenant_quota_reject_total_);
+    serialize_metric(tenant_evict_bytes_total_);
 
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);

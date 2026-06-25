@@ -107,6 +107,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
     setConfig(config, "MC_MTU", "transports/rdma/endpoint/path_mtu");
     setConfig(config, "MC_IB_TC", "transports/rdma/endpoint/traffic_class");
+    setConfig(config, "MC_IB_SL", "transports/rdma/endpoint/service_level");
     setConfig(config, "MC_IB_PCI_RELAXED_ORDERING",
               "transports/rdma/pci_relaxed_ordering");
     setConfig(config, "MC_WORKERS_PER_CTX",
