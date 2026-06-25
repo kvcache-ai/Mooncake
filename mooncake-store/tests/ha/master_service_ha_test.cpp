@@ -61,10 +61,12 @@ class MasterServiceHATest : public ::testing::Test {
                           size_t slice_length = 1024) const {
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start = service.PutStart(client_id, key, kDefaultTenant, slice_length, config);
+        auto put_start = service.PutStart(client_id, key, kDefaultTenant,
+                                          slice_length, config);
         EXPECT_TRUE(put_start.has_value());
         EXPECT_TRUE(
-            service.PutEnd(client_id, key, kDefaultTenant, ReplicaType::MEMORY).has_value());
+            service.PutEnd(client_id, key, kDefaultTenant, ReplicaType::MEMORY)
+                .has_value());
         return key;
     }
 
@@ -76,10 +78,12 @@ class MasterServiceHATest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         config.preferred_segments = {segment_name};
-        auto put_start = service.PutStart(client_id, key, kDefaultTenant, slice_length, config);
+        auto put_start = service.PutStart(client_id, key, kDefaultTenant,
+                                          slice_length, config);
         EXPECT_TRUE(put_start.has_value());
         EXPECT_TRUE(
-            service.PutEnd(client_id, key, kDefaultTenant, ReplicaType::MEMORY).has_value());
+            service.PutEnd(client_id, key, kDefaultTenant, ReplicaType::MEMORY)
+                .has_value());
         return key;
     }
 
@@ -201,7 +205,8 @@ TEST_F(MasterServiceHATest, RestoreFromStandbySnapshotClearsInvalidEndpoints) {
         {MakeStandbyObject("valid_restore_key", endpoint)}, 2,
         {MakeStandbyMemorySegment(endpoint)});
 
-    auto valid_result = service.GetReplicaList("valid_restore_key", kDefaultTenant);
+    auto valid_result =
+        service.GetReplicaList("valid_restore_key", kDefaultTenant);
     ASSERT_TRUE(valid_result.has_value()) << toString(valid_result.error());
     ASSERT_EQ(1u, valid_result->replicas.size());
     EXPECT_EQ(endpoint, valid_result->replicas.front()
@@ -234,7 +239,8 @@ TEST_F(MasterServiceHATest, RemoveByRegexPublishesRemoveOpLog) {
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
 
     size_t entries_before = mock_store->EntryCount();
-    auto res = service->RemoveByRegex("^regex_key_", kDefaultTenant, /*force=*/true);
+    auto res =
+        service->RemoveByRegex("^regex_key_", kDefaultTenant, /*force=*/true);
     ASSERT_TRUE(res.has_value());
     EXPECT_EQ(5, res.value());
 
@@ -336,10 +342,12 @@ TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start = service->PutStart(client_id, key, kDefaultTenant, 1024, config);
+    auto put_start =
+        service->PutStart(client_id, key, kDefaultTenant, 1024, config);
     ASSERT_TRUE(put_start.has_value());
 
-    auto res = service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
+    auto res =
+        service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
     ASSERT_TRUE(res.has_value());
 
     OpLogEntry entry;
@@ -366,15 +374,18 @@ TEST_F(MasterServiceHATest, PutRevokeKeepsLocalDiskPublishesPutEndOpLog) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start = service->PutStart(client_id, key, kDefaultTenant, 1024, config);
+    auto put_start =
+        service->PutStart(client_id, key, kDefaultTenant, 1024, config);
     ASSERT_TRUE(put_start.has_value());
 
     Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
                                ReplicaStatus::COMPLETE);
-    auto add_res = service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
+    auto add_res =
+        service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
     ASSERT_TRUE(add_res.has_value());
 
-    auto res = service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
+    auto res =
+        service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
     ASSERT_TRUE(res.has_value());
 
     OpLogEntry entry;
@@ -403,11 +414,12 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaPublishesPutEndOpLog) {
 
     Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
                                ReplicaStatus::COMPLETE);
-    auto add_res = service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
+    auto add_res =
+        service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
     ASSERT_TRUE(add_res.has_value());
 
-    auto res =
-        service->EvictDiskReplica(client_id, key, kDefaultTenant, ReplicaType::LOCAL_DISK);
+    auto res = service->EvictDiskReplica(client_id, key, kDefaultTenant,
+                                         ReplicaType::LOCAL_DISK);
     ASSERT_TRUE(res.has_value());
 
     OpLogEntry entry;
@@ -466,7 +478,8 @@ TEST_F(MasterServiceHATest, CopyEndPublishesPutEndOpLog) {
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto copy_start = service->CopyStart(client_id, key, kDefaultTenant, "seg1", {"seg2"});
+    auto copy_start =
+        service->CopyStart(client_id, key, kDefaultTenant, "seg1", {"seg2"});
     ASSERT_TRUE(copy_start.has_value());
 
     auto res = service->CopyEnd(client_id, key, kDefaultTenant);
@@ -499,7 +512,8 @@ TEST_F(MasterServiceHATest, MoveEndPublishesPutEndOpLog) {
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto move_start = service->MoveStart(client_id, key, kDefaultTenant, "seg1", "seg2");
+    auto move_start =
+        service->MoveStart(client_id, key, kDefaultTenant, "seg1", "seg2");
     ASSERT_TRUE(move_start.has_value());
 
     auto res = service->MoveEnd(client_id, key, kDefaultTenant);
@@ -533,7 +547,8 @@ TEST_F(MasterServiceHATest,
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto copy_start = service->CopyStart(client_id, key, kDefaultTenant, "seg1", {"seg2"});
+    auto copy_start =
+        service->CopyStart(client_id, key, kDefaultTenant, "seg1", {"seg2"});
     ASSERT_TRUE(copy_start.has_value());
 
     auto copy_end = service->CopyEnd(client_id, key, kDefaultTenant);
@@ -576,7 +591,8 @@ TEST_F(MasterServiceHATest, AddReplicaPersistFailureSkipsLocalMutation) {
 
     Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
                                ReplicaStatus::COMPLETE);
-    auto add_res = service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
+    auto add_res =
+        service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
     EXPECT_FALSE(add_res.has_value())
         << "AddReplica must return error when OpLog persist fails";
 
@@ -611,7 +627,8 @@ TEST_F(MasterServiceHATest, CopyEndPersistFailureSkipsLocalMutation) {
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto copy_start = service->CopyStart(client_id, key, kDefaultTenant, "seg1", {"seg2"});
+    auto copy_start =
+        service->CopyStart(client_id, key, kDefaultTenant, "seg1", {"seg2"});
     ASSERT_TRUE(copy_start.has_value());
 
     mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
@@ -657,7 +674,8 @@ TEST_F(MasterServiceHATest, MoveEndPersistFailureSkipsLocalMutation) {
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto move_start = service->MoveStart(client_id, key, kDefaultTenant, "seg1", "seg2");
+    auto move_start =
+        service->MoveStart(client_id, key, kDefaultTenant, "seg1", "seg2");
     ASSERT_TRUE(move_start.has_value());
 
     mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
@@ -704,19 +722,22 @@ TEST_F(MasterServiceHATest, PutRevokePersistFailureSkipsLocalMutation) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start = service->PutStart(client_id, key, kDefaultTenant, 1024, config);
+    auto put_start =
+        service->PutStart(client_id, key, kDefaultTenant, 1024, config);
     ASSERT_TRUE(put_start.has_value());
 
     mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
 
-    auto res = service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
+    auto res =
+        service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
     EXPECT_FALSE(res.has_value())
         << "PutRevoke must return error when OpLog persist fails";
 
     // Restore persist; PutRevoke must succeed because the PROCESSING replica
     // was NOT erased on the failed attempt.
     mock_store->SetWriteError(ErrorCode::OK);
-    auto retry = service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
+    auto retry =
+        service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
     EXPECT_TRUE(retry.has_value())
         << "PutRevoke retry must succeed because the PROCESSING replica "
            "was preserved after persist failure";
@@ -798,7 +819,8 @@ TEST_F(MasterServiceHATest, PutStartOverwritePersistFailureSkipsErase) {
     // PutStart but never PutEnd — leaves a PROCESSING-only metadata.
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start = service->PutStart(client_id, key, kDefaultTenant, 1024, config);
+    auto put_start =
+        service->PutStart(client_id, key, kDefaultTenant, 1024, config);
     ASSERT_TRUE(put_start.has_value());
 
     // Wait for put_start_discard_timeout to elapse.
@@ -809,14 +831,16 @@ TEST_F(MasterServiceHATest, PutStartOverwritePersistFailureSkipsErase) {
     // Second PutStart triggers the overwrite-REMOVE branch. With persist
     // failing it must return error (not silently drop the old metadata).
     const UUID client_id2 = generate_uuid();
-    auto retry_start = service->PutStart(client_id2, key, kDefaultTenant, 1024, config);
+    auto retry_start =
+        service->PutStart(client_id2, key, kDefaultTenant, 1024, config);
     EXPECT_FALSE(retry_start.has_value())
         << "PutStart overwrite must return error when REMOVE persist fails";
 
     // Restore persist; the overwrite must now succeed and the new
     // PutStart must allocate a fresh PROCESSING replica for client_id2.
     mock_store->SetWriteError(ErrorCode::OK);
-    auto retry2 = service->PutStart(client_id2, key, kDefaultTenant, 1024, config);
+    auto retry2 =
+        service->PutStart(client_id2, key, kDefaultTenant, 1024, config);
     EXPECT_TRUE(retry2.has_value())
         << "PutStart overwrite must succeed once persist is restored";
 }
@@ -847,7 +871,8 @@ TEST_F(MasterServiceHATest,
     // PutStart but never PutEnd — leaves a PROCESSING memory replica.
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start = service->PutStart(client_id, key, kDefaultTenant, 1024, config);
+    auto put_start =
+        service->PutStart(client_id, key, kDefaultTenant, 1024, config);
     ASSERT_TRUE(put_start.has_value());
 
     // AddReplica a COMPLETE LOCAL_DISK so the metadata has both a
@@ -855,7 +880,8 @@ TEST_F(MasterServiceHATest,
     // had_complete_replica will be true when the reaper runs.
     Replica local_disk_replica(client_id, 1024, "ld_endpoint",
                                ReplicaStatus::COMPLETE);
-    auto add_res = service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
+    auto add_res =
+        service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
     ASSERT_TRUE(add_res.has_value());
 
     // Wait for put_start_release_timeout to elapse so Part 1 considers
@@ -876,7 +902,8 @@ TEST_F(MasterServiceHATest,
     // PROCESSING memory replica was preserved, PutEnd marks it COMPLETE
     // and GetReplicaList will return BOTH descriptors.
     mock_store->SetWriteError(ErrorCode::OK);
-    auto end_res = service->PutEnd(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
+    auto end_res =
+        service->PutEnd(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
     ASSERT_TRUE(end_res.has_value());
 
     auto after = service->GetReplicaList(key, kDefaultTenant);
