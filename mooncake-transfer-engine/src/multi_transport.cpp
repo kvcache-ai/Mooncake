@@ -513,10 +513,6 @@ bool MultiTransport::isTcpOnly() const {
     return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
 }
 
-bool MultiTransport::hasRdmaTransport() const {
-    return transport_map_.count("rdma") != 0;
-}
-
 std::vector<Transport*> MultiTransport::listTransports() {
     std::vector<Transport*> transport_list;
     for (auto& entry : transport_map_)

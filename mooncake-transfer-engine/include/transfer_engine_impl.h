@@ -353,10 +353,6 @@ class TransferEngineImpl {
 
     bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
 
-    bool hasRdmaTransport() const {
-        return multi_transports_->hasRdmaTransport();
-    }
-
     int syncSegmentCache(const std::string& segment_name = "") {
         return metadata_->syncSegmentCache(segment_name);
     }

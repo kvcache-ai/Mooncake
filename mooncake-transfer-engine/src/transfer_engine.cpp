@@ -192,10 +192,6 @@ device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
 
 bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
 
-bool TransferEngine::hasRdmaTransport() const {
-    return impl_->hasRdmaTransport();
-}
-
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
     return impl_->syncSegmentCache(segment_name);
 }
@@ -623,11 +619,6 @@ bool TransferEngine::isTcpOnly() const {
         return false;
     else
         return impl_->isTcpOnly();
-}
-
-bool TransferEngine::hasRdmaTransport() const {
-    if (use_tent_) return false;
-    return impl_->hasRdmaTransport();
 }
 
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {

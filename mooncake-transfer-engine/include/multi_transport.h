@@ -63,8 +63,6 @@ class MultiTransport {
      */
     bool isTcpOnly() const;
 
-    bool hasRdmaTransport() const;
-
     std::vector<Transport *> listTransports();
 
     void *getBaseAddr();

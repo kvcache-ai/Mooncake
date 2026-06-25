@@ -1051,7 +1051,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE: {
-                    if (engine_.hasRdmaTransport()) {
+                    if (handle.protocol_ == "rdma") {
                         auto [prepared, staging] =
                             ensureRegisteredForRDMA(slices);
                         if (prepared.empty() && !slices.empty()) {
@@ -1115,14 +1115,15 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
         auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
+        auto& handle = mem_desc.buffer_descriptor;
+        if (!validateTransferParams(handle, slices)) {
             return std::nullopt;
         }
 
         // For RDMA WRITE ops, ensure slices are in registered memory.
         const std::vector<Slice>* effective_slices = &slices;
         std::vector<Slice> prepared;
-        if (op_code == TransferRequest::WRITE && engine_.hasRdmaTransport()) {
+        if (op_code == TransferRequest::WRITE && handle.protocol_ == "rdma") {
             auto [p, staging] = ensureRegisteredForRDMA(slices);
             if (p.empty() && !slices.empty()) {
                 LOG(ERROR) << "ensureRegisteredForRDMA failed in submit_batch";
@@ -1135,7 +1136,6 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             }
         }
 
-        auto& handle = mem_desc.buffer_descriptor;
         uint64_t offset = 0;
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
