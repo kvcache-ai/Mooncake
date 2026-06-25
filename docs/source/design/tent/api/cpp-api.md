@@ -2,108 +2,19 @@
 
 ## Overview
 
-This page summarizes the C++ APIs in `mooncake-transfer-engine/tent/include/tent/transfer_engine.h`.
-It follows the same structure as the Transfer Engine API documentation.
+This page documents the TENT C++ API in `mooncake-transfer-engine/tent/include/tent/transfer_engine.h`.
 
-For conceptual background, see [TENT Overview](overview.md).
+For conceptual background, see [TENT Overview](../overview.md). For migration from classic Transfer Engine, see [Migration Guide](../getting-started/migration.md).
 
 **Prerequisites and API modes**
 - **Build** with `-DUSE_TENT=ON` to enable TENT.
 - TENT provides two API surfaces:
   - **TENT-native API** (documented below).
-  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see [TE C++ API Reference](../transfer-engine/cpp-api.md)
+  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see [TE C++ API Reference](../../transfer-engine/cpp-api.md)
 
 **Core APIs vs Advanced APIs**
 - Core APIs form the minimal path to move data: create the engine, register memory, open segments, submit transfers, and query status.
 - Advanced APIs are optional; they help with segment export/import, notifications, and engine introspection.
-
-## Key Differences from Transfer Engine
-
-TENT redesigns the API surface based on different design goals. The following table summarizes the key differences and the rationale behind them.
-
-| Aspect | Transfer Engine (TE) | TENT | Rationale |
-|--------|---------------------|------|-----------|
-| **Initialization** | Two-step: constructor + `init(metadata_conn_string, server_name, ...)` | Single-step: constructor with `Config` object or config file path | Simplifies initialization; centralizes configuration in a single place |
-| **Transport Management** | Manual: `installTransport()`, `uninstallTransport()`, `getTransport()` | Removed from public API | TENT performs dynamic transport selection at runtime; applications should not manage transports directly |
-| **Memory Allocation** | Not provided; users allocate memory externally | `allocateLocalMemory()` / `freeLocalMemory()` | Provides integrated memory management with automatic registration |
-| **Memory Registration** | `registerLocalMemory(addr, len, location, remote_accessible, update_metadata)` | `registerLocalMemory(addr, size, Permission)` or `MemoryOptions` | Cleaner semantics; `Permission` replaces boolean flags; metadata updates are internal |
-| **Segment Discovery** | Via metadata service; manual cache sync with `syncSegmentCache()` | Internal control plane (metadata type = `p2p` or central); no manual sync | Simplifies metadata management; discovery handled inside runtime |
-| **Error Handling** | Mixed: some APIs return `int`, others return `Status` | Consistent: all APIs return `Status` | Uniform error handling across the API |
-| **Topology/Introspection** | Exposed: `getLocalTopology()`, `getMetadata()`, `checkOverlap()`, etc. | Internalized; not exposed | TENT handles topology and path selection internally; reduces API complexity |
-
-### Design Philosophy
-
-1. **Declarative over Imperative**: Applications describe *what* data to move, not *how* to move it. Transport selection, path optimization, and failure handling are delegated to the TENT runtime.
-
-2. **Single Initialization**: Instead of a two-phase `constructor + init()` pattern, TENT uses configuration objects that fully describe the engine state at construction time.
-
-3. **Internal Metadata Management**: TENT does not expose metadata internals (`TransferMetadata`, `Topology`). Segment discovery is handled by the control plane (P2P or central), and the cache is managed automatically.
-
-4. **Consistent Error Model**: All TENT APIs return `Status` objects, eliminating the mixed `int` / `Status` return types in TE.
-
-## API Mapping: TE to TENT
-
-For users migrating from Transfer Engine, the following table shows how TE APIs map to TENT APIs. TENT provides a backward-compatible shim (`MC_USE_TENT=1`) that allows existing TE code to run on the TENT runtime.
-
-| Transfer Engine API | TENT API | Notes |
-|---------------------|----------|-------|
-| **Initialization** |||
-| `TransferEngine(auto_discover)` | `TransferEngine()` | TENT ignores `auto_discover`; discovery is always automatic |
-| `init(conn_string, server_name, ip, port)` | Constructor with `Config` | Config sets `metadata_type`, `metadata_servers`, `local_segment_name` |
-| `freeEngine()` | Destructor | Resources released automatically on destruction |
-| **Transport** |||
-| `installTransport(proto, args)` | *Not available* | Transport selection is internal to TENT |
-| `uninstallTransport(proto)` | *Not available* | — |
-| `getTransport(proto)` | *Not available* | — |
-| **Memory** |||
-| `registerLocalMemory(addr, len, location, remote_accessible, update_metadata)` | `registerLocalMemory(addr, size, MemoryOptions)` | `MemoryOptions.location` replaces `location`; `MemoryOptions.perm` replaces `remote_accessible` |
-| `unregisterLocalMemory(addr, update_metadata)` | `unregisterLocalMemory(addr)` | Metadata update is internal |
-| `registerLocalMemoryBatch(buffer_list, location)` | `registerLocalMemory(addr_list, size_list, MemoryOptions)` | Batch API uses vectors instead of `BufferEntry` |
-| `unregisterLocalMemoryBatch(addr_list)` | `unregisterLocalMemory(addr_list)` | — |
-| *Not available* | `allocateLocalMemory(addr, size, location)` | TENT-only: allocates and registers in one call |
-| *Not available* | `freeLocalMemory(addr)` | TENT-only: frees allocated memory |
-| **Segment** |||
-| `openSegment(segment_name)` → returns handle | `openSegment(handle, segment_name)` → via output param | Return style differs; `Status` indicates success/failure |
-| `closeSegment(handle)` | `closeSegment(handle)` | Same semantics |
-| `removeLocalSegment(segment_name)` | *Not available* | Segment lifecycle managed internally |
-| `CheckSegmentStatus(sid)` | *Not available* | Status checking is internal |
-| `syncSegmentCache(segment_name)` | *Not available* | Cache sync is automatic |
-| *Not available* | `exportLocalSegment(shared_handle)` | Declared in TENT API but currently not implemented |
-| *Not available* | `importRemoteSegment(handle, shared_handle)` | Declared in TENT API but currently not implemented |
-| `getSegmentInfo(handle, info)` | `getSegmentInfo(handle, info)` | Same semantics |
-| **Batch & Transfer** |||
-| `allocateBatchID(batch_size)` | `allocateBatch(batch_size)` | Renamed |
-| `freeBatchID(batch_id)` | `freeBatch(batch_id)` | Renamed |
-| `submitTransfer(batch_id, entries)` | `submitTransfer(batch_id, request_list)` | `TransferRequest` → `Request` |
-| `submitTransferWithNotify(batch_id, entries, notify_msg)` | `submitTransfer(batch_id, request_list, notifi)` | Unified API with optional notification |
-| `getTransferStatus(batch_id, task_id, status)` | `getTransferStatus(batch_id, task_id, status)` | Same |
-| `getBatchTransferStatus(batch_id, status)` | `getTransferStatus(batch_id, status)` | Overloaded; single `TransferStatus` output = overall status |
-| *Not available* | `getTransferStatus(batch_id, status_list)` | TENT-only: get all task statuses at once |
-| **Notification** |||
-| `sendNotifyByID(target_id, notify_msg)` | `sendNotification(target_id, notifi)` | Renamed; uses `Notification` struct |
-| `sendNotifyByName(remote_agent, notify_msg)` | `openSegment()` + `sendNotification()` | TENT requires explicit segment handle |
-| `getNotifies(notifies)` | `receiveNotification(notifi_list)` | Renamed; uses `Notification` struct |
-| **Introspection** |||
-| `getLocalIpAndPort()` | `getRpcServerAddress()` + `getRpcServerPort()` | Split into two methods |
-| `getRpcPort()` | `getRpcServerPort()` | Same |
-| `getMetadata()` | *Not available* | Metadata internals not exposed |
-| `getLocalTopology()` | *Not available* | Topology internals not exposed |
-| `checkOverlap(addr, length)` | *Not available* | — |
-| `setAutoDiscover(auto_discover)` | *Not available* | Always enabled (ignored under `MC_USE_TENT`) |
-| `setWhitelistFilters(filters)` | *Not available* | Configure via `Config` |
-| `numContexts()` | *Not available* | — |
-| *Not available* | `available()` | TENT-only: check if engine initialized successfully |
-| *Not available* | `getSegmentName()` | TENT-only: get local segment name |
-
-### Using the Backward-Compatible Shim
-
-Existing Transfer Engine code can run on TENT by setting the environment variable:
-
-```bash
-export MC_USE_TENT=1
-```
-
-When this variable is set, the `mooncake::TransferEngine` class internally delegates to `mooncake::tent::TransferEngine`. Most TE APIs are translated automatically. APIs that have no TENT equivalent (e.g., `installTransport`, `getMetadata`) become no-ops or return placeholder values.
 
 ## Core APIs
 
@@ -244,12 +155,18 @@ Allocates a `BatchID` that can hold up to `batch_size` transfer requests.
 ```cpp
 Status submitTransfer(BatchID batch_id,
                       const std::vector<Request>& request_list);
+
+// With notification
+Status submitTransfer(BatchID batch_id,
+                      const std::vector<Request>& request_list,
+                      const Notification& notifi);
 ```
 
 Submits transfer requests to the specified batch. Requests are executed asynchronously.
 
 - `batch_id`: The batch to submit requests to.
 - `request_list`: Vector of `Request` objects.
+- `notifi`: Optional notification to send upon completion.
 - Return value: `Status::OK()` on success; otherwise a non-OK status.
 
 #### TransferEngine::getTransferStatus
@@ -330,6 +247,11 @@ Status registerLocalMemory(std::vector<void*> addr_list,
 
 // Advanced version with MemoryOptions
 Status registerLocalMemory(void* addr, size_t size, MemoryOptions& options);
+
+// Batch registration with MemoryOptions
+Status registerLocalMemory(std::vector<void*> addr_list,
+                           std::vector<size_t> size_list,
+                           MemoryOptions& options);
 ```
 
 Registers externally allocated memory for use in transfers.
@@ -431,19 +353,6 @@ Imports a remote segment from a shared handle string.
 ### Notifications
 
 TENT supports lightweight notifications to coordinate data movement between nodes.
-
-#### TransferEngine::submitTransfer (with notification)
-
-```cpp
-Status submitTransfer(BatchID batch_id,
-                      const std::vector<Request>& request_list,
-                      const Notification& notifi);
-```
-
-Submits transfers and sends a notification upon completion.
-
-- `notifi`: A `{name, msg}` payload delivered to the receiver when the transfer completes.
-- Typical use: Signal that transferred data is ready for consumption.
 
 #### TransferEngine::sendNotification
 
@@ -599,3 +508,11 @@ static Status InvalidArgument(std::string_view msg);
 static Status InternalError(std::string_view msg);
 // ... and more
 ```
+
+## See Also
+
+- [Quick Start Guide](../getting-started/quick-start.md) - Getting started with TENT
+- [Migration Guide](../getting-started/migration.md) - Migrating from classic Transfer Engine
+- [C API Reference](c-api.md) - C API documentation
+- [Python API Reference](python-api.md) - Python API documentation
+- [Configuration Reference](../configuration/configuration.md) - Configuration options
