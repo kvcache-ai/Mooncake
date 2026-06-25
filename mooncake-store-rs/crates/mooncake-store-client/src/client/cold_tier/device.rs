@@ -70,6 +70,8 @@ impl StorageOwnerState {
         let offload_mode = cold_tier.offload_mode;
         let offload_priority = cold_tier.offload_priority;
         let staging_pool_bytes = cold_tier.rate_limits.staging_pool_bytes;
+        let staging_slot_ttl =
+            std::time::Duration::from_millis(cold_tier.rate_limits.staging_slot_ttl_ms.max(1));
         let restore_max_distinct_flights = cold_tier.rate_limits.restore_max_distinct_flights;
         Self {
             runtime,
@@ -93,6 +95,7 @@ impl StorageOwnerState {
             staging_pool: parking_lot::Mutex::new(None),
             pending_staging_slots: parking_lot::Mutex::new(std::collections::HashMap::new()),
             staging_pool_bytes,
+            staging_slot_ttl,
         }
     }
 

@@ -349,6 +349,8 @@ pub struct ColdTierRateLimitConfig {
     /// passthrough.  Variable-length allocations are carved from this region.
     /// Default: 256 MiB.  Override with `MC_STORE_RS_STAGING_POOL_BYTES`.
     pub staging_pool_bytes: usize,
+    /// Maximum age before an unacked staging slot can be force-unpinned.
+    pub staging_slot_ttl_ms: u64,
 }
 
 impl Default for ColdTierRateLimitConfig {
@@ -377,6 +379,7 @@ impl Default for ColdTierRateLimitConfig {
             pressure_offload_boost: 4,
             pressure_stall_timeout_ms: 200,
             staging_pool_bytes: 256 * 1024 * 1024,
+            staging_slot_ttl_ms: 30_000,
         }
     }
 }
@@ -409,6 +412,11 @@ impl ColdTierRateLimitConfig {
 
     pub fn foreground_offload_kick_batch(mut self, limit: usize) -> Self {
         self.foreground_offload_kick_batch = limit.max(1);
+        self
+    }
+
+    pub fn staging_slot_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.staging_slot_ttl_ms = ttl_ms.max(1);
         self
     }
 }

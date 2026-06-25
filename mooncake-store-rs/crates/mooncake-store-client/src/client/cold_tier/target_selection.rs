@@ -1,4 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+};
 
 use mooncake_store_core::ClientRuntimeId;
 
@@ -49,10 +55,10 @@ pub(in super::super) fn select_cold_backing_target(
 ///   2. `batch_ios`         — how many IOs this batch has routed to each target
 ///   3. `GLOBAL_ACCUM_IOS`  — cumulative per-target IO count across all batches
 ///
-/// Lock-free on the hot path: `batch_ios` is a small Vec with borrowed lookup,
-/// `GLOBAL_ACCUM_IOS` uses `RwLock` + `AtomicU64` (shared read lock + atomic
-/// increment), and `inflight_snapshot` is taken once at construction via
-/// `try_lock`.  Zero exclusive locks and zero clones in `select_target`.
+/// No exclusive locks on the hot path: `batch_ios` is a small Vec with borrowed lookup,
+/// `GLOBAL_ACCUM_IOS` uses `RwLock<HashMap>` + `AtomicU64` (shared read lock +
+/// atomic increment), and `inflight_snapshot` is taken once at construction via
+/// `try_lock`.  `select_target` avoids exclusive locks on the common path.
 pub(in super::super) struct ColdTierTargetSelector {
     /// Per-target IO count within this batch.  Vec with linear scan — device
     /// count is tens at most, and contiguous memory beats HashMap key
@@ -79,60 +85,54 @@ pub(in super::super) struct ColdTierTargetResult {
 // ---------------------------------------------------------------------------
 // Global per-(owner, device) cumulative IO counter.
 //
-// RwLock<Vec<Entry>> with AtomicU64 counts:
-//   - Reads:  RwLock::read() (shared) + linear scan + AtomicU64::load(Relaxed)
+// HashMap with AtomicU64 counts:
+//   - Reads:  RwLock::read() (shared) + O(1) lookup + AtomicU64::load(Relaxed)
 //   - Writes: common path is read() + fetch_add (entry exists); only the first
-//     occurrence of a new (owner, device) pair takes write() to append.
+//     occurrence of a new (owner, device) pair takes write() to insert.
+//
+// The map is bounded to avoid stale runtime/device pairs accumulating forever
+// across restarts. When the bound is hit, counters reset; this only affects
+// long-term tie-breaking fairness, not correctness.
 // ---------------------------------------------------------------------------
 
-struct GlobalAccumEntry {
-    owner: ClientRuntimeId,
-    device_id: String,
-    count: AtomicU64,
+const GLOBAL_ACCUM_MAX_ENTRIES: usize = 4096;
+type GlobalAccumKey = (ClientRuntimeId, String);
+type GlobalAccumMap = HashMap<GlobalAccumKey, AtomicU64>;
+
+static GLOBAL_ACCUM_IOS: OnceLock<parking_lot::RwLock<GlobalAccumMap>> = OnceLock::new();
+
+fn global_accum_ios() -> &'static parking_lot::RwLock<GlobalAccumMap> {
+    GLOBAL_ACCUM_IOS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
 }
 
-static GLOBAL_ACCUM_IOS: parking_lot::RwLock<Vec<GlobalAccumEntry>> =
-    parking_lot::RwLock::new(Vec::new());
-
-fn global_accum_count(
-    entries: &[GlobalAccumEntry],
-    owner: &ClientRuntimeId,
-    device_id: &str,
-) -> u64 {
+fn global_accum_count(entries: &GlobalAccumMap, owner: &ClientRuntimeId, device_id: &str) -> u64 {
     entries
-        .iter()
-        .find(|e| &e.owner == owner && e.device_id == device_id)
-        .map(|e| e.count.load(Ordering::Relaxed))
+        .get(&(owner.clone(), device_id.to_string()))
+        .map(|count| count.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
 
-/// Increment global accum for (owner, device).  Fast path (read lock +
-/// fetch_add) when the entry exists; slow path (write lock + push) only for
+/// Increment global accum for (owner, device). Fast path (read lock +
+/// fetch_add) when the entry exists; slow path (write lock + insert) only for
 /// the first occurrence of each (owner, device) pair.
 fn increment_global_accum(owner: &ClientRuntimeId, device_id: &str) {
+    let key = (owner.clone(), device_id.to_string());
     {
-        let entries = GLOBAL_ACCUM_IOS.read();
-        if let Some(entry) = entries
-            .iter()
-            .find(|e| &e.owner == owner && e.device_id == device_id)
-        {
-            entry.count.fetch_add(1, Ordering::Relaxed);
+        let entries = global_accum_ios().read();
+        if let Some(count) = entries.get(&key) {
+            count.fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
-    let mut entries = GLOBAL_ACCUM_IOS.write();
-    if let Some(entry) = entries
-        .iter()
-        .find(|e| &e.owner == owner && e.device_id == device_id)
-    {
-        entry.count.fetch_add(1, Ordering::Relaxed);
+    let mut entries = global_accum_ios().write();
+    if let Some(count) = entries.get(&key) {
+        count.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    entries.push(GlobalAccumEntry {
-        owner: owner.clone(),
-        device_id: device_id.to_string(),
-        count: AtomicU64::new(1),
-    });
+    if entries.len() >= GLOBAL_ACCUM_MAX_ENTRIES {
+        entries.clear();
+    }
+    entries.insert(key, AtomicU64::new(1));
 }
 
 impl ColdTierTargetSelector {
@@ -194,8 +194,7 @@ impl ColdTierTargetSelector {
     /// tiebreaking for real-time load, intra-batch balance, and long-term
     /// fairness.
     ///
-    /// Hot path: zero exclusive locks, zero clones (only the final result
-    /// construction clones the winner).
+    /// Hot path: zero exclusive locks; only lookup keys and the final result are cloned.
     pub fn select_target(
         &mut self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
@@ -210,7 +209,7 @@ impl ColdTierTargetSelector {
         }
 
         // Shared read lock — never blocks other readers.
-        let global = GLOBAL_ACCUM_IOS.read();
+        let global = global_accum_ios().read();
 
         let selected_idx = targets
             .iter()
@@ -230,11 +229,9 @@ impl ColdTierTargetSelector {
         self.batch_increment(selected.owner, selected.cold_tier_id);
 
         // Update global accum (atomic under shared read lock — common path).
-        if let Some(entry) = global
-            .iter()
-            .find(|e| &e.owner == selected.owner && e.device_id == selected.cold_tier_id)
-        {
-            entry.count.fetch_add(1, Ordering::Relaxed);
+        let global_key = (selected.owner.clone(), selected.cold_tier_id.to_string());
+        if let Some(count) = global.get(&global_key) {
+            count.fetch_add(1, Ordering::Relaxed);
         } else {
             drop(global);
             increment_global_accum(selected.owner, selected.cold_tier_id);
