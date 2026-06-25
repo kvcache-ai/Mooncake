@@ -2894,9 +2894,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             if (it != tenant_state.metadata.end()) {
                 if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
                     if (enable_ha_ && oplog_store_) {
-                        auto err = PersistRemoveForHA(
-                            "PutStart(stale cleanup REMOVE)",
-                            object_id.tenant_id, key);
+                        auto err =
+                            PersistRemoveForHA("PutStart(stale cleanup REMOVE)",
+                                               object_id.tenant_id, key);
                         if (!err) {
                             return tl::make_unexpected(err.error());
                         }
@@ -2921,9 +2921,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     }
                     if (enable_ha_ && oplog_store_) {
-                        auto err = PersistRemoveForHA(
-                            "PutStart(stale cleanup REMOVE)",
-                            object_id.tenant_id, key);
+                        auto err =
+                            PersistRemoveForHA("PutStart(stale cleanup REMOVE)",
+                                               object_id.tenant_id, key);
                         if (!err) {
                             return tl::make_unexpected(err.error());
                         }
@@ -5742,8 +5742,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 source->dec_refcnt();
             }
 
-            auto replicas = PopReplicasWithCacheTotalAccounting(
-                metadata, target_pred);
+            auto replicas =
+                PopReplicasWithCacheTotalAccounting(metadata, target_pred);
             if (!replicas.empty()) {
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
