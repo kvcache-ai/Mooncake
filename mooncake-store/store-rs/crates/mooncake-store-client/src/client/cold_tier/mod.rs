@@ -5,6 +5,7 @@ mod eviction;
 mod helpers;
 mod metrics;
 mod offload;
+mod resolve;
 mod restore;
 mod scheduler;
 mod shutdown;
@@ -68,6 +69,7 @@ pub(super) use offload::{
     prepare_pending_offload_entry, publish_initial_write_cold_backing,
     publish_pending_cold_backing_for_eviction,
 };
+pub(super) use resolve::resolved_uses_cold_backing;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use restore::restore_payload_from_cold_backing;

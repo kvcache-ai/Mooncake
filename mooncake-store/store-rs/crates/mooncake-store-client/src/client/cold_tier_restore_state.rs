@@ -114,6 +114,7 @@ impl RestorePromotionQueue {
     fn new(limit: usize, batch_limit: usize, max_in_flight: usize) -> Self {
         Self {
             state: Mutex::new(RestorePromotionQueueState::default()),
+            idle: parking_lot::Condvar::new(),
             limit: limit.max(1),
             batch_limit: batch_limit.max(1),
             max_in_flight: max_in_flight.max(1),
@@ -188,7 +189,11 @@ impl RestorePromotionQueue {
     }
 
     fn complete(&self, key: &RestorePromotionKey) {
-        self.state.lock().in_flight.remove(key);
+        let mut state = self.state.lock();
+        state.in_flight.remove(key);
+        if state.in_flight.is_empty() && !state.worker_active {
+            self.idle.notify_all();
+        }
     }
 
     fn abort_worker_batch(&self, tasks: Vec<RestorePromotionTask>) {
@@ -201,10 +206,15 @@ impl RestorePromotionQueue {
             }
         }
         state.worker_active = false;
+        self.idle.notify_all();
     }
 
     fn finish_worker(&self) {
-        self.state.lock().worker_active = false;
+        let mut state = self.state.lock();
+        state.worker_active = false;
+        if state.in_flight.is_empty() {
+            self.idle.notify_all();
+        }
     }
 
     fn shutdown(&self) {
@@ -217,6 +227,7 @@ impl RestorePromotionQueue {
             state.entries.clear();
             state.keys.clear();
         }
+        self.idle.notify_all();
         // Wait for in-flight tasks to complete, with a timeout to avoid hanging
         // if the worker is stuck in a transport write or metadata operation.
         self.wait_for_worker_idle_bounded(Duration::from_secs(5));
@@ -228,22 +239,24 @@ impl RestorePromotionQueue {
 
     fn wait_for_worker_idle_bounded(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        loop {
-            let idle = {
-                let state = self.state.lock();
-                !state.worker_active && state.in_flight.is_empty()
-            };
-            if idle {
-                return;
-            }
-            if Instant::now() >= deadline {
+        let mut state = self.state.lock();
+        while state.worker_active || !state.in_flight.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 tracing::warn!(
                     timeout_ms = timeout.as_millis() as u64,
                     "restore promotion queue shutdown timed out waiting for worker idle"
                 );
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let result = self.idle.wait_for(&mut state, remaining);
+            if result.timed_out() && (state.worker_active || !state.in_flight.is_empty()) {
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "restore promotion queue shutdown timed out waiting for worker idle"
+                );
+                return;
+            }
         }
     }
 }

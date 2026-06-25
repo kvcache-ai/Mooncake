@@ -1900,7 +1900,7 @@ fn process_device_group(
         let needed = entry.cold_backing.length as usize;
         let slot = staging_pool.try_allocate(needed).or_else(|| {
             let reclaimed =
-                storage_owner.sweep_expired_staging_slots(std::time::Duration::from_secs(30));
+                storage_owner.sweep_expired_staging_slots(storage_owner.staging_slot_ttl);
             if reclaimed > 0 {
                 if let Some(slot) = staging_pool.try_allocate(needed) {
                     return Some(slot);

@@ -1,4 +1,4 @@
-const MAX_TENANT_LOCAL_EVICTION_ATTEMPTS: usize = 8;
+const TENANT_LOCAL_EVICTION_CANDIDATE_BATCH_SIZE: usize = 32;
 const PARALLEL_CHECKSUM_MIN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARALLEL_CHECKSUM_WORKERS: usize = 16;
 
@@ -153,8 +153,10 @@ impl StoreClient {
             created_at_ms,
             writer_runtime: self.lease.runtime.clone(),
         };
-        let mut eviction_candidates = None;
-        for _ in 0..MAX_TENANT_LOCAL_EVICTION_ATTEMPTS {
+        let mut eviction_candidates = VecDeque::new();
+        let mut attempted_victims = BTreeSet::new();
+        let max_evictions = self.tenant_local_eviction_budget(&request)?;
+        for _ in 0..max_evictions {
             let reserve_result = self.metadata.reserve_tenant_quota(&request);
             registry::record_tenant_quota_reservation(match &reserve_result {
                 Ok(_) => "ok",
@@ -171,6 +173,7 @@ impl StoreClient {
                         object_id,
                         scoped_key,
                         &mut eviction_candidates,
+                        &mut attempted_victims,
                     )? {
                         registry::record_tenant_local_eviction("miss");
                         return Err(StoreError::QuotaExceeded { kind, message });
@@ -192,6 +195,7 @@ impl StoreClient {
                         object_id,
                         scoped_key,
                         &mut eviction_candidates,
+                        &mut attempted_victims,
                     )? {
                         registry::record_tenant_local_eviction("miss");
                         return Err(StoreError::Conflict(message));
@@ -211,46 +215,69 @@ impl StoreClient {
         )))
     }
 
+    fn tenant_local_eviction_budget(
+        &self,
+        request: &TenantQuotaReservationRequest,
+    ) -> Result<usize> {
+        let state = self.metadata.get_tenant_quota_state(&request.scope)?;
+        let active_objects = state
+            .map(|state| {
+                state
+                    .used_objects
+                    .saturating_add(state.pending_reserved_objects)
+                    .saturating_add(request.delta_objects.max(0) as u64)
+            })
+            .unwrap_or_else(|| request.delta_objects.max(0) as u64);
+        Ok(active_objects.max(1).min(usize::MAX as u64) as usize)
+    }
+
     fn try_evict_one_object_in_tenant(
         &self,
         object_id: &LogicalObjectId,
         scoped_key: &ObjectKey,
-        eviction_candidates: &mut Option<VecDeque<LogicalObjectId>>,
+        eviction_candidates: &mut VecDeque<LogicalObjectId>,
+        attempted_victims: &mut BTreeSet<ObjectKey>,
     ) -> Result<bool> {
-        if eviction_candidates.is_none() {
-            let scope = self.tenant_quota_scope(object_id);
-            let candidates = self
-                .metadata
-                .list_tenant_eviction_candidates(&scope, MAX_TENANT_LOCAL_EVICTION_ATTEMPTS)?
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.key != *scoped_key
-                        && candidate.state == TenantObjectAccountingState::Active
-                })
-                .filter_map(|candidate| {
-                    mooncake_store_core::parse_legacy_scoped_key(&candidate.key)
-                        .ok()
-                        .filter(|victim| victim.scope.tenant == object_id.scope.tenant)
-                })
-                .collect();
-            *eviction_candidates = Some(candidates);
-        }
-        let Some(candidates) = eviction_candidates.as_mut() else {
-            return Ok(false);
-        };
-        while let Some(victim) = candidates.pop_front() {
-            if self
-                .remove_in_tenant(
-                    victim.scope.tenant.as_str(),
-                    victim.logical_key.as_str(),
-                    true,
-                )
-                .is_ok()
-            {
-                return Ok(true);
+        loop {
+            if eviction_candidates.is_empty() {
+                let scope = self.tenant_quota_scope(object_id);
+                let candidates = self
+                    .metadata
+                    .list_tenant_eviction_candidates(
+                        &scope,
+                        TENANT_LOCAL_EVICTION_CANDIDATE_BATCH_SIZE,
+                    )?
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.key != *scoped_key
+                            && candidate.state == TenantObjectAccountingState::Active
+                            && !attempted_victims.contains(&candidate.key)
+                    })
+                    .filter_map(|candidate| {
+                        mooncake_store_core::parse_legacy_scoped_key(&candidate.key)
+                            .ok()
+                            .filter(|victim| victim.scope.tenant == object_id.scope.tenant)
+                    })
+                    .collect::<VecDeque<_>>();
+                if candidates.is_empty() {
+                    return Ok(false);
+                }
+                *eviction_candidates = candidates;
+            }
+            while let Some(victim) = eviction_candidates.pop_front() {
+                attempted_victims.insert(ObjectKey::from_logical_id(&victim));
+                if self
+                    .remove_in_tenant(
+                        victim.scope.tenant.as_str(),
+                        victim.logical_key.as_str(),
+                        false,
+                    )
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
             }
         }
-        Ok(false)
     }
 
     fn reserve_tenant_quota_for_delete(
@@ -1902,16 +1929,10 @@ impl StoreClient {
             1 => Some(remote_readable[0].clone()),
             n => {
                 remote_readable.sort_by_key(|r| r.priority);
-                let hash = replica_balance_hash(&local_runtime.stable_id.0) as usize;
+                let hash = replica_balance_hash(&local_runtime.stable_id.0, &route.key.0) as usize;
                 Some(remote_readable[hash % n].clone())
             }
         }
-    }
-
-    fn resolved_uses_cold_backing(entry: &ResolvedObject) -> bool {
-        cold_tier::materialized_cold_backing(&entry.route).is_some()
-            && (entry.route.replicas.is_empty()
-                || entry.replica.segment_name.0 == "__cold_backing__")
     }
 
     fn replica_is_readable(
@@ -2424,66 +2445,12 @@ impl StoreClient {
                             ) {
                                 Some(replica) => (replica, refreshed_readable),
                                 None => {
-                                    let Some(cold_backing) = cold_tier::materialized_cold_backing(&route)
-                                    else {
-                                        return Err(StoreError::NotFound(format!(
-                                            "tenant={tenant} key={} has no readable replica owner",
-                                            object.key
-                                        )));
-                                    };
-                                    let mut cold_backing = cold_backing;
-                                    select_cold_backing_target(&mut cold_backing, |id| {
-                                        self.storage_owner.cold_tier_devices.has_local_backend(id)
-                                    });
-                                    // Fast-fail for unreachable remote cold targets:
-                                    // avoid gRPC timeout by checking device state and
-                                    // owner liveness before creating the placeholder.
-                                    if !self
-                                        .storage_owner
-                                        .cold_tier_devices
-                                        .has_local_backend(&cold_backing.cold_tier_id)
-                                    {
-                                        if self.storage_owner.cold_tier_devices.device_state(
-                                            &cold_backing.cold_tier_id,
-                                        ) == Some(mooncake_store_core::ColdTierDeviceState::Unregistered)
-                                        {
-                                            return Err(StoreError::NotFound(format!(
-                                                "tenant={tenant} key={}: cold tier device {} is unregistered (owner shut down)",
-                                                object.key, cold_backing.cold_tier_id
-                                            )));
-                                        }
-                                        if !readable_runtimes.contains(&cold_backing.owner) {
-                                            let refreshed_for_cold =
-                                                self.readable_runtime_set(true)?;
-                                            if !refreshed_for_cold.contains(&cold_backing.owner) {
-                                                // The exact runtime ID (stable_id + epoch) is gone —
-                                                // check if a newer incarnation of the same node is
-                                                // live.  After restart the epoch increments but the
-                                                // SSD devices (and their data) remain available.
-                                                let has_live_incarnation = self
-                                                    .metadata
-                                                    .get_live_runtime_by_stable_id(
-                                                        &cold_backing.owner.stable_id,
-                                                    )
-                                                    .ok()
-                                                    .flatten()
-                                                    .is_some();
-                                                if !has_live_incarnation {
-                                                    return Err(StoreError::NotFound(format!(
-                                                        "tenant={tenant} key={}: cold backing owner {} is not readable",
-                                                        object.key, cold_backing.owner
-                                                    )));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    return Ok(ResolvedObject {
-                                        tenant: tenant.to_string(),
-                                        key: object.key.to_string(),
+                                    return self.resolve_cold_backing_read(
                                         route,
-                                        replica: cold_backing_placeholder(&cold_backing),
-                                        fallback_replicas: VecDeque::new(),
-                                    });
+                                        &tenant,
+                                        object.key,
+                                        &readable_runtimes,
+                                    );
                                 }
                             }
                         }
@@ -2744,7 +2711,7 @@ impl StoreClient {
             let local_paths: Vec<bool> = resolved
                 .iter()
                 .map(|entry| {
-                    !Self::resolved_uses_cold_backing(entry)
+                    !cold_tier::resolved_uses_cold_backing(entry)
                         && entry.replica.owner == self.lease.runtime
                         && memory.has_storage_segment(&entry.replica.segment_name)
                 })
@@ -2907,7 +2874,7 @@ impl StoreClient {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                (Self::resolved_uses_cold_backing(entry)
+                (cold_tier::resolved_uses_cold_backing(entry)
                     && entry.route.cold_backing.as_ref().is_some_and(|cb| {
                         self.storage_owner
                             .cold_tier_devices
@@ -2951,7 +2918,7 @@ impl StoreClient {
             .filter(|&index| {
                 !local_paths[index]
                     && !cold_index_set.contains(&index)
-                    && !Self::resolved_uses_cold_backing(&resolved[index])
+                    && !cold_tier::resolved_uses_cold_backing(&resolved[index])
             })
             .collect();
         if !hot_remote_indices.is_empty() {
@@ -3037,7 +3004,7 @@ impl StoreClient {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                (Self::resolved_uses_cold_backing(entry)
+                (cold_tier::resolved_uses_cold_backing(entry)
                     && !entry.route.cold_backing.as_ref().is_some_and(|cb| {
                         self.storage_owner
                             .cold_tier_devices
@@ -5479,7 +5446,7 @@ impl StoreClient {
                             key = %resolved.key,
                             segment = %resolved.replica.segment_name.0,
                             owner = %resolved.replica.owner,
-                            is_cold_backed = Self::resolved_uses_cold_backing(resolved),
+                            is_cold_backed = cold_tier::resolved_uses_cold_backing(resolved),
                             error = %error,
                             "read_single_object_with_failover exhausted all retries"
                         );
@@ -5502,12 +5469,15 @@ impl StoreClient {
     }
 }
 
-fn replica_balance_hash(reader_id: &str) -> u64 {
-    let mut h = 0u64;
-    for b in reader_id.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(u64::from(b));
-    }
-    h
+fn replica_balance_hash(reader_id: &str, key: &str) -> u64 {
+    use xxhash_rust::xxh3::Xxh3Default;
+
+    let mut hasher = Xxh3Default::new();
+    hasher.update(&(reader_id.len() as u64).to_le_bytes());
+    hasher.update(reader_id.as_bytes());
+    hasher.update(&(key.len() as u64).to_le_bytes());
+    hasher.update(key.as_bytes());
+    hasher.digest()
 }
 
 #[cfg(test)]
