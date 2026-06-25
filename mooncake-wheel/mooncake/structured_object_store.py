@@ -120,6 +120,14 @@ class _TensorObjectBufferPayload:
 
 
 @dataclass(frozen=True)
+class _RawDestinationBuffer:
+    ptr: int
+    size: int
+    owner: Any
+    pre_registered: bool = False
+
+
+@dataclass(frozen=True)
 class StructuredMemberSlice:
     """Slice description for one structured member."""
 
@@ -179,6 +187,13 @@ class _NdarrayReadPlan:
     byte_length: int
     step: int
     cover_row_count: int
+
+
+@dataclass(frozen=True)
+class _DataProtoRowSelection:
+    count: int
+    member_slice: StructuredMemberSlice | None = None
+    indices: tuple[int, ...] | None = None
 
 
 DATAPROTO_REF_HANDLE_TYPE = "mooncake_dataproto_ref"
@@ -504,24 +519,20 @@ class MooncakeBundleTransfer:
         meta_info_keys: Optional[Sequence[str]] = None,
         data_cls: Optional[Any] = None,
         destinations: Optional[Mapping[str, Any]] = None,
-        rows: slice | StructuredMemberSlice | None = None,
+        rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
     ) -> Any:
         """Materialize selected DataProto fields from structured object refs."""
         ref = _resolve_dataproto_ref(ref)
-        row_slice = _coerce_dataproto_row_slice(rows, ref.batch_size)
-        output_rows = (
-            ref.batch_size
-            if row_slice is None
-            else _slice_length(row_slice, ref.batch_size)
-        )
+        row_selection = _coerce_dataproto_row_selection(rows, ref.batch_size)
+        row_slice = None if row_selection is None else row_selection.member_slice
+        row_indices = None if row_selection is None else row_selection.indices
+        output_rows = ref.batch_size if row_selection is None else row_selection.count
         batch_names, non_tensor_names = _resolve_dataproto_field_selection(
             ref, fields, batch_fields, non_tensor_fields
         )
         batch: dict[str, Any] = {}
         non_tensor_batch: dict[str, Any] = {}
         destination_map = destinations or {}
-        if row_slice is not None and destination_map:
-            raise ValueError("DataProto row slicing does not support destinations")
         requested = [
             *[("batch", name) for name in batch_names],
             *[("non_tensor_batch", name) for name in non_tensor_names],
@@ -545,19 +556,32 @@ class MooncakeBundleTransfer:
                 for name, location in entries
                 if name in destination_map
             }
-            spec = self.read_spec(stage_ref).select_members(members)
-            if row_slice is not None:
-                for member in members:
-                    spec = spec.slice_member(
-                        member,
-                        axis=row_slice.axis,
-                        start=row_slice.start,
-                        end=row_slice.end,
-                        step=row_slice.step,
-                    )
-            result = self.materialize_into(spec, stage_destinations)
+            if row_indices is None:
+                spec = self.read_spec(stage_ref).select_members(members)
+                if row_slice is not None:
+                    for member in members:
+                        spec = spec.slice_member(
+                            member,
+                            axis=row_slice.axis,
+                            start=row_slice.start,
+                            end=row_slice.end,
+                            step=row_slice.step,
+                        )
+                result = self.materialize_into(spec, stage_destinations)
+                for name, location in entries:
+                    value = result.objects[location.member]
+                    if location.section == "batch":
+                        batch[name] = value
+                    else:
+                        non_tensor_batch[name] = value
+                continue
             for name, location in entries:
-                value = result.objects[location.member]
+                value = self._read_dataproto_member_indices(
+                    stage_ref,
+                    location.member,
+                    row_indices,
+                    destination_map.get(name),
+                )
                 if location.section == "batch":
                     batch[name] = value
                 else:
@@ -565,7 +589,7 @@ class MooncakeBundleTransfer:
         for name, location in encoded_requests:
             stage_ref = ref.stage_refs[location.stage]
             encoded = ref.encoded_non_tensor[name]
-            if row_slice is None:
+            if row_selection is None:
                 members = list(encoded["payload_members"].values())
                 result = self.materialize(
                     self.read_spec(stage_ref).select_members(members)
@@ -576,6 +600,15 @@ class MooncakeBundleTransfer:
                 }
                 values = _decode_structured_leaf(
                     encoded["codec"], payload, ref.batch_size, encoded.get("metadata")
+                )
+            elif row_indices is not None:
+                payload, metadata = self._read_structured_non_tensor_payload_indices(
+                    stage_ref,
+                    encoded,
+                    row_indices,
+                )
+                values = _decode_structured_leaf(
+                    encoded["codec"], payload, output_rows, metadata
                 )
             else:
                 payload, metadata = self._read_structured_non_tensor_payload_slice(
@@ -594,6 +627,331 @@ class MooncakeBundleTransfer:
         return _build_dataproto_like_result(
             batch, non_tensor_batch, meta_info, data_cls
         )
+
+    def _read_dataproto_member_indices(
+        self,
+        stage_ref: RemoteBundleRef,
+        member: str,
+        indices: Sequence[int],
+        destination: Any,
+    ) -> Any:
+        manifest = self._bundle_store.resolve_manifest(stage_ref)
+        metadata = _decode_structured_metadata(
+            self._bundle_store.read_payload(manifest["meta"])
+        )
+        field_spec = _structured_field_specs(metadata).get(member, {"encoding": "bytes"})
+        payload_spec = manifest["buffers"][member]
+        encoding = field_spec.get("encoding", "bytes")
+        if encoding == "ndarray":
+            return self._read_ndarray_member_indices(
+                member, payload_spec, field_spec, indices, destination
+            )
+        if encoding == "torch_tensor":
+            return self._read_torch_tensor_member_indices(
+                member, payload_spec, field_spec, indices, destination
+            )
+        raise ValueError(f"structured member {member} does not support indexed rows")
+
+    def _read_ndarray_member_indices(
+        self,
+        name: str,
+        payload_spec: Mapping[str, Any],
+        field_spec: Mapping[str, Any],
+        indices: Sequence[int],
+        destination: Any,
+    ) -> np.ndarray:
+        dtype = field_spec.get("dtype")
+        shape = field_spec.get("shape")
+        if not isinstance(dtype, str) or not isinstance(shape, list):
+            raise ValueError(
+                f"structured ndarray field {name} is missing dtype or shape"
+            )
+        dtype_obj = np.dtype(dtype)
+        full_shape = tuple(int(dim) for dim in shape)
+        if not full_shape:
+            raise ValueError("structured ndarray indexed read requires at least one dimension")
+        output_shape = (len(indices), *full_shape[1:])
+        if isinstance(destination, _RawDestinationBuffer):
+            nbytes = int(np.prod(output_shape, dtype=np.int64)) * dtype_obj.itemsize
+            if destination.size < nbytes:
+                raise ValueError(
+                    f"raw destination has {destination.size} bytes, expected at least {nbytes}"
+                )
+            target = np.ctypeslib.as_array(
+                (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
+            ).view(dtype_obj).reshape(output_shape)
+            if not indices:
+                return target
+            row_width = dtype_obj.itemsize * int(np.prod(full_shape[1:], dtype=np.int64))
+            ranges = [
+                (row * row_width, out * row_width, row_width)
+                for out, row in enumerate(indices)
+            ]
+            if destination.pre_registered:
+                self._bundle_store.read_payload_ranges_into_raw_destination(
+                    payload_spec, destination.ptr, ranges
+                )
+            else:
+                data = bytearray(nbytes)
+                self._bundle_store.read_payload_ranges_into_bytearray(
+                    payload_spec, data, ranges
+                )
+                ctypes.memmove(destination.ptr, bytes(data), nbytes)
+            _ = destination.owner
+            return target
+        target = _resolve_ndarray_destination(name, destination, dtype_obj, output_shape)
+        if not indices:
+            return target
+        row_width = dtype_obj.itemsize * int(np.prod(full_shape[1:], dtype=np.int64))
+        self._bundle_store.read_payload_ranges_into_array(
+            payload_spec,
+            target.view(np.uint8).reshape(-1),
+            [
+                (row * row_width, out * row_width, row_width)
+                for out, row in enumerate(indices)
+            ],
+        )
+        return target
+
+    def _read_torch_tensor_member_indices(
+        self,
+        name: str,
+        payload_spec: Mapping[str, Any],
+        field_spec: Mapping[str, Any],
+        indices: Sequence[int],
+        destination: Any,
+    ) -> Any:
+        metadata_bytes = int(payload_spec.get("metadata_bytes", -1))
+        shape = field_spec.get("shape")
+        element_size = int(field_spec.get("element_size", 0))
+        if metadata_bytes < 0 or not isinstance(shape, list) or element_size <= 0:
+            raise ValueError(
+                f"structured tensor field {name} is missing slice metadata"
+            )
+        if not shape:
+            raise ValueError("structured tensor indexed read requires at least one dimension")
+        row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
+        data_length = len(indices) * row_width
+        metadata = self._bundle_store.read_payload_range(payload_spec, 0, metadata_bytes)
+        sliced_metadata = _slice_tensor_metadata(
+            metadata, (len(indices), *shape[1:]), data_length
+        )
+        if destination is not None:
+            if not isinstance(destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)):
+                raise ValueError(
+                    f"structured tensor member {name} only supports tensor_object_buffer or raw_destination destinations"
+                )
+            expected_bytes = metadata_bytes + data_length
+            if destination.size < expected_bytes:
+                raise ValueError(
+                    f"tensor destination has {destination.size} bytes, expected at least {expected_bytes}"
+                )
+            ctypes.memmove(destination.ptr, sliced_metadata, metadata_bytes)
+            if data_length:
+                ranges = [
+                    (
+                        metadata_bytes + row * row_width,
+                        metadata_bytes + out * row_width,
+                        row_width,
+                    )
+                    for out, row in enumerate(indices)
+                ]
+                if isinstance(destination, _RawDestinationBuffer) and destination.pre_registered:
+                    self._bundle_store.read_payload_ranges_into_raw_destination(
+                        payload_spec, destination.ptr, ranges
+                    )
+                else:
+                    data = bytearray(data_length)
+                    self._bundle_store.read_payload_ranges_into_bytearray(
+                        payload_spec,
+                        data,
+                        [
+                            (source_offset, destination_offset - metadata_bytes, size)
+                            for source_offset, destination_offset, size in ranges
+                        ],
+                    )
+                    ctypes.memmove(
+                        destination.ptr + metadata_bytes, bytes(data), data_length
+                    )
+            _ = destination.owner
+            return destination
+        data = bytearray(data_length)
+        if data_length:
+            self._bundle_store.read_payload_ranges_into_bytearray(
+                payload_spec,
+                data,
+                [(metadata_bytes + row * row_width, out * row_width, row_width) for out, row in enumerate(indices)],
+            )
+        return _deserialize_tensor_payload(sliced_metadata + data)
+
+    def _read_structured_non_tensor_payload_indices(
+        self,
+        stage_ref: RemoteBundleRef,
+        encoded: Mapping[str, Any],
+        indices: Sequence[int],
+    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+        codec = encoded["codec"]
+        payload_members = encoded["payload_members"]
+        manifest = self._bundle_store.resolve_manifest(stage_ref)
+        stage_metadata = _decode_structured_metadata(
+            self._bundle_store.read_payload(manifest["meta"])
+        )
+        field_specs = _structured_field_specs(stage_metadata)
+        metadata = dict(encoded.get("metadata") or {})
+
+        def member(payload_name: str) -> str:
+            return payload_members[payload_name]
+
+        def member_dtype(payload_name: str) -> np.dtype[Any]:
+            spec = field_specs.get(member(payload_name), {})
+            dtype = spec.get("dtype")
+            if not isinstance(dtype, str):
+                raise ValueError(
+                    f"structured non-tensor payload {member(payload_name)} is missing dtype"
+                )
+            return np.dtype(dtype)
+
+        def read_member_indices(payload_name: str, member_indices: Sequence[int]) -> Any:
+            return self._read_dataproto_member_indices(
+                stage_ref, member(payload_name), member_indices, None
+            )
+
+        def read_data_ranges(
+            payload_name: str,
+            ranges: Sequence[tuple[int, int, int]],
+            dtype: np.dtype[Any] | None = None,
+        ) -> Any:
+            total_bytes = sum(byte_length for _src, _dst, byte_length in ranges)
+            payload_spec = manifest["buffers"][member(payload_name)]
+            if dtype is None:
+                data = bytearray(total_bytes)
+                self._bundle_store.read_payload_ranges_into_bytearray(
+                    payload_spec, data, ranges
+                )
+                return bytes(data)
+            array = np.empty(total_bytes // dtype.itemsize, dtype=dtype)
+            self._bundle_store.read_payload_ranges_into_array(
+                payload_spec, array.view(np.uint8).reshape(-1), ranges
+            )
+            return array
+
+        if codec == "ndarray":
+            return {
+                "data": read_member_indices("data", indices),
+                "nulls": read_member_indices("nulls", indices),
+            }, metadata
+
+        if codec in {"ragged_tensor", "typed_ragged"}:
+            offsets = read_member_indices(
+                "offsets", [index for row in indices for index in (row, row + 1)]
+            )
+            begins = offsets[0::2]
+            ends = offsets[1::2]
+            item_counts = [int(end) - int(begin) for begin, end in zip(begins, ends)]
+            gathered_offsets = np.empty(len(indices) + 1, dtype=offsets.dtype)
+            gathered_offsets[0] = 0
+            for index, count in enumerate(item_counts):
+                gathered_offsets[index + 1] = int(gathered_offsets[index]) + count
+            dtype = member_dtype("data")
+            ranges = []
+            destination_item = 0
+            for begin, count in zip(begins, item_counts):
+                if count:
+                    ranges.append(
+                        (
+                            int(begin) * dtype.itemsize,
+                            destination_item * dtype.itemsize,
+                            count * dtype.itemsize,
+                        )
+                    )
+                destination_item += count
+            return {
+                "data": read_data_ranges("data", ranges, dtype),
+                "offsets": gathered_offsets,
+                "shapes": read_member_indices("shapes", indices),
+                "ndims": read_member_indices("ndims", indices),
+                "nulls": read_member_indices("nulls", indices),
+            }, metadata
+
+        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "json_ragged"}:
+            offsets = read_member_indices(
+                "offsets", [index for row in indices for index in (row, row + 1)]
+            )
+            begins = offsets[0::2]
+            ends = offsets[1::2]
+            byte_counts = [int(end) - int(begin) for begin, end in zip(begins, ends)]
+            gathered_offsets = np.empty(len(indices) + 1, dtype=offsets.dtype)
+            gathered_offsets[0] = 0
+            ranges = []
+            destination_offset = 0
+            for begin, count in zip(begins, byte_counts):
+                gathered_offsets[len(ranges) + 1] = destination_offset + count
+                if count:
+                    ranges.append((int(begin), destination_offset, count))
+                destination_offset += count
+            if "media_encodings" in metadata:
+                metadata["media_encodings"] = [
+                    metadata["media_encodings"][index] for index in indices
+                ]
+            return {
+                "data": read_data_ranges("data", ranges),
+                "offsets": gathered_offsets,
+                "nulls": read_member_indices("nulls", indices),
+            }, metadata
+
+        if codec == "media_list_ragged":
+            row_offsets = read_member_indices(
+                "row_offsets", [index for row in indices for index in (row, row + 1)]
+            )
+            item_begins = row_offsets[0::2]
+            item_ends = row_offsets[1::2]
+            item_counts = [
+                int(end) - int(begin) for begin, end in zip(item_begins, item_ends)
+            ]
+            gathered_row_offsets = np.empty(len(indices) + 1, dtype=row_offsets.dtype)
+            gathered_row_offsets[0] = 0
+            for index, count in enumerate(item_counts):
+                gathered_row_offsets[index + 1] = int(gathered_row_offsets[index]) + count
+            boundary_indices = [
+                boundary
+                for begin, end in zip(item_begins, item_ends)
+                for boundary in range(int(begin), int(end) + 1)
+            ]
+            byte_offsets = read_member_indices("byte_offsets", boundary_indices)
+            ranges = []
+            gathered_byte_offsets = np.empty(
+                int(gathered_row_offsets[-1]) + 1, dtype=byte_offsets.dtype
+            )
+            gathered_byte_offsets[0] = 0
+            destination_offset = 0
+            source_index = 0
+            destination_boundary = 1
+            media_encodings = []
+            for begin, count in zip(item_begins, item_counts):
+                for item in range(count):
+                    byte_begin = int(byte_offsets[source_index + item])
+                    byte_end = int(byte_offsets[source_index + item + 1])
+                    byte_count = byte_end - byte_begin
+                    if byte_count:
+                        ranges.append((byte_begin, destination_offset, byte_count))
+                    destination_offset += byte_count
+                    gathered_byte_offsets[destination_boundary] = destination_offset
+                    destination_boundary += 1
+                if "media_encodings" in metadata:
+                    media_encodings.extend(
+                        metadata["media_encodings"][int(begin) : int(begin) + count]
+                    )
+                source_index += count + 1
+            if "media_encodings" in metadata:
+                metadata["media_encodings"] = media_encodings
+            return {
+                "data": read_data_ranges("data", ranges),
+                "row_offsets": gathered_row_offsets,
+                "byte_offsets": gathered_byte_offsets,
+                "nulls": read_member_indices("nulls", indices),
+            }, metadata
+
+        raise ValueError(f"unknown structured non-tensor codec: {codec}")
 
     def _read_structured_non_tensor_payload_slice(
         self,
@@ -1045,22 +1403,41 @@ def _validate_dataproto_fields_exist(
         raise KeyError(f"unknown DataProto fields: {missing}")
 
 
-def _coerce_dataproto_row_slice(
-    rows: slice | StructuredMemberSlice | None, total_rows: int
-) -> StructuredMemberSlice | None:
+def _coerce_dataproto_row_selection(
+    rows: slice | StructuredMemberSlice | Sequence[int] | None, total_rows: int
+) -> _DataProtoRowSelection | None:
     if rows is None:
         return None
     if isinstance(rows, StructuredMemberSlice):
         if rows.axis != 0:
             raise ValueError("DataProto row slicing currently supports axis=0 only")
         _normalized_member_slice(rows, total_rows)
-        return rows
+        return _DataProtoRowSelection(
+            count=_slice_length(rows, total_rows), member_slice=rows
+        )
     if isinstance(rows, slice):
         start, end, step = rows.indices(total_rows)
         if step <= 0:
             raise ValueError("DataProto row slicing step must be positive")
-        return StructuredMemberSlice(axis=0, start=start, end=end, step=step)
-    raise TypeError("DataProto rows must be a slice or StructuredMemberSlice")
+        member_slice = StructuredMemberSlice(axis=0, start=start, end=end, step=step)
+        return _DataProtoRowSelection(
+            count=_slice_length(member_slice, total_rows), member_slice=member_slice
+        )
+    if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes, bytearray)):
+        indices = tuple(_normalize_dataproto_row_index(index, total_rows) for index in rows)
+        return _DataProtoRowSelection(count=len(indices), indices=indices)
+    raise TypeError("DataProto rows must be a slice, StructuredMemberSlice, or row index sequence")
+
+
+def _normalize_dataproto_row_index(index: Any, total_rows: int) -> int:
+    if not isinstance(index, (int, np.integer)):
+        raise TypeError("DataProto row indices must be integers")
+    normalized = int(index)
+    if normalized < 0:
+        normalized += total_rows
+    if normalized < 0 or normalized >= total_rows:
+        raise IndexError(f"DataProto row index {index} out of range for {total_rows} rows")
+    return normalized
 
 
 def _slice_length(member_slice: StructuredMemberSlice, total_rows: int) -> int:
@@ -1591,17 +1968,13 @@ class _StructuredObjectLayer:
         destination: Any,
     ) -> Any:
         if member_slice is not None:
-            if destination is not None:
-                raise ValueError(
-                    f"structured tensor member {name} does not support sliced materialize_into"
-                )
             return self._read_sliced_torch_tensor_member(
-                name, payload_spec, field_spec, member_slice
+                name, payload_spec, field_spec, member_slice, destination
             )
         if destination is not None:
-            if not isinstance(destination, _TensorObjectBufferPayload):
+            if not isinstance(destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)):
                 raise ValueError(
-                    f"structured tensor member {name} only supports tensor_object_buffer destinations"
+                    f"structured tensor member {name} only supports tensor_object_buffer or raw_destination destinations"
                 )
             materialized = self._bundle_store.read_tensor_payload_into(
                 payload_spec, destination
@@ -1623,6 +1996,7 @@ class _StructuredObjectLayer:
         payload_spec: Mapping[str, Any],
         field_spec: Mapping[str, Any],
         member_slice: StructuredMemberSlice,
+        destination: Any,
     ) -> Any:
         metadata_bytes = int(payload_spec.get("metadata_bytes", -1))
         shape = field_spec.get("shape")
@@ -1643,19 +2017,42 @@ class _StructuredObjectLayer:
         row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
         data_offset = metadata_bytes + start * row_width
         data_length = (end - start) * row_width
-        if payload_spec.get("kind") == "tensor":
-            tensor = self._bundle_store.read_tensor_payload(payload_spec)
-            return tensor[start:end]
         metadata = self._bundle_store.read_payload_range(
             payload_spec, 0, metadata_bytes
         )
+        sliced_metadata = _slice_tensor_metadata(
+            metadata, (end - start, *shape[1:]), data_length
+        )
+        if destination is not None:
+            if not isinstance(destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)):
+                raise ValueError(
+                    f"structured tensor member {name} only supports tensor_object_buffer or raw_destination destinations"
+                )
+            expected_bytes = metadata_bytes + data_length
+            if destination.size < expected_bytes:
+                raise ValueError(
+                    f"tensor destination has {destination.size} bytes, expected at least {expected_bytes}"
+                )
+            ctypes.memmove(destination.ptr, sliced_metadata, metadata_bytes)
+            if isinstance(destination, _RawDestinationBuffer) and destination.pre_registered:
+                self._bundle_store.read_payload_range_into_raw_destination(
+                    payload_spec,
+                    destination.ptr,
+                    metadata_bytes,
+                    data_offset,
+                    data_length,
+                )
+            else:
+                data = self._bundle_store.read_payload_range(
+                    payload_spec, data_offset, data_length
+                )
+                ctypes.memmove(destination.ptr + metadata_bytes, data, data_length)
+            _ = destination.owner
+            return destination
         data = self._bundle_store.read_payload_range(
             payload_spec, data_offset, data_length
         )
-        return _deserialize_tensor_payload(
-            _slice_tensor_metadata(metadata, (end - start, *shape[1:]), data_length)
-            + data
-        )
+        return _deserialize_tensor_payload(sliced_metadata + data)
 
     def _read_bytes_member(
         self,
@@ -1846,6 +2243,58 @@ class _BundleManifestStore:
             byte_offset,
             destination_pre_registered=destination_pre_registered,
         )
+
+    def read_payload_range_into_raw_destination(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination_ptr: int,
+        destination_offset: int,
+        byte_offset: int,
+        byte_length: int,
+    ) -> None:
+        if not self._transport.read_payload_range_into_raw_destination(
+            payload_spec, destination_ptr, destination_offset, byte_offset, byte_length
+        ):
+            data = self.read_payload_range(payload_spec, byte_offset, byte_length)
+            ctypes.memmove(destination_ptr + destination_offset, data, byte_length)
+
+    def read_payload_ranges_into_array(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination: np.ndarray,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> None:
+        if not ranges:
+            return
+        self._transport.read_payload_ranges_into_array(payload_spec, destination, ranges)
+
+    def read_payload_ranges_into_bytearray(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination: bytearray,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> None:
+        if not ranges:
+            return
+        self._transport.read_payload_ranges_into_bytearray(
+            payload_spec, destination, ranges
+        )
+
+    def read_payload_ranges_into_raw_destination(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination_ptr: int,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> None:
+        if not ranges:
+            return
+        if self._transport.read_payload_ranges_into_raw_destination(
+            payload_spec, destination_ptr, ranges
+        ):
+            return
+        for byte_offset, destination_offset, byte_length in ranges:
+            data = self.read_payload_range(payload_spec, byte_offset, byte_length)
+            ctypes.memmove(destination_ptr + destination_offset, data, byte_length)
 
     def _put_tensor_payload(
         self,
@@ -2164,6 +2613,63 @@ class _MooncakePayloadTransport:
                 chunks, destination, byte_offset, byte_length
             )
 
+    def read_payload_range_into_raw_destination(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination_ptr: int,
+        destination_offset: int,
+        byte_offset: int,
+        byte_length: int,
+    ) -> bool:
+        if byte_length == 0:
+            return True
+        return self._read_payload_range_into_raw_destination(
+            payload_spec["chunks"],
+            destination_ptr,
+            byte_offset,
+            byte_length,
+            allow_get_into=False,
+            destination_offset=destination_offset,
+        )
+
+    def read_payload_ranges_into_array(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination: np.ndarray,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> None:
+        if self._read_payload_ranges_into_registered_destination(
+            payload_spec["chunks"], destination, ranges
+        ):
+            return
+        self._copy_payload_ranges_into_destination(
+            payload_spec["chunks"], destination.view(np.uint8).reshape(-1), ranges
+        )
+
+    def read_payload_ranges_into_bytearray(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination: bytearray,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> None:
+        if self._read_payload_ranges_into_registered_destination(
+            payload_spec["chunks"], destination, ranges
+        ):
+            return
+        self._copy_payload_ranges_into_destination(
+            payload_spec["chunks"], destination, ranges
+        )
+
+    def read_payload_ranges_into_raw_destination(
+        self,
+        payload_spec: Mapping[str, Any],
+        destination_ptr: int,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> bool:
+        return self._read_payload_ranges_into_raw_destination(
+            payload_spec["chunks"], destination_ptr, ranges
+        )
+
     def put_tensor_object_buffer(
         self,
         key: str,
@@ -2393,6 +2899,70 @@ class _MooncakePayloadTransport:
                 chunks, base_ptr, byte_offset, byte_length
             )
 
+    def _read_payload_ranges_into_registered_destination(
+        self,
+        chunks: Sequence[Mapping[str, Any]],
+        destination: bytearray | np.ndarray,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> bool:
+        if not self._has_buffer_registration_support():
+            return False
+        with self._registered_buffer(destination, "structured ranged payload") as base_ptr:
+            return self._read_payload_ranges_into_raw_destination(
+                chunks, base_ptr, ranges
+            )
+
+    def _read_payload_ranges_into_raw_destination(
+        self,
+        chunks: Sequence[Mapping[str, Any]],
+        base_ptr: int,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> bool:
+        get_into_ranges = self._get_into_ranges
+        if not callable(get_into_ranges):
+            return False
+        fragments = []
+        for source_offset, destination_offset, byte_length in ranges:
+            fragments.extend(
+                _payload_range_fragments(chunks, source_offset, byte_length, destination_offset)
+            )
+        if not fragments:
+            return True
+        keys = [
+            key
+            for key, _chunk_size, _destination_offset, _source_offset, _size in fragments
+        ]
+        dst_offsets = [
+            [destination_offset]
+            for _key, _chunk_size, destination_offset, _source_offset, _size in fragments
+        ]
+        src_offsets = [
+            [source_offset]
+            for _key, _chunk_size, _destination_offset, source_offset, _size in fragments
+        ]
+        sizes = [
+            [size]
+            for _key, _chunk_size, _destination_offset, _source_offset, size in fragments
+        ]
+        results = get_into_ranges(
+            [base_ptr], [keys], [dst_offsets], [src_offsets], [sizes]
+        )
+        if len(results) != 1 or len(results[0]) != len(keys):
+            raise RuntimeError(
+                f"get_into_ranges returned invalid ranged result shape for {len(keys)} chunks"
+            )
+        for key, expected_sizes, actual_sizes in zip(keys, sizes, results[0]):
+            if len(actual_sizes) != len(expected_sizes):
+                raise RuntimeError(
+                    f"get_into_ranges returned invalid ranged fragment count for {key}"
+                )
+            for expected_size, actual_size in zip(expected_sizes, actual_sizes):
+                if actual_size != expected_size:
+                    raise RuntimeError(
+                        f"get_into_ranges failed for {key}: expected {expected_size}, got {actual_size}"
+                    )
+        return True
+
     def _read_payload_range_into_raw_destination(
         self,
         chunks: Sequence[Mapping[str, Any]],
@@ -2400,6 +2970,7 @@ class _MooncakePayloadTransport:
         byte_offset: int,
         byte_length: int,
         allow_get_into: bool = True,
+        destination_offset: int = 0,
     ) -> bool:
         get_into = self._get_into
         if (
@@ -2410,7 +2981,9 @@ class _MooncakePayloadTransport:
         ):
             expected_size = int(chunks[0]["bytes"])
             if expected_size == byte_length:
-                read_size = get_into(chunks[0]["key"], base_ptr, expected_size)
+                read_size = get_into(
+                    chunks[0]["key"], base_ptr + destination_offset, expected_size
+                )
                 if read_size != expected_size:
                     raise RuntimeError(
                         f"get_into failed for {chunks[0]['key']}: expected {expected_size}, got {read_size}"
@@ -2419,7 +2992,9 @@ class _MooncakePayloadTransport:
         get_into_ranges = self._get_into_ranges
         if not callable(get_into_ranges):
             return False
-        fragments = _payload_range_fragments(chunks, byte_offset, byte_length)
+        fragments = _payload_range_fragments(
+            chunks, byte_offset, byte_length, destination_offset
+        )
         if not fragments:
             return True
         keys = [
@@ -2427,8 +3002,8 @@ class _MooncakePayloadTransport:
             for key, _chunk_size, _destination_offset, _source_offset, _size in fragments
         ]
         dst_offsets = [
-            [destination_offset]
-            for _key, _chunk_size, destination_offset, _source_offset, _size in fragments
+            [fragment_destination_offset]
+            for _key, _chunk_size, fragment_destination_offset, _source_offset, _size in fragments
         ]
         src_offsets = [
             [source_offset]
@@ -2467,6 +3042,31 @@ class _MooncakePayloadTransport:
         data = bytearray(byte_length)
         self._copy_payload_range_into_bytearray(chunks, data, byte_offset, byte_length)
         destination[:byte_length] = np.frombuffer(data, dtype=np.uint8)
+
+    def _copy_payload_ranges_into_destination(
+        self,
+        chunks: Sequence[Mapping[str, Any]],
+        destination: bytearray | np.ndarray,
+        ranges: Sequence[tuple[int, int, int]],
+    ) -> None:
+        for source_offset, destination_offset, byte_length in ranges:
+            for (
+                key,
+                chunk_size,
+                fragment_destination_offset,
+                fragment_source_offset,
+                size,
+            ) in _payload_range_fragments(
+                chunks, source_offset, byte_length, destination_offset
+            ):
+                data = self._store.get(key)
+                if len(data) != chunk_size:
+                    raise RuntimeError(
+                        f"get failed for {key}: expected {chunk_size} bytes, got {len(data)}"
+                    )
+                destination[
+                    fragment_destination_offset : fragment_destination_offset + size
+                ] = data[fragment_source_offset : fragment_source_offset + size]
 
     def _copy_payload_range_into_bytearray(
         self,
@@ -2591,9 +3191,19 @@ def _resolve_ndarray_destination(
 ) -> np.ndarray:
     if destination is None:
         return np.empty(shape, dtype=dtype)
+    if isinstance(destination, _RawDestinationBuffer):
+        nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        if destination.size < nbytes:
+            raise ValueError(
+                f"raw destination has {destination.size} bytes, expected at least {nbytes}"
+            )
+        _ = destination.owner
+        return np.ctypeslib.as_array(
+            (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
+        ).view(dtype).reshape(shape)
     if not isinstance(destination, np.ndarray):
         raise TypeError(
-            f"structured ndarray field {name} destination must be a numpy.ndarray"
+            f"structured ndarray field {name} destination must be a numpy.ndarray or raw_destination"
         )
     if destination.dtype != dtype:
         raise ValueError(
@@ -2723,6 +3333,7 @@ def _payload_range_fragments(
     chunks: Sequence[Mapping[str, Any]],
     byte_offset: int,
     byte_length: int,
+    destination_offset: int = 0,
 ) -> list[tuple[str, int, int, int, int]]:
     fragments: list[tuple[str, int, int, int, int]] = []
     read_end = byte_offset + byte_length
@@ -2737,7 +3348,7 @@ def _payload_range_fragments(
                 (
                     chunk["key"],
                     chunk_size,
-                    overlap_start - byte_offset,
+                    destination_offset + overlap_start - byte_offset,
                     overlap_start - chunk_offset,
                     overlap_end - overlap_start,
                 )
@@ -2813,6 +3424,14 @@ def tensor_object_buffer(
 ) -> _TensorObjectBufferPayload:
     return _TensorObjectBufferPayload(
         ptr=int(ptr), size=int(size), owner=owner, batch_size=batch_size
+    )
+
+
+def raw_destination(
+    ptr: int, size: int, owner: Any = None, *, pre_registered: bool = False
+) -> _RawDestinationBuffer:
+    return _RawDestinationBuffer(
+        ptr=int(ptr), size=int(size), owner=owner, pre_registered=pre_registered
     )
 
 

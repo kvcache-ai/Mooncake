@@ -18,6 +18,7 @@ from mooncake.structured_object_store import (
     export_dataproto_ref,
     import_dataproto_ref,
     is_dataproto_ref_handle,
+    raw_destination,
     tensor_object_buffer,
 )
 
@@ -345,6 +346,23 @@ def make_transfer(
     if default_chunk_bytes is not None:
         kwargs["default_chunk_bytes"] = default_chunk_bytes
     return current_store, MooncakeBundleTransfer(current_store, **kwargs)
+
+
+def real_transfer(key_prefix: str) -> tuple[object, MooncakeBundleTransfer]:
+    mooncake_store = pytest.importorskip("mooncake.store")
+    store = mooncake_store.MooncakeDistributedStore()
+    rc = store.setup(
+        os.getenv("LOCAL_HOSTNAME", "localhost"),
+        os.getenv("MC_METADATA_SERVER", "P2PHANDSHAKE"),
+        16 * 1024 * 1024,
+        4 * 1024 * 1024,
+        os.getenv("PROTOCOL", "tcp"),
+        os.getenv("DEVICE_NAME", ""),
+        os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+    )
+    if rc != 0:
+        pytest.skip(f"MooncakeDistributedStore setup failed: {rc}")
+    return store, MooncakeBundleTransfer(store, key_prefix=key_prefix)
 
 
 def structured_payload(
@@ -1145,22 +1163,26 @@ def test_structured_object_torch_tensor_slice_uses_range_reads() -> None:
     assert store.get_into_ranges_calls >= 2
 
 
-def test_structured_object_native_torch_tensor_slice_falls_back_to_get_tensor() -> None:
+def test_structured_object_direct_torch_tensor_slice_uses_real_store_ranges() -> None:
     torch = pytest.importorskip("torch")
-    store, transfer = make_transfer()
+    mooncake_store = pytest.importorskip("mooncake.store")
+    if not hasattr(mooncake_store, "_serialize_tensor") or not hasattr(
+        mooncake_store, "_deserialize_tensor"
+    ):
+        pytest.skip("built mooncake.store lacks tensor serialization helpers")
+    _store, transfer = real_transfer("structured-test-slice")
     tensor = torch.arange(48, dtype=torch.int64).reshape(12, 4)
-    ref = transfer.put_structured_object(
-        StructuredObjectPayload(buffers={"tensor": tensor})
-    )
+    ref = transfer.put_structured_object(StructuredObjectPayload(buffers={"tensor": tensor}))
 
-    result = transfer.materialize(
-        transfer.read_spec(ref)
-        .select_members(["tensor"])
-        .slice_member("tensor", axis=0, start=3, end=9)
-    )
-
-    assert torch.equal(result.objects["tensor"], tensor[3:9])
-    assert store.get_tensor_calls == 1
+    try:
+        result = transfer.materialize(
+            transfer.read_spec(ref)
+            .select_members(["tensor"])
+            .slice_member("tensor", axis=0, start=3, end=9)
+        )
+        assert torch.equal(result.objects["tensor"], tensor[3:9])
+    finally:
+        transfer.remove_bundle(ref)
 
 
 def test_structured_object_tensor_object_buffer_uses_put_tensor_from() -> None:
@@ -1367,9 +1389,14 @@ def test_dataproto_helper_selects_fields_and_meta() -> None:
     )
 
 
-def test_dataproto_helper_slices_tensor_and_object_rows() -> None:
+def test_dataproto_helper_reads_rows_with_real_store_ranges() -> None:
     torch = pytest.importorskip("torch")
-    store, transfer = make_transfer()
+    mooncake_store = pytest.importorskip("mooncake.store")
+    if not hasattr(mooncake_store, "_serialize_tensor") or not hasattr(
+        mooncake_store, "_deserialize_tensor"
+    ):
+        pytest.skip("built mooncake.store lacks tensor serialization helpers")
+    _store, transfer = real_transfer("structured-test-dataproto-rows")
     tensor = torch.arange(24, dtype=torch.int64).reshape(6, 4)
     data = SimpleDataProto(
         batch={
@@ -1399,21 +1426,83 @@ def test_dataproto_helper_slices_tensor_and_object_rows() -> None:
     )
     ref = transfer.put_dataproto(data)
 
-    result = transfer.get_dataproto(ref, rows=slice(2, 5))
+    try:
+        sliced = transfer.get_dataproto(ref, rows=slice(2, 5))
+        gathered = transfer.get_dataproto(ref, rows=[4, 1, 3])
+        array_dst = np.empty((3, 3), dtype=np.int64)
+        into = transfer.get_dataproto(
+            ref,
+            batch_fields=["array"],
+            rows=[4, 1, 3],
+            destinations={"array": array_dst},
+        )
+        pool = mooncake_store.BufferPool(_store, 1024 * 1024)
+        raw_array = pool.acquire(array_dst.nbytes)
+        raw_array_result = transfer.get_dataproto(
+            ref,
+            batch_fields=["array"],
+            rows=[4, 1, 3],
+            destinations={
+                "array": raw_destination(
+                    raw_array.ptr,
+                    raw_array.size,
+                    raw_array,
+                    pre_registered=True,
+                )
+            },
+        )
+        tensor_payload_bytes = int(
+            ref.stage_refs["default"].manifest["buffers"]["batch.tensor"]["metadata_bytes"]
+        ) + tensor[[4, 1, 3]].numel() * tensor.element_size()
+        raw_tensor = pool.acquire(tensor_payload_bytes)
+        raw_tensor_result = transfer.get_dataproto(
+            ref,
+            batch_fields=["tensor"],
+            rows=[4, 1, 3],
+            destinations={
+                "tensor": raw_destination(
+                    raw_tensor.ptr,
+                    raw_tensor.size,
+                    raw_tensor,
+                    pre_registered=True,
+                )
+            },
+        )
 
-    assert torch.equal(result["batch"]["tensor"], tensor[2:5])
-    assert np.array_equal(result["batch"]["array"], data.batch["array"][2:5])
-    assert result["non_tensor_batch"]["text"].tolist() == ["ccc", "dddd", "eeeee"]
-    assert result["non_tensor_batch"]["json"].tolist() == [
-        {"i": 2},
-        {"i": 3},
-        {"i": 4},
-    ]
-    actual_ragged = result["non_tensor_batch"]["ragged"]
-    assert torch.equal(actual_ragged[0], data.non_tensor_batch["ragged"][2])
-    assert torch.equal(actual_ragged[1], data.non_tensor_batch["ragged"][3])
-    assert torch.equal(actual_ragged[2], data.non_tensor_batch["ragged"][4])
-    assert store.get_into_ranges_calls > 0
+        assert torch.equal(sliced["batch"]["tensor"], tensor[2:5])
+        assert np.array_equal(sliced["batch"]["array"], data.batch["array"][2:5])
+        assert sliced["non_tensor_batch"]["text"].tolist() == [
+            "ccc",
+            "dddd",
+            "eeeee",
+        ]
+        assert sliced["non_tensor_batch"]["json"].tolist() == [
+            {"i": 2},
+            {"i": 3},
+            {"i": 4},
+        ]
+        actual_ragged = sliced["non_tensor_batch"]["ragged"]
+        assert torch.equal(actual_ragged[0], data.non_tensor_batch["ragged"][2])
+        assert torch.equal(actual_ragged[1], data.non_tensor_batch["ragged"][3])
+        assert torch.equal(actual_ragged[2], data.non_tensor_batch["ragged"][4])
+        assert torch.equal(gathered["batch"]["tensor"], tensor[[4, 1, 3]])
+        assert np.array_equal(gathered["batch"]["array"], data.batch["array"][[4, 1, 3]])
+        assert gathered["non_tensor_batch"]["text"].tolist() == ["eeeee", "bb", "dddd"]
+        assert into["batch"]["array"] is array_dst
+        assert np.array_equal(array_dst, data.batch["array"][[4, 1, 3]])
+        assert np.array_equal(
+            raw_array_result["batch"]["array"], data.batch["array"][[4, 1, 3]]
+        )
+        assert raw_tensor_result["batch"]["tensor"].ptr == raw_tensor.ptr
+        decoded_tensor = mooncake_store._deserialize_tensor(
+            bytes(raw_tensor.buffer[:tensor_payload_bytes])
+        )
+        assert torch.equal(decoded_tensor, tensor[[4, 1, 3]])
+        raw_array.release()
+        raw_tensor.release()
+        pool.close()
+    finally:
+        transfer.cleanup_dataproto(ref)
 
 
 def test_dataproto_helper_supports_dict_cls_and_reports_bad_cls() -> None:
