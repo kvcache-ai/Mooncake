@@ -31,6 +31,11 @@ struct TenantQuotaSnapshot {
     bool over_quota = false;
 };
 
+struct TenantQuotaAssignment {
+    std::string tenant_id;
+    uint64_t effective_quota_bytes = 0;
+};
+
 enum class TenantQuotaError {
     kQuotaExceeded,
     kInvalidArgument,
@@ -38,6 +43,11 @@ enum class TenantQuotaError {
 };
 
 using TenantQuotaResult = tl::expected<void, TenantQuotaError>;
+
+std::vector<TenantQuotaAssignment> BuildEffectiveQuotaAssignments(
+    const std::map<std::string, TenantQuotaState>& tenants,
+    uint64_t default_requested_quota_bytes,
+    uint64_t allocatable_capacity_bytes);
 
 class TenantQuotaTable {
    public:

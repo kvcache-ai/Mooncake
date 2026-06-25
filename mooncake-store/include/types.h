@@ -407,6 +407,7 @@ enum class ErrorCode : int32_t {
     DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
     DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
     DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
+    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -461,9 +462,10 @@ YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
  * @brief Allocation strategy type for segment allocation
  */
 enum class AllocationStrategyType {
-    RANDOM = 0,        // Pure random allocation
-    FREE_RATIO_FIRST,  // Free-ratio-first allocation
-    CXL,               // CXL-specific allocation
+    RANDOM = 0,            // Pure random allocation
+    FREE_RATIO_FIRST,      // Free-ratio-first allocation
+    CXL,                   // CXL-specific allocation
+    SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
 };
 
 /**

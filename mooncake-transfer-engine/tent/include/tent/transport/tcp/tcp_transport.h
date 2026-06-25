@@ -38,6 +38,8 @@ struct TcpParams {
 
 struct TcpTask {
     Request request;
+    BatchID progress_batch_id{0};
+    std::function<void(BatchID)> notify_progress;
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
     uint64_t target_addr = 0;
@@ -45,6 +47,8 @@ struct TcpTask {
     TcpTask() = default;
     TcpTask(TcpTask &&other) noexcept
         : request(std::move(other.request)),
+          progress_batch_id(other.progress_batch_id),
+          notify_progress(std::move(other.notify_progress)),
           status_word(other.status_word.load(std::memory_order_relaxed)),
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),

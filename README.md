@@ -209,6 +209,7 @@ The following hardware partners and cloud platforms are supported by the Mooncak
       <td align="center"><img src="image/partners/amd_logo.png" alt="AMD" height="26" /><br/><sub>AMD</sub></td>
       <td align="center"><img src="image/partners/aliyun_logo.png" alt="Alibaba Cloud" height="24" /><br/><sub>Alibaba Cloud</sub></td>
       <td align="center"><img src="image/partners/aws-logo.png" alt="AWS" height="24" /><br/><sub>AWS</sub></td>
+      <td align="center"><img src="image/partners/sunrise_logo.png" alt="Sunrise" height="26" /><br/><sub>Sunrise</sub></td>
     </tr>
   </table>
 </div>
