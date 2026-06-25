@@ -519,15 +519,18 @@ func (m *EventManager) StartHTTPServer() error {
 			return true
 		})
 
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]interface{}{
-			"count":     len(services),
+		resp, err := json.Marshal(map[string]interface{}{
+			"count":    len(services),
 			"services": services,
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Error("Failed to encode services response", "err", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(resp)
 	})
 
 	server := &http.Server{
