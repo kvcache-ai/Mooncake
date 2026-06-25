@@ -72,9 +72,11 @@ coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
         case ErrorCode::JOB_NOT_FOUND:
         case ErrorCode::SEGMENT_NOT_FOUND:
         case ErrorCode::OBJECT_NOT_FOUND:
+        case ErrorCode::TENANT_NOT_REGISTERED:
             return coro_http::status_type::not_found;
         case ErrorCode::UNAVAILABLE_IN_CURRENT_MODE:
         case ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS:
+        case ErrorCode::TENANT_NOT_EMPTY:
             return coro_http::status_type::conflict;
         default:
             return coro_http::status_type::internal_server_error;
@@ -220,12 +222,6 @@ struct HttpTenantQuotaPolicyRequest {
 };
 YLT_REFL(HttpTenantQuotaPolicyRequest, requested_quota_bytes);
 
-struct HttpDefaultTenantQuotaResponse {
-    bool success{true};
-    uint64_t requested_quota_bytes{0};
-};
-YLT_REFL(HttpDefaultTenantQuotaResponse, success, requested_quota_bytes);
-
 tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     coro_http::coro_http_request& req) {
     auto tenant_id_view = req.get_decode_query_value("tenant_id");
@@ -233,7 +229,7 @@ tl::expected<std::string, ErrorCode> ParseAdminTenantId(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::string tenant_id = NormalizeTenantId(std::string(tenant_id_view));
-    if (tenant_id.empty() || tenant_id.front() == '_') {
+    if (!IsValidTenantId(tenant_id)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return tenant_id;
@@ -1092,45 +1088,6 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     });
 }
 
-void MasterAdminServer::HandleGetDefaultTenantQuota(
-    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
-    WithActiveService(resp, [&](auto service) {
-        auto result = service->GetDefaultTenantQuotaPolicy();
-        if (!result.has_value()) {
-            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                               result.error());
-            return;
-        }
-        WriteJsonResponse(resp, coro_http::status_type::ok,
-                          HttpDefaultTenantQuotaResponse{
-                              .requested_quota_bytes = result.value()});
-    });
-}
-
-void MasterAdminServer::HandleSetDefaultTenantQuota(
-    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
-    auto body_result = ParseQuotaPolicyBody(req);
-    if (!body_result.has_value()) {
-        WriteErrorResponse(resp, coro_http::status_type::bad_request,
-                           ErrorCode::INVALID_PARAMS, body_result.error());
-        return;
-    }
-
-    WithActiveService(resp, [&](auto service) {
-        auto result = service->SetDefaultTenantQuotaPolicy(
-            body_result->requested_quota_bytes);
-        if (!result.has_value()) {
-            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                               result.error());
-            return;
-        }
-        WriteJsonResponse(
-            resp, coro_http::status_type::ok,
-            HttpDefaultTenantQuotaResponse{
-                .requested_quota_bytes = body_result->requested_quota_bytes});
-    });
-}
-
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1218,16 +1175,6 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/tenant_quotas",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleDeleteTenantQuota(req, resp);
-        });
-    http_server_.set_http_handler<GET>(
-        "/api/v1/tenant_quotas/default",
-        [this](coro_http_request& req, coro_http_response& resp) {
-            HandleGetDefaultTenantQuota(req, resp);
-        });
-    http_server_.set_http_handler<PUT>(
-        "/api/v1/tenant_quotas/default",
-        [this](coro_http_request& req, coro_http_response& resp) {
-            HandleSetDefaultTenantQuota(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/batch_query_keys",

@@ -28,6 +28,7 @@
 #include "mutex.h"
 #include "segment.h"
 #include "tenant_quota.h"
+#include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
@@ -98,10 +99,8 @@ class MasterService {
         const std::string& tenant_id) const;
     tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
         const std::string& tenant_id, uint64_t requested_quota_bytes);
-    std::optional<TenantQuotaSnapshot> DeleteTenantQuotaPolicy(
-        const std::string& tenant_id);
-    uint64_t GetDefaultTenantQuotaPolicy() const;
-    void SetDefaultTenantQuotaPolicy(uint64_t requested_quota_bytes);
+    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+    DeleteTenantQuotaPolicy(const std::string& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
     /**
@@ -1335,6 +1334,15 @@ class MasterService {
                                              const std::string& tenant_id) {
         return {NormalizeTenantId(tenant_id), user_key};
     }
+    std::string NormalizeRequestTenantId(const std::string& tenant_id) const;
+    ObjectIdentity MakeObjectIdentityForRequest(
+        const std::string& user_key, const std::string& tenant_id) const;
+    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWrite(
+        const std::string& tenant_id) const;
+    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWriteLocked(
+        const std::string& tenant_id) const;
+    bool IsTenantRegistered(const std::string& tenant_id) const;
+    bool TenantHasObjects(const std::string& tenant_id) const;
 
     static std::string MakeTenantScopedKey(const std::string& tenant_id,
                                            const std::string& key) {
@@ -1406,6 +1414,9 @@ class MasterService {
     void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
+    void LoadTenantQuotaPoliciesFromStoreOrThrow();
+    void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
+    TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
     uint64_t GetTenantQuotaCapacityBytes();
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
@@ -1756,20 +1767,6 @@ class MasterService {
             const msgpack::object& obj);
     };
 
-    class TenantQuotaPolicySerializer {
-       public:
-        TenantQuotaPolicySerializer(MasterService* service)
-            : service_(service) {}
-
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
-        tl::expected<void, SerializationError> Deserialize(
-            const std::vector<uint8_t>& data);
-        void Reset();
-
-       private:
-        MasterService* service_;
-    };
-
     friend class MetadataAccessor;
     class MetadataAccessorRO {
        public:
@@ -1923,13 +1920,11 @@ class MasterService {
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
-    const bool enable_tenant_quota_;
-    // Startup default used when restoring legacy snapshots without
-    // tenant_quota_policy.
-    const uint64_t configured_default_tenant_quota_bytes_;
-    // Runtime default policy, mutable through the tenant quota admin API.
-    std::atomic<uint64_t> default_tenant_quota_bytes_;
-    const uint64_t tenant_quota_pool_capacity_bytes_;
+    const bool enable_multi_tenants_;
+    const std::string tenant_quota_connector_type_;
+    const std::string tenant_quota_connector_uri_;
+    std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
+    mutable std::mutex tenant_quota_policy_mutex_;
     mutable std::mutex tenant_quota_recompute_mutex_;
 
     // HTTP metadata server pointer for cleanup on client timeout
