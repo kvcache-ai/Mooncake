@@ -77,6 +77,19 @@ Field names are global within a ref. A `batch` field and a `non_tensor_batch` fi
 - `meta_info_keys`: metadata selection.
 - `data_cls`: return a DataProto-like class instead of a plain dict.
 - `destinations`: caller-provided output buffers.
+- `rows`: row selection with a Python `slice` or `StructuredMemberSlice`.
+
+Use `rows` to materialize the same batch-row range across all selected `batch` and `non_tensor_batch` fields:
+
+```python
+subset = transfer.get_dataproto(
+    ref,
+    fields=["input_ids", "text", "rewards"],
+    rows=slice(128, 256),
+)
+```
+
+Row selection supports `axis=0`. Tensor and ndarray batch fields use structured member slicing; structured object `non_tensor_batch` fields read only the selected row metadata and payload ranges. Native Mooncake tensor fields fall back to `get_tensor()` followed by local row slicing when no tensor-range API is available. `rows` cannot be combined with `destinations`; structured object `non_tensor_batch` fields currently require `step=1`.
 
 The result is a plain dictionary when `data_cls` is omitted:
 
