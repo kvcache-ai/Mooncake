@@ -735,59 +735,6 @@ impl StoreClient {
         self.release_reclaim_allocations_best_effort(&releases, true, "flush_all_reclaims")
     }
 
-    fn flush_pending_offloads_before_drain(&self) {
-        const MAX_ROUNDS: usize = 64;
-        const BATCH_SIZE: usize = 32;
-        for round in 0..MAX_ROUNDS {
-            if self.storage_owner.pending_offloads.is_empty() {
-                if round > 0 {
-                    tracing::info!(
-                        runtime = %self.lease.runtime,
-                        rounds = round,
-                        "flush_pending_offloads_before_drain: complete"
-                    );
-                }
-                return;
-            }
-            match self
-                .storage_owner
-                .materialize_pending_offloads_bounded(BATCH_SIZE)
-            {
-                Ok(0) => {
-                    tracing::info!(
-                        runtime = %self.lease.runtime,
-                        rounds = round,
-                        remaining = self.storage_owner.pending_offloads.len(),
-                        "flush_pending_offloads_before_drain: no progress, stopping"
-                    );
-                    return;
-                }
-                Ok(materialized) => {
-                    tracing::debug!(
-                        runtime = %self.lease.runtime,
-                        round,
-                        materialized,
-                        "flush_pending_offloads_before_drain: round complete"
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        runtime = %self.lease.runtime,
-                        round,
-                        %error,
-                        "flush_pending_offloads_before_drain: error, stopping"
-                    );
-                    return;
-                }
-            }
-        }
-        tracing::warn!(
-            runtime = %self.lease.runtime,
-            remaining = self.storage_owner.pending_offloads.len(),
-            "flush_pending_offloads_before_drain: hit max rounds"
-        );
-    }
-
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
         self.storage_owner.untrack_route(route);
         let grace_ms = self.local_memory.reclaim_grace_ms;
