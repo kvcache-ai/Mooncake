@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdlib>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -42,6 +44,28 @@ class MasterMetricsTest : public ::testing::Test {
             client.get("http://127.0.0.1:" + std::to_string(port) + path);
         return {result.status, std::string(result.resp_body)};
     }
+};
+
+class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        if (const char* old_value = std::getenv(name)) {
+            old_value_ = old_value;
+        }
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_) {
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
 };
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
@@ -698,6 +722,123 @@ TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     // Idempotent: same capacity reported again — gauge must not change.
     ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
     EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+}
+
+TEST_F(MasterMetricsTest, OffloadingQueueMetricsAreSerialized) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.inc_offload_queue_push_failures(0);
+    metrics.inc_offloading_queue_size(0);
+    metrics.set_offloading_queue_limit(metrics.get_offloading_queue_limit());
+
+    const std::string serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_offload_queue_push_failures_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_offloading_queue_size"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_offloading_queue_limit"),
+              std::string::npos);
+}
+
+TEST_F(MasterMetricsTest, OffloadingQueueMetricsTrackPushAndHeartbeat) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t base_queue_size = metrics.get_offloading_queue_size();
+    const int64_t base_push_failures =
+        metrics.get_offload_queue_push_failures();
+    const int64_t base_queue_limit = metrics.get_offloading_queue_limit();
+
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService svc(config);
+
+    EXPECT_EQ(metrics.get_offloading_queue_limit(), 50000);
+
+    constexpr size_t kBuf = 0x600000000;
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    constexpr uint64_t kValueSize = 4096;
+
+    UUID client_id = generate_uuid();
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "offloading_queue_metrics_segment";
+    seg.base = kBuf;
+    seg.size = kSegSize;
+    seg.te_endpoint = seg.name;
+
+    ASSERT_TRUE(svc.MountSegment(seg, client_id).has_value());
+    ASSERT_TRUE(svc.MountLocalDiskSegment(client_id, true).has_value());
+
+    ReplicateConfig config1;
+    config1.replica_num = 1;
+    config1.preferred_segment = seg.name;
+    const std::string key = "offloading_queue_metrics_key";
+
+    ASSERT_TRUE(svc.PutStart(client_id, key, "default", kValueSize, config1)
+                    .has_value());
+    ASSERT_TRUE(
+        svc.PutEnd(client_id, key, "default", ReplicaType::MEMORY).has_value());
+
+    EXPECT_EQ(metrics.get_offloading_queue_size(), base_queue_size + 1);
+    EXPECT_EQ(metrics.get_offload_queue_push_failures(), base_push_failures);
+
+    auto heartbeat = svc.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(heartbeat.has_value());
+    ASSERT_EQ(heartbeat->size(), 1);
+    EXPECT_EQ((*heartbeat)[0].key, key);
+    EXPECT_EQ((*heartbeat)[0].size, static_cast<int64_t>(kValueSize));
+    EXPECT_EQ(metrics.get_offloading_queue_size(), base_queue_size);
+
+    metrics.set_offloading_queue_limit(base_queue_limit);
+}
+
+TEST_F(MasterMetricsTest, OffloadingQueuePushFailureMetricTracksFullQueue) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t base_queue_size = metrics.get_offloading_queue_size();
+    const int64_t base_push_failures =
+        metrics.get_offload_queue_push_failures();
+    const int64_t base_queue_limit = metrics.get_offloading_queue_limit();
+
+    ScopedEnvVar offloading_queue_limit("MC_OFFLOADING_QUEUE_LIMIT", "0");
+
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService svc(config);
+
+    EXPECT_EQ(metrics.get_offloading_queue_limit(), 0);
+
+    constexpr size_t kBuf = 0x700000000;
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+
+    UUID client_id = generate_uuid();
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "offloading_queue_full_segment";
+    seg.base = kBuf;
+    seg.size = kSegSize;
+    seg.te_endpoint = seg.name;
+
+    ASSERT_TRUE(svc.MountSegment(seg, client_id).has_value());
+    ASSERT_TRUE(svc.MountLocalDiskSegment(client_id, true).has_value());
+
+    ReplicateConfig config1;
+    config1.replica_num = 1;
+    config1.preferred_segment = seg.name;
+    const std::string key = "offloading_queue_full_key";
+
+    ASSERT_TRUE(
+        svc.PutStart(client_id, key, "default", 1024, config1).has_value());
+    ASSERT_TRUE(
+        svc.PutEnd(client_id, key, "default", ReplicaType::MEMORY).has_value());
+
+    EXPECT_EQ(metrics.get_offloading_queue_size(), base_queue_size);
+    EXPECT_EQ(metrics.get_offload_queue_push_failures(),
+              base_push_failures + 1);
+
+    auto heartbeat = svc.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_TRUE(heartbeat->empty());
+    EXPECT_EQ(metrics.get_offloading_queue_size(), base_queue_size);
+
+    metrics.set_offloading_queue_limit(base_queue_limit);
 }
 
 TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {

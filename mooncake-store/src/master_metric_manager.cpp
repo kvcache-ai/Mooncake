@@ -75,6 +75,14 @@ MasterMetricManager::MasterMetricManager()
                         "Total number of PutEnd requests received"),
       put_end_failures_("master_put_end_failures_total",
                         "Total number of failed PutEnd requests"),
+      offload_queue_push_failures_(
+          "master_offload_queue_push_failures_total",
+          "Total number of PutEnd offload queue push failures"),
+      offloading_queue_size_("master_offloading_queue_size",
+                             "Current number of items in the offloading queue"),
+      offloading_queue_limit_(
+          "master_offloading_queue_limit",
+          "Configured maximum capacity of the offloading queue"),
       put_revoke_requests_("master_put_revoke_requests_total",
                            "Total number of PutRevoke requests received"),
       put_revoke_failures_("master_put_revoke_failures_total",
@@ -465,6 +473,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
     promotion_in_flight_metric_.update(0);
+    offloading_queue_size_.update(0);
+    offloading_queue_limit_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
@@ -481,6 +491,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     put_start_alloc_failures_.inc(0);
     put_end_requests_.inc(0);
     put_end_failures_.inc(0);
+    offload_queue_push_failures_.inc(0);
     put_revoke_requests_.inc(0);
     put_revoke_failures_.inc(0);
     get_replica_list_requests_.inc(0);
@@ -876,6 +887,21 @@ void MasterMetricManager::inc_put_end_requests(int64_t val) {
 void MasterMetricManager::inc_put_end_failures(int64_t val) {
     put_end_failures_.inc(val);
 }
+void MasterMetricManager::inc_offload_queue_push_failures(int64_t val) {
+    offload_queue_push_failures_.inc(val);
+}
+void MasterMetricManager::inc_offloading_queue_size(int64_t val) {
+    offloading_queue_size_.inc(val);
+}
+void MasterMetricManager::dec_offloading_queue_size(int64_t val) {
+    offloading_queue_size_.dec(val);
+}
+void MasterMetricManager::set_offloading_queue_limit(int64_t val) {
+    offloading_queue_limit_.update(val);
+}
+int64_t MasterMetricManager::get_offloading_queue_limit() {
+    return offloading_queue_limit_.value();
+}
 void MasterMetricManager::inc_put_revoke_requests(int64_t val) {
     put_revoke_requests_.inc(val);
 }
@@ -1157,6 +1183,14 @@ int64_t MasterMetricManager::get_put_end_requests() {
 
 int64_t MasterMetricManager::get_put_end_failures() {
     return put_end_failures_.value();
+}
+
+int64_t MasterMetricManager::get_offload_queue_push_failures() {
+    return offload_queue_push_failures_.value();
+}
+
+int64_t MasterMetricManager::get_offloading_queue_size() {
+    return offloading_queue_size_.value();
 }
 
 int64_t MasterMetricManager::get_put_revoke_requests() {
@@ -1704,6 +1738,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
+    serialize_metric(offload_queue_push_failures_);
+    serialize_metric(offloading_queue_size_);
+    serialize_metric(offloading_queue_limit_);
     serialize_metric(put_revoke_requests_);
     serialize_metric(put_revoke_failures_);
     serialize_metric(get_replica_list_requests_);
@@ -1914,6 +1951,7 @@ std::string MasterMetricManager::get_summary_string(
     int64_t put_start_alloc_fails = put_start_alloc_failures_.value();
     int64_t put_ends = put_end_requests_.value();
     int64_t put_end_fails = put_end_failures_.value();
+    int64_t offload_queue_push_fails = offload_queue_push_failures_.value();
     int64_t put_revoke_requests = put_revoke_requests_.value();
     int64_t put_revoke_fails = put_revoke_failures_.value();
     int64_t get_replicas = get_replica_list_requests_.value();
@@ -2035,6 +2073,7 @@ std::string MasterMetricManager::get_summary_string(
     current_counters.put_start_alloc_fails = put_start_alloc_fails;
     current_counters.put_ends = put_ends;
     current_counters.put_end_fails = put_end_fails;
+    current_counters.offload_queue_push_fails = offload_queue_push_fails;
     current_counters.put_revoke_requests = put_revoke_requests;
     current_counters.put_revoke_fails = put_revoke_fails;
     current_counters.get_replicas = get_replicas;
