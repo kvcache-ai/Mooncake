@@ -160,7 +160,7 @@ echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD MUSA_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -200,6 +200,15 @@ elif [ "$NPU_BUILD" = "1" ]; then
     sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Ascend NPU version)"/' pyproject.toml
     sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "ascend", "npu"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-npu"
+elif [ "$MUSA_BUILD" = "1" ]; then
+    echo "Modifying package name for MUSA build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-musa"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (MUSA version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "musa", "moore-threads"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-musa"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
@@ -350,6 +359,8 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libmusa.so* \
+    --exclude libmusart.so* \
     --exclude libamdhip64.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \

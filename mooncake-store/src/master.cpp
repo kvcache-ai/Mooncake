@@ -177,6 +177,40 @@ DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_uint64(offloading_queue_limit, 50000,
+              "Maximum number of objects allowed in the offloading queue per "
+              "local disk segment. Increase to allow more objects to be "
+              "offloaded to SSD before force-eviction kicks in");
+DEFINE_validator(offloading_queue_limit, [](const char* flagname,
+                                            uint64_t value) {
+    // Zero would cause PushOffloadingQueue to always return
+    // KEYS_ULTRA_LIMIT, disabling offload entirely. The upper
+    // bound (1e8) keeps `offloading_queue_limit_ *
+    // offload_cap_ratio_` well within signed long range to
+    // avoid overflow when computing offload_cap in
+    // BatchEvict / EvictTenantMemoryForQuota.
+    if (value == 0) {
+        LOG(FATAL) << "offloading_queue_limit must be greater than 0";
+        return false;
+    }
+    if (value > 100'000'000ULL) {
+        LOG(FATAL) << "offloading_queue_limit must be <= "
+                      "100000000 to avoid overflow";
+        return false;
+    }
+    return true;
+});
+DEFINE_double(offload_cap_ratio, 0.5,
+              "Per-cycle offload cap as a fraction of offloading_queue_limit. "
+              "Controls how many objects can be queued for offload in a single "
+              "eviction cycle before falling back to force-evict");
+DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
 DEFINE_bool(promotion_on_hit, false,
             "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
             "offload_on_evict)");
@@ -436,6 +470,17 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    {
+        uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
+        default_config.GetUInt64("offloading_queue_limit",
+                                 &tmp_offloading_queue_limit,
+                                 FLAGS_offloading_queue_limit);
+        master_config.offloading_queue_limit =
+            static_cast<size_t>(tmp_offloading_queue_limit);
+    }
+    default_config.GetDouble("offload_cap_ratio",
+                             &master_config.offload_cap_ratio,
+                             FLAGS_offload_cap_ratio);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
     default_config.GetUInt32("promotion_admission_threshold",
@@ -734,6 +779,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offloading_queue_limit =
+            static_cast<size_t>(FLAGS_offloading_queue_limit);
+    }
+    if ((google::GetCommandLineFlagInfo("offload_cap_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_cap_ratio = FLAGS_offload_cap_ratio;
     }
     if ((google::GetCommandLineFlagInfo("promotion_on_hit", &info) &&
          !info.is_default) ||
@@ -1220,6 +1276,8 @@ int main(int argc, char* argv[]) {
         << ", enable_offload=" << master_config.enable_offload
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
+        << ", offloading_queue_limit=" << master_config.offloading_queue_limit
+        << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
