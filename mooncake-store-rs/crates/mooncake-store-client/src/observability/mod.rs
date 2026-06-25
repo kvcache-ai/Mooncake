@@ -1,3 +1,5 @@
+mod cold_tier_exporter;
+mod cold_tier_registry;
 mod exporter;
 mod metadata;
 mod process;
