@@ -110,7 +110,6 @@ include!("types.rs");
 include!("cold_tier_types.rs");
 include!("builder.rs");
 include!("state_core.rs");
-include!("storage_eviction.rs");
 include!("membership_sync.rs");
 include!("state_adapters.rs");
 include!("state_store.rs");
