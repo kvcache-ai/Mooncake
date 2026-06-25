@@ -97,6 +97,13 @@ size_t sum_value_sizes(const std::vector<std::span<const char>> &values) {
     return total;
 }
 
+bool has_client_buffer_for_write(
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    size_t size) {
+    if (size == 0) return true;
+    return client_buffer_allocator && client_buffer_allocator->size() > 0;
+}
+
 size_t sum_sizes(const std::vector<size_t> &sizes) {
     size_t total = 0;
     for (size_t size : sizes) {
@@ -1706,6 +1713,11 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (!has_client_buffer_for_write(client_buffer_allocator,
+                                     value.size_bytes())) {
+        LOG(ERROR) << "Client buffer allocator is not available";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // Staging is deferred to ensureRegisteredForRDMA in the transfer layer.
     // For LOCAL_MEMCPY this eliminates one copy; for RDMA with registered
     // buffers it also eliminates one copy; for RDMA with unregistered buffers
@@ -1767,6 +1779,11 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     }
     if (keys.size() != values.size()) {
         LOG(ERROR) << "Key and value size mismatch";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!has_client_buffer_for_write(client_buffer_allocator,
+                                     sum_value_sizes(values))) {
+        LOG(ERROR) << "Client buffer allocator is not available";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     (void)client_buffer_allocator;
@@ -1832,6 +1849,11 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!has_client_buffer_for_write(client_buffer_allocator,
+                                     sum_value_sizes(values))) {
+        LOG(ERROR) << "Client buffer allocator is not available";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     (void)client_buffer_allocator;
@@ -3684,6 +3706,11 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (!has_client_buffer_for_write(client_buffer_allocator,
+                                     value.size_bytes())) {
+        LOG(ERROR) << "Client buffer allocator is not available";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     (void)client_buffer_allocator;
 
     std::vector<Slice> slices =
@@ -3906,6 +3933,11 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (!has_client_buffer_for_write(client_buffer_allocator,
+                                     sum_value_sizes(values))) {
+        LOG(ERROR) << "Client buffer allocator is not available";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     (void)client_buffer_allocator;
 
     std::vector<Slice> slices;
@@ -3976,6 +4008,11 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
     }
     if (keys.size() != values.size()) {
         LOG(ERROR) << "Key and value size mismatch";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!has_client_buffer_for_write(client_buffer_allocator,
+                                     sum_value_sizes(values))) {
+        LOG(ERROR) << "Client buffer allocator is not available";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     (void)client_buffer_allocator;  // staging moved to ensureRegisteredForRDMA
