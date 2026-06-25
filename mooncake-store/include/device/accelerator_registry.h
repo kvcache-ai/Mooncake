@@ -17,8 +17,8 @@ class AcceleratorRegistry {
         const = 0;
     virtual RuntimeAccelerator RuntimeAccelerators(
         bool ensure = false) const = 0;
-    virtual const AcceleratorDevice* GetDevice(AcceleratorVendor vendor)
-        const = 0;
+    virtual const AcceleratorDevice* GetDevice(
+        AcceleratorVendor vendor) const = 0;
 };
 
 const AcceleratorRegistry& GetAcceleratorRegistry();

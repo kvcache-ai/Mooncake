@@ -13,7 +13,9 @@ void FreeHipPinnedHostBuffer(void* addr) { hipHostFree(addr); }
 
 class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
    public:
-    AcceleratorVendor Vendor() const override { return AcceleratorVendor::kHip; }
+    AcceleratorVendor Vendor() const override {
+        return AcceleratorVendor::kHip;
+    }
 
     bool ProbeAvailable() const override {
         int count = 0;
@@ -69,7 +71,6 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         }
         return PinnedHostBuffer(addr, size, FreeHipPinnedHostBuffer);
     }
-
 };
 
 const AcceleratorDevice& HipDeviceInstance() {

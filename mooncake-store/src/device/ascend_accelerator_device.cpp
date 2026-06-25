@@ -98,7 +98,6 @@ class AscendAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         }
         return PinnedHostBuffer(addr, size, FreeAscendPinnedHostBuffer);
     }
-
 };
 
 const AcceleratorDevice& AscendDeviceInstance() {

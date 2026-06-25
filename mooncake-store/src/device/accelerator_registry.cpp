@@ -41,8 +41,7 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
             registered_device_list_.data(), registered_device_count_);
     }
 
-    RuntimeAccelerator RuntimeAccelerators(
-        bool ensure = false) const override {
+    RuntimeAccelerator RuntimeAccelerators(bool ensure = false) const override {
         // The registry-level available list represents devices that have been
         // verified usable. We probe once on first use and then optimistically
         // assume devices stay alive during the process lifetime.
@@ -55,8 +54,8 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
         return RuntimeAccelerator(available_devices_);
     }
 
-    const AcceleratorDevice* GetDevice(AcceleratorVendor vendor)
-        const override {
+    const AcceleratorDevice* GetDevice(
+        AcceleratorVendor vendor) const override {
         return registered_devices_[VendorIndex(vendor)];
     }
 
@@ -84,7 +83,8 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
     }
 
     std::array<const AcceleratorDevice*, kVendorCount> registered_devices_{};
-    std::array<const AcceleratorDevice*, kVendorCount> registered_device_list_{};
+    std::array<const AcceleratorDevice*, kVendorCount>
+        registered_device_list_{};
     size_t registered_device_count_ = 0;
     mutable std::once_flag available_init_once_;
     mutable std::mutex available_mutex_;
@@ -98,7 +98,9 @@ AcceleratorRegistryImpl& MutableRegistry() {
 
 }  // namespace
 
-const AcceleratorRegistry& GetAcceleratorRegistry() { return MutableRegistry(); }
+const AcceleratorRegistry& GetAcceleratorRegistry() {
+    return MutableRegistry();
+}
 
 void RegisterAcceleratorDevice(const AcceleratorDevice& device) {
     MutableRegistry().Register(device);

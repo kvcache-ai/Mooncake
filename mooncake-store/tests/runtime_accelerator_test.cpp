@@ -65,8 +65,7 @@ TEST(RuntimeAcceleratorTest, FindDeviceForPointerReturnsMatchingDevice) {
     RuntimeAccelerator runtime_accelerator({&device});
 
     PointerInfo info;
-    auto* found =
-        runtime_accelerator.FindDeviceForPointer(&device_byte, &info);
+    auto* found = runtime_accelerator.FindDeviceForPointer(&device_byte, &info);
 
     EXPECT_EQ(found, &device);
     EXPECT_EQ(info.kind, MemoryKind::kDevice);
@@ -113,8 +112,8 @@ TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorUsesMemcpyForHostPointers) {
     char dst[sizeof(src)] = {};
     RuntimeAccelerator runtime_accelerator;
 
-    EXPECT_TRUE(runtime_accelerator.CopyMaybeAccelerator(dst, src,
-                                                        sizeof(src)));
+    EXPECT_TRUE(
+        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
     EXPECT_STREQ(dst, src);
 }
 
@@ -125,8 +124,8 @@ TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorRejectsDifferentDevices) {
     FakeAcceleratorDevice dst_device(AcceleratorVendor::kMusa, dst, 1);
     RuntimeAccelerator runtime_accelerator({&src_device, &dst_device});
 
-    EXPECT_FALSE(runtime_accelerator.CopyMaybeAccelerator(dst, src,
-                                                         sizeof(src)));
+    EXPECT_FALSE(
+        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
 }
 
 TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorUsesAutoForSingleDevice) {
@@ -135,8 +134,8 @@ TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorUsesAutoForSingleDevice) {
     FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, src, 5);
     RuntimeAccelerator runtime_accelerator({&device});
 
-    EXPECT_TRUE(runtime_accelerator.CopyMaybeAccelerator(dst, src,
-                                                        sizeof(src)));
+    EXPECT_TRUE(
+        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
 
     EXPECT_STREQ(dst, src);
     EXPECT_EQ(device.current_device_id(), 5);
