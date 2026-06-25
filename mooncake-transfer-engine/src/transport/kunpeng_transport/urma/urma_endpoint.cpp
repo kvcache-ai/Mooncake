@@ -170,12 +170,25 @@ int UrmaContext::construct(GlobalConfig& config) {
 
 int UrmaContext::deconstruct() {
     for (auto& entry : seg_region_list_) {
-        int ret = urma_unregister_seg(entry.first);
+        urma_target_seg_t* seg_ptr = entry.first;
+        // Release the application-side reference in local_tseg_list_ BEFORE
+        // calling urma_unregister_seg.  URMA uses reference counting: if the
+        // app still holds the pointer, the count stays > 0 and the VA range
+        // is not freed.  A subsequent urma_register_seg for the same VA would
+        // then fail with "duplicate".
+        for (auto& tseg : local_tseg_list_) {
+            if (tseg == seg_ptr) {
+                tseg = nullptr;
+                break;
+            }
+        }
+        int ret = urma_unregister_seg(seg_ptr);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister segment";
         }
     }
     seg_region_list_.clear();
+    local_tseg_list_.clear();
 
     for (auto& seg : imported_seg_list_) {
         int ret = urma_unimport_seg(seg);
@@ -336,12 +349,28 @@ int UrmaContext::unregisterMemoryRegion(uint64_t addr) {
              iter != seg_region_list_.end(); ++iter) {
             if ((*iter).first->seg.ubva.va <= addr &&
                 addr < (*iter).first->seg.ubva.va + (*iter).second) {
-                if (urma_unregister_seg((*iter).first)) {
-                    LOG(ERROR) << "Failed to unregister memory "
-                               << (*iter).first->seg.ubva.va;
+                urma_target_seg_t* seg_ptr = (*iter).first;
+                uint64_t seg_va = seg_ptr->seg.ubva.va;
+
+                // Release the app-side reference in local_tseg_list_ BEFORE
+                // calling urma_unregister_seg.  URMA reference-counts segments:
+                // while the app holds the pointer the VA range stays "in use"
+                // and a subsequent urma_register_seg for the same VA fails with
+                // "duplicate".  Nulling the entry here lets the ref count drop
+                // to zero inside urma_unregister_seg.
+                for (auto& tseg : local_tseg_list_) {
+                    if (tseg == seg_ptr) {
+                        tseg = nullptr;
+                        break;
+                    }
+                }
+
+                seg_region_list_.erase(iter);
+
+                if (urma_unregister_seg(seg_ptr)) {
+                    LOG(ERROR) << "Failed to unregister memory " << seg_va;
                     return ERR_CONTEXT;
                 }
-                seg_region_list_.erase(iter);
                 has_removed = true;
                 break;
             }

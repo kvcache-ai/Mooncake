@@ -86,15 +86,24 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    for (auto& context : context_list_) {
-        int ret = context->registerMemoryRegion((uint64_t)addr, length);
+    for (size_t i = 0; i < context_list_.size(); ++i) {
+        int ret =
+            context_list_[i]->registerMemoryRegion((uint64_t)addr, length);
         if (ret) {
-            LOG(ERROR) << "UbTransport: cannot register LocalMemory";
+            LOG(ERROR) << "UbTransport: cannot register LocalMemory on context "
+                       << i;
+            // Roll back registrations that already succeeded on context[0..i-1]
+            // so URMA fully releases those VA ranges before we return.
+            for (size_t j = 0; j < i; ++j)
+                context_list_[j]->unregisterMemoryRegion((uint64_t)addr);
             return ret;
         }
-        ret = context->buildLocalBufferDesc((uint64_t)addr, buffer_desc);
+        ret =
+            context_list_[i]->buildLocalBufferDesc((uint64_t)addr, buffer_desc);
         if (ret) {
             LOG(ERROR) << "UbTransport: build buffer description failed";
+            for (size_t j = 0; j <= i; ++j)
+                context_list_[j]->unregisterMemoryRegion((uint64_t)addr);
             return ret;
         }
     }
