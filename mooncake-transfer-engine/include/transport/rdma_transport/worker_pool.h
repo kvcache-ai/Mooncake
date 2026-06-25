@@ -40,7 +40,7 @@ class WorkerPool {
 
     void transferWorker(int thread_id);
 
-    bool hasOutstandingCq();
+    bool hasOutstandingCq(int thread_id);
 
     void monitorWorker();
 

@@ -440,8 +440,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 }
 
-bool WorkerPool::hasOutstandingCq() {
-    for (int cq_index = 0; cq_index < context_.cqCount(); ++cq_index) {
+bool WorkerPool::hasOutstandingCq(int thread_id) {
+    for (int cq_index = thread_id; cq_index < context_.cqCount();
+         cq_index += kTransferWorkerCount) {
         if (*context_.cqOutstandingCount(cq_index) > 0) return true;
     }
     return false;
@@ -457,7 +458,7 @@ void WorkerPool::transferWorker(int thread_id) {
         auto submitted_slice_count =
             submitted_slice_count_.load(std::memory_order_relaxed);
         if (processed_slice_count == submitted_slice_count &&
-            !hasOutstandingCq()) {
+            !hasOutstandingCq(thread_id)) {
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
@@ -467,7 +468,7 @@ void WorkerPool::transferWorker(int thread_id) {
                 // producers that submit after it will notify this worker.
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
                         submitted_slice_count_.load() &&
-                    !hasOutstandingCq()) {
+                    !hasOutstandingCq(thread_id)) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
                 parked_worker_count_.fetch_sub(1, std::memory_order_acq_rel);
