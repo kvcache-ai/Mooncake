@@ -59,6 +59,16 @@ struct MasterConfig {
     uint64_t max_replicas_per_key;
 
     std::string deployment_mode;
+
+    // Redis election backend configuration (used when election_backend ==
+    // "redis")
+    std::string election_backend = "etcd";  // "etcd" (default) or "redis"
+    std::string redis_endpoint;         // Redis endpoint, e.g. "10.0.0.1:6379"
+    std::string redis_password;         // Redis AUTH password (empty = no auth)
+    int redis_db_index = 0;             // Redis DB index
+    int redis_master_view_ttl_sec = 5;  // Leader key TTL in seconds
+    int redis_heartbeat_interval_sec =
+        2;  // KeepLeader renewal interval (TTL/3)
 };
 
 class MasterServiceSupervisorConfig {
@@ -107,6 +117,15 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // Redis election backend configuration
+    ElectionBackend election_backend = ElectionBackend::ETCD;
+    std::string redis_endpoint;            // Redis endpoint for election
+    std::string redis_password;            // Redis AUTH password
+    int redis_db_index = 0;                // Redis DB index
+    int redis_master_view_ttl_sec = 5;     // Leader key TTL in seconds
+    int redis_heartbeat_interval_sec = 2;  // KeepLeader renewal interval
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -164,6 +183,23 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        // Election backend configuration
+        if (config.election_backend == "redis") {
+            election_backend = ElectionBackend::REDIS;
+        } else if (config.election_backend == "etcd") {
+            election_backend = ElectionBackend::ETCD;
+        } else {
+            throw std::runtime_error(
+                "Unknown election_backend: " + config.election_backend +
+                ". Must be 'etcd' or 'redis'");
+        }
+        redis_endpoint = config.redis_endpoint;
+        redis_password = config.redis_password;
+        redis_db_index = config.redis_db_index;
+        redis_master_view_ttl_sec = config.redis_master_view_ttl_sec;
+        redis_heartbeat_interval_sec = config.redis_heartbeat_interval_sec;
+
         validate();
     }
 
@@ -206,6 +242,20 @@ class MasterServiceSupervisorConfig {
         }
         if (!rpc_thread_num.IsSet()) {
             throw std::runtime_error("rpc_thread_num is not set");
+        }
+        // Validate Redis election backend configuration
+        if (election_backend == ElectionBackend::REDIS &&
+            redis_endpoint.empty()) {
+            throw std::runtime_error(
+                "redis_endpoint is required when election_backend is redis");
+        }
+        if (election_backend == ElectionBackend::REDIS &&
+            redis_heartbeat_interval_sec >= redis_master_view_ttl_sec) {
+            throw std::runtime_error(
+                "redis_heartbeat_interval_sec (" +
+                std::to_string(redis_heartbeat_interval_sec) +
+                ") must be less than redis_master_view_ttl_sec (" +
+                std::to_string(redis_master_view_ttl_sec) + ")");
         }
     }
 };

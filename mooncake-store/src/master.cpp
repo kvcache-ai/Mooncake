@@ -126,6 +126,22 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+// Redis election backend configuration
+DEFINE_string(election_backend, "etcd",
+              "Election backend for HA leader election: 'etcd' (default) or "
+              "'redis' (P2P HA)");
+DEFINE_string(redis_endpoint, "",
+              "Redis endpoint for election (required when "
+              "election_backend=redis), e.g. '10.0.0.1:6379'");
+DEFINE_string(redis_password, "", "Redis AUTH password (empty = no auth)");
+DEFINE_int32(redis_db_index, 0, "Redis database index (default: 0)");
+DEFINE_int32(
+    redis_master_view_ttl_sec, 5,
+    "TTL in seconds for the leader key in Redis election (default: 5)");
+DEFINE_int32(redis_heartbeat_interval_sec, 2,
+             "KeepLeader heartbeat interval in seconds for Redis election "
+             "(default: 2, should be < ttl)");
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -228,6 +244,23 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_max_replicas_per_key);
     default_config.GetString("deployment_mode", &master_config.deployment_mode,
                              FLAGS_deployment_mode);
+
+    // Redis election backend configuration
+    default_config.GetString("election_backend",
+                             &master_config.election_backend,
+                             FLAGS_election_backend);
+    default_config.GetString("redis_endpoint", &master_config.redis_endpoint,
+                             FLAGS_redis_endpoint);
+    default_config.GetString("redis_password", &master_config.redis_password,
+                             FLAGS_redis_password);
+    default_config.GetInt32("redis_db_index", &master_config.redis_db_index,
+                            FLAGS_redis_db_index);
+    default_config.GetInt32("redis_master_view_ttl_sec",
+                            &master_config.redis_master_view_ttl_sec,
+                            FLAGS_redis_master_view_ttl_sec);
+    default_config.GetInt32("redis_heartbeat_interval_sec",
+                            &master_config.redis_heartbeat_interval_sec,
+                            FLAGS_redis_heartbeat_interval_sec);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -469,6 +502,41 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.max_replicas_per_key = FLAGS_max_replicas_per_key;
     }
+
+    // Redis election backend configuration
+    if ((google::GetCommandLineFlagInfo("election_backend", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.election_backend = FLAGS_election_backend;
+    }
+    if ((google::GetCommandLineFlagInfo("redis_endpoint", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.redis_endpoint = FLAGS_redis_endpoint;
+    }
+    if ((google::GetCommandLineFlagInfo("redis_password", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.redis_password = FLAGS_redis_password;
+    }
+    if ((google::GetCommandLineFlagInfo("redis_db_index", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.redis_db_index = FLAGS_redis_db_index;
+    }
+    if ((google::GetCommandLineFlagInfo("redis_master_view_ttl_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.redis_master_view_ttl_sec =
+            FLAGS_redis_master_view_ttl_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("redis_heartbeat_interval_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.redis_heartbeat_interval_sec =
+            FLAGS_redis_heartbeat_interval_sec;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -520,8 +588,34 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
 
-    if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
-        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
+    // Validate election_backend value
+    if (master_config.election_backend != "etcd" &&
+        master_config.election_backend != "redis") {
+        LOG(FATAL) << "Invalid election_backend: "
+                   << master_config.election_backend
+                   << ". Must be 'etcd' or 'redis'";
+        return 1;
+    }
+    if (master_config.enable_ha && master_config.etcd_endpoints.empty() &&
+        master_config.election_backend != "redis") {
+        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true and "
+                      "election_backend is etcd";
+        return 1;
+    }
+    if (master_config.enable_ha && master_config.election_backend == "redis" &&
+        master_config.redis_endpoint.empty()) {
+        LOG(FATAL)
+            << "redis_endpoint must be set when election_backend is redis "
+               "and enable_ha is true";
+        return 1;
+    }
+    if (master_config.election_backend == "redis" &&
+        master_config.redis_heartbeat_interval_sec >=
+            master_config.redis_master_view_ttl_sec) {
+        LOG(FATAL) << "redis_heartbeat_interval_sec ("
+                   << master_config.redis_heartbeat_interval_sec
+                   << ") must be less than redis_master_view_ttl_sec ("
+                   << master_config.redis_master_view_ttl_sec << ")";
         return 1;
     }
     if (!master_config.enable_ha && !master_config.etcd_endpoints.empty()) {

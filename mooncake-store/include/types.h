@@ -84,6 +84,11 @@ using ViewVersionId = int64_t;
 using EtcdLeaseId = int64_t;
 #endif
 
+/**
+ * @brief Election backend type for leader election in HA mode.
+ */
+enum class ElectionBackend { ETCD, REDIS };
+
 using UUID = std::pair<uint64_t, uint64_t>;
 
 using SerializedByte = uint8_t;  // Used as basic unit of serialized data
