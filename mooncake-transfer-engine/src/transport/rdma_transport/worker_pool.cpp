@@ -48,6 +48,24 @@ static const std::string &sourceLocationOrUnknown(Transport::Slice *slice) {
     return slice->source_location.empty() ? kUnknown : slice->source_location;
 }
 
+static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
+                            uint64_t offset, size_t length,
+                            const std::string &local_hca, int &buffer_id,
+                            int &device_id, int retry_count = 0) {
+    const auto &config = globalConfig();
+    if (config.enable_hca_peer_affinity) {
+        return RdmaTransport::selectDeviceByLocalHca(
+            peer_segment_desc, offset, length, local_hca, buffer_id, device_id,
+            retry_count);
+    }
+
+    auto hint = config.enable_dest_device_affinity
+                    ? std::string_view(local_hca)
+                    : std::string_view();
+    return RdmaTransport::selectDevice(peer_segment_desc, offset, length, hint,
+                                       buffer_id, device_id, retry_count);
+}
+
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
@@ -127,12 +145,9 @@ int WorkerPool::submitPostSend(
         }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
-        auto hint = globalConfig().enable_dest_device_affinity
-                        ? context_.deviceName()
-                        : "";
-        if (RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                        slice->rdma.dest_addr, slice->length,
-                                        hint, buffer_id, device_id)) {
+        if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                             slice->length, context_.deviceName(), buffer_id,
+                             device_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -143,9 +158,10 @@ int WorkerPool::submitPostSend(
                 continue;
             }
 
-            if (RdmaTransport::selectDevice(
-                    peer_segment_desc.get(), slice->rdma.dest_addr,
-                    slice->length, hint, buffer_id, device_id)) {
+            if (selectPeerDevice(peer_segment_desc.get(),
+                                 slice->rdma.dest_addr, slice->length,
+                                 context_.deviceName(), buffer_id,
+                                 device_id)) {
                 slice->markFailed();
                 context_.engine().meta()->dumpMetadataContent(
                     peer_segment_desc->name, slice->rdma.dest_addr,
@@ -402,10 +418,10 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
             int buffer_id, device_id;
             if (!peer_segment_desc ||
-                RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                            slice->rdma.dest_addr,
-                                            slice->length, buffer_id, device_id,
-                                            slice->rdma.retry_cnt)) {
+                selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                                 slice->length, context_.deviceName(),
+                                 buffer_id, device_id,
+                                 slice->rdma.retry_cnt)) {
                 slice->markFailed();
                 processed_slice_count_++;
                 continue;

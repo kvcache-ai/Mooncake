@@ -744,6 +744,33 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
+int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
+                                          size_t length,
+                                          std::string_view local_hca,
+                                          int &buffer_id, int &device_id,
+                                          int retry_count) {
+    if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
+    const auto &buffers = desc->buffers;
+    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
+         ++buffer_id) {
+        const auto &buffer = buffers[buffer_id];
+
+        if (offset < buffer.addr || length > buffer.length ||
+            offset - buffer.addr > buffer.length - length) {
+            continue;
+        }
+
+        const auto location = resolveBufferLocation(buffer, offset);
+        device_id = desc->topology.selectDeviceByLocalHca(
+            location, local_hca, retry_count);
+        if (device_id >= 0) return 0;
+        device_id = desc->topology.selectDeviceByLocalHca(
+            kWildcardLocation, local_hca, retry_count);
+        if (device_id >= 0) return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
+}
+
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
                                 int retry_count) {

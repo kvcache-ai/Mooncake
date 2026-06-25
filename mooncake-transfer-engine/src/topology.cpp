@@ -309,7 +309,12 @@ static void applyGpuHcaAffinityOverride(
     }
 }
 
-static void applyHcaPeerAffinity(TopologyMatrix &matrix) {
+static void precomputeResolvedHcaPeerAffinity(
+    const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
+    std::unordered_map<
+        std::string,
+        std::unordered_map<std::string, std::vector<int>>> &affinity_by_local) {
+    affinity_by_local.clear();
     const auto &config = globalConfig();
     if (!config.enable_hca_peer_affinity) return;
     if (config.nic_peer_affinity.empty()) {
@@ -318,46 +323,32 @@ static void applyHcaPeerAffinity(TopologyMatrix &matrix) {
         return;
     }
 
-    for (auto &entry : matrix) {
+    for (const auto &entry : matrix) {
         if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
-
-        std::vector<std::string> all_hca = entry.second.preferred_hca;
-        all_hca.insert(all_hca.end(), entry.second.avail_hca.begin(),
-                       entry.second.avail_hca.end());
 
         std::unordered_set<std::string> preferred_set(
             entry.second.preferred_hca.begin(),
             entry.second.preferred_hca.end());
-        std::vector<std::string> peer_preferred_hca;
-        std::unordered_set<std::string> peer_preferred_set;
 
-        for (const auto &local_hca : entry.second.preferred_hca) {
-            const auto mapping_it = config.nic_peer_affinity.find(local_hca);
-            if (mapping_it == config.nic_peer_affinity.end()) continue;
+        for (const auto &mapping : config.nic_peer_affinity) {
+            const auto &local_hca = mapping.first;
+            const auto &peer_hcas = mapping.second;
 
-            for (const auto &peer_hca : mapping_it->second) {
+            std::vector<int> peer_preferred_hca;
+            std::unordered_set<std::string> peer_preferred_set;
+            for (const auto &peer_hca : peer_hcas) {
                 if (!preferred_set.count(peer_hca)) continue;
+                auto hca_id_it = hca_id_map.find(peer_hca);
+                if (hca_id_it == hca_id_map.end()) continue;
                 if (peer_preferred_set.insert(peer_hca).second) {
-                    peer_preferred_hca.push_back(peer_hca);
+                    peer_preferred_hca.push_back(hca_id_it->second);
                 }
             }
-        }
 
-        if (peer_preferred_hca.empty()) {
-            LOG(WARNING) << "No MC_NIC_PEER_AFFINITY intersection for "
-                         << entry.first << "; keep existing preferred HCAs.";
-            continue;
+            if (peer_preferred_hca.empty()) continue;
+            affinity_by_local[local_hca][entry.first] =
+                std::move(peer_preferred_hca);
         }
-
-        std::vector<std::string> avail_hca;
-        std::unordered_set<std::string> seen_hca;
-        for (const auto &hca : all_hca) {
-            if (!seen_hca.insert(hca).second) continue;
-            if (!peer_preferred_set.count(hca)) avail_hca.push_back(hca);
-        }
-
-        entry.second.preferred_hca = std::move(peer_preferred_hca);
-        entry.second.avail_hca = std::move(avail_hca);
     }
 }
 
@@ -688,10 +679,12 @@ void Topology::clear() {
     matrix_.clear();
     hca_list_.clear();
     resolved_matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
 }
 
 int Topology::discover(const std::vector<std::string> &filter) {
     matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
     auto all_hca = listInfiniBandDevices(filter);
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
@@ -734,6 +727,7 @@ int Topology::parse(const std::string &topology_json) {
     }
 
     matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
     for (const auto &key : root.getMemberNames()) {
         const Json::Value &value = root[key];
         if (value.isArray() && value.size() == 2) {
@@ -753,7 +747,6 @@ int Topology::parse(const std::string &topology_json) {
         }
     }
 
-    applyHcaPeerAffinity(matrix_);
     return resolve();
 }
 
@@ -792,6 +785,36 @@ int Topology::selectDevice(const std::string storage_type,
     return selectDevice(storage_type, retry_count);
 }
 
+int Topology::selectDeviceByLocalHca(const std::string storage_type,
+                                     std::string_view local_hca,
+                                     int retry_count) {
+    if (!local_hca.empty()) {
+        auto local_it =
+            resolved_hca_peer_affinity_by_local_.find(std::string(local_hca));
+        if (local_it != resolved_hca_peer_affinity_by_local_.end()) {
+            auto hints_it = local_it->second.find(std::string(storage_type));
+            if (hints_it != local_it->second.end() &&
+                !hints_it->second.empty()) {
+                const auto &candidates = hints_it->second;
+                if (retry_count == 0) {
+                    int rand_value;
+                    if (use_round_robin_) {
+                        thread_local int tl_counter = 0;
+                        rand_value = tl_counter;
+                        tl_counter = (tl_counter + 1) % 10000;
+                    } else {
+                        rand_value = SimpleRandom::Get().next();
+                    }
+                    return candidates[rand_value % candidates.size()];
+                }
+                return candidates[(retry_count - 1) % candidates.size()];
+            }
+        }
+    }
+
+    return selectDevice(storage_type, retry_count);
+}
+
 int Topology::selectDevice(const std::string storage_type, int retry_count) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
@@ -823,6 +846,7 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
 
 int Topology::resolve() {
     resolved_matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
     hca_list_.clear();
     std::map<std::string, int> hca_id_map;
     int next_hca_map_index = 0;
@@ -857,6 +881,8 @@ int Topology::resolve() {
                 hca_id_map[hca];
         }
     }
+    precomputeResolvedHcaPeerAffinity(
+        matrix_, hca_id_map, resolved_hca_peer_affinity_by_local_);
     return 0;
 }
 
