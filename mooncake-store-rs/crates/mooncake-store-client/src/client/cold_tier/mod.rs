@@ -7,6 +7,7 @@ mod metrics;
 mod offload;
 mod restore;
 mod scheduler;
+mod shutdown;
 mod staging_pool;
 mod target_selection;
 mod worker;
