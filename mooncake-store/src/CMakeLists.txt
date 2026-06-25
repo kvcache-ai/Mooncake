@@ -81,6 +81,15 @@ set(MOONCAKE_STORE_SOURCES
 
 set(EXTRA_LIBS "")
 
+# Find hiredis for Redis election backend
+if(STORE_USE_REDIS)
+    find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
+    find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
+    message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
+    list(APPEND MOONCAKE_STORE_SOURCES redis_helper.cpp)
+    list(APPEND EXTRA_LIBS ${HIREDIS_LIB})
+endif()
+
 # Find xxHash (required for ComputeChecksum)
 find_path(
   XXHASH_INCLUDE_DIR
@@ -129,6 +138,10 @@ add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 # to targets that don't need it (e.g., mooncake_master).
 # Targets that need transfer_engine should link it explicitly.
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
+if(STORE_USE_REDIS)
+    target_include_directories(mooncake_store PUBLIC ${HIREDIS_INCLUDE_DIR})
+    target_compile_definitions(mooncake_store PUBLIC STORE_USE_REDIS)
+endif()
 target_link_libraries(mooncake_store
     PUBLIC
         cachelib_memory_allocator
