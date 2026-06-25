@@ -3,6 +3,7 @@
 #include <numa.h>
 
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,6 +72,9 @@ TensorMetadata build_full_tensor_metadata(const py::handle &tensor,
 std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
     BufferHandle *buffer_handle, char *usr_buffer, int64_t data_length,
     bool *take_ownership, char **exported_data, size_t *total_length);
+pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
+                                  int64_t data_length,
+                                  bool own_user_buffer = false);
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count);
 
@@ -132,14 +136,15 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
 }
 
 pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
-                                  int64_t data_length) {
+                                  int64_t data_length,
+                                  bool own_user_buffer) {
     if (!buffer_handle && !usr_buffer) return pybind11::none();
     if (buffer_handle && usr_buffer) return pybind11::none();
 
-    bool take_ownership = !!buffer_handle;
+    bool take_ownership = !!buffer_handle || own_user_buffer;
     size_t total_length;
     char *exported_data;
-    if (take_ownership) {
+    if (buffer_handle) {
         total_length = buffer_handle->size();
         if (total_length <= sizeof(TensorMetadata)) {
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
@@ -155,12 +160,18 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     } else {
         exported_data = usr_buffer;
         if (data_length < 0) {
+            if (take_ownership) {
+                delete[] exported_data;
+            }
             LOG(ERROR) << "Get tensor into failed with error code: "
                        << data_length;
             return pybind11::none();
         }
         total_length = static_cast<size_t>(data_length);
         if (total_length <= sizeof(TensorMetadata)) {
+            if (take_ownership) {
+                delete[] exported_data;
+            }
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
@@ -210,7 +221,6 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
 
     try {
         // Construct numpy array
-        bool take_ownership = !!buffer_handle;
         py::object np_array = array_creators[dtype_index](
             exported_data, sizeof(TensorMetadata), tensor_size, take_ownership);
 
@@ -246,6 +256,40 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         }
         return pybind11::none();
     }
+}
+
+py::bytes serialize_tensor_to_bytes(py::object tensor) {
+    PyTensorInfo info = extract_tensor_info(tensor);
+    if (!info.valid()) {
+        throw py::value_error("unsupported tensor for Mooncake tensor serialization");
+    }
+
+    TensorMetadata metadata = info.metadata;
+    metadata.header.data_bytes = info.tensor_size;
+    size_t total_length = sizeof(TensorMetadata) + info.tensor_size;
+    std::string payload(total_length, '\0');
+    memcpy(payload.data(), &metadata, sizeof(TensorMetadata));
+    if (info.tensor_size > 0) {
+        memcpy(payload.data() + sizeof(TensorMetadata),
+               reinterpret_cast<const void *>(info.data_ptr), info.tensor_size);
+    }
+    return py::bytes(payload);
+}
+
+py::object deserialize_tensor_from_bytes(py::bytes payload) {
+    std::string data = payload;
+    if (data.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        throw py::value_error("serialized tensor payload is too large");
+    }
+
+    char *owned_data = new char[data.size()];
+    memcpy(owned_data, data.data(), data.size());
+    py::object tensor = buffer_to_tensor(nullptr, owned_data,
+                                         static_cast<int64_t>(data.size()), true);
+    if (tensor.is_none()) {
+        throw py::value_error("invalid serialized Mooncake tensor payload");
+    }
+    return tensor;
 }
 
 std::vector<std::vector<void *>> CastAddrs2Ptrs(
@@ -1527,6 +1571,11 @@ class MooncakeHostMemAllocatorPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    m.def("_serialize_tensor", &serialize_tensor_to_bytes,
+          "Serialize a torch tensor using Mooncake tensor metadata.");
+    m.def("_deserialize_tensor", &deserialize_tensor_from_bytes,
+          "Deserialize bytes produced by _serialize_tensor.");
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
