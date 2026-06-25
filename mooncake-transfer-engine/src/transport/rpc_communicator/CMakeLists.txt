@@ -1,6 +1,6 @@
 file(GLOB CORO_RPC_SOURCES "*.cpp")
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
 add_library(rpc_communicator OBJECT ${CORO_RPC_SOURCES})
 
