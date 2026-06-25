@@ -33,17 +33,6 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
-static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
-    if (result != cudaSuccess) {
-        LOG(ERROR) << message << " (Error code: " << result << " - "
-                   << cudaGetErrorString(result) << ")" << std::endl;
-        return false;
-    }
-    return true;
-}
-
-namespace mooncake {
-
 namespace {
 struct CudaStreamNVLinkRAII {
     cudaStream_t stream_;
@@ -78,17 +67,24 @@ struct CudaEventNVLinkRAII {
 static thread_local CudaEventNVLinkRAII tl_nvlink_sync_event;
 }  // anonymous namespace
 
-using Slice = Transport::Slice;
+static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
+    if (result != cudaSuccess) {
+        LOG(ERROR) << message << " (Error code: " << result << " - "
+                   << cudaGetErrorString(result) << ")" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+namespace mooncake {
+
+typedef Transport::Slice Slice;
 
 /// Submit batched memcpy operations using cudaMemcpyBatchAsync when available
 /// (CUDA 12.8+), falling back to per-slice cudaMemcpyAsync otherwise.
-/// Uses cudaMemcpySrcAccessOrderStream to ensure source data visibility for
-/// P2P copies. This attribute is REQUIRED — without it, the GPU does not
-/// insert the necessary memory barriers for P2P access, causing segfaults.
-/// The caller must also establish GPU-level stream synchronization
-/// (via cudaEventRecord + cudaStreamWaitEvent) before calling this function.
-/// Individual slice errors are tracked so that slices whose memcpy failed
-/// are marked as FAILED while successfully submitted ones are POSTED.
+/// Uses cudaMemcpySrcAccessOrderStream attribute to respect stream access
+/// ordering semantics. Individual slice errors are tracked so that slices
+/// whose memcpy failed are marked as FAILED while successful ones are POSTED.
 static void submitBatchMemcpy(const std::vector<Slice *> &slices,
                               const std::vector<void *> &srcs,
                               const std::vector<void *> &dsts,
@@ -98,6 +94,9 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
 
     const size_t count = slices.size();
     cudaError_t err = cudaSuccess;
+    const char *disable_batch = std::getenv("MC_NVLINK_DISABLE_BATCH_MEMCPY");
+    const bool force_per_slice = disable_batch && disable_batch[0] != '\0' &&
+                                 disable_batch[0] != '0';
 
     // Log the active memcpy path once per process lifetime
     static const bool logged_once = [] {
@@ -117,18 +116,31 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
     (void)logged_once;
 
 #if CUDART_VERSION >= 12080
-    // srcAccessOrderStream is REQUIRED for P2P copies — without it, the GPU
-    // does not insert necessary memory barriers for cross-device access,
-    // resulting in segmentation faults. The caller also establishes a
-    // GPU-level dependency via cudaEventRecord(cudaStreamPerThread) +
-    // cudaStreamWaitEvent(nvlink_stream) to ensure source data is coherent
-    // before the memcpy starts; these two mechanisms are complementary.
+    if (force_per_slice) {
+        for (size_t i = 0; i < count; ++i) {
+            auto single_err = cudaMemcpy(dsts[i], srcs[i], sizes[i],
+                                         cudaMemcpyDeviceToDevice);
+            if (single_err != cudaSuccess) {
+                LOG(ERROR)
+                    << "IntraNodeNvlinkTransport: forced cudaMemcpy "
+                    << "failed at index " << i << ": "
+                    << cudaGetErrorString(single_err);
+                slices[i]->markFailed();
+                continue;
+            }
+            slices[i]->markSuccess();
+        }
+        return;
+    }
+    // Use srcAccessOrderStream for P2P copies. The GPU-level dependency
+    // established by cudaEventRecord + cudaStreamWaitEvent in the caller
+    // ensures the source data is visible through nvlink_stream's access
+    // order, satisfying srcAccessOrderStream's requirement.
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     size_t attrs_idx = 0;
     // cudaMemcpyBatchAsync in CUDA 12.8 takes non-const size_t* for sizes
     std::vector<size_t> mutable_sizes(sizes);
-    size_t fail_idx = count;
 #endif
 
 #if CUDART_VERSION >= 13000
@@ -136,55 +148,25 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
                                const_cast<const void **>(srcs.data()),
                                mutable_sizes.data(), static_cast<size_t>(count),
                                &attr, &attrs_idx, 1, stream);
-    if (err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaMemcpyBatchAsync "
-                   << "failed: " << cudaGetErrorString(err);
-        // CUDA >= 13.0 does not return fail_idx; conservatively mark all
-        // as FAILED since we cannot determine which copies succeeded.
-        for (size_t i = 0; i < count; ++i) {
-            if (slices[i]->status == Slice::PENDING) {
-                slices[i]->markFailed();
-            }
-        }
-    } else {
-        for (size_t i = 0; i < count; ++i) {
-            slices[i]->status = Slice::POSTED;
-            slices[i]->local.cuda_stream = (void *)stream;
-        }
-    }
 #elif CUDART_VERSION >= 12080
-    err = cudaMemcpyBatchAsync(const_cast<void **>(dsts.data()),
-                               const_cast<void **>(srcs.data()),
-                               mutable_sizes.data(), static_cast<size_t>(count),
-                               &attr, &attrs_idx, 1, &fail_idx, stream);
-    if (err != cudaSuccess) {
-        if (fail_idx < count) {
-            LOG(ERROR) << "IntraNodeNvlinkTransport: cudaMemcpyBatchAsync "
-                       << "failed at index " << fail_idx
-                       << " (src=" << srcs[fail_idx]
-                       << ", dst=" << dsts[fail_idx]
-                       << ", size=" << sizes[fail_idx]
-                       << "): " << cudaGetErrorString(err);
-        } else {
-            LOG(ERROR) << "IntraNodeNvlinkTransport: cudaMemcpyBatchAsync "
-                       << "failed: " << cudaGetErrorString(err);
-        }
-        // Copies [0, fail_idx) were submitted successfully → POSTED.
-        // Copy [fail_idx] failed → FAILED.
-        // Copies (fail_idx, count) were never submitted → FAILED.
-        for (size_t i = 0; i < fail_idx; ++i) {
-            slices[i]->status = Slice::POSTED;
-            slices[i]->local.cuda_stream = (void *)stream;
-        }
-        for (size_t i = fail_idx; i < count; ++i) {
-            if (slices[i]->status == Slice::PENDING) {
-                slices[i]->markFailed();
+    {
+        size_t fail_idx = count;
+        err = cudaMemcpyBatchAsync(
+            const_cast<void **>(dsts.data()), const_cast<void **>(srcs.data()),
+            mutable_sizes.data(), static_cast<size_t>(count), &attr, &attrs_idx,
+            1, &fail_idx, stream);
+        if (err != cudaSuccess) {
+            if (fail_idx < count) {
+                LOG(ERROR) << "IntraNodeNvlinkTransport: cudaMemcpyBatchAsync "
+                           << "failed at index " << fail_idx
+                           << " (src=" << srcs[fail_idx]
+                           << ", dst=" << dsts[fail_idx]
+                           << ", size=" << sizes[fail_idx]
+                           << "): " << cudaGetErrorString(err);
+            } else {
+                LOG(ERROR) << "IntraNodeNvlinkTransport: cudaMemcpyBatchAsync "
+                           << "failed: " << cudaGetErrorString(err);
             }
-        }
-    } else {
-        for (size_t i = 0; i < count; ++i) {
-            slices[i]->status = Slice::POSTED;
-            slices[i]->local.cuda_stream = (void *)stream;
         }
     }
 #else
@@ -204,6 +186,68 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
     }
     return;  // Slice states already set above
 #endif
+
+    // CUDA 12.8+ headers expose cudaMemcpyBatchAsync even on systems whose
+    // installed driver cannot execute it.  Keep the NVLink path usable in that
+    // common mixed-version setup by falling back to per-slice cudaMemcpyAsync.
+    if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+        // Clear the runtime's last-error slot before falling back; otherwise a
+        // later unrelated PyTorch CUDA call may observe this expected probe
+        // failure and abort the process.
+        (void)cudaGetLastError();
+        LOG(WARNING) << "IntraNodeNvlinkTransport: cudaMemcpyBatchAsync is not "
+                     << "supported by the installed driver; falling back to "
+                     << "per-slice cudaMemcpy";
+        for (size_t i = 0; i < count; ++i) {
+            cudaPointerAttributes src_attr{};
+            cudaPointerAttributes dst_attr{};
+            cudaError_t src_attr_err = cudaPointerGetAttributes(&src_attr,
+                                                                srcs[i]);
+            cudaError_t dst_attr_err = cudaPointerGetAttributes(&dst_attr,
+                                                                dsts[i]);
+            if (src_attr_err != cudaSuccess || dst_attr_err != cudaSuccess) {
+                if (src_attr_err != cudaSuccess) (void)cudaGetLastError();
+                if (dst_attr_err != cudaSuccess) (void)cudaGetLastError();
+                LOG(ERROR) << "IntraNodeNvlinkTransport: fallback pointer "
+                           << "attribute query failed at index " << i;
+                slices[i]->markFailed();
+                continue;
+            }
+            auto single_err = cudaSuccess;
+            if (src_attr.device >= 0 && dst_attr.device >= 0 &&
+                src_attr.device != dst_attr.device) {
+                single_err = cudaMemcpyPeer(dsts[i], dst_attr.device, srcs[i],
+                                            src_attr.device, sizes[i]);
+            } else {
+                single_err =
+                    cudaMemcpy(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault);
+            }
+            if (single_err != cudaSuccess) {
+                LOG(ERROR)
+                    << "IntraNodeNvlinkTransport: fallback cudaMemcpy "
+                    << "failed at index " << i << ": "
+                    << cudaGetErrorString(single_err);
+                slices[i]->markFailed();
+                continue;
+            }
+            slices[i]->markSuccess();
+        }
+        return;
+    }
+
+    // For cudaMemcpyBatchAsync paths, update slice states based on result
+    if (err != cudaSuccess) {
+        for (size_t i = 0; i < count; ++i) {
+            if (slices[i]->status == Slice::PENDING) {
+                slices[i]->markFailed();
+            }
+        }
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            slices[i]->status = Slice::POSTED;
+            slices[i]->local.cuda_stream = (void *)stream;
+        }
+    }
 }
 
 static int getNumDevices() {
@@ -241,7 +285,12 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     }
     cudaError_t result = cudaDeviceEnablePeerAccess(dst_device_id, 0);
 
-    if (result != cudaSuccess && result != cudaErrorPeerAccessAlreadyEnabled) {
+    if (result == cudaErrorPeerAccessAlreadyEnabled) {
+        (void)cudaGetLastError();
+        return true;
+    }
+
+    if (result != cudaSuccess) {
         LOG(ERROR) << "IntraNodeNvlinkTransport: failed to enable p2p access "
                       "(Error code: "
                    << result << " - " << cudaGetErrorString(result) << ")"
@@ -314,6 +363,18 @@ int IntraNodeNvlinkTransport::install(
     std::shared_ptr<Topology> topology) {
     metadata_ = metadata;
     local_server_name_ = local_server_name;
+
+    int original_device = -1;
+    cudaGetDevice(&original_device);
+    int num_devices = getNumDevices();
+    for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id) {
+        for (int dst_device_id = 0; dst_device_id < num_devices;
+             ++dst_device_id) {
+            if (src_device_id == dst_device_id) continue;
+            enableP2PAccess(src_device_id, dst_device_id);
+        }
+    }
+    if (original_device >= 0) cudaSetDevice(original_device);
 
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
@@ -427,21 +488,11 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    // Poll POSTED slices for async completion via cudaStreamQuery.
-    // Cache the query result per stream to avoid redundant driver calls,
-    // since multiple slices typically share the same CUDA stream.
-    std::unordered_map<cudaStream_t, cudaError_t> stream_status_cache;
+    // Poll POSTED slices for async completion via cudaStreamQuery
     for (auto *slice : task.slice_list) {
         if (slice && slice->status == Slice::POSTED) {
             cudaStream_t stream = (cudaStream_t)slice->local.cuda_stream;
-            auto it = stream_status_cache.find(stream);
-            cudaError_t cuda_err;
-            if (it == stream_status_cache.end()) {
-                cuda_err = cudaStreamQuery(stream);
-                stream_status_cache[stream] = cuda_err;
-            } else {
-                cuda_err = it->second;
-            }
+            cudaError_t cuda_err = cudaStreamQuery(stream);
             if (cuda_err == cudaSuccess) {
                 slice->markSuccess();
             } else if (cuda_err != cudaErrorNotReady) {
@@ -548,12 +599,15 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
     if (err != cudaSuccess) {
         LOG(ERROR)
             << "IntraNodeNvlinkTransport: cudaPointerGetAttributes failed";
-        return -1;
+        return 0;
     }
 
     if (attr.type != cudaMemoryTypeDevice) {
-        LOG(ERROR) << "Unsupported memory type, " << addr << " " << attr.type;
-        return -1;
+        if (globalConfig().trace) {
+            LOG(INFO) << "IntraNodeNvlinkTransport: skipping non-device memory "
+                      << addr << " type=" << attr.type;
+        }
+        return 0;
     }
 
     // Resolve the true cudaMalloc base address. Framework caching allocators
@@ -609,7 +663,8 @@ int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
         LOG(WARNING)
             << "IntraNodeNvlinkTransport: cuMemGetAddressRange failed for "
             << "addr " << addr << " during unregister (error " << cu_err
-            << "). Memory may already be freed, using provided address.";
+            << "). Assuming non-device memory and skipping.";
+        return 0;
     }
 
     {

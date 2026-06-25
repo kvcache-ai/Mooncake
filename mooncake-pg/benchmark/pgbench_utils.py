@@ -176,7 +176,7 @@ def compute_counts(
         recvcount = size_elems
         paramcount = sendcount
         return sendcount, recvcount, paramcount, 0, 0
-    if collective == "all_gather":
+    if collective in ("all_gather", "all_gather_base"):
         base = _align_count_by_16(size_elems // nranks if nranks else 0, elt_size)
         sendcount = base
         recvcount = base * nranks
@@ -200,7 +200,7 @@ def compute_counts(
 def busbw_factor(collective: str, nranks: int) -> float:
     if collective == "all_reduce":
         return (2.0 * (nranks - 1)) / nranks if nranks else 0.0
-    if collective in ("reduce_scatter", "all_gather", "alltoall"):
+    if collective in ("reduce_scatter", "all_gather", "all_gather_base", "alltoall"):
         return (nranks - 1) / nranks if nranks else 0.0
     if collective in ("broadcast", "sendrecv"):
         return 1.0

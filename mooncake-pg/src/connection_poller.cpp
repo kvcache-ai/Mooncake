@@ -23,6 +23,14 @@ namespace mooncake {
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(USE_MACA)
 static bool supportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+    const char* intranode_nvlink = getenv("MC_INTRANODE_NVLINK");
+    const char* mixed_nvlink = getenv("MC_PG_NVLINK_MIXED");
+
+    if (!(mixed_nvlink && mixed_nvlink[0] != '\0' && mixed_nvlink[0] != '0') &&
+        intranode_nvlink && intranode_nvlink[0] != '\0' &&
+        intranode_nvlink[0] != '0') {
+        return true;
+    }
 
     bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
     if (!fabric_enabled) return false;

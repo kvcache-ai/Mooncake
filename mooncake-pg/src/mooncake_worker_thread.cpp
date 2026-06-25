@@ -1,4 +1,7 @@
 #include <cuda_alike.h>
+#include <chrono>
+#include <cstdlib>
+#include <string>
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <glog/logging.h>
@@ -22,7 +25,173 @@ static void setActiveRanksTensorValue(TransferGroupMeta* group, int rank,
         group->activeRanksTensor[rank] = value;
     }
 }
+namespace {
 
+bool pgProfileEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOONCAKE_PG_PROFILE");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool pgSkipSelfEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOONCAKE_PG_SKIP_SELF");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool pgCanSkipSelf(int opType) {
+    switch ((c10d::OpType)opType) {
+        case c10d::OpType::ALLREDUCE:
+        case c10d::OpType::ALLGATHER:
+        case c10d::OpType::_ALLGATHER_BASE:
+        case c10d::OpType::_REDUCE_SCATTER_BASE:
+        case c10d::OpType::ALLTOALL:
+        case c10d::OpType::ALLTOALL_BASE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool pgProfileDetailEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOONCAKE_PG_PROFILE_DETAIL");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+int pgProfileRankFilter() {
+    static const int rank = [] {
+        const char* value = std::getenv("MOONCAKE_PG_PROFILE_RANK");
+        return value ? std::atoi(value) : -1;
+    }();
+    return rank;
+}
+
+uint64_t pgProfileSummaryInterval() {
+    static const uint64_t interval = [] {
+        const char* value = std::getenv("MOONCAKE_PG_PROFILE_INTERVAL");
+        int parsed = value ? std::atoi(value) : 1000;
+        return parsed > 0 ? static_cast<uint64_t>(parsed) : 1000ULL;
+    }();
+    return interval;
+}
+
+uint64_t profileNowUs() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               clock::now().time_since_epoch())
+        .count();
+}
+
+std::string pgStoreSyncKey(const TransferGroupMeta* group, int rank,
+                           uint64_t sequence) {
+    return "mooncake_pg_intra_sync/" + std::to_string(group->backendIndex) +
+           "/" + std::to_string(sequence) + "/" + std::to_string(rank);
+}
+
+const char* opName(int opType) {
+    switch ((c10d::OpType)opType) {
+        case c10d::OpType::BROADCAST:
+            return "broadcast";
+        case c10d::OpType::ALLREDUCE:
+            return "allreduce";
+        case c10d::OpType::ALLGATHER:
+            return "allgather";
+        case c10d::OpType::_ALLGATHER_BASE:
+            return "allgather_base";
+        case c10d::OpType::_REDUCE_SCATTER_BASE:
+            return "reduce_scatter_base";
+        case c10d::OpType::ALLTOALL:
+            return "alltoall";
+        case c10d::OpType::ALLTOALL_BASE:
+            return "alltoall_base";
+        case c10d::OpType::BARRIER:
+            return "barrier";
+        case c10d::OpType::REDUCE:
+            return "reduce";
+        case c10d::OpType::GATHER:
+            return "gather";
+        case c10d::OpType::SCATTER:
+            return "scatter";
+        default:
+            return "unknown";
+    }
+}
+
+struct PgOpStats {
+    uint64_t chunks = 0;
+    uint64_t bytes = 0;
+    uint64_t wait_conn_us = 0;
+    uint64_t tensor_to_buffer_us = 0;
+    uint64_t enqueue_us = 0;
+    uint64_t buffer_to_tensor_us = 0;
+    uint64_t host_issue_us = 0;
+    uint64_t transfer_submit_us = 0;
+    uint64_t transfer_wait_us = 0;
+    uint64_t transfer_poll_count = 0;
+    uint64_t signal_submit_us = 0;
+    uint64_t signal_wait_us = 0;
+    uint64_t signal_poll_count = 0;
+    uint64_t end_to_end_us = 0;
+};
+
+void addStats(PgOpStats& stats, size_t bytes, const PgProfileSlot& slot,
+              uint64_t transfer_submit_us, uint64_t transfer_wait_us,
+              uint64_t transfer_poll_count, uint64_t signal_submit_us,
+              uint64_t signal_wait_us, uint64_t signal_poll_count,
+              uint64_t end_to_end_us) {
+    ++stats.chunks;
+    stats.bytes += bytes;
+    stats.wait_conn_us += slot.wait_conn_us;
+    stats.tensor_to_buffer_us += slot.tensor_to_buffer_us;
+    stats.enqueue_us += slot.enqueue_us;
+    stats.buffer_to_tensor_us += slot.buffer_to_tensor_us;
+    stats.host_issue_us += slot.host_issue_us;
+    stats.transfer_submit_us += transfer_submit_us;
+    stats.transfer_wait_us += transfer_wait_us;
+    stats.transfer_poll_count += transfer_poll_count;
+    stats.signal_submit_us += signal_submit_us;
+    stats.signal_wait_us += signal_wait_us;
+    stats.signal_poll_count += signal_poll_count;
+    stats.end_to_end_us += end_to_end_us;
+}
+
+void logSummary(const PgOpStats* stats, size_t num_stats, int rank) {
+    for (size_t op = 0; op < num_stats; ++op) {
+        const auto& s = stats[op];
+        if (s.chunks == 0) continue;
+        LOG(INFO) << "MOONCAKE_PG_PROFILE_SUMMARY rank=" << rank
+                  << " op=" << opName(static_cast<int>(op))
+                  << " op_id=" << op << " chunks=" << s.chunks
+                  << " bytes=" << s.bytes
+                  << " avg_e2e_us=" << (s.end_to_end_us / s.chunks)
+                  << " avg_host_issue_us=" << (s.host_issue_us / s.chunks)
+                  << " avg_wait_conn_us=" << (s.wait_conn_us / s.chunks)
+                  << " avg_tensor_to_buffer_us="
+                  << (s.tensor_to_buffer_us / s.chunks)
+                  << " avg_enqueue_us=" << (s.enqueue_us / s.chunks)
+                  << " avg_buffer_to_tensor_us="
+                  << (s.buffer_to_tensor_us / s.chunks)
+                  << " avg_transfer_submit_us="
+                  << (s.transfer_submit_us / s.chunks)
+                  << " avg_transfer_wait_us="
+                  << (s.transfer_wait_us / s.chunks)
+                  << " avg_transfer_polls="
+                  << (s.transfer_poll_count / s.chunks)
+                  << " avg_signal_submit_us="
+                  << (s.signal_submit_us / s.chunks)
+                  << " avg_signal_wait_us=" << (s.signal_wait_us / s.chunks)
+                  << " avg_signal_polls=" << (s.signal_poll_count / s.chunks);
+    }
+}
+
+}  // namespace
 void MooncakeWorker::Start() {
     bool expected = false;
     if (started_.compare_exchange_strong(expected, true)) {
@@ -82,6 +251,21 @@ void MooncakeWorker::startWorker() {
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
+        const bool profile = pgProfileEnabled();
+        const bool skip_self = pgSkipSelfEnabled();
+        const bool profile_detail = pgProfileDetailEnabled();
+        const int profile_rank_filter = pgProfileRankFilter();
+        const uint64_t profile_interval = pgProfileSummaryInterval();
+        PgOpStats profile_stats[64]{};
+        uint64_t profile_chunks = 0;
+        int last_profile_rank = -1;
+        uint64_t task_begin_us[kNumTasks_]{};
+        uint64_t transfer_start_us[kNumTasks_]{};
+        uint64_t transfer_submit_us[kNumTasks_]{};
+        uint64_t transfer_poll_count[kNumTasks_]{};
+        uint64_t signal_start_us[kNumTasks_]{};
+        uint64_t signal_submit_us[kNumTasks_]{};
+        uint64_t signal_poll_count[kNumTasks_]{};
         while (running_) {
             PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -100,19 +284,38 @@ void MooncakeWorker::startWorker() {
                     (c10d::OpType)task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
+                    if (profile) {
+                        task_begin_us[i] = profileNowUs();
+                        transfer_start_us[i] = 0;
+                        transfer_submit_us[i] = 0;
+                        transfer_poll_count[i] = 0;
+                        signal_start_us[i] = 0;
+                        signal_submit_us[i] = 0;
+                        signal_poll_count[i] = 0;
+                    }
                     if (skipTransfer) {
                         submitted_task_sequence_[i].store(
                             submit_sequence, std::memory_order_release);
+                        if (profile) {
+                            transfer_start_us[i] = profileNowUs();
+                        }
                         task_status[i].store(TRANSFERRED_1,
                                              std::memory_order_release);
                         continue;
                     }
+                    const uint64_t transfer_submit_begin_us =
+                        profile ? profileNowUs() : 0;
                     for (size_t j = 0; j < kMaxNumRanks; ++j) {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
+                    const bool skip_self_for_task =
+                        skip_self && pgCanSkipSelf(task.opType);
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
+                            continue;
+                        }
+                        if (skip_self_for_task && j == group->rank) {
                             continue;
                         }
                         if (((c10d::OpType)task.opType ==
@@ -176,9 +379,16 @@ void MooncakeWorker::startWorker() {
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
                     group->engine->submitTransfer(task.batchID, entries);
+                    if (profile) {
+                        transfer_submit_us[i] =
+                            profileNowUs() - transfer_submit_begin_us;
+                    }
                     submitted_task_sequence_[i].store(
                         submit_sequence, std::memory_order_release);
                     activeTime[i] = clock::now();
+                    if (profile) {
+                        transfer_start_us[i] = profileNowUs();
+                    }
                     task_status[i].store(TRANSFERRED_1,
                                          std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
@@ -187,6 +397,9 @@ void MooncakeWorker::startWorker() {
                     TransferStatus status;
 
                     if (!skipTransfer) {
+                        if (profile) {
+                            ++transfer_poll_count[i];
+                        }
                         auto now = clock::now();
                         auto diff = std::chrono::duration_cast<
                             std::chrono::microseconds>(now - activeTime[i]);
@@ -239,18 +452,115 @@ void MooncakeWorker::startWorker() {
                         }
                     }
 
+                    if (group->storeSync) {
+                        const std::string local_key =
+                            pgStoreSyncKey(group, group->rank,
+                                           task.submitSequence);
+                        group->store->set(local_key, "1");
+
+                        std::vector<std::string> keys;
+                        keys.reserve(group->size);
+                        for (int j = 0; j < group->size; ++j) {
+                            if (!group->activeRanks[j]) {
+                                continue;
+                            }
+                            keys.push_back(
+                                pgStoreSyncKey(group, j, task.submitSequence));
+                        }
+                        BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
+                            std::chrono::microseconds(10)));
+                        waiter.wait([&] { return group->store->check(keys); });
+
+                        task_status[i].store(DONE, std::memory_order_release);
+                        task.active = false;
+                        if (hasCallback_[i]) {
+                            auto callback = std::move(callbacks_[i]);
+                            hasCallback_[i] = false;
+                            callback();
+                        }
+                        if (profile &&
+                            (profile_rank_filter < 0 ||
+                             profile_rank_filter == group->rank)) {
+                            const uint64_t done_us = profileNowUs();
+                            const PgProfileSlot slot = profile_slots_[i];
+                            const uint64_t e2e_us = task_begin_us[i]
+                                                         ? done_us -
+                                                               task_begin_us[i]
+                                                         : 0;
+                            const size_t op_index =
+                                static_cast<size_t>(task.opType) < 64
+                                    ? static_cast<size_t>(task.opType)
+                                    : 63;
+                            last_profile_rank = group->rank;
+                            addStats(profile_stats[op_index], task.tensorSize,
+                                     slot, transfer_submit_us[i], 0,
+                                     transfer_poll_count[i], 0, 0, 0, e2e_us);
+                            ++profile_chunks;
+                            if (profile_detail) {
+                                LOG(INFO)
+                                    << "MOONCAKE_PG_PROFILE_DETAIL rank="
+                                    << group->rank << " op="
+                                    << opName(task.opType)
+                                    << " seq=" << task.submitSequence
+                                    << " bytes=" << task.tensorSize
+                                    << " e2e_us=" << e2e_us
+                                    << " store_sync=1";
+                            }
+                            if (profile_chunks % profile_interval == 0) {
+                                logSummary(profile_stats, 64,
+                                           last_profile_rank);
+                            }
+                        }
+                        continue;
+                    }
+
                     auto source_ptr = (int32_t*)group->segmentInfos[group->rank]
                                           .send_sync[task.bufferOffset];
+                    auto local_signal_ptr =
+                        (int32_t*)group->segmentInfos[group->rank]
+                            .recv_sync[task.bufferOffset];
+                    int32_t one = 1;
+                    if (group->syncOnDevice) {
+                        cudaError_t err = cudaMemcpy(source_ptr, &one,
+                                                     sizeof(one),
+                                                     cudaMemcpyHostToDevice);
+                        if (err != cudaSuccess) {
+                            LOG(ERROR)
+                                << "Failed to prepare CUDA PG sync source: "
+                                << cudaGetErrorString(err);
+                        }
+                    }
 
+                    const uint64_t signal_submit_begin_us =
+                        profile ? profileNowUs() : 0;
                     for (size_t j = 0; j < kMaxNumRanks; ++j) {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
+                    const bool skip_self_for_task =
+                        skip_self && pgCanSkipSelf(task.opType);
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
-                        *source_ptr = 1;
+                        if (!group->syncOnDevice) {
+                            *source_ptr = 1;
+                        }
+                        if (skip_self_for_task && j == group->rank) {
+                            if (group->syncOnDevice) {
+                                cudaError_t err = cudaMemcpy(
+                                    local_signal_ptr + j, &one, sizeof(one),
+                                    cudaMemcpyHostToDevice);
+                                if (err != cudaSuccess) {
+                                    LOG(ERROR)
+                                        << "Failed to set local CUDA PG sync: "
+                                        << cudaGetErrorString(err);
+                                }
+                            } else {
+                                local_signal_ptr[j] = 1;
+                            }
+                            continue;
+                        }
                         rankToTaskId[i][j] = entries.size();
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
@@ -265,13 +575,32 @@ void MooncakeWorker::startWorker() {
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
                     group->engine->submitTransfer(task.batchID, entries);
+                    if (profile) {
+                        signal_submit_us[i] =
+                            profileNowUs() - signal_submit_begin_us;
+                    }
                     activeTime[i] = clock::now();
+                    if (profile) {
+                        signal_start_us[i] = profileNowUs();
+                    }
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool task_done = true;
                     auto signal_ptr = (int32_t*)group->segmentInfos[group->rank]
                                           .recv_sync[task.bufferOffset];
+                    int32_t signal_snapshot[kMaxNumRanks]{};
+                    if (group->syncOnDevice) {
+                        cudaError_t err = cudaMemcpy(
+                            signal_snapshot, signal_ptr,
+                            kMaxNumRanks * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost);
+                        if (err != cudaSuccess) {
+                            LOG(ERROR) << "Failed to read CUDA PG sync region: "
+                                       << cudaGetErrorString(err);
+                            task_done = false;
+                        }
+                    }
 
                     auto now = clock::now();
                     auto diff =
@@ -279,6 +608,9 @@ void MooncakeWorker::startWorker() {
                             now - activeTime[i]);
 
                     TransferStatus status;
+                    if (profile) {
+                        ++signal_poll_count[i];
+                    }
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
                             continue;
@@ -288,7 +620,10 @@ void MooncakeWorker::startWorker() {
                         }
                         group->engine->getTransferStatus(
                             task.batchID, rankToTaskId[i][j], status);
-                        if (signal_ptr[j] != 1 ||
+                        const int32_t signal_value = group->syncOnDevice
+                                                         ? signal_snapshot[j]
+                                                         : signal_ptr[j];
+                        if (signal_value != 1 ||
                             status.s != TransferStatusEnum::COMPLETED) {
                             if (status.s == TransferStatusEnum::FAILED ||
                                 (j != group->rank &&
@@ -317,8 +652,18 @@ void MooncakeWorker::startWorker() {
                         activeTime[i] = clock::now();
                     }
                     if (task_done) {
-                        for (int j = 0; j < group->size; ++j) {
-                            signal_ptr[j] = 0;
+                        if (group->syncOnDevice) {
+                            cudaError_t err = cudaMemset(
+                                signal_ptr, 0, kMaxNumRanks * sizeof(int32_t));
+                            if (err != cudaSuccess) {
+                                LOG(ERROR)
+                                    << "Failed to reset CUDA PG sync region: "
+                                    << cudaGetErrorString(err);
+                            }
+                        } else {
+                            for (int j = 0; j < group->size; ++j) {
+                                signal_ptr[j] = 0;
+                            }
                         }
                         task_status[i].store(DONE, std::memory_order_release);
                         task.active = false;
@@ -336,9 +681,81 @@ void MooncakeWorker::startWorker() {
                                    "failure (likely caused by a timeout): "
                                 << s.message();
                         }
+                        if (profile &&
+                            (profile_rank_filter < 0 ||
+                             profile_rank_filter == group->rank)) {
+                            const uint64_t done_us = profileNowUs();
+                            const PgProfileSlot slot = profile_slots_[i];
+                            uint64_t transfer_wait_us = 0;
+                            if (transfer_start_us[i] && signal_start_us[i] &&
+                                !skipTransfer) {
+                                const uint64_t signal_submit_begin_us =
+                                    signal_start_us[i] > signal_submit_us[i]
+                                        ? signal_start_us[i] -
+                                              signal_submit_us[i]
+                                        : signal_start_us[i];
+                                transfer_wait_us = signal_submit_begin_us >
+                                                           transfer_start_us[i]
+                                                       ? signal_submit_begin_us -
+                                                             transfer_start_us[i]
+                                                       : 0;
+                            }
+                            const uint64_t signal_wait_us = signal_start_us[i]
+                                                                ? done_us -
+                                                                      signal_start_us[i]
+                                                                : 0;
+                            const uint64_t e2e_us =
+                                task_begin_us[i] ? done_us - task_begin_us[i]
+                                                 : 0;
+                            const size_t op_index =
+                                static_cast<size_t>(task.opType) < 64
+                                    ? static_cast<size_t>(task.opType)
+                                    : 63;
+                            last_profile_rank = group->rank;
+                            addStats(profile_stats[op_index], task.tensorSize,
+                                     slot, transfer_submit_us[i],
+                                     transfer_wait_us, transfer_poll_count[i],
+                                     signal_submit_us[i], signal_wait_us,
+                                     signal_poll_count[i], e2e_us);
+                            ++profile_chunks;
+                            if (profile_detail) {
+                                LOG(INFO)
+                                    << "MOONCAKE_PG_PROFILE_DETAIL rank="
+                                    << group->rank << " op="
+                                    << opName(task.opType)
+                                    << " op_id=" << task.opType
+                                    << " seq=" << task.submitSequence
+                                    << " bytes=" << task.tensorSize
+                                    << " e2e_us=" << e2e_us
+                                    << " host_issue_us=" << slot.host_issue_us
+                                    << " wait_conn_us=" << slot.wait_conn_us
+                                    << " tensor_to_buffer_us="
+                                    << slot.tensor_to_buffer_us
+                                    << " enqueue_us=" << slot.enqueue_us
+                                    << " buffer_to_tensor_us="
+                                    << slot.buffer_to_tensor_us
+                                    << " transfer_submit_us="
+                                    << transfer_submit_us[i]
+                                    << " transfer_wait_us="
+                                    << transfer_wait_us
+                                    << " transfer_polls="
+                                    << transfer_poll_count[i]
+                                    << " signal_submit_us="
+                                    << signal_submit_us[i]
+                                    << " signal_wait_us=" << signal_wait_us
+                                    << " signal_polls="
+                                    << signal_poll_count[i];
+                            }
+                            if (profile_chunks % profile_interval == 0) {
+                                logSummary(profile_stats, 64, group->rank);
+                            }
+                        }
                     }
                 }
             }
+        }
+        if (profile && profile_chunks > 0) {
+            logSummary(profile_stats, 64, last_profile_rank);
         }
     });
 }

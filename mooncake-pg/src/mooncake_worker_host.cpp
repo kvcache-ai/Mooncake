@@ -3,6 +3,8 @@
 // from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
 
 #include <mooncake_backend.h>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -13,6 +15,47 @@
 #include "pg_utils.h"
 
 namespace mooncake {
+
+namespace {
+
+bool pgProfileEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOONCAKE_PG_PROFILE");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool pgSkipSelfEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOONCAKE_PG_SKIP_SELF");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool pgCanSkipSelf(c10d::OpType opType) {
+    switch (opType) {
+        case c10d::OpType::ALLREDUCE:
+        case c10d::OpType::ALLGATHER:
+        case c10d::OpType::_ALLGATHER_BASE:
+        case c10d::OpType::_REDUCE_SCATTER_BASE:
+        case c10d::OpType::ALLTOALL:
+        case c10d::OpType::ALLTOALL_BASE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+uint64_t profileNowUs() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
 
 class MooncakeWorkCpu : public ::c10d::Work {
    public:
@@ -214,6 +257,350 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
     }
 }
 
+void launchP2pReduceScatterSlottedKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t slotStride, int slots, int rank, int numRanks, uint32_t sequence,
+    cudaStream_t stream) {
+    size_t num = tensorSize / output.element_size();
+    switch (output.scalar_type()) {
+        case c10::kByte:
+            launchP2pReduceScatterSlottedKernel_uint8(
+                (uint8_t*)output.data_ptr(), (const uint8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kChar:
+            launchP2pReduceScatterSlottedKernel_int8(
+                (int8_t*)output.data_ptr(), (const int8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kShort:
+            launchP2pReduceScatterSlottedKernel_int16(
+                (int16_t*)output.data_ptr(), (const int16_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kInt:
+            launchP2pReduceScatterSlottedKernel_int32(
+                (int*)output.data_ptr(), (const int*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kLong:
+            launchP2pReduceScatterSlottedKernel_int64(
+                (int64_t*)output.data_ptr(), (const int64_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kFloat:
+            launchP2pReduceScatterSlottedKernel_float(
+                (float*)output.data_ptr(), (const float*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kDouble:
+            launchP2pReduceScatterSlottedKernel_double(
+                (double*)output.data_ptr(), (const double*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kBool:
+            launchP2pReduceScatterSlottedKernel_bool(
+                (bool*)output.data_ptr(), (const bool*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kBFloat16:
+            launchP2pReduceScatterSlottedKernel_bf16(
+                output.data_ptr(), input.data_ptr(), local_recv_base, peer_ptrs,
+                available, num, slotStride, slots, rank, numRanks, sequence,
+                stream);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce_scatter dtype: ",
+                                        output.scalar_type()));
+    }
+}
+
+void launchP2pReduceScatterSlottedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t slotStride, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream) {
+    size_t num = tensorSize / output.element_size();
+    switch (output.scalar_type()) {
+        case c10::kByte:
+            launchP2pReduceScatterSlottedGraphKernel_uint8(
+                (uint8_t*)output.data_ptr(), (const uint8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kChar:
+            launchP2pReduceScatterSlottedGraphKernel_int8(
+                (int8_t*)output.data_ptr(), (const int8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kShort:
+            launchP2pReduceScatterSlottedGraphKernel_int16(
+                (int16_t*)output.data_ptr(), (const int16_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kInt:
+            launchP2pReduceScatterSlottedGraphKernel_int32(
+                (int*)output.data_ptr(), (const int*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kLong:
+            launchP2pReduceScatterSlottedGraphKernel_int64(
+                (int64_t*)output.data_ptr(), (const int64_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kFloat:
+            launchP2pReduceScatterSlottedGraphKernel_float(
+                (float*)output.data_ptr(), (const float*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kDouble:
+            launchP2pReduceScatterSlottedGraphKernel_double(
+                (double*)output.data_ptr(), (const double*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kBool:
+            launchP2pReduceScatterSlottedGraphKernel_bool(
+                (bool*)output.data_ptr(), (const bool*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kBFloat16:
+            launchP2pReduceScatterSlottedGraphKernel_bf16(
+                output.data_ptr(), input.data_ptr(), local_recv_base, peer_ptrs,
+                available, num, slotStride, slots, rank, numRanks,
+                baseSequenceSlot, stream);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce_scatter dtype: ",
+                                        output.scalar_type()));
+    }
+}
+
+void launchP2pReduceScatterSlottedChunkedKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t chunkBytes, size_t slotStride, int slots, int rank, int numRanks,
+    uint32_t baseSequence, cudaStream_t stream) {
+    TORCH_CHECK(tensorSize % output.element_size() == 0,
+                "reduce_scatter tensorSize must align to element size");
+    TORCH_CHECK(chunkBytes % output.element_size() == 0,
+                "reduce_scatter chunkBytes must align to element size");
+    size_t fullNum = tensorSize / output.element_size();
+    size_t chunkNum = chunkBytes / output.element_size();
+    switch (output.scalar_type()) {
+        case c10::kByte:
+            launchP2pReduceScatterSlottedChunkedKernel_uint8(
+                (uint8_t*)output.data_ptr(), (const uint8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kChar:
+            launchP2pReduceScatterSlottedChunkedKernel_int8(
+                (int8_t*)output.data_ptr(), (const int8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kShort:
+            launchP2pReduceScatterSlottedChunkedKernel_int16(
+                (int16_t*)output.data_ptr(), (const int16_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kInt:
+            launchP2pReduceScatterSlottedChunkedKernel_int32(
+                (int*)output.data_ptr(), (const int*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kLong:
+            launchP2pReduceScatterSlottedChunkedKernel_int64(
+                (int64_t*)output.data_ptr(), (const int64_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kFloat:
+            launchP2pReduceScatterSlottedChunkedKernel_float(
+                (float*)output.data_ptr(), (const float*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kDouble:
+            launchP2pReduceScatterSlottedChunkedKernel_double(
+                (double*)output.data_ptr(), (const double*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kBool:
+            launchP2pReduceScatterSlottedChunkedKernel_bool(
+                (bool*)output.data_ptr(), (const bool*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequence, stream);
+            break;
+        case c10::kBFloat16:
+            launchP2pReduceScatterSlottedChunkedKernel_bf16(
+                output.data_ptr(), input.data_ptr(), local_recv_base, peer_ptrs,
+                available, fullNum, chunkNum, slotStride, slots, rank, numRanks,
+                baseSequence, stream);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce_scatter dtype: ",
+                                        output.scalar_type()));
+    }
+}
+
+void launchP2pReduceScatterSlottedChunkedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t chunkBytes, size_t slotStride, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream) {
+    TORCH_CHECK(tensorSize % output.element_size() == 0,
+                "reduce_scatter tensorSize must align to element size");
+    TORCH_CHECK(chunkBytes % output.element_size() == 0,
+                "reduce_scatter chunkBytes must align to element size");
+    size_t fullNum = tensorSize / output.element_size();
+    size_t chunkNum = chunkBytes / output.element_size();
+    switch (output.scalar_type()) {
+        case c10::kByte:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_uint8(
+                (uint8_t*)output.data_ptr(), (const uint8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kChar:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_int8(
+                (int8_t*)output.data_ptr(), (const int8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kShort:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_int16(
+                (int16_t*)output.data_ptr(), (const int16_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kInt:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_int32(
+                (int*)output.data_ptr(), (const int*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kLong:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_int64(
+                (int64_t*)output.data_ptr(), (const int64_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kFloat:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_float(
+                (float*)output.data_ptr(), (const float*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kDouble:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_double(
+                (double*)output.data_ptr(), (const double*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kBool:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_bool(
+                (bool*)output.data_ptr(), (const bool*)input.data_ptr(),
+                local_recv_base, peer_ptrs, available, fullNum, chunkNum,
+                slotStride, slots, rank, numRanks, baseSequenceSlot, stream);
+            break;
+        case c10::kBFloat16:
+            launchP2pReduceScatterSlottedChunkedGraphKernel_bf16(
+                output.data_ptr(), input.data_ptr(), local_recv_base, peer_ptrs,
+                available, fullNum, chunkNum, slotStride, slots, rank, numRanks,
+                baseSequenceSlot, stream);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce_scatter dtype: ",
+                                        output.scalar_type()));
+    }
+}
+
+void launchP2pAllReduceSlottedKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream) {
+    size_t num = tensorSize / tensor.element_size();
+    switch (tensor.scalar_type()) {
+        case c10::kByte:
+            launchP2pAllReduceSlottedKernel_uint8(
+                (uint8_t*)tensor.data_ptr(), (const uint8_t*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kChar:
+            launchP2pAllReduceSlottedKernel_int8(
+                (int8_t*)tensor.data_ptr(), (const int8_t*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kShort:
+            launchP2pAllReduceSlottedKernel_int16(
+                (int16_t*)tensor.data_ptr(), (const int16_t*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kInt:
+            launchP2pAllReduceSlottedKernel_int32(
+                (int*)tensor.data_ptr(), (const int*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kLong:
+            launchP2pAllReduceSlottedKernel_int64(
+                (int64_t*)tensor.data_ptr(), (const int64_t*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kFloat:
+            launchP2pAllReduceSlottedKernel_float(
+                (float*)tensor.data_ptr(), (const float*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kDouble:
+            launchP2pAllReduceSlottedKernel_double(
+                (double*)tensor.data_ptr(), (const double*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kBool:
+            launchP2pAllReduceSlottedKernel_bool(
+                (bool*)tensor.data_ptr(), (const bool*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                rank, numRanks, sequence, stream);
+            break;
+        case c10::kBFloat16:
+            launchP2pAllReduceSlottedKernel_bf16(
+                tensor.data_ptr(), tensor.data_ptr(), local_recv_base, peer_ptrs,
+                available, num, slotStride, slots, rank, numRanks, sequence,
+                stream);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported all_reduce dtype: ",
+                                        tensor.scalar_type()));
+    }
+}
+
 template <typename T>
 T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
     switch (op) {
@@ -406,7 +793,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
                              const at::cuda::CUDAStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
                              const at::cuda::CUDAStream&)>& bufferToTensor) {
+    const bool profile = pgProfileEnabled();
+    const uint64_t api_start_us = profile ? profileNowUs() : 0;
     connection_ctx->waitUntilNewRanksConnected();
+    const uint64_t wait_conn_us = profile ? profileNowUs() - api_start_us : 0;
 
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
@@ -427,9 +817,38 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
         submitted_tasks.push_back(
             {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
+        uint64_t issue_start_us = 0;
+        uint64_t before_us = 0;
+        uint64_t tensor_to_buffer_us = 0;
+        uint64_t enqueue_us = 0;
+        uint64_t buffer_to_tensor_us = 0;
+        if (profile) {
+            issue_start_us = profileNowUs();
+            before_us = issue_start_us;
+        }
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             pos, realSize, enq_stream);
+        if (pgSkipSelfEnabled() && pgCanSkipSelf(opType) &&
+            meta->activeRanks[meta->rank]) {
+            uint64_t self_source =
+                meta->segmentInfos[meta->rank].send_buffer[bufferOffset];
+            if (opType == c10d::OpType::_REDUCE_SCATTER_BASE ||
+                opType == c10d::OpType::ALLTOALL ||
+                opType == c10d::OpType::ALLTOALL_BASE) {
+                self_source += meta->rank * realSize;
+            }
+            uint64_t self_target =
+                meta->segmentInfos[meta->rank].recv_buffer[bufferOffset] +
+                meta->rank * realSize;
+            cudaMemcpyAsync((void*)self_target, (void*)self_source, realSize,
+                            cudaMemcpyDeviceToDevice, enq_stream);
+        }
+        if (profile) {
+            const uint64_t now_us = profileNowUs();
+            tensor_to_buffer_us = now_us - before_us;
+            before_us = now_us;
+        }
 
         hasCallback_[taskId] = false;
         launchEnqueueTaskKernel(
@@ -437,9 +856,27 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId,
             enq_stream.stream());
+        if (profile) {
+            const uint64_t now_us = profileNowUs();
+            enqueue_us = now_us - before_us;
+            before_us = now_us;
+        }
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream);
+        if (profile) {
+            const uint64_t now_us = profileNowUs();
+            buffer_to_tensor_us = now_us - before_us;
+            PgProfileSlot slot;
+            slot.sequence = taskSequence;
+            slot.issue_start_us = issue_start_us;
+            slot.wait_conn_us = pos == 0 ? wait_conn_us : 0;
+            slot.tensor_to_buffer_us = tensor_to_buffer_us;
+            slot.enqueue_us = enqueue_us;
+            slot.buffer_to_tensor_us = buffer_to_tensor_us;
+            slot.host_issue_us = now_us - issue_start_us;
+            profile_slots_[taskId] = slot;
+        }
 
         ++cudaTaskCount;
         ++meta->taskCount;

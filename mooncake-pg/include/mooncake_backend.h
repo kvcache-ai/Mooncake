@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <mooncake_worker.cuh>
 #include <connection_poller.h>
@@ -13,6 +14,7 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <transport/device/device_transport.h>
 #include <transfer_engine.h>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -218,6 +220,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void publishLocalPeerMetadata();
     void maybeInitDeviceCollectiveRuntime();
     void resetDeviceCollectiveRuntime();
+    bool allActivePeersOnSameHost() const;
+    void maybeInitDirectP2pAllgather();
     void setLocalOnlyActiveRanks();
     void syncActiveRanksTensor();
 
@@ -238,6 +242,23 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
+    bool syncRegionsOnDevice_{false};
+    bool directP2pAllgatherReady_{false};
+    uint32_t directP2pAllgatherSequence_{1};
+    uint32_t* directP2pDeviceSequenceCounter_{nullptr};
+    uint32_t* directP2pDeviceSequenceSlots_{nullptr};
+    uint32_t directP2pDeviceSequenceSlotCursor_{0};
+    std::unique_ptr<device::P2pTransport> directP2pTransport_;
+    std::vector<void*> directP2pPeerPtrsHost_;
+    struct DirectP2pOutputPeerCache {
+        void** peer_ptrs_dev{nullptr};
+        std::vector<void*> peer_ptrs_host;
+        bool ready{false};
+    };
+    std::unordered_map<uintptr_t, DirectP2pOutputPeerCache>
+        directP2pOutputPeerCache_;
+    uint32_t* directP2pHostSignals_{nullptr};
+    size_t directP2pHostSignalsBytes_{0};
     SegmentInfo rank_info;
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};

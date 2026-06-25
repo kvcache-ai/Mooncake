@@ -332,6 +332,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
         // Explicit env var overrides take priority over HCA auto-detection
         if (intra_env) {
+            const char* mixed_nvlink = getenv("MC_PG_NVLINK_MIXED");
+            if (mixed_nvlink && mixed_nvlink[0] != '\0' &&
+                mixed_nvlink[0] != '0') {
+                Transport* rdma_transport =
+                    multi_transports_->installTransport("rdma", local_topology_);
+                if (!rdma_transport) {
+                    LOG(ERROR) << "Failed to install RDMA transport for mixed "
+                                  "PG NVLink mode";
+                    return -1;
+                }
+            }
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
