@@ -2459,6 +2459,7 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     result = transfer.get_dataproto(ref)
 
     assert set(ref.encoded_non_tensor) == {"text", "json", "blob", "nullable_int"}
+    assert ref.encoded_non_tensor["json"]["codec"] == "msgpack_ragged"
     assert result["non_tensor_batch"]["text"].tolist() == [
         "hello",
         None,
@@ -2508,3 +2509,187 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     assert actual[1] is None
     assert torch.equal(actual[2], ragged[2])
     assert torch.equal(actual[3], ragged[3])
+
+
+def _assert_tensor_object_equal(actual, expected) -> None:
+    torch = pytest.importorskip("torch")
+    if expected is None:
+        assert actual is None
+        return
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert set(actual) == set(expected)
+        for key, value in expected.items():
+            _assert_tensor_object_equal(actual[key], value)
+        return
+    if isinstance(expected, list):
+        assert isinstance(actual, list)
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_tensor_object_equal(actual_item, expected_item)
+        return
+    if isinstance(expected, torch.Tensor):
+        assert torch.equal(actual, expected)
+        return
+    assert actual == expected
+
+
+def test_dataproto_helper_dict_of_tensors_object_array_roundtrip() -> None:
+    torch = pytest.importorskip("torch")
+    _store, transfer = make_transfer()
+    samples = np.asarray(
+        [
+            {"tokens": torch.arange(2, dtype=torch.int64), "reward": 1.0},
+            {"tokens": torch.arange(3, dtype=torch.int64), "reward": 2.0},
+            {"tokens": torch.arange(1, dtype=torch.int64), "reward": None},
+            {"tokens": None, "reward": 4.0},
+        ],
+        dtype=object,
+    )
+
+    ref = transfer.put_dataproto(
+        SimpleDataProto(
+            batch={"input_ids": np.arange(8, dtype=np.int64).reshape(4, 2)},
+            non_tensor_batch={"samples": samples},
+            meta_info={"source": "dict-of-tensors"},
+        )
+    )
+    result = transfer.get_dataproto(ref)
+    view = transfer.dataproto_manifest_view(ref)
+
+    assert ref.encoded_non_tensor["samples"]["codec"] == "structured_recursive"
+    assert view["non_tensor_fields"]["samples"]["spec"]["codec"] == "structured_recursive"
+    assert result["meta_info"] == {"source": "dict-of-tensors"}
+    actual = result["non_tensor_batch"]["samples"]
+    for row, expected in enumerate(samples):
+        _assert_tensor_object_equal(actual[row], expected)
+
+
+def test_dataproto_helper_dict_of_tensors_distinguishes_missing_keys_and_nulls() -> None:
+    torch = pytest.importorskip("torch")
+    _store, transfer = make_transfer()
+    samples = np.asarray(
+        [
+            {"tokens": torch.arange(2), "label": None},
+            {"label": 1},
+            None,
+            {"tokens": None, "label": 3},
+        ],
+        dtype=object,
+    )
+
+    ref = transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"samples": samples}))
+    actual = transfer.get_dataproto(ref)["non_tensor_batch"]["samples"]
+
+    assert "tokens" in actual[0]
+    assert actual[0]["label"] is None
+    assert "tokens" not in actual[1]
+    assert actual[1]["label"] == 1
+    assert actual[2] is None
+    assert "tokens" in actual[3]
+    assert actual[3]["tokens"] is None
+    assert actual[3]["label"] == 3
+
+
+def test_dataproto_helper_nested_tensor_object_array_rows() -> None:
+    torch = pytest.importorskip("torch")
+    _store, transfer = make_transfer()
+    samples = np.asarray(
+        [
+            {"images": [{"pixels": torch.arange(2)}], "meta": {"rank": 0}},
+            {"images": [{"pixels": torch.arange(3)}, {"pixels": None}], "meta": {}},
+            {"images": [], "meta": {"rank": None}},
+        ],
+        dtype=object,
+    )
+
+    ref = transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"samples": samples}))
+    actual = transfer.get_dataproto(ref)["non_tensor_batch"]["samples"]
+
+    for row, expected in enumerate(samples):
+        _assert_tensor_object_equal(actual[row], expected)
+
+
+def test_dataproto_helper_reads_dict_of_tensors_rows_and_selected_field() -> None:
+    torch = pytest.importorskip("torch")
+    _store, transfer = make_transfer()
+    samples = np.asarray(
+        [
+            {"tokens": torch.arange(i + 1, dtype=torch.int64), "row": i}
+            for i in range(6)
+        ],
+        dtype=object,
+    )
+    samples[2] = {"tokens": None, "row": 2}
+    samples[4] = None
+    input_ids = np.arange(12, dtype=np.int64).reshape(6, 2)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(
+            batch={"input_ids": input_ids},
+            non_tensor_batch={"samples": samples},
+            meta_info={"kind": "dict-tensor"},
+        )
+    )
+
+    sliced = transfer.get_dataproto(ref, fields=["samples"], rows=slice(1, 5))
+    gathered = transfer.get_dataproto(ref, fields=["input_ids", "samples"], rows=[5, 0, 2, 4])
+
+    assert sliced["batch"] == {}
+    assert sliced["meta_info"] == {"kind": "dict-tensor"}
+    for row, expected in enumerate(samples[1:5]):
+        _assert_tensor_object_equal(sliced["non_tensor_batch"]["samples"][row], expected)
+    assert np.array_equal(gathered["batch"]["input_ids"], input_ids[[5, 0, 2, 4]])
+    for row, expected_index in enumerate([5, 0, 2, 4]):
+        _assert_tensor_object_equal(
+            gathered["non_tensor_batch"]["samples"][row], samples[expected_index]
+        )
+
+
+def test_dataproto_helper_recursive_manifest_export_append_and_overwrite() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    input_ids = np.arange(4, dtype=np.int64)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"input_ids": input_ids}), stage="rollout")
+    samples = np.asarray(
+        [
+            {"tokens": torch.arange(1, dtype=torch.float32), "score": 0.0},
+            {"tokens": torch.arange(2, dtype=torch.float32), "score": 1.0},
+            {"tokens": torch.arange(3, dtype=torch.float32), "score": None},
+            {"tokens": None, "score": 3.0},
+        ],
+        dtype=object,
+    )
+
+    ref = transfer.append_dataproto_fields(
+        ref,
+        SimpleDataProto(non_tensor_batch={"samples": samples}, meta_info={"stage": "samples"}),
+        stage="rollout",
+    )
+    handle = export_dataproto_ref(ref)
+    json.dumps(handle)
+    imported = import_dataproto_ref(handle)
+    result = transfer.get_dataproto(imported)
+    view = transfer.dataproto_manifest_view(imported)
+
+    assert np.array_equal(result["batch"]["input_ids"], input_ids)
+    _assert_tensor_object_equal(result["non_tensor_batch"]["samples"][1], samples[1])
+    spec = view["non_tensor_fields"]["samples"]["spec"]
+    assert spec["codec"] == "structured_recursive"
+    assert spec["metadata"]["nodes"]
+    assert spec["metadata"]["leaves"]
+    assert any(name.endswith(".missing") for name in spec["payload_members"])
+
+    old_manifest_key = ref.stage_refs["rollout"].manifest_key
+    ref = transfer.append_dataproto_fields(
+        ref,
+        SimpleDataProto(
+            batch={"input_ids": input_ids},
+            non_tensor_batch={"samples": np.asarray(["a", "b", "c", "d"], dtype=object)},
+        ),
+        stage="rollout",
+        overwrite=True,
+    )
+    overwritten = transfer.get_dataproto(ref)
+    assert ref.encoded_non_tensor["samples"]["codec"] == "utf8_ragged"
+    assert overwritten["non_tensor_batch"]["samples"].tolist() == ["a", "b", "c", "d"]
+    assert old_manifest_key not in store.objects

@@ -16,6 +16,8 @@ try:
 except Exception:  # pragma: no cover - depends on built extension
     _mooncake_store = None  # type: ignore[assignment]
 
+import msgpack as _msgpack
+
 DEFAULT_BUNDLE_CHUNK_BYTES = 512 * 1024**2
 AUTO_PARALLEL_MIN_BYTES = 4 * 1024**3
 AUTO_PARALLEL_MIN_CHUNKS = 8
@@ -598,8 +600,8 @@ class MooncakeBundleTransfer:
                     payload_name: result.objects[member]
                     for payload_name, member in encoded["payload_members"].items()
                 }
-                values = _decode_structured_leaf(
-                    encoded["codec"], payload, ref.batch_size, encoded.get("metadata")
+                values = _decode_structured_non_tensor_encoded(
+                    encoded, payload, ref.batch_size, encoded.get("metadata")
                 )
             elif row_indices is not None:
                 payload, metadata = self._read_structured_non_tensor_payload_indices(
@@ -607,8 +609,8 @@ class MooncakeBundleTransfer:
                     encoded,
                     row_indices,
                 )
-                values = _decode_structured_leaf(
-                    encoded["codec"], payload, output_rows, metadata
+                values = _decode_structured_non_tensor_encoded(
+                    encoded, payload, output_rows, metadata
                 )
             else:
                 payload, metadata = self._read_structured_non_tensor_payload_slice(
@@ -617,8 +619,8 @@ class MooncakeBundleTransfer:
                     row_slice,
                     ref.batch_size,
                 )
-                values = _decode_structured_leaf(
-                    encoded["codec"], payload, output_rows, metadata
+                values = _decode_structured_non_tensor_encoded(
+                    encoded, payload, output_rows, metadata
                 )
             array = np.empty(output_rows, dtype=object)
             array[:] = values
@@ -835,6 +837,38 @@ class MooncakeBundleTransfer:
             )
             return array
 
+        if _is_recursive_encoded_non_tensor(encoded):
+            recursive_payload: dict[str, Any] = {}
+            for node in metadata.get("nodes", []):
+                for key in ("missing_payload", "row_mask_payload", "lengths_payload"):
+                    payload_name = node.get(key)
+                    if payload_name is not None:
+                        recursive_payload[payload_name] = read_member_indices(
+                            payload_name, indices
+                        )
+            for leaf in metadata.get("leaves", []):
+                leaf_payload_members = leaf["payload_members"]
+                flat_payload_members = {
+                    name: payload_members[global_name]
+                    for name, global_name in leaf_payload_members.items()
+                    if name != "missing"
+                }
+                leaf_payload, _leaf_metadata = self._read_structured_non_tensor_payload_indices(
+                    stage_ref,
+                    {
+                        "codec": leaf["codec"],
+                        "metadata": leaf.get("metadata") or {},
+                        "payload_members": flat_payload_members,
+                    },
+                    indices,
+                )
+                for name, value in leaf_payload.items():
+                    recursive_payload[leaf_payload_members[name]] = value
+                recursive_payload[leaf_payload_members["missing"]] = read_member_indices(
+                    leaf_payload_members["missing"], indices
+                )
+            return recursive_payload, metadata
+
         if codec == "ndarray":
             return {
                 "data": read_member_indices("data", indices),
@@ -873,7 +907,7 @@ class MooncakeBundleTransfer:
                 "nulls": read_member_indices("nulls", indices),
             }, metadata
 
-        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "json_ragged"}:
+        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "msgpack_ragged", "json_ragged"}:
             offsets = read_member_indices(
                 "offsets", [index for row in indices for index in (row, row + 1)]
             )
@@ -986,6 +1020,37 @@ class MooncakeBundleTransfer:
                 payload_spec, byte_start, byte_end - byte_start
             )
 
+        if _is_recursive_encoded_non_tensor(encoded):
+            recursive_payload: dict[str, Any] = {}
+            for node in metadata.get("nodes", []):
+                for key in ("missing_payload", "row_mask_payload", "lengths_payload"):
+                    payload_name = node.get(key)
+                    if payload_name is not None:
+                        recursive_payload[payload_name] = read_member(payload_name, start, end)
+            for leaf in metadata.get("leaves", []):
+                leaf_payload_members = leaf["payload_members"]
+                flat_payload_members = {
+                    name: payload_members[global_name]
+                    for name, global_name in leaf_payload_members.items()
+                    if name != "missing"
+                }
+                leaf_payload, _leaf_metadata = self._read_structured_non_tensor_payload_slice(
+                    stage_ref,
+                    {
+                        "codec": leaf["codec"],
+                        "metadata": leaf.get("metadata") or {},
+                        "payload_members": flat_payload_members,
+                    },
+                    row_slice,
+                    total_rows,
+                )
+                for name, value in leaf_payload.items():
+                    recursive_payload[leaf_payload_members[name]] = value
+                recursive_payload[leaf_payload_members["missing"]] = read_member(
+                    leaf_payload_members["missing"], start, end
+                )
+            return recursive_payload, metadata
+
         if codec == "ndarray":
             return {
                 "data": read_member("data", start, end),
@@ -1005,7 +1070,7 @@ class MooncakeBundleTransfer:
                 "nulls": read_member("nulls", start, end),
             }, metadata
 
-        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "json_ragged"}:
+        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "msgpack_ragged", "json_ragged"}:
             offsets = read_member("offsets", start, end + 1)
             base = int(offsets[0])
             limit = int(offsets[-1])
@@ -1524,8 +1589,154 @@ def _encode_structured_non_tensor_field(
     path: str, value: np.ndarray
 ) -> _EncodedStructuredLeaf:
     values = list(value)
+    leaves: list[_InferredLeaf] = []
+    nodes: list[_InferredNode] = []
+    infer_structure(path, values, leaves, nodes)
+    if nodes and _should_encode_recursive_structure(leaves):
+        return _encode_recursive_structured_non_tensor_field(path, values, leaves, nodes)
     decision = _choose_leaf_codec(values)
     return _encode_structured_leaf(values, decision)
+
+
+def _should_encode_recursive_structure(leaves: Sequence[_InferredLeaf]) -> bool:
+    return any(leaf.decision.codec == "ragged_tensor" for leaf in leaves)
+
+
+def _recursive_leaf_decision(values: list[Any], decision: _CodecDecision) -> _CodecDecision:
+    if decision.accepted:
+        return decision
+    if all(value is None or isinstance(value, _Missing) for value in values):
+        return _CodecDecision(
+            True,
+            "json_ragged",
+            "all rows are null or missing",
+            "json",
+        )
+    return decision
+
+
+def _encode_recursive_structured_non_tensor_field(
+    path: str,
+    values: list[Any],
+    leaves: Sequence[_InferredLeaf],
+    nodes: Sequence[_InferredNode],
+) -> _EncodedStructuredLeaf:
+    payload: dict[str, Any] = {}
+    node_specs: list[dict[str, Any]] = []
+    for node_id, node in enumerate(nodes):
+        spec: dict[str, Any] = {
+            "id": node_id,
+            "path": node.path,
+            "node_type": node.node_type,
+            "children": list(node.children),
+        }
+        missing_payload_name = f"node.{node_id}.missing"
+        payload[missing_payload_name] = np.asarray(
+            [_lookup_structured_path(value, path, node.path) is MISSING for value in values],
+            dtype=np.bool_,
+        )
+        spec["missing_payload"] = missing_payload_name
+        if node.row_mask is not None:
+            payload_name = f"node.{node_id}.row_mask"
+            payload[payload_name] = np.asarray(node.row_mask, dtype=np.bool_)
+            spec["row_mask_payload"] = payload_name
+        if node.lengths is not None:
+            payload_name = f"node.{node_id}.lengths"
+            payload[payload_name] = np.asarray(node.lengths, dtype=np.int64)
+            spec["lengths_payload"] = payload_name
+        node_specs.append(spec)
+
+    leaf_specs: list[dict[str, Any]] = []
+    for leaf_id, leaf in enumerate(leaves):
+        missing = np.asarray(
+            [isinstance(value, _Missing) for value in leaf.values], dtype=np.bool_
+        )
+        codec_values = [None if is_missing else value for is_missing, value in zip(missing, leaf.values)]
+        decision = _recursive_leaf_decision(leaf.values, leaf.decision)
+        encoded = _encode_structured_leaf(codec_values, decision)
+        leaf_payload_members: dict[str, str] = {}
+        for payload_name, payload_value in encoded.payload.items():
+            recursive_payload_name = f"leaf.{leaf_id}.{payload_name}"
+            payload[recursive_payload_name] = payload_value
+            leaf_payload_members[payload_name] = recursive_payload_name
+        missing_payload_name = f"leaf.{leaf_id}.missing"
+        payload[missing_payload_name] = missing
+        leaf_payload_members["missing"] = missing_payload_name
+        leaf_specs.append(
+            {
+                "id": leaf_id,
+                "path": leaf.path,
+                "codec": encoded.codec,
+                "rows": encoded.rows,
+                "metadata": encoded.metadata,
+                "payload_members": leaf_payload_members,
+            }
+        )
+
+    return _EncodedStructuredLeaf(
+        codec="structured_recursive",
+        rows=len(values),
+        payload=payload,
+        metadata={
+            "schema_source": "inferred_from_runtime_values",
+            "structure_version": 1,
+            "root_path": path,
+            "nodes": node_specs,
+            "leaves": leaf_specs,
+        },
+    )
+
+
+def _is_recursive_encoded_non_tensor(encoded: Mapping[str, Any]) -> bool:
+    return encoded.get("codec") == "structured_recursive"
+
+
+def _structured_path_tokens(path: str) -> list[Any]:
+    tokens: list[Any] = []
+    index = 0
+    current = []
+    while index < len(path):
+        char = path[index]
+        if char == "\\":
+            index += 1
+            if index < len(path):
+                current.append(path[index])
+        elif char == ".":
+            tokens.append("".join(current))
+            current = []
+        elif char == "[":
+            if current:
+                tokens.append("".join(current))
+                current = []
+            end = path.index("]", index)
+            tokens.append(int(path[index + 1 : end]))
+            index = end
+        else:
+            current.append(char)
+        index += 1
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _lookup_structured_path(value: Any, root_path: str, path: str) -> Any:
+    root_tokens = _structured_path_tokens(root_path)
+    path_tokens = _structured_path_tokens(path)
+    current = value
+    for token in path_tokens[len(root_tokens) :]:
+        if isinstance(token, str):
+            if current is None:
+                return None
+            if isinstance(current, _Missing) or not isinstance(current, dict):
+                return MISSING
+            current = current.get(token, MISSING)
+            continue
+        if current is None:
+            return None
+        if isinstance(current, _Missing) or not isinstance(current, (list, tuple)):
+            return MISSING
+        current = current[token] if token < len(current) else MISSING
+    return current
 
 
 def _encode_structured_leaf(
@@ -1550,14 +1761,23 @@ def _encode_structured_leaf(
         payload, metadata = _encode_bytes_like_values(
             [None if value is None else value.encode("utf-8") for value in values]
         )
+    elif codec == "msgpack_ragged":
+        payload, metadata = _encode_bytes_like_values(
+            [
+                None
+                if value is None
+                else _msgpack.packb(value, use_bin_type=True, strict_types=True)
+                for value in values
+            ]
+        )
     elif codec == "json_ragged":
         payload, metadata = _encode_bytes_like_values(
             [
                 None
                 if value is None
-                else json.dumps(
-                    value, ensure_ascii=False, separators=(",", ":")
-                ).encode("utf-8")
+                else json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
                 for value in values
             ]
         )
@@ -1576,6 +1796,99 @@ def _encode_structured_leaf(
     return _EncodedStructuredLeaf(
         codec=codec, rows=len(values), payload=payload, metadata=metadata
     )
+
+
+
+def _decode_structured_non_tensor_encoded(
+    encoded: Mapping[str, Any],
+    payload: dict[str, Any],
+    rows: int,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> list[Any]:
+    if _is_recursive_encoded_non_tensor(encoded):
+        return _decode_structured_recursive_field(encoded, payload, rows)
+    return _decode_structured_leaf(encoded["codec"], payload, rows, metadata)
+
+
+def _decode_structured_recursive_field(
+    encoded: Mapping[str, Any], payload: dict[str, Any], rows: int
+) -> list[Any]:
+    metadata = encoded.get("metadata") or {}
+    leaf_values: dict[str, list[Any]] = {}
+    for leaf in metadata.get("leaves", []):
+        leaf_payload_members = leaf["payload_members"]
+        leaf_payload = {
+            name: payload[global_name]
+            for name, global_name in leaf_payload_members.items()
+            if name != "missing"
+        }
+        values = _decode_structured_leaf(
+            leaf["codec"], leaf_payload, rows, leaf.get("metadata")
+        )
+        missing = payload[leaf_payload_members["missing"]]
+        leaf_values[leaf["path"]] = [
+            MISSING if bool(missing[row]) else values[row] for row in range(rows)
+        ]
+    return _reconstruct_structured_rows(metadata, payload, leaf_values, rows)
+
+
+def _child_path(node: Mapping[str, Any], child: Any) -> str:
+    if node["node_type"] == "dict":
+        return f"{node['path']}.{_escape_key(str(child))}"
+    return f"{node['path']}[{int(child)}]"
+
+
+def _path_depth(path: str) -> int:
+    return path.count(".") + path.count("[")
+
+
+def _reconstruct_structured_rows(
+    metadata: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    leaf_values: Mapping[str, list[Any]],
+    rows: int,
+) -> list[Any]:
+    values_by_path: dict[str, list[Any]] = dict(leaf_values)
+    nodes = sorted(
+        metadata.get("nodes", []), key=lambda node: _path_depth(node["path"]), reverse=True
+    )
+    for node in nodes:
+        missing_payload = node.get("missing_payload")
+        missing = payload[missing_payload] if missing_payload is not None else None
+        row_mask_payload = node.get("row_mask_payload")
+        row_mask = payload[row_mask_payload] if row_mask_payload is not None else None
+        lengths_payload = node.get("lengths_payload")
+        lengths = payload[lengths_payload] if lengths_payload is not None else None
+        node_values = []
+        for row in range(rows):
+            if missing is not None and bool(missing[row]):
+                node_values.append(MISSING)
+                continue
+            if row_mask is not None and not bool(row_mask[row]):
+                node_values.append(None)
+                continue
+            if node["node_type"] == "dict":
+                item = {}
+                for child in node["children"]:
+                    child_values = values_by_path[_child_path(node, child)]
+                    child_value = child_values[row]
+                    if not isinstance(child_value, _Missing):
+                        item[child] = child_value
+                node_values.append(item)
+                continue
+            length = int(lengths[row]) if lengths is not None else len(node["children"])
+            item = [None] * length
+            for child in node["children"]:
+                index = int(child)
+                if index >= length:
+                    continue
+                child_values = values_by_path[_child_path(node, child)]
+                child_value = child_values[row]
+                if not isinstance(child_value, _Missing):
+                    item[index] = child_value
+            node_values.append(item)
+        values_by_path[node["path"]] = node_values
+    return values_by_path[metadata["root_path"]]
 
 
 def _decode_structured_leaf(
@@ -1599,6 +1912,11 @@ def _decode_structured_leaf(
     if codec == "utf8_ragged":
         return [
             None if value is None else value.decode("utf-8")
+            for value in _decode_bytes_like_values(payload, rows)
+        ]
+    if codec == "msgpack_ragged":
+        return [
+            None if value is None else _msgpack.unpackb(value, raw=False)
             for value in _decode_bytes_like_values(payload, rows)
         ]
     if codec == "json_ragged":
@@ -4040,6 +4358,33 @@ def _can_numeric_scalar(values: list[Any]) -> _CodecDecision:
     )
 
 
+def _can_msgpack(values: list[Any]) -> _CodecDecision:
+    nn = _non_null(values)
+    if not nn:
+        return _CodecDecision(False, "msgpack_ragged", "all rows are null", "msgpack")
+    if not all(isinstance(v, (dict, list, tuple)) for v in nn):
+        return _CodecDecision(
+            False, "msgpack_ragged", "not all rows are structured objects", "msgpack"
+        )
+    sampled_bytes = 0
+    for i, v in enumerate(nn):
+        try:
+            encoded = _msgpack.packb(v, use_bin_type=True, strict_types=True)
+        except (TypeError, ValueError, OverflowError):
+            return _CodecDecision(
+                False, "msgpack_ragged", "serialization failed", "msgpack"
+            )
+        if i < _INFER_MAX_SAMPLE_ROWS:
+            sampled_bytes += len(encoded)
+    if sampled_bytes > _INFER_MAX_JSON_BYTES:
+        return _CodecDecision(
+            False, "msgpack_ragged", "sampled payload too large", "msgpack"
+        )
+    return _CodecDecision(
+        True, "msgpack_ragged", "all rows pass msgpack serialization", "msgpack"
+    )
+
+
 def _can_json(values: list[Any]) -> _CodecDecision:
     nn = _non_null(values)
     if not nn:
@@ -4069,6 +4414,7 @@ _CODEC_PREDICATES: tuple[Any, ...] = (
     lambda v: _check_all(v, _is_bytes_like, "bytes_ragged", "bytes-like"),
     lambda v: _check_all(v, _is_pil_image, "media_bytes", "media"),
     lambda v: _check_all(v, lambda x: isinstance(x, str), "utf8_ragged", "str"),
+    _can_msgpack,
     _can_json,
 )
 
