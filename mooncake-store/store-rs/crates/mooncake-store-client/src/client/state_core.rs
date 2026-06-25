@@ -326,9 +326,6 @@ struct SegmentTransportMetadata {
 /// Central state for a storage-owner runtime.  Cold tier fields
 /// (cold_tier_devices, hot_replicas, offload_mode, offload_priority)
 /// are consumed by the offload/restore pipeline.
-#[allow(dead_code)]
-enum DeferredColdTierReconcile {}
-
 struct StorageOwnerState {
     runtime: ClientRuntimeId,
     route_ops: RouteOperations,
@@ -350,7 +347,6 @@ struct StorageOwnerState {
     staging_pool: Mutex<Option<Arc<cold_tier::ColdRestoreStagingPool>>>,
     pending_staging_slots: Mutex<HashMap<(SegmentName, u64), (cold_tier::StagingSlot, Instant)>>,
     staging_pool_bytes: usize,
-    staging_slot_ttl: Duration,
 }
 
 #[derive(Default)]

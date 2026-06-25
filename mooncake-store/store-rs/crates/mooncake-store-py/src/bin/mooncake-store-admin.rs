@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc;
@@ -75,7 +76,7 @@ enum PolicyCommand {
     Get {
         #[command(flatten)]
         scope: OptionalPolicyScopeArgs,
-        #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_EFFECTIVE")]
+        #[arg(long, default_value_t = false)]
         effective: bool,
     },
     Set {
@@ -91,11 +92,11 @@ enum PolicyCommand {
     Delete {
         #[command(flatten)]
         scope: PolicyScopeArgs,
-        #[arg(long, env = "MC_STORE_ADMIN_EXPECTED_VERSION")]
+        #[arg(long)]
         expected_version: Option<u64>,
     },
     List {
-        #[arg(long, env = "MC_STORE_ADMIN_TENANT")]
+        #[arg(long)]
         tenant: Option<String>,
     },
 }
@@ -123,13 +124,13 @@ enum QuotaCommand {
         scope: PolicyScopeArgs,
         #[arg(long, env = "MC_STORE_ADMIN_RESERVATION_ID")]
         reservation_id: String,
-        #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_DRY_RUN")]
+        #[arg(long, default_value_t = false, env = "MC_STORE_ADMIN_DRY_RUN")]
         dry_run: bool,
     },
     Reconcile {
         #[command(flatten)]
         scope: PolicyScopeArgs,
-        #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_DRY_RUN")]
+        #[arg(long, default_value_t = false, env = "MC_STORE_ADMIN_DRY_RUN")]
         dry_run: bool,
     },
 }
@@ -142,15 +143,15 @@ enum MigrateCommand {
         #[arg(
             long = "target-segment",
             required = true,
-            value_delimiter = ',',
-            env = "MC_STORE_ADMIN_TARGET_SEGMENTS"
+            env = "MC_STORE_ADMIN_TARGET_SEGMENTS",
+            value_delimiter = ','
         )]
         target_segments: Vec<String>,
     },
     Move {
         #[command(flatten)]
         common: RouteMigrationArgs,
-        #[arg(long = "target-segment", env = "MC_STORE_ADMIN_TARGET_SEGMENT")]
+        #[arg(long = "target-segment")]
         target_segment: String,
     },
     Task {
@@ -202,6 +203,10 @@ struct TracingOnArgs {
 struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:0", env = "MC_STORE_ADMIN_BIND_ADDR")]
     bind_addr: String,
+    #[arg(long)]
+    auth_token_file: Option<String>,
+    #[arg(long)]
+    insecure_allow_non_loopback: bool,
     #[arg(
         long,
         default_value_t = 5_000,
@@ -218,8 +223,8 @@ struct ServerArgs {
     quota_reconcile_interval_ms: u64,
     #[arg(
         long = "quota-reconcile-tenant",
-        value_delimiter = ',',
-        env = "MC_STORE_ADMIN_QUOTA_RECONCILE_TENANTS"
+        env = "MC_STORE_ADMIN_QUOTA_RECONCILE_TENANTS",
+        value_delimiter = ','
     )]
     quota_reconcile_tenants: Vec<String>,
 }
@@ -246,11 +251,11 @@ struct RouteMigrationArgs {
 
 #[derive(ClapArgs, Clone, Debug)]
 struct OptionalPolicyScopeArgs {
-    #[arg(long, env = "MC_STORE_ADMIN_TENANT")]
+    #[arg(long)]
     tenant: Option<String>,
-    #[arg(long, env = "MC_STORE_ADMIN_DOMAIN")]
+    #[arg(long)]
     domain: Option<String>,
-    #[arg(long, env = "MC_STORE_ADMIN_OBJECT_SET")]
+    #[arg(long)]
     object_set: Option<String>,
 }
 
@@ -282,9 +287,9 @@ struct PolicyValueArgs {
     max_inflight_bytes_per_batch: Option<u64>,
     #[arg(long, env = "MC_STORE_ADMIN_DEFAULT_REPLICA_COUNT")]
     default_replica_count: Option<usize>,
-    #[arg(long, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_PREFER_LOCAL")]
+    #[arg(long, env = "MC_STORE_ADMIN_PREFER_LOCAL")]
     prefer_local: Option<bool>,
-    #[arg(long, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_PREFER_ALLOC_IN_SAME_NODE")]
+    #[arg(long, env = "MC_STORE_ADMIN_PREFER_ALLOC_IN_SAME_NODE")]
     prefer_alloc_in_same_node: Option<bool>,
     #[arg(
         long,
@@ -443,6 +448,8 @@ fn run_tracing_command(args: &Args, command: &TracingCommand) -> Result<(), Box<
 }
 
 fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<dyn Error>> {
+    validate_admin_http_bind(server_args)?;
+    let auth_token = load_admin_auth_token(server_args)?;
     let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
     let maintenance_shutdown = Arc::new(AtomicBool::new(false));
     let maintenance_thread = spawn_stale_segment_maintenance_worker(
@@ -452,8 +459,10 @@ fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<d
     );
     let quota_thread =
         spawn_quota_reconcile_worker(service.clone(), server_args, maintenance_shutdown.clone());
-    let mut server = AdminHttpServerHandle::start(&server_args.bind_addr, service)?;
-    info!(address = %server.address(), "mooncake-store-admin ready");
+    let auth_enabled = auth_token.is_some();
+    let mut server =
+        AdminHttpServerHandle::start_with_auth(&server_args.bind_addr, service, auth_token)?;
+    info!(address = %server.address(), auth_enabled, "admin http server listening");
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     ctrlc::set_handler(move || {
@@ -474,6 +483,38 @@ fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<d
             .map_err(|_| std::io::Error::other("admin quota reconcile worker panicked"))?;
     }
     Ok(())
+}
+
+fn validate_admin_http_bind(server_args: &ServerArgs) -> Result<(), Box<dyn Error>> {
+    let addrs = server_args.bind_addr.to_socket_addrs()?.collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(format!(
+            "admin bind address {} did not resolve",
+            server_args.bind_addr
+        )
+        .into());
+    }
+    if addrs.iter().all(|addr| addr.ip().is_loopback()) {
+        return Ok(());
+    }
+    if server_args.auth_token_file.is_some() || server_args.insecure_allow_non_loopback {
+        return Ok(());
+    }
+    Err(
+        "admin HTTP non-loopback bind requires --auth-token-file or --insecure-allow-non-loopback"
+            .into(),
+    )
+}
+
+fn load_admin_auth_token(server_args: &ServerArgs) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(path) = server_args.auth_token_file.as_deref() else {
+        return Ok(None);
+    };
+    let token = fs::read_to_string(path)?.trim().to_string();
+    if token.is_empty() {
+        return Err(format!("admin auth token file {path} is empty").into());
+    }
+    Ok(Some(token))
 }
 
 fn run_migrate_task_command(
@@ -1598,7 +1639,7 @@ mod tests {
                 ("MC_STORE_ADMIN_KEY", Some("key-env")),
                 ("MC_STORE_ADMIN_RESERVATION_STATE", Some("aborted")),
                 ("MC_STORE_ADMIN_RESERVATION_ID", Some("reservation-env")),
-                ("MC_STORE_ADMIN_DRY_RUN", Some("yes")),
+                ("MC_STORE_ADMIN_DRY_RUN", Some("true")),
             ],
             || {
                 let args = Args::parse_from(["mooncake-store-admin", "quota", "reservations"]);

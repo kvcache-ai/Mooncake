@@ -1,12 +1,81 @@
 use super::super::{
     refresh_cold_tier_device_cache, ObjectRoute, OperationTracker, PendingOffloadPrepareOutcome,
-    Result, StorageOwnerState,
+    RestorePromotionQueue, Result, StorageOwnerState, StoreError,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
+
+impl StorageOwnerState {
+    pub(in super::super) fn evict_all(
+        &self,
+        restore_promotions: &RestorePromotionQueue,
+    ) -> Result<usize> {
+        const MAX_ERROR_RETRIES: usize = 3;
+        const MAX_NO_PROGRESS_RETRIES: usize = 100;
+        const NO_PROGRESS_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+        let mut evicted = 0usize;
+        let mut error_retries = 0usize;
+        let mut no_progress_retries = 0usize;
+        self.rebuild_clock()?;
+        loop {
+            match self.evict_one_blocking(None) {
+                Ok(true) => {
+                    evicted += 1;
+                    error_retries = 0;
+                    no_progress_retries = 0;
+                }
+                Ok(false) if !self.has_hot_replicas_for_debug_evict_all()? => break,
+                Ok(false) if no_progress_retries < MAX_NO_PROGRESS_RETRIES => {
+                    no_progress_retries += 1;
+                    restore_promotions.wait_for_worker_idle();
+                    warn!(
+                        runtime = %self.runtime,
+                        evicted,
+                        attempt = no_progress_retries,
+                        max_attempts = MAX_NO_PROGRESS_RETRIES,
+                        "debug evict_all retrying after no-progress scan with hot replicas remaining"
+                    );
+                    std::thread::sleep(NO_PROGRESS_RETRY_DELAY);
+                    self.rebuild_clock()?;
+                }
+                Ok(false) => {
+                    return Err(StoreError::InvalidState(format!(
+                        "debug evict_all made no progress after {MAX_NO_PROGRESS_RETRIES} retries with hot replicas remaining"
+                    )));
+                }
+                Err(error) if error_retries < MAX_ERROR_RETRIES => {
+                    error_retries += 1;
+                    warn!(
+                        runtime = %self.runtime,
+                        evicted,
+                        attempt = error_retries,
+                        max_attempts = MAX_ERROR_RETRIES,
+                        error = %error,
+                        "debug evict_all retrying after eviction error"
+                    );
+                    self.rebuild_clock()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        info!(
+            runtime = %self.runtime,
+            evicted,
+            "debug evict_all completed"
+        );
+        Ok(evicted)
+    }
+
+    fn has_hot_replicas_for_debug_evict_all(&self) -> Result<bool> {
+        Ok(!self
+            .collect_routes_by_replica_owner(&self.runtime)?
+            .is_empty())
+    }
+}
 
 /// Notification channel: offload thread signals cold restore waiters
 /// when entries become Materialized (evictable without I/O).

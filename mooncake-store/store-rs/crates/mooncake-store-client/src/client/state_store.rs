@@ -905,6 +905,119 @@ impl StorageOwnerState {
         self.evict_one_blocking(preferred_segment.as_ref())
     }
 
+    pub(in super) fn evict_one_clean_and_reserve_bounded(
+        &self,
+        length_bytes: u64,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        let budget = self.hot_replicas.eviction_budget().max(1);
+        for _ in 0..budget {
+            let victim = self.hot_replicas.pick_victim(
+                preferred_segment,
+                self.offload_priority.eviction_policy,
+                self.offload_priority.eviction_scan_limit,
+            );
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(reservation) = self.evict_candidate_clean_and_reserve(&victim, length_bytes)?
+            {
+                return Ok(Some(reservation));
+            }
+        }
+        Ok(None)
+    }
+
+    fn evict_candidate_clean_and_reserve(
+        &self,
+        victim: &ClockEntryId,
+        length_bytes: u64,
+    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        let Some(route) = self.route_ops.load_routes_bounded(std::slice::from_ref(&victim.route_key))?.into_iter().next().flatten() else {
+            self.hot_replicas.remove_id(victim);
+            return Ok(None);
+        };
+        if route.state != RouteState::Active {
+            self.hot_replicas.remove_id(victim);
+            return Ok(None);
+        }
+        if self.replica_index_for_victim(&route, victim).is_none() {
+            self.sync_route(&route);
+            return Ok(None);
+        }
+        match route.cold_backing.as_ref().map(|backing| backing.state) {
+            Some(mooncake_store_core::ColdBackingState::Materialized) => {}
+            _ => return Ok(None),
+        }
+        let Some(replica_index) = self.replica_index_for_victim(&route, victim) else {
+            self.sync_route(&route);
+            return Ok(None);
+        };
+        let evicted_replica = &route.replicas[replica_index];
+        if evicted_replica.length < length_bytes {
+            return Ok(None);
+        }
+        if self.read_pin_registry.is_pinned(
+            &evicted_replica.segment_name,
+            evicted_replica.segment_offset,
+        ) {
+            return Ok(None);
+        }
+        self.evict_route_replica_and_reserve(victim, &route, replica_index, length_bytes)
+    }
+
+    fn evict_route_replica_and_reserve(
+        &self,
+        victim: &ClockEntryId,
+        route: &ObjectRoute,
+        replica_index: usize,
+        length_bytes: u64,
+    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        let evicted_replica = route.replicas[replica_index].clone();
+        let next = cold_tier::route_after_replica_eviction(route, replica_index, false);
+        let cas = self.route_ops.compare_and_swap_route(
+            &route.key,
+            Some(route.version),
+            next.as_ref(),
+        )?;
+        if !cas.applied {
+            match cas.current.as_ref() {
+                Some(current) => self.sync_route(current),
+                None => self.hot_replicas.remove_id(victim),
+            }
+            return Ok(None);
+        }
+
+        self.hot_replicas.remove_id(victim);
+        let excess = evicted_replica.length - length_bytes;
+        if excess > 0 {
+            self.allocator.lock().release(
+                &self.runtime,
+                &evicted_replica.segment_name,
+                evicted_replica.segment_offset + length_bytes,
+                excess,
+            )?;
+        }
+        if let Some(next) = &next {
+            self.sync_route(next);
+        }
+        info!(
+            runtime = %self.runtime,
+            key = %route.key.0,
+            segment = %evicted_replica.segment_name.0,
+            offset_bytes = evicted_replica.segment_offset,
+            length_bytes = evicted_replica.length,
+            reuse_length = length_bytes,
+            "dram_eviction_and_reuse"
+        );
+        Ok(Some(mooncake_store_core::SegmentReservation {
+            owner: self.runtime.clone(),
+            segment_name: evicted_replica.segment_name,
+            offset_bytes: evicted_replica.segment_offset,
+            length_bytes,
+        }))
+    }
+
     fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {
         let tracker = OperationTracker::new("storage_owner_evict_one");
         let result = (|| {
@@ -1049,6 +1162,23 @@ impl StorageOwnerState {
             );
         }
         Ok(true)
+    }
+
+    pub(in super) fn current_materialized_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
+        let Some(route) = self.route_ops.load_routes_bounded(std::slice::from_ref(key))?.into_iter().next().flatten() else {
+            self.hot_replicas.remove_key(key);
+            return Ok(None);
+        };
+        self.sync_route(&route);
+        if route.state == RouteState::Active
+            && route.cold_backing.as_ref().is_some_and(|cold_backing| {
+                cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
+            })
+        {
+            Ok(Some(route))
+        } else {
+            Ok(None)
+        }
     }
 
     fn rebuild_clock(&self) -> Result<()> {

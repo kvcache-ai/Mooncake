@@ -1,15 +1,20 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mooncake_store_core::StoreError;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::models::{
-    ErrorResponse, PutTenantPolicyRequest, RouteMigrationMode, RouteMigrationTaskSubmitRequest,
-    TenantQuotaAbortRequest, TenantQuotaReconcileRequest, TracingAction, TracingUpdateRequest,
+    ColdTierDisableRequest, ColdTierDrainRequest, ColdTierEnableRequest, ColdTierRegisterRequest,
+    ColdTierUnregisterRequest, CreateColdTierDeviceRequest, ErrorResponse, PutTenantPolicyRequest,
+    RouteMigrationMode, RouteMigrationTaskSubmitRequest, TenantQuotaAbortRequest,
+    TenantQuotaReconcileRequest, TracingAction, TracingUpdateRequest,
+    TriggerColdTierOffloadRequest,
 };
 use super::service::AdminService;
 
@@ -25,6 +30,14 @@ pub struct AdminHttpServerHandle {
 
 impl AdminHttpServerHandle {
     pub fn start(bind_addr: &str, service: AdminService) -> mooncake_store_core::Result<Self> {
+        Self::start_with_auth(bind_addr, service, None)
+    }
+
+    pub fn start_with_auth(
+        bind_addr: &str,
+        service: AdminService,
+        auth_token: Option<String>,
+    ) -> mooncake_store_core::Result<Self> {
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
             StoreError::Transport(format!(
                 "admin http server failed to bind {bind_addr}: {error}"
@@ -43,10 +56,11 @@ impl AdminHttpServerHandle {
                 ))
             })?
             .to_string();
+        let auth_token = auth_token.map(Arc::new);
         let (shutdown, shutdown_rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name(format!("mooncake-store-admin-{address}"))
-            .spawn(move || run_admin_http_server(listener, shutdown_rx, service))
+            .spawn(move || run_admin_http_server(listener, shutdown_rx, service, auth_token))
             .map_err(|error| {
                 StoreError::Transport(format!(
                     "admin http server failed to spawn worker thread: {error}"
@@ -80,10 +94,17 @@ impl Drop for AdminHttpServerHandle {
     }
 }
 
-fn run_admin_http_server(listener: TcpListener, shutdown_rx: Receiver<()>, service: AdminService) {
+fn run_admin_http_server(
+    listener: TcpListener,
+    shutdown_rx: Receiver<()>,
+    service: AdminService,
+    auth_token: Option<Arc<String>>,
+) {
     loop {
         match listener.accept() {
-            Ok((stream, _)) => handle_admin_http_connection(stream, &service),
+            Ok((stream, _)) => {
+                handle_admin_http_connection(stream, &service, auth_token.as_deref())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if shutdown_rx.recv_timeout(HTTP_POLL_INTERVAL).is_ok() {
                     return;
@@ -94,12 +115,16 @@ fn run_admin_http_server(listener: TcpListener, shutdown_rx: Receiver<()>, servi
     }
 }
 
-fn handle_admin_http_connection(mut stream: TcpStream, service: &AdminService) {
+fn handle_admin_http_connection(
+    mut stream: TcpStream,
+    service: &AdminService,
+    auth_token: Option<&String>,
+) {
     if stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).is_err() {
         return;
     }
     let response = match read_http_request(&mut stream) {
-        Ok(request) => route_request(service, request),
+        Ok(request) => route_request(service, request, auth_token),
         Err(HttpRequestReadError::ContentTooLarge) => {
             drain_remaining_input(&mut stream);
             http_error_response("413 Payload Too Large", "request content is too large")
@@ -114,6 +139,7 @@ fn handle_admin_http_connection(mut stream: TcpStream, service: &AdminService) {
 struct HttpRequest {
     method: String,
     path: String,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -129,10 +155,27 @@ impl From<std::io::Error> for HttpRequestReadError {
     }
 }
 
-fn route_request(service: &AdminService, request: HttpRequest) -> String {
+fn route_request(
+    service: &AdminService,
+    request: HttpRequest,
+    auth_token: Option<&String>,
+) -> String {
     let path_only = request.path.split('?').next().unwrap_or("/").to_string();
+    if matches!(
+        (request.method.as_str(), path_only.as_str()),
+        ("GET", "/healthz") | ("GET", "/livez")
+    ) {
+        return http_text_response("200 OK", "ok\n");
+    }
+    if let Some(token) = auth_token {
+        if !request_has_bearer_token(&request, token) {
+            return http_error_response(
+                "401 Unauthorized",
+                "missing or invalid admin authorization token",
+            );
+        }
+    }
     match (request.method.as_str(), path_only.as_str()) {
-        ("GET", "/healthz") | ("GET", "/livez") => http_text_response("200 OK", "ok\n"),
         ("GET", "/v1/tenant-policies") => {
             let tenant_filter = query_param(&request.path, "tenant");
             let effective = query_flag(&request.path, "effective");
@@ -171,6 +214,19 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
         ("GET", "/v1/route-migrations") => {
             http_json_response("200 OK", &service.list_route_migration_tasks())
         }
+        ("POST", "/v1/cold-tier/devices") => {
+            create_cold_tier_device(service, &request.path, &request.body)
+        }
+        ("GET", "/v1/cold-tier/devices") => list_cold_tier_devices(service, &request.path),
+        ("POST", "/v1/cold-tier/offloads/trigger") => {
+            trigger_cold_tier_offload(service, &request.body)
+        }
+        ("GET", "/v1/cold-tier/offloads") => {
+            http_json_response("200 OK", &service.list_cold_tier_offload_tasks())
+        }
+        ("GET", "/v1/cold-tier/offloads/trigger") => {
+            http_error_response("405 Method Not Allowed", "method not allowed")
+        }
         ("POST", "/v1/route-migrations/copy") => {
             submit_route_migration_request(service, &request.body, RouteMigrationMode::Copy)
         }
@@ -201,6 +257,8 @@ fn update_tracing_request(service: &AdminService, body: &[u8], action: TracingAc
     }
 }
 
+include!("cold_tier_http.rs");
+
 fn submit_route_migration_request(
     service: &AdminService,
     body: &[u8],
@@ -209,7 +267,7 @@ fn submit_route_migration_request(
     let payload = match serde_json::from_slice::<RouteMigrationTaskSubmitRequest>(body) {
         Ok(payload) => payload,
         Err(error) => {
-            return http_error_response("400 Bad Request", &format!("invalid JSON body: {error}"))
+            return http_error_response("400 Bad Request", &format!("invalid JSON body: {error}"));
         }
     };
     match service.submit_route_migration_task(expected_mode, payload) {
@@ -218,7 +276,33 @@ fn submit_route_migration_request(
     }
 }
 
+fn request_has_bearer_token(request: &HttpRequest, expected: &str) -> bool {
+    let Some(value) = request
+        .headers
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case("authorization").then_some(value))
+    else {
+        return false;
+    };
+    let Some(token) = value.trim().strip_prefix("Bearer ") else {
+        return false;
+    };
+    token == expected
+}
+
 fn route_scoped_request(service: &AdminService, request: HttpRequest, path_only: &str) -> String {
+    if path_only.starts_with("/v1/cold-tier/devices/") {
+        return route_cold_tier_device_request(service, request, path_only);
+    }
+    if path_only.starts_with("/v1/cold-tier/objects/") {
+        return route_cold_tier_object_request(service, request, path_only);
+    }
+    if path_only == "/v1/debug/routes" || path_only.starts_with("/v1/debug/routes/") {
+        return route_debug_route_request(service, request, path_only);
+    }
+    if path_only.starts_with("/v1/cold-tier/offloads/") {
+        return route_cold_tier_offload_request(service, request, path_only);
+    }
     if path_only.starts_with("/v1/route-migrations/") {
         return route_migration_request(service, request, path_only);
     }
@@ -229,6 +313,33 @@ fn route_scoped_request(service: &AdminService, request: HttpRequest, path_only:
         return route_tenant_object_accounting_request(service, request, path_only);
     }
     route_policy_scope_request(service, request, path_only)
+}
+
+fn route_debug_route_request(
+    service: &AdminService,
+    request: HttpRequest,
+    path_only: &str,
+) -> String {
+    if request.method != "GET" {
+        return http_error_response("405 Method Not Allowed", "method not allowed");
+    }
+    if path_only == "/v1/debug/routes" {
+        return match service.list_debug_routes(query_param(&request.path, "tenant").as_deref()) {
+            Ok(response) => http_json_response("200 OK", &response),
+            Err(error) => http_store_error(error),
+        };
+    }
+    let Some(encoded_key) = path_only.strip_prefix("/v1/debug/routes/") else {
+        return http_error_response("404 Not Found", "not found");
+    };
+    let Some(key) = percent_decode_component(encoded_key) else {
+        return http_error_response("400 Bad Request", "invalid object key encoding");
+    };
+    match service.get_debug_route(query_param(&request.path, "tenant").as_deref(), &key) {
+        Ok(Some(response)) => http_json_response("200 OK", &response),
+        Ok(None) => http_error_response("404 Not Found", &format!("route {key} not found")),
+        Err(error) => http_store_error(error),
+    }
 }
 
 fn route_migration_request(
@@ -276,7 +387,7 @@ fn route_policy_scope_request(
                     return http_error_response(
                         "400 Bad Request",
                         &format!("invalid JSON body: {error}"),
-                    )
+                    );
                 }
             };
             match service.set_tenant_policy(
@@ -623,14 +734,26 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpRequestR
     let header_end = header_end.unwrap_or(request.len());
     let header_bytes = &request[..header_end];
     let header_text = String::from_utf8_lossy(header_bytes);
-    let first_line = header_text.lines().next().unwrap_or_default();
+    let mut header_lines = header_text.lines();
+    let first_line = header_lines.next().unwrap_or_default();
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or("/").to_string();
+    let headers = header_lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
     let body_start = usize::min(request.len(), header_end.saturating_add(4));
     let body_end = usize::min(request.len(), body_start.saturating_add(content_length));
     let body = request[body_start..body_end].to_vec();
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
 }
 
 fn drain_remaining_input(stream: &mut TcpStream) {
@@ -705,6 +828,15 @@ fn query_flag(path: &str, key: &str) -> bool {
     )
 }
 
+fn parse_json_body<T: Default + DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice::<T>(body).map_err(|error| {
+        http_error_response("400 Bad Request", &format!("invalid JSON body: {error}"))
+    })
+}
+
 fn http_store_error(error: StoreError) -> String {
     match error {
         StoreError::Conflict(message)
@@ -713,10 +845,10 @@ fn http_store_error(error: StoreError) -> String {
         StoreError::NotFound(message) => http_error_response("404 Not Found", &message),
         StoreError::Unsupported(message) => http_error_response("501 Not Implemented", &message),
         StoreError::InvalidState(message) => http_error_response("400 Bad Request", &message),
-        StoreError::Backpressure(message) => http_error_response("429 Too Many Requests", &message),
         StoreError::Metadata(message)
         | StoreError::Transport(message)
-        | StoreError::Allocator(message) => {
+        | StoreError::Allocator(message)
+        | StoreError::Backpressure(message) => {
             http_error_response("500 Internal Server Error", &message)
         }
     }
@@ -756,8 +888,10 @@ fn http_error_response(status: &str, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread::sleep;
     use std::time::Duration;
@@ -765,15 +899,17 @@ mod tests {
     use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
     use mooncake_store_client::control_plane_pb;
     use mooncake_store_core::{
-        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute, ReplicaRoute,
-        ReplicaTier, RouteState, RouteVersion, SegmentName, StoreError,
-        TenantObjectAccountingState, TenantPolicySpec, TenantQuotaPolicy,
+        scoped_object_key, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState,
+        ClientRuntimeId, ColdBackingRoute, ColdBackingState, ColdTierDeviceRecord,
+        ColdTierDeviceState, ColdTierTargetSpec, CompatibilityDescriptor, MetadataBackend,
+        ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentName,
+        StoreError, TenantObjectAccountingState, TenantPolicySpec, TenantQuotaPolicy,
         TenantQuotaReservationRequest, TenantRoutePolicy,
     };
     use parking_lot::Mutex;
 
     use crate::admin::models::PolicyPatchInput;
+    use crate::admin::models::TriggerColdTierOffloadRequest;
     use crate::admin::service::{
         AdminService, MigrationExecutionProbe, MigrationQueueConfig, MigrationRpc,
     };
@@ -801,11 +937,59 @@ mod tests {
         AdminService::new(backend, "memory://test", MetadataKeyspace::default())
     }
 
+    fn test_service_with_backend(backend: Arc<dyn MetadataBackend>) -> AdminService {
+        AdminService::new(backend, "memory://test", MetadataKeyspace::default())
+    }
+
+    fn bearer(token: &str) -> String {
+        format!("Authorization: Bearer {token}\r\n")
+    }
+
+    fn encode_test_cold_tier_path_component(value: &str) -> String {
+        if value.is_empty() {
+            return "~".to_string();
+        }
+        let mut component = String::with_capacity(value.len());
+        for byte in value.as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-') {
+                component.push(*byte as char);
+            } else {
+                component.push('~');
+                component.push_str(&format!("{byte:02X}"));
+            }
+        }
+        component
+    }
+
+    fn sample_cold_tier_device(device_id: &str) -> ColdTierDeviceRecord {
+        ColdTierDeviceRecord {
+            device_id: device_id.to_string(),
+            stable_id: "storage-a".to_string(),
+            epoch: Some(1),
+            cold_tier_id: device_id.to_string(),
+            kind: "ssd".to_string(),
+            target: ColdTierTargetSpec::Directory {
+                path: format!("/tmp/{device_id}"),
+            },
+            root_dir: Some(format!("/tmp/{device_id}")),
+            state: ColdTierDeviceState::Healthy,
+            capacity_bytes: Some(1024),
+            used_bytes: 0,
+            reserved_bytes: 0,
+            failure_count: 0,
+            last_error: None,
+            tags: Vec::new(),
+            updated_at_ms: 1,
+        }
+    }
+
     #[derive(Clone, Default)]
     struct FakeMigrationRpc {
         submit_results: Arc<Mutex<VecDeque<mooncake_store_core::Result<String>>>>,
         status_results: Arc<Mutex<VecDeque<mooncake_store_core::Result<MigrationExecutionProbe>>>>,
         route_results: Arc<Mutex<VecDeque<mooncake_store_core::Result<Option<ObjectRoute>>>>>,
+        offload_results: Arc<Mutex<VecDeque<mooncake_store_core::Result<u64>>>>,
+        offload_calls: Arc<AtomicUsize>,
     }
 
     impl MigrationRpc for FakeMigrationRpc {
@@ -843,15 +1027,73 @@ mod tests {
         ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
             self.route_results.lock().pop_front().unwrap_or(Ok(None))
         }
+
+        fn trigger_cold_tier_offload(
+            &self,
+            _lease: &ClientLease,
+            _max_tasks: u64,
+        ) -> mooncake_store_core::Result<u64> {
+            self.offload_calls.fetch_add(1, Ordering::SeqCst);
+            self.offload_results.lock().pop_front().unwrap_or(Ok(0))
+        }
+
+        fn manual_cold_tier_gc(
+            &self,
+            _lease: &ClientLease,
+            _device_id: &str,
+            _max_backings: u64,
+        ) -> mooncake_store_core::Result<u64> {
+            Ok(0)
+        }
+
+        fn manual_cold_tier_free(
+            &self,
+            _lease: &ClientLease,
+            _device_id: &str,
+            _max_victims: u64,
+        ) -> mooncake_store_core::Result<control_plane_pb::ManualColdTierFreeReply> {
+            Ok(control_plane_pb::ManualColdTierFreeReply {
+                attempted_victims: 0,
+                freed_backings: 0,
+                skipped_backings: 0,
+                reached_low_watermark: true,
+                error: None,
+                collected_backings: 0,
+            })
+        }
+
+        fn probe_cold_tier_device(
+            &self,
+            _lease: &ClientLease,
+            device_id: &str,
+        ) -> mooncake_store_core::Result<control_plane_pb::ProbeColdTierDeviceReply> {
+            Ok(control_plane_pb::ProbeColdTierDeviceReply {
+                device_id: device_id.to_string(),
+                capacity_bytes: 0,
+                used_bytes: 0,
+                reserved_bytes: 0,
+                schedulable: true,
+                state: "Healthy".to_string(),
+                last_error: String::new(),
+                error: None,
+            })
+        }
     }
 
     fn test_migration_service(rpc: Arc<dyn MigrationRpc>) -> AdminService {
+        test_migration_service_with_stable_id(rpc, "executor-a")
+    }
+
+    fn test_migration_service_with_stable_id(
+        rpc: Arc<dyn MigrationRpc>,
+        stable_id: &str,
+    ) -> AdminService {
         let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
         backend
             .upsert_client_lease(&live_lease("authority-a", 1))
             .expect("authority lease should store");
         backend
-            .upsert_client_lease(&live_lease("executor-a", 1))
+            .upsert_client_lease(&live_lease(stable_id, 1))
             .expect("executor lease should store");
         AdminService::new_with_migration_support(
             backend,
@@ -988,6 +1230,1083 @@ mod tests {
     }
 
     #[test]
+    fn admin_http_auth_token_protects_non_health_requests() {
+        let service = test_service();
+        let mut server = AdminHttpServerHandle::start_with_auth(
+            "127.0.0.1:0",
+            service.clone(),
+            Some("secret-token".to_string()),
+        )
+        .expect("server start");
+        let address = server.address().to_string();
+
+        let health = http_request(
+            &address,
+            &format!("GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(health.contains("HTTP/1.1 200 OK"));
+
+        let unauthorized = http_request(
+            &address,
+            &format!(
+                "GET /v1/tenant-policies HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(unauthorized.contains("HTTP/1.1 401 Unauthorized"));
+
+        let authorized = http_request(
+            &address,
+            &format!(
+                "GET /v1/tenant-policies HTTP/1.1\r\nHost: {address}\r\n{}Connection: close\r\n\r\n",
+                bearer("secret-token")
+            ),
+        );
+        assert!(authorized.contains("HTTP/1.1 200 OK"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_auth_token_rejects_wrong_token() {
+        let service = test_service();
+        let mut server = AdminHttpServerHandle::start_with_auth(
+            "127.0.0.1:0",
+            service,
+            Some("secret-token".to_string()),
+        )
+        .expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "GET /v1/tenant-policies HTTP/1.1\r\nHost: {address}\r\n{}Connection: close\r\n\r\n",
+                bearer("wrong-token")
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 401 Unauthorized"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_serves_cold_tier_device_lifecycle() {
+        let service = test_service();
+        service
+            .backend()
+            .upsert_client_lease(&live_lease("store-a", 7))
+            .expect("store lease should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+        let root = std::env::temp_dir().join(format!(
+            "mooncake-cold-tier-http-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let body = serde_json::json!({
+            "stable_id": "store-a",
+            "cold_tier_id": "ssd-0",
+            "kind": "ssd",
+            "target": {"type": "directory", "path": root.to_string_lossy()},
+            "capacity_override_bytes": 1024,
+            "tags": ["local", "ssd"]
+        })
+        .to_string();
+        let create = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(create.contains("HTTP/1.1 201 Created"));
+        assert!(create.contains("\"cold_tier_id\":\"ssd-0\""));
+        assert!(create.contains("\"state\":\"unregistered\""));
+        let device_id = create
+            .split("\"device_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("device_id should be present")
+            .to_string();
+
+        let register = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/{device_id}/register HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                "{}"
+            ),
+        );
+        assert!(register.contains("HTTP/1.1 201 Created"));
+        assert!(register.contains("\"epoch\":7"));
+        assert!(register.contains("\"state\":\"healthy\""));
+        assert!(register.contains("\"schedulable\":true"));
+
+        let list = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices?stable_id=store-a&state=healthy&schedulable=true HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(list.contains("HTTP/1.1 200 OK"));
+        assert!(list.contains("\"devices\":["));
+        assert!(list.contains(&device_id));
+
+        let bad_state = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices?state=bad HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(bad_state.contains("HTTP/1.1 400 Bad Request"));
+
+        let bad_schedulable = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices?schedulable=maybe HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(bad_schedulable.contains("HTTP/1.1 400 Bad Request"));
+        assert!(bad_schedulable.contains("invalid schedulable filter"));
+
+        let disable = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/{device_id}/disable HTTP/1.1\r\nHost: {address}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                "{}"
+            ),
+        );
+        assert!(disable.contains("\"state\":\"disabled_by_admin\""));
+        assert!(disable.contains("\"schedulable\":false"));
+
+        let enable = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/{device_id}/enable HTTP/1.1\r\nHost: {address}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                "{}"
+            ),
+        );
+        assert!(enable.contains("\"state\":\"healthy\""));
+
+        let unregister = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/{device_id}/unregister HTTP/1.1\r\nHost: {address}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                "{}"
+            ),
+        );
+        assert!(unregister.contains("HTTP/1.1 200 OK"));
+        assert!(unregister.contains("\"state\":\"unregistered\""));
+
+        server.shutdown().expect("server shutdown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admin_http_server_reports_cold_tier_orphan_quarantine() {
+        let service = test_service();
+        let root = std::env::temp_dir().join(format!(
+            "mooncake-cold-tier-http-quarantine-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let encoded = encode_test_cold_tier_path_component("ssd/quarantine");
+        let final_quarantine = root.join(&encoded).join("__orphan_quarantine__");
+        let pending_quarantine = root
+            .join("__pending__")
+            .join(&encoded)
+            .join("__orphan_quarantine__");
+        fs::create_dir_all(&final_quarantine).expect("final quarantine should exist");
+        fs::create_dir_all(&pending_quarantine).expect("pending quarantine should exist");
+        fs::write(final_quarantine.join("final.bin"), b"final").expect("final file should write");
+        fs::write(pending_quarantine.join("pending.bin"), b"pending")
+            .expect("pending file should write");
+        fs::create_dir_all(final_quarantine.join("nested.bin"))
+            .expect("nested directory should write");
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&ColdTierDeviceRecord {
+                device_id: "ssd/quarantine".to_string(),
+                stable_id: "store-a".to_string(),
+                epoch: None,
+                cold_tier_id: "ssd/quarantine".to_string(),
+                kind: "ssd".to_string(),
+                target: ColdTierTargetSpec::Directory {
+                    path: root.to_string_lossy().into_owned(),
+                },
+                root_dir: None,
+                state: ColdTierDeviceState::Healthy,
+                capacity_bytes: None,
+                used_bytes: 0,
+                reserved_bytes: 0,
+                failure_count: 0,
+                last_error: None,
+                tags: Vec::new(),
+                updated_at_ms: 1,
+            })
+            .expect("device should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd%2Fquarantine/orphan-quarantine HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"device_id\":\"ssd/quarantine\""));
+        assert!(response.contains("\"cold_tier_id\":\"ssd/quarantine\""));
+        assert!(response.contains("\"count\":2"));
+        assert!(response.contains("\"total_bytes\":12"));
+        assert!(response.contains("\"area\":\"final\""));
+        assert!(response.contains("\"file_name\":\"final.bin\""));
+        assert!(response.contains("\"area\":\"pending\""));
+        assert!(response.contains("\"file_name\":\"pending.bin\""));
+        assert!(!response.contains("nested.bin"));
+
+        let wrong_method = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd%2Fquarantine/orphan-quarantine HTTP/1.1\r\nHost: {address}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        );
+        assert!(wrong_method.contains("HTTP/1.1 405 Method Not Allowed"));
+
+        server.shutdown().expect("server shutdown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admin_http_server_uses_dot_segment_safe_cold_tier_quarantine_paths() {
+        let service = test_service();
+        let root = std::env::temp_dir().join(format!(
+            "mooncake-cold-tier-http-dot-quarantine-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let safe_quarantine = root.join("~2E").join("__orphan_quarantine__");
+        let unsafe_quarantine = root.join("__orphan_quarantine__");
+        fs::create_dir_all(&safe_quarantine).expect("safe quarantine should exist");
+        fs::create_dir_all(&unsafe_quarantine).expect("unsafe quarantine should exist");
+        fs::write(safe_quarantine.join("safe.bin"), b"safe").expect("safe file should write");
+        fs::write(unsafe_quarantine.join("unsafe.bin"), b"unsafe")
+            .expect("unsafe file should write");
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&ColdTierDeviceRecord {
+                device_id: ".".to_string(),
+                stable_id: "store-a".to_string(),
+                epoch: None,
+                cold_tier_id: ".".to_string(),
+                kind: "ssd".to_string(),
+                target: ColdTierTargetSpec::Directory {
+                    path: root.to_string_lossy().into_owned(),
+                },
+                root_dir: None,
+                state: ColdTierDeviceState::Healthy,
+                capacity_bytes: None,
+                used_bytes: 0,
+                reserved_bytes: 0,
+                failure_count: 0,
+                last_error: None,
+                tags: Vec::new(),
+                updated_at_ms: 1,
+            })
+            .expect("device should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/%2E/orphan-quarantine HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"device_id\":\".\""));
+        assert!(response.contains("\"count\":1"));
+        assert!(response.contains("\"file_name\":\"safe.bin\""));
+        assert!(response.contains("/~2E/__orphan_quarantine__/safe.bin"));
+        assert!(!response.contains("unsafe.bin"));
+
+        server.shutdown().expect("server shutdown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admin_http_server_handles_multiple_cold_tier_devices_for_one_runtime() {
+        let backend: Arc<dyn MetadataBackend> =
+            Arc::new(InMemoryMetadataBackend::new_hard_isolated());
+        let tenant_backend = backend.for_tenant("tenant-a").expect("tenant backend");
+        let service = test_service_with_backend(backend);
+        tenant_backend
+            .upsert_client_lease(&live_lease("store-a", 7))
+            .expect("store lease should store");
+        let mut route = ObjectRoute {
+            key: ObjectKey::new("cold-object-a"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                segment_name: SegmentName::new("hot-segment-a"),
+                offset: None,
+                segment_offset: 0,
+                length: 12,
+                checksum: Some(99),
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: Some(ColdBackingRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                cold_tier_id: "ssd-a".to_string(),
+                object_locator: "objects/a.bin".to_string(),
+                length: 12,
+                checksum: Some(99),
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            }),
+        };
+        tenant_backend
+            .compare_and_swap_object_route(&route.key, None, Some(&route))
+            .expect("route should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service.clone()).expect("server start");
+        let address = server.address().to_string();
+        let first_root = std::env::temp_dir().join(format!(
+            "mooncake-cold-tier-http-multi-a-{}",
+            std::process::id()
+        ));
+        let second_root = std::env::temp_dir().join(format!(
+            "mooncake-cold-tier-http-multi-b-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&first_root);
+        let _ = fs::remove_dir_all(&second_root);
+        fs::create_dir_all(&first_root).expect("first cold root should exist");
+        fs::create_dir_all(&second_root).expect("second cold root should exist");
+
+        for (cold_tier_id, root) in [("ssd-a", &first_root), ("ssd-b", &second_root)] {
+            let body = serde_json::json!({
+                "stable_id": "store-a",
+                "cold_tier_id": cold_tier_id,
+                "kind": "ssd",
+                "target": {"type": "directory", "path": root.to_string_lossy()}
+            })
+            .to_string();
+            let create = http_request(
+                &address,
+                &format!(
+                    "POST /v1/cold-tier/devices?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                ),
+            );
+            assert!(create.contains("HTTP/1.1 201 Created"));
+            assert!(create.contains(&format!("\"cold_tier_id\":\"{cold_tier_id}\"")));
+            let register = http_request(
+                &address,
+                &format!(
+                    "POST /v1/cold-tier/devices/{cold_tier_id}/register?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                ),
+            );
+            assert!(register.contains("HTTP/1.1 201 Created"));
+            assert!(register.contains("\"state\":\"healthy\""));
+        }
+
+        let list = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices?tenant=tenant-a&stable_id=store-a&state=healthy&schedulable=true HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(list.contains("HTTP/1.1 200 OK"));
+        assert!(list.contains("\"cold_tier_id\":\"ssd-a\""));
+        assert!(list.contains("\"cold_tier_id\":\"ssd-b\""));
+
+        let root_list = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices?stable_id=store-a&state=healthy&schedulable=true HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(root_list.contains("HTTP/1.1 200 OK"));
+        assert!(root_list.contains("\"devices\":[]"));
+
+        let dry_run = serde_json::json!({"dry_run": true}).to_string();
+        let first_dry_run = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-a/unregister?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                dry_run.len(),
+                dry_run
+            ),
+        );
+        assert!(first_dry_run.contains("HTTP/1.1 200 OK"));
+        assert!(first_dry_run.contains("\"dry_run\":true"));
+        assert!(first_dry_run.contains("\"state\":\"healthy\""));
+        assert!(first_dry_run.contains("\"blocked_objects\":1"));
+        let first_after_dry_run = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-a?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(first_after_dry_run.contains("\"state\":\"healthy\""));
+
+        let first_drain = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-a/unregister?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        );
+        assert!(first_drain.contains("HTTP/1.1 200 OK"));
+        assert!(first_drain.contains("\"dry_run\":false"));
+        assert!(first_drain.contains("\"state\":\"draining\""));
+        assert!(first_drain.contains("\"blocked_objects\":1"));
+        let second_after_drain = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-b?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(second_after_drain.contains("HTTP/1.1 200 OK"));
+        assert!(second_after_drain.contains("\"state\":\"healthy\""));
+        assert!(second_after_drain.contains("\"schedulable\":true"));
+
+        let force_drain = serde_json::json!({"force": true}).to_string();
+        let first_force = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-a/unregister?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                force_drain.len(),
+                force_drain
+            ),
+        );
+        assert!(first_force.contains("HTTP/1.1 200 OK"));
+        assert!(first_force.contains("\"state\":\"unregistered\""));
+        let second_after_force = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-b?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(second_after_force.contains("HTTP/1.1 200 OK"));
+        assert!(second_after_force.contains("\"state\":\"healthy\""));
+        assert!(second_after_force.contains("\"schedulable\":true"));
+        route.version = route.version.next();
+        let observed = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/cold-object-a?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(observed.contains("\"state\":\"pending_delete\""));
+
+        let cold_only_route = ObjectRoute {
+            key: ObjectKey::new("cold-only-object"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+            cold_backing: Some(ColdBackingRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                cold_tier_id: "ssd-b".to_string(),
+                object_locator: "objects/cold-only.bin".to_string(),
+                length: 12,
+                checksum: None,
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            }),
+        };
+        tenant_backend
+            .compare_and_swap_object_route(&cold_only_route.key, None, Some(&cold_only_route))
+            .expect("cold-only route should store");
+        let force_cold_only = serde_json::json!({"force": true}).to_string();
+        let cold_only_force = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-b/unregister?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                force_cold_only.len(),
+                force_cold_only
+            ),
+        );
+        assert!(cold_only_force.contains("HTTP/1.1 409 Conflict"));
+        assert!(cold_only_force.contains("reclaimable"));
+        let second_after_rejected_force = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-b?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(second_after_rejected_force.contains("\"state\":\"healthy\""));
+
+        server.shutdown().expect("server shutdown");
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn admin_http_server_uses_shared_in_memory_backend_for_cold_tier_queries() {
+        let shared = Arc::new(InMemoryMetadataBackend::new());
+        let runtime_backend = shared
+            .for_tenant("tenant-a")
+            .expect("tenant view should exist");
+        runtime_backend
+            .upsert_client_lease(&live_lease("store-a", 7))
+            .expect("store lease should store");
+        runtime_backend
+            .put_cold_tier_device_if_absent(&ColdTierDeviceRecord {
+                device_id: "ssd-shared".to_string(),
+                stable_id: "store-a".to_string(),
+                epoch: Some(7),
+                cold_tier_id: "ssd-shared".to_string(),
+                kind: "ssd".to_string(),
+                target: ColdTierTargetSpec::Directory {
+                    path: "/tmp/shared-cold-root".to_string(),
+                },
+                root_dir: Some("/tmp/shared-cold-root".to_string()),
+                state: ColdTierDeviceState::Healthy,
+                capacity_bytes: Some(4096),
+                used_bytes: 64,
+                reserved_bytes: 0,
+                failure_count: 0,
+                last_error: None,
+                tags: vec!["shared".to_string()],
+                updated_at_ms: 1,
+            })
+            .expect("device should store in tenant view");
+
+        let service = test_service_with_backend(runtime_backend.clone());
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+        let response = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-shared?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"device_id\":\"ssd-shared\""));
+        assert!(response.contains("\"stable_id\":\"store-a\""));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_triggers_cold_tier_offload() {
+        let rpc = Arc::new(FakeMigrationRpc {
+            offload_results: Arc::new(Mutex::new(vec![Ok(3), Ok(0)].into())),
+            ..FakeMigrationRpc::default()
+        });
+        let service = test_migration_service_with_stable_id(rpc.clone(), "storage-a");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+        let body = serde_json::to_string(&TriggerColdTierOffloadRequest {
+            stable_id: "storage-a".to_string(),
+            max_tasks: Some(7),
+        })
+        .expect("request should serialize");
+
+        let response = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/offloads/trigger HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 202 Accepted"));
+        assert!(response.contains("\"task_id\":\"cold-tier-offload-1\""));
+        assert!(response.contains("\"stable_id\":\"storage-a\""));
+        assert!(response.contains("\"max_tasks\":7"));
+
+        let started = std::time::Instant::now();
+        let mut status = String::new();
+        while started.elapsed() < Duration::from_secs(5) {
+            status = http_request(
+                &address,
+                &format!(
+                    "GET /v1/cold-tier/offloads/cold-tier-offload-1 HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            if status.contains("\"state\":\"succeeded\"") {
+                break;
+            }
+            sleep(Duration::from_millis(10));
+        }
+        assert!(status.contains("HTTP/1.1 200 OK"));
+        assert!(status.contains("\"state\":\"succeeded\""));
+        assert!(status.contains("\"materialized\":3"));
+        assert!(rpc.offload_calls.load(Ordering::SeqCst) >= 1);
+
+        let list = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/offloads HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(list.contains("HTTP/1.1 200 OK"));
+        assert!(list.contains("\"count\":1"));
+        assert!(list.contains("cold-tier-offload-1"));
+
+        let wrong_method = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/offloads/trigger HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(wrong_method.contains("HTTP/1.1 405 Method Not Allowed"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_keeps_async_cold_tier_drain_in_draining_state() {
+        let rpc = Arc::new(FakeMigrationRpc::default());
+        let service = test_migration_service(rpc);
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("ssd-async-drain"))
+            .expect("device should seed");
+        service
+            .backend()
+            .compare_and_swap_object_route(
+                &ObjectKey::new("drain-object"),
+                None,
+                Some(&ObjectRoute {
+                    key: ObjectKey::new("drain-object"),
+                    namespace: None,
+                    logical_key: None,
+                    canonical_key: None,
+                    sharing_scope: None,
+                    qos_tier: None,
+                    version: RouteVersion(1),
+                    state: RouteState::Active,
+                    compatibility: CompatibilityDescriptor::default(),
+                    replicas: Vec::new(),
+                    cold_backing: Some(ColdBackingRoute {
+                        owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
+                        cold_tier_id: "ssd-async-drain".to_string(),
+                        object_locator: "objects/drain-object.bin".to_string(),
+                        length: 12,
+                        checksum: None,
+                        state: ColdBackingState::Materialized,
+                        replicas: Vec::new(),
+                    }),
+                }),
+            )
+            .expect("route should seed");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+        let body = serde_json::json!({
+            "migration_task_executor": "executor-a",
+            "migration_target_segments": ["segment-b"],
+            "migration_max_retries": 3
+        })
+        .to_string();
+
+        let drain = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-async-drain/drain HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(drain.contains("HTTP/1.1 200 OK"));
+        assert!(drain.contains("\"state\":\"draining\""));
+        assert!(drain.contains("\"blocked_objects\":1"));
+        assert!(drain.contains("\"reclaimable_objects\":0"));
+        assert!(drain.contains("\"marked_pending_delete\":0"));
+        assert!(drain.contains("\"collected_pending_delete\":0"));
+        assert!(drain.contains("\"migration_tasks_submitted\":1"));
+
+        let device = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-async-drain HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(device.contains("HTTP/1.1 200 OK"));
+        assert!(device.contains("\"state\":\"draining\""));
+
+        let object = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/drain-object HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(object.contains("HTTP/1.1 200 OK"));
+        assert!(object.contains("\"state\":\"materialized\""));
+        assert!(object.contains("\"locator\":\"objects/drain-object.bin\""));
+
+        let tasks = http_request(
+            &address,
+            &format!(
+                "GET /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(tasks.contains("HTTP/1.1 200 OK"));
+        assert!(tasks.contains("\"count\":1"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_serves_debug_route_dump() {
+        let service = test_service();
+        let key = ObjectKey::new("tenant-a/default/default/object-a");
+        let route = ObjectRoute {
+            key: key.clone(),
+            namespace: Some(mooncake_store_core::NamespaceScope::with_defaults(
+                Some("tenant-a"),
+                Some("default"),
+                Some("default"),
+            )),
+            logical_key: Some("object-a".to_string()),
+            canonical_key: Some("tenant-a/default/default/object-a".to_string()),
+            sharing_scope: Some("tenant-a".to_string()),
+            qos_tier: Some("default".to_string()),
+            version: RouteVersion(7),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                segment_name: SegmentName::new("segment-a"),
+                offset: None,
+                segment_offset: 12,
+                length: 34,
+                checksum: Some(56),
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: Some(ColdBackingRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                cold_tier_id: "device-a".to_string(),
+                object_locator: "objects/ab/object-a.bin".to_string(),
+                length: 34,
+                checksum: Some(56),
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            }),
+        };
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("device-a"))
+            .expect("device should seed");
+        service
+            .backend()
+            .compare_and_swap_object_route(&key, None, Some(&route))
+            .expect("route should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let list = http_request(
+            &address,
+            &format!(
+                "GET /v1/debug/routes?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(list.contains("HTTP/1.1 200 OK"));
+        assert!(list.contains("\"count\":1"));
+        assert!(list.contains("\"key\":\"tenant-a/default/default/object-a\""));
+        assert!(list.contains("\"logical_key\":\"object-a\""));
+        assert!(list.contains("\"tenant\":\"tenant-a\""));
+        assert!(list.contains("\"domain\":\"default\""));
+        assert!(list.contains("\"object_set\":\"default\""));
+        assert!(list.contains("\"owner_stable_id\":\"store-a\""));
+        assert!(list.contains("\"cold_tier_id\":\"device-a\""));
+
+        let detail = http_request(
+            &address,
+            &format!(
+                "GET /v1/debug/routes/tenant-a%2Fdefault%2Fdefault%2Fobject-a?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(detail.contains("HTTP/1.1 200 OK"));
+        assert!(detail.contains("\"version\":7"));
+        assert!(detail.contains("\"segment_name\":\"segment-a\""));
+        assert!(detail.contains("\"locator\":\"objects/ab/object-a.bin\""));
+
+        let missing = http_request(
+            &address,
+            &format!(
+                "GET /v1/debug/routes/missing-object HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(missing.contains("HTTP/1.1 404 Not Found"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_serves_cold_tier_object_lookup() {
+        let service = test_service();
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("device-a"))
+            .expect("device should seed");
+        let key = ObjectKey::new("tenant-a/ns/key-1");
+        let route = ObjectRoute {
+            key: key.clone(),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+            cold_backing: Some(ColdBackingRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                cold_tier_id: "device-a".to_string(),
+                object_locator: "objects/ab/key-1.bin".to_string(),
+                length: 12,
+                checksum: Some(99),
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            }),
+        };
+        service
+            .backend()
+            .compare_and_swap_object_route(&key, None, Some(&route))
+            .expect("route should store");
+        let pending_key = ObjectKey::new("tenant-a/ns/key-2");
+        let pending_route = ObjectRoute {
+            key: pending_key.clone(),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+            cold_backing: Some(ColdBackingRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                cold_tier_id: "device-a".to_string(),
+                object_locator: "objects/ab/key-2.bin".to_string(),
+                length: 21,
+                checksum: None,
+                state: ColdBackingState::PendingOffload,
+                replicas: Vec::new(),
+            }),
+        };
+        service
+            .backend()
+            .compare_and_swap_object_route(&pending_key, None, Some(&pending_route))
+            .expect("pending route should store");
+        let hot_key = ObjectKey::new("tenant-a/ns/hot-key");
+        let hot_route = ObjectRoute {
+            key: hot_key.clone(),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+            cold_backing: None,
+        };
+        service
+            .backend()
+            .compare_and_swap_object_route(&hot_key, None, Some(&hot_route))
+            .expect("hot route should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/tenant-a%2Fns%2Fkey-1 HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"device_id\":\"device-a\""));
+        assert!(response.contains("\"cold_tier_id\":\"device-a\""));
+        assert!(response.contains("\"state\":\"materialized\""));
+        assert!(response.contains("\"locator\":\"objects/ab/key-1.bin\""));
+        assert!(response.contains("\"length\":12"));
+        assert!(response.contains("\"checksum\":99"));
+
+        let pending = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/tenant-a%2Fns%2Fkey-2 HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(pending.contains("HTTP/1.1 200 OK"));
+        assert!(pending.contains("\"state\":\"pending_offload\""));
+        assert!(pending.contains("\"checksum\":null"));
+
+        let hot = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/tenant-a%2Fns%2Fhot-key HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(hot.contains("HTTP/1.1 200 OK"));
+        assert!(hot.contains("\"key\":\"tenant-a/ns/hot-key\""));
+        assert!(hot.contains("\"cold_backing\":null"));
+
+        let missing = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/missing-object HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(missing.contains("HTTP/1.1 200 OK"));
+        assert!(missing.contains("\"key\":\"missing-object\""));
+        assert!(missing.contains("\"cold_backing\":null"));
+
+        let bad_encoding = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/bad%ZZ HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(bad_encoding.contains("HTTP/1.1 400 Bad Request"));
+        assert!(bad_encoding.contains("invalid object key encoding"));
+
+        let wrong_method = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/objects/tenant-a%2Fns%2Fkey-1 HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(wrong_method.contains("HTTP/1.1 405 Method Not Allowed"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_scopes_cold_tier_object_lookup_by_tenant() {
+        let shared: Arc<dyn MetadataBackend> =
+            Arc::new(InMemoryMetadataBackend::new_hard_isolated());
+        let tenant_a = shared
+            .for_tenant("tenant-a")
+            .expect("tenant-a view should exist");
+        let tenant_b = shared
+            .for_tenant("tenant-b")
+            .expect("tenant-b view should exist");
+        tenant_a
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("device-a"))
+            .expect("tenant-a device should seed");
+        tenant_b
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("device-b"))
+            .expect("tenant-b device should seed");
+        tenant_a
+            .compare_and_swap_object_route(
+                &ObjectKey::new("shared-key"),
+                None,
+                Some(&ObjectRoute {
+                    key: ObjectKey::new("shared-key"),
+                    namespace: None,
+                    logical_key: None,
+                    canonical_key: None,
+                    sharing_scope: None,
+                    qos_tier: None,
+                    version: RouteVersion(1),
+                    state: RouteState::Active,
+                    compatibility: CompatibilityDescriptor::default(),
+                    replicas: Vec::new(),
+                    cold_backing: Some(ColdBackingRoute {
+                        owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                        cold_tier_id: "device-a".to_string(),
+                        object_locator: "objects/a.bin".to_string(),
+                        length: 12,
+                        checksum: None,
+                        state: ColdBackingState::Materialized,
+                        replicas: Vec::new(),
+                    }),
+                }),
+            )
+            .expect("tenant-a route should store");
+        tenant_b
+            .compare_and_swap_object_route(
+                &ObjectKey::new("shared-key"),
+                None,
+                Some(&ObjectRoute {
+                    key: ObjectKey::new("shared-key"),
+                    namespace: None,
+                    logical_key: None,
+                    canonical_key: None,
+                    sharing_scope: None,
+                    qos_tier: None,
+                    version: RouteVersion(1),
+                    state: RouteState::Active,
+                    compatibility: CompatibilityDescriptor::default(),
+                    replicas: Vec::new(),
+                    cold_backing: Some(ColdBackingRoute {
+                        owner: ClientRuntimeId::new("store-b", ClientEpoch(8)),
+                        cold_tier_id: "device-b".to_string(),
+                        object_locator: "objects/b.bin".to_string(),
+                        length: 21,
+                        checksum: Some(9),
+                        state: ColdBackingState::PendingOffload,
+                        replicas: Vec::new(),
+                    }),
+                }),
+            )
+            .expect("tenant-b route should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", test_service_with_backend(shared))
+                .expect("server start");
+        let address = server.address().to_string();
+
+        let tenant_a_lookup = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/shared-key?tenant=tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(tenant_a_lookup.contains("HTTP/1.1 200 OK"));
+        assert!(tenant_a_lookup.contains("\"device_id\":\"device-a\""));
+        assert!(tenant_a_lookup.contains("\"locator\":\"objects/a.bin\""));
+        assert!(tenant_a_lookup.contains("\"state\":\"materialized\""));
+        assert!(!tenant_a_lookup.contains("device-b"));
+
+        let tenant_b_lookup = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/objects/shared-key?tenant=tenant-b HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(tenant_b_lookup.contains("HTTP/1.1 200 OK"));
+        assert!(tenant_b_lookup.contains("\"device_id\":\"device-b\""));
+        assert!(tenant_b_lookup.contains("\"locator\":\"objects/b.bin\""));
+        assert!(tenant_b_lookup.contains("\"state\":\"pending_offload\""));
+        assert!(!tenant_b_lookup.contains("device-a"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
     fn admin_http_server_reports_cleanup_capability_errors() {
         let service = test_service();
         let mut server =
@@ -1061,6 +2380,62 @@ mod tests {
         );
         assert!(response.contains("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("invalid JSON body"));
+
+        let cold_register = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-0/register HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                bad_body.len(),
+                bad_body
+            ),
+        );
+        assert!(cold_register.contains("HTTP/1.1 400 Bad Request"));
+        assert!(cold_register.contains("invalid JSON body"));
+
+        let cold_unregister = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-0/unregister HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                bad_body.len(),
+                bad_body
+            ),
+        );
+        assert!(cold_unregister.contains("HTTP/1.1 400 Bad Request"));
+        assert!(cold_unregister.contains("invalid JSON body"));
+
+        let cold_disable = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-0/disable HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                bad_body.len(),
+                bad_body
+            ),
+        );
+        assert!(cold_disable.contains("HTTP/1.1 400 Bad Request"));
+        assert!(cold_disable.contains("invalid JSON body"));
+
+        let cold_enable = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-0/enable HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                bad_body.len(),
+                bad_body
+            ),
+        );
+        assert!(cold_enable.contains("HTTP/1.1 400 Bad Request"));
+        assert!(cold_enable.contains("invalid JSON body"));
+
+        let unknown_field = serde_json::json!({"unknown": true}).to_string();
+        let cold_unregister_unknown = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-0/unregister HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                unknown_field.len(),
+                unknown_field
+            ),
+        );
+        assert!(cold_unregister_unknown.contains("HTTP/1.1 400 Bad Request"));
+        assert!(cold_unregister_unknown.contains("unknown field"));
 
         server.shutdown().expect("server shutdown");
     }
@@ -1202,7 +2577,7 @@ mod tests {
                     None::<String>,
                     None::<String>,
                 ),
-                key: mooncake_store_core::ObjectKey::new("tenant-a::object-a"),
+                key: scoped_object_key("tenant-a", "object-a"),
                 expected_object_version: None,
                 delta_bytes: 12,
                 delta_objects: 1,
@@ -1236,7 +2611,7 @@ mod tests {
                     None::<String>,
                     None::<String>,
                 ),
-                key: mooncake_store_core::ObjectKey::new("tenant-a::object-b"),
+                key: scoped_object_key("tenant-a", "object-b"),
                 expected_object_version: None,
                 delta_bytes: 3,
                 delta_objects: 1,
@@ -1350,7 +2725,7 @@ mod tests {
                     None::<String>,
                     None::<String>,
                 ),
-                key: mooncake_store_core::ObjectKey::new("tenant-a::object-abort"),
+                key: scoped_object_key("tenant-a", "object-abort"),
                 expected_object_version: None,
                 delta_bytes: 3,
                 delta_objects: 1,
@@ -1410,6 +2785,7 @@ mod tests {
                 .into(),
             )),
             route_results: Arc::new(Mutex::new(VecDeque::new())),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service(rpc);
         let mut server =
@@ -1461,6 +2837,7 @@ mod tests {
             route_results: Arc::new(Mutex::new(
                 vec![Ok(Some(sample_completed_move_route()))].into(),
             )),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service(rpc);
         let mut server =
@@ -1720,6 +3097,168 @@ mod tests {
         );
         assert!(response.contains("HTTP/1.1 405 Method Not Allowed"));
         assert!(response.contains("method not allowed"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_serves_cold_tier_blockers() {
+        let rpc = Arc::new(FakeMigrationRpc::default());
+        let service = test_migration_service(rpc);
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("ssd-blockers"))
+            .expect("device should seed");
+        service
+            .backend()
+            .compare_and_swap_object_route(
+                &ObjectKey::new("blocker-object"),
+                None,
+                Some(&ObjectRoute {
+                    key: ObjectKey::new("blocker-object"),
+                    namespace: None,
+                    logical_key: None,
+                    canonical_key: None,
+                    sharing_scope: None,
+                    qos_tier: None,
+                    version: RouteVersion(1),
+                    state: RouteState::Active,
+                    compatibility: CompatibilityDescriptor::default(),
+                    replicas: Vec::new(),
+                    cold_backing: Some(ColdBackingRoute {
+                        owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
+                        cold_tier_id: "ssd-blockers".to_string(),
+                        object_locator: "objects/blocker.bin".to_string(),
+                        length: 64,
+                        checksum: None,
+                        state: ColdBackingState::Materialized,
+                        replicas: Vec::new(),
+                    }),
+                }),
+            )
+            .expect("route should seed");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-blockers/blockers HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"device_id\":\"ssd-blockers\""));
+        assert!(response.contains("\"blocked_objects\":1"));
+
+        let not_found = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/nonexistent/blockers HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(not_found.contains("HTTP/1.1 404 Not Found"));
+
+        let wrong_method = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-blockers/blockers HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(wrong_method.contains("HTTP/1.1 405 Method Not Allowed"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_serves_cold_tier_manual_gc() {
+        let rpc = Arc::new(FakeMigrationRpc::default());
+        let service = test_migration_service(rpc);
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("ssd-gc"))
+            .expect("device should seed");
+        service
+            .backend()
+            .upsert_client_lease(&live_lease("storage-a", 1))
+            .expect("lease should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-gc/manual-gc HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"device_id\":\"ssd-gc\""));
+        assert!(response.contains("\"collected_objects\":0"));
+        assert!(response.contains("manual cold tier GC completed"));
+
+        let not_found = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/nonexistent/manual-gc HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(not_found.contains("HTTP/1.1 404 Not Found"));
+
+        let wrong_method = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-gc/manual-gc HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(wrong_method.contains("HTTP/1.1 405 Method Not Allowed"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_serves_cold_tier_manual_free() {
+        let rpc = Arc::new(FakeMigrationRpc::default());
+        let service = test_migration_service(rpc);
+        service
+            .backend()
+            .put_cold_tier_device_if_absent(&sample_cold_tier_device("ssd-free"))
+            .expect("device should seed");
+        service
+            .backend()
+            .upsert_client_lease(&live_lease("storage-a", 1))
+            .expect("lease should store");
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/ssd-free/manual-free HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"device_id\":\"ssd-free\""));
+        assert!(response.contains("\"freed_backings\":0"));
+        assert!(response.contains("\"reached_low_watermark\":true"));
+        assert!(response.contains("manual cold tier free completed"));
+
+        let not_found = http_request(
+            &address,
+            &format!(
+                "POST /v1/cold-tier/devices/nonexistent/manual-free HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(not_found.contains("HTTP/1.1 404 Not Found"));
+
+        let wrong_method = http_request(
+            &address,
+            &format!(
+                "GET /v1/cold-tier/devices/ssd-free/manual-free HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(wrong_method.contains("HTTP/1.1 405 Method Not Allowed"));
 
         server.shutdown().expect("server shutdown");
     }

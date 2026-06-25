@@ -18,9 +18,9 @@ use crate::mesh::read_repair::{
     RouteAuthorityObservation, RouteReadRepairState,
 };
 use crate::mesh::registry::{
-    authority_compare_and_swap_many, authority_contains_many, authority_get_many,
-    authority_get_version_floor, authority_get_version_floors, authority_is_local,
-    authority_list_reuse_candidates, authority_list_routes_by_replica_owner,
+    authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
+    authority_get_many, authority_get_version_floor, authority_get_version_floors,
+    authority_is_local, authority_list_reuse_candidates, authority_list_routes_by_replica_owner,
     authority_list_routes_in_scope, local_authority_service, register_local_authority,
     unregister_local_authority,
 };
@@ -60,6 +60,7 @@ struct EmbeddedWrhRouteDirectory {
     route_topk: usize,
     namespace: String,
     local_stable_id: ClientStableId,
+    metadata: Arc<dyn MetadataBackend>,
     authority_client: Arc<dyn RouteAuthorityClient>,
     membership: Arc<dyn RouteMembershipProvider>,
     async_mirror: AsyncRouteMirrorWorker,
@@ -103,6 +104,7 @@ impl EmbeddedWrhRouteDirectory {
             route_topk,
             namespace,
             local_stable_id: lease.runtime.stable_id.clone(),
+            metadata,
             authority_client,
             membership,
             async_mirror,
@@ -803,6 +805,10 @@ impl Drop for EmbeddedWrhRouteDirectory {
 }
 
 impl RouteDirectory for EmbeddedWrhRouteDirectory {
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.metadata.as_ref()
+    }
+
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -1018,6 +1024,16 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         results.pop().ok_or_else(|| {
             StoreError::InvalidState("missing route cas result from batch path".to_string())
         })?
+    }
+
+    fn compare_and_swap_local_route(
+        &self,
+        _observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> Result<CasResult> {
+        authority_compare_and_swap(&self.namespace, &self.local_stable_id, key, expected, next)
     }
 
     fn compare_and_swap_object_routes(

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -17,25 +18,38 @@ use mooncake_store_client::{
 };
 use mooncake_store_core::{
     route_logical_object_id, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId,
-    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, RoutePolicyDomain,
-    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
-    TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
-    TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationState,
-    TenantRoutePolicy, CONTROL_ADDR_LABEL, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET, METRICS_PORT_LABEL,
+    ColdBackingState, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
+    ColdTierPutDeviceResult, LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey,
+    ObjectRoute, RoutePolicyDomain, StoreError, TenantBandwidthShapingPolicy,
+    TenantExecutionFairnessPolicy, TenantObjectAccountingState, TenantPlacementPolicy,
+    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest,
+    TenantQuotaPolicy, TenantQuotaReservationState, TenantRoutePolicy, CONTROL_ADDR_LABEL,
+    DEFAULT_DOMAIN, DEFAULT_OBJECT_SET, METRICS_PORT_LABEL,
 };
 use parking_lot::Mutex;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::config::build_store_metadata_backend;
 
 use super::models::{
     AdminCleanupReport, AdminMaintenanceReport, AdminOwnerCleanupReport, AdminOwnerCleanupState,
-    DeleteTenantPolicyResponse, GetTenantObjectAccountingResponse, GetTenantPolicyResponse,
-    GetTenantQuotaStateResponse, ListTenantQuotaReservationsResponse, PolicyPatchInput,
+    ColdTierBlockersResponse, ColdTierDeviceResponse, ColdTierDeviceState, ColdTierDisableRequest,
+    ColdTierDrainRequest, ColdTierDrainResponse, ColdTierEnableRequest, ColdTierManualFreeResponse,
+    ColdTierManualGcResponse, ColdTierObjectBackingOwnerResponse, ColdTierObjectBackingResponse,
+    ColdTierOffloadTaskState, ColdTierQuarantineFile, ColdTierQuarantineReport,
+    ColdTierRegisterRequest, ColdTierRegisterResponse, ColdTierStateChangeResponse,
+    ColdTierTargetSpec, ColdTierUnregisterRequest, ColdTierUnregisterResponse,
+    CreateColdTierDeviceRequest, CreateColdTierDeviceResponse, DebugRouteListResponse,
+    DebugRouteNamespaceResponse, DebugRouteReplicaResponse, DebugRouteResponse,
+    DeleteTenantPolicyResponse, GetColdTierObjectResponse, GetTenantObjectAccountingResponse,
+    GetTenantPolicyResponse, GetTenantQuotaStateResponse, ListColdTierDevicesResponse,
+    ListColdTierOffloadTasksResponse, ListTenantQuotaReservationsResponse, PolicyPatchInput,
     RouteMigrationMode, RouteMigrationTaskListResponse, RouteMigrationTaskState,
     RouteMigrationTaskStatusResponse, RouteMigrationTaskSubmitRequest, RoutePolicyResponse,
     TenantQuotaAbortResponse, TenantQuotaReconcileAction, TenantQuotaReconcileReport,
     TracingAction, TracingClusterResponse, TracingNodeResponse, TracingUpdateRequest,
+    TriggerColdTierOffloadRequest, TriggerColdTierOffloadResponse,
 };
 
 pub type AdminResult<T> = mooncake_store_core::Result<T>;
@@ -44,6 +58,8 @@ const DEFAULT_MIGRATION_MAX_RETRIES: u32 = 5;
 const DEFAULT_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_secs(3);
 const DEFAULT_MIGRATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_MIGRATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ADMIN_LIVE_LEASE_RESOLVE_ATTEMPTS: usize = 8;
+const ADMIN_LIVE_LEASE_RESOLVE_BACKOFF: Duration = Duration::from_millis(50);
 const MIGRATION_MAX_RETRIES_ENV: &str = "MC_STORE_ADMIN_MIGRATION_MAX_RETRIES";
 const MIGRATION_RETRY_BASE_DELAY_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_RETRY_BASE_DELAY_MS";
 const MIGRATION_RETRY_MAX_DELAY_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_RETRY_MAX_DELAY_MS";
@@ -125,6 +141,28 @@ pub(crate) trait MigrationRpc: Send + Sync {
         authority: &ClientStableId,
         key: &ObjectKey,
     ) -> AdminResult<Option<ObjectRoute>>;
+
+    fn trigger_cold_tier_offload(&self, lease: &ClientLease, max_tasks: u64) -> AdminResult<u64>;
+
+    fn manual_cold_tier_gc(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_backings: u64,
+    ) -> AdminResult<u64>;
+
+    fn manual_cold_tier_free(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_victims: u64,
+    ) -> AdminResult<control_plane_pb::ManualColdTierFreeReply>;
+
+    fn probe_cold_tier_device(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+    ) -> AdminResult<control_plane_pb::ProbeColdTierDeviceReply>;
 }
 
 struct ControlPlaneMigrationRpc;
@@ -167,6 +205,36 @@ impl MigrationRpc for ControlPlaneMigrationRpc {
         key: &ObjectKey,
     ) -> AdminResult<Option<ObjectRoute>> {
         MigrationControlClient::new()?.get_route(lease, namespace, authority, key)
+    }
+
+    fn trigger_cold_tier_offload(&self, lease: &ClientLease, max_tasks: u64) -> AdminResult<u64> {
+        MigrationControlClient::new()?.trigger_cold_tier_offload(lease, max_tasks)
+    }
+
+    fn manual_cold_tier_gc(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_backings: u64,
+    ) -> AdminResult<u64> {
+        MigrationControlClient::new()?.manual_cold_tier_gc(lease, device_id, max_backings)
+    }
+
+    fn manual_cold_tier_free(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_victims: u64,
+    ) -> AdminResult<control_plane_pb::ManualColdTierFreeReply> {
+        MigrationControlClient::new()?.manual_cold_tier_free(lease, device_id, max_victims)
+    }
+
+    fn probe_cold_tier_device(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+    ) -> AdminResult<control_plane_pb::ProbeColdTierDeviceReply> {
+        MigrationControlClient::new()?.probe_cold_tier_device(lease, device_id)
     }
 }
 
@@ -723,6 +791,25 @@ impl MigrationTaskManagerState {
     }
 
     fn resolve_live_lease(&self, stable_id: &str) -> AdminResult<ClientLease> {
+        let mut last_error = None;
+        for attempt in 0..ADMIN_LIVE_LEASE_RESOLVE_ATTEMPTS {
+            match self.resolve_live_lease_once(stable_id) {
+                Ok(lease) => return Ok(lease),
+                Err(error @ StoreError::NotFound(_)) => {
+                    last_error = Some(error);
+                    if attempt + 1 < ADMIN_LIVE_LEASE_RESOLVE_ATTEMPTS {
+                        thread::sleep(ADMIN_LIVE_LEASE_RESOLVE_BACKOFF);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            StoreError::NotFound(format!("live client lease for {stable_id} was not found"))
+        }))
+    }
+
+    fn resolve_live_lease_once(&self, stable_id: &str) -> AdminResult<ClientLease> {
         let mut matches = self
             .backend
             .list_live_clients()?
@@ -821,6 +908,36 @@ fn parse_env_u32(name: &str) -> AdminResult<Option<u32>> {
 
 fn parse_env_duration_ms(name: &str) -> AdminResult<Option<Duration>> {
     Ok(parse_env_u32(name)?.map(|value| Duration::from_millis(value as u64)))
+}
+
+fn resolve_live_lease_from_backend(
+    backend: &dyn MetadataBackend,
+    stable_id: &str,
+) -> AdminResult<ClientLease> {
+    let stable_id = ClientStableId::new(stable_id);
+    let mut last_missing = None;
+    for attempt in 0..ADMIN_LIVE_LEASE_RESOLVE_ATTEMPTS {
+        match backend.get_live_runtime_by_stable_id(&stable_id)? {
+            Some(lease) => return Ok(lease),
+            None => {
+                last_missing = Some(StoreError::InvalidState(format!(
+                    "live runtime {stable_id} not found"
+                )));
+                if attempt + 1 < ADMIN_LIVE_LEASE_RESOLVE_ATTEMPTS {
+                    thread::sleep(ADMIN_LIVE_LEASE_RESOLVE_BACKOFF);
+                }
+            }
+        }
+    }
+    Err(last_missing
+        .unwrap_or_else(|| StoreError::InvalidState(format!("live runtime {stable_id} not found"))))
+}
+
+fn current_live_epoch(backend: &dyn MetadataBackend, stable_id: &str) -> AdminResult<u64> {
+    Ok(resolve_live_lease_from_backend(backend, stable_id)?
+        .runtime
+        .epoch
+        .0)
 }
 
 fn validate_route_migration_request(
@@ -932,6 +1049,7 @@ pub struct AdminService {
     metadata_url: String,
     keyspace: MetadataKeyspace,
     migrations: MigrationTaskManager,
+    cold_tier_offloads: ColdTierOffloadTaskManager,
 }
 
 trait AdminMaintenanceBackend {
@@ -1305,7 +1423,12 @@ impl AdminService {
         migration_rpc: Arc<dyn MigrationRpc>,
     ) -> Self {
         Self {
-            migrations: MigrationTaskManager::new(backend.clone(), migration_rpc, migration_config),
+            migrations: MigrationTaskManager::new(
+                backend.clone(),
+                migration_rpc.clone(),
+                migration_config,
+            ),
+            cold_tier_offloads: ColdTierOffloadTaskManager::new(backend.clone(), migration_rpc),
             backend,
             metadata_url: metadata_url.into(),
             keyspace,
@@ -1420,6 +1543,104 @@ impl AdminService {
 
     pub fn list_route_migration_tasks(&self) -> RouteMigrationTaskListResponse {
         self.migrations.list()
+    }
+
+    pub fn list_debug_routes(&self, tenant: Option<&str>) -> AdminResult<DebugRouteListResponse> {
+        const MAX_ROUTES: usize = 10_000;
+        let tenant = tenant.map(str::trim).filter(|tenant| !tenant.is_empty());
+        let mut routes = self
+            .backend
+            .list_object_routes()?
+            .into_iter()
+            .filter(|route| self.debug_route_matches_tenant(route, tenant))
+            .take(MAX_ROUTES)
+            .map(|route| self.debug_route_response(&route))
+            .collect::<Vec<_>>();
+        routes.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(DebugRouteListResponse {
+            count: routes.len(),
+            routes,
+        })
+    }
+
+    pub fn get_debug_route(
+        &self,
+        tenant: Option<&str>,
+        key: &str,
+    ) -> AdminResult<Option<DebugRouteResponse>> {
+        let tenant = tenant.map(str::trim).filter(|tenant| !tenant.is_empty());
+        let route = self
+            .backend
+            .get_object_route(&ObjectKey::new(key))?
+            .filter(|route| self.debug_route_matches_tenant(route, tenant))
+            .map(|route| self.debug_route_response(&route));
+        Ok(route)
+    }
+
+    fn debug_route_matches_tenant(&self, route: &ObjectRoute, tenant: Option<&str>) -> bool {
+        match tenant {
+            Some(expected) => {
+                route
+                    .namespace
+                    .as_ref()
+                    .map(|namespace| namespace.tenant.as_str() == expected)
+                    .unwrap_or(false)
+                    || route
+                        .sharing_scope
+                        .as_deref()
+                        .map(|sharing_scope| sharing_scope == expected)
+                        .unwrap_or(false)
+                    || route
+                        .canonical_key
+                        .as_deref()
+                        .and_then(|canonical_key| canonical_key.split('/').next())
+                        .map(|tenant| tenant == expected)
+                        .unwrap_or(false)
+                    || route
+                        .key
+                        .0
+                        .split("::ns/")
+                        .next()
+                        .map(|tenant| tenant == expected)
+                        .unwrap_or(false)
+            }
+            None => true,
+        }
+    }
+
+    fn debug_route_response(&self, route: &ObjectRoute) -> DebugRouteResponse {
+        DebugRouteResponse {
+            key: route.key.0.clone(),
+            version: route.version.0,
+            state: format!("{:?}", route.state),
+            namespace: route
+                .namespace
+                .as_ref()
+                .map(|namespace| DebugRouteNamespaceResponse {
+                    tenant: namespace.tenant.clone(),
+                    domain: namespace.domain.clone(),
+                    object_set: namespace.object_set.clone(),
+                }),
+            logical_key: route.logical_key.clone(),
+            canonical_key: route.canonical_key.clone(),
+            sharing_scope: route.sharing_scope.clone(),
+            qos_tier: route.qos_tier.clone(),
+            replicas: route
+                .replicas
+                .iter()
+                .map(|replica| DebugRouteReplicaResponse {
+                    owner_stable_id: replica.owner.stable_id.to_string(),
+                    owner_epoch: replica.owner.epoch.0,
+                    segment_name: replica.segment_name.0.clone(),
+                    segment_offset: replica.segment_offset,
+                    length: replica.length,
+                    checksum: replica.checksum,
+                    tier: format!("{:?}", replica.tier),
+                    priority: replica.priority,
+                })
+                .collect(),
+            cold_backing: self.debug_route_cold_backing(self.backend.as_ref(), route),
+        }
     }
 
     pub fn get_route_policy(&self, tenant: Option<&str>) -> AdminResult<RoutePolicyResponse> {
@@ -1864,6 +2085,8 @@ impl AdminService {
     }
 }
 
+include!("cold_tier_service.rs");
+
 pub fn route_policy_domain(tenant: Option<&str>) -> RoutePolicyDomain {
     tenant
         .map(|tenant| RoutePolicyDomain::Tenant(tenant.to_string()))
@@ -2066,13 +2289,14 @@ mod tests {
     use mooncake_store_client::control_plane_pb;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        ClientStableId, CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute,
-        ReplicaRoute, ReplicaTier, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
-        SegmentAnnouncement, SegmentLifecycleState, SegmentName, TenantObjectAccounting,
-        TenantObjectAccountingState, TenantPolicy, TenantQuotaAbortOutcome,
-        TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
-        TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
-        TenantQuotaReservationState, TenantQuotaState, METRICS_PORT_LABEL,
+        ClientStableId, ColdBackingRoute, ColdBackingState, CompatibilityDescriptor,
+        MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
+        RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement,
+        SegmentLifecycleState, SegmentName, TenantObjectAccounting, TenantObjectAccountingState,
+        TenantPolicy, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservation,
+        TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaReservationState,
+        TenantQuotaState, METRICS_PORT_LABEL,
     };
     use parking_lot::Mutex;
 
@@ -2255,6 +2479,46 @@ mod tests {
             self.inner.list_route_policies()
         }
 
+        fn put_cold_tier_device_if_absent(
+            &self,
+            device: &mooncake_store_core::ColdTierDeviceRecord,
+        ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierPutDeviceResult> {
+            self.inner.put_cold_tier_device_if_absent(device)
+        }
+
+        fn get_cold_tier_device(
+            &self,
+            device_id: &str,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::ColdTierDeviceRecord>>
+        {
+            self.inner.get_cold_tier_device(device_id)
+        }
+
+        fn list_cold_tier_devices(
+            &self,
+            filter: &mooncake_store_core::ColdTierDeviceFilter,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
+            self.inner.list_cold_tier_devices(filter)
+        }
+
+        fn update_cold_tier_device(
+            &self,
+            device_id: &str,
+            update: mooncake_store_core::ColdTierDeviceUpdate,
+        ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierDeviceRecord> {
+            self.inner.update_cold_tier_device(device_id, update)
+        }
+
+        fn apply_cold_tier_usage_delta(
+            &self,
+            device_id: &str,
+            delta: mooncake_store_core::ColdTierUsageDelta,
+            updated_at_ms: u64,
+        ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierDeviceRecord> {
+            self.inner
+                .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
+        }
+
         fn get_tenant_policy(
             &self,
             scope: &TenantPolicyScope,
@@ -2357,17 +2621,14 @@ mod tests {
         ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
             self.inner.get_handoff(stable_id)
         }
-
-        fn list_cold_tier_devices(
-            &self,
-            filter: &mooncake_store_core::ColdTierDeviceFilter,
-        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ColdTierDeviceRecord>> {
-            self.inner.list_cold_tier_devices(filter)
-        }
     }
 
     fn test_service() -> AdminService {
         let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        AdminService::new(backend, "memory://test", MetadataKeyspace::default())
+    }
+
+    fn test_service_with_backend(backend: Arc<dyn MetadataBackend>) -> AdminService {
         AdminService::new(backend, "memory://test", MetadataKeyspace::default())
     }
 
@@ -2412,14 +2673,13 @@ mod tests {
     impl RedisTestServer {
         fn start() -> Option<Self> {
             let _env_guard = RedisEnvGuard::clear_auth();
-            if Command::new("redis-server")
+            if !Command::new("redis-server")
                 .arg("--version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .ok()?
                 .success()
-                == false
             {
                 return None;
             }
@@ -2608,6 +2868,16 @@ mod tests {
         submit_results: Arc<Mutex<VecDeque<AdminResult<String>>>>,
         status_results: Arc<Mutex<VecDeque<AdminResult<MigrationExecutionProbe>>>>,
         route_results: Arc<Mutex<VecDeque<AdminResult<Option<ObjectRoute>>>>>,
+        offload_results: Arc<Mutex<VecDeque<AdminResult<u64>>>>,
+        offload_calls: Arc<Mutex<Vec<(String, u64)>>>,
+        manual_gc_results: Arc<Mutex<VecDeque<AdminResult<u64>>>>,
+        manual_gc_calls: Arc<Mutex<Vec<(String, String, u64)>>>,
+        manual_free_results:
+            Arc<Mutex<VecDeque<AdminResult<control_plane_pb::ManualColdTierFreeReply>>>>,
+        manual_free_calls: Arc<Mutex<Vec<(String, String, u64)>>>,
+        probe_results:
+            Arc<Mutex<VecDeque<AdminResult<control_plane_pb::ProbeColdTierDeviceReply>>>>,
+        probe_calls: Arc<Mutex<Vec<(String, String)>>>,
         submit_calls: Arc<AtomicUsize>,
         status_calls: Arc<AtomicUsize>,
     }
@@ -2658,6 +2928,76 @@ mod tests {
             _key: &ObjectKey,
         ) -> AdminResult<Option<ObjectRoute>> {
             self.route_results.lock().pop_front().unwrap_or(Ok(None))
+        }
+
+        fn trigger_cold_tier_offload(
+            &self,
+            lease: &ClientLease,
+            max_tasks: u64,
+        ) -> AdminResult<u64> {
+            self.offload_calls
+                .lock()
+                .push((lease.runtime.stable_id.to_string(), max_tasks));
+            self.offload_results.lock().pop_front().unwrap_or(Ok(0))
+        }
+
+        fn manual_cold_tier_gc(
+            &self,
+            lease: &ClientLease,
+            device_id: &str,
+            max_backings: u64,
+        ) -> AdminResult<u64> {
+            self.manual_gc_calls.lock().push((
+                lease.runtime.stable_id.to_string(),
+                device_id.to_string(),
+                max_backings,
+            ));
+            self.manual_gc_results.lock().pop_front().unwrap_or(Ok(0))
+        }
+
+        fn manual_cold_tier_free(
+            &self,
+            lease: &ClientLease,
+            device_id: &str,
+            max_victims: u64,
+        ) -> AdminResult<control_plane_pb::ManualColdTierFreeReply> {
+            self.manual_free_calls.lock().push((
+                lease.runtime.stable_id.to_string(),
+                device_id.to_string(),
+                max_victims,
+            ));
+            self.manual_free_results.lock().pop_front().unwrap_or(Ok(
+                control_plane_pb::ManualColdTierFreeReply {
+                    attempted_victims: 0,
+                    freed_backings: 0,
+                    skipped_backings: 0,
+                    reached_low_watermark: true,
+                    error: None,
+                    collected_backings: 0,
+                },
+            ))
+        }
+
+        fn probe_cold_tier_device(
+            &self,
+            lease: &ClientLease,
+            device_id: &str,
+        ) -> AdminResult<control_plane_pb::ProbeColdTierDeviceReply> {
+            self.probe_calls
+                .lock()
+                .push((lease.runtime.stable_id.to_string(), device_id.to_string()));
+            self.probe_results.lock().pop_front().unwrap_or_else(|| {
+                Ok(control_plane_pb::ProbeColdTierDeviceReply {
+                    device_id: device_id.to_string(),
+                    capacity_bytes: 0,
+                    used_bytes: 0,
+                    reserved_bytes: 0,
+                    schedulable: true,
+                    state: "Healthy".to_string(),
+                    last_error: String::new(),
+                    error: None,
+                })
+            })
         }
     }
 
@@ -3008,6 +3348,8 @@ mod tests {
         route
     }
 
+    include!("cold_tier_service_tests.rs");
+
     #[test]
     fn root_scope_helpers_collapse_nested_scope() {
         let nested = TenantPolicyScope::new("tenant-a", Some("domain-a"), Some("set-a"));
@@ -3132,6 +3474,127 @@ mod tests {
                 route_topk: Some(4),
             })
         );
+    }
+
+    #[test]
+    fn admin_service_lists_debug_routes_from_root_backend_with_tenant_filter() {
+        let shared = Arc::new(InMemoryMetadataBackend::new_hard_isolated());
+        let route = ObjectRoute {
+            key: ObjectKey::new("tenant-a/default/default/object-a"),
+            namespace: Some(NamespaceScope::with_defaults(
+                Some("tenant-a"),
+                Some("default"),
+                Some("default"),
+            )),
+            logical_key: Some("object-a".to_string()),
+            canonical_key: Some("tenant-a/default/default/object-a".to_string()),
+            sharing_scope: Some("tenant-a".to_string()),
+            qos_tier: Some("default".to_string()),
+            version: RouteVersion(7),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                segment_name: SegmentName::new("segment-a"),
+                offset: None,
+                segment_offset: 12,
+                length: 34,
+                checksum: Some(56),
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: Some(ColdBackingRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                cold_tier_id: "device-a".to_string(),
+                object_locator: "objects/ab/object-a.bin".to_string(),
+                length: 34,
+                checksum: Some(56),
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            }),
+        };
+        shared
+            .compare_and_swap_object_route(&route.key, None, Some(&route))
+            .expect("route should store");
+
+        let service = test_service_with_backend(shared);
+        let list = service
+            .list_debug_routes(Some("tenant-a"))
+            .expect("tenant-filtered debug route list should succeed");
+        assert_eq!(list.count, 1);
+        assert_eq!(list.routes[0].key, "tenant-a/default/default/object-a");
+        assert_eq!(
+            list.routes[0]
+                .namespace
+                .as_ref()
+                .expect("namespace should exist")
+                .tenant,
+            "tenant-a"
+        );
+
+        let detail = service
+            .get_debug_route(Some("tenant-a"), "tenant-a/default/default/object-a")
+            .expect("tenant-filtered debug route lookup should succeed")
+            .expect("route should be visible through root backend tenant filter");
+        assert_eq!(detail.version, 7);
+        assert_eq!(detail.key, "tenant-a/default/default/object-a");
+
+        let missing = service
+            .get_debug_route(Some("tenant-b"), "tenant-a/default/default/object-a")
+            .expect("mismatched tenant lookup should succeed");
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn admin_service_lists_debug_routes_when_tenant_is_only_encoded_in_key() {
+        let shared = Arc::new(InMemoryMetadataBackend::new_hard_isolated());
+        let route = ObjectRoute {
+            key: ObjectKey::new("default::ns/default/default/object-a"),
+            namespace: None,
+            logical_key: Some("object-a".to_string()),
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: Some("default".to_string()),
+            version: RouteVersion(7),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                segment_name: SegmentName::new("segment-a"),
+                offset: None,
+                segment_offset: 12,
+                length: 34,
+                checksum: Some(56),
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: Some(ColdBackingRoute {
+                owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
+                cold_tier_id: "device-a".to_string(),
+                object_locator: "objects/ab/object-a.bin".to_string(),
+                length: 34,
+                checksum: Some(56),
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            }),
+        };
+        shared
+            .compare_and_swap_object_route(&route.key, None, Some(&route))
+            .expect("route should store");
+
+        let service = test_service_with_backend(shared);
+        let list = service
+            .list_debug_routes(Some("default"))
+            .expect("key-encoded tenant route list should succeed");
+        assert_eq!(list.count, 1);
+        assert_eq!(list.routes[0].key, "default::ns/default/default/object-a");
+
+        let detail = service
+            .get_debug_route(Some("default"), "default::ns/default/default/object-a")
+            .expect("key-encoded tenant route lookup should succeed")
+            .expect("route should be visible through key fallback");
+        assert_eq!(detail.version, 7);
+        assert_eq!(detail.key, "default::ns/default/default/object-a");
     }
 
     #[test]
@@ -3627,8 +4090,7 @@ mod tests {
                 .into(),
             )),
             route_results: Arc::new(Mutex::new(VecDeque::new())),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -3676,8 +4138,7 @@ mod tests {
                 )))]
                 .into(),
             )),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -3721,8 +4182,7 @@ mod tests {
             )),
             status_results: Arc::new(Mutex::new(VecDeque::new())),
             route_results: Arc::new(Mutex::new(vec![Ok(None), Ok(None)].into())),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -3766,8 +4226,7 @@ mod tests {
                 vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
             )),
             route_results: Arc::new(Mutex::new(VecDeque::new())),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -3815,8 +4274,7 @@ mod tests {
                 ]
                 .into(),
             )),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -3862,8 +4320,7 @@ mod tests {
                 )))]
                 .into(),
             )),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -3909,8 +4366,7 @@ mod tests {
                 )))]
                 .into(),
             )),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -4023,8 +4479,7 @@ mod tests {
                 .into(),
             )),
             route_results: Arc::new(Mutex::new(vec![Ok(None)].into())),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -4068,8 +4523,7 @@ mod tests {
                 .into(),
             )),
             route_results: Arc::new(Mutex::new(vec![Ok(None), Ok(None)].into())),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -4199,8 +4653,7 @@ mod tests {
                 )))]
                 .into(),
             )),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,
@@ -4261,8 +4714,7 @@ mod tests {
                 vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
             )),
             route_results: Arc::new(Mutex::new(VecDeque::new())),
-            submit_calls: Arc::new(AtomicUsize::new(0)),
-            status_calls: Arc::new(AtomicUsize::new(0)),
+            ..FakeMigrationRpc::default()
         });
         let service = test_migration_service_with_rpc(
             backend,

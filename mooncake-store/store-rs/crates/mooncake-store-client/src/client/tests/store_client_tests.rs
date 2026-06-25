@@ -294,6 +294,10 @@ impl RouteDirectory for RecordingRouteDirectory {
             "recording route directory does not support CAS".to_string(),
         ))
     }
+
+    fn metadata(&self) -> &dyn MetadataBackend {
+        panic!("recording route directory does not expose metadata")
+    }
 }
 
 #[test]

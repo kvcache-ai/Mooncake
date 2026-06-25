@@ -415,7 +415,6 @@ const DEFAULT_RESTORE_PROMOTION_QUEUE_LIMIT: usize = 1024;
 
 struct RestorePromotionQueue {
     state: Mutex<RestorePromotionQueueState>,
-    idle: parking_lot::Condvar,
     limit: usize,
     batch_limit: usize,
     max_in_flight: usize,

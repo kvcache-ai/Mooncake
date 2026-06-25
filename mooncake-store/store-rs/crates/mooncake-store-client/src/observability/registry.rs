@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -56,6 +58,75 @@ pub(crate) const METADATA_OPERATION_TOTAL: &str = "mooncake_store_metadata_opera
 pub(crate) const METADATA_OPERATION_INFLIGHT: &str = "mooncake_store_metadata_operation_inflight";
 pub(crate) const METADATA_OPERATION_DURATION: &str =
     "mooncake_store_metadata_operation_duration_seconds";
+pub(crate) const COLD_TIER_DEVICE_TOTAL: &str = "mooncake_store_cold_tier_device_total";
+pub(crate) const COLD_TIER_DEVICE_SCHEDULABLE_TOTAL: &str =
+    "mooncake_store_cold_tier_device_schedulable_total";
+pub(crate) const COLD_TIER_DEVICE_USED_BYTES: &str = "mooncake_store_cold_tier_device_used_bytes";
+pub(crate) const COLD_TIER_DEVICE_RESERVED_BYTES: &str =
+    "mooncake_store_cold_tier_device_reserved_bytes";
+pub(crate) const COLD_TIER_DEVICE_CAPACITY_BYTES: &str =
+    "mooncake_store_cold_tier_device_capacity_bytes";
+pub(crate) const COLD_TIER_PENDING_OFFLOAD_TOTAL: &str =
+    "mooncake_store_cold_tier_pending_offload_total";
+pub(crate) const COLD_TIER_PENDING_OFFLOAD_READY: &str =
+    "mooncake_store_cold_tier_pending_offload_ready";
+pub(crate) const COLD_TIER_PENDING_OFFLOAD_DELAYED: &str =
+    "mooncake_store_cold_tier_pending_offload_delayed";
+pub(crate) const COLD_TIER_PENDING_OFFLOAD_ATTEMPTS_TOTAL: &str =
+    "mooncake_store_cold_tier_pending_offload_attempts_total";
+pub(crate) const COLD_TIER_PENDING_OFFLOAD_MAX_ATTEMPTS: &str =
+    "mooncake_store_cold_tier_pending_offload_max_attempts";
+pub(crate) const COLD_TIER_RECLAIM_PENDING_TOTAL: &str =
+    "mooncake_store_cold_tier_reclaim_pending_total";
+pub(crate) const COLD_TIER_RECLAIM_DUE_TOTAL: &str = "mooncake_store_cold_tier_reclaim_due_total";
+pub(crate) const COLD_TIER_RECLAIM_BY_KIND: &str = "mooncake_store_cold_tier_reclaim_by_kind";
+pub(crate) const COLD_TIER_RECLAIM_BY_QOS_TIER: &str =
+    "mooncake_store_cold_tier_reclaim_by_qos_tier";
+pub(crate) const COLD_TIER_RECLAIM_BY_POLICY_RANK: &str =
+    "mooncake_store_cold_tier_reclaim_by_policy_rank";
+pub(crate) const COLD_TIER_OPERATION_TOTAL: &str = "mooncake_store_cold_tier_operation_total";
+pub(crate) const COLD_RESTORE_SINGLEFLIGHT_TOTAL: &str =
+    "mooncake_store_cold_restore_singleflight_total";
+pub(crate) const COLD_RESTORE_MAX_CONCURRENT_IO_PER_OBJECT: &str =
+    "mooncake_store_cold_restore_max_concurrent_io_per_object";
+pub(crate) const COLD_TIER_SSD_READ_DURATION: &str =
+    "mooncake_store_cold_tier_ssd_read_duration_seconds";
+pub(crate) const COLD_TIER_SSD_WRITE_DURATION: &str =
+    "mooncake_store_cold_tier_ssd_write_duration_seconds";
+pub(crate) const EXTENT_STORE_IO_PRIORITY_WAIT: &str =
+    "mooncake_store_extent_store_io_priority_wait_seconds";
+pub(crate) const STAGING_POOL_WAIT: &str = "mooncake_store_staging_pool_wait_seconds";
+pub(crate) const STAGING_POOL_EXHAUSTION_TOTAL: &str =
+    "mooncake_store_staging_pool_exhaustion_total";
+pub(crate) const EXTENT_STORE_QUEUE_WAIT: &str = "mooncake_store_extent_store_queue_wait_seconds";
+pub(crate) const EXTENT_STORE_PIPELINE_DURATION: &str =
+    "mooncake_store_extent_store_pipeline_duration_seconds";
+
+// --- Batch Get Phase Profiling Metrics ---
+pub(crate) const BATCH_GET_PHASE_DURATION: &str = "mooncake_store_batch_get_phase_duration_seconds";
+pub(crate) const BATCH_GET_PATH_ITEMS_TOTAL: &str = "mooncake_store_batch_get_path_items_total";
+pub(crate) const FACADE_PHASE_DURATION: &str = "mooncake_store_facade_phase_duration_seconds";
+pub(crate) const RDMA_TRANSFER_DURATION: &str = "mooncake_store_rdma_transfer_duration_seconds";
+pub(crate) const RDMA_BYTES_TOTAL: &str = "mooncake_store_rdma_bytes_total";
+pub(crate) const COLD_READ_BATCH_WALL_DURATION: &str =
+    "mooncake_store_cold_read_batch_wall_duration_seconds";
+pub(crate) const IO_URING_PHASE_DURATION: &str = "mooncake_store_io_uring_phase_duration_seconds";
+pub(crate) const IO_URING_OPS_TOTAL: &str = "mooncake_store_io_uring_ops_total";
+pub(crate) const COLD_RESTORE_BATCH_DURATION: &str =
+    "mooncake_store_cold_restore_batch_duration_seconds";
+pub(crate) const COLD_RESTORE_BATCH_ITEMS: &str = "mooncake_store_cold_restore_batch_items";
+pub(crate) const COLD_PREFETCH_WORKER_DURATION: &str =
+    "mooncake_store_cold_prefetch_worker_duration_seconds";
+pub(crate) const COLD_PREFETCH_WORKER_ITEMS: &str =
+    "mooncake_store_cold_prefetch_worker_items_total";
+pub(crate) const BATCH_IS_EXIST_DURATION: &str = "mooncake_store_batch_is_exist_duration_seconds";
+
+/// Bucket boundaries for SSD IO latency histograms.
+/// Covers normal SSD (~1ms) through throttled cloud disk (~1s+).
+pub(crate) const COLD_TIER_IO_BUCKETS: &[f64] = &[
+    0.000_1, 0.000_5, 0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0,
+    10.0,
+];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OperationMetricSnapshot {
@@ -123,6 +194,29 @@ pub struct MetricsSnapshot {
     pub cold_tier_reclaim_by_qos_tier: Vec<GaugeSample<ColdTierReclaimQosKey>>,
     pub cold_tier_reclaim_by_policy_rank: Vec<GaugeSample<ColdTierReclaimPolicyRankKey>>,
     pub cold_tier_operations: Vec<CounterSample<ColdTierOperationKey>>,
+    pub cold_restore_singleflight: Vec<CounterSample<ColdRestoreSingleflightKey>>,
+    pub cold_restore_max_concurrent_io_per_object: f64,
+    pub cold_tier_ssd_read_duration: Vec<HistogramSample<ResultKey>>,
+    pub cold_tier_ssd_write_duration: Vec<HistogramSample<ResultKey>>,
+    pub io_priority_wait: Vec<HistogramSample<ResultKey>>,
+    pub staging_pool_wait: Vec<HistogramSample<ResultKey>>,
+    pub staging_pool_exhaustion: Vec<CounterSample<ResultKey>>,
+    pub extent_store_queue_wait: Vec<HistogramSample<ResultKey>>,
+    pub extent_store_pipeline_duration: Vec<HistogramSample<ResultKey>>,
+    // Batch get phase profiling metrics
+    pub batch_get_phase_duration: Vec<HistogramSample<PhaseKey>>,
+    pub batch_get_path_items: Vec<CounterSample<PhaseKey>>,
+    pub facade_phase_duration: Vec<HistogramSample<PhaseKey>>,
+    pub rdma_transfer_duration: Vec<HistogramSample<PhaseKey>>,
+    pub rdma_bytes: Vec<CounterSample<PhaseKey>>,
+    pub cold_read_batch_wall_duration: Vec<HistogramSample<ResultKey>>,
+    pub io_uring_phase_duration: Vec<HistogramSample<PhaseKey>>,
+    pub io_uring_ops: Vec<CounterSample<ResultKey>>,
+    pub cold_restore_batch_duration: Vec<HistogramSample<PhaseKey>>,
+    pub cold_restore_batch_items: Vec<CounterSample<ResultKey>>,
+    pub cold_prefetch_worker_duration: Vec<HistogramSample<ResultKey>>,
+    pub cold_prefetch_worker_items: Vec<CounterSample<ResultKey>>,
+    pub batch_is_exist_duration: Vec<HistogramSample<PhaseKey>>,
     pub process: ProcessSnapshot,
 }
 
@@ -207,28 +301,6 @@ pub struct PreferredSegmentSkipKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct TenantKey {
-    pub tenant: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ReplicaDistributionKey {
-    pub runtime: String,
-    pub tier: &'static str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct RuntimeKey {
-    pub runtime: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct RuntimeStatusKey {
-    pub runtime: String,
-    pub state: &'static str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ColdTierRuntimeKey {
     pub runtime: String,
 }
@@ -262,6 +334,34 @@ pub struct ColdTierOperationKey {
     pub operation: &'static str,
     pub result: &'static str,
     pub error_kind: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ColdRestoreSingleflightKey {
+    pub event: &'static str,
+    pub result: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TenantKey {
+    pub tenant: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ReplicaDistributionKey {
+    pub runtime: String,
+    pub tier: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RuntimeKey {
+    pub runtime: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RuntimeStatusKey {
+    pub runtime: String,
+    pub state: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -375,19 +475,34 @@ impl<K: Ord + Clone> GaugeFamily<K> {
 
 pub(crate) struct HistogramFamily<K> {
     inner: BTreeMap<K, HistogramState>,
+    bucket_boundaries: &'static [f64],
 }
 
 impl<K> Default for HistogramFamily<K> {
     fn default() -> Self {
         Self {
             inner: BTreeMap::new(),
+            bucket_boundaries: REQUEST_DURATION_BUCKETS,
+        }
+    }
+}
+
+impl<K> HistogramFamily<K> {
+    fn with_buckets(bucket_boundaries: &'static [f64]) -> Self {
+        Self {
+            inner: BTreeMap::new(),
+            bucket_boundaries,
         }
     }
 }
 
 impl<K: Ord + Clone> HistogramFamily<K> {
     fn observe(&mut self, key: K, value: f64) {
-        self.inner.entry(key).or_default().observe(value);
+        let boundaries = self.bucket_boundaries;
+        self.inner
+            .entry(key)
+            .or_insert_with(|| HistogramState::with_buckets(boundaries))
+            .observe(value, boundaries);
     }
 
     fn snapshot(&self) -> Vec<HistogramSample<K>> {
@@ -421,8 +536,16 @@ impl Default for HistogramState {
 }
 
 impl HistogramState {
-    fn observe(&mut self, value: f64) {
-        for (index, bucket) in REQUEST_DURATION_BUCKETS.iter().enumerate() {
+    fn with_buckets(boundaries: &[f64]) -> Self {
+        Self {
+            buckets: vec![0; boundaries.len()],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+
+    fn observe(&mut self, value: f64, boundaries: &[f64]) {
+        for (index, bucket) in boundaries.iter().enumerate() {
             if value <= *bucket {
                 self.buckets[index] = self.buckets[index].saturating_add(1);
             }
@@ -443,7 +566,6 @@ struct OperationMetricState {
 
 type OperationKey = (&'static str, &'static str);
 
-#[derive(Default)]
 struct MetricsRegistry {
     tenant: String,
     operations: BTreeMap<OperationKey, OperationMetricState>,
@@ -479,12 +601,12 @@ struct MetricsRegistry {
     metadata_operations: CounterFamily<MetadataOperationKey>,
     metadata_inflight: GaugeFamily<MetadataInflightKey>,
     metadata_duration: HistogramFamily<MetadataOperationKey>,
+    cold_tier_device_states: GaugeFamily<ColdTierDeviceStateKey>,
     cold_tier_device_totals: GaugeFamily<ColdTierRuntimeKey>,
     cold_tier_device_schedulable: GaugeFamily<ColdTierRuntimeKey>,
     cold_tier_device_used_bytes: GaugeFamily<ColdTierRuntimeKey>,
     cold_tier_device_reserved_bytes: GaugeFamily<ColdTierRuntimeKey>,
     cold_tier_device_capacity_bytes: GaugeFamily<ColdTierRuntimeKey>,
-    cold_tier_device_states: GaugeFamily<ColdTierDeviceStateKey>,
     cold_tier_pending_offload_total: GaugeFamily<ColdTierRuntimeKey>,
     cold_tier_pending_offload_ready: GaugeFamily<ColdTierRuntimeKey>,
     cold_tier_pending_offload_delayed: GaugeFamily<ColdTierRuntimeKey>,
@@ -496,11 +618,120 @@ struct MetricsRegistry {
     cold_tier_reclaim_by_qos_tier: GaugeFamily<ColdTierReclaimQosKey>,
     cold_tier_reclaim_by_policy_rank: GaugeFamily<ColdTierReclaimPolicyRankKey>,
     cold_tier_operations: CounterFamily<ColdTierOperationKey>,
+    cold_restore_singleflight: CounterFamily<ColdRestoreSingleflightKey>,
+    cold_restore_max_concurrent_io_per_object: f64,
+    cold_tier_ssd_read_duration: HistogramFamily<ResultKey>,
+    cold_tier_ssd_write_duration: HistogramFamily<ResultKey>,
+    io_priority_wait: HistogramFamily<ResultKey>,
+    staging_pool_wait: HistogramFamily<ResultKey>,
+    staging_pool_exhaustion: CounterFamily<ResultKey>,
+    extent_store_queue_wait: HistogramFamily<ResultKey>,
+    extent_store_pipeline_duration: HistogramFamily<ResultKey>,
+    // Batch get phase profiling metrics
+    batch_get_phase_duration: HistogramFamily<PhaseKey>,
+    batch_get_path_items: CounterFamily<PhaseKey>,
+    facade_phase_duration: HistogramFamily<PhaseKey>,
+    rdma_transfer_duration: HistogramFamily<PhaseKey>,
+    rdma_bytes: CounterFamily<PhaseKey>,
+    cold_read_batch_wall_duration: HistogramFamily<ResultKey>,
+    io_uring_phase_duration: HistogramFamily<PhaseKey>,
+    io_uring_ops: CounterFamily<ResultKey>,
+    cold_restore_batch_duration: HistogramFamily<PhaseKey>,
+    cold_restore_batch_items: CounterFamily<ResultKey>,
+    cold_prefetch_worker_duration: HistogramFamily<ResultKey>,
+    cold_prefetch_worker_items: CounterFamily<ResultKey>,
+    batch_is_exist_duration: HistogramFamily<PhaseKey>,
 }
 
-#[derive(Clone, Default)]
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self {
+            tenant: String::new(),
+            operations: BTreeMap::new(),
+            request_totals: CounterFamily::default(),
+            request_bytes: CounterFamily::default(),
+            request_inflight: GaugeFamily::default(),
+            request_duration: HistogramFamily::default(),
+            segments: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            runtime_leases: BTreeMap::new(),
+            heartbeat_consecutive_failures: GaugeFamily::default(),
+            heartbeat_last_success_ms: GaugeFamily::default(),
+            membership_refresh: CounterFamily::default(),
+            membership_refresh_duration: HistogramFamily::default(),
+            route_cas: CounterFamily::default(),
+            replication_publish: CounterFamily::default(),
+            replication_publish_duration: HistogramFamily::default(),
+            checksum_validation: CounterFamily::default(),
+            tenant_quota_reservation: CounterFamily::default(),
+            tenant_quota_finalize: CounterFamily::default(),
+            tenant_quota_abort: CounterFamily::default(),
+            tenant_quota_reconcile: CounterFamily::default(),
+            tenant_local_eviction: CounterFamily::default(),
+            preferred_segment_skip: CounterFamily::default(),
+            rebalance_routes: CounterFamily::default(),
+            rebalance_bytes: CounterFamily::default(),
+            segment_lifecycle: CounterFamily::default(),
+            reclaim_release: CounterFamily::default(),
+            eviction: CounterFamily::default(),
+            eviction_duration: HistogramFamily::default(),
+            transport_operations: CounterFamily::default(),
+            transport_bytes: CounterFamily::default(),
+            metadata_operations: CounterFamily::default(),
+            metadata_inflight: GaugeFamily::default(),
+            metadata_duration: HistogramFamily::default(),
+            cold_tier_device_states: GaugeFamily::default(),
+            cold_tier_device_totals: GaugeFamily::default(),
+            cold_tier_device_schedulable: GaugeFamily::default(),
+            cold_tier_device_used_bytes: GaugeFamily::default(),
+            cold_tier_device_reserved_bytes: GaugeFamily::default(),
+            cold_tier_device_capacity_bytes: GaugeFamily::default(),
+            cold_tier_pending_offload_total: GaugeFamily::default(),
+            cold_tier_pending_offload_ready: GaugeFamily::default(),
+            cold_tier_pending_offload_delayed: GaugeFamily::default(),
+            cold_tier_pending_offload_attempts_total: GaugeFamily::default(),
+            cold_tier_pending_offload_max_attempts: GaugeFamily::default(),
+            cold_tier_reclaim_pending_total: GaugeFamily::default(),
+            cold_tier_reclaim_due_total: GaugeFamily::default(),
+            cold_tier_reclaim_by_kind: GaugeFamily::default(),
+            cold_tier_reclaim_by_qos_tier: GaugeFamily::default(),
+            cold_tier_reclaim_by_policy_rank: GaugeFamily::default(),
+            cold_tier_operations: CounterFamily::default(),
+            cold_restore_singleflight: CounterFamily::default(),
+            cold_restore_max_concurrent_io_per_object: 1.0,
+            cold_tier_ssd_read_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            cold_tier_ssd_write_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            io_priority_wait: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            staging_pool_wait: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            staging_pool_exhaustion: CounterFamily::default(),
+            extent_store_queue_wait: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            extent_store_pipeline_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            batch_get_phase_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            batch_get_path_items: CounterFamily::default(),
+            facade_phase_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            rdma_transfer_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            rdma_bytes: CounterFamily::default(),
+            cold_read_batch_wall_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            io_uring_phase_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            io_uring_ops: CounterFamily::default(),
+            cold_restore_batch_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            cold_restore_batch_items: CounterFamily::default(),
+            cold_prefetch_worker_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+            cold_prefetch_worker_items: CounterFamily::default(),
+            batch_is_exist_duration: HistogramFamily::with_buckets(COLD_TIER_IO_BUCKETS),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct SharedMetricsRegistry {
     inner: Arc<Mutex<MetricsRegistry>>,
+}
+
+impl Default for SharedMetricsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SharedMetricsRegistry {
@@ -680,6 +911,29 @@ impl MetricsRegistry {
             cold_tier_reclaim_by_qos_tier: self.cold_tier_reclaim_by_qos_tier.snapshot(),
             cold_tier_reclaim_by_policy_rank: self.cold_tier_reclaim_by_policy_rank.snapshot(),
             cold_tier_operations: self.cold_tier_operations.snapshot(),
+            cold_restore_singleflight: self.cold_restore_singleflight.snapshot(),
+            cold_restore_max_concurrent_io_per_object: self
+                .cold_restore_max_concurrent_io_per_object,
+            cold_tier_ssd_read_duration: self.cold_tier_ssd_read_duration.snapshot(),
+            cold_tier_ssd_write_duration: self.cold_tier_ssd_write_duration.snapshot(),
+            io_priority_wait: self.io_priority_wait.snapshot(),
+            staging_pool_wait: self.staging_pool_wait.snapshot(),
+            staging_pool_exhaustion: self.staging_pool_exhaustion.snapshot(),
+            extent_store_queue_wait: self.extent_store_queue_wait.snapshot(),
+            extent_store_pipeline_duration: self.extent_store_pipeline_duration.snapshot(),
+            batch_get_phase_duration: self.batch_get_phase_duration.snapshot(),
+            batch_get_path_items: self.batch_get_path_items.snapshot(),
+            facade_phase_duration: self.facade_phase_duration.snapshot(),
+            rdma_transfer_duration: self.rdma_transfer_duration.snapshot(),
+            rdma_bytes: self.rdma_bytes.snapshot(),
+            cold_read_batch_wall_duration: self.cold_read_batch_wall_duration.snapshot(),
+            io_uring_phase_duration: self.io_uring_phase_duration.snapshot(),
+            io_uring_ops: self.io_uring_ops.snapshot(),
+            cold_restore_batch_duration: self.cold_restore_batch_duration.snapshot(),
+            cold_restore_batch_items: self.cold_restore_batch_items.snapshot(),
+            cold_prefetch_worker_duration: self.cold_prefetch_worker_duration.snapshot(),
+            cold_prefetch_worker_items: self.cold_prefetch_worker_items.snapshot(),
+            batch_is_exist_duration: self.batch_is_exist_duration.snapshot(),
             process,
         }
     }
@@ -1070,6 +1324,25 @@ pub(crate) fn record_transport_operation_with_registry(
     );
 }
 
+pub(crate) fn record_metadata_operation_with_registry(
+    registry: &SharedMetricsRegistry,
+    backend: &'static str,
+    operation: &'static str,
+    result: &'static str,
+    duration: Duration,
+) {
+    let mut registry = registry.lock();
+    let key = MetadataOperationKey {
+        backend,
+        operation,
+        result,
+    };
+    registry.metadata_operations.add(key.clone(), 1);
+    registry
+        .metadata_duration
+        .observe(key, duration.as_secs_f64());
+}
+
 pub(crate) fn increment_metadata_inflight_with_registry(
     registry: &SharedMetricsRegistry,
     backend: &'static str,
@@ -1090,25 +1363,6 @@ pub(crate) fn decrement_metadata_inflight_with_registry(
         .lock()
         .metadata_inflight
         .add(MetadataInflightKey { backend, operation }, -1.0);
-}
-
-pub(crate) fn record_metadata_operation_with_registry(
-    registry: &SharedMetricsRegistry,
-    backend: &'static str,
-    operation: &'static str,
-    result: &'static str,
-    duration: Duration,
-) {
-    let mut registry = registry.lock();
-    let key = MetadataOperationKey {
-        backend,
-        operation,
-        result,
-    };
-    registry.metadata_operations.add(key.clone(), 1);
-    registry
-        .metadata_duration
-        .observe(key, duration.as_secs_f64());
 }
 
 pub(crate) fn record_membership_refresh(result: &'static str, duration: Duration) {
@@ -1199,11 +1453,41 @@ pub(crate) fn record_segment_lifecycle(action: &'static str, result: &'static st
         .add(ActionResultKey { action, result }, 1);
 }
 
+#[allow(dead_code)]
 pub(crate) fn record_reclaim_release(action: &'static str, result: &'static str) {
     global_metrics_registry()
         .lock()
         .reclaim_release
         .add(ActionResultKey { action, result }, 1);
+}
+
+pub(crate) struct ColdTierDeviceMetrics<'a> {
+    pub runtime: &'a str,
+    pub total_devices: usize,
+    pub schedulable_devices: usize,
+    pub total_used_bytes: u64,
+    pub total_reserved_bytes: u64,
+    pub total_capacity_bytes: Option<u64>,
+    pub by_state: Vec<(ColdTierDeviceState, usize)>,
+}
+
+pub(crate) struct ColdTierPendingOffloadMetrics<'a> {
+    pub runtime: &'a str,
+    pub total_pending: usize,
+    pub ready: usize,
+    pub delayed: usize,
+    pub max_attempts: u32,
+    pub total_attempts: u64,
+}
+
+pub(crate) struct ColdTierReclaimMetrics<'a> {
+    pub runtime: &'a str,
+    pub total_pending: usize,
+    pub due: usize,
+    pub cold_backing_reclaims: usize,
+    pub hot_segment_reclaims: usize,
+    pub by_qos_tier: Vec<(&'a str, usize)>,
+    pub by_policy_rank: Vec<(u8, usize)>,
 }
 
 pub(crate) fn record_eviction(result: &'static str, duration: Duration) {
@@ -1213,6 +1497,321 @@ pub(crate) fn record_eviction(result: &'static str, duration: Duration) {
     registry
         .eviction_duration
         .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_cold_tier_device_metrics(metrics: ColdTierDeviceMetrics<'_>) {
+    let mut registry = global_metrics_registry().lock();
+    let key = ColdTierRuntimeKey {
+        runtime: metrics.runtime.to_string(),
+    };
+    registry
+        .cold_tier_device_totals
+        .set(key.clone(), metrics.total_devices as f64);
+    registry
+        .cold_tier_device_schedulable
+        .set(key.clone(), metrics.schedulable_devices as f64);
+    registry
+        .cold_tier_device_used_bytes
+        .set(key.clone(), metrics.total_used_bytes as f64);
+    registry
+        .cold_tier_device_reserved_bytes
+        .set(key.clone(), metrics.total_reserved_bytes as f64);
+    if let Some(capacity) = metrics.total_capacity_bytes {
+        registry
+            .cold_tier_device_capacity_bytes
+            .set(key, capacity as f64);
+    }
+    for (state, count) in metrics.by_state {
+        registry.cold_tier_device_states.set(
+            ColdTierDeviceStateKey {
+                runtime: metrics.runtime.to_string(),
+                state: cold_tier_device_state_label(state),
+            },
+            count as f64,
+        );
+    }
+}
+
+pub(crate) fn record_cold_tier_pending_offload_metrics(metrics: ColdTierPendingOffloadMetrics<'_>) {
+    let mut registry = global_metrics_registry().lock();
+    let key = ColdTierRuntimeKey {
+        runtime: metrics.runtime.to_string(),
+    };
+    registry
+        .cold_tier_pending_offload_total
+        .set(key.clone(), metrics.total_pending as f64);
+    registry
+        .cold_tier_pending_offload_ready
+        .set(key.clone(), metrics.ready as f64);
+    registry
+        .cold_tier_pending_offload_delayed
+        .set(key.clone(), metrics.delayed as f64);
+    registry
+        .cold_tier_pending_offload_attempts_total
+        .set(key.clone(), metrics.total_attempts as f64);
+    registry
+        .cold_tier_pending_offload_max_attempts
+        .set(key, metrics.max_attempts as f64);
+}
+
+pub(crate) fn record_cold_tier_reclaim_metrics(metrics: ColdTierReclaimMetrics<'_>) {
+    let mut registry = global_metrics_registry().lock();
+    let key = ColdTierRuntimeKey {
+        runtime: metrics.runtime.to_string(),
+    };
+    registry
+        .cold_tier_reclaim_pending_total
+        .set(key.clone(), metrics.total_pending as f64);
+    registry
+        .cold_tier_reclaim_due_total
+        .set(key.clone(), metrics.due as f64);
+    registry.cold_tier_reclaim_by_kind.set(
+        ColdTierReclaimKindKey {
+            runtime: metrics.runtime.to_string(),
+            kind: "cold_backing",
+        },
+        metrics.cold_backing_reclaims as f64,
+    );
+    registry.cold_tier_reclaim_by_kind.set(
+        ColdTierReclaimKindKey {
+            runtime: metrics.runtime.to_string(),
+            kind: "hot_segment",
+        },
+        metrics.hot_segment_reclaims as f64,
+    );
+    for (qos_tier, count) in metrics.by_qos_tier {
+        registry.cold_tier_reclaim_by_qos_tier.set(
+            ColdTierReclaimQosKey {
+                runtime: metrics.runtime.to_string(),
+                qos_tier: qos_tier.to_string(),
+            },
+            count as f64,
+        );
+    }
+    for (policy_rank, count) in metrics.by_policy_rank {
+        registry.cold_tier_reclaim_by_policy_rank.set(
+            ColdTierReclaimPolicyRankKey {
+                runtime: metrics.runtime.to_string(),
+                policy_rank,
+            },
+            count as f64,
+        );
+    }
+}
+
+pub(crate) fn record_cold_tier_operation(
+    operation: &'static str,
+    result: &'static str,
+    error_kind: &'static str,
+) {
+    global_metrics_registry().lock().cold_tier_operations.add(
+        ColdTierOperationKey {
+            operation,
+            result,
+            error_kind,
+        },
+        1,
+    );
+}
+
+pub(crate) fn record_cold_tier_operation_result<T>(
+    operation: &'static str,
+    result: &std::result::Result<T, mooncake_store_core::StoreError>,
+) {
+    match result {
+        Ok(_) => record_cold_tier_operation(operation, "ok", "none"),
+        Err(error) => record_cold_tier_operation(operation, "error", cold_tier_error_kind(error)),
+    }
+}
+
+pub(crate) fn record_cold_restore_singleflight(event: &'static str, result: &'static str) {
+    global_metrics_registry()
+        .lock()
+        .cold_restore_singleflight
+        .add(ColdRestoreSingleflightKey { event, result }, 1);
+}
+
+pub(crate) fn set_cold_restore_max_concurrent_io_per_object(count: usize) {
+    let mut registry = global_metrics_registry().lock();
+    let current = registry.cold_restore_max_concurrent_io_per_object;
+    let new_val = count as f64;
+    if new_val > current {
+        registry.cold_restore_max_concurrent_io_per_object = new_val;
+    }
+}
+
+pub(crate) fn record_cold_tier_ssd_read(result: &'static str, duration: Duration) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .cold_tier_ssd_read_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_cold_tier_ssd_write(result: &'static str, duration: Duration) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .cold_tier_ssd_write_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_io_priority_wait(kind: &'static str, duration: Duration) {
+    let key = ResultKey { result: kind };
+    global_metrics_registry()
+        .lock()
+        .io_priority_wait
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_staging_pool_wait(result: &'static str, duration: Duration) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .staging_pool_wait
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_staging_pool_exhaustion() {
+    let key = ResultKey {
+        result: "try_allocate",
+    };
+    global_metrics_registry()
+        .lock()
+        .staging_pool_exhaustion
+        .add(key, 1);
+}
+
+pub(crate) fn record_extent_store_queue_wait(direction: &'static str, duration: Duration) {
+    let key = ResultKey { result: direction };
+    global_metrics_registry()
+        .lock()
+        .extent_store_queue_wait
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_extent_store_pipeline_duration(direction: &'static str, duration: Duration) {
+    let key = ResultKey { result: direction };
+    global_metrics_registry()
+        .lock()
+        .extent_store_pipeline_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_batch_get_phase_duration(phase: &'static str, duration: Duration) {
+    let key = PhaseKey { phase };
+    global_metrics_registry()
+        .lock()
+        .batch_get_phase_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_batch_get_path_items(phase: &'static str, count: u64) {
+    let key = PhaseKey { phase };
+    global_metrics_registry()
+        .lock()
+        .batch_get_path_items
+        .add(key, count);
+}
+
+pub(crate) fn record_facade_phase_duration(phase: &'static str, duration: Duration) {
+    let key = PhaseKey { phase };
+    global_metrics_registry()
+        .lock()
+        .facade_phase_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_rdma_transfer_duration(phase: &'static str, duration: Duration) {
+    let key = PhaseKey { phase };
+    global_metrics_registry()
+        .lock()
+        .rdma_transfer_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_rdma_bytes(phase: &'static str, bytes: u64) {
+    let key = PhaseKey { phase };
+    global_metrics_registry().lock().rdma_bytes.add(key, bytes);
+}
+
+pub(crate) fn record_cold_read_batch_wall_duration(result: &'static str, duration: Duration) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .cold_read_batch_wall_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_io_uring_phase_duration(phase: &'static str, duration: Duration) {
+    let key = PhaseKey { phase };
+    global_metrics_registry()
+        .lock()
+        .io_uring_phase_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_io_uring_ops(result: &'static str, count: u64) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .io_uring_ops
+        .add(key, count);
+}
+
+pub(crate) fn record_cold_restore_batch_duration(phase: &'static str, duration: Duration) {
+    let key = PhaseKey { phase };
+    global_metrics_registry()
+        .lock()
+        .cold_restore_batch_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_cold_restore_batch_items(result: &'static str, count: u64) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .cold_restore_batch_items
+        .add(key, count);
+}
+
+pub(crate) fn record_cold_prefetch_worker_duration(result: &'static str, duration: Duration) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .cold_prefetch_worker_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_cold_prefetch_worker_items(result: &'static str, count: u64) {
+    let key = ResultKey { result };
+    global_metrics_registry()
+        .lock()
+        .cold_prefetch_worker_items
+        .add(key, count);
+}
+
+pub(crate) fn record_batch_is_exist_duration(phase: &'static str, duration: Duration) {
+    let key = PhaseKey { phase };
+    global_metrics_registry()
+        .lock()
+        .batch_is_exist_duration
+        .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn cold_tier_error_kind(error: &mooncake_store_core::StoreError) -> &'static str {
+    match error {
+        mooncake_store_core::StoreError::NotFound(_) => "not_found",
+        mooncake_store_core::StoreError::InvalidState(_) => "invalid_state",
+        mooncake_store_core::StoreError::Conflict(_) => "conflict",
+        mooncake_store_core::StoreError::StaleEpoch(_) => "stale_epoch",
+        mooncake_store_core::StoreError::Transport(_) => "transport",
+        mooncake_store_core::StoreError::Allocator(_) => "allocator",
+        mooncake_store_core::StoreError::Metadata(_) => "metadata",
+        mooncake_store_core::StoreError::Unsupported(_) => "unsupported",
+        mooncake_store_core::StoreError::QuotaExceeded { .. } => "quota_exceeded",
+        mooncake_store_core::StoreError::Backpressure(_) => "backpressure",
+    }
 }
 
 pub(crate) fn snapshot_metrics_with_registry(
@@ -1326,185 +1925,6 @@ fn replica_tier_label(tier: ReplicaTier) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) struct ColdTierDeviceMetrics<'a> {
-    pub runtime: &'a str,
-    pub total_devices: usize,
-    pub schedulable_devices: usize,
-    pub total_used_bytes: u64,
-    pub total_reserved_bytes: u64,
-    pub total_capacity_bytes: Option<u64>,
-    pub by_state: Vec<(ColdTierDeviceState, usize)>,
-}
-
-#[allow(dead_code)]
-pub(crate) struct ColdTierPendingOffloadMetrics<'a> {
-    pub runtime: &'a str,
-    pub total_pending: usize,
-    pub ready: usize,
-    pub delayed: usize,
-    pub max_attempts: u32,
-    pub total_attempts: u64,
-}
-
-#[allow(dead_code)]
-pub(crate) struct ColdTierReclaimMetrics<'a> {
-    pub runtime: &'a str,
-    pub total_pending: usize,
-    pub due: usize,
-    pub cold_backing_reclaims: usize,
-    pub hot_segment_reclaims: usize,
-    pub by_qos_tier: Vec<(&'a str, usize)>,
-    pub by_policy_rank: Vec<(u8, usize)>,
-}
-
-#[allow(dead_code)]
-pub(crate) fn record_cold_tier_device_metrics(metrics: ColdTierDeviceMetrics<'_>) {
-    let mut registry = global_metrics_registry().lock();
-    let key = ColdTierRuntimeKey {
-        runtime: metrics.runtime.to_string(),
-    };
-    registry
-        .cold_tier_device_totals
-        .set(key.clone(), metrics.total_devices as f64);
-    registry
-        .cold_tier_device_schedulable
-        .set(key.clone(), metrics.schedulable_devices as f64);
-    registry
-        .cold_tier_device_used_bytes
-        .set(key.clone(), metrics.total_used_bytes as f64);
-    registry
-        .cold_tier_device_reserved_bytes
-        .set(key.clone(), metrics.total_reserved_bytes as f64);
-    if let Some(capacity) = metrics.total_capacity_bytes {
-        registry
-            .cold_tier_device_capacity_bytes
-            .set(key, capacity as f64);
-    }
-    for (state, count) in metrics.by_state {
-        registry.cold_tier_device_states.set(
-            ColdTierDeviceStateKey {
-                runtime: metrics.runtime.to_string(),
-                state: cold_tier_device_state_label(state),
-            },
-            count as f64,
-        );
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn record_cold_tier_pending_offload_metrics(metrics: ColdTierPendingOffloadMetrics<'_>) {
-    let mut registry = global_metrics_registry().lock();
-    let key = ColdTierRuntimeKey {
-        runtime: metrics.runtime.to_string(),
-    };
-    registry
-        .cold_tier_pending_offload_total
-        .set(key.clone(), metrics.total_pending as f64);
-    registry
-        .cold_tier_pending_offload_ready
-        .set(key.clone(), metrics.ready as f64);
-    registry
-        .cold_tier_pending_offload_delayed
-        .set(key.clone(), metrics.delayed as f64);
-    registry
-        .cold_tier_pending_offload_attempts_total
-        .set(key.clone(), metrics.total_attempts as f64);
-    registry
-        .cold_tier_pending_offload_max_attempts
-        .set(key, metrics.max_attempts as f64);
-}
-
-#[allow(dead_code)]
-pub(crate) fn record_cold_tier_reclaim_metrics(metrics: ColdTierReclaimMetrics<'_>) {
-    let mut registry = global_metrics_registry().lock();
-    let key = ColdTierRuntimeKey {
-        runtime: metrics.runtime.to_string(),
-    };
-    registry
-        .cold_tier_reclaim_pending_total
-        .set(key.clone(), metrics.total_pending as f64);
-    registry
-        .cold_tier_reclaim_due_total
-        .set(key.clone(), metrics.due as f64);
-    registry.cold_tier_reclaim_by_kind.set(
-        ColdTierReclaimKindKey {
-            runtime: metrics.runtime.to_string(),
-            kind: "cold_backing",
-        },
-        metrics.cold_backing_reclaims as f64,
-    );
-    registry.cold_tier_reclaim_by_kind.set(
-        ColdTierReclaimKindKey {
-            runtime: metrics.runtime.to_string(),
-            kind: "hot_segment",
-        },
-        metrics.hot_segment_reclaims as f64,
-    );
-    for (qos_tier, count) in metrics.by_qos_tier {
-        registry.cold_tier_reclaim_by_qos_tier.set(
-            ColdTierReclaimQosKey {
-                runtime: metrics.runtime.to_string(),
-                qos_tier: qos_tier.to_string(),
-            },
-            count as f64,
-        );
-    }
-    for (policy_rank, count) in metrics.by_policy_rank {
-        registry.cold_tier_reclaim_by_policy_rank.set(
-            ColdTierReclaimPolicyRankKey {
-                runtime: metrics.runtime.to_string(),
-                policy_rank,
-            },
-            count as f64,
-        );
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn record_cold_tier_operation(
-    operation: &'static str,
-    result: &'static str,
-    error_kind: &'static str,
-) {
-    global_metrics_registry().lock().cold_tier_operations.add(
-        ColdTierOperationKey {
-            operation,
-            result,
-            error_kind,
-        },
-        1,
-    );
-}
-
-#[allow(dead_code)]
-pub(crate) fn record_cold_tier_operation_result<T>(
-    operation: &'static str,
-    result: &std::result::Result<T, mooncake_store_core::StoreError>,
-) {
-    match result {
-        Ok(_) => record_cold_tier_operation(operation, "ok", "none"),
-        Err(error) => record_cold_tier_operation(operation, "error", cold_tier_error_kind(error)),
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn cold_tier_error_kind(error: &mooncake_store_core::StoreError) -> &'static str {
-    match error {
-        mooncake_store_core::StoreError::NotFound(_) => "not_found",
-        mooncake_store_core::StoreError::InvalidState(_) => "invalid_state",
-        mooncake_store_core::StoreError::Conflict(_) => "conflict",
-        mooncake_store_core::StoreError::StaleEpoch(_) => "stale_epoch",
-        mooncake_store_core::StoreError::Transport(_) => "transport",
-        mooncake_store_core::StoreError::Allocator(_) => "allocator",
-        mooncake_store_core::StoreError::Metadata(_) => "metadata",
-        mooncake_store_core::StoreError::Unsupported(_) => "unsupported",
-        mooncake_store_core::StoreError::QuotaExceeded { .. } => "quota_exceeded",
-        mooncake_store_core::StoreError::Backpressure(_) => "backpressure",
-    }
-}
-
-#[allow(dead_code)]
 fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
     match state {
         ColdTierDeviceState::Unregistered => "unregistered",

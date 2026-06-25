@@ -201,6 +201,38 @@ impl MigrationControlClient {
     ) -> Result<Option<ObjectRoute>> {
         self.inner.get_route(lease, namespace, authority, key)
     }
+
+    pub fn trigger_cold_tier_offload(&self, lease: &ClientLease, max_tasks: u64) -> Result<u64> {
+        self.inner.trigger_cold_tier_offload(lease, max_tasks)
+    }
+
+    pub fn manual_cold_tier_gc(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_backings: u64,
+    ) -> Result<u64> {
+        self.inner
+            .manual_cold_tier_gc(lease, device_id, max_backings)
+    }
+
+    pub fn manual_cold_tier_free(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_victims: u64,
+    ) -> Result<pb::ManualColdTierFreeReply> {
+        self.inner
+            .manual_cold_tier_free(lease, device_id, max_victims)
+    }
+
+    pub fn probe_cold_tier_device(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+    ) -> Result<pb::ProbeColdTierDeviceReply> {
+        self.inner.probe_cold_tier_device(lease, device_id)
+    }
 }
 
 #[derive(Debug)]

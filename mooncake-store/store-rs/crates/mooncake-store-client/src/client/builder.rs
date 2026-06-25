@@ -513,7 +513,9 @@ impl StoreClientBuilder {
             .first()
             .map(|r| r.cold_tier_id.clone())
             .unwrap_or_else(|| runtime.stable_id.to_string());
-        let mut cold_tier_handles = BTreeMap::new();
+        let mut cold_tier_handles: BTreeMap<String, Arc<dyn PersistentStorageBackend>> =
+            BTreeMap::new();
+        let mut deferred_reconciles: Vec<DeferredColdTierReconcile> = Vec::new();
         for resolved in &resolved_cold_tier {
             #[cfg(test)]
             if let Some(backend) = self
@@ -524,10 +526,21 @@ impl StoreClientBuilder {
                 cold_tier_handles.insert(resolved.cold_tier_id.clone(), backend);
                 continue;
             }
-            let backend: Arc<dyn PersistentStorageBackend> =
-                Arc::new(LocalDirPersistentStorageBackend::new_with_root(
-                    resolved.root_dir.clone(),
-                ));
+            let mut reconcile_devices = vec![resolved.clone()];
+            for (old_id, new_id) in &cold_tier_aliases {
+                if new_id == &resolved.cold_tier_id {
+                    let mut alias_device = resolved.clone();
+                    alias_device.cold_tier_id = old_id.clone();
+                    reconcile_devices.push(alias_device);
+                }
+            }
+            let backend = Arc::new(LocalDirPersistentStorageBackend::new_with_root(
+                resolved.root_dir.clone(),
+            ));
+            deferred_reconciles.push(DeferredColdTierReconcile::LocalDir(
+                backend.clone(),
+                reconcile_devices,
+            ));
             cold_tier_handles.insert(resolved.cold_tier_id.clone(), backend);
         }
         // Register aliases so routes referencing old cold_tier_ids still resolve.
@@ -626,6 +639,14 @@ impl StoreClientBuilder {
         };
         runtime_metadata.upsert_client_lease(&lease)?;
         prewarm_live_client_cache(runtime_metadata.as_ref(), &live_client_cache, &lease)?;
+        if !startup_activation_pending {
+            run_deferred_cold_tier_reconciles(
+                std::mem::take(&mut deferred_reconciles),
+                runtime_metadata.as_ref(),
+                route_directory.as_ref(),
+                &lease,
+            );
+        }
         let prewarm_delay = startup_prewarm_delay(&runtime, self.startup_prewarm_max_delay);
         if !prewarm_delay.is_zero() {
             std::thread::sleep(prewarm_delay);
@@ -744,7 +765,7 @@ impl StoreClientBuilder {
             restore_promotions,
             cold_tier,
             cold_restore_flights,
-            deferred_cold_tier_reconciles: Mutex::new(Vec::new()),
+            deferred_cold_tier_reconciles: Mutex::new(deferred_reconciles),
         })
     }
 }

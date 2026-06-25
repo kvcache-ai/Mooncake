@@ -424,6 +424,8 @@ pub trait RouteDirectory: Send + Sync {
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult>;
 
+    fn metadata(&self) -> &dyn MetadataBackend;
+
     fn compare_and_swap_object_routes(
         &self,
         observer: &ClientLease,
@@ -442,6 +444,25 @@ pub trait RouteDirectory: Send + Sync {
             .collect())
     }
 
+    /// Compare-and-swap a single route using only the local authority,
+    /// bypassing distributed mesh authority selection.
+    ///
+    /// Used during startup manifest recovery: the local node has physical
+    /// ownership of the SSD data and should register routes without
+    /// depending on other mesh members being reachable.
+    ///
+    /// The default delegates to [`Self::compare_and_swap_object_route`],
+    /// which is correct for MetadataOnly (routes go to Redis directly).
+    fn compare_and_swap_local_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> Result<CasResult> {
+        self.compare_and_swap_object_route(observer, key, expected, next)
+    }
+
     fn list_routes_by_replica_owner(
         &self,
         _observer: &ClientLease,
@@ -450,6 +471,14 @@ pub trait RouteDirectory: Send + Sync {
         Err(crate::error::StoreError::Unsupported(
             "route directory does not support list_routes_by_replica_owner".to_string(),
         ))
+    }
+
+    fn list_routes_by_cold_backing(
+        &self,
+        _observer: &ClientLease,
+        filter: &ColdBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.metadata().list_object_routes_by_cold_backing(filter)
     }
 
     fn list_routes_in_scope(
@@ -505,7 +534,217 @@ mod tests {
 
     struct TestRouteDirectory;
 
+    static TEST_METADATA: TestMetadataBackend = TestMetadataBackend;
+
+    struct TestMetadataBackend;
+
+    impl MetadataBackend for TestMetadataBackend {
+        fn route_namespace(&self) -> String {
+            "test".to_string()
+        }
+        fn upsert_client_lease(&self, _lease: &ClientLease) -> Result<()> {
+            Ok(())
+        }
+        fn allocate_client_lease(&self, template: &ClientLease) -> Result<ClientRuntimeId> {
+            Ok(template.runtime.clone())
+        }
+        fn update_client_state(
+            &self,
+            _runtime: &ClientRuntimeId,
+            _next: ClientLifecycleState,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
+            Ok(Vec::new())
+        }
+        fn publish_segment(&self, _segment: &SegmentAnnouncement) -> Result<()> {
+            Ok(())
+        }
+        fn unpublish_segment(
+            &self,
+            _owner: &ClientRuntimeId,
+            _segment: &SegmentName,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn list_segments(
+            &self,
+            _owner: Option<&ClientRuntimeId>,
+        ) -> Result<Vec<SegmentAnnouncement>> {
+            Ok(Vec::new())
+        }
+        fn update_segment_state(
+            &self,
+            _owner: &ClientRuntimeId,
+            _segment: &SegmentName,
+            _next: SegmentLifecycleState,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn reserve_segment(
+            &self,
+            _owner: &ClientRuntimeId,
+            _segment: &SegmentName,
+            _length_bytes: u64,
+        ) -> Result<SegmentReservation> {
+            Err(crate::StoreError::Unsupported("test".to_string()))
+        }
+        fn release_segment(
+            &self,
+            _owner: &ClientRuntimeId,
+            _segment: &SegmentName,
+            _offset_bytes: u64,
+            _length_bytes: u64,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn get_object_route(&self, _key: &ObjectKey) -> Result<Option<ObjectRoute>> {
+            Ok(None)
+        }
+        fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
+            Ok(Vec::new())
+        }
+        fn compare_and_swap_object_route(
+            &self,
+            _key: &ObjectKey,
+            _expected: Option<RouteVersion>,
+            _next: Option<&ObjectRoute>,
+        ) -> Result<CasResult> {
+            Err(crate::StoreError::Unsupported("test".to_string()))
+        }
+        fn put_cold_tier_device_if_absent(
+            &self,
+            device: &ColdTierDeviceRecord,
+        ) -> Result<ColdTierPutDeviceResult> {
+            Ok(ColdTierPutDeviceResult::Created(device.clone()))
+        }
+        fn get_cold_tier_device(&self, _device_id: &str) -> Result<Option<ColdTierDeviceRecord>> {
+            Ok(None)
+        }
+        fn list_cold_tier_devices(
+            &self,
+            _filter: &ColdTierDeviceFilter,
+        ) -> Result<Vec<ColdTierDeviceRecord>> {
+            Ok(Vec::new())
+        }
+        fn update_cold_tier_device(
+            &self,
+            _device_id: &str,
+            _update: ColdTierDeviceUpdate,
+        ) -> Result<ColdTierDeviceRecord> {
+            Err(crate::StoreError::Unsupported("test".to_string()))
+        }
+        fn apply_cold_tier_usage_delta(
+            &self,
+            _device_id: &str,
+            _delta: ColdTierUsageDelta,
+            _updated_at_ms: u64,
+        ) -> Result<ColdTierDeviceRecord> {
+            Err(crate::StoreError::Unsupported("test".to_string()))
+        }
+        fn get_route_policy(&self, _domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
+            Ok(None)
+        }
+        fn put_route_policy_if_absent(
+            &self,
+            _domain: &RoutePolicyDomain,
+            _policy: &RoutePolicy,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        fn put_route_policy(
+            &self,
+            _domain: &RoutePolicyDomain,
+            _policy: &RoutePolicy,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn delete_route_policy(&self, _domain: &RoutePolicyDomain) -> Result<bool> {
+            Ok(false)
+        }
+        fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+            Ok(Vec::new())
+        }
+        fn get_tenant_policy(&self, _scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
+            Ok(None)
+        }
+        fn list_tenant_policies(&self, _tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
+            Ok(Vec::new())
+        }
+        fn put_tenant_policy(
+            &self,
+            policy: &TenantPolicy,
+            _expected_version: Option<u64>,
+        ) -> Result<TenantPolicy> {
+            Ok(policy.clone())
+        }
+        fn delete_tenant_policy(
+            &self,
+            _scope: &TenantPolicyScope,
+            _expected_version: Option<u64>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+        fn get_tenant_quota_state(
+            &self,
+            _scope: &TenantPolicyScope,
+        ) -> Result<Option<TenantQuotaState>> {
+            Ok(None)
+        }
+        fn get_tenant_object_accounting(
+            &self,
+            _key: &ObjectKey,
+        ) -> Result<Option<TenantObjectAccounting>> {
+            Ok(None)
+        }
+        fn get_tenant_quota_reservation(
+            &self,
+            _reservation_id: &str,
+        ) -> Result<Option<TenantQuotaReservation>> {
+            Ok(None)
+        }
+        fn list_tenant_eviction_candidates(
+            &self,
+            _scope: &TenantPolicyScope,
+            _limit: usize,
+        ) -> Result<Vec<TenantObjectAccounting>> {
+            Ok(Vec::new())
+        }
+        fn list_tenant_quota_reservations(
+            &self,
+            _scope: &TenantPolicyScope,
+        ) -> Result<Vec<TenantQuotaReservation>> {
+            Ok(Vec::new())
+        }
+        fn reserve_tenant_quota(
+            &self,
+            _request: &TenantQuotaReservationRequest,
+        ) -> Result<TenantQuotaReservationOutcome> {
+            Err(crate::StoreError::Unsupported("test".to_string()))
+        }
+        fn finalize_tenant_quota(
+            &self,
+            _request: &TenantQuotaFinalizeRequest,
+        ) -> Result<TenantQuotaFinalizeOutcome> {
+            Err(crate::StoreError::Unsupported("test".to_string()))
+        }
+        fn abort_tenant_quota(&self, _reservation_id: &str) -> Result<TenantQuotaAbortOutcome> {
+            Err(crate::StoreError::Unsupported("test".to_string()))
+        }
+        fn put_handoff(&self, _handoff: &HandoffPlan) -> Result<()> {
+            Ok(())
+        }
+        fn get_handoff(&self, _stable_id: &ClientStableId) -> Result<Option<HandoffPlan>> {
+            Ok(None)
+        }
+    }
+
     impl RouteDirectory for TestRouteDirectory {
+        fn metadata(&self) -> &dyn MetadataBackend {
+            &TEST_METADATA
+        }
+
         fn get_object_route(
             &self,
             _observer: &ClientLease,

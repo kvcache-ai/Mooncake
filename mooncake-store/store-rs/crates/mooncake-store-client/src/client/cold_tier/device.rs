@@ -1,31 +1,24 @@
-// Cold tier device management and admission control.
-//
-// Implements:
-// - StorageOwnerState::new() — cold tier runtime construction
-// - Device bootstrap, register, probe, reconcile lifecycle
-// - Device selection for offload (watermark + capacity checks)
-// - Two-tier admission control (ColdTierAdmission: runtime + per-device)
-// - Usage delta tracking (apply_cold_tier_usage_delta)
-// - Backend resolution (backend_for, backend_for_with_refresh)
-
 use super::super::{
-    cold_tier_device_visible_in_cache, current_time_ms, refresh_cold_tier_device_cache,
-    ClientRuntimeId, ColdTierAdmission, ColdTierAdmissionBucket, ColdTierAdmissionOp,
-    ColdTierAdmissionPermit, ColdTierAdmissionRejection, ColdTierDeviceAdmissionState,
-    ColdTierDeviceManager, ColdTierRateLimitConfig, MetadataBackend, ObjectRoute,
-    PersistentStorageBackend, Result, StorageOwnerColdTierConfig, StorageOwnerState, StoreError,
+    cold_tier_device_visible_in_cache, current_time_ms, pending_publish_deadline_ms,
+    refresh_cold_tier_device_cache, ClientRuntimeId, ColdTierAdmission, ColdTierAdmissionBucket,
+    ColdTierAdmissionOp, ColdTierAdmissionPermit, ColdTierAdmissionRejection,
+    ColdTierDeviceAdmissionState, ColdTierDeviceManager, ColdTierRateLimitConfig, MetadataBackend,
+    ObjectRoute, PersistentStorageBackend, Result, StorageOwnerColdTierConfig, StorageOwnerState,
+    StoreError, DEFAULT_TRANSFER_STALL_TIMEOUT,
 };
 use mooncake_store_core::{ColdTierDeviceRecord, ColdTierUsageDelta};
 use std::collections::BTreeMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
 
+/// Returns true if offload writes should be deferred when restore reads are
+/// active on the same device. This prevents write bandwidth from competing
+/// with latency-sensitive cold reads on the same SSD.
 /// Number of cold-tier replicas to write per object.  Default 1 (no extra
 /// replicas).  Set to 2 or 3 to spread read load across multiple devices.
-/// Controlled by env var `MC_STORE_RS_COLD_TIER_REPLICAS`.
 fn cold_tier_replica_count() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -37,24 +30,12 @@ fn cold_tier_replica_count() -> usize {
     })
 }
 
-/// Returns the IO-score weight used in `device_offload_score()`.
-///
-/// When `MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE` is set (non-zero,
-/// non-"false"), the weight is raised from the default 0.7 to 0.9 so offload
-/// more aggressively avoids devices with concurrent restore reads.  The
-/// selection never hard-filters devices — even when all devices have active
-/// restores, the least-busy one is still chosen to prevent offload starvation.
-fn io_score_weight() -> f64 {
-    static CACHED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+fn throttle_offload_on_restore() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        let throttle = std::env::var("MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE")
+        std::env::var("MC_STORE_RS_COLD_TIER_THROTTLE_OFFLOAD_ON_RESTORE")
             .map(|v| v != "0" && v != "false")
-            .unwrap_or(false);
-        if throttle {
-            0.9
-        } else {
-            0.7
-        }
+            .unwrap_or(false)
     })
 }
 
@@ -69,10 +50,10 @@ impl StorageOwnerState {
     ) -> Self {
         let offload_mode = cold_tier.offload_mode;
         let offload_priority = cold_tier.offload_priority;
-        let staging_pool_bytes = cold_tier.rate_limits.staging_pool_bytes;
-        let staging_slot_ttl =
-            std::time::Duration::from_millis(cold_tier.rate_limits.staging_slot_ttl_ms.max(1));
-        let restore_max_distinct_flights = cold_tier.rate_limits.restore_max_distinct_flights;
+        let staging_pool_bytes = std::env::var("MC_STORE_RS_STAGING_POOL_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(cold_tier.rate_limits.staging_pool_bytes);
         Self {
             runtime,
             route_ops,
@@ -81,33 +62,33 @@ impl StorageOwnerState {
             state,
             cold_tier_devices: ColdTierDeviceManager::new(cold_tier),
             hot_replicas: super::super::HotReplicaTracker::default(),
-            pending_offloads: super::super::ColdTierOffloadManager::default(),
+            pending_offloads: super::super::ColdTierOffloadManager::new(offload_priority),
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
-            initial_cold_backing_repair_at_ms: std::sync::atomic::AtomicU64::new(0),
+            initial_cold_backing_repair_at_ms: AtomicU64::new(0),
             offload_mode,
             offload_priority,
-            owner_cold_restore_flights: super::super::OwnerColdRestoreFlightMap::new(
-                restore_max_distinct_flights,
-            ),
+            owner_cold_restore_flights: super::super::OwnerColdRestoreFlightMap::default(),
             cold_restore_io_tracker: super::super::ColdRestoreIoTracker::default(),
             eviction_ready_signal: super::super::EvictionReadySignal::default(),
             read_pin_registry: super::super::ReadPinRegistry::default(),
             staging_pool: parking_lot::Mutex::new(None),
             pending_staging_slots: parking_lot::Mutex::new(std::collections::HashMap::new()),
             staging_pool_bytes,
-            staging_slot_ttl,
         }
     }
 
     fn select_cold_tier_device(&self, length: u64) -> Result<Option<ColdTierDeviceRecord>> {
         self.cold_tier_devices
-            .select_for_offload(self.metadata.as_ref(), length)
+            .select_for_offload(self.route_ops.directory().metadata(), length)
     }
 
     /// Select up to `n` distinct devices for multi-replica offload.
     fn select_cold_tier_devices(&self, length: u64, n: usize) -> Result<Vec<ColdTierDeviceRecord>> {
-        self.cold_tier_devices
-            .select_n_for_offload(self.metadata.as_ref(), length, n)
+        self.cold_tier_devices.select_n_for_offload(
+            self.route_ops.directory().metadata(),
+            length,
+            n,
+        )
     }
 
     pub(in super::super) fn cold_tier_device_crosses_critical(
@@ -118,13 +99,6 @@ impl StorageOwnerState {
         self.cold_tier_devices.crosses_critical(device, length)
     }
 
-    /// Conditionally assign cold backing metadata to a route at write time.
-    ///
-    /// In `Passthrough` mode, cold backing is assigned eagerly so the
-    /// background offload pipeline can begin materializing the SSD payload
-    /// immediately.  In `EvictTriggered` mode, returns `None` — cold
-    /// backing is deferred until eviction pressure forces the hot replica
-    /// out of DRAM.
     pub(in super::super) fn cold_backing_for_route(
         &self,
         route: &ObjectRoute,
@@ -132,9 +106,6 @@ impl StorageOwnerState {
         length: u64,
         checksum: u64,
     ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
-        if super::cold_tier_disabled() {
-            return Ok(None);
-        }
         match self.offload_mode {
             super::super::ColdTierOffloadMode::Passthrough => {
                 self.pending_cold_backing_for_route(route, owner, length, checksum)
@@ -143,10 +114,6 @@ impl StorageOwnerState {
         }
     }
 
-    /// Unconditionally create cold backing metadata in PendingOffload state.
-    /// Selects device(s) and constructs the object locator.  Called by
-    /// `cold_backing_for_route` in Passthrough mode; also called directly
-    /// during eviction-triggered offload.
     pub(in super::super) fn pending_cold_backing_for_route(
         &self,
         route: &ObjectRoute,
@@ -154,22 +121,17 @@ impl StorageOwnerState {
         length: u64,
         checksum: u64,
     ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
-        if super::cold_tier_disabled() {
-            return Ok(None);
-        }
         let replica_count = cold_tier_replica_count();
-        let select_devices = |storage_owner: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
+        let select_devices = |s: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
             if replica_count > 1 {
-                storage_owner.select_cold_tier_devices(length, replica_count)
+                s.select_cold_tier_devices(length, replica_count)
             } else {
-                Ok(storage_owner
-                    .select_cold_tier_device(length)?
-                    .into_iter()
-                    .collect())
+                Ok(s.select_cold_tier_device(length)?.into_iter().collect())
             }
         };
         let mut devices = select_devices(self)?;
         if devices.is_empty() {
+            // Inline GC: try to free cold tier space, then retry selection.
             let freed = self.try_inline_gc_for_offload(length)?;
             if freed > 0 {
                 devices = select_devices(self)?;
@@ -184,9 +146,6 @@ impl StorageOwnerState {
             );
             return Ok(None);
         };
-        // Object locator format: "<canonical_key>@v<version>".
-        // Encodes the route key and version so the SSD filename is unique
-        // per object version and decodable for restart recovery.
         let object_locator = format!(
             "{}@v{}",
             route
@@ -226,13 +185,113 @@ impl StorageOwnerState {
         }))
     }
 
+    pub(in super::super) fn reserve_owner_restore_space(
+        &self,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        // Fully synchronous eviction strategy — every loop iteration does actual
+        // work (SSD write via inline flush), never idle-waits.
+        //
+        // 1. Fast path: allocate from free pool
+        // 2. Clean evict-and-reserve: Materialized entry, zero I/O, direct slot reuse
+        // 3. Pinned check: if all entries pinned by RDMA readers, return Backpressure
+        //    (only ACK can free pins; waiting here deadlocks the reader's thread::scope)
+        // 4. Inline flush: evict_one_blocking flushes a PendingOffload entry to SSD
+        //    (~10ms actual I/O work), making it Materialized, then evicts it to free pool.
+        //    Loop back to step 1 to grab the freed slot.
+        for _ in 0..32usize {
+            // 1. Fast path: free pool
+            {
+                let mut allocator = self.allocator.lock();
+                match allocator.reserve_any(&self.runtime, length_bytes) {
+                    Ok(reservation) => {
+                        allocator.mark_pending_reservation(
+                            &reservation,
+                            pending_publish_deadline_ms(
+                                reservation.length_bytes,
+                                DEFAULT_TRANSFER_STALL_TIMEOUT,
+                                None,
+                            ),
+                        );
+                        return Ok(reservation);
+                    }
+                    Err(StoreError::Allocator(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            // 2. Clean evict-and-reserve (Materialized, zero I/O, direct slot reuse)
+            if let Some(reservation) =
+                self.evict_one_clean_and_reserve_bounded(length_bytes, None)?
+            {
+                self.allocator.lock().mark_pending_allocation(
+                    &reservation.segment_name,
+                    reservation.offset_bytes,
+                    reservation.length_bytes,
+                    pending_publish_deadline_ms(
+                        reservation.length_bytes,
+                        DEFAULT_TRANSFER_STALL_TIMEOUT,
+                        None,
+                    ),
+                );
+                return Ok(reservation);
+            }
+
+            // 3. Pinned entries block progress — return Backpressure immediately.
+            // Reader-side wave retry handles sequencing: RDMA+ACK frees pins
+            // between waves, so the next wave finds free slots.
+            if self.read_pin_registry.pinned_count() > 0 {
+                return Err(StoreError::Backpressure(
+                    "restore: eviction candidates pinned by active readers".into(),
+                ));
+            }
+
+            // 4. Inline flush via existing evict_one_blocking:
+            //    PendingOffload → SSD write → Materialized → evict → free to allocator.
+            //    This is ~10ms of actual SSD work per iteration (not idle waiting).
+            if !self.evict_one_blocking(None)? {
+                break;
+            }
+            // Slot freed to allocator pool — loop back to step 1 to grab it.
+        }
+
+        Err(StoreError::Allocator(format!(
+            "segment capacity exhausted for cold restore: requested={length_bytes}"
+        )))
+    }
+
+    /// Reclaim staging slots whose readers never sent ACK (crash, network
+    /// partition).  Called opportunistically when the staging pool is exhausted.
+    /// Returns the number of slots reclaimed.
+    pub(in super::super) fn sweep_expired_staging_slots(&self, ttl: Duration) -> usize {
+        let now = Instant::now();
+        let mut pending = self.pending_staging_slots.lock();
+        let before = pending.len();
+        pending.retain(|key, (_slot, created_at)| {
+            if now.duration_since(*created_at) > ttl {
+                // Force-unpin: the reader will never ACK, so clear the orphaned pin.
+                self.read_pin_registry.force_unpin(&key.0, key.1);
+                tracing::warn!(
+                    segment = key.0 .0.as_str(),
+                    offset = key.1,
+                    age_s = now.duration_since(*created_at).as_secs(),
+                    "staging slot TTL expired, force-releasing"
+                );
+                false // StagingSlot::drop → pool.release → notify waiters
+            } else {
+                true
+            }
+        });
+        before - pending.len()
+    }
+
     pub(in super::super) fn apply_cold_tier_usage_delta(
         &self,
         device_id: &str,
         used_bytes: i64,
         reserved_bytes: i64,
     ) -> Result<()> {
-        let device = self.metadata.apply_cold_tier_usage_delta(
+        let device = self.route_ops.metadata().apply_cold_tier_usage_delta(
             device_id,
             ColdTierUsageDelta {
                 used_bytes,
@@ -450,10 +509,10 @@ impl ColdTierAdmission {
         let mut devices = self.devices.lock();
         if let Some(device) = devices.get_mut(&permit.device_id) {
             if device.paused_until.is_some() {
-                tracing::info!(
-                    device_id = %permit.device_id,
-                    operation = permit.op.operation_name(),
-                    "cold tier device resumed after probe success"
+                super::super::registry::record_cold_tier_operation(
+                    permit.op.operation_name(),
+                    "device_resumed",
+                    "probe_success",
                 );
             }
             device.consecutive_errors = 0;
@@ -471,12 +530,10 @@ impl ColdTierAdmission {
                 device.paused_until = Some(
                     Instant::now() + Duration::from_millis(self.config.device_pause_ms.max(1)),
                 );
-                tracing::warn!(
-                    device_id = %permit.device_id,
-                    operation = permit.op.operation_name(),
-                    consecutive_errors = device.consecutive_errors,
-                    pause_ms = self.config.device_pause_ms,
-                    "cold tier device paused after backend errors"
+                super::super::registry::record_cold_tier_operation(
+                    permit.op.operation_name(),
+                    "device_paused",
+                    "backend_error",
                 );
             }
         }
@@ -683,19 +740,19 @@ impl ColdTierDeviceManager {
         // away from SSDs that are busy serving restore reads, reducing read/write
         // contention on the same physical disk.
         //
-        // Score = (1 - w) × capacity_score + w × io_score
+        // Score = 0.3 × capacity_score + 0.7 × io_score
         //   capacity_score = free_percentage / 100.0          (0.0 – 1.0)
         //   io_score       = 1.0 / (1.0 + restore_in_flight) (0.0 – 1.0)
-        //   w              = io_score_weight()                (0.7 or 0.9)
         //
         // When no restore reads are active on any device, the formula degrades
         // gracefully to pure free-percentage selection (the prior behaviour).
-        // Notably there is no hard filter: even when all devices have active
-        // restores, the least-busy device is selected to prevent offload
-        // starvation.
+        let throttle = throttle_offload_on_restore();
         devices
             .into_iter()
             .filter(|device| self.offload_rejection_reason(device, length).is_none())
+            .filter(|device| {
+                !throttle || self.admission.device_restore_in_flight(&device.device_id) == 0
+            })
             .max_by(|left, right| {
                 let left_score = self.device_offload_score(left);
                 let right_score = self.device_offload_score(right);
@@ -717,9 +774,13 @@ impl ColdTierDeviceManager {
         if devices.is_empty() || n == 0 {
             return Vec::new();
         }
+        let throttle = throttle_offload_on_restore();
         let mut eligible: Vec<_> = devices
             .into_iter()
             .filter(|device| self.offload_rejection_reason(device, length).is_none())
+            .filter(|device| {
+                !throttle || self.admission.device_restore_in_flight(&device.device_id) == 0
+            })
             .collect();
         // Sort descending by offload score (best first).
         eligible.sort_by(|a, b| {
@@ -744,8 +805,7 @@ impl ColdTierDeviceManager {
         let capacity_score = free_pct / 100.0; // 0.0 – 1.0
         let restore_in_flight = self.admission.device_restore_in_flight(&device.device_id);
         let io_score = 1.0 / (1.0 + restore_in_flight as f64); // 0.0 – 1.0
-        let w = io_score_weight();
-        (1.0 - w) * capacity_score + w * io_score
+        0.3 * capacity_score + 0.7 * io_score
     }
 
     fn usable_device(&self, device: &ColdTierDeviceRecord) -> bool {
@@ -870,13 +930,6 @@ impl ColdTierDeviceManager {
         }
     }
 
-    /// Resolve a backend for the given cold backing, using a device snapshot
-    /// to lazily register backends not yet in the resolver.
-    ///
-    /// A device may have two IDs (device_id and cold_tier_id) when the
-    /// admin-assigned cold_tier_id differs from the internal device_id.
-    /// Both are registered as resolver aliases so that cold backing routes
-    /// referencing either ID resolve to the same backend.
     fn backend_for_from_snapshot(
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
@@ -907,9 +960,6 @@ impl ColdTierDeviceManager {
         if !resolver.has_backend(&device.device_id) {
             resolver.insert_backend(device.device_id.clone(), backend.clone());
         }
-        // Register alias: cold_tier_id may differ from device_id when the
-        // admin assigns a user-facing cold_tier_id distinct from the internal
-        // device_id.  Both must resolve to the same backend.
         if device.cold_tier_id != device.device_id && !resolver.has_backend(&device.cold_tier_id) {
             resolver.insert_backend(device.cold_tier_id.clone(), backend.clone());
         }

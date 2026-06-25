@@ -14,7 +14,7 @@ const COLD_OBJECT_MANIFEST_HEADER_LEN: usize = 44;
 const COLD_OBJECT_CHECKSUM_NONE: u16 = 0;
 const COLD_OBJECT_CHECKSUM_XXH3: u16 = 1;
 
-fn encode_backend_payload(
+pub(crate) fn encode_backend_payload(
     payload: &[u8],
     expected_length: u64,
     checksum: Option<u64>,
@@ -226,7 +226,7 @@ fn cold_object_payload_metadata_and_manifest(
     ))
 }
 
-fn decode_backend_payload(
+pub(crate) fn decode_backend_payload(
     path: &std::path::Path,
     label: &str,
     mut encoded: Vec<u8>,
@@ -307,7 +307,7 @@ impl LocalDirPersistentStorageBackend {
         Self { root: root.into() }
     }
 
-    fn object_path(
+    pub(crate) fn object_path(
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> std::path::PathBuf {
@@ -433,6 +433,449 @@ impl LocalDirPersistentStorageBackend {
         let mut bytes = 0u64;
         collect_local_dir_file_stats(root, &mut count, &mut bytes)?;
         Ok((count, bytes))
+    }
+}
+
+fn route_from_recovered_cold_object(
+    recovered: &RecoveredColdObject,
+    owner: ClientRuntimeId,
+) -> ObjectRoute {
+    ObjectRoute {
+        key: recovered.manifest.key.clone(),
+        namespace: recovered.manifest.namespace.clone(),
+        logical_key: recovered.manifest.logical_key.clone(),
+        canonical_key: recovered.manifest.canonical_key.clone(),
+        sharing_scope: recovered.manifest.sharing_scope.clone(),
+        qos_tier: recovered.manifest.qos_tier.clone(),
+        version: recovered.manifest.route_version,
+        state: RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: Vec::new(),
+        cold_backing: Some(mooncake_store_core::ColdBackingRoute {
+            owner,
+            cold_tier_id: recovered.manifest.cold_tier_id.clone(),
+            object_locator: recovered.manifest.object_locator.clone(),
+            length: recovered.metadata.length,
+            checksum: recovered.metadata.checksum,
+            state: mooncake_store_core::ColdBackingState::Materialized,
+            replicas: Vec::new(),
+        }),
+    }
+}
+
+enum RecoveredObjectOutcome {
+    Registered,
+    AlreadyConsistent,
+    Superseded,
+}
+
+fn try_register_recovered_cold_object(
+    metadata: &dyn MetadataBackend,
+    route_directory: &dyn RouteDirectory,
+    observer: &ClientLease,
+    recovered: &RecoveredColdObject,
+) -> Result<RecoveredObjectOutcome> {
+    let manifest_backing = mooncake_store_core::ColdBackingRoute {
+        owner: observer.runtime.clone(),
+        cold_tier_id: recovered.manifest.cold_tier_id.clone(),
+        object_locator: recovered.manifest.object_locator.clone(),
+        length: recovered.metadata.length,
+        checksum: recovered.metadata.checksum,
+        state: mooncake_store_core::ColdBackingState::Materialized,
+        replicas: Vec::new(),
+    };
+
+    if let Some(current) = metadata.get_object_route(&recovered.manifest.key)? {
+        let already_consistent = current.cold_backing.as_ref().is_some_and(|backing| {
+            backing.cold_tier_id == recovered.manifest.cold_tier_id
+                && backing.object_locator == recovered.manifest.object_locator
+                && backing.owner == observer.runtime
+                && backing.state == mooncake_store_core::ColdBackingState::Materialized
+        });
+        if already_consistent {
+            return Ok(RecoveredObjectOutcome::AlreadyConsistent);
+        }
+        if current.version > recovered.manifest.route_version {
+            tracing::warn!(
+                route_key = %recovered.manifest.key.0,
+                current_version = current.version.0,
+                recovered_version = recovered.manifest.route_version.0,
+                cold_tier_id = %recovered.manifest.cold_tier_id,
+                object_locator = %recovered.manifest.object_locator,
+                "startup cold-tier manifest recovery: skipping stale disk manifest for newer route"
+            );
+            return Ok(RecoveredObjectOutcome::Superseded);
+        }
+
+        let mut next = current.clone();
+        next.version = current.version.next();
+        next.cold_backing = Some(manifest_backing);
+        let cas = route_directory.compare_and_swap_local_route(
+            observer,
+            &recovered.manifest.key,
+            Some(current.version),
+            Some(&next),
+        )?;
+        if cas.applied {
+            tracing::info!(
+                route_key = %recovered.manifest.key.0,
+                current_version = current.version.0,
+                cold_tier_id = %recovered.manifest.cold_tier_id,
+                object_locator = %recovered.manifest.object_locator,
+                had_cold_backing = current.cold_backing.is_some(),
+                "startup cold-tier manifest recovery: repaired route from disk manifest"
+            );
+            Ok(RecoveredObjectOutcome::Registered)
+        } else {
+            tracing::warn!(
+                route_key = %recovered.manifest.key.0,
+                current_version = current.version.0,
+                "startup cold-tier manifest recovery: route repair CAS conflict"
+            );
+            Ok(RecoveredObjectOutcome::Superseded)
+        }
+    } else {
+        let route = route_from_recovered_cold_object(recovered, observer.runtime.clone());
+        let cas = route_directory.compare_and_swap_local_route(
+            observer,
+            &recovered.manifest.key,
+            None,
+            Some(&route),
+        )?;
+        if cas.applied {
+            tracing::info!(
+                route_key = %recovered.manifest.key.0,
+                route_version = recovered.manifest.route_version.0,
+                cold_tier_id = %recovered.manifest.cold_tier_id,
+                object_locator = %recovered.manifest.object_locator,
+                "startup cold-tier manifest recovery: registered disk-backed route"
+            );
+            Ok(RecoveredObjectOutcome::Registered)
+        } else {
+            tracing::info!(
+                route_key = %recovered.manifest.key.0,
+                route_version = recovered.manifest.route_version.0,
+                "startup cold-tier manifest recovery: superseded by newer version on disk"
+            );
+            Ok(RecoveredObjectOutcome::Superseded)
+        }
+    }
+}
+
+pub(super) fn reconcile_cold_tier_startup(
+    metadata: &dyn MetadataBackend,
+    route_directory: &dyn RouteDirectory,
+    observer: &ClientLease,
+    backend: &LocalDirPersistentStorageBackend,
+    devices: &[ResolvedColdTierTarget],
+) -> Result<()> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+    for device in devices {
+        let routes = route_directory.list_routes_by_cold_backing(
+            observer,
+            &mooncake_store_core::ColdBackingRouteFilter {
+                device_id: Some(device.cold_tier_id.clone()),
+                ..mooncake_store_core::ColdBackingRouteFilter::default()
+            },
+        )?;
+        let mut live_final_paths = BTreeSet::new();
+        let mut live_pending_paths = BTreeSet::new();
+        let mut recovered_objects = backend.scan_recovered_objects(device)?;
+        recovered_objects.sort_by(|a, b| {
+            a.manifest
+                .key
+                .cmp(&b.manifest.key)
+                .then(b.manifest.route_version.cmp(&a.manifest.route_version))
+        });
+        let mut recovered_used_bytes = 0u64;
+        for recovered in &recovered_objects {
+            match try_register_recovered_cold_object(metadata, route_directory, observer, recovered)
+            {
+                Ok(RecoveredObjectOutcome::Registered) => {
+                    live_final_paths.insert(recovered.path.clone());
+                    recovered_used_bytes =
+                        recovered_used_bytes.saturating_add(recovered.metadata.length);
+                }
+                Ok(RecoveredObjectOutcome::AlreadyConsistent) => {
+                    recovered_used_bytes =
+                        recovered_used_bytes.saturating_add(recovered.metadata.length);
+                }
+                Ok(RecoveredObjectOutcome::Superseded) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        route_key = %recovered.manifest.key.0,
+                        cold_tier_id = %recovered.manifest.cold_tier_id,
+                        %error,
+                        "startup recovery: skipping object due to error"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            runtime = %observer.runtime,
+            cold_tier_id = %device.cold_tier_id,
+            initial_routes = routes.len(),
+            recovered_objects = recovered_objects.len(),
+            recovered_used_bytes,
+            "reconcile_cold_tier_startup: disk recovery complete"
+        );
+        let routes = if recovered_objects.is_empty() {
+            routes
+        } else {
+            route_directory.list_routes_by_cold_backing(
+                observer,
+                &mooncake_store_core::ColdBackingRouteFilter {
+                    device_id: Some(device.cold_tier_id.clone()),
+                    ..mooncake_store_core::ColdBackingRouteFilter::default()
+                },
+            )?
+        };
+        let mut used_bytes = 0u64;
+        for route in &routes {
+            let route_result: Result<()> = (|| {
+                let Some(cold_backing) = route.cold_backing.as_ref() else {
+                    return Ok(());
+                };
+                if cold_backing.cold_tier_id != device.cold_tier_id {
+                    return Ok(());
+                }
+                let final_path = backend.object_path(cold_backing);
+                let pending_path = backend.pending_source_path(cold_backing);
+                match cold_backing.state {
+                    mooncake_store_core::ColdBackingState::Materialized => {
+                        if let Some((stored_length, _)) = backend.object_metadata(cold_backing)? {
+                            if cold_backing.owner != observer.runtime {
+                                let mut next = route.clone();
+                                next.version = next.version.next();
+                                if let Some(next_backing) = next.cold_backing.as_mut() {
+                                    next_backing.owner = observer.runtime.clone();
+                                }
+                                let cas = route_directory.compare_and_swap_local_route(
+                                    observer,
+                                    &route.key,
+                                    Some(route.version),
+                                    Some(&next),
+                                )?;
+                                if cas.applied {
+                                    tracing::info!(
+                                        route_key = %route.key.0,
+                                        stale_owner = %cold_backing.owner,
+                                        new_owner = %observer.runtime,
+                                        "startup cold-tier adoption: updated stale owner"
+                                    );
+                                }
+                            }
+                            live_final_paths.insert(final_path);
+                            used_bytes = used_bytes.saturating_add(stored_length);
+                        }
+                    }
+                    mooncake_store_core::ColdBackingState::PendingOffload => {
+                        if let Some((stored_length, _)) = backend.object_metadata(cold_backing)? {
+                            let mut next = route.clone();
+                            next.version = next.version.next();
+                            if let Some(next_backing) = next.cold_backing.as_mut() {
+                                next_backing.state =
+                                    mooncake_store_core::ColdBackingState::Materialized;
+                                next_backing.length = stored_length;
+                                if next_backing.owner != observer.runtime {
+                                    next_backing.owner = observer.runtime.clone();
+                                }
+                            }
+                            let cas = route_directory.compare_and_swap_local_route(
+                                observer,
+                                &route.key,
+                                Some(route.version),
+                                Some(&next),
+                            )?;
+                            if cas.applied {
+                                let _ = backend.delete_pending_source(cold_backing);
+                                live_final_paths.insert(final_path);
+                                used_bytes = used_bytes.saturating_add(stored_length);
+                            } else {
+                                live_pending_paths.insert(pending_path);
+                                if cas
+                                    .current
+                                    .as_ref()
+                                    .and_then(|current| current.cold_backing.as_ref())
+                                    .is_some_and(|current| {
+                                        super::super::cold_tier::same_cold_payload(
+                                            current,
+                                            cold_backing,
+                                        )
+                                    })
+                                {
+                                    tracing::warn!(
+                                        route_key = %route.key.0,
+                                        cold_tier_id = %cold_backing.cold_tier_id,
+                                        object_locator = %cold_backing.object_locator,
+                                        current_state = ?cas
+                                            .current
+                                            .as_ref()
+                                            .and_then(|current| current.cold_backing.as_ref())
+                                            .map(|current| current.state),
+                                        "startup cold-tier reconcile kept final payload after CAS conflict"
+                                    );
+                                    live_final_paths.insert(final_path);
+                                    used_bytes = used_bytes.saturating_add(stored_length);
+                                }
+                            }
+                        } else if backend.get_pending_source(cold_backing)?.is_some() {
+                            live_pending_paths.insert(pending_path);
+                        }
+                    }
+                    mooncake_store_core::ColdBackingState::PendingDelete => {}
+                }
+                Ok(())
+            })();
+            if let Err(error) = route_result {
+                tracing::warn!(
+                    route_key = %route.key.0,
+                    %error,
+                    "startup reconcile: skipping route due to error"
+                );
+            }
+        }
+        let final_dir = device
+            .root_dir
+            .join(encode_backend_component(&device.cold_tier_id));
+        let pending_dir = device
+            .root_dir
+            .join("__pending__")
+            .join(encode_backend_component(&device.cold_tier_id));
+        quarantine_orphan_cold_tier_files(&final_dir, &live_final_paths)?;
+        quarantine_orphan_cold_tier_files(&pending_dir, &live_pending_paths)?;
+        gc_orphan_quarantine(&final_dir);
+        gc_orphan_quarantine(&pending_dir);
+        let routes_used_bytes = used_bytes;
+        let used_bytes = used_bytes.max(recovered_used_bytes);
+        if let Some(existing) = metadata.get_cold_tier_device(&device.cold_tier_id)? {
+            let used_bytes = used_bytes.max(existing.used_bytes);
+            tracing::info!(
+                runtime = %observer.runtime,
+                cold_tier_id = %device.cold_tier_id,
+                routes_used_bytes,
+                recovered_used_bytes,
+                existing_used_bytes = existing.used_bytes,
+                final_used_bytes = used_bytes,
+                live_final_paths = live_final_paths.len(),
+                "reconcile_cold_tier_startup: updating device used_bytes"
+            );
+            let mut update = mooncake_store_core::ColdTierDeviceUpdate::new(current_time_ms());
+            update.expected_updated_at_ms = Some(existing.updated_at_ms);
+            update.used_bytes = Some(used_bytes);
+            update.reserved_bytes = Some(0);
+            let updated = metadata.update_cold_tier_device(&device.cold_tier_id, update)?;
+            tracing::info!(
+                runtime = %observer.runtime,
+                cold_tier_id = %device.cold_tier_id,
+                device_used_bytes = updated.used_bytes,
+                device_epoch = ?updated.epoch,
+                "reconcile_cold_tier_startup: device update committed"
+            );
+        } else {
+            tracing::warn!(
+                runtime = %observer.runtime,
+                cold_tier_id = %device.cold_tier_id,
+                "reconcile_cold_tier_startup: device not found in metadata, skipping used_bytes update"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_orphan_cold_tier_files(
+    directory: &std::path::Path,
+    live_paths: &BTreeSet<std::path::PathBuf>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(StoreError::Transport(format!(
+                "failed to scan cold tier directory {}: {error}",
+                directory.display()
+            )))
+        }
+    };
+    let quarantine_directory = directory.join("__orphan_quarantine__");
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            StoreError::Transport(format!(
+                "failed to scan cold tier directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let path = entry.path();
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        if extension
+            .map(|ext| ext.starts_with("tmp-"))
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if extension != Some("bin") || live_paths.contains(&path) {
+            continue;
+        }
+        std::fs::create_dir_all(&quarantine_directory).map_err(|error| {
+            StoreError::Transport(format!(
+                "failed to create cold tier orphan quarantine {}: {error}",
+                quarantine_directory.display()
+            ))
+        })?;
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        let mut quarantined = quarantine_directory.join(file_name);
+        if quarantined.exists() {
+            quarantined = quarantine_directory.join(format!(
+                "{}.{}",
+                file_name.to_string_lossy(),
+                current_time_ms()
+            ));
+        }
+        std::fs::rename(&path, &quarantined).map_err(|error| {
+            StoreError::Transport(format!(
+                "failed to quarantine orphan cold tier object {} to {}: {error}",
+                path.display(),
+                quarantined.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+const ORPHAN_QUARANTINE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn gc_orphan_quarantine(directory: &std::path::Path) {
+    let quarantine_dir = directory.join("__orphan_quarantine__");
+    let entries = match std::fs::read_dir(&quarantine_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let now_ms = current_time_ms();
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let age_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| {
+                mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| now_ms.saturating_sub(d.as_millis() as u64))
+            })
+            .unwrap_or(0);
+        if age_ms >= ORPHAN_QUARANTINE_TTL_MS {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
