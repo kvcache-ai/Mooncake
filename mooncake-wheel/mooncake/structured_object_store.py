@@ -3968,7 +3968,7 @@ def _torch_save_payload_bytes(value: Any) -> bytes:
 
 
 def _deserialize_torch_save_payload(payload: bytes) -> Any:
-    return _torch.load(io.BytesIO(payload), weights_only=False)
+    return _torch.load(io.BytesIO(payload), weights_only=True)
 
 
 def _slice_tensor_metadata(
