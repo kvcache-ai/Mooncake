@@ -5,6 +5,7 @@
 
 #include <memory>
 
+
 #include "master_metric_manager.h"
 
 namespace mooncake {
