@@ -108,26 +108,51 @@ class PerDeviceStreamPool {
 
 static thread_local PerDeviceStreamPool tl_device_stream_pool;
 
-/// Thread-local sync event, created on the caller's active device.
-/// Used to capture the caller's GPU work completion via cudaEventSynchronize
-/// (CPU-blocking), avoiding expensive cross-device cudaStreamWaitEvent on
-/// non-NVIDIA GPUs.
-static thread_local cudaEvent_t tl_caller_sync_event = nullptr;
-static thread_local int tl_caller_sync_event_device = -1;
+/// Per-device event pool (thread-local). Caches one event per device to
+/// avoid repeated create/destroy on device switches, and ensures proper
+/// cleanup when the thread exits.
+class PerDeviceEventPool {
+   public:
+    cudaEvent_t getOrCreate(int device_id) {
+        auto it = pool_.find(device_id);
+        if (it != pool_.end()) return it->second;
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        if (cudaSetDevice(device_id) != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaSetDevice(" << device_id
+                       << ") failed when creating event";
+            return nullptr;
+        }
+        cudaEvent_t event = nullptr;
+        cudaError_t err =
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+            LOG(FATAL) << "Failed to create NVLink sync event on device "
+                       << device_id << ": " << cudaGetErrorString(err);
+        cudaSetDevice(saved_device);
+        pool_[device_id] = event;
+        return event;
+    }
+    ~PerDeviceEventPool() {
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        for (auto &kv : pool_) {
+            cudaSetDevice(kv.first);
+            if (kv.second) cudaEventDestroy(kv.second);
+        }
+        cudaSetDevice(saved_device);
+    }
+
+   private:
+    std::unordered_map<int, cudaEvent_t> pool_;
+};
+
+static thread_local PerDeviceEventPool tl_device_event_pool;
 
 static cudaEvent_t getCallerSyncEvent() {
     int current_device = 0;
     cudaGetDevice(&current_device);
-    if (tl_caller_sync_event_device != current_device) {
-        if (tl_caller_sync_event) cudaEventDestroy(tl_caller_sync_event);
-        cudaError_t err = cudaEventCreateWithFlags(&tl_caller_sync_event,
-                                                   cudaEventDisableTiming);
-        if (err != cudaSuccess)
-            LOG(FATAL) << "Failed to create NVLink sync event on device "
-                       << current_device << ": " << cudaGetErrorString(err);
-        tl_caller_sync_event_device = current_device;
-    }
-    return tl_caller_sync_event;
+    return tl_device_event_pool.getOrCreate(current_device);
 }
 
 static int getDeviceForPointer(const void *ptr) {
