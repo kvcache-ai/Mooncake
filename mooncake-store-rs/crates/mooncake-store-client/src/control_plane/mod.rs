@@ -229,8 +229,8 @@ mod cold_tier_server;
 mod server;
 
 pub(crate) use cold_tier::{
-    ColdReadResponse, ColdReadResult, ColdReadTarget, ColdTierControlService,
-    UnsupportedColdTierControlService,
+    ColdReadResponse, ColdReadResult, ColdReadTarget, ColdTierControlService, ColdTierFreeResult,
+    ColdTierProbeResult, UnsupportedColdTierControlService,
 };
 pub(crate) use server::ControlPlaneHandle;
 

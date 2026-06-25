@@ -10,6 +10,125 @@ async fn run_blocking_control<T: Send + 'static>(
         .map_err(|error| Status::internal(format!("{operation} worker failed: {error}")))
 }
 
+pub(super) async fn handle_trigger_cold_tier_offload(
+    cold_tier: Arc<dyn ColdTierControlService>,
+    request: Request<pb::TriggerColdTierOffloadRequest>,
+) -> std::result::Result<Response<pb::TriggerColdTierOffloadReply>, Status> {
+    let request = request.into_inner();
+    let reply = run_blocking_control("trigger_cold_tier_offload", move || {
+        match cold_tier.trigger_offload(request.max_tasks as usize) {
+            Ok(materialized) => pb::TriggerColdTierOffloadReply {
+                materialized: materialized as u64,
+                error: None,
+            },
+            Err(error) => pb::TriggerColdTierOffloadReply {
+                materialized: 0,
+                error: Some(pb_error(error)),
+            },
+        }
+    })
+    .await?;
+    Ok(Response::new(reply))
+}
+
+pub(super) async fn handle_manual_cold_tier_gc(
+    cold_tier: Arc<dyn ColdTierControlService>,
+    request: Request<pb::ManualColdTierGcRequest>,
+) -> std::result::Result<Response<pb::ManualColdTierGcReply>, Status> {
+    let request = request.into_inner();
+    if request.device_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "manual_cold_tier_gc requires device_id",
+        ));
+    }
+    let reply = run_blocking_control("manual_cold_tier_gc", move || {
+        match cold_tier.manual_gc(&request.device_id, request.max_backings as usize) {
+            Ok(collected) => pb::ManualColdTierGcReply {
+                collected: collected as u64,
+                error: None,
+            },
+            Err(error) => pb::ManualColdTierGcReply {
+                collected: 0,
+                error: Some(pb_error(error)),
+            },
+        }
+    })
+    .await?;
+    Ok(Response::new(reply))
+}
+
+pub(super) async fn handle_manual_cold_tier_free(
+    cold_tier: Arc<dyn ColdTierControlService>,
+    request: Request<pb::ManualColdTierFreeRequest>,
+) -> std::result::Result<Response<pb::ManualColdTierFreeReply>, Status> {
+    let request = request.into_inner();
+    if request.device_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "manual_cold_tier_free requires device_id",
+        ));
+    }
+    let reply = run_blocking_control("manual_cold_tier_free", move || {
+        match cold_tier.manual_free(&request.device_id, request.max_victims as usize) {
+            Ok(result) => pb::ManualColdTierFreeReply {
+                attempted_victims: result.attempted_victims as u64,
+                freed_backings: result.freed_backings as u64,
+                skipped_backings: result.skipped_backings as u64,
+                reached_low_watermark: result.reached_low_watermark,
+                error: None,
+                collected_backings: result.collected_backings as u64,
+            },
+            Err(error) => pb::ManualColdTierFreeReply {
+                attempted_victims: 0,
+                freed_backings: 0,
+                skipped_backings: 0,
+                reached_low_watermark: false,
+                error: Some(pb_error(error)),
+                collected_backings: 0,
+            },
+        }
+    })
+    .await?;
+    Ok(Response::new(reply))
+}
+
+pub(super) async fn handle_probe_cold_tier_device(
+    cold_tier: Arc<dyn ColdTierControlService>,
+    request: Request<pb::ProbeColdTierDeviceRequest>,
+) -> std::result::Result<Response<pb::ProbeColdTierDeviceReply>, Status> {
+    let request = request.into_inner();
+    if request.device_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "probe_cold_tier_device requires device_id",
+        ));
+    }
+    let reply = run_blocking_control("probe_cold_tier_device", move || {
+        match cold_tier.probe_device(&request.device_id) {
+            Ok(result) => pb::ProbeColdTierDeviceReply {
+                device_id: result.device_id,
+                capacity_bytes: result.capacity_bytes.unwrap_or_default(),
+                used_bytes: result.used_bytes,
+                reserved_bytes: result.reserved_bytes,
+                schedulable: result.schedulable,
+                state: result.state,
+                last_error: result.last_error.unwrap_or_default(),
+                error: None,
+            },
+            Err(error) => pb::ProbeColdTierDeviceReply {
+                device_id: request.device_id,
+                capacity_bytes: 0,
+                used_bytes: 0,
+                reserved_bytes: 0,
+                schedulable: false,
+                state: String::new(),
+                last_error: String::new(),
+                error: Some(pb_error(error)),
+            },
+        }
+    })
+    .await?;
+    Ok(Response::new(reply))
+}
+
 pub(super) async fn handle_read_from_cold(
     cold_tier: Arc<dyn ColdTierControlService>,
     request: Request<pb::ReadFromColdRequest>,

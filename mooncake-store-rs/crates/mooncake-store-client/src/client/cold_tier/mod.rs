@@ -40,10 +40,7 @@ fn env_flag_enabled(name: &str) -> bool {
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use device::cold_tier_free_percentage;
-pub(super) use eviction::{
-    route_after_replica_eviction, should_delete_route_after_last_replica_eviction,
-    EvictionReadySignal,
-};
+pub(super) use eviction::{route_after_replica_eviction, EvictionReadySignal};
 pub(super) use helpers::{
     backend_load_cold_payload_batch_into, backend_remove_cold_payload,
     backend_remove_cold_payload_batch, backend_remove_pending_source,
