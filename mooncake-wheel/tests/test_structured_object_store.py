@@ -1657,6 +1657,57 @@ def test_dataproto_helper_appends_stage_fields_without_rewriting_existing() -> N
         transfer.append_dataproto_fields(ref, rollout, stage="duplicate")
 
 
+def test_dataproto_helper_same_stage_append_reads_rows_with_real_store() -> None:
+    pytest.importorskip("mooncake.store")
+    _store, transfer = real_transfer("structured-test-dataproto-same-stage")
+    input_ids = np.arange(24, dtype=np.int64).reshape(6, 4)
+    old_log_probs = np.linspace(0.0, 1.0, 6, dtype=np.float32)
+    text = np.asarray(["", "bb", "ccc", "dddd", "eeeee", "ffffff"], dtype=object)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"input_ids": input_ids}, meta_info={"step": 1}),
+        stage="rollout",
+    )
+    old_ref = ref
+    old_manifest_key = ref.stage_refs["rollout"].manifest_key
+    ref = transfer.append_dataproto_fields(
+        ref,
+        SimpleDataProto(
+            batch={"old_log_probs": old_log_probs},
+            non_tensor_batch={"text": text},
+            meta_info={"stage": "rollout-extra"},
+        ),
+        stage="rollout",
+    )
+
+    try:
+        old_result = transfer.get_dataproto(old_ref)
+        result = transfer.get_dataproto(ref)
+        sliced = transfer.get_dataproto(ref, rows=slice(2, 5))
+        gathered = transfer.get_dataproto(
+            ref, fields=["input_ids", "text"], rows=[4, 1, 3]
+        )
+        view = transfer.dataproto_manifest_view(ref)
+
+        assert set(ref.stage_refs) == {"rollout"}
+        assert ref.stage_refs["rollout"].manifest_key != old_manifest_key
+        assert np.array_equal(old_result["batch"]["input_ids"], input_ids)
+        assert np.array_equal(result["batch"]["input_ids"], input_ids)
+        assert np.array_equal(result["batch"]["old_log_probs"], old_log_probs)
+        assert result["non_tensor_batch"]["text"].tolist() == text.tolist()
+        assert result["meta_info"] == {"step": 1, "stage": "rollout-extra"}
+        assert np.array_equal(sliced["batch"]["input_ids"], input_ids[2:5])
+        assert np.array_equal(sliced["batch"]["old_log_probs"], old_log_probs[2:5])
+        assert sliced["non_tensor_batch"]["text"].tolist() == text[2:5].tolist()
+        assert np.array_equal(gathered["batch"]["input_ids"], input_ids[[4, 1, 3]])
+        assert gathered["non_tensor_batch"]["text"].tolist() == text[[4, 1, 3]].tolist()
+        assert view["batch_fields"]["input_ids"]["stage"] == "rollout"
+        assert view["batch_fields"]["old_log_probs"]["stage"] == "rollout"
+        assert view["non_tensor_fields"]["text"]["stage"] == "rollout"
+        assert set(ref.encoded_non_tensor) == {"text"}
+    finally:
+        transfer.cleanup_dataproto(ref)
+
+
 def test_dataproto_helper_rejects_inconsistent_batch_sizes() -> None:
     _store, transfer = make_transfer()
     data = SimpleDataProto(

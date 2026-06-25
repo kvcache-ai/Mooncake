@@ -884,8 +884,8 @@ class MooncakeBundleTransfer:
             gathered_offsets[0] = 0
             ranges = []
             destination_offset = 0
-            for begin, count in zip(begins, byte_counts):
-                gathered_offsets[len(ranges) + 1] = destination_offset + count
+            for index, (begin, count) in enumerate(zip(begins, byte_counts)):
+                gathered_offsets[index + 1] = destination_offset + count
                 if count:
                     ranges.append((int(begin), destination_offset, count))
                 destination_offset += count
@@ -1050,6 +1050,59 @@ class MooncakeBundleTransfer:
             seen.add(stage_ref.manifest_key)
             self.remove_bundle(stage_ref)
 
+    def _append_dataproto_stage_manifest(
+        self,
+        old_stage_ref: RemoteBundleRef,
+        payload: StructuredObjectPayload,
+        *,
+        partition: str,
+        chunk_bytes: Optional[int],
+        policy: Optional[BundleTransferPolicy],
+    ) -> RemoteBundleRef:
+        new_stage_ref = self.put_structured_object(
+            payload,
+            partition=partition,
+            chunk_bytes=chunk_bytes,
+            policy=policy,
+        )
+        try:
+            old_manifest = self._bundle_store.resolve_manifest(old_stage_ref)
+            new_manifest = self._bundle_store.resolve_manifest(new_stage_ref)
+            old_metadata = _decode_structured_metadata(
+                self._bundle_store.read_payload(old_manifest["meta"])
+            )
+            new_metadata = _decode_structured_metadata(
+                self._bundle_store.read_payload(new_manifest["meta"])
+            )
+            merged_metadata = _merge_structured_stage_metadata(
+                old_metadata, new_metadata
+            )
+            merged_buffers = dict(old_manifest["buffers"])
+            collisions = sorted(set(merged_buffers) & set(new_manifest["buffers"]))
+            if collisions:
+                raise ValueError(f"structured members already exist: {collisions}")
+            merged_buffers.update(new_manifest["buffers"])
+            merged_ref = self._bundle_store.put_bundle_manifest(
+                _encode_structured_metadata(merged_metadata),
+                merged_buffers,
+                partition=partition,
+                chunk_bytes=chunk_bytes,
+                policy=policy,
+                cleanup_keys=[
+                    self._bundle_store.manifest_key(old_stage_ref),
+                    *self._bundle_store.payload_keys(old_manifest["meta"]),
+                ],
+            )
+        except Exception:
+            self.remove_bundle(new_stage_ref)
+            raise
+        obsolete_keys = [
+            self._bundle_store.manifest_key(new_stage_ref),
+            *self._bundle_store.payload_keys(new_manifest["meta"]),
+        ]
+        self._bundle_store.remove_keys(obsolete_keys, strict=False)
+        return merged_ref
+
     def _put_dataproto_stage(
         self,
         ref: MooncakeDataProtoRef | None,
@@ -1156,20 +1209,28 @@ class MooncakeBundleTransfer:
             },
             buffers=buffers,
         )
-        old_stage_ref = (
-            ref.stage_refs.get(stage) if ref is not None and overwrite else None
-        )
-        stage_ref = self.put_structured_object(
-            payload,
-            partition=partition,
-            chunk_bytes=chunk_bytes,
-            policy=policy,
-        )
-        if (
-            old_stage_ref is not None
-            and old_stage_ref.manifest_key != stage_ref.manifest_key
-        ):
-            self.remove_bundle(old_stage_ref)
+        existing_stage_ref = ref.stage_refs.get(stage) if ref is not None else None
+        if existing_stage_ref is not None and not overwrite:
+            stage_ref = self._append_dataproto_stage_manifest(
+                existing_stage_ref,
+                payload,
+                partition=partition,
+                chunk_bytes=chunk_bytes,
+                policy=policy,
+            )
+        else:
+            stage_ref = self.put_structured_object(
+                payload,
+                partition=partition,
+                chunk_bytes=chunk_bytes,
+                policy=policy,
+            )
+            if (
+                existing_stage_ref is not None
+                and overwrite
+                and existing_stage_ref.manifest_key != stage_ref.manifest_key
+            ):
+                self.remove_bundle(existing_stage_ref)
         if ref is None:
             stage_refs = {stage: stage_ref}
             field_index = dict(field_updates)
@@ -2189,11 +2250,78 @@ class _BundleManifestStore:
             raise
         return RemoteBundleRef(manifest_key=manifest_key, manifest=manifest)
 
+    def put_bundle_manifest(
+        self,
+        meta: bytes | bytearray | memoryview,
+        buffers: Mapping[str, Any],
+        *,
+        partition: str,
+        chunk_bytes: Optional[int],
+        policy: Optional[BundleTransferPolicy],
+        cleanup_keys: Optional[Sequence[str]] = None,
+    ) -> RemoteBundleRef:
+        _validate_key_segment(partition, "partition")
+        meta_view = _bytes_view(meta, "meta")
+        target_chunk_bytes = _validate_chunk_bytes(
+            self._default_chunk_bytes if chunk_bytes is None else chunk_bytes
+        )
+        transfer_policy = self._policy(policy)
+        object_id = f"{partition}/{uuid.uuid4().hex}"
+        base_key = f"{self._key_prefix}/{object_id}"
+        manifest_key = f"{base_key}/manifest"
+        written_keys: list[str] = []
+        try:
+            meta_spec, meta_keys = self._put_payload(
+                f"{base_key}/meta",
+                meta_view,
+                target_chunk_bytes,
+                _copy_transfer_policy(transfer_policy),
+                pre_registered=False,
+            )
+            written_keys.extend(meta_keys)
+            manifest = {
+                "version": 1,
+                "layout": "bundle",
+                "object_id": object_id,
+                "meta": meta_spec,
+                "buffers": dict(buffers),
+                "buffer_object_ids": sorted(
+                    {
+                        str(payload_spec["key"])
+                        .removeprefix(f"{self._key_prefix}/")
+                        .split("/buffer/", 1)[0]
+                        for payload_spec in buffers.values()
+                    }
+                ),
+            }
+            if cleanup_keys:
+                manifest["cleanup_keys"] = list(dict.fromkeys(cleanup_keys))
+            self._validate_manifest(manifest)
+            manifest_blob = _encode_manifest(manifest)
+            _check_status(
+                self._store.put(manifest_key, manifest_blob), "put", manifest_key
+            )
+            written_keys.append(manifest_key)
+        except Exception:
+            _cleanup_keys(self._store, written_keys, strict=False)
+            raise
+        return RemoteBundleRef(manifest_key=manifest_key, manifest=manifest)
+
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
         manifest = self.resolve_manifest(ref)
         keys = self._payload_keys(manifest)
+        keys.extend(manifest.get("cleanup_keys", []))
         keys.append(self._manifest_key(ref, manifest))
         _cleanup_keys(self._store, keys, strict=True)
+
+    def manifest_key(self, ref: RemoteBundleRef | Mapping[str, Any]) -> str:
+        return self._manifest_key(ref, self.resolve_manifest(ref))
+
+    def payload_keys(self, payload_spec: Mapping[str, Any]) -> list[str]:
+        return [chunk["key"] for chunk in payload_spec["chunks"]]
+
+    def remove_keys(self, keys: Sequence[str], *, strict: bool) -> None:
+        _cleanup_keys(self._store, keys, strict=strict)
 
     def resolve_manifest(
         self, ref: RemoteBundleRef | Mapping[str, Any]
@@ -2404,20 +2532,48 @@ class _BundleManifestStore:
         if not isinstance(object_id, str):
             raise ValueError("bundle manifest object_id must be a string")
         base_key = f"{self._key_prefix}/{object_id}"
-        self._validate_payload_spec(manifest.get("meta"), base_key)
+        buffer_object_ids = manifest.get("buffer_object_ids", [object_id])
+        if not isinstance(buffer_object_ids, list) or not all(
+            isinstance(item, str) for item in buffer_object_ids
+        ):
+            raise ValueError("bundle manifest buffer_object_ids must be a list of strings")
+        allowed_buffer_base_keys = [
+            f"{self._key_prefix}/{buffer_object_id}"
+            for buffer_object_id in buffer_object_ids
+        ]
+        self._validate_payload_spec(manifest.get("meta"), base_keys=[base_key])
+        cleanup_keys = manifest.get("cleanup_keys", [])
+        if not isinstance(cleanup_keys, list) or not all(
+            self._is_allowed_cleanup_key(item, allowed_buffer_base_keys)
+            for item in cleanup_keys
+        ):
+            raise ValueError("bundle manifest cleanup_keys are outside the bundle namespace")
         buffers = manifest.get("buffers")
         if not isinstance(buffers, dict):
             raise ValueError("bundle manifest buffers must be a dict")
         for name, payload_spec in buffers.items():
             _validate_key_segment(name, "buffer name")
-            self._validate_payload_spec(payload_spec, base_key)
+            self._validate_payload_spec(
+                payload_spec, base_keys=allowed_buffer_base_keys
+            )
 
-    def _validate_payload_spec(self, payload_spec: Any, base_key: str) -> None:
+    def _is_allowed_cleanup_key(self, key: Any, base_keys: Sequence[str]) -> bool:
+        if not isinstance(key, str):
+            return False
+        return any(
+            key == f"{base_key}/manifest" or key.startswith(f"{base_key}/")
+            for base_key in base_keys
+        )
+
+    def _validate_payload_spec(
+        self, payload_spec: Any, base_keys: Sequence[str] | None = None
+    ) -> None:
         if not isinstance(payload_spec, dict):
             raise ValueError("bundle payload spec must be a dict")
         payload_key = payload_spec.get("key")
-        if not isinstance(payload_key, str) or not payload_key.startswith(
-            f"{base_key}/"
+        if not isinstance(payload_key, str) or (
+            base_keys is not None
+            and not any(payload_key.startswith(f"{base_key}/") for base_key in base_keys)
         ):
             raise ValueError("bundle payload key is outside the bundle namespace")
         expected_bytes = int(payload_spec.get("bytes", -1))
@@ -3579,6 +3735,25 @@ def _structured_field_specs(metadata: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(field_specs, dict):
         raise ValueError("structured field specs must be a dict")
     return field_specs
+
+
+def _merge_structured_stage_metadata(
+    old_metadata: Mapping[str, Any], new_metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    old_dataproto = old_metadata.get("dataproto")
+    new_dataproto = new_metadata.get("dataproto")
+    if old_dataproto != new_dataproto:
+        raise ValueError("DataProto stage metadata mismatch during manifest merge")
+    merged = dict(old_metadata)
+    old_specs = dict(_structured_field_specs(old_metadata))
+    new_specs = dict(_structured_field_specs(new_metadata))
+    collisions = sorted(set(old_specs) & set(new_specs))
+    if collisions:
+        raise ValueError(f"structured members already exist: {collisions}")
+    old_specs.update(new_specs)
+    if old_specs:
+        merged[STRUCTURED_FIELD_SPECS_KEY] = old_specs
+    return merged
 
 
 def _encode_structured_metadata(metadata: Mapping[str, Any]) -> bytes:
