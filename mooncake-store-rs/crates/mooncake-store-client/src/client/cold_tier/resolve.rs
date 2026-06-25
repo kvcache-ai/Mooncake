@@ -18,6 +18,11 @@ impl StoreClient {
         logical_key: &str,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> Result<ResolvedObject> {
+        if super::cold_tier_disabled() {
+            return Err(StoreError::NotFound(format!(
+                "tenant={tenant} key={logical_key} has no readable replica owner"
+            )));
+        }
         let Some(mut cold_backing) = materialized_cold_backing(&route) else {
             return Err(StoreError::NotFound(format!(
                 "tenant={tenant} key={logical_key} has no readable replica owner"
