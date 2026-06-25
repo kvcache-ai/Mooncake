@@ -162,7 +162,7 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     return Status::OK();
 }
 
-static int detectDeviceFromPointer(void* ptr) {
+static int detectDeviceFromPointer(void *ptr) {
     if (!ptr) return -1;
     cudaPointerAttributes attrs = {};
     auto err = cudaPointerGetAttributes(&attrs, ptr);
