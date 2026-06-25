@@ -1708,6 +1708,144 @@ def test_dataproto_helper_same_stage_append_reads_rows_with_real_store() -> None
         transfer.cleanup_dataproto(ref)
 
 
+def test_dataproto_helper_reads_rollout_transfer_data_with_real_store() -> None:
+    pytest.importorskip("mooncake.store")
+    _store, transfer = real_transfer("structured-test-rollout-transfer")
+    row_ids = [f"rollout-row-{index}" for index in range(6)]
+    input_ids = np.arange(48, dtype=np.int64).reshape(6, 8)
+    attention_mask = (input_ids % 3 != 0).astype(np.int32)
+    position_ids = np.tile(np.arange(8, dtype=np.int64), (6, 1))
+    responses = (input_ids[:, -3:] + 100).astype(np.int64)
+    response_mask = np.ones((6, 3), dtype=np.int32)
+    prompts = np.asarray(
+        ["", "prompt-b", "prompt-c", "prompt-d", "prompt-e", "prompt-f"],
+        dtype=object,
+    )
+    sample_meta = np.asarray(
+        [{"row": index, "tag": row_id} for index, row_id in enumerate(row_ids)],
+        dtype=object,
+    )
+    old_log_probs = np.linspace(-0.5, 0.5, 18, dtype=np.float32).reshape(6, 3)
+    ref_log_probs = old_log_probs + np.float32(0.25)
+    rewards = np.linspace(0.0, 1.0, 6, dtype=np.float32)
+    advantages = rewards + np.float32(10.0)
+    returns = rewards + np.float32(20.0)
+    values = rewards + np.float32(30.0)
+    rollout_data = {
+        "batch": {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "responses": responses,
+            "response_mask": response_mask,
+        },
+        "non_tensor_batch": {
+            "prompts": prompts,
+            "sample_meta": sample_meta,
+        },
+        "meta_info": {"roll_row_ids": row_ids, "global_step": 7},
+    }
+    logprob_data = {
+        "batch": {
+            "old_log_probs": old_log_probs,
+            "ref_log_probs": ref_log_probs,
+        },
+        "non_tensor_batch": {},
+        "meta_info": {"logprob_stage": "complete"},
+    }
+    value_data = {
+        "batch": {
+            "rewards": rewards,
+            "advantages": advantages,
+            "returns": returns,
+            "values": values,
+        },
+        "non_tensor_batch": {},
+        "meta_info": {"critic_stage": "complete"},
+    }
+    ref = transfer.put_dataproto(
+        rollout_data,
+        namespace="roll",
+        partition="remote-batch",
+        stage="rollout",
+    )
+    ref = transfer.append_dataproto_fields(ref, logprob_data, stage="logprob")
+    ref = transfer.append_dataproto_fields(ref, value_data, stage="rollout")
+    handle = export_dataproto_ref(ref)
+
+    try:
+        full = transfer.get_dataproto(handle)
+        selected = transfer.get_dataproto(
+            handle,
+            fields=["input_ids", "old_log_probs", "advantages", "prompts"],
+            meta_info_keys=["roll_row_ids"],
+        )
+        sliced = transfer.get_dataproto(
+            handle,
+            fields=["responses", "ref_log_probs", "returns", "sample_meta"],
+            rows=slice(1, 5),
+        )
+        gathered = transfer.get_dataproto(
+            handle,
+            fields=["attention_mask", "values", "prompts", "sample_meta"],
+            rows=[5, 0, 3],
+        )
+        imported = import_dataproto_ref(handle)
+        imported_selected = transfer.get_dataproto(
+            imported,
+            batch_fields=["position_ids", "rewards"],
+            rows=[2, 4],
+        )
+        view = transfer.dataproto_manifest_view(handle)
+
+        assert full["meta_info"] == {
+            "roll_row_ids": row_ids,
+            "global_step": 7,
+            "logprob_stage": "complete",
+            "critic_stage": "complete",
+        }
+        assert np.array_equal(full["batch"]["input_ids"], input_ids)
+        assert np.array_equal(full["batch"]["attention_mask"], attention_mask)
+        assert np.array_equal(full["batch"]["position_ids"], position_ids)
+        assert np.array_equal(full["batch"]["responses"], responses)
+        assert np.array_equal(full["batch"]["response_mask"], response_mask)
+        assert np.array_equal(full["batch"]["old_log_probs"], old_log_probs)
+        assert np.array_equal(full["batch"]["ref_log_probs"], ref_log_probs)
+        assert np.array_equal(full["batch"]["rewards"], rewards)
+        assert np.array_equal(full["batch"]["advantages"], advantages)
+        assert np.array_equal(full["batch"]["returns"], returns)
+        assert np.array_equal(full["batch"]["values"], values)
+        assert full["non_tensor_batch"]["prompts"].tolist() == prompts.tolist()
+        assert full["non_tensor_batch"]["sample_meta"].tolist() == sample_meta.tolist()
+
+        assert set(selected["batch"]) == {"input_ids", "old_log_probs", "advantages"}
+        assert set(selected["non_tensor_batch"]) == {"prompts"}
+        assert selected["meta_info"] == {"roll_row_ids": row_ids}
+        assert np.array_equal(selected["batch"]["input_ids"], input_ids)
+        assert np.array_equal(selected["batch"]["old_log_probs"], old_log_probs)
+        assert np.array_equal(selected["batch"]["advantages"], advantages)
+        assert selected["non_tensor_batch"]["prompts"].tolist() == prompts.tolist()
+
+        assert np.array_equal(sliced["batch"]["responses"], responses[1:5])
+        assert np.array_equal(sliced["batch"]["ref_log_probs"], ref_log_probs[1:5])
+        assert np.array_equal(sliced["batch"]["returns"], returns[1:5])
+        assert sliced["non_tensor_batch"]["sample_meta"].tolist() == sample_meta[1:5].tolist()
+
+        assert np.array_equal(gathered["batch"]["attention_mask"], attention_mask[[5, 0, 3]])
+        assert np.array_equal(gathered["batch"]["values"], values[[5, 0, 3]])
+        assert gathered["non_tensor_batch"]["prompts"].tolist() == prompts[[5, 0, 3]].tolist()
+        assert gathered["non_tensor_batch"]["sample_meta"].tolist() == sample_meta[[5, 0, 3]].tolist()
+
+        assert np.array_equal(imported_selected["batch"]["position_ids"], position_ids[[2, 4]])
+        assert np.array_equal(imported_selected["batch"]["rewards"], rewards[[2, 4]])
+        assert view["batch_fields"]["input_ids"]["stage"] == "rollout"
+        assert view["batch_fields"]["old_log_probs"]["stage"] == "logprob"
+        assert view["batch_fields"]["advantages"]["stage"] == "rollout"
+        assert view["non_tensor_fields"]["prompts"]["stage"] == "rollout"
+    finally:
+        transfer.cleanup_dataproto(ref)
+
+
 def test_dataproto_helper_rejects_inconsistent_batch_sizes() -> None:
     _store, transfer = make_transfer()
     data = SimpleDataProto(
