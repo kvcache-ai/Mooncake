@@ -845,10 +845,10 @@ fn http_store_error(error: StoreError) -> String {
         StoreError::NotFound(message) => http_error_response("404 Not Found", &message),
         StoreError::Unsupported(message) => http_error_response("501 Not Implemented", &message),
         StoreError::InvalidState(message) => http_error_response("400 Bad Request", &message),
+        StoreError::Backpressure(message) => http_error_response("429 Too Many Requests", &message),
         StoreError::Metadata(message)
         | StoreError::Transport(message)
-        | StoreError::Allocator(message)
-        | StoreError::Backpressure(message) => {
+        | StoreError::Allocator(message) => {
             http_error_response("500 Internal Server Error", &message)
         }
     }
@@ -2500,6 +2500,10 @@ mod tests {
         assert!(
             http_store_error(StoreError::StaleEpoch("stale".to_string()))
                 .contains("HTTP/1.1 409 Conflict")
+        );
+        assert!(
+            http_store_error(StoreError::Backpressure("busy".to_string()))
+                .contains("HTTP/1.1 429 Too Many Requests")
         );
         assert!(http_store_error(StoreError::Metadata("boom".to_string()))
             .contains("HTTP/1.1 500 Internal Server Error"));

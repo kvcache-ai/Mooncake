@@ -643,6 +643,7 @@ impl StoreClient {
             )? {
                 route = updated;
             }
+            self.storage_owner.track_route(&route);
             if let Some(previous) = current.as_ref() {
                 if let Err(error) = self.reclaim_route(previous, reclaim_mode) {
                     warn!(
@@ -5443,6 +5444,23 @@ impl StoreClient {
         request_deadline: RequestDeadline,
     ) -> Result<()> {
         loop {
+            if resolved.route.state == RouteState::Active
+                && cold_tier::resolved_uses_cold_backing(resolved)
+            {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    tenant = %resolved.tenant,
+                    key = %resolved.key,
+                    route_version = resolved.route.version.0,
+                    "triggering synchronous cold restore for selected cold backing"
+                );
+                crate::client::cold_tier::trigger_remote_owner_cold_restore(
+                    self,
+                    resolved,
+                    request_deadline,
+                )?;
+                continue;
+            }
             match self.execute_selected_replica_direct(
                 transport,
                 resolved,
@@ -5483,12 +5501,10 @@ impl StoreClient {
                                 continue;
                             }
                         }
-                        // Last resort: if the route is cold-only (no replicas, has
-                        // materialized cold backing), trigger synchronous cold restore
-                        // via the owner and retry.
+                        // Last resort: if the selected replica is a cold backing placeholder,
+                        // trigger synchronous cold restore via the owner and retry.
                         if resolved.route.state == RouteState::Active
-                            && resolved.route.replicas.is_empty()
-                            && cold_tier::materialized_cold_backing(&resolved.route).is_some()
+                            && cold_tier::resolved_uses_cold_backing(resolved)
                         {
                             debug!(
                                 runtime = %self.lease.runtime,
