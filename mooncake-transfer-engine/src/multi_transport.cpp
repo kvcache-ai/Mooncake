@@ -439,6 +439,23 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
+    if (proto == "nvlink_intra" && transport_map_.count("rdma")) {
+        bool has_nvlink_buffer = false;
+        bool has_matching_buffer = false;
+        for (auto& buffer : target_segment_desc->buffers) {
+            if (buffer.addr <= entry.target_offset &&
+                entry.target_offset + entry.length <= buffer.addr + buffer.length) {
+                has_matching_buffer = true;
+                if (!buffer.shm_name.empty()) {
+                    has_nvlink_buffer = true;
+                    break;
+                }
+            }
+        }
+        if (has_matching_buffer && !has_nvlink_buffer) {
+            proto = "rdma";
+        }
+    }
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport

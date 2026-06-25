@@ -4,6 +4,10 @@
 
 #include <mooncake_worker_kernels.cuh>
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+
 #ifdef __MUSA__
 #include <musa_bf16.h>
 #endif
@@ -165,6 +169,2118 @@ DEF_LAUNCH_REDUCE(double, double)
 DEF_LAUNCH_REDUCE(bool, bool)
 
 #undef DEF_LAUNCH_REDUCE
+
+__global__ void p2pAllgatherBaseCopyKernel(const char* input, void** peer_ptrs,
+                                           const int32_t* available,
+                                           size_t tensorSize, int rank,
+                                           int numRanks) {
+    size_t total = tensorSize * static_cast<size_t>(numRanks);
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+    for (size_t idx = tid; idx < total; idx += stride) {
+        int peer = static_cast<int>(idx / tensorSize);
+        if (!available[peer]) continue;
+        size_t off = idx - static_cast<size_t>(peer) * tensorSize;
+        char* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        peer_base[static_cast<size_t>(rank) * tensorSize + off] = input[off];
+    }
+}
+
+__global__ void p2pAllgatherBaseSignalWaitKernel(void** peer_ptrs,
+                                                 const int32_t* available,
+                                                 void* local_recv_base,
+                                                 int rank, int numRanks,
+                                                 uint32_t sequence,
+                                                 size_t signalOffset) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        __threadfence_system();
+        for (int peer = 0; peer < numRanks; ++peer) {
+            if (!available[peer]) continue;
+            char* peer_base = static_cast<char*>(peer_ptrs[peer]);
+            uint32_t* peer_signal =
+                reinterpret_cast<uint32_t*>(peer_base + signalOffset);
+#ifdef __MUSA__
+            peer_signal[rank] = sequence;
+#else
+            atomicExch_system(
+                reinterpret_cast<unsigned int*>(peer_signal + rank), sequence);
+#endif
+        }
+        __threadfence_system();
+
+        uint32_t* local_signal = reinterpret_cast<uint32_t*>(
+            static_cast<char*>(local_recv_base) + signalOffset);
+        bool done = false;
+        while (!done) {
+            done = true;
+            for (int peer = 0; peer < numRanks; ++peer) {
+                if (!available[peer]) continue;
+#ifdef __MUSA__
+                uint32_t value = local_signal[peer];
+#else
+                uint32_t value = atomicAdd(
+                    reinterpret_cast<unsigned int*>(local_signal + peer), 0);
+#endif
+                if (value < sequence) {
+                    done = false;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void launchP2pAllgatherBaseKernel(void* input, void* output,
+                                  void* local_recv_base, void** peer_ptrs,
+                                  int32_t* available, size_t tensorSize,
+                                  int rank, int numRanks, uint32_t sequence,
+                                  cudaStream_t stream) {
+    constexpr size_t kProduceSignalOffset =
+        kBufferSize - 2 * kMaxNumRanks * sizeof(uint32_t);
+    constexpr size_t kConsumeSignalOffset =
+        kBufferSize - kMaxNumRanks * sizeof(uint32_t);
+    size_t total = tensorSize * static_cast<size_t>(numRanks);
+    int threads = 256;
+    int blocks = static_cast<int>((total + threads - 1) / threads);
+    blocks = blocks < 1 ? 1 : (blocks > 1024 ? 1024 : blocks);
+    p2pAllgatherBaseCopyKernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const char*>(input), peer_ptrs, available, tensorSize, rank,
+        numRanks);
+    p2pAllgatherBaseSignalWaitKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, local_recv_base, rank, numRanks, sequence,
+        kProduceSignalOffset);
+    cudaMemcpyAsync(output, local_recv_base,
+                    tensorSize * static_cast<size_t>(numRanks),
+                    cudaMemcpyDeviceToDevice, stream);
+    p2pAllgatherBaseSignalWaitKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, local_recv_base, rank, numRanks, sequence,
+        kConsumeSignalOffset);
+}
+
+void launchP2pAllgatherBaseCopyKernel(void* input, void** peer_ptrs,
+                                      int32_t* available, size_t tensorSize,
+                                      int rank, int numRanks,
+                                      cudaStream_t stream) {
+    size_t total = tensorSize * static_cast<size_t>(numRanks);
+    int threads = 256;
+    int blocks = static_cast<int>((total + threads - 1) / threads);
+    blocks = blocks < 1 ? 1 : (blocks > 1024 ? 1024 : blocks);
+    p2pAllgatherBaseCopyKernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const char*>(input), peer_ptrs, available, tensorSize, rank,
+        numRanks);
+}
+
+void launchP2pAllgatherBaseFinishKernel(void* output, void* local_recv_base,
+                                        void** peer_ptrs, int32_t* available,
+                                        size_t tensorSize, int rank,
+                                        int numRanks, uint32_t sequence,
+                                        cudaStream_t stream) {
+    constexpr size_t kProduceSignalOffset =
+        kBufferSize - 2 * kMaxNumRanks * sizeof(uint32_t);
+    constexpr size_t kConsumeSignalOffset =
+        kBufferSize - kMaxNumRanks * sizeof(uint32_t);
+    p2pAllgatherBaseSignalWaitKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, local_recv_base, rank, numRanks, sequence,
+        kProduceSignalOffset);
+    cudaMemcpyAsync(output, local_recv_base,
+                    tensorSize * static_cast<size_t>(numRanks),
+                    cudaMemcpyDeviceToDevice, stream);
+    p2pAllgatherBaseSignalWaitKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, local_recv_base, rank, numRanks, sequence,
+        kConsumeSignalOffset);
+}
+
+__device__ __forceinline__ void p2pAgCopyBytes(char* dst, const char* src,
+                                               size_t bytes) {
+    size_t tid = threadIdx.x;
+    size_t stride = blockDim.x;
+    size_t words = bytes / sizeof(uint64_t);
+    auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+    const auto* src64 = reinterpret_cast<const uint64_t*>(src);
+    for (size_t i = tid; i < words; i += stride) {
+        dst64[i] = src64[i];
+    }
+    for (size_t i = words * sizeof(uint64_t) + tid; i < bytes; i += stride) {
+        dst[i] = src[i];
+    }
+}
+
+__device__ __forceinline__ void p2pAgCopyBytesSlice(char* dst, const char* src,
+                                                    size_t offset,
+                                                    size_t bytes) {
+    char* slice_dst = dst + offset;
+    const char* slice_src = src + offset;
+    uintptr_t dst_addr = reinterpret_cast<uintptr_t>(slice_dst);
+    uintptr_t src_addr = reinterpret_cast<uintptr_t>(slice_src);
+    if (((dst_addr | src_addr | bytes) & (sizeof(uint64_t) - 1)) == 0) {
+        p2pAgCopyBytes(slice_dst, slice_src, bytes);
+        return;
+    }
+
+    size_t tid = threadIdx.x;
+    size_t stride = blockDim.x;
+    for (size_t i = tid; i < bytes; i += stride) {
+        slice_dst[i] = slice_src[i];
+    }
+}
+
+__device__ __forceinline__ void p2pAgSignalStore(uint32_t* ptr, uint32_t value,
+                                                 int signalMode) {
+#ifdef __MUSA__
+    ptr[0] = value;
+#else
+    if (signalMode == 1) {
+        asm volatile("st.global.release.sys.u32 [%0], %1;"
+                     :
+                     : "l"(ptr), "r"(value)
+                     : "memory");
+    } else if (signalMode == 2) {
+        asm volatile("st.global.relaxed.sys.u32 [%0], %1;"
+                     :
+                     : "l"(ptr), "r"(value)
+                     : "memory");
+    } else {
+        atomicExch_system(reinterpret_cast<unsigned int*>(ptr), value);
+    }
+#endif
+}
+
+__device__ __forceinline__ uint32_t p2pAgSignalLoad(uint32_t* ptr,
+                                                    int signalMode) {
+#ifdef __MUSA__
+    return ptr[0];
+#else
+    if (signalMode == 1) {
+        uint32_t value;
+        asm volatile("ld.global.acquire.sys.u32 %0, [%1];"
+                     : "=r"(value)
+                     : "l"(ptr)
+                     : "memory");
+        return value;
+    } else if (signalMode == 2) {
+        return reinterpret_cast<volatile uint32_t*>(ptr)[0];
+    }
+    return atomicAdd(reinterpret_cast<unsigned int*>(ptr), 0);
+#endif
+}
+
+__global__ void p2pAllgatherRingKernel(const char* input, char* output,
+                                       char* local_recv_base, void** peer_ptrs,
+                                       const int32_t* available,
+                                       size_t tensorSize, int rank,
+                                       int numRanks, uint32_t sequence,
+                                       int signalMode, int numChannels) {
+    const int channel = blockIdx.x;
+    if (channel >= numChannels) return;
+
+    const size_t signalSlots =
+        static_cast<size_t>(numChannels) * kMaxNumRanks;
+    const size_t kProduceSignalOffset =
+        kBufferSize - 2 * signalSlots * sizeof(uint32_t);
+    const size_t kConsumeSignalOffset =
+        kBufferSize - signalSlots * sizeof(uint32_t);
+    const size_t channelStart =
+        (tensorSize * static_cast<size_t>(channel)) /
+        static_cast<size_t>(numChannels);
+    const size_t channelEnd =
+        (tensorSize * static_cast<size_t>(channel + 1)) /
+        static_cast<size_t>(numChannels);
+    const size_t channelBytes = channelEnd - channelStart;
+    const int prev = (rank + numRanks - 1) % numRanks;
+    const int next = (rank + 1) % numRanks;
+    if (!available[prev] || !available[next]) return;
+
+    auto* produce = reinterpret_cast<uint32_t*>(local_recv_base +
+                                                kProduceSignalOffset);
+    auto* consume = reinterpret_cast<uint32_t*>(local_recv_base +
+                                                kConsumeSignalOffset);
+    char* next_base = static_cast<char*>(peer_ptrs[next]);
+    auto* next_produce = reinterpret_cast<uint32_t*>(next_base +
+                                                     kProduceSignalOffset);
+    char* prev_base = static_cast<char*>(peer_ptrs[prev]);
+    auto* prev_consume = reinterpret_cast<uint32_t*>(prev_base +
+                                                     kConsumeSignalOffset);
+    const size_t signalLane =
+        static_cast<size_t>(channel) * kMaxNumRanks + static_cast<size_t>(rank);
+    const size_t prevSignalLane =
+        static_cast<size_t>(channel) * kMaxNumRanks + static_cast<size_t>(prev);
+    const size_t nextSignalLane =
+        static_cast<size_t>(channel) * kMaxNumRanks + static_cast<size_t>(next);
+
+    // Seed the local scratch/output with this rank's own chunk.
+    p2pAgCopyBytesSlice(
+        local_recv_base + static_cast<size_t>(rank) * tensorSize, input,
+        channelStart, channelBytes);
+    p2pAgCopyBytesSlice(output + static_cast<size_t>(rank) * tensorSize, input,
+                        channelStart, channelBytes);
+    __syncthreads();
+
+    // NCCL-like ring: each step forwards one rank chunk to the next peer.  A
+    // per-neighbor monotonically increasing step value replaces the coarse
+    // all-rank host/shm barrier used by earlier PoCs.
+    for (int step = 0; step < numRanks - 1; ++step) {
+        const int send_chunk = (rank - step + numRanks) % numRanks;
+        const int recv_chunk = (rank - step - 1 + numRanks) % numRanks;
+        const uint32_t step_seq =
+            sequence * static_cast<uint32_t>(kMaxNumRanks * numChannels) +
+            static_cast<uint32_t>(step * numChannels + channel + 1);
+
+        p2pAgCopyBytesSlice(
+            next_base + static_cast<size_t>(send_chunk) * tensorSize,
+            local_recv_base + static_cast<size_t>(send_chunk) * tensorSize,
+            channelStart, channelBytes);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            if (signalMode == 2) __threadfence_system();
+            p2pAgSignalStore(next_produce + signalLane, step_seq,
+                             signalMode);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            uint32_t value = 0;
+            do {
+                value = p2pAgSignalLoad(produce + prevSignalLane,
+                                        signalMode);
+            } while (value < step_seq);
+        }
+        __syncthreads();
+        p2pAgCopyBytesSlice(
+            output + static_cast<size_t>(recv_chunk) * tensorSize,
+            local_recv_base + static_cast<size_t>(recv_chunk) * tensorSize,
+            channelStart, channelBytes);
+        __syncthreads();
+    }
+
+    // Keep peer scratch from being overwritten by the next invocation before
+    // the rank that owns that scratch has copied all chunks to user output.
+    // Each rank writes data into next's scratch, so it waits for next's ack;
+    // each rank receives data from prev, so it sends the ack to prev.
+    if (threadIdx.x == 0) {
+        if (signalMode == 2) __threadfence_system();
+        p2pAgSignalStore(prev_consume + signalLane, sequence, signalMode);
+        uint32_t value = 0;
+        do {
+            value = p2pAgSignalLoad(consume + nextSignalLane, signalMode);
+        } while (value < sequence);
+    }
+}
+
+void launchP2pAllgatherRingKernel(void* input, void* output,
+                                  void* local_recv_base, void** peer_ptrs,
+                                  int32_t* available, size_t tensorSize,
+                                  int rank, int numRanks, uint32_t sequence,
+                                  int signalMode, int numChannels,
+                                  cudaStream_t stream) {
+    p2pAllgatherRingKernel<<<numChannels, 256, 0, stream>>>(
+        static_cast<const char*>(input), static_cast<char*>(output),
+        static_cast<char*>(local_recv_base), peer_ptrs, available, tensorSize,
+        rank, numRanks, sequence, signalMode, numChannels);
+}
+
+__global__ void p2pAllgatherFifoRingKernel(const char* input, char* output,
+                                           char* local_recv_base,
+                                           void** peer_ptrs,
+                                           const int32_t* available,
+                                           size_t tensorSize, int rank,
+                                           int numRanks, uint32_t sequence,
+                                           int signalMode,
+                                           int numChannels, int fifoSlots) {
+    const int channel = blockIdx.x;
+    if (channel >= numChannels) return;
+
+    const int prev = (rank + numRanks - 1) % numRanks;
+    const int next = (rank + 1) % numRanks;
+    if (!available[prev] || !available[next]) return;
+
+    const size_t channelStart =
+        (tensorSize * static_cast<size_t>(channel)) /
+        static_cast<size_t>(numChannels);
+    const size_t channelEnd =
+        (tensorSize * static_cast<size_t>(channel + 1)) /
+        static_cast<size_t>(numChannels);
+    const size_t channelBytes = channelEnd - channelStart;
+    const size_t channelStride =
+        (tensorSize + static_cast<size_t>(numChannels) - 1) /
+        static_cast<size_t>(numChannels);
+    const size_t dataBytes = static_cast<size_t>(numChannels) *
+                             static_cast<size_t>(fifoSlots) * channelStride;
+    const size_t signalSlots =
+        static_cast<size_t>(numChannels) * static_cast<size_t>(fifoSlots);
+    const size_t produceSignalOffset =
+        kBufferSize - 2 * signalSlots * sizeof(uint32_t);
+    const size_t consumeSignalOffset =
+        kBufferSize - signalSlots * sizeof(uint32_t);
+    if (dataBytes > produceSignalOffset) return;
+
+    const size_t signalLane =
+        static_cast<size_t>(channel) * static_cast<size_t>(fifoSlots);
+    char* next_base = static_cast<char*>(peer_ptrs[next]);
+    auto* produce = reinterpret_cast<uint32_t*>(local_recv_base +
+                                                produceSignalOffset);
+    auto* consume = reinterpret_cast<uint32_t*>(local_recv_base +
+                                                consumeSignalOffset);
+    auto* next_produce = reinterpret_cast<uint32_t*>(next_base +
+                                                     produceSignalOffset);
+    auto* next_consume = reinterpret_cast<uint32_t*>(next_base +
+                                                     consumeSignalOffset);
+
+    p2pAgCopyBytesSlice(output + static_cast<size_t>(rank) * tensorSize, input,
+                        channelStart, channelBytes);
+    __syncthreads();
+
+    for (int step = 0; step < numRanks - 1; ++step) {
+        const int send_chunk = (rank - step + numRanks) % numRanks;
+        const int recv_chunk = (rank - step - 1 + numRanks) % numRanks;
+        const int slot = step % fifoSlots;
+        const size_t slotLane = signalLane + static_cast<size_t>(slot);
+
+        if (threadIdx.x == 0 && sequence > 1) {
+            uint32_t value = 0;
+            do {
+                value = p2pAgSignalLoad(next_consume + slotLane,
+                                        signalMode);
+            } while (value < sequence - 1);
+        }
+        __syncthreads();
+
+        const size_t slotOffset =
+            (static_cast<size_t>(channel) * static_cast<size_t>(fifoSlots) +
+             static_cast<size_t>(slot)) *
+            channelStride;
+        char* next_fifo = next_base + slotOffset;
+        if (step == 0) {
+            p2pAgCopyBytes(next_fifo, input + channelStart, channelBytes);
+        } else {
+            const int prevSlot = (step - 1) % fifoSlots;
+            const size_t prevSlotOffset =
+                (static_cast<size_t>(channel) * static_cast<size_t>(fifoSlots) +
+                 static_cast<size_t>(prevSlot)) *
+                channelStride;
+            char* local_fifo = local_recv_base + prevSlotOffset;
+            p2pAgCopyBytes(next_fifo, local_fifo, channelBytes);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            if (signalMode == 2) __threadfence_system();
+            p2pAgSignalStore(next_produce + slotLane, sequence, signalMode);
+        }
+
+        if (threadIdx.x == 0) {
+            uint32_t value = 0;
+            do {
+                value = p2pAgSignalLoad(produce + slotLane, signalMode);
+            } while (value < sequence);
+        }
+        __syncthreads();
+
+        char* local_fifo = local_recv_base + slotOffset;
+        p2pAgCopyBytes(output + static_cast<size_t>(recv_chunk) * tensorSize +
+                           channelStart,
+                       local_fifo, channelBytes);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            if (signalMode == 2) __threadfence_system();
+            p2pAgSignalStore(consume + slotLane, sequence, signalMode);
+        }
+        __syncthreads();
+    }
+}
+
+void launchP2pAllgatherFifoRingKernel(void* input, void* output,
+                                      void* local_recv_base, void** peer_ptrs,
+                                      int32_t* available, size_t tensorSize,
+                                      int rank, int numRanks,
+                                      uint32_t sequence, int signalMode,
+                                      int numChannels, int fifoSlots,
+                                      cudaStream_t stream) {
+    p2pAllgatherFifoRingKernel<<<numChannels, 256, 0, stream>>>(
+        static_cast<const char*>(input), static_cast<char*>(output),
+        static_cast<char*>(local_recv_base), peer_ptrs, available, tensorSize,
+        rank, numRanks, sequence, signalMode, numChannels, fifoSlots);
+}
+
+__global__ void p2pAllgatherStoreWaitPrevConsumeKernel(
+    char* local_recv_base, size_t consumeSignalOffset, int numRanks,
+    uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0 || sequence <= 1) return;
+    auto* consume = reinterpret_cast<volatile uint32_t*>(local_recv_base +
+                                                         consumeSignalOffset);
+    const uint32_t previous = sequence - 1;
+    for (int peer = 0; peer < numRanks; ++peer) {
+        while (consume[peer] < previous) {
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreToScratchKernel(const char* input,
+                                                 void** peer_ptrs,
+                                                 const int32_t* available,
+                                                 size_t tensorSize, int rank,
+                                                 int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+    if (((reinterpret_cast<uintptr_t>(input) | tensorSize) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(input);
+        const size_t words = tensorSize / sizeof(uint64_t);
+        for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+            if (!available[peer]) continue;
+            auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+            auto* dst = peer_base + static_cast<size_t>(rank) * tensorSize;
+            if ((reinterpret_cast<uintptr_t>(dst) & (sizeof(uint64_t) - 1)) ==
+                0) {
+                auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+                for (size_t i = tid; i < words; i += stride) {
+                    dst64[i] = src64[i];
+                }
+            } else {
+                for (size_t i = tid; i < tensorSize; i += stride) {
+                    dst[i] = input[i];
+                }
+            }
+        }
+        return;
+    }
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* dst = peer_base + static_cast<size_t>(rank) * tensorSize;
+        for (size_t i = tid; i < tensorSize; i += stride) {
+            dst[i] = input[i];
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreProduceWaitKernel(
+    char* local_recv_base, void** peer_ptrs, const int32_t* available,
+    size_t produceSignalOffset, int rank, int numRanks, uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* peerProduce = reinterpret_cast<uint32_t*>(peer_base +
+                                                        produceSignalOffset);
+        p2pAgSignalStore(peerProduce + rank, sequence, 2);
+    }
+    __threadfence_system();
+
+    auto* produce = reinterpret_cast<volatile uint32_t*>(local_recv_base +
+                                                         produceSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (produce[peer] < sequence) {
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreConsumeKernel(
+    void** peer_ptrs, const int32_t* available, size_t consumeSignalOffset,
+    int rank, int numRanks, uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* peerConsume = reinterpret_cast<uint32_t*>(peer_base +
+                                                        consumeSignalOffset);
+        p2pAgSignalStore(peerConsume + rank, sequence, 2);
+    }
+}
+
+__global__ void p2pAllgatherStoreLocalCopyKernel(const char* local_recv_base,
+                                                 char* output,
+                                                 size_t bytes) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    if (((reinterpret_cast<uintptr_t>(local_recv_base) |
+          reinterpret_cast<uintptr_t>(output) | bytes) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(local_recv_base);
+        auto* dst64 = reinterpret_cast<uint64_t*>(output);
+        const size_t words = bytes / sizeof(uint64_t);
+        for (size_t i = tid; i < words; i += stride) {
+            dst64[i] = src64[i];
+        }
+        return;
+    }
+    for (size_t i = tid; i < bytes; i += stride) {
+        output[i] = local_recv_base[i];
+    }
+}
+
+__global__ void p2pAllgatherStoreToSlottedScratchKernel(
+    const char* input, void** peer_ptrs, const int32_t* available,
+    size_t tensorSize, size_t slotStride, int slot, int rank, int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStride;
+    if (((reinterpret_cast<uintptr_t>(input) | tensorSize | slotStride) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(input);
+        const size_t words = tensorSize / sizeof(uint64_t);
+        for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+            if (!available[peer]) continue;
+            auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+            auto* dst = peer_base + slotOffset +
+                        static_cast<size_t>(rank) * slotStride;
+            if ((reinterpret_cast<uintptr_t>(dst) & (sizeof(uint64_t) - 1)) ==
+                0) {
+                auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+                for (size_t i = tid; i < words; i += stride) {
+                    dst64[i] = src64[i];
+                }
+            } else {
+                for (size_t i = tid; i < tensorSize; i += stride) {
+                    dst[i] = input[i];
+                }
+            }
+        }
+        return;
+    }
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* dst = peer_base + slotOffset + static_cast<size_t>(rank) * slotStride;
+        for (size_t i = tid; i < tensorSize; i += stride) {
+            dst[i] = input[i];
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreSlottedProduceWaitKernel(
+    char* local_recv_base, void** peer_ptrs, const int32_t* available,
+    size_t produceSignalOffset, int slot, int rank, int numRanks,
+    uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* peerProduce = reinterpret_cast<uint32_t*>(peer_base +
+                                                        produceSignalOffset);
+        p2pAgSignalStore(peerProduce +
+                             static_cast<size_t>(slot) * kMaxNumRanks + rank,
+                         sequence, 2);
+    }
+    __threadfence_system();
+
+    auto* produce = reinterpret_cast<volatile uint32_t*>(local_recv_base +
+                                                         produceSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (produce[static_cast<size_t>(slot) * kMaxNumRanks + peer] <
+               sequence) {
+        }
+    }
+}
+
+__global__ void p2pSlottedReuseWaitKernel(
+    const char* local_recv_base, const int32_t* available,
+    size_t consumeSignalOffset, int slot, int numRanks, uint32_t sequence,
+    int slots) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (sequence < static_cast<uint32_t>(slots)) return;
+
+    const uint32_t previousSequence = sequence - static_cast<uint32_t>(slots);
+    auto* consume = reinterpret_cast<const volatile uint32_t*>(
+        local_recv_base + consumeSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (consume[static_cast<size_t>(slot) * kMaxNumRanks + peer] <
+               previousSequence) {
+        }
+    }
+}
+
+__global__ void p2pSlottedConsumeNotifyKernel(
+    void** peer_ptrs, const int32_t* available, size_t consumeSignalOffset,
+    int slot, int rank, int numRanks, uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* peerConsume = reinterpret_cast<uint32_t*>(peer_base +
+                                                       consumeSignalOffset);
+        p2pAgSignalStore(peerConsume +
+                             static_cast<size_t>(slot) * kMaxNumRanks + rank,
+                         sequence, 2);
+    }
+    __threadfence_system();
+}
+
+__global__ void p2pReserveSequenceKernel(uint32_t* counter,
+                                         uint32_t* sequenceSlot,
+                                         uint32_t increment) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    *sequenceSlot = atomicAdd(counter, increment);
+}
+
+void launchP2pReserveSequence(uint32_t* counter, uint32_t* sequenceSlot,
+                              uint32_t increment, cudaStream_t stream) {
+    p2pReserveSequenceKernel<<<1, 1, 0, stream>>>(counter, sequenceSlot,
+                                                  increment);
+}
+
+__global__ void p2pSlottedReuseWaitGraphKernel(
+    const char* local_recv_base, const int32_t* available,
+    size_t consumeSignalOffset, const uint32_t* baseSequenceSlot,
+    uint32_t chunkIndex, int slots, int numRanks) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    if (sequence < static_cast<uint32_t>(slots)) return;
+
+    const uint32_t previousSequence = sequence - static_cast<uint32_t>(slots);
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    auto* consume = reinterpret_cast<const volatile uint32_t*>(
+        local_recv_base + consumeSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (consume[static_cast<size_t>(slot) * kMaxNumRanks + peer] <
+               previousSequence) {
+        }
+    }
+}
+
+__global__ void p2pSlottedProduceWaitGraphKernel(
+    char* local_recv_base, void** peer_ptrs, const int32_t* available,
+    size_t produceSignalOffset, const uint32_t* baseSequenceSlot,
+    uint32_t chunkIndex, int slots, int rank, int numRanks) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* peerProduce = reinterpret_cast<uint32_t*>(peer_base +
+                                                        produceSignalOffset);
+        p2pAgSignalStore(peerProduce +
+                             static_cast<size_t>(slot) * kMaxNumRanks + rank,
+                         sequence, 2);
+    }
+    __threadfence_system();
+
+    auto* produce = reinterpret_cast<volatile uint32_t*>(local_recv_base +
+                                                         produceSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (produce[static_cast<size_t>(slot) * kMaxNumRanks + peer] <
+               sequence) {
+        }
+    }
+}
+
+__global__ void p2pSlottedConsumeNotifyGraphKernel(
+    void** peer_ptrs, const int32_t* available, size_t consumeSignalOffset,
+    const uint32_t* baseSequenceSlot, uint32_t chunkIndex, int slots, int rank,
+    int numRanks) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* peerConsume = reinterpret_cast<uint32_t*>(peer_base +
+                                                       consumeSignalOffset);
+        p2pAgSignalStore(peerConsume +
+                             static_cast<size_t>(slot) * kMaxNumRanks + rank,
+                         sequence, 2);
+    }
+    __threadfence_system();
+}
+
+__global__ void p2pAllgatherStoreSlottedLocalCopyKernel(
+    const char* local_recv_base, char* output, size_t tensorSize,
+    size_t slotStride, int slot, int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t outputBytes = tensorSize * static_cast<size_t>(numRanks);
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStride;
+
+    if (slotStride == tensorSize &&
+        ((reinterpret_cast<uintptr_t>(local_recv_base) |
+          reinterpret_cast<uintptr_t>(output) | outputBytes) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(local_recv_base +
+                                                             slotOffset);
+        auto* dst64 = reinterpret_cast<uint64_t*>(output);
+        const size_t words = outputBytes / sizeof(uint64_t);
+        for (size_t i = tid; i < words; i += stride) {
+            dst64[i] = src64[i];
+        }
+        return;
+    }
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        const char* src = local_recv_base + slotOffset +
+                          static_cast<size_t>(peer) * slotStride;
+        char* dst = output + static_cast<size_t>(peer) * tensorSize;
+        if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) |
+              tensorSize) &
+             (sizeof(uint64_t) - 1)) == 0) {
+            const auto* src64 = reinterpret_cast<const uint64_t*>(src);
+            auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+            const size_t words = tensorSize / sizeof(uint64_t);
+            for (size_t i = tid; i < words; i += stride) {
+                dst64[i] = src64[i];
+            }
+        } else {
+            for (size_t i = tid; i < tensorSize; i += stride) {
+                dst[i] = src[i];
+            }
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreSlottedLocalCopyChunkKernel(
+    const char* local_recv_base, char* output, size_t chunkBytes,
+    size_t outputRankStride, size_t chunkOffset, size_t slotStride, int slot,
+    int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStride;
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        const char* src = local_recv_base + slotOffset +
+                          static_cast<size_t>(peer) * slotStride;
+        char* dst = output + static_cast<size_t>(peer) * outputRankStride +
+                    chunkOffset;
+        if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) |
+              chunkBytes) &
+             (sizeof(uint64_t) - 1)) == 0) {
+            const auto* src64 = reinterpret_cast<const uint64_t*>(src);
+            auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+            const size_t words = chunkBytes / sizeof(uint64_t);
+            for (size_t i = tid; i < words; i += stride) {
+                dst64[i] = src64[i];
+            }
+        } else {
+            for (size_t i = tid; i < chunkBytes; i += stride) {
+                dst[i] = src[i];
+            }
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreToSlottedScratchGraphKernel(
+    const char* input, void** peer_ptrs, const int32_t* available,
+    size_t tensorSize, size_t slotStride, const uint32_t* baseSequenceSlot,
+    uint32_t chunkIndex, int slots, int rank, int numRanks) {
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStride;
+
+    if (((reinterpret_cast<uintptr_t>(input) | tensorSize) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(input);
+        const size_t words = tensorSize / sizeof(uint64_t);
+        for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+            if (!available[peer]) continue;
+            auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+            auto* dst64 = reinterpret_cast<uint64_t*>(
+                peer_base + slotOffset + static_cast<size_t>(rank) * slotStride);
+            for (size_t i = tid; i < words; i += stride) {
+                dst64[i] = src64[i];
+            }
+        }
+        return;
+    }
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        char* dst = peer_base + slotOffset + static_cast<size_t>(rank) * slotStride;
+        for (size_t i = tid; i < tensorSize; i += stride) {
+            dst[i] = input[i];
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreSlottedLocalCopyGraphKernel(
+    const char* local_recv_base, char* output, size_t tensorSize,
+    size_t slotStride, const uint32_t* baseSequenceSlot, uint32_t chunkIndex,
+    int slots, int numRanks) {
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t outputBytes = tensorSize * static_cast<size_t>(numRanks);
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStride;
+
+    if (slotStride == tensorSize &&
+        ((reinterpret_cast<uintptr_t>(local_recv_base) |
+          reinterpret_cast<uintptr_t>(output) | outputBytes) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(local_recv_base +
+                                                             slotOffset);
+        auto* dst64 = reinterpret_cast<uint64_t*>(output);
+        const size_t words = outputBytes / sizeof(uint64_t);
+        for (size_t i = tid; i < words; i += stride) {
+            dst64[i] = src64[i];
+        }
+        return;
+    }
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        const char* src = local_recv_base + slotOffset +
+                          static_cast<size_t>(peer) * slotStride;
+        char* dst = output + static_cast<size_t>(peer) * tensorSize;
+        if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) |
+              tensorSize) &
+             (sizeof(uint64_t) - 1)) == 0) {
+            const auto* src64 = reinterpret_cast<const uint64_t*>(src);
+            auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+            const size_t words = tensorSize / sizeof(uint64_t);
+            for (size_t i = tid; i < words; i += stride) {
+                dst64[i] = src64[i];
+            }
+        } else {
+            for (size_t i = tid; i < tensorSize; i += stride) {
+                dst[i] = src[i];
+            }
+        }
+    }
+}
+
+__global__ void p2pAllgatherStoreSlottedLocalCopyChunkGraphKernel(
+    const char* local_recv_base, char* output, size_t chunkBytes,
+    size_t outputRankStride, size_t chunkOffset, size_t slotStride,
+    const uint32_t* baseSequenceSlot, uint32_t chunkIndex, int slots,
+    int numRanks) {
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStride;
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        const char* src = local_recv_base + slotOffset +
+                          static_cast<size_t>(peer) * slotStride;
+        char* dst = output + static_cast<size_t>(peer) * outputRankStride +
+                    chunkOffset;
+        if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) |
+              chunkBytes) &
+             (sizeof(uint64_t) - 1)) == 0) {
+            const auto* src64 = reinterpret_cast<const uint64_t*>(src);
+            auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+            const size_t words = chunkBytes / sizeof(uint64_t);
+            for (size_t i = tid; i < words; i += stride) {
+                dst64[i] = src64[i];
+            }
+        } else {
+            for (size_t i = tid; i < chunkBytes; i += stride) {
+                dst[i] = src[i];
+            }
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterStoreToSlottedScratchKernel(
+    const scalar_t* input, void** peer_ptrs, const int32_t* available,
+    size_t numElements, size_t slotStrideBytes, int slot, int rank,
+    int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* dst = reinterpret_cast<scalar_t*>(
+            peer_base + slotOffset + static_cast<size_t>(rank) * slotStrideBytes);
+        const scalar_t* src = input + static_cast<size_t>(peer) * numElements;
+        for (size_t i = tid; i < numElements; i += stride) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterStoreChunkToSlottedScratchKernel(
+    const scalar_t* input, void** peer_ptrs, const int32_t* available,
+    size_t fullNumElements, size_t chunkOffsetElements, size_t chunkElements,
+    size_t slotStrideBytes, int slot, int rank, int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* dst = reinterpret_cast<scalar_t*>(
+            peer_base + slotOffset + static_cast<size_t>(rank) * slotStrideBytes);
+        const scalar_t* src = input + static_cast<size_t>(peer) * fullNumElements +
+                              chunkOffsetElements;
+        for (size_t i = tid; i < chunkElements; i += stride) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterStoreToSlottedScratchGraphKernel(
+    const scalar_t* input, void** peer_ptrs, const int32_t* available,
+    size_t numElements, size_t slotStrideBytes,
+    const uint32_t* baseSequenceSlot, uint32_t chunkIndex, int slots, int rank,
+    int numRanks) {
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* dst = reinterpret_cast<scalar_t*>(
+            peer_base + slotOffset + static_cast<size_t>(rank) * slotStrideBytes);
+        const scalar_t* src = input + static_cast<size_t>(peer) * numElements;
+        for (size_t i = tid; i < numElements; i += stride) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterStoreChunkToSlottedScratchGraphKernel(
+    const scalar_t* input, void** peer_ptrs, const int32_t* available,
+    size_t fullNumElements, size_t chunkOffsetElements, size_t chunkElements,
+    size_t slotStrideBytes, const uint32_t* baseSequenceSlot,
+    uint32_t chunkIndex, int slots, int rank, int numRanks) {
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* dst = reinterpret_cast<scalar_t*>(
+            peer_base + slotOffset + static_cast<size_t>(rank) * slotStrideBytes);
+        const scalar_t* src = input + static_cast<size_t>(peer) * fullNumElements +
+                              chunkOffsetElements;
+        for (size_t i = tid; i < chunkElements; i += stride) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+__global__ void p2pReduceScatterSlottedProduceWaitKernel(
+    char* local_recv_base, void** peer_ptrs, const int32_t* available,
+    size_t produceSignalOffset, int slot, int rank, int numRanks,
+    uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* peerProduce = reinterpret_cast<uint32_t*>(peer_base +
+                                                        produceSignalOffset);
+        p2pAgSignalStore(peerProduce +
+                             static_cast<size_t>(slot) * kMaxNumRanks + rank,
+                         sequence, 2);
+    }
+    __threadfence_system();
+
+    auto* produce = reinterpret_cast<volatile uint32_t*>(local_recv_base +
+                                                         produceSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (produce[static_cast<size_t>(slot) * kMaxNumRanks + peer] <
+               sequence) {
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterSlottedLocalReduceKernel(
+    scalar_t* output, const char* local_recv_base, size_t numElements,
+    size_t slotStrideBytes, int slot, int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+
+#ifdef __MUSA__
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
+#else
+    constexpr bool kIsBf16 = false;
+#endif
+    using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
+
+    for (size_t i = tid; i < numElements; i += stride) {
+        auto* src0 = reinterpret_cast<const scalar_t*>(local_recv_base +
+                                                       slotOffset);
+        acc_t acc;
+        if constexpr (kIsBf16) {
+            acc = static_cast<float>(src0[i]);
+        } else {
+            acc = src0[i];
+        }
+        for (int peer = 1; peer < numRanks; ++peer) {
+            auto* src = reinterpret_cast<const scalar_t*>(
+                local_recv_base + slotOffset +
+                static_cast<size_t>(peer) * slotStrideBytes);
+            if constexpr (kIsBf16) {
+                acc += static_cast<float>(src[i]);
+            } else {
+                acc += src[i];
+            }
+        }
+        if constexpr (kIsBf16) {
+            output[i] = static_cast<scalar_t>(acc);
+        } else {
+            output[i] = acc;
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterSlottedLocalReduceChunkKernel(
+    scalar_t* output, const char* local_recv_base, size_t chunkOffsetElements,
+    size_t chunkElements, size_t slotStrideBytes, int slot, int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+
+#ifdef __MUSA__
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
+#else
+    constexpr bool kIsBf16 = false;
+#endif
+    using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
+
+    for (size_t i = tid; i < chunkElements; i += stride) {
+        auto* src0 = reinterpret_cast<const scalar_t*>(local_recv_base +
+                                                       slotOffset);
+        acc_t acc;
+        if constexpr (kIsBf16) {
+            acc = static_cast<float>(src0[i]);
+        } else {
+            acc = src0[i];
+        }
+        for (int peer = 1; peer < numRanks; ++peer) {
+            auto* src = reinterpret_cast<const scalar_t*>(
+                local_recv_base + slotOffset +
+                static_cast<size_t>(peer) * slotStrideBytes);
+            if constexpr (kIsBf16) {
+                acc += static_cast<float>(src[i]);
+            } else {
+                acc += src[i];
+            }
+        }
+        if constexpr (kIsBf16) {
+            output[chunkOffsetElements + i] = static_cast<scalar_t>(acc);
+        } else {
+            output[chunkOffsetElements + i] = acc;
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterSlottedLocalReduceGraphKernel(
+    scalar_t* output, const char* local_recv_base, size_t numElements,
+    size_t slotStrideBytes, const uint32_t* baseSequenceSlot,
+    uint32_t chunkIndex, int slots, int numRanks) {
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+#ifdef __MUSA__
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
+#else
+    constexpr bool kIsBf16 = false;
+#endif
+    using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
+
+    for (size_t i = tid; i < numElements; i += stride) {
+        auto* src0 = reinterpret_cast<const scalar_t*>(local_recv_base +
+                                                       slotOffset);
+        acc_t acc;
+        if constexpr (kIsBf16) {
+            acc = static_cast<float>(src0[i]);
+        } else {
+            acc = src0[i];
+        }
+        for (int peer = 1; peer < numRanks; ++peer) {
+            auto* src = reinterpret_cast<const scalar_t*>(
+                local_recv_base + slotOffset +
+                static_cast<size_t>(peer) * slotStrideBytes);
+            if constexpr (kIsBf16) {
+                acc += static_cast<float>(src[i]);
+            } else {
+                acc += src[i];
+            }
+        }
+        if constexpr (kIsBf16) {
+            output[i] = static_cast<scalar_t>(acc);
+        } else {
+            output[i] = acc;
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void p2pReduceScatterSlottedLocalReduceChunkGraphKernel(
+    scalar_t* output, const char* local_recv_base, size_t chunkOffsetElements,
+    size_t chunkElements, size_t slotStrideBytes,
+    const uint32_t* baseSequenceSlot, uint32_t chunkIndex, int slots,
+    int numRanks) {
+    const uint32_t sequence = *baseSequenceSlot + chunkIndex;
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+#ifdef __MUSA__
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
+#else
+    constexpr bool kIsBf16 = false;
+#endif
+    using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
+
+    for (size_t i = tid; i < chunkElements; i += stride) {
+        auto* src0 = reinterpret_cast<const scalar_t*>(local_recv_base +
+                                                       slotOffset);
+        acc_t acc;
+        if constexpr (kIsBf16) {
+            acc = static_cast<float>(src0[i]);
+        } else {
+            acc = src0[i];
+        }
+        for (int peer = 1; peer < numRanks; ++peer) {
+            auto* src = reinterpret_cast<const scalar_t*>(
+                local_recv_base + slotOffset +
+                static_cast<size_t>(peer) * slotStrideBytes);
+            if constexpr (kIsBf16) {
+                acc += static_cast<float>(src[i]);
+            } else {
+                acc += src[i];
+            }
+        }
+        if constexpr (kIsBf16) {
+            output[chunkOffsetElements + i] = static_cast<scalar_t>(acc);
+        } else {
+            output[chunkOffsetElements + i] = acc;
+        }
+    }
+}
+
+template <typename scalar_t>
+void launchP2pReduceScatterSlottedKernelTyped(
+    scalar_t* output, const scalar_t* input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t numElements,
+    size_t slotStrideBytes, int slots, int rank, int numRanks,
+    uint32_t sequence, cudaStream_t stream) {
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+    constexpr int threads = 256;
+    const size_t elements_per_block = threads;
+    int blocks_x = static_cast<int>((numElements + elements_per_block - 1) /
+                                    elements_per_block);
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
+        slot, numRanks, sequence, slots);
+    p2pReduceScatterStoreToSlottedScratchKernel<<<store_grid, threads, 0,
+                                                  stream>>>(
+        input, peer_ptrs, available, numElements, slotStrideBytes, slot, rank,
+        numRanks);
+    p2pReduceScatterSlottedProduceWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), peer_ptrs, available,
+        produceSignalOffset, slot, rank, numRanks, sequence);
+    p2pReduceScatterSlottedLocalReduceKernel<<<blocks_x, threads, 0, stream>>>(
+        output, static_cast<const char*>(local_recv_base), numElements,
+        slotStrideBytes, slot, numRanks);
+    p2pSlottedConsumeNotifyKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, consumeSignalOffset, slot, rank, numRanks,
+        sequence);
+}
+
+#define DEF_LAUNCH_P2P_RS_SLOTTED(scalar_t, suffix)                         \
+    void launchP2pReduceScatterSlottedKernel_##suffix(                       \
+        scalar_t* output, const scalar_t* input, void* local_recv_base,       \
+        void** peer_ptrs, int32_t* available, size_t numElements,             \
+        size_t slotStrideBytes, int slots, int rank, int numRanks,            \
+        uint32_t sequence, cudaStream_t stream) {                             \
+        launchP2pReduceScatterSlottedKernelTyped(                            \
+            output, input, local_recv_base, peer_ptrs, available, numElements,\
+            slotStrideBytes, slots, rank, numRanks, sequence, stream);        \
+    }
+
+DEF_LAUNCH_P2P_RS_SLOTTED(uint8_t, uint8)
+DEF_LAUNCH_P2P_RS_SLOTTED(int8_t, int8)
+DEF_LAUNCH_P2P_RS_SLOTTED(int16_t, int16)
+DEF_LAUNCH_P2P_RS_SLOTTED(int, int32)
+DEF_LAUNCH_P2P_RS_SLOTTED(int64_t, int64)
+DEF_LAUNCH_P2P_RS_SLOTTED(float, float)
+DEF_LAUNCH_P2P_RS_SLOTTED(double, double)
+DEF_LAUNCH_P2P_RS_SLOTTED(bool, bool)
+
+#undef DEF_LAUNCH_P2P_RS_SLOTTED
+
+void launchP2pReduceScatterSlottedKernel_bf16(
+    void* output, const void* input, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t numElements, size_t slotStrideBytes, int slots,
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream) {
+#ifdef __MUSA__
+    launchP2pReduceScatterSlottedKernelTyped(
+        static_cast<mt_bfloat16*>(output), static_cast<const mt_bfloat16*>(input),
+        local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
+        slots, rank, numRanks, sequence, stream);
+#else
+    launchP2pReduceScatterSlottedKernelTyped(
+        static_cast<at::BFloat16*>(output), static_cast<const at::BFloat16*>(input),
+        local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
+        slots, rank, numRanks, sequence, stream);
+#endif
+}
+
+template <typename scalar_t>
+void launchP2pReduceScatterSlottedChunkedKernelTyped(
+    scalar_t* output, const scalar_t* input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t fullNumElements,
+    size_t chunkElements, size_t slotStrideBytes, int slots, int rank,
+    int numRanks, uint32_t baseSequence, cudaStream_t stream) {
+    constexpr int threads = 256;
+    size_t chunkIndex = 0;
+    for (size_t offset = 0; offset < fullNumElements;
+         offset += chunkElements, ++chunkIndex) {
+        const size_t thisChunk = std::min(chunkElements, fullNumElements - offset);
+        const uint32_t sequence =
+            baseSequence + static_cast<uint32_t>(chunkIndex);
+        const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+        const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                                   sizeof(uint32_t);
+        const size_t produceSignalOffset = kBufferSize - signalBytes;
+        const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+        int blocks_x = static_cast<int>((thisChunk + threads - 1) / threads);
+        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+        dim3 store_grid(blocks_x, numRanks, 1);
+        p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
+            static_cast<const char*>(local_recv_base), available,
+            consumeSignalOffset, slot, numRanks, sequence, slots);
+        p2pReduceScatterStoreChunkToSlottedScratchKernel<<<store_grid, threads,
+                                                           0, stream>>>(
+            input, peer_ptrs, available, fullNumElements, offset, thisChunk,
+            slotStrideBytes, slot, rank, numRanks);
+        p2pReduceScatterSlottedProduceWaitKernel<<<1, 1, 0, stream>>>(
+            static_cast<char*>(local_recv_base), peer_ptrs, available,
+            produceSignalOffset, slot, rank, numRanks, sequence);
+        p2pReduceScatterSlottedLocalReduceChunkKernel<<<blocks_x, threads, 0,
+                                                        stream>>>(
+            output, static_cast<const char*>(local_recv_base), offset,
+            thisChunk, slotStrideBytes, slot, numRanks);
+        p2pSlottedConsumeNotifyKernel<<<1, 1, 0, stream>>>(
+            peer_ptrs, available, consumeSignalOffset, slot, rank, numRanks,
+            sequence);
+    }
+}
+
+#define DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(scalar_t, suffix)                  \
+    void launchP2pReduceScatterSlottedChunkedKernel_##suffix(                \
+        scalar_t* output, const scalar_t* input, void* local_recv_base,       \
+        void** peer_ptrs, int32_t* available, size_t fullNumElements,         \
+        size_t chunkElements, size_t slotStrideBytes, int slots, int rank,    \
+        int numRanks, uint32_t baseSequence, cudaStream_t stream) {           \
+        launchP2pReduceScatterSlottedChunkedKernelTyped(                     \
+            output, input, local_recv_base, peer_ptrs, available,             \
+            fullNumElements, chunkElements, slotStrideBytes, slots, rank,     \
+            numRanks, baseSequence, stream);                                 \
+    }
+
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(uint8_t, uint8)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(int8_t, int8)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(int16_t, int16)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(int, int32)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(int64_t, int64)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(float, float)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(double, double)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED(bool, bool)
+
+#undef DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED
+
+void launchP2pReduceScatterSlottedChunkedKernel_bf16(
+    void* output, const void* input, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t fullNumElements, size_t chunkElements,
+    size_t slotStrideBytes, int slots, int rank, int numRanks,
+    uint32_t baseSequence, cudaStream_t stream) {
+#ifdef __MUSA__
+    launchP2pReduceScatterSlottedChunkedKernelTyped(
+        static_cast<mt_bfloat16*>(output), static_cast<const mt_bfloat16*>(input),
+        local_recv_base, peer_ptrs, available, fullNumElements, chunkElements,
+        slotStrideBytes, slots, rank, numRanks, baseSequence, stream);
+#else
+    launchP2pReduceScatterSlottedChunkedKernelTyped(
+        static_cast<at::BFloat16*>(output), static_cast<const at::BFloat16*>(input),
+        local_recv_base, peer_ptrs, available, fullNumElements, chunkElements,
+        slotStrideBytes, slots, rank, numRanks, baseSequence, stream);
+#endif
+}
+
+template <typename scalar_t>
+void launchP2pReduceScatterSlottedGraphKernelTyped(
+    scalar_t* output, const scalar_t* input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t numElements,
+    size_t slotStrideBytes, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream) {
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>((numElements + threads - 1) / threads);
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+    constexpr uint32_t chunkIndex = 0;
+    p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
+        baseSequenceSlot, chunkIndex, slots, numRanks);
+    p2pReduceScatterStoreToSlottedScratchGraphKernel<<<store_grid, threads, 0,
+                                                       stream>>>(
+        input, peer_ptrs, available, numElements, slotStrideBytes,
+        baseSequenceSlot, chunkIndex, slots, rank, numRanks);
+    p2pSlottedProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), peer_ptrs, available,
+        produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
+        numRanks);
+    p2pReduceScatterSlottedLocalReduceGraphKernel<<<blocks_x, threads, 0,
+                                                    stream>>>(
+        output, static_cast<const char*>(local_recv_base), numElements,
+        slotStrideBytes, baseSequenceSlot, chunkIndex, slots, numRanks);
+    p2pSlottedConsumeNotifyGraphKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, consumeSignalOffset, baseSequenceSlot, chunkIndex,
+        slots, rank, numRanks);
+}
+
+#define DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(scalar_t, suffix)                    \
+    void launchP2pReduceScatterSlottedGraphKernel_##suffix(                  \
+        scalar_t* output, const scalar_t* input, void* local_recv_base,       \
+        void** peer_ptrs, int32_t* available, size_t numElements,             \
+        size_t slotStrideBytes, int slots, int rank, int numRanks,            \
+        const uint32_t* baseSequenceSlot, cudaStream_t stream) {              \
+        launchP2pReduceScatterSlottedGraphKernelTyped(                       \
+            output, input, local_recv_base, peer_ptrs, available, numElements,\
+            slotStrideBytes, slots, rank, numRanks, baseSequenceSlot, stream);\
+    }
+
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(uint8_t, uint8)
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(int8_t, int8)
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(int16_t, int16)
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(int, int32)
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(int64_t, int64)
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(float, float)
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(double, double)
+DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(bool, bool)
+
+#undef DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH
+
+void launchP2pReduceScatterSlottedGraphKernel_bf16(
+    void* output, const void* input, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t numElements, size_t slotStrideBytes, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream) {
+#ifdef __MUSA__
+    launchP2pReduceScatterSlottedGraphKernelTyped(
+        static_cast<mt_bfloat16*>(output), static_cast<const mt_bfloat16*>(input),
+        local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
+        slots, rank, numRanks, baseSequenceSlot, stream);
+#else
+    launchP2pReduceScatterSlottedGraphKernelTyped(
+        static_cast<at::BFloat16*>(output), static_cast<const at::BFloat16*>(input),
+        local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
+        slots, rank, numRanks, baseSequenceSlot, stream);
+#endif
+}
+
+template <typename scalar_t>
+void launchP2pReduceScatterSlottedChunkedGraphKernelTyped(
+    scalar_t* output, const scalar_t* input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t fullNumElements,
+    size_t chunkElements, size_t slotStrideBytes, int slots, int rank,
+    int numRanks, const uint32_t* baseSequenceSlot, cudaStream_t stream) {
+    constexpr int threads = 256;
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+    uint32_t chunkIndex = 0;
+    for (size_t offset = 0; offset < fullNumElements;
+         offset += chunkElements, ++chunkIndex) {
+        const size_t thisChunk = std::min(chunkElements, fullNumElements - offset);
+        int blocks_x = static_cast<int>((thisChunk + threads - 1) / threads);
+        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+        dim3 store_grid(blocks_x, numRanks, 1);
+        p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
+            static_cast<const char*>(local_recv_base), available,
+            consumeSignalOffset, baseSequenceSlot, chunkIndex, slots, numRanks);
+        p2pReduceScatterStoreChunkToSlottedScratchGraphKernel<<<store_grid,
+                                                                threads, 0,
+                                                                stream>>>(
+            input, peer_ptrs, available, fullNumElements, offset, thisChunk,
+            slotStrideBytes, baseSequenceSlot, chunkIndex, slots, rank,
+            numRanks);
+        p2pSlottedProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
+            static_cast<char*>(local_recv_base), peer_ptrs, available,
+            produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
+            numRanks);
+        p2pReduceScatterSlottedLocalReduceChunkGraphKernel<<<blocks_x, threads,
+                                                             0, stream>>>(
+            output, static_cast<const char*>(local_recv_base), offset,
+            thisChunk, slotStrideBytes, baseSequenceSlot, chunkIndex, slots,
+            numRanks);
+        p2pSlottedConsumeNotifyGraphKernel<<<1, 1, 0, stream>>>(
+            peer_ptrs, available, consumeSignalOffset, baseSequenceSlot,
+            chunkIndex, slots, rank, numRanks);
+    }
+}
+
+#define DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(scalar_t, suffix)            \
+    void launchP2pReduceScatterSlottedChunkedGraphKernel_##suffix(           \
+        scalar_t* output, const scalar_t* input, void* local_recv_base,       \
+        void** peer_ptrs, int32_t* available, size_t fullNumElements,         \
+        size_t chunkElements, size_t slotStrideBytes, int slots, int rank,    \
+        int numRanks, const uint32_t* baseSequenceSlot, cudaStream_t stream) {\
+        launchP2pReduceScatterSlottedChunkedGraphKernelTyped(                \
+            output, input, local_recv_base, peer_ptrs, available,             \
+            fullNumElements, chunkElements, slotStrideBytes, slots, rank,     \
+            numRanks, baseSequenceSlot, stream);                             \
+    }
+
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(uint8_t, uint8)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(int8_t, int8)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(int16_t, int16)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(int, int32)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(int64_t, int64)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(float, float)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(double, double)
+DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH(bool, bool)
+
+#undef DEF_LAUNCH_P2P_RS_SLOTTED_CHUNKED_GRAPH
+
+void launchP2pReduceScatterSlottedChunkedGraphKernel_bf16(
+    void* output, const void* input, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t fullNumElements, size_t chunkElements,
+    size_t slotStrideBytes, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream) {
+#ifdef __MUSA__
+    launchP2pReduceScatterSlottedChunkedGraphKernelTyped(
+        static_cast<mt_bfloat16*>(output), static_cast<const mt_bfloat16*>(input),
+        local_recv_base, peer_ptrs, available, fullNumElements, chunkElements,
+        slotStrideBytes, slots, rank, numRanks, baseSequenceSlot, stream);
+#else
+    launchP2pReduceScatterSlottedChunkedGraphKernelTyped(
+        static_cast<at::BFloat16*>(output), static_cast<const at::BFloat16*>(input),
+        local_recv_base, peer_ptrs, available, fullNumElements, chunkElements,
+        slotStrideBytes, slots, rank, numRanks, baseSequenceSlot, stream);
+#endif
+}
+
+template <typename scalar_t>
+__global__ void p2pAllReduceStoreToSlottedScratchKernel(
+    const scalar_t* input, void** peer_ptrs, const int32_t* available,
+    size_t numElements, size_t slotStrideBytes, int slot, int rank,
+    int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t slotOffset = static_cast<size_t>(slot) *
+                              static_cast<size_t>(numRanks) * slotStrideBytes;
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(peer_ptrs[peer]);
+        auto* dst = reinterpret_cast<scalar_t*>(
+            peer_base + slotOffset + static_cast<size_t>(rank) * slotStrideBytes);
+        for (size_t i = tid; i < numElements; i += stride) {
+            dst[i] = input[i];
+        }
+    }
+}
+
+template <typename scalar_t>
+void launchP2pAllReduceSlottedKernelTyped(
+    scalar_t* output, const scalar_t* input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t numElements,
+    size_t slotStrideBytes, int slots, int rank, int numRanks,
+    uint32_t sequence, cudaStream_t stream) {
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>((numElements + threads - 1) / threads);
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
+        slot, numRanks, sequence, slots);
+    p2pAllReduceStoreToSlottedScratchKernel<<<store_grid, threads, 0, stream>>>(
+        input, peer_ptrs, available, numElements, slotStrideBytes, slot, rank,
+        numRanks);
+    p2pReduceScatterSlottedProduceWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), peer_ptrs, available,
+        produceSignalOffset, slot, rank, numRanks, sequence);
+    p2pReduceScatterSlottedLocalReduceKernel<<<blocks_x, threads, 0, stream>>>(
+        output, static_cast<const char*>(local_recv_base), numElements,
+        slotStrideBytes, slot, numRanks);
+    p2pSlottedConsumeNotifyKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, consumeSignalOffset, slot, rank, numRanks,
+        sequence);
+}
+
+#define DEF_LAUNCH_P2P_AR_SLOTTED(scalar_t, suffix)                         \
+    void launchP2pAllReduceSlottedKernel_##suffix(                           \
+        scalar_t* output, const scalar_t* input, void* local_recv_base,       \
+        void** peer_ptrs, int32_t* available, size_t numElements,             \
+        size_t slotStrideBytes, int slots, int rank, int numRanks,            \
+        uint32_t sequence, cudaStream_t stream) {                             \
+        launchP2pAllReduceSlottedKernelTyped(                                \
+            output, input, local_recv_base, peer_ptrs, available, numElements,\
+            slotStrideBytes, slots, rank, numRanks, sequence, stream);        \
+    }
+
+DEF_LAUNCH_P2P_AR_SLOTTED(uint8_t, uint8)
+DEF_LAUNCH_P2P_AR_SLOTTED(int8_t, int8)
+DEF_LAUNCH_P2P_AR_SLOTTED(int16_t, int16)
+DEF_LAUNCH_P2P_AR_SLOTTED(int, int32)
+DEF_LAUNCH_P2P_AR_SLOTTED(int64_t, int64)
+DEF_LAUNCH_P2P_AR_SLOTTED(float, float)
+DEF_LAUNCH_P2P_AR_SLOTTED(double, double)
+DEF_LAUNCH_P2P_AR_SLOTTED(bool, bool)
+
+#undef DEF_LAUNCH_P2P_AR_SLOTTED
+
+void launchP2pAllReduceSlottedKernel_bf16(
+    void* output, const void* input, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t numElements, size_t slotStrideBytes, int slots,
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream) {
+#ifdef __MUSA__
+    launchP2pAllReduceSlottedKernelTyped(
+        static_cast<mt_bfloat16*>(output), static_cast<const mt_bfloat16*>(input),
+        local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
+        slots, rank, numRanks, sequence, stream);
+#else
+    launchP2pAllReduceSlottedKernelTyped(
+        static_cast<at::BFloat16*>(output), static_cast<const at::BFloat16*>(input),
+        local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
+        slots, rank, numRanks, sequence, stream);
+#endif
+}
+
+__global__ void p2pAllgatherDirectOutputStoreKernel(
+    const char* input, void** output_peer_ptrs, const int32_t* available,
+    size_t tensorSize, int rank, int numRanks) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+    if (((reinterpret_cast<uintptr_t>(input) | tensorSize) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(input);
+        const size_t words = tensorSize / sizeof(uint64_t);
+        for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+            if (!available[peer]) continue;
+            auto* peer_output = static_cast<char*>(output_peer_ptrs[peer]);
+            auto* dst = peer_output + static_cast<size_t>(rank) * tensorSize;
+            if ((reinterpret_cast<uintptr_t>(dst) & (sizeof(uint64_t) - 1)) ==
+                0) {
+                auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+                for (size_t i = tid; i < words; i += stride) {
+                    dst64[i] = src64[i];
+                }
+            } else {
+                for (size_t i = tid; i < tensorSize; i += stride) {
+                    dst[i] = input[i];
+                }
+            }
+        }
+        return;
+    }
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        if (!available[peer]) continue;
+        auto* peer_output = static_cast<char*>(output_peer_ptrs[peer]);
+        auto* dst = peer_output + static_cast<size_t>(rank) * tensorSize;
+        for (size_t i = tid; i < tensorSize; i += stride) {
+            dst[i] = input[i];
+        }
+    }
+}
+
+__global__ void p2pAllgatherDirectOutputProduceWaitKernel(
+    char* local_recv_base, void** scratch_peer_ptrs, const int32_t* available,
+    size_t produceSignalOffset, int rank, int numRanks, uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(scratch_peer_ptrs[peer]);
+        auto* peerProduce = reinterpret_cast<uint32_t*>(peer_base +
+                                                        produceSignalOffset);
+        p2pAgSignalStore(peerProduce + rank, sequence, 2);
+    }
+    __threadfence_system();
+
+    auto* produce = reinterpret_cast<volatile uint32_t*>(local_recv_base +
+                                                         produceSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (produce[peer] < sequence) {
+        }
+    }
+}
+
+void launchP2pAllgatherStoreSignalKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, int rank, int numRanks,
+    uint32_t sequence, cudaStream_t stream) {
+    constexpr size_t kProduceSignalOffset =
+        kBufferSize - 2 * kMaxNumRanks * sizeof(uint32_t);
+    constexpr size_t kConsumeSignalOffset =
+        kBufferSize - kMaxNumRanks * sizeof(uint32_t);
+#ifndef __MUSA__
+    const bool profile = [rank] {
+        const char* value = std::getenv("MOONCAKE_PG_STORE_SIGNAL_PROFILE");
+        if (!value || value[0] == '\0' || value[0] == '0') return false;
+        const char* rank_value =
+            std::getenv("MOONCAKE_PG_STORE_SIGNAL_PROFILE_RANK");
+        if (!rank_value || rank_value[0] == '\0') return true;
+        char* end = nullptr;
+        long parsed = std::strtol(rank_value, &end, 10);
+        return end != rank_value && static_cast<int>(parsed) == rank;
+    }();
+    cudaEvent_t ev[6]{};
+    if (profile) {
+        for (auto& event : ev) {
+            cudaEventCreate(&event);
+        }
+        cudaEventRecord(ev[0], stream);
+    }
+#endif
+    p2pAllgatherStoreWaitPrevConsumeKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), kConsumeSignalOffset, numRanks,
+        sequence);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[1], stream);
+#endif
+
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 grid(blocks_x, numRanks, 1);
+    p2pAllgatherStoreToScratchKernel<<<grid, threads, 0, stream>>>(
+        static_cast<const char*>(input), peer_ptrs, available, tensorSize, rank,
+        numRanks);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[2], stream);
+#endif
+    p2pAllgatherStoreProduceWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), peer_ptrs, available,
+        kProduceSignalOffset, rank, numRanks, sequence);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[3], stream);
+#endif
+    const size_t outputBytes = tensorSize * static_cast<size_t>(numRanks);
+    int copy_blocks = static_cast<int>(
+        (outputBytes + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+    p2pAllgatherStoreLocalCopyKernel<<<copy_blocks, threads, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), static_cast<char*>(output),
+        outputBytes);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[4], stream);
+#endif
+    p2pAllgatherStoreConsumeKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, kConsumeSignalOffset, rank, numRanks, sequence);
+#ifndef __MUSA__
+    if (profile) {
+        cudaEventRecord(ev[5], stream);
+        cudaEventSynchronize(ev[5]);
+        float wait_prev_ms = 0.0f;
+        float store_ms = 0.0f;
+        float produce_wait_ms = 0.0f;
+        float local_copy_ms = 0.0f;
+        float consume_ms = 0.0f;
+        float total_ms = 0.0f;
+        cudaEventElapsedTime(&wait_prev_ms, ev[0], ev[1]);
+        cudaEventElapsedTime(&store_ms, ev[1], ev[2]);
+        cudaEventElapsedTime(&produce_wait_ms, ev[2], ev[3]);
+        cudaEventElapsedTime(&local_copy_ms, ev[3], ev[4]);
+        cudaEventElapsedTime(&consume_ms, ev[4], ev[5]);
+        cudaEventElapsedTime(&total_ms, ev[0], ev[5]);
+        std::fprintf(
+            stderr,
+            "MOONCAKE_PG_STORE_SIGNAL_PROFILE rank=%d seq=%u ranks=%d "
+            "bytes=%zu wait_prev_us=%.3f store_us=%.3f "
+            "produce_wait_us=%.3f local_copy_us=%.3f consume_us=%.3f "
+            "total_us=%.3f\n",
+            rank, sequence, numRanks, tensorSize, wait_prev_ms * 1000.0f,
+            store_ms * 1000.0f, produce_wait_ms * 1000.0f,
+            local_copy_ms * 1000.0f, consume_ms * 1000.0f,
+            total_ms * 1000.0f);
+        for (auto& event : ev) {
+            cudaEventDestroy(event);
+        }
+    }
+#endif
+}
+
+void launchP2pAllgatherStoreSignalSlottedKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream) {
+    const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+
+#ifndef __MUSA__
+    const bool profile = [rank] {
+        const char* value = std::getenv("MOONCAKE_PG_STORE_SIGNAL_PROFILE");
+        if (!value || value[0] == '\0' || value[0] == '0') return false;
+        const char* rank_value =
+            std::getenv("MOONCAKE_PG_STORE_SIGNAL_PROFILE_RANK");
+        if (!rank_value || rank_value[0] == '\0') return true;
+        char* end = nullptr;
+        long parsed = std::strtol(rank_value, &end, 10);
+        return end != rank_value && static_cast<int>(parsed) == rank;
+    }();
+    cudaEvent_t ev[4]{};
+    if (profile) {
+        for (auto& event : ev) {
+            cudaEventCreate(&event);
+        }
+        cudaEventRecord(ev[0], stream);
+    }
+#endif
+
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
+        slot, numRanks, sequence, slots);
+    p2pAllgatherStoreToSlottedScratchKernel<<<store_grid, threads, 0, stream>>>(
+        static_cast<const char*>(input), peer_ptrs, available, tensorSize,
+        slotStride, slot, rank, numRanks);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[1], stream);
+#endif
+
+    p2pAllgatherStoreSlottedProduceWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), peer_ptrs, available,
+        produceSignalOffset, slot, rank, numRanks, sequence);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[2], stream);
+#endif
+
+    int copy_blocks = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+    dim3 copy_grid(copy_blocks, numRanks, 1);
+    p2pAllgatherStoreSlottedLocalCopyKernel<<<copy_grid, threads, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), static_cast<char*>(output),
+        tensorSize, slotStride, slot, numRanks);
+    p2pSlottedConsumeNotifyKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, consumeSignalOffset, slot, rank, numRanks,
+        sequence);
+#ifndef __MUSA__
+    if (profile) {
+        cudaEventRecord(ev[3], stream);
+        cudaEventSynchronize(ev[3]);
+        float store_ms = 0.0f;
+        float produce_wait_ms = 0.0f;
+        float local_copy_ms = 0.0f;
+        float total_ms = 0.0f;
+        cudaEventElapsedTime(&store_ms, ev[0], ev[1]);
+        cudaEventElapsedTime(&produce_wait_ms, ev[1], ev[2]);
+        cudaEventElapsedTime(&local_copy_ms, ev[2], ev[3]);
+        cudaEventElapsedTime(&total_ms, ev[0], ev[3]);
+        std::fprintf(
+            stderr,
+            "MOONCAKE_PG_STORE_SIGNAL_SLOTTED_PROFILE rank=%d seq=%u "
+            "slot=%d slots=%d ranks=%d bytes=%zu slot_stride=%zu "
+            "store_us=%.3f produce_wait_us=%.3f local_copy_us=%.3f "
+            "total_us=%.3f\n",
+            rank, sequence, slot, slots, numRanks, tensorSize, slotStride,
+            store_ms * 1000.0f, produce_wait_ms * 1000.0f,
+            local_copy_ms * 1000.0f, total_ms * 1000.0f);
+        for (auto& event : ev) {
+            cudaEventDestroy(event);
+        }
+    }
+#endif
+}
+
+void launchP2pAllgatherStoreSignalSlottedChunkedKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t chunkBytes,
+    size_t slotStride, int slots, int rank, int numRanks,
+    uint32_t baseSequence, cudaStream_t stream) {
+    constexpr int threads = 256;
+    size_t chunkIndex = 0;
+    for (size_t offset = 0; offset < tensorSize;
+         offset += chunkBytes, ++chunkIndex) {
+        const size_t thisChunk = std::min(chunkBytes, tensorSize - offset);
+        const uint32_t sequence =
+            baseSequence + static_cast<uint32_t>(chunkIndex);
+        const int slot = static_cast<int>(sequence % static_cast<uint32_t>(slots));
+        const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                                   sizeof(uint32_t);
+        const size_t produceSignalOffset = kBufferSize - signalBytes;
+        const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+        int blocks_x = static_cast<int>(
+            (thisChunk + threads * sizeof(uint64_t) - 1) /
+            (threads * sizeof(uint64_t)));
+        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+        dim3 store_grid(blocks_x, numRanks, 1);
+        p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
+            static_cast<const char*>(local_recv_base), available,
+            consumeSignalOffset, slot, numRanks, sequence, slots);
+        p2pAllgatherStoreToSlottedScratchKernel<<<store_grid, threads, 0,
+                                                  stream>>>(
+            static_cast<const char*>(input) + offset, peer_ptrs, available,
+            thisChunk, slotStride, slot, rank, numRanks);
+        p2pAllgatherStoreSlottedProduceWaitKernel<<<1, 1, 0, stream>>>(
+            static_cast<char*>(local_recv_base), peer_ptrs, available,
+            produceSignalOffset, slot, rank, numRanks, sequence);
+
+        int copy_blocks = static_cast<int>(
+            (thisChunk + threads * sizeof(uint64_t) - 1) /
+            (threads * sizeof(uint64_t)));
+        copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+        dim3 copy_grid(copy_blocks, numRanks, 1);
+        p2pAllgatherStoreSlottedLocalCopyChunkKernel<<<copy_grid, threads, 0,
+                                                       stream>>>(
+            static_cast<const char*>(local_recv_base), static_cast<char*>(output),
+            thisChunk, tensorSize, offset, slotStride, slot, numRanks);
+        p2pSlottedConsumeNotifyKernel<<<1, 1, 0, stream>>>(
+            peer_ptrs, available, consumeSignalOffset, slot, rank, numRanks,
+            sequence);
+    }
+}
+
+void launchP2pAllgatherStoreSignalSlottedGraphKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream) {
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+    constexpr uint32_t chunkIndex = 0;
+    p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
+        baseSequenceSlot, chunkIndex, slots, numRanks);
+    p2pAllgatherStoreToSlottedScratchGraphKernel<<<store_grid, threads, 0,
+                                                   stream>>>(
+        static_cast<const char*>(input), peer_ptrs, available, tensorSize,
+        slotStride, baseSequenceSlot, chunkIndex, slots, rank, numRanks);
+    p2pSlottedProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), peer_ptrs, available,
+        produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
+        numRanks);
+    int copy_blocks = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+    dim3 copy_grid(copy_blocks, numRanks, 1);
+    p2pAllgatherStoreSlottedLocalCopyGraphKernel<<<copy_grid, threads, 0,
+                                                   stream>>>(
+        static_cast<const char*>(local_recv_base), static_cast<char*>(output),
+        tensorSize, slotStride, baseSequenceSlot, chunkIndex, slots, numRanks);
+    p2pSlottedConsumeNotifyGraphKernel<<<1, 1, 0, stream>>>(
+        peer_ptrs, available, consumeSignalOffset, baseSequenceSlot, chunkIndex,
+        slots, rank, numRanks);
+}
+
+void launchP2pAllgatherStoreSignalSlottedChunkedGraphKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t chunkBytes,
+    size_t slotStride, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream) {
+    constexpr int threads = 256;
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+    uint32_t chunkIndex = 0;
+    for (size_t offset = 0; offset < tensorSize;
+         offset += chunkBytes, ++chunkIndex) {
+        const size_t thisChunk = std::min(chunkBytes, tensorSize - offset);
+        int blocks_x = static_cast<int>(
+            (thisChunk + threads * sizeof(uint64_t) - 1) /
+            (threads * sizeof(uint64_t)));
+        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+        dim3 store_grid(blocks_x, numRanks, 1);
+        p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
+            static_cast<const char*>(local_recv_base), available,
+            consumeSignalOffset, baseSequenceSlot, chunkIndex, slots, numRanks);
+        p2pAllgatherStoreToSlottedScratchGraphKernel<<<store_grid, threads, 0,
+                                                       stream>>>(
+            static_cast<const char*>(input) + offset, peer_ptrs, available,
+            thisChunk, slotStride, baseSequenceSlot, chunkIndex, slots, rank,
+            numRanks);
+        p2pSlottedProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
+            static_cast<char*>(local_recv_base), peer_ptrs, available,
+            produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
+            numRanks);
+        int copy_blocks = static_cast<int>(
+            (thisChunk + threads * sizeof(uint64_t) - 1) /
+            (threads * sizeof(uint64_t)));
+        copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+        dim3 copy_grid(copy_blocks, numRanks, 1);
+        p2pAllgatherStoreSlottedLocalCopyChunkGraphKernel<<<copy_grid, threads,
+                                                            0, stream>>>(
+            static_cast<const char*>(local_recv_base), static_cast<char*>(output),
+            thisChunk, tensorSize, offset, slotStride, baseSequenceSlot,
+            chunkIndex, slots, numRanks);
+        p2pSlottedConsumeNotifyGraphKernel<<<1, 1, 0, stream>>>(
+            peer_ptrs, available, consumeSignalOffset, baseSequenceSlot,
+            chunkIndex, slots, rank, numRanks);
+    }
+}
+
+void launchP2pAllgatherDirectOutputStoreSignalKernel(
+    void* input, void** output_peer_ptrs, void* local_recv_base,
+    void** scratch_peer_ptrs, int32_t* available, size_t tensorSize, int rank,
+    int numRanks, uint32_t sequence, cudaStream_t stream) {
+    constexpr size_t kProduceSignalOffset =
+        kBufferSize - kMaxNumRanks * sizeof(uint32_t);
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    p2pAllgatherDirectOutputStoreKernel<<<store_grid, threads, 0, stream>>>(
+        static_cast<const char*>(input), output_peer_ptrs, available,
+        tensorSize, rank, numRanks);
+    p2pAllgatherDirectOutputProduceWaitKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), scratch_peer_ptrs, available,
+        kProduceSignalOffset, rank, numRanks, sequence);
+}
+
+__global__ void ipcAllgatherStoreKernel(const char* input,
+                                        const uintptr_t* outPtrs, int rank,
+                                        int numRanks, size_t tensorSize) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+    if (((reinterpret_cast<uintptr_t>(input) | tensorSize) &
+         (sizeof(uint64_t) - 1)) == 0) {
+        const auto* src64 = reinterpret_cast<const uint64_t*>(input);
+        const size_t words = tensorSize / sizeof(uint64_t);
+        for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+            auto* dst = reinterpret_cast<char*>(outPtrs[peer]) +
+                        static_cast<size_t>(rank) * tensorSize;
+            if ((reinterpret_cast<uintptr_t>(dst) & (sizeof(uint64_t) - 1)) ==
+                0) {
+                auto* dst64 = reinterpret_cast<uint64_t*>(dst);
+                for (size_t i = tid; i < words; i += stride) {
+                    dst64[i] = src64[i];
+                }
+            } else {
+                for (size_t i = tid; i < tensorSize; i += stride) {
+                    dst[i] = input[i];
+                }
+            }
+        }
+        return;
+    }
+
+    for (int peer = blockIdx.y; peer < numRanks; peer += gridDim.y) {
+        auto* dst = reinterpret_cast<char*>(outPtrs[peer]) +
+                    static_cast<size_t>(rank) * tensorSize;
+        for (size_t i = tid; i < tensorSize; i += stride) {
+            dst[i] = input[i];
+        }
+    }
+}
+
+void launchIpcAllgatherStoreKernel(void* input, const uintptr_t* outPtrs,
+                                   int rank, int numRanks, size_t tensorSize,
+                                   cudaStream_t stream) {
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 grid(blocks_x, numRanks, 1);
+    ipcAllgatherStoreKernel<<<grid, threads, 0, stream>>>(
+        static_cast<const char*>(input), outPtrs, rank, numRanks, tensorSize);
+}
+
+__global__ void ipcAllgatherSignalWaitKernel(const uintptr_t* signalPtrs,
+                                             int rank, int numRanks,
+                                             uint32_t sequence) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        auto* peerSignals = reinterpret_cast<uint32_t*>(signalPtrs[peer]);
+        p2pAgSignalStore(peerSignals + rank, sequence, 2);
+    }
+    __threadfence_system();
+
+    auto* localSignals =
+        reinterpret_cast<volatile uint32_t*>(signalPtrs[rank]);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        while (localSignals[peer] < sequence) {
+        }
+    }
+}
+
+void launchIpcAllgatherStoreSignalKernel(
+    void* input, const uintptr_t* outPtrs, const uintptr_t* signalPtrs,
+    int rank, int numRanks, uint32_t sequence, size_t tensorSize,
+    cudaStream_t stream) {
+    launchIpcAllgatherStoreKernel(input, outPtrs, rank, numRanks, tensorSize,
+                                  stream);
+    ipcAllgatherSignalWaitKernel<<<1, 1, 0, stream>>>(signalPtrs, rank,
+                                                       numRanks, sequence);
+}
 
 void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
                              size_t numRanks, int op, bool* activeRanks,

@@ -25,10 +25,31 @@ from pgbench_utils import (
 COLLECTIVES = {
     "all_reduce",
     "all_gather",
+    "all_gather_base",
     "broadcast",
     "reduce_scatter",
     "alltoall",
     "sendrecv",
+}
+
+PRESETS = {
+    # Decode-side SGLang TP collectives are usually small/medium hidden-state
+    # tensors rather than large bulk bandwidth transfers.  This preset is for
+    # attribution runs with MOONCAKE_PG_PROFILE=1; run it separately for
+    # all_reduce, all_gather, and reduce_scatter.
+    "sglang-decode": {
+        "minbytes": "16K",
+        "maxbytes": "2M",
+        "stepfactor": 2,
+        "stepbytes": "1K",
+        "iters": 200,
+        "warmup_iters": 20,
+        "agg_iters": 1,
+        "check": 0,
+        "average": 3,
+        "datatype": "bfloat16",
+        "op": "sum",
+    },
 }
 
 
@@ -37,6 +58,7 @@ def _parse_args() -> argparse.Namespace:
         description="mooncake-pg pgbench (nccl-tests style)"
     )
     parser.add_argument("--collective", required=True, choices=sorted(COLLECTIVES))
+    parser.add_argument("--preset", choices=sorted(PRESETS), default=None)
     parser.add_argument(
         "--backend", choices=["mooncake", "mooncake-cpu", "nccl", "gloo"]
     )
@@ -146,6 +168,14 @@ def _run_all_gather(out_list: List[torch.Tensor], inp: torch.Tensor) -> None:
     dist.all_gather(out_list, inp)
 
 
+def _run_all_gather_base(output: torch.Tensor, inp: torch.Tensor) -> None:
+    if hasattr(dist, "all_gather_into_tensor"):
+        dist.all_gather_into_tensor(output, inp)
+    else:
+        chunks = list(output.chunk(dist.get_world_size()))
+        dist.all_gather(chunks, inp)
+
+
 def _run_reduce_scatter(
     output: torch.Tensor,
     input_buf: torch.Tensor,
@@ -233,6 +263,15 @@ def _bench_once(
         _fill_tensor(inp, float(rank + 1))
         _run_all_gather(out_list, inp)
         result = out_buf
+    elif args.collective == "all_gather_base":
+        out_buf = _alloc_tensor(recvcount, dtype, device)
+        if in_place:
+            inp = out_buf[rank * sendcount : (rank + 1) * sendcount]
+        else:
+            inp = _alloc_tensor(sendcount, dtype, device)
+        _fill_tensor(inp, float(rank + 1))
+        _run_all_gather_base(out_buf, inp)
+        result = out_buf
     elif args.collective == "reduce_scatter":
         input_buf = _alloc_tensor(sendcount, dtype, device)
         if in_place:
@@ -276,6 +315,8 @@ def _bench_once(
                 _run_broadcast(recv, args.root)
             elif args.collective == "all_gather":
                 _run_all_gather(out_list, inp)
+            elif args.collective == "all_gather_base":
+                _run_all_gather_base(out_buf, inp)
             elif args.collective == "reduce_scatter":
                 _run_reduce_scatter(
                     output,
@@ -303,6 +344,8 @@ def _bench_once(
                 _run_broadcast(recv, args.root)
             elif args.collective == "all_gather":
                 _run_all_gather(out_list, inp)
+            elif args.collective == "all_gather_base":
+                _run_all_gather_base(out_buf, inp)
             elif args.collective == "reduce_scatter":
                 _run_reduce_scatter(
                     output,
@@ -345,9 +388,12 @@ def _bench_once(
                 _run_broadcast(recv, args.root)
                 expected = torch.full_like(result, 7.0)
                 wrong += _count_wrong(result, expected)
-            elif args.collective == "all_gather":
+            elif args.collective in ("all_gather", "all_gather_base"):
                 _fill_tensor(inp, float(rank + 1))
-                _run_all_gather(out_list, inp)
+                if args.collective == "all_gather":
+                    _run_all_gather(out_list, inp)
+                else:
+                    _run_all_gather_base(out_buf, inp)
                 if sendcount > 0:
                     expected = torch.empty_like(result)
                     for peer in range(world_size):
@@ -574,6 +620,9 @@ def _launch(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.preset:
+        for key, value in PRESETS[args.preset].items():
+            setattr(args, key, value)
     args.minbytes = parse_size(args.minbytes)
     args.maxbytes = parse_size(args.maxbytes)
     args.stepbytes = parse_size(args.stepbytes)

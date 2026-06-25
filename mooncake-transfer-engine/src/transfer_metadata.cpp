@@ -763,8 +763,12 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.shm_name = bufferJSON["shm_name"].asString();
+            const char* mixed_nvlink = getenv("MC_PG_NVLINK_MIXED");
+            const bool allow_non_nvlink_buffer =
+                desc->protocol == "nvlink_intra" && mixed_nvlink &&
+                mixed_nvlink[0] != '\0' && mixed_nvlink[0] != '0';
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.shm_name.empty()) {
+                (buffer.shm_name.empty() && !allow_non_nvlink_buffer)) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol
                              << "buffer name " << buffer.name << "buffer addr "

@@ -20,6 +20,17 @@ size_t getEnv_size_t(const char* name, size_t default_val) {
     return val ? std::strtoull(val, nullptr, 10) : default_val;
 }
 
+bool useDeviceControlRegionsForNvlink() {
+#ifndef MOONCAKE_EP_USE_MUSA
+    const char* mixed = std::getenv("MC_PG_NVLINK_MIXED");
+    if (mixed && mixed[0] != '\0' && mixed[0] != '0') return false;
+    const char* value = std::getenv("MC_INTRANODE_NVLINK");
+    return value && value[0] != '\0' && value[0] != '0';
+#else
+    return false;
+#endif
+}
+
 void setCudaDeviceIfNeeded(bool is_cpu, int cuda_device_index,
                            const char* context) {
     if (is_cpu) {
@@ -209,12 +220,36 @@ void P2PProxy::allocateResources() {
 
     const size_t ctrl_slots =
         kMaxNumRanks * static_cast<size_t>(kP2PControlRingSize);
-    resources_.credit_region_ = new CreditSlot[ctrl_slots]{};
-    resources_.ack_region_ = new AckSlot[ctrl_slots]{};
+    control_regions_on_device_ = !is_cpu_ && useDeviceControlRegionsForNvlink();
+    if (control_regions_on_device_) {
+        cudaError_t err = cudaMalloc(&resources_.credit_region_,
+                                     ctrl_slots * sizeof(CreditSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to allocate CUDA P2P credit region: ",
+                    cudaGetErrorString(err));
+        err = cudaMalloc(&resources_.ack_region_,
+                         ctrl_slots * sizeof(AckSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to allocate CUDA P2P ack region: ",
+                    cudaGetErrorString(err));
+        err = cudaMemset(resources_.credit_region_, 0,
+                         ctrl_slots * sizeof(CreditSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to clear CUDA P2P credit region: ",
+                    cudaGetErrorString(err));
+        err = cudaMemset(resources_.ack_region_, 0,
+                         ctrl_slots * sizeof(AckSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to clear CUDA P2P ack region: ",
+                    cudaGetErrorString(err));
+    } else {
+        resources_.credit_region_ = new CreditSlot[ctrl_slots]{};
+        resources_.ack_region_ = new AckSlot[ctrl_slots]{};
 
-    for (size_t i = 0; i < ctrl_slots; ++i) {
-        resources_.credit_region_[i].reset();
-        resources_.ack_region_[i].reset();
+        for (size_t i = 0; i < ctrl_slots; ++i) {
+            resources_.credit_region_[i].reset();
+            resources_.ack_region_[i].reset();
+        }
     }
 
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
@@ -268,13 +303,39 @@ void P2PProxy::allocateResources() {
 
     // Staging buffers for control messages.  RDMA requires every
     // transfer source to live in a registered MR.
-    resources_.credit_staging_buf_ = new CreditSlot[ctrl_slots]{};
+    if (control_regions_on_device_) {
+        cudaError_t err = cudaMalloc(&resources_.credit_staging_buf_,
+                                     ctrl_slots * sizeof(CreditSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to allocate CUDA P2P credit staging region: ",
+                    cudaGetErrorString(err));
+        err = cudaMemset(resources_.credit_staging_buf_, 0,
+                         ctrl_slots * sizeof(CreditSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to clear CUDA P2P credit staging region: ",
+                    cudaGetErrorString(err));
+    } else {
+        resources_.credit_staging_buf_ = new CreditSlot[ctrl_slots]{};
+    }
     rc = engine_->registerLocalMemory(resources_.credit_staging_buf_,
                                       ctrl_slots * sizeof(CreditSlot),
                                       kWildcardLocation);
     TORCH_CHECK(rc == 0, "Failed to register P2P credit staging region");
 
-    resources_.ack_staging_buf_ = new AckSlot[ctrl_slots]{};
+    if (control_regions_on_device_) {
+        cudaError_t err = cudaMalloc(&resources_.ack_staging_buf_,
+                                     ctrl_slots * sizeof(AckSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to allocate CUDA P2P ack staging region: ",
+                    cudaGetErrorString(err));
+        err = cudaMemset(resources_.ack_staging_buf_, 0,
+                         ctrl_slots * sizeof(AckSlot));
+        TORCH_CHECK(err == cudaSuccess,
+                    "Failed to clear CUDA P2P ack staging region: ",
+                    cudaGetErrorString(err));
+    } else {
+        resources_.ack_staging_buf_ = new AckSlot[ctrl_slots]{};
+    }
     rc = engine_->registerLocalMemory(resources_.ack_staging_buf_,
                                       ctrl_slots * sizeof(AckSlot),
                                       kWildcardLocation);
@@ -433,26 +494,42 @@ void P2PProxy::releaseResources() {
     if (resources_.credit_staging_buf_ != nullptr) {
         if (engine_)
             engine_->unregisterLocalMemory(resources_.credit_staging_buf_);
-        delete[] resources_.credit_staging_buf_;
+        if (control_regions_on_device_) {
+            cudaFree(resources_.credit_staging_buf_);
+        } else {
+            delete[] resources_.credit_staging_buf_;
+        }
         resources_.credit_staging_buf_ = nullptr;
     }
 
     if (resources_.ack_staging_buf_ != nullptr) {
         if (engine_)
             engine_->unregisterLocalMemory(resources_.ack_staging_buf_);
-        delete[] resources_.ack_staging_buf_;
+        if (control_regions_on_device_) {
+            cudaFree(resources_.ack_staging_buf_);
+        } else {
+            delete[] resources_.ack_staging_buf_;
+        }
         resources_.ack_staging_buf_ = nullptr;
     }
 
     if (resources_.credit_region_ != nullptr) {
         if (engine_) engine_->unregisterLocalMemory(resources_.credit_region_);
-        delete[] resources_.credit_region_;
+        if (control_regions_on_device_) {
+            cudaFree(resources_.credit_region_);
+        } else {
+            delete[] resources_.credit_region_;
+        }
         resources_.credit_region_ = nullptr;
     }
 
     if (resources_.ack_region_ != nullptr) {
         if (engine_) engine_->unregisterLocalMemory(resources_.ack_region_);
-        delete[] resources_.ack_region_;
+        if (control_regions_on_device_) {
+            cudaFree(resources_.ack_region_);
+        } else {
+            delete[] resources_.ack_region_;
+        }
         resources_.ack_region_ = nullptr;
     }
 }

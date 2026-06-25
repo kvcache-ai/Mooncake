@@ -556,6 +556,7 @@ class P2PProxy {
     TransferEngine* engine_ = nullptr;
     std::shared_ptr<TransferGroupMeta> meta_;
     bool is_cpu_ = false;
+    bool control_regions_on_device_ = false;
     int rank_ = 0;
     int size_ = 0;
     int cuda_device_index_ = -1;

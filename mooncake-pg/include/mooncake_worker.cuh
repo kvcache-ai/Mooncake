@@ -53,6 +53,8 @@ struct TransferGroupMeta {
 #endif
     int bufferBaseIndex;
     int backendIndex;
+    bool syncOnDevice = false;
+    bool storeSync = false;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
 };
@@ -77,15 +79,131 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
 
+void launchP2pReduceScatterSlottedKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t slotStride, int slots, int rank, int numRanks, uint32_t sequence,
+    cudaStream_t stream);
+
+void launchP2pReserveSequence(uint32_t* counter, uint32_t* sequenceSlot,
+                              uint32_t increment, cudaStream_t stream);
+
+void launchP2pReduceScatterSlottedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t slotStride, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream);
+
+void launchP2pReduceScatterSlottedChunkedKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t chunkBytes, size_t slotStride, int slots, int rank, int numRanks,
+    uint32_t baseSequence, cudaStream_t stream);
+
+void launchP2pReduceScatterSlottedChunkedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* available, size_t tensorSize,
+    size_t chunkBytes, size_t slotStride, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream);
+
+void launchP2pAllReduceSlottedKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream);
+
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
 void preloadReduceKernels();
+
+void launchP2pAllgatherBaseKernel(void* input, void* output,
+                                  void* local_recv_base, void** peer_ptrs,
+                                  int32_t* available, size_t tensorSize,
+                                  int rank, int numRanks, uint32_t sequence,
+                                  cudaStream_t stream);
+
+void launchP2pAllgatherBaseCopyKernel(void* input, void** peer_ptrs,
+                                      int32_t* available, size_t tensorSize,
+                                      int rank, int numRanks,
+                                      cudaStream_t stream);
+
+void launchP2pAllgatherBaseFinishKernel(void* output, void* local_recv_base,
+                                        void** peer_ptrs, int32_t* available,
+                                        size_t tensorSize, int rank,
+                                        int numRanks, uint32_t sequence,
+                                        cudaStream_t stream);
+
+void launchP2pAllgatherRingKernel(void* input, void* output,
+                                  void* local_recv_base, void** peer_ptrs,
+                                  int32_t* available, size_t tensorSize,
+                                  int rank, int numRanks, uint32_t sequence,
+                                  int signalMode, int numChannels,
+                                  cudaStream_t stream);
+
+void launchP2pAllgatherFifoRingKernel(void* input, void* output,
+                                      void* local_recv_base, void** peer_ptrs,
+                                      int32_t* available, size_t tensorSize,
+                                      int rank, int numRanks,
+                                      uint32_t sequence, int signalMode,
+                                      int numChannels, int fifoSlots,
+                                      cudaStream_t stream);
+
+void launchP2pAllgatherStoreSignalKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, int rank, int numRanks,
+    uint32_t sequence, cudaStream_t stream);
+
+void launchP2pAllgatherStoreSignalSlottedKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream);
+
+void launchP2pAllgatherStoreSignalSlottedGraphKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream);
+
+void launchP2pAllgatherStoreSignalSlottedChunkedKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t chunkBytes,
+    size_t slotStride, int slots, int rank, int numRanks,
+    uint32_t baseSequence, cudaStream_t stream);
+
+void launchP2pAllgatherStoreSignalSlottedChunkedGraphKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t chunkBytes,
+    size_t slotStride, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, cudaStream_t stream);
+
+void launchP2pAllgatherDirectOutputStoreSignalKernel(
+    void* input, void** output_peer_ptrs, void* local_recv_base,
+    void** scratch_peer_ptrs, int32_t* available, size_t tensorSize, int rank,
+    int numRanks, uint32_t sequence, cudaStream_t stream);
+
+void launchIpcAllgatherStoreKernel(void* input, const uintptr_t* outPtrs,
+                                   int rank, int numRanks, size_t tensorSize,
+                                   cudaStream_t stream);
+
+void launchIpcAllgatherStoreSignalKernel(
+    void* input, const uintptr_t* outPtrs, const uintptr_t* signalPtrs,
+    int rank, int numRanks, uint32_t sequence, size_t tensorSize,
+    cudaStream_t stream);
 
 class ConnectionContext;
 
 struct CudaTaskSubmissionToken {
     size_t task_id;
     uint64_t sequence;
+};
+
+struct PgProfileSlot {
+    uint64_t sequence = 0;
+    uint64_t issue_start_us = 0;
+    uint64_t wait_conn_us = 0;
+    uint64_t tensor_to_buffer_us = 0;
+    uint64_t enqueue_us = 0;
+    uint64_t buffer_to_tensor_us = 0;
+    uint64_t host_issue_us = 0;
 };
 
 class MooncakeWorker {
@@ -152,6 +270,7 @@ class MooncakeWorker {
     int cudaTaskCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
+    PgProfileSlot profile_slots_[kNumTasks_]{};
 
     std::thread worker_thread_;
 };
