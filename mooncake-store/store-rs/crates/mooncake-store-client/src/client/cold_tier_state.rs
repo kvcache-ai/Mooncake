@@ -318,6 +318,11 @@ impl OffloadPressureTracker {
     }
 }
 
+#[derive(Default)]
+struct HotReplicaTracker {
+    clock: Mutex<StorageClockState>,
+}
+
 struct ColdTierAdmission {
     config: ColdTierRateLimitConfig,
     runtime_offload: Mutex<ColdTierAdmissionBucket>,
@@ -391,6 +396,16 @@ struct PendingDeleteGcResult {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ColdTierMaintenanceStats {
     pub(crate) devices: BTreeMap<String, BackendMaintenanceStats>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ReclaimQueueSnapshot {
+    total_pending: usize,
+    due: usize,
+    cold_backing_reclaims: usize,
+    hot_segment_reclaims: usize,
+    by_qos_tier: BTreeMap<String, usize>,
+    by_policy_rank: BTreeMap<u8, usize>,
 }
 
 type SharedRestorePromotionQueue = Arc<RestorePromotionQueue>;
