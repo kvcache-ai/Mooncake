@@ -1031,7 +1031,6 @@ impl StorageOwnerState {
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
         self.route_ops.list_routes_by_replica_owner(owner)
     }
-
 }
 
 fn route_storage_bytes(route: &ObjectRoute, runtime: &ClientRuntimeId) -> u64 {
@@ -1054,11 +1053,7 @@ impl StorageClockState {
         self.track_route_with_fresh_write(route, runtime, false);
     }
 
-    fn track_fresh_route(
-        &mut self,
-        route: &ObjectRoute,
-        runtime: &ClientRuntimeId,
-    ) {
+    fn track_fresh_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
         self.track_route_with_fresh_write(route, runtime, true);
     }
 
@@ -1077,16 +1072,8 @@ impl StorageClockState {
         }
     }
 
-    fn untrack_route(
-        &mut self,
-        route: &ObjectRoute,
-        runtime: &ClientRuntimeId,
-    ) {
-        for replica in route
-            .replicas
-            .iter()
-            .filter(|replica| replica.owner == *runtime)
-        {
+    fn untrack_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        for replica in route.replicas.iter().filter(|replica| replica.owner == *runtime) {
             self.remove_id(&ClockEntryId {
                 route_key: route.key.clone(),
                 segment_name: replica.segment_name.clone(),
@@ -1100,11 +1087,7 @@ impl StorageClockState {
         self.track_route(route, runtime);
     }
 
-    fn sync_fresh_route(
-        &mut self,
-        route: &ObjectRoute,
-        runtime: &ClientRuntimeId,
-    ) {
+    fn sync_fresh_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
         self.remove_key(&route.key);
         self.track_fresh_route(route, runtime);
     }
@@ -1147,10 +1130,7 @@ impl StorageClockState {
         }
     }
 
-    fn pick_victim_clock(
-        &mut self,
-        preferred_segment: Option<&SegmentName>,
-    ) -> Option<ClockEntryId> {
+    fn pick_victim_clock(&mut self, preferred_segment: Option<&SegmentName>) -> Option<ClockEntryId> {
         if self.entries.is_empty() {
             return None;
         }
@@ -1363,8 +1343,6 @@ impl StoreState {
         snapshot
     }
 }
-
-
 
 fn watermark_bytes(capacity_bytes: u64, percent: u8) -> u64 {
     if percent == 0 || capacity_bytes == 0 {
