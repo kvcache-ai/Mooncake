@@ -380,6 +380,56 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 | `--enable_http_metadata_server` | `false` | Enable embedded HTTP metadata server |
 | `--http_metadata_server_host` | `0.0.0.0` | Metadata bind host |
 | `--http_metadata_server_port` | `8080` | Metadata TCP port |
+| `--enable_metadata_cleanup_on_timeout` | `false` | Delete a client's stale HTTP metadata (`mooncake/[<cluster>/]ram/<segment>` and `mooncake/[<cluster>/]rpc_meta/<segment>`) when its heartbeat times out (see below) |
+
+### Stale Metadata Cleanup on Client Timeout
+
+When a client crashes or is force-killed (`kill -9`, OOM, node failure), it cannot
+run its normal cleanup, leaving stale entries on the HTTP metadata server
+(`mooncake/[<cluster>/]ram/<segment>` and `mooncake/[<cluster>/]rpc_meta/<segment>`).
+The HTTP metadata server has no heartbeat of its own, so these entries linger and
+can mislead nodes that later connect or restart with different RDMA parameters.
+
+With `--enable_metadata_cleanup_on_timeout=true`, the Master Service reuses its
+existing client-heartbeat monitor: when a client's `--client_ttl` expires, in
+addition to unmounting the segment it also removes that client's `ram/` and
+`rpc_meta/` keys from the HTTP metadata server. It supports both deployment
+topologies:
+
+- **Co-located** (`--enable_http_metadata_server=true`): the master removes the
+  keys via a direct in-process call (no network overhead).
+- **Separately deployed** HTTP metadata server: the master derives the metadata
+  server address from the cluster's existing configuration and removes the keys
+  via HTTP `DELETE`. The address is read, in priority order, from:
+  1. the `MOONCAKE_TE_META_DATA_SERVER` environment variable (the same Transfer
+     Engine metadata connection string the clients use, e.g.
+     `http://host:8080/metadata`), then
+  2. the `metadata_server` field of the JSON file pointed to by
+     `MOONCAKE_CONFIG_PATH`.
+
+Notes:
+- Only `http(s)` metadata servers are supported; `etcd`/`redis`/`P2PHANDSHAKE`
+  backends are not cleaned up (a warning is logged and cleanup stays disabled).
+- The feature is opt-in and best-effort: if no co-located server is enabled and
+  no HTTP metadata address can be derived, the master logs a warning and
+  disables cleanup. Remote `DELETE` failures are logged but never block the
+  client-monitor thread or the main process.
+- Respects `MC_METADATA_CLUSTER_ID` for custom key prefixes (matching the
+  Transfer Engine).
+
+```bash
+# Co-located metadata server
+mooncake_master \
+  --enable_http_metadata_server=true \
+  --enable_metadata_cleanup_on_timeout=true \
+  --client_ttl=10
+
+# Separately-deployed HTTP metadata server (address derived from the env var)
+export MOONCAKE_TE_META_DATA_SERVER=http://metadata-host:8080/metadata
+mooncake_master \
+  --enable_metadata_cleanup_on_timeout=true \
+  --client_ttl=10
+```
 
 ### Memory Allocator
 
@@ -553,7 +603,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `metadata_server` | str | required | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
 | `global_segment_size` | int (bytes) | required | DRAM contributed to the cluster (the sample uses 3.2 GB) |
 | `local_buffer_size` | int (bytes) | required | Transfer Engine buffer |
-| `protocol` | str | required | `tcp` / `rdma` / `cxl` / `ascend` |
+| `protocol` | str | required | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
 | `rdma_devices` | str | required | RDMA NIC(s), comma-separated (pass `""` for non-RDMA). **Keyword is `rdma_devices`, not `device_name`** |
 | `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
@@ -581,8 +631,8 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 |----------|-------------------------|---------|-------------|
 | `MOONCAKE_MASTER` | `master_server_addr` | — (required unless `MOONCAKE_CONFIG_PATH`) | Master `host:port` |
 | `MOONCAKE_TE_META_DATA_SERVER` | `metadata_server` | `P2PHANDSHAKE` | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
-| `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `cxl` / `ascend` |
-| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA device(s), comma-separated; `auto-discovery` supported |
+| `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
+| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated; `auto-discovery` supported |
 | `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |

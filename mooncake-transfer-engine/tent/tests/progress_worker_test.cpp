@@ -20,7 +20,7 @@
 //     progressBatch / waitTransferCompletion) still sees its batch
 //     progress through failover;
 //   * one notify advances the engine by exactly one progress step;
-//   * freeBatch racing the worker is safe (no UAF, no crash);
+//   * freeBatch racing the worker, including cross-thread free, is safe;
 //   * worker shuts down cleanly on engine destruction.
 
 #include <gtest/gtest.h>
@@ -447,6 +447,46 @@ TEST(ProgressWorker, FreeBatchRacesWithWorker) {
 
     stop.store(true, std::memory_order_release);
     spammer.join();
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(ProgressWorker, BatchMayBeFreedFromDifferentThread) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xC4);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = 0;
+    std::thread allocator([&] { batch_id = engine.allocateBatch(1); });
+    allocator.join();
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    std::atomic<bool> free_ok{false};
+    std::thread freer([&] { free_ok.store(engine.freeBatch(batch_id).ok()); });
+    freer.join();
+    EXPECT_TRUE(free_ok.load());
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, status).IsInvalidArgument());
 
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }

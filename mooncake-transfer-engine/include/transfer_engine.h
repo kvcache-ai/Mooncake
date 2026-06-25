@@ -71,6 +71,10 @@ class TransferEngine {
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
+    TransferEngine(TransferEngine&&) = default;
+
+    TransferEngine& operator=(TransferEngine&&) = default;
+
     ~TransferEngine();
 
     int init(const std::string& metadata_conn_string,
@@ -87,6 +91,8 @@ class TransferEngine {
     std::string getLocalIpAndPort();
 
     int getRpcPort();
+
+    bool isUsingTent() const { return use_tent_; }
 
     SegmentHandle openSegment(const std::string& segment_name);
 

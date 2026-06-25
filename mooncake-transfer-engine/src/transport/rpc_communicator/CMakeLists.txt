@@ -10,7 +10,6 @@ target_link_libraries(rpc_communicator
     yalantinglibs::yalantinglibs 
     glog::glog 
     pthread 
-    ${Python3_LIBRARIES}
 )
 
 target_include_directories(rpc_communicator 

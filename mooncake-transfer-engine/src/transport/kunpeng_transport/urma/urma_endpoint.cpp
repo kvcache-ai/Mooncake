@@ -243,7 +243,11 @@ int UrmaContext::deconstruct() {
         urma_context_ = nullptr;
     }
 
-    urma_uninit();
+    // urma_uninit() is a global teardown and must only be called once via
+    // the static UrmaContext::uninit() (invoked by UbTransport::uninit()).
+    // Calling it here per-context would tear down the URMA runtime while
+    // other UrmaContext objects are still alive, causing the second and
+    // subsequent contexts to fail on urma_delete_context().
     return 0;
 }
 

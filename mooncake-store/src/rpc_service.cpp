@@ -13,8 +13,19 @@
 namespace mooncake {
 
 WrappedMasterService::WrappedMasterService(
-    const WrappedMasterServiceConfig& config)
-    : master_service_(MasterServiceConfig(config)) {}
+    const WrappedMasterServiceConfig& config,
+    HttpMetadataServer* http_metadata_server,
+    const std::string& http_metadata_remote_url)
+    : master_service_(MasterServiceConfig(config)) {
+    // Configure metadata cleanup on client timeout. Prefer the co-located
+    // in-process server; otherwise fall back to a separately-deployed HTTP
+    // metadata server derived from the cluster configuration.
+    if (http_metadata_server) {
+        master_service_.setHttpMetadataServer(http_metadata_server);
+    } else if (!http_metadata_remote_url.empty()) {
+        master_service_.setHttpMetadataRemoteUrl(http_metadata_remote_url);
+    }
+}
 
 WrappedMasterService::~WrappedMasterService() = default;
 

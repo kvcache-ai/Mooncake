@@ -135,6 +135,7 @@ design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
+design/ssd-free-ratio-first-allocation
 :::
 
 % API Documentation
