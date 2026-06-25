@@ -35,11 +35,22 @@ UrmaContext::UrmaContext(UbTransport& engine, std::string device_name,
       next_jfr_list_index_(0) {}
 
 UrmaContext::~UrmaContext() {
+    // toString() calls getAsyncFd() which dereferences urma_context_.
+    // getAsyncFd() must tolerate nullptr before we call it here.
     auto thisString = toString();
+
+    // worker_pool_ is a shared_ptr; reset on null is safe.
     worker_pool_.reset();
     LOG(INFO) << "destroy worker pool done.";
-    endpoint_store_->destroy();
-    LOG(INFO) << "destroy endpoint store done.";
+
+    // endpoint_store_ may be null if construction failed before doConstruct().
+    if (endpoint_store_) {
+        endpoint_store_->destroy();
+        LOG(INFO) << "destroy endpoint store done.";
+    } else {
+        LOG(INFO) << "endpoint store is null, skip destroy.";
+    }
+
     if (urma_context_) deconstruct();
     LOG(WARNING) << "finished destroy context : " << thisString;
 }
@@ -52,7 +63,10 @@ std::string UrmaContext::toString() {
     return ss.str();
 }
 
-int UrmaContext::getAsyncFd() { return urma_context_->async_fd; }
+int UrmaContext::getAsyncFd() {
+    if (urma_context_ == nullptr) return -1;
+    return urma_context_->async_fd;
+}
 
 int UrmaContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
