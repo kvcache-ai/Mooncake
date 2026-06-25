@@ -17,18 +17,6 @@ namespace mooncake {
 
 namespace {
 
-const device::AcceleratorDevice* FindDeviceForPointer(
-    const std::vector<const device::AcceleratorDevice*>& accelerators,
-    const void* ptr, device::PointerInfo* out_info = nullptr) {
-    for (auto* accelerator : accelerators) {
-        auto info = accelerator->QueryPointer(ptr);
-        if (info.kind != device::MemoryKind::kDevice) continue;
-        if (out_info) *out_info = info;
-        return accelerator;
-    }
-    return nullptr;
-}
-
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -500,22 +488,17 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // WriteBucket) always receives host pointers.
         std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
         std::vector<PinnedBufferPool::Buffer> staging_bufs;
-        auto accelerators = device::GetAcceleratorRegistry().AvailableDevices();
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
 
         for (auto& [obj_key, slices] : batch_object) {
             std::vector<Slice> host_slices;
             bool obj_success = true;
             for (const auto& slice : slices) {
-                device::PointerInfo pointer_info;
-                auto* accelerator =
-                    FindDeviceForPointer(accelerators, slice.ptr,
-                                         &pointer_info);
-                if (accelerator) {
-                    accelerator->SetContext(pointer_info.device_id);
+                if (runtime_accelerator.IsDevicePointer(slice.ptr)) {
                     auto buf = pinned_buffer_pool_->Acquire(slice.size);
-                    if (!accelerator->Copy(
-                            buf.data, slice.ptr, slice.size,
-                            device::CopyDirection::kDeviceToHost)) {
+                    if (!runtime_accelerator.CopyToHost(buf.data, slice.ptr,
+                                                        slice.size)) {
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
                         pinned_buffer_pool_->Release(std::move(buf));
                         obj_success = false;

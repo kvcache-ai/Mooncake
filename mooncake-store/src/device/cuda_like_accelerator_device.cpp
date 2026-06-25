@@ -1,5 +1,5 @@
 #include "device/accelerator_registry.h"
-#include "pinned_buffer_pool.h"
+#include "pinned_host_buffer.h"
 
 #include "cuda_alike.h"
 

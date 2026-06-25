@@ -17,22 +17,6 @@
 #include "spdk/spdk_wrapper.h"
 #endif
 
-namespace {
-
-const mooncake::device::AcceleratorDevice* FindDeviceForPointer(
-    const std::vector<const mooncake::device::AcceleratorDevice*>& accelerators,
-    const void* ptr, mooncake::device::PointerInfo* out_info = nullptr) {
-    for (auto* accelerator : accelerators) {
-        auto info = accelerator->QueryPointer(ptr);
-        if (info.kind != mooncake::device::MemoryKind::kDevice) continue;
-        if (out_info) *out_info = info;
-        return accelerator;
-    }
-    return nullptr;
-}
-
-}  // namespace
-
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
@@ -666,19 +650,17 @@ void MemcpyWorkerPool::workerThread() {
         if (task.state) {
             try {
                 bool ok = true;
-                auto accelerators =
-                    device::GetAcceleratorRegistry().AvailableDevices();
+                auto runtime_accelerator =
+                    device::GetAcceleratorRegistry().RuntimeAccelerators();
                 for (const auto& op : task.operations) {
                     device::PointerInfo src_info;
                     device::PointerInfo dst_info;
-                    auto* src_device =
-                        FindDeviceForPointer(accelerators, op.src, &src_info);
-                    auto* dst_device =
-                        FindDeviceForPointer(accelerators, op.dest, &dst_info);
+                    auto* src_device = runtime_accelerator.FindDeviceForPointer(
+                        op.src, &src_info);
+                    auto* dst_device = runtime_accelerator.FindDeviceForPointer(
+                        op.dest, &dst_info);
 
-                    if (!src_device && !dst_device) {
-                        std::memcpy(op.dest, op.src, op.size);
-                    } else {
+                    if (src_device || dst_device) {
                         if (src_device && dst_device &&
                             src_device != dst_device) {
                             LOG(ERROR)
@@ -690,19 +672,15 @@ void MemcpyWorkerPool::workerThread() {
                             ok = false;
                             break;
                         }
-                        auto* accelerator = src_device ? src_device : dst_device;
-                        const auto& info = src_device ? src_info : dst_info;
-                        accelerator->SetContext(info.device_id);
-                        if (!accelerator->Copy(op.dest, op.src, op.size,
-                                               device::CopyDirection::kAuto)) {
-                            LOG(ERROR)
-                                << "GPU memcpy failed: src_dev="
-                                << src_info.device_id
-                                << " dst_dev=" << dst_info.device_id
-                                << " size=" << op.size;
-                            ok = false;
-                            break;
-                        }
+                    }
+                    if (!runtime_accelerator.CopyMaybeAccelerator(
+                            op.dest, op.src, op.size)) {
+                        LOG(ERROR) << "GPU memcpy failed: src_dev="
+                                   << src_info.device_id
+                                   << " dst_dev=" << dst_info.device_id
+                                   << " size=" << op.size;
+                        ok = false;
+                        break;
                     }
                 }
 

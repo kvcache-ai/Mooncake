@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "device/accelerator_device.h"
+#include "device/runtime_accelerator.h"
 
 namespace mooncake {
 namespace device {
@@ -14,7 +15,7 @@ class AcceleratorRegistry {
 
     virtual std::span<const AcceleratorDevice* const> RegisteredDevices()
         const = 0;
-    virtual std::vector<const AcceleratorDevice*> AvailableDevices(
+    virtual RuntimeAccelerator RuntimeAccelerators(
         bool ensure = false) const = 0;
     virtual const AcceleratorDevice* GetDevice(AcceleratorVendor vendor)
         const = 0;

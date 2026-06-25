@@ -5,54 +5,8 @@
 #include <utility>
 #include <vector>
 
-namespace mooncake {
-namespace device {
-
-using PinnedHostBufferDeleter = void (*)(void* addr);
-
-struct PinnedHostBuffer {
-    void* addr = nullptr;
-    size_t size = 0;
-    PinnedHostBufferDeleter deleter = nullptr;
-
-    PinnedHostBuffer() = default;
-    PinnedHostBuffer(void* addr, size_t size,
-                     PinnedHostBufferDeleter deleter)
-        : addr(addr), size(size), deleter(deleter) {}
-
-    PinnedHostBuffer(const PinnedHostBuffer&) = delete;
-    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
-
-    PinnedHostBuffer(PinnedHostBuffer&& other) noexcept {
-        *this = std::move(other);
-    }
-    PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept {
-        if (this != &other) {
-            reset();
-            addr = other.addr;
-            size = other.size;
-            deleter = other.deleter;
-            other.addr = nullptr;
-            other.size = 0;
-            other.deleter = nullptr;
-        }
-        return *this;
-    }
-
-    ~PinnedHostBuffer() { reset(); }
-
-    void reset() {
-        if (addr && deleter) deleter(addr);
-        addr = nullptr;
-        size = 0;
-        deleter = nullptr;
-    }
-};
-
-}  // namespace device
-}  // namespace mooncake
-
 #include "device/accelerator_registry.h"
+#include "pinned_host_buffer.h"
 
 namespace mooncake {
 
@@ -73,13 +27,13 @@ class PinnedBufferPool {
     static constexpr size_t kDefaultMaxPoolSize = 32;
 
     struct Buffer {
-        device::PinnedHostBuffer pinned_host;
+        PinnedHostBuffer pinned_host;
         std::unique_ptr<char[]> pageable_host;
         char* data = nullptr;
         size_t capacity = 0;
 
         Buffer() = default;
-        explicit Buffer(device::PinnedHostBuffer pinned_host)
+        explicit Buffer(PinnedHostBuffer pinned_host)
             : pinned_host(std::move(pinned_host)),
               data(static_cast<char*>(this->pinned_host.addr)),
               capacity(this->pinned_host.size) {}
@@ -150,9 +104,9 @@ class PinnedBufferPool {
    private:
     static Buffer AllocNew(size_t size) {
         const auto& registry = device::GetAcceleratorRegistry();
-        auto available = registry.AvailableDevices();
-        if (available.size() == 1) {
-            auto host = available.front()->AllocatePinnedHost(size);
+        auto runtime_accelerator = registry.RuntimeAccelerators();
+        for (auto* accelerator : runtime_accelerator.Devices()) {
+            auto host = accelerator->AllocatePinnedHost(size);
             if (host.addr) return Buffer(std::move(host));
         }
         return Buffer::Pageable(size);

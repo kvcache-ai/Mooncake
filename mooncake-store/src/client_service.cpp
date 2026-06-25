@@ -45,18 +45,6 @@ namespace mooncake {
 
 namespace {
 
-const device::AcceleratorDevice* FindDeviceForPointer(
-    const std::vector<const device::AcceleratorDevice*>& accelerators,
-    const void* ptr, device::PointerInfo* out_info = nullptr) {
-    for (auto* accelerator : accelerators) {
-        auto info = accelerator->QueryPointer(ptr);
-        if (info.kind != device::MemoryKind::kDevice) continue;
-        if (out_info) *out_info = info;
-        return accelerator;
-    }
-    return nullptr;
-}
-
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
     const char* raw_value = std::getenv("MC_STORE_NUMA_SOCKET_ID");
@@ -3351,17 +3339,14 @@ void Client::PutToLocalFile(const std::string& key,
     // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
 
-    auto accelerators = device::GetAcceleratorRegistry().AvailableDevices();
     for (const auto& slice : slices) {
-        device::PointerInfo pointer_info;
-        auto* accelerator =
-            FindDeviceForPointer(accelerators, slice.ptr, &pointer_info);
-        if (accelerator) {
-            accelerator->SetContext(pointer_info.device_id);
+        if (runtime_accelerator.IsDevicePointer(slice.ptr)) {
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!accelerator->Copy(buf.data, slice.ptr, slice.size,
-                                   device::CopyDirection::kDeviceToHost)) {
+            if (!runtime_accelerator.CopyToHost(buf.data, slice.ptr,
+                                                slice.size)) {
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
                 pinned_buffer_pool_->Release(std::move(buf));

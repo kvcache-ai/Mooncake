@@ -263,34 +263,16 @@ void fill_ranged_read_results_with_error(
     }
 }
 
-const device::AcceleratorDevice* FindDeviceForPointer(
-    const void* ptr, device::PointerInfo* out_info = nullptr) {
-    for (auto* accelerator :
-         device::GetAcceleratorRegistry().AvailableDevices()) {
-        auto info = accelerator->QueryPointer(ptr);
-        if (info.kind != device::MemoryKind::kDevice) continue;
-        if (out_info) *out_info = info;
-        return accelerator;
-    }
-    return nullptr;
-}
-
 // Scatter host (CPU) memory to a destination that may be GPU or host.
 // Returns tl::expected<void, ErrorCode> for use in functions returning
 // tl::expected<int64_t, ErrorCode>.
 inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     void *dst, const void *src, size_t size, const std::string &context) {
-    device::PointerInfo pointer_info;
-    auto* accelerator = FindDeviceForPointer(dst, &pointer_info);
-    if (accelerator) {
-        accelerator->SetContext(pointer_info.device_id);
-        if (!accelerator->Copy(dst, src, size,
-                               device::CopyDirection::kHostToDevice)) {
-            LOG(ERROR) << "H2D copy failed: " << context;
-            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
-        }
-    } else {
-        memcpy(dst, src, size);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyFromHost(dst, src, size)) {
+        LOG(ERROR) << "H2D copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
     return {};
 }
@@ -2614,8 +2596,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // MEMORY / DISK: use client_->Get.  FilterQueryResult ensures
     // Client::Get's internal FindFirstCompleteReplica can only see
     // the replica we selected, preventing accidental LOCAL_DISK picks.
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
     if (replica.is_disk_replica() &&
-        FindDeviceForPointer(buffer_handle->ptr()) != nullptr) {
+        runtime_accelerator.IsDevicePointer(buffer_handle->ptr())) {
         LOG(WARNING) << "DISK replica for key '" << key
                      << "' received a device pointer from the allocator; "
                      << "file I/O cannot write to GPU memory — read will fail. "
@@ -2920,8 +2904,10 @@ RealClient::batch_get_buffer_internal(
         // DISK replicas use storage_backend::vector_read (file I/O) which
         // can only write to CPU-addressable memory.  If the allocator ever
         // returns device memory for DISK, the read will silently fail.
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
         if (replica.is_disk_replica() &&
-            FindDeviceForPointer(buffer_handle->ptr()) != nullptr) {
+            runtime_accelerator.IsDevicePointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << "DISK replica for key '" << key
                 << "' received a device pointer from the allocator; "

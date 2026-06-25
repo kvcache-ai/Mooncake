@@ -32,7 +32,7 @@ set(MOONCAKE_STORE_SOURCES
     storage/distributed/distributed_storage_backend.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
-    device/host_accelerator_device.cpp
+    device/runtime_accelerator.cpp
     device/cuda_like_accelerator_device.cpp
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp

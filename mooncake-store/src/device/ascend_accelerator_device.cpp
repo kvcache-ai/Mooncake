@@ -1,5 +1,5 @@
 #include "device/accelerator_registry.h"
-#include "pinned_buffer_pool.h"
+#include "pinned_host_buffer.h"
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include <acl/acl_rt.h>

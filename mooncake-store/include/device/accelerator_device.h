@@ -4,11 +4,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "pinned_host_buffer.h"
+
 namespace mooncake {
 namespace device {
 
 enum class AcceleratorVendor {
-    kHost,
     kNvidia,
     kMusa,
     kMaca,
@@ -37,8 +38,6 @@ struct PointerInfo {
     MemoryKind kind = MemoryKind::kUnknown;
     int32_t device_id = -1;
 };
-
-struct PinnedHostBuffer;
 
 class AcceleratorDevice {
    public:
