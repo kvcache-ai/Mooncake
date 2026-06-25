@@ -1051,20 +1051,21 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE: {
-                    if (engine_.isTcpOnly()) {
+                    if (engine_.hasRdmaTransport()) {
+                        auto [prepared, staging] =
+                            ensureRegisteredForRDMA(slices);
+                        if (prepared.empty() && !slices.empty()) {
+                            LOG(ERROR) << "ensureRegisteredForRDMA failed";
+                            return std::nullopt;
+                        }
+                        future = submitTransferEngineOperation(handle, prepared,
+                                                               op_code);
+                        if (future && !staging.empty()) {
+                            future->attachStagingHandles(std::move(staging));
+                        }
+                    } else {
                         future = submitTransferEngineOperation(handle, slices,
                                                                op_code);
-                        break;
-                    }
-                    auto [prepared, staging] = ensureRegisteredForRDMA(slices);
-                    if (prepared.empty() && !slices.empty()) {
-                        LOG(ERROR) << "ensureRegisteredForRDMA failed";
-                        return std::nullopt;
-                    }
-                    future = submitTransferEngineOperation(handle, prepared,
-                                                           op_code);
-                    if (future && !staging.empty()) {
-                        future->attachStagingHandles(std::move(staging));
                     }
                     break;
                 }
@@ -1118,10 +1119,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             return std::nullopt;
         }
 
-        // For non-TCP WRITE ops, ensure slices are in RDMA-registered memory.
+        // For RDMA WRITE ops, ensure slices are in registered memory.
         const std::vector<Slice>* effective_slices = &slices;
         std::vector<Slice> prepared;
-        if (op_code == TransferRequest::WRITE && !engine_.isTcpOnly()) {
+        if (op_code == TransferRequest::WRITE && engine_.hasRdmaTransport()) {
             auto [p, staging] = ensureRegisteredForRDMA(slices);
             if (p.empty() && !slices.empty()) {
                 LOG(ERROR) << "ensureRegisteredForRDMA failed in submit_batch";

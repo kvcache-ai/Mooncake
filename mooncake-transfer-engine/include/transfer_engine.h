@@ -178,6 +178,8 @@ class TransferEngine {
      */
     bool isTcpOnly() const;
 
+    bool hasRdmaTransport() const;
+
     int syncSegmentCache(const std::string& segment_name = "");
 
     std::shared_ptr<TransferMetadata> getMetadata();
