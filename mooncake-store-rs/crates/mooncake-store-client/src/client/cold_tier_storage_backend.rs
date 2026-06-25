@@ -408,7 +408,7 @@ pub(super) struct ColdObjectRead<'a, 'b> {
 
 /// A batched cold tier read request that returns an owned or pinned payload without copying.
 pub(super) struct ColdObjectPinnedRead<'a> {
-    cold_backing: &'a mooncake_store_core::ColdBackingRoute,
+    pub(super) cold_backing: &'a mooncake_store_core::ColdBackingRoute,
 }
 
 /// Reference-counted handle to a cold tier payload that avoids copying when the backend can
@@ -776,7 +776,48 @@ pub(crate) struct MountInfoEntry {
 
 #[path = "local_dir_cold_backend.rs"]
 mod local_dir_cold_backend;
+use local_dir_cold_backend::reconcile_cold_tier_startup;
 pub(crate) use local_dir_cold_backend::LocalDirPersistentStorageBackend;
+#[cfg(test)]
+pub(crate) use local_dir_cold_backend::{decode_backend_payload, encode_backend_payload};
+
+pub(super) enum DeferredColdTierReconcile {
+    LocalDir(
+        Arc<LocalDirPersistentStorageBackend>,
+        Vec<ResolvedColdTierTarget>,
+    ),
+}
+
+pub(super) fn run_deferred_cold_tier_reconciles(
+    deferred: Vec<DeferredColdTierReconcile>,
+    metadata: &dyn MetadataBackend,
+    route_directory: &dyn RouteDirectory,
+    lease: &ClientLease,
+) {
+    tracing::info!(
+        runtime = %lease.runtime,
+        deferred_count = deferred.len(),
+        "run_deferred_cold_tier_reconciles: starting"
+    );
+    for item in deferred {
+        let result = match &item {
+            DeferredColdTierReconcile::LocalDir(backend, devices) => reconcile_cold_tier_startup(
+                metadata,
+                route_directory,
+                lease,
+                backend.as_ref(),
+                devices,
+            ),
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                %error,
+                runtime = %lease.runtime,
+                "cold tier startup reconcile failed, orphan files will be cleaned by background GC"
+            );
+        }
+    }
+}
 
 pub(super) fn default_cold_tier_root() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -1154,7 +1195,7 @@ pub(crate) fn find_mount_for_path<'a>(
         .max_by_key(|entry| entry.mount_point.as_os_str().len())
 }
 
-fn encode_backend_component(value: &str) -> String {
+pub(super) fn encode_backend_component(value: &str) -> String {
     if value.is_empty() {
         return "~".to_string();
     }

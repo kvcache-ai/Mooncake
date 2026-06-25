@@ -18,6 +18,10 @@ struct MetadataRouteDirectory {
 }
 
 impl RouteDirectory for MetadataRouteDirectory {
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.metadata.as_ref()
+    }
+
     fn get_object_route(
         &self,
         _observer: &ClientLease,

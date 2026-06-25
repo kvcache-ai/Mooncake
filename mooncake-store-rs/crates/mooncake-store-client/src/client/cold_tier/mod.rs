@@ -42,14 +42,17 @@ fn env_flag_enabled(name: &str) -> bool {
 #[allow(unused_imports)]
 pub(super) use device::cold_tier_free_percentage;
 pub(super) use eviction::{route_after_replica_eviction, EvictionReadySignal};
+#[allow(unused_imports)]
 pub(super) use helpers::{
-    backend_load_cold_payload_batch_into, backend_remove_cold_payload,
-    backend_remove_cold_payload_batch, backend_remove_pending_source,
-    backend_store_cold_payload_batch, backend_store_pending_source, cold_only_read_placeholder,
-    cold_restore_flight_key, is_cold_backing_placeholder, materialized_cold_backing,
-    payload_checksum, read_local_hot_replica_payload, same_cold_payload,
-    validate_cold_restore_payload, with_disjoint_restore_caller_buffers,
+    backend_load_cold_payload_batch_into, backend_load_cold_payload_batch_pinned,
+    backend_remove_cold_payload, backend_remove_cold_payload_batch, backend_remove_pending_source,
+    backend_store_cold_payload_batch, backend_store_pending_source, cold_backing_placeholder,
+    cold_only_read_placeholder, cold_restore_flight_key, is_cold_backing_placeholder,
+    materialized_cold_backing, payload_checksum, read_local_hot_replica_payload, same_cold_payload,
+    validate_cold_restore_payload, validate_resolved_payload_checksum,
+    with_disjoint_restore_caller_buffers,
 };
+#[allow(unused_imports)]
 pub(super) use metrics::{
     record_cold_restore_batch_duration, record_cold_restore_batch_items,
     record_cold_restore_singleflight, record_cold_tier_ssd_read,
@@ -70,12 +73,11 @@ pub(super) use offload::{
 pub(super) use restore::restore_payload_from_cold_backing;
 #[allow(unused_imports)]
 pub(super) use restore::{
-    batch_contains_cold_backing_placeholder, batch_read_from_cold_staged,
-    enqueue_restore_promotion, execute_batch_get_with_cold_restore, execute_cold_restore_direct,
-    execute_local_restore_batch_reads, execute_owner_cold_restore_promote_phase,
-    execute_owner_cold_restore_ssd_phase_staging, promote_owned_materialized_route_by_key,
-    read_from_cold_one_shot, trigger_remote_owner_cold_restore, try_init_staging_pool,
-    wait_for_restore_promotions, PromoteTimingBreakdown,
+    batch_read_from_cold_staged, enqueue_restore_promotion, execute_local_restore_batch_reads,
+    execute_owner_cold_restore_promote_phase, execute_owner_cold_restore_ssd_phase_staging,
+    promote_owned_materialized_route_by_key, read_from_cold_one_shot,
+    trigger_remote_owner_cold_restore, try_init_staging_pool, wait_for_restore_promotions,
+    PromoteTimingBreakdown,
 };
 pub(super) use scheduler::ColdTierHandle;
 pub(super) use staging_pool::{ColdRestoreStagingPool, StagingSlot};

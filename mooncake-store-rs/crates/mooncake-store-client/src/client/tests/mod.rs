@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
+use std::fs;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
@@ -22,15 +23,18 @@ use mooncake_transport::{Opcode, TransferPacingMode};
 use parking_lot::Mutex;
 
 use super::{
-    align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
-    control_bind_host, copy_into_region, effective_route_policy, encode_lifecycle_state,
-    flatten_slices, now_ms, payload_checksum, record_success_metric, route_topk_from_tenant_spec,
+    align_up_u64, backend_store_cold_payload_batch, bootstrap_route_policy,
+    cached_live_client_snapshot, compatibility_matches, control_bind_host, copy_into_region,
+    decode_backend_payload, effective_route_policy, encode_backend_component,
+    encode_backend_payload, encode_lifecycle_state, flatten_slices, now_ms, payload_checksum,
+    record_success_metric, restore_payload_from_cold_backing, route_topk_from_tenant_spec,
     run_bounded_parallel_jobs, scatter_into_buffers, shared_cold_tier_device_cache,
     shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
-    ColdTierBackendResolver, ColdTierKind, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
-    ColdTierRateLimitConfig, ColdTierTargetConfig, ColdTierWatermarkConfig, LiveClientCache,
-    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
-    ReplicaWriteTarget, ResolvedObject, RouteWriteGate, SegmentAllocator,
+    ColdObjectRead, ColdObjectWrite, ColdTierBackendResolver, ColdTierKind, ColdTierOffloadMode,
+    ColdTierOffloadPriorityConfig, ColdTierRateLimitConfig, ColdTierTargetConfig,
+    ColdTierWatermarkConfig, LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState,
+    LocalAuthorityAdapter, LocalDirPersistentStorageBackend, PendingReclaim,
+    PersistentStorageBackend, ReplicaWriteTarget, ResolvedObject, RouteWriteGate, SegmentAllocator,
     StorageOwnerColdTierConfig, StorageOwnerState, StoreState, SuspectRuntimeCache,
 };
 use crate::{
@@ -124,6 +128,8 @@ struct CountingMetadataBackend {
 struct CountingRouteDirectory {
     inner: Arc<dyn RouteDirectory>,
     get_object_routes_calls: AtomicUsize,
+    bounded_reads: Arc<AtomicUsize>,
+    full_reads: Arc<AtomicUsize>,
 }
 
 struct EmptyConflictRouteDirectory {
@@ -219,6 +225,9 @@ impl crate::control_plane::EvictionService for NoopEvictionService {
 struct BlockingCasMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     block_key: ObjectKey,
+    empty_conflict_key: Option<ObjectKey>,
+    error_key: StdMutex<Option<ObjectKey>>,
+    error_cas_failures_remaining: AtomicUsize,
     gate: Arc<(StdMutex<BlockingCasGateState>, Condvar)>,
     omit_current_on_conflict: AtomicBool,
 }
@@ -243,6 +252,95 @@ struct RecoverableMetadataState {
     hidden_clients: BTreeSet<String>,
     hidden_segments: BTreeSet<String>,
     hide_route_policy: bool,
+}
+
+struct CountingStorageBackend {
+    inner: LocalDirPersistentStorageBackend,
+    reads: AtomicUsize,
+    batch_reads: AtomicUsize,
+    delay: Duration,
+}
+
+impl CountingStorageBackend {
+    fn new(inner: LocalDirPersistentStorageBackend) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+            batch_reads: AtomicUsize::new(0),
+            delay: Duration::from_millis(25),
+        }
+    }
+
+    fn read_count(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    fn batch_read_count(&self) -> usize {
+        self.batch_reads.load(Ordering::SeqCst)
+    }
+}
+
+impl PersistentStorageBackend for CountingStorageBackend {
+    fn put_object(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+        payload: &[u8],
+    ) -> mooncake_store_core::Result<mooncake_store_core::ColdBackingRoute> {
+        self.inner.put_object(cold_backing, payload)
+    }
+
+    fn get_object(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<Option<Vec<u8>>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        sleep(self.delay);
+        self.inner.get_object(cold_backing)
+    }
+
+    fn get_objects_into_batch(
+        &self,
+        reads: &mut [ColdObjectRead<'_, '_>],
+    ) -> Vec<mooncake_store_core::Result<Option<usize>>> {
+        self.batch_reads.fetch_add(1, Ordering::SeqCst);
+        reads
+            .iter_mut()
+            .map(|read| {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                sleep(self.delay);
+                self.inner.get_object_into(read.cold_backing, read.dst)
+            })
+            .collect()
+    }
+
+    fn delete_object(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_object(cold_backing)
+    }
+
+    fn put_pending_source(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+        payload: &[u8],
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_pending_source(cold_backing, payload)
+    }
+
+    fn get_pending_source(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<Option<Vec<u8>>> {
+        self.inner.get_pending_source(cold_backing)
+    }
+
+    fn delete_pending_source(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_pending_source(cold_backing)
+    }
 }
 
 impl CountingMetadataBackend {
@@ -311,6 +409,8 @@ impl CountingRouteDirectory {
         Self {
             inner,
             get_object_routes_calls: AtomicUsize::new(0),
+            bounded_reads: Arc::new(AtomicUsize::new(0)),
+            full_reads: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -380,9 +480,42 @@ impl FinalizeFailureMetadataBackend {
 
 impl BlockingCasMetadataBackend {
     fn new(inner: Arc<InMemoryMetadataBackend>, block_key: &str) -> Self {
+        Self::with_options(inner, ObjectKey::new(block_key), None, None, usize::MAX)
+    }
+
+    fn with_empty_conflict(inner: Arc<InMemoryMetadataBackend>, conflict_key: &str) -> Self {
+        Self::with_options(
+            inner,
+            ObjectKey::new(""),
+            Some(ObjectKey::new(conflict_key)),
+            None,
+            usize::MAX,
+        )
+    }
+
+    fn with_route_error(inner: Arc<InMemoryMetadataBackend>, error_key: &str) -> Self {
+        Self::with_options(
+            inner,
+            ObjectKey::new(""),
+            None,
+            Some(ObjectKey::new(error_key)),
+            usize::MAX,
+        )
+    }
+
+    fn with_options(
+        inner: Arc<InMemoryMetadataBackend>,
+        block_key: ObjectKey,
+        empty_conflict_key: Option<ObjectKey>,
+        error_key: Option<ObjectKey>,
+        error_cas_failures_remaining: usize,
+    ) -> Self {
         Self {
             inner,
-            block_key: ObjectKey::new(block_key),
+            block_key,
+            empty_conflict_key,
+            error_key: StdMutex::new(error_key),
+            error_cas_failures_remaining: AtomicUsize::new(error_cas_failures_remaining),
             gate: Arc::new((
                 StdMutex::new(BlockingCasGateState {
                     armed: false,
@@ -1634,6 +1767,7 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.get_object_routes_calls.fetch_add(1, Ordering::Relaxed);
+        self.full_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.get_object_routes(observer, keys)
     }
 
@@ -1642,6 +1776,7 @@ impl RouteDirectory for CountingRouteDirectory {
         observer: &ClientLease,
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.bounded_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.get_object_routes_bounded(observer, keys)
     }
 
@@ -1716,6 +1851,10 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> Vec<Option<RouteVersion>> {
         self.inner.get_version_floors(observer, keys)
+    }
+
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.inner.metadata()
     }
 }
 
@@ -1860,6 +1999,10 @@ impl RouteDirectory for EmptyConflictRouteDirectory {
         keys: &[ObjectKey],
     ) -> Vec<Option<RouteVersion>> {
         self.inner.get_version_floors(observer, keys)
+    }
+
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.inner.metadata()
     }
 }
 
@@ -2265,6 +2408,39 @@ impl MetadataBackend for BlockingCasMetadataBackend {
                 state.armed = false;
             }
         }
+        if self
+            .empty_conflict_key
+            .as_ref()
+            .is_some_and(|conflict_key| conflict_key == key)
+        {
+            return Ok(mooncake_store_core::CasResult {
+                applied: false,
+                current: None,
+                version_floor: None,
+            });
+        }
+        let should_error = self
+            .error_key
+            .lock()
+            .expect("blocking CAS error key lock should succeed")
+            .as_ref()
+            .is_some_and(|error_key| error_key == key);
+        if should_error {
+            let remaining = self.error_cas_failures_remaining.load(Ordering::SeqCst);
+            if remaining == usize::MAX
+                || self
+                    .error_cas_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        current.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(StoreError::Metadata(format!(
+                    "injected CAS error for {}",
+                    key.0
+                )));
+            }
+        }
         let result = self
             .inner
             .compare_and_swap_object_route(key, expected, next)?;
@@ -2513,11 +2689,15 @@ fn test_future_expiry_ms() -> u64 {
     now_ms().saturating_add(30_000)
 }
 
-fn cold_tier_test_root(name: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
+fn cold_tier_existing_test_root(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
         "mooncake-store-client-cold-tier-test-{}-{name}",
         std::process::id()
-    ));
+    ))
+}
+
+fn cold_tier_test_root(name: &str) -> std::path::PathBuf {
+    let root = cold_tier_existing_test_root(name);
     let _ = std::fs::remove_dir_all(&root);
     root
 }
@@ -2529,6 +2709,27 @@ fn cold_tier_test_config(name: &str) -> ColdTierTargetConfig {
 
 fn cold_tier_test_config_with_root(name: &str, root: std::path::PathBuf) -> ColdTierTargetConfig {
     ColdTierTargetConfig::directory(name, ColdTierKind::Ssd, root)
+}
+
+fn test_backend_for(
+    cold_backing: &mooncake_store_core::ColdBackingRoute,
+) -> LocalDirPersistentStorageBackend {
+    LocalDirPersistentStorageBackend::new_with_root(cold_tier_existing_test_root(
+        &cold_backing.cold_tier_id,
+    ))
+}
+
+fn store_test_cold_payload(cold_backing: &mooncake_store_core::ColdBackingRoute, payload: &[u8]) {
+    let writes = [ColdObjectWrite {
+        route: None,
+        cold_backing,
+        payload,
+    }];
+    let mut results = backend_store_cold_payload_batch(&test_backend_for(cold_backing), &writes);
+    results
+        .pop()
+        .expect("cold payload store should return one result")
+        .expect("cold payload store should succeed");
 }
 
 fn wait_for_materialized_cold_backing(
@@ -2552,6 +2753,22 @@ fn wait_for_materialized_cold_backing(
         );
         sleep(Duration::from_millis(10));
     }
+}
+
+fn force_cold_only_route(client: &StoreClient, key: &str) {
+    let route = client
+        .query_route(key)
+        .expect("route query should succeed")
+        .expect("route should exist");
+    let mut next = route.clone();
+    next.version = route.version.next();
+    next.replicas.clear();
+    assert!(
+        client
+            .cas_route(key, Some(route.version), Some(&next))
+            .expect("cold-only route CAS should succeed")
+            .applied
+    );
 }
 
 fn wait_for_route_replica_on_owner(
@@ -17247,6 +17464,7 @@ fn is_exist_evicts_unreadable_route_and_sets_version_floor() {
 }
 
 mod adversarial;
+mod cold_tier_restore_tests;
 mod fault_injection_prop;
 mod lifecycle_tests;
 mod namespace_adversarial;

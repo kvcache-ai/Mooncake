@@ -88,6 +88,10 @@ impl RouteDirectory for CasErrorRouteDirectory {
     ) -> StoreResult<Vec<ObjectRoute>> {
         self.inner.list_routes_by_replica_owner(observer, owner)
     }
+
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.inner.metadata()
+    }
 }
 
 struct PanickingOnceTransportFactory {
@@ -2372,7 +2376,8 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
         &current,
         &ReplicaReadSelector::Segment(SegmentName::new("seg-a")),
     )
-    .expect("segment selector should resolve");
+    .expect("segment selector should resolve")
+    .expect("segment selector should return a hot replica");
     assert_eq!(by_segment.owner, source_owner);
     assert_eq!(by_segment.segment_name, SegmentName::new("seg-a"));
 
@@ -2383,7 +2388,8 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
             segment_name: SegmentName::new("seg-b"),
         },
     )
-    .expect("owner+segment selector should resolve");
+    .expect("owner+segment selector should resolve")
+    .expect("owner+segment selector should return a hot replica");
     assert_eq!(by_owner_and_segment.owner, replica_b_owner);
     assert_eq!(by_owner_and_segment.segment_name, SegmentName::new("seg-b"));
 }

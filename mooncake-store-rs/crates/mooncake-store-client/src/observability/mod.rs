@@ -28,8 +28,12 @@ pub use registry::{MetricsSnapshot, OperationMetricSnapshot};
 
 static TRACING_STATE: OnceLock<()> = OnceLock::new();
 static METRICS_HTTP_SERVER: OnceLock<Mutex<Option<MetricsHttpServer>>> = OnceLock::new();
+static DEBUG_EVICT_ALL_FN: OnceLock<Mutex<Option<DebugEvictAllFn>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_PROCESS_LOCK: OnceLock<ReentrantMutex<()>> = OnceLock::new();
+
+/// Callback type for the debug evict-all endpoint.
+type DebugEvictAllFn = Arc<dyn Fn() -> Result<usize> + Send + Sync>;
 
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
@@ -336,6 +340,15 @@ fn open_trace_file(path: &Path) -> Result<File> {
         })
 }
 
+/// Register a debug callback for the `POST /debug/evict-all` endpoint on the
+/// metrics HTTP server.  Must be called after `start_metrics_http_server`.
+#[allow(dead_code)]
+pub fn register_debug_evict_all(callback: DebugEvictAllFn) {
+    *debug_evict_all_callback()
+        .lock()
+        .expect("debug evict-all callback lock poisoned") = Some(callback);
+}
+
 pub fn start_metrics_http_server(bind_addr: &str) -> Result<String> {
     let mut server = metrics_http_server()
         .lock()
@@ -487,6 +500,10 @@ fn metrics_http_server() -> &'static Mutex<Option<MetricsHttpServer>> {
     METRICS_HTTP_SERVER.get_or_init(|| Mutex::new(None))
 }
 
+fn debug_evict_all_callback() -> &'static Mutex<Option<DebugEvictAllFn>> {
+    DEBUG_EVICT_ALL_FN.get_or_init(|| Mutex::new(None))
+}
+
 fn run_metrics_http_server(
     listener: TcpListener,
     shutdown_rx: Receiver<()>,
@@ -512,28 +529,31 @@ fn handle_metrics_http_connection(
     if stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).is_err() {
         return;
     }
-    let path = match read_http_path(&mut stream) {
-        Ok(path) => path,
+    let (method, path) = match read_http_request_line(&mut stream) {
+        Ok(parsed) => parsed,
         Err(_) => return,
     };
-    let (status, content_type, body) = match path.as_str() {
-        "/metrics" => (
+    let (status, content_type, body) = match (method.as_str(), path.as_str()) {
+        ("GET", "/metrics") => (
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
             render_prometheus_metrics_with_registry(registry),
         ),
-        "/stats" => (
+        ("GET", "/stats") => (
             "200 OK",
             "application/json; charset=utf-8",
             render_stats_json_with_registry(registry),
         ),
-        "/breakdown" => (
+        (_, "/breakdown") => (
             "200 OK",
             "application/json; charset=utf-8",
             render_breakdown_json_with_registry(registry),
         ),
-        "/healthz" | "/livez" => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
-        path if path.starts_with("/tracing") || path.starts_with("/trace") => {
+        (_, "/healthz") | (_, "/livez") => {
+            ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string())
+        }
+        ("POST", "/debug/evict-all") => handle_debug_evict_all(),
+        (_, path) if path.starts_with("/tracing") || path.starts_with("/trace") => {
             match profiling::handle_tracing_http_path(path) {
                 Ok(body) => ("200 OK", "application/json; charset=utf-8", body),
                 Err(error) => (
@@ -558,7 +578,39 @@ fn handle_metrics_http_connection(
     let _ = stream.flush();
 }
 
-fn read_http_path(stream: &mut TcpStream) -> std::io::Result<String> {
+fn handle_debug_evict_all() -> (&'static str, &'static str, String) {
+    let callback = {
+        let callback = debug_evict_all_callback()
+            .lock()
+            .expect("debug evict-all callback lock poisoned")
+            .clone();
+        let Some(callback) = callback else {
+            return (
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                r#"{"error":"evict-all callback not registered"}"#.to_string(),
+            );
+        };
+        callback
+    };
+    match callback() {
+        Ok(evicted) => (
+            "200 OK",
+            "application/json; charset=utf-8",
+            format!(r#"{{"evicted":{evicted}}}"#),
+        ),
+        Err(error) => (
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            format!(
+                r#"{{"error":"{}"}}"#,
+                error.to_string().replace('"', "\\\"")
+            ),
+        ),
+    }
+}
+
+fn read_http_request_line(stream: &mut TcpStream) -> std::io::Result<(String, String)> {
     let mut request = Vec::with_capacity(1024);
     let mut buffer = [0_u8; 512];
     loop {
@@ -574,12 +626,9 @@ fn read_http_path(stream: &mut TcpStream) -> std::io::Result<String> {
     let request = String::from_utf8_lossy(&request);
     let first_line = request.lines().next().unwrap_or_default();
     let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or("/");
-    if method != "GET" {
-        return Ok("/".to_string());
-    }
-    Ok(path.to_string())
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    Ok((method, path))
 }
 
 fn default_scope(operation: &'static str) -> &'static str {
@@ -1776,6 +1825,28 @@ mod tests {
         server
             .shutdown()
             .expect("metrics server should stop cleanly");
+    }
+
+    #[test]
+    fn debug_evict_all_registration_replaces_previous_callback() {
+        let _guard = metrics_test_lock().lock();
+        *debug_evict_all_callback()
+            .lock()
+            .expect("debug evict-all callback lock should not be poisoned") = None;
+
+        register_debug_evict_all(Arc::new(|| {
+            Err(StoreError::InvalidState("stale callback".to_string()))
+        }));
+        register_debug_evict_all(Arc::new(|| Ok(7)));
+
+        let (status, content_type, body) = handle_debug_evict_all();
+        assert_eq!(status, "200 OK");
+        assert_eq!(content_type, "application/json; charset=utf-8");
+        assert_eq!(body, r#"{"evicted":7}"#);
+
+        *debug_evict_all_callback()
+            .lock()
+            .expect("debug evict-all callback lock should not be poisoned") = None;
     }
 
     fn http_get(address: &str, path: &str) -> String {

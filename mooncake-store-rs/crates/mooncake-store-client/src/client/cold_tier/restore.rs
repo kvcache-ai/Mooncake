@@ -1,336 +1,37 @@
 use super::super::{
-    cold_tier_device_id, compatibility_matches, payload_checksum, registry, AsyncEvictionHandle,
+    cold_tier_device_id, compatibility_matches, registry, AsyncEvictionHandle,
     AsyncReplicaTrackHandle, AsyncRouteHitReportHandle, ColdObjectRead, ColdRestoreFlightLeader,
-    ColdRestoreFlightRegistration, ColdTierHandle, ColdTierRateLimitConfig, ControlPlaneHandle,
-    LocalAllocatorState, MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker,
-    ReplicaRoute, ReplicaTier, ReplicationPolicy, RequestDeadline, ResolvedObject,
-    RestorePromotionKey, RestorePromotionPayload, RestorePromotionPushOutcome,
-    RestorePromotionQueue, RestorePromotionTask, Result, RouteState, SegmentName,
-    SegmentTargetChunk, StorageOwnerState, StoreClient, StoreError, StoreTransport,
+    ColdRestoreFlightRegistration, ColdTierAdmissionPermit, ColdTierHandle,
+    ColdTierRateLimitConfig, ControlPlaneHandle, LocalAllocatorState, MembershipSyncHandle,
+    ObjectKey, ObjectRef, ObjectRoute, OperationTracker, ReplicaRoute, ReplicaTier,
+    ReplicationPolicy, RequestDeadline, ResolvedObject, RestorePromotionKey,
+    RestorePromotionPayload, RestorePromotionPushOutcome, RestorePromotionQueue,
+    RestorePromotionTask, Result, RouteState, StorageOwnerState, StoreClient, StoreError,
     DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
 };
 use super::{
     backend_load_cold_payload_batch_into, cold_restore_flight_key, materialized_cold_backing,
-    record_cold_restore_batch_duration, record_cold_restore_batch_items,
-    select_cold_backing_target, validate_cold_restore_payload,
-    with_disjoint_restore_caller_buffers,
+    payload_checksum, record_cold_tier_ssd_read, select_cold_backing_target,
+    validate_cold_restore_payload, with_disjoint_restore_caller_buffers,
 };
 use std::{
-    collections::{BTreeSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicUsize},
         Arc,
     },
     thread::sleep,
-    time::Duration,
 };
 use tracing::{debug, info, warn};
 
-impl StorageOwnerState {
-    pub(in super::super) fn current_materialized_route(
-        &self,
-        key: &ObjectKey,
-    ) -> Result<Option<ObjectRoute>> {
-        let Some(route) = self.route_ops.load_route(key)? else {
-            self.hot_replicas.clock.lock().remove_key(key);
-            return Ok(None);
-        };
-        self.sync_route(&route);
-        if route.state == RouteState::Active
-            && route.cold_backing.as_ref().is_some_and(|cold_backing| {
-                cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
-            })
-        {
-            Ok(Some(route))
-        } else {
-            Ok(None)
-        }
+impl StoreClient {
+    /// Debug/test-only: evict all DRAM KV cache entries from this storage owner.
+    ///
+    /// Returns the number of entries evicted.
+    #[cfg(test)]
+    pub fn debug_evict_all(&self) -> Result<usize> {
+        self.wait_for_restore_promotions();
+        self.storage_owner.evict_all(&self.restore_promotions)
     }
-
-    pub(in super::super) fn reserve_owner_restore_space(
-        &self,
-        length_bytes: u64,
-    ) -> Result<mooncake_store_core::SegmentReservation> {
-        match self
-            .allocator
-            .lock()
-            .reserve_any(&self.runtime, length_bytes)
-        {
-            Ok(reservation) => Ok(reservation),
-            Err(first_error) => {
-                if self.evict_one_blocking(None)? {
-                    self.allocator
-                        .lock()
-                        .reserve_any(&self.runtime, length_bytes)
-                } else {
-                    Err(first_error)
-                }
-            }
-        }
-    }
-
-    pub(in super::super) fn sweep_expired_staging_slots(&self, ttl: Duration) -> usize {
-        let expired = {
-            let mut pending = self.pending_staging_slots.lock();
-            let mut expired = Vec::new();
-            pending.retain(|(segment, offset), (_, inserted_at)| {
-                if inserted_at.elapsed() < ttl {
-                    return true;
-                }
-                expired.push((segment.clone(), *offset));
-                false
-            });
-            expired
-        };
-        for (segment, offset) in &expired {
-            self.read_pin_registry.force_unpin(segment, *offset);
-        }
-        if !expired.is_empty() {
-            record_cold_restore_batch_items("staging_slots_swept", expired.len() as u64);
-            info!(
-                runtime = %self.runtime,
-                swept = expired.len(),
-                ttl_ms = ttl.as_millis() as u64,
-                "swept expired cold restore staging slots"
-            );
-        }
-        expired.len()
-    }
-
-    pub(in super::super) fn evict_one_clean_and_reserve_bounded(
-        &self,
-        length_bytes: u64,
-        preferred_segment: Option<&SegmentName>,
-    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
-        match self
-            .allocator
-            .lock()
-            .reserve_any(&self.runtime, length_bytes)
-        {
-            Ok(reservation) => Ok(Some(reservation)),
-            Err(_) => {
-                if self.evict_one_blocking(preferred_segment)? {
-                    self.allocator
-                        .lock()
-                        .reserve_any(&self.runtime, length_bytes)
-                        .map(Some)
-                } else {
-                    Ok(None)
-                }
-            }
-        }
-    }
-}
-
-pub(in super::super) fn batch_contains_cold_backing_placeholder(
-    resolved: &[ResolvedObject],
-) -> bool {
-    resolved
-        .iter()
-        .any(|entry| super::is_cold_backing_placeholder(&entry.replica))
-}
-
-pub(in super::super) fn execute_batch_get_with_cold_restore(
-    client: &StoreClient,
-    transport: &dyn StoreTransport,
-    resolved: &mut [ResolvedObject],
-    buffers: &mut [&mut [u8]],
-    lengths: Vec<usize>,
-) -> Result<Vec<usize>> {
-    let total_bytes = lengths.iter().map(|length| *length as u64).sum::<u64>();
-    let attempts = resolved
-        .iter()
-        .map(|entry| 1 + entry.fallback_replicas.len())
-        .max()
-        .unwrap_or(1);
-    let request_deadline = client.request_deadline_for_transfer(total_bytes, attempts);
-    let mut checked_remote_runtimes = BTreeSet::new();
-    let local_segments = client.local_storage_segments();
-    for (entry, buffer) in resolved.iter_mut().zip(buffers.iter_mut()) {
-        if super::is_cold_backing_placeholder(&entry.replica) {
-            execute_cold_restore_direct(client, transport, entry, buffer, request_deadline)?;
-        } else {
-            client.read_single_object_with_failover(
-                transport,
-                entry,
-                buffer,
-                &mut checked_remote_runtimes,
-                &local_segments,
-                request_deadline,
-            )?;
-        }
-    }
-    let payloads = buffers
-        .iter()
-        .zip(lengths.iter())
-        .map(|(buffer, length)| &buffer[..*length])
-        .collect::<Vec<_>>();
-    StoreClient::validate_batch_replica_checksums(resolved, &payloads)?;
-    Ok(lengths)
-}
-
-pub(in super::super) fn execute_cold_restore_direct(
-    client: &StoreClient,
-    transport: &dyn StoreTransport,
-    resolved: &ResolvedObject,
-    buffer: &mut [u8],
-    request_deadline: RequestDeadline,
-) -> Result<()> {
-    if super::cold_tier_disabled() {
-        return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
-    }
-    let cold_backing = materialized_cold_backing(&resolved.route).ok_or_else(|| {
-        StoreError::NotFound(format!(
-            "route {} has no materialized cold backing",
-            resolved.route.key.0
-        ))
-    })?;
-    let length = cold_backing.length as usize;
-    if buffer.len() < length {
-        return Err(StoreError::Allocator(format!(
-            "buffer too small for tenant={} key={}: need {length}, have {}",
-            resolved.tenant,
-            resolved.key,
-            buffer.len()
-        )));
-    }
-    if cold_backing.owner == client.lease.runtime {
-        let backend = client
-            .storage_owner
-            .cold_tier_devices
-            .backend_for_with_refresh(
-                client.metadata.as_ref(),
-                &cold_backing,
-                "local_read_cold_restore_backend_refresh",
-            )?;
-        let Some(read_len) = backend.get_object_into(&cold_backing, &mut buffer[..length])? else {
-            return Err(StoreError::NotFound(format!(
-                "cold backing {}:{} not found",
-                cold_backing.cold_tier_id, cold_backing.object_locator
-            )));
-        };
-        if read_len != length {
-            return Err(StoreError::InvalidState(format!(
-                "cold backing {} length mismatch: expected {} actual {}",
-                cold_backing.object_locator, length, read_len
-            )));
-        }
-        if let Some(expected) = cold_backing.checksum {
-            let actual = payload_checksum(&buffer[..length]);
-            if actual != expected {
-                return Err(StoreError::InvalidState(format!(
-                    "cold backing {} checksum mismatch: expected {} actual {}",
-                    cold_backing.object_locator, expected, actual
-                )));
-            }
-        }
-        enqueue_restore_promotion(
-            client,
-            resolved,
-            RestorePromotionPayload::Shared(Arc::new(buffer[..length].to_vec())),
-        );
-        return Ok(());
-    }
-
-    let lease = client.lookup_runtime_lease(&cold_backing.owner)?;
-    let request = crate::control_plane::pb::ReadFromColdRequest {
-        namespace: client.metadata.route_namespace(),
-        authority: cold_backing.owner.stable_id.0.clone(),
-        tenant: resolved.tenant.clone(),
-        key: resolved
-            .route
-            .logical_key
-            .clone()
-            .unwrap_or_else(|| resolved.key.clone()),
-        domain: resolved
-            .route
-            .namespace
-            .as_ref()
-            .map(|scope| scope.domain.clone())
-            .unwrap_or_default(),
-        object_set: resolved
-            .route
-            .namespace
-            .as_ref()
-            .map(|scope| scope.object_set.clone())
-            .unwrap_or_default(),
-    };
-    let reply = client.control_client.read_from_cold(&lease, request)?;
-    let staging_segment = SegmentName::new(reply.segment_name.clone());
-    if reply.length != cold_backing.length {
-        client.control_client.ack_cold_read_complete(
-            &lease,
-            vec![staging_segment.0.clone()],
-            vec![reply.segment_offset],
-        );
-        return Err(StoreError::InvalidState(format!(
-            "cold read reply length mismatch for {}: expected {} actual {}",
-            resolved.route.key.0, cold_backing.length, reply.length
-        )));
-    }
-    if reply.checksum != cold_backing.checksum {
-        client.control_client.ack_cold_read_complete(
-            &lease,
-            vec![staging_segment.0.clone()],
-            vec![reply.segment_offset],
-        );
-        return Err(StoreError::InvalidState(format!(
-            "cold read reply checksum mismatch for {}: expected {:?} actual {:?}",
-            resolved.route.key.0, cold_backing.checksum, reply.checksum
-        )));
-    }
-    let target_chunks = reply
-        .target_chunks
-        .iter()
-        .map(|chunk| SegmentTargetChunk {
-            logical_offset: chunk.logical_offset,
-            target_offset: chunk.target_offset,
-            length_bytes: chunk.length_bytes,
-        })
-        .collect::<Vec<_>>();
-    client.state.lock().cache_segment_target_metadata(
-        &cold_backing.owner,
-        &staging_segment,
-        &target_chunks,
-        reply.transport_endpoint.clone(),
-        reply.transport_segment_descriptor.clone(),
-    );
-    let staging_replica = ReplicaRoute {
-        owner: cold_backing.owner.clone(),
-        segment_name: staging_segment.clone(),
-        offset: None,
-        segment_offset: reply.segment_offset,
-        length: reply.length,
-        checksum: reply.checksum,
-        tier: ReplicaTier::File,
-        priority: 0,
-    };
-    let staging_resolved = ResolvedObject {
-        tenant: resolved.tenant.clone(),
-        key: resolved.key.clone(),
-        route: resolved.route.clone(),
-        replica: staging_replica,
-        fallback_replicas: VecDeque::new(),
-    };
-    let result = client.execute_remote_get_direct(
-        transport,
-        &staging_resolved,
-        buffer,
-        reply.length as usize,
-        request_deadline,
-    );
-    client.control_client.ack_cold_read_complete(
-        &lease,
-        vec![staging_segment.0],
-        vec![reply.segment_offset],
-    );
-    result?;
-    enqueue_restore_promotion(
-        client,
-        resolved,
-        RestorePromotionPayload::Shared(Arc::new(buffer[..length].to_vec())),
-    );
-    Ok(())
 }
 
 pub(in super::super) fn enqueue_restore_promotion(
@@ -855,46 +556,33 @@ fn spawn_restore_promotion_worker_if_needed(client: &StoreClient, resolved: &Res
             for task in tasks {
                 let promote_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     execute_restore_promotion(&promoter, &task)
-                }));
+                }))
+                .unwrap_or_else(|_| {
+                    Err(StoreError::InvalidState(
+                        "restore promotion panicked".to_string(),
+                    ))
+                });
+                registry::record_cold_tier_operation_result("restore_promote", &promote_result);
                 match promote_result {
-                    Ok(promote_result) => {
-                        registry::record_cold_tier_operation_result(
-                            "restore_promote",
-                            &promote_result,
-                        );
-                        match promote_result {
-                            Ok(()) => {
-                                debug!(
-                                    tenant = %task.tenant,
-                                    key = %task.object_id.logical_key,
-                                    route_key = %task.current.key.0,
-                                    route_version = task.current.version.0,
-                                    payload_bytes = task.payload.len(),
-                                    "cold tier restored payload promoted"
-                                );
-                            }
-                            Err(error) => {
-                                debug!(
-                                    tenant = %task.tenant,
-                                    key = %task.object_id.logical_key,
-                                    route_key = %task.current.key.0,
-                                    route_version = task.current.version.0,
-                                    payload_bytes = task.payload.len(),
-                                    error = %error,
-                                    "restore promotion failed after cold read"
-                                );
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        registry::record_cold_tier_operation("restore_promote", "error", "panic");
-                        warn!(
+                    Ok(()) => {
+                        debug!(
                             tenant = %task.tenant,
                             key = %task.object_id.logical_key,
                             route_key = %task.current.key.0,
                             route_version = task.current.version.0,
                             payload_bytes = task.payload.len(),
-                            "restore promotion worker recovered from task panic"
+                            "cold tier restored payload promoted"
+                        );
+                    }
+                    Err(error) => {
+                        debug!(
+                            tenant = %task.tenant,
+                            key = %task.object_id.logical_key,
+                            route_key = %task.current.key.0,
+                            route_version = task.current.version.0,
+                            payload_bytes = task.payload.len(),
+                            error = %error,
+                            "restore promotion failed after cold read"
                         );
                     }
                 }
@@ -915,7 +603,7 @@ fn spawn_restore_promotion_worker_if_needed(client: &StoreClient, resolved: &Res
         .spawn(move || run_tasks(tasks));
     if let Err(error) = spawn_result {
         queue.abort_worker_batch(tasks_for_abort);
-        warn!(
+        debug!(
             runtime = %client.lease.runtime,
             tenant = %resolved.tenant,
             key = %resolved.key,
@@ -1791,7 +1479,7 @@ fn promote_materialized_cold_backing(
     })();
     let ssd_read_elapsed = t_ssd.elapsed();
     let ssd_read_us = ssd_read_elapsed.as_micros() as u64;
-    super::record_cold_tier_ssd_read(
+    record_cold_tier_ssd_read(
         if ssd_read_result.is_ok() {
             "ok"
         } else {
@@ -2040,6 +1728,9 @@ pub(in super::super) fn batch_read_from_cold_staged(
     }
 
     if batch_entries.is_empty() {
+        use crate::observability::registry::{
+            record_cold_restore_batch_duration, record_cold_restore_batch_items,
+        };
         record_cold_restore_batch_duration("wall", started.elapsed());
         record_cold_restore_batch_items("resolved_no_ssd", target_count as u64);
         return results
@@ -2111,6 +1802,9 @@ pub(in super::super) fn batch_read_from_cold_staged(
     }
 
     // Record cold restore batch metrics
+    use crate::observability::registry::{
+        record_cold_restore_batch_duration, record_cold_restore_batch_items,
+    };
     record_cold_restore_batch_duration("parallel", parallel_start.elapsed());
     record_cold_restore_batch_duration("wall", started.elapsed());
     record_cold_restore_batch_items("complete", target_count as u64);
@@ -2181,20 +1875,32 @@ fn process_device_group(
     // Use Option<StagingSlot> parallel to `group` — None means failed alloc.
     let mut staged_slots: Vec<Option<super::staging_pool::StagingSlot>> =
         Vec::with_capacity(group.len());
-    let mut restore_permits = Vec::with_capacity(group.len());
+    let mut restore_permits: Vec<Option<ColdTierAdmissionPermit>> = Vec::with_capacity(group.len());
 
     for entry in group.iter() {
-        restore_permits.push(
-            storage_owner
-                .cold_tier_devices
-                .try_acquire_restore(cold_tier_device_id(&entry.cold_backing))
-                .ok(),
-        );
+        let permit = match storage_owner
+            .cold_tier_devices
+            .try_acquire_restore(cold_tier_device_id(&entry.cold_backing))
+        {
+            Ok(permit) => permit,
+            Err(reason) => {
+                staged_slots.push(None);
+                restore_permits.push(None);
+                out.push((
+                    entry.index,
+                    cold_read_error(StoreError::Transport(format!(
+                        "cold tier restore backpressure: {}",
+                        reason.metric_label()
+                    ))),
+                ));
+                continue;
+            }
+        };
 
         let needed = entry.cold_backing.length as usize;
         let slot = staging_pool.try_allocate(needed).or_else(|| {
             let reclaimed =
-                storage_owner.sweep_expired_staging_slots(storage_owner.staging_slot_ttl);
+                storage_owner.sweep_expired_staging_slots(std::time::Duration::from_secs(30));
             if reclaimed > 0 {
                 if let Some(slot) = staging_pool.try_allocate(needed) {
                     return Some(slot);
@@ -2207,9 +1913,13 @@ fn process_device_group(
         });
 
         match slot {
-            Some(slot) => staged_slots.push(Some(slot)),
+            Some(slot) => {
+                staged_slots.push(Some(slot));
+                restore_permits.push(Some(permit));
+            }
             None => {
                 staged_slots.push(None);
+                restore_permits.push(None);
                 out.push((
                     entry.index,
                     cold_read_error(StoreError::Backpressure(
@@ -2254,7 +1964,6 @@ fn process_device_group(
     };
 
     let ssd_read_us = t_ssd.elapsed().as_micros() as u64;
-    drop(restore_permits);
 
     // 4f + Phase 5: validate checksum, publish to singleflight, pin, build response.
     // Track which group indices succeeded (for deferred promote pass below).
@@ -2321,6 +2030,14 @@ fn process_device_group(
         if let Some(mut leader) = entry.leader.take() {
             let _: Result<super::super::OwnerColdRestoreOutcome> =
                 leader.publish_data_ready(outcome.clone());
+        }
+
+        if let Some(permit) = restore_permits[group_idx].take() {
+            if outcome.is_ok() {
+                permit.complete_ok();
+            } else {
+                permit.complete_error();
+            }
         }
 
         match outcome {
@@ -2767,7 +2484,8 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
         // Pool exhausted — sweep expired entries before blocking.
         // Reclaims slots whose readers crashed without ACK.
         let util_before = staging_pool.utilization();
-        let reclaimed = storage_owner.sweep_expired_staging_slots(storage_owner.staging_slot_ttl);
+        let reclaimed = storage_owner
+            .sweep_expired_staging_slots(std::time::Duration::from_secs(30));
         if reclaimed > 0 {
             // Retry fast path after sweep freed slots.
             if let Some(slot) = staging_pool.try_allocate(needed) {
@@ -2844,7 +2562,7 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
     })();
     let ssd_read_elapsed = t_ssd.elapsed();
     let ssd_read_us = ssd_read_elapsed.as_micros() as u64;
-    super::record_cold_tier_ssd_read(
+    record_cold_tier_ssd_read(
         if ssd_read_result.is_ok() {
             "ok"
         } else {
@@ -2944,8 +2662,6 @@ pub(in super::super) fn execute_owner_cold_restore_promote_phase(
             pending.insert(key, (slot, std::time::Instant::now()));
         }
         // else: reader already ACKed → drop slot → recycle buffer.
-        // Holding pending_staging_slots while checking the pin closes the race
-        // with ACK: ACK unpins first, then takes the same pending lock.
     };
 
     // 1. Try fast-path: allocate from free pool (no eviction).

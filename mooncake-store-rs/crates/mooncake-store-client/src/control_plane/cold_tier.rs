@@ -255,6 +255,7 @@ impl ControlPlaneClient {
         result
     }
 
+    #[allow(dead_code)]
     pub(crate) fn read_from_cold(
         &self,
         lease: &ClientLease,

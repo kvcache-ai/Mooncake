@@ -125,7 +125,14 @@ use cold_tier_storage_backend::*;
 /// Cold tier device management, admission control, offload pipeline, and cleanup.
 #[allow(dead_code)]
 mod cold_tier;
-use self::cold_tier::{payload_checksum, ColdTierHandle, EvictionReadySignal};
+use self::cold_tier::{
+    backend_load_cold_payload_batch_pinned, backend_remove_pending_source,
+    cold_backing_placeholder, payload_checksum, select_cold_backing_target,
+    validate_cold_restore_payload, validate_resolved_payload_checksum, ColdTierHandle,
+    EvictionReadySignal,
+};
+#[cfg(test)]
+use self::cold_tier::{backend_store_cold_payload_batch, restore_payload_from_cold_backing};
 
 type SharedRouteWriteGate = Arc<RouteWriteGate>;
 

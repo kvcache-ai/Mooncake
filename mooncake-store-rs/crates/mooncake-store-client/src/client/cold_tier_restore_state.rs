@@ -41,7 +41,7 @@ impl ColdRestoreSingleflight {
                 )
             }
         };
-        crate::client::cold_tier::record_cold_restore_singleflight("begin", metric_result);
+        crate::observability::registry::record_cold_restore_singleflight("begin", metric_result);
         registration
     }
 
@@ -60,7 +60,7 @@ impl ColdRestoreSingleflight {
             .unwrap_or_else(|| Err(StoreError::InvalidState(
                 "cold restore flight result missing after wake".to_string(),
             )));
-        crate::client::cold_tier::record_cold_restore_singleflight(
+        crate::observability::registry::record_cold_restore_singleflight(
             "wait",
             if result.is_ok() { "ok" } else { "error" },
         );
@@ -83,7 +83,7 @@ impl ColdRestoreSingleflight {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.flights.remove(key);
         }
-        crate::client::cold_tier::record_cold_restore_singleflight("finish", metric_result);
+        crate::observability::registry::record_cold_restore_singleflight("finish", metric_result);
     }
 
 }
@@ -114,7 +114,6 @@ impl RestorePromotionQueue {
     fn new(limit: usize, batch_limit: usize, max_in_flight: usize) -> Self {
         Self {
             state: Mutex::new(RestorePromotionQueueState::default()),
-            idle: parking_lot::Condvar::new(),
             limit: limit.max(1),
             batch_limit: batch_limit.max(1),
             max_in_flight: max_in_flight.max(1),
@@ -189,11 +188,7 @@ impl RestorePromotionQueue {
     }
 
     fn complete(&self, key: &RestorePromotionKey) {
-        let mut state = self.state.lock();
-        state.in_flight.remove(key);
-        if state.in_flight.is_empty() && !state.worker_active {
-            self.idle.notify_all();
-        }
+        self.state.lock().in_flight.remove(key);
     }
 
     fn abort_worker_batch(&self, tasks: Vec<RestorePromotionTask>) {
@@ -206,15 +201,10 @@ impl RestorePromotionQueue {
             }
         }
         state.worker_active = false;
-        self.idle.notify_all();
     }
 
     fn finish_worker(&self) {
-        let mut state = self.state.lock();
-        state.worker_active = false;
-        if state.in_flight.is_empty() {
-            self.idle.notify_all();
-        }
+        self.state.lock().worker_active = false;
     }
 
     fn shutdown(&self) {
@@ -227,7 +217,6 @@ impl RestorePromotionQueue {
             state.entries.clear();
             state.keys.clear();
         }
-        self.idle.notify_all();
         // Wait for in-flight tasks to complete, with a timeout to avoid hanging
         // if the worker is stuck in a transport write or metadata operation.
         self.wait_for_worker_idle_bounded(Duration::from_secs(5));
@@ -239,30 +228,22 @@ impl RestorePromotionQueue {
 
     fn wait_for_worker_idle_bounded(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock();
-        while state.worker_active || !state.in_flight.is_empty() {
-            let now = Instant::now();
-            if now >= deadline {
+        loop {
+            let idle = {
+                let state = self.state.lock();
+                !state.worker_active && state.in_flight.is_empty()
+            };
+            if idle {
+                return;
+            }
+            if Instant::now() >= deadline {
                 tracing::warn!(
                     timeout_ms = timeout.as_millis() as u64,
-                    in_flight = state.in_flight.len(),
-                    worker_active = state.worker_active,
                     "restore promotion queue shutdown timed out waiting for worker idle"
                 );
                 return;
             }
-            let remaining = deadline.saturating_duration_since(now);
-            if self.idle.wait_for(&mut state, remaining).timed_out()
-                && (state.worker_active || !state.in_flight.is_empty())
-            {
-                tracing::warn!(
-                    timeout_ms = timeout.as_millis() as u64,
-                    in_flight = state.in_flight.len(),
-                    worker_active = state.worker_active,
-                    "restore promotion queue shutdown timed out waiting for worker idle"
-                );
-                return;
-            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -289,7 +270,6 @@ impl StoreState {
     ///
     /// For normal DRAM reads, all target_chunks are already within the
     /// existing SegmentInfo buffers, so this is a no-op.
-    #[allow(dead_code)]
     fn augment_segment_info_from_target_metadata(
         &self,
         info: &mut SegmentInfo,

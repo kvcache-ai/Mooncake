@@ -78,6 +78,15 @@ impl StoreClient {
             self.startup_activation_pending.store(true, Ordering::SeqCst);
             return Err(error);
         }
+        let deferred = std::mem::take(&mut *self.deferred_cold_tier_reconciles.lock());
+        if !deferred.is_empty() {
+            run_deferred_cold_tier_reconciles(
+                deferred,
+                self.metadata.as_ref(),
+                self.route_directory.as_ref(),
+                &lease,
+            );
+        }
         if let Err(error) = self.cold_tier.run_startup(self.storage_owner.clone(), &lease) {
             tracing::warn!(error = %error, "cold tier startup deferred to background tick");
         }
