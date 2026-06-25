@@ -87,6 +87,48 @@ if (USE_CUDA OR USE_MUSA OR USE_MACA)
     target_link_libraries(device_p2p_transport_smoke_test PUBLIC transfer_engine)
     add_test(NAME device_p2p_transport_smoke_test
         COMMAND device_p2p_transport_smoke_test)
+
+    add_executable(device_ibgda_transport_smoke_test
+        ${WORKSPACE}/device_ibgda_transport_smoke_test.cpp)
+    target_link_libraries(device_ibgda_transport_smoke_test
+        PUBLIC transfer_engine gflags::gflags)
+
+    if(USE_MACA)
+        find_program(MACA_MXCC
+            NAMES mxcc
+            HINTS
+              ${MACA_ROOT}/mxgpu_llvm/bin
+              ${MACA_ROOT}/bin
+              /opt/maca/mxgpu_llvm/bin
+              /opt/maca/bin)
+        if(MACA_MXCC)
+            set(_device_ibgda_devctx_probe_obj
+                ${CMAKE_CURRENT_BINARY_DIR}/device_ibgda_devctx_probe_maca.o)
+            add_custom_command(
+                OUTPUT ${_device_ibgda_devctx_probe_obj}
+                COMMAND ${MACA_MXCC}
+                        -std=c++20
+                        -DUSE_MACA
+                        -DMOONCAKE_EP_USE_MACA
+                        -I${MACA_INCLUDE_DIR}
+                        -I${CMAKE_CURRENT_SOURCE_DIR}/../include
+                        -I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/include
+                        -I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/etcd
+                        -I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/k8s-lease
+                        -I/usr/include/jsoncpp
+                        -c ${WORKSPACE}/device_ibgda_devctx_probe.cu
+                        -o ${_device_ibgda_devctx_probe_obj}
+                DEPENDS ${WORKSPACE}/device_ibgda_devctx_probe.cu
+                VERBATIM)
+            add_executable(device_ibgda_devctx_probe
+                ${_device_ibgda_devctx_probe_obj})
+            set_target_properties(device_ibgda_devctx_probe
+                PROPERTIES LINKER_LANGUAGE CXX)
+            target_link_options(device_ibgda_devctx_probe PRIVATE -no-pie)
+            target_link_libraries(device_ibgda_devctx_probe PUBLIC
+                transfer_engine gflags::gflags mccompiler)
+        endif()
+    endif()
 endif()
 
 if (USE_UBSHMEM)

@@ -26,6 +26,7 @@
 #include <infiniband/verbs.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "cuda_alike.h"
@@ -199,11 +200,37 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
-        cudaError_t err = cudaMalloc(&ctrl_buf_, kCtrlBufSize);
-        if (err != cudaSuccess) {
-            LOG(ERROR) << "[EP IBGDA] cudaMalloc ctrl_buf failed: "
-                       << cudaGetErrorString(err);
-            return -1;
+        if (std::getenv("MC_IBGDA_CTRL_HOST")) {
+            int ret = posix_memalign(&ctrl_buf_, 4096, kCtrlBufSize);
+            if (ret != 0) {
+                LOG(ERROR) << "[EP IBGDA] posix_memalign ctrl_buf failed: "
+                           << ret;
+                return -1;
+            }
+            memset(ctrl_buf_, 0, kCtrlBufSize);
+            cudaError_t err = cudaHostRegister(
+                ctrl_buf_, kCtrlBufSize,
+                cudaHostRegisterPortable | cudaHostRegisterMapped);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "[EP IBGDA] cudaHostRegister host ctrl_buf failed: "
+                           << cudaGetErrorString(err);
+                return -1;
+            }
+            err = cudaHostGetDevicePointer(&ctrl_buf_dev_, ctrl_buf_, 0);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "[EP IBGDA] cudaHostGetDevicePointer ctrl_buf failed: "
+                           << cudaGetErrorString(err);
+                return -1;
+            }
+            LOG(INFO) << "[EP IBGDA] Using host control buffer probe mode";
+        } else {
+            cudaError_t err = cudaMalloc(&ctrl_buf_, kCtrlBufSize);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "[EP IBGDA] cudaMalloc ctrl_buf failed: "
+                           << cudaGetErrorString(err);
+                return -1;
+            }
+            ctrl_buf_dev_ = ctrl_buf_;
         }
 
         ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
@@ -225,10 +252,15 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int createQueuePairs(void* stream_ptr) override {
         auto stream = static_cast<cudaStream_t>(stream_ptr);
+        int wqe = 16384;
+        if (const char* env = std::getenv("MC_IBGDA_WQE")) {
+            int parsed = std::atoi(env);
+            if (parsed > 0) wqe = parsed;
+        }
         for (int i = 0; i < num_qps_; ++i) {
             mlx5gda_qp* qp =
                 mlx5gda_create_rc_qp(mpd_, ctrl_buf_, ctrl_buf_umem_,
-                                     ctrl_buf_heap_, pd_, 16384, 1, stream);
+                                     ctrl_buf_heap_, pd_, wqe, 1, stream);
             if (!qp) {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
                 return -1;
@@ -243,12 +275,14 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
                 .wq = reinterpret_cast<mlx5gda_wqebb*>(
-                    static_cast<char*>(ctrl_buf_) + qp->wq_offset),
+                    static_cast<char*>(ctrl_buf_dev_) + qp->wq_offset),
                 .cq = reinterpret_cast<mlx5_cqe64*>(
-                    static_cast<char*>(ctrl_buf_) + qp->send_cq->cq_offset),
+                    static_cast<char*>(ctrl_buf_dev_) + qp->send_cq->cq_offset),
                 .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
-                    static_cast<char*>(ctrl_buf_) + qp->dbr_offset),
-                .bf = static_cast<char*>(qp->uar->reg_addr),
+                    static_cast<char*>(ctrl_buf_dev_) + qp->dbr_offset),
+                .bf = std::getenv("MC_IBGDA_DISABLE_BF")
+                          ? nullptr
+                          : static_cast<char*>(qp->uar->reg_addr),
             };
             cudaMemcpy(
                 static_cast<char*>(qp_devctxs_) + i * sizeof(mlx5gda_qp_devctx),
@@ -363,8 +397,14 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             ctrl_buf_umem_ = nullptr;
         }
         if (ctrl_buf_) {
-            cudaFree(ctrl_buf_);
+            if (std::getenv("MC_IBGDA_CTRL_HOST")) {
+                cudaHostUnregister(ctrl_buf_);
+                free(ctrl_buf_);
+            } else {
+                cudaFree(ctrl_buf_);
+            }
             ctrl_buf_ = nullptr;
+            ctrl_buf_dev_ = nullptr;
         }
         if (mr_) {
             ibv_dereg_mr(mr_);
@@ -407,6 +447,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     // Control buffer
     void* ctrl_buf_ = nullptr;  // GPU VA
+    void* ctrl_buf_dev_ = nullptr;
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
 

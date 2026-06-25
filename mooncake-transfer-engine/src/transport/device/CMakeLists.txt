@@ -6,7 +6,7 @@
 # written ldflags (Go p2p-store / mooncake-store), which bypass CMake's
 # target_link_libraries propagation.
 set(DEVICE_TRANSPORT_SOURCES p2p_device_transport.cpp)
-if(USE_CUDA OR USE_MUSA)
+if(USE_CUDA OR USE_MUSA OR USE_MACA)
     list(APPEND DEVICE_TRANSPORT_SOURCES ibgda_device_transport.cpp mlx5gda.cpp)
 endif()
 
