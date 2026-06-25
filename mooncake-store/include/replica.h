@@ -130,8 +130,7 @@ struct ReplicateConfig {
         os << "]";
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node;
-        os << ", preferred_storage_level: "
-           << config.preferred_storage_level
+        os << ", preferred_storage_level: " << config.preferred_storage_level
            << ", data_type: " << config.data_type;
         if (config.group_ids.has_value()) {
             os << ", group_ids: [";
