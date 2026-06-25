@@ -28,7 +28,6 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <cuda_runtime.h>
 
 #include <atomic>
 #include <chrono>
@@ -37,6 +36,7 @@
 #include <thread>
 #include <vector>
 
+#include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transport/device/comm_device.cuh"
 #include "transport/device/device_transport.h"
@@ -113,7 +113,10 @@ static std::vector<int32_t> readIpcHandle(int rank) {
 // GDR buffer layout:
 //   [0 .. kDataBytes)              — data region
 //   [kDataBytes .. kDataBytes+4)   — signal word (int32_t)
+//   [kDataBytes+4 .. +8)           — result word (int32_t)
 static constexpr int kSignalWordOffset = 4096;  // must match kDataBytes default
+static constexpr int kResultWordOffset = kSignalWordOffset + sizeof(int32_t);
+static constexpr unsigned long long kReceiverPollIters = 1000000000ULL;
 
 // Rank 0: P2P-write data to rank 1, then signal.
 __global__ void senderKernel(mooncake::device::CommCtx ctx, int dst_rank,
@@ -126,7 +129,6 @@ __global__ void senderKernel(mooncake::device::CommCtx ctx, int dst_rank,
     void* peer_data = mc_route_put(ctx, dst_rank, local_data);
     if (peer_data == nullptr) {
         printf("[Rank 0] FAIL: P2P not available to rank %d\n", dst_rank);
-        asm("trap;");
         return;
     }
 
@@ -156,12 +158,25 @@ __global__ void receiverKernel(mooncake::device::CommCtx ctx, int src_rank,
 
     char* local_data = reinterpret_cast<char*>(ctx.p2p.local_base);
     int* local_sig = reinterpret_cast<int*>(local_data + kSignalWordOffset);
+    int* local_result = reinterpret_cast<int*>(local_data + kResultWordOffset);
+
+    *local_result = -1;
 
     // Spin-wait for the signal.
     // The sender writes the signal via P2P store (mc_p2p_signal →
     // mc_st_release). We use ld_acquire to observe it.
-    while (mc_ld_acquire(local_sig) == 0) {
+    bool signaled = false;
+    for (unsigned long long iter = 0; iter < kReceiverPollIters; ++iter) {
+        if (mc_ld_acquire(local_sig) != 0) {
+            signaled = true;
+            break;
+        }
         __threadfence_block();
+    }
+    if (!signaled) {
+        *local_result = -2;
+        printf("[Rank 1] FAIL: timed out waiting for signal\n");
+        return;
     }
 
     // Verify the data written by rank 0.
@@ -172,9 +187,11 @@ __global__ void receiverKernel(mooncake::device::CommCtx ctx, int src_rank,
         }
     }
     if (mismatches > 0) {
+        *local_result = mismatches;
         printf("[Rank 1] FAIL: %d byte mismatches in received data\n",
                mismatches);
     } else {
+        *local_result = 0;
         printf("[Rank 1] PASS: all %d bytes match expected pattern\n",
                data_bytes);
     }
@@ -215,7 +232,7 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     // 2. Allocate GDR buffer and fill with initial pattern.
     // -----------------------------------------------------------------------
-    constexpr size_t kBufSize = kSignalWordOffset + sizeof(int32_t);
+    constexpr size_t kBufSize = kResultWordOffset + sizeof(int32_t);
     void* gdr_buffer = p2p->allocateBuffer(kBufSize);
     CHECK_NOTNULL(gdr_buffer);
     LOG(INFO) << "Rank " << rank << " allocated GDR buffer: " << gdr_buffer;
@@ -267,6 +284,16 @@ int main(int argc, char** argv) {
         receiverKernel<<<1, 1>>>(ctx, peer_rank, FLAGS_kDataBytes);
     }
     checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+
+    if (rank == 1) {
+        int result = -1;
+        checkCuda(cudaMemcpy(
+                      &result,
+                      static_cast<char*>(gdr_buffer) + kResultWordOffset,
+                      sizeof(result), cudaMemcpyDeviceToHost),
+                  "cudaMemcpy(result)");
+        CHECK_EQ(result, 0) << "receiver kernel failed with result " << result;
+    }
 
     // -----------------------------------------------------------------------
     // 5. Barrier: rank 1 signals completion, rank 0 waits before cleanup.

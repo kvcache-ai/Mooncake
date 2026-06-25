@@ -7,7 +7,9 @@
 
 #include "transport/device/device_ops.cuh"
 #include "transport/device/p2p_device.cuh"
+#ifndef MOONCAKE_EP_USE_MACA
 #include "transport/device/ibgda_device.cuh"
+#endif
 
 namespace mooncake {
 namespace device {
@@ -18,7 +20,9 @@ namespace device {
 
 struct CommCtx {
     P2PContext p2p;
+#ifndef MOONCAKE_EP_USE_MACA
     IbgdaContext ibgda;
+#endif
     int rank;
 };
 
@@ -36,11 +40,21 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     ctx.p2p.peer_ptrs = ipc_peer_ptrs;
     ctx.p2p.local_base = gdr_buffer;
 
+#ifndef MOONCAKE_EP_USE_MACA
     ctx.ibgda.qp_devctxs = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
     ctx.ibgda.raddrs = reinterpret_cast<const uint64_t*>(raddrs);
     ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(rkeys);
     ctx.ibgda.local_atomic_base = rdma_send_signal_buffer;
     ctx.ibgda.remote_atomic_base = rdma_recv_signal_buffer;
+#else
+    (void)raddrs;
+    (void)rkeys;
+    (void)qp_devctxs;
+    (void)rdma_send_signal_buffer;
+    (void)rdma_recv_signal_buffer;
+    (void)num_ranks;
+    (void)num_qps;
+#endif
 
     return ctx;
 }
@@ -84,6 +98,16 @@ __device__ __forceinline__ void mc_rdma_put(
     const void* send_ptr,
     void* recv_ptr,  // local VA of the recv slot (for raddr computation)
     uint32_t nbytes, int lane_id) {
+#ifdef MOONCAKE_EP_USE_MACA
+    (void)ctx;
+    (void)channel;
+    (void)dst_rank;
+    (void)qps_per_rank;
+    (void)send_ptr;
+    (void)recv_ptr;
+    (void)nbytes;
+    (void)lane_id;
+#else
     if (lane_id == 0) {
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
@@ -92,6 +116,7 @@ __device__ __forceinline__ void mc_rdma_put(
         mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
                      send_ptr, recv_raddr, nbytes);
     }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +136,7 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
     if (mc_comm_p2p_available(ctx, dst_rank)) {
         mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
     } else {
+#ifndef MOONCAKE_EP_USE_MACA
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
             (reinterpret_cast<const char*>(sig_ptr) -
@@ -123,6 +149,10 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
              reinterpret_cast<const char*>(ctx.p2p.local_base));
         mc_ibgda_red_add(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
                          laddr, recv_raddr, val);
+#else
+        (void)channel;
+        (void)qps_per_rank;
+#endif
     }
 }
 

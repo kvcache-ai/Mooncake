@@ -72,7 +72,7 @@ endif()
 # fails at generate time.  Opt in explicitly with -DBUILD_DEVICE_TRANSPORT_EXAMPLE=ON
 # when building manually on a host with a recent CMake and 2 GPUs.
 option(BUILD_DEVICE_TRANSPORT_EXAMPLE
-       "Build the two-rank Device API P2P example (requires CUDA20-capable CMake and 2 GPUs)"
+       "Build the two-rank Device API P2P example (requires CUDA or MACA and 2 GPUs)"
        OFF)
 if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
   enable_language(CUDA)
@@ -105,4 +105,39 @@ if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
     set_target_properties(device_transport_example PROPERTIES
       CUDA_ARCHITECTURES "80;90")
   endif()
+elseif(USE_MACA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
+  find_program(MACA_MXCC
+    NAMES mxcc
+    HINTS
+      ${MACA_ROOT}/mxgpu_llvm/bin
+      ${MACA_ROOT}/bin
+      /opt/maca/mxgpu_llvm/bin
+      /opt/maca/bin)
+  if(NOT MACA_MXCC)
+    message(FATAL_ERROR "BUILD_DEVICE_TRANSPORT_EXAMPLE=ON with USE_MACA requires mxcc")
+  endif()
+
+  set(_device_transport_example_obj
+      ${CMAKE_CURRENT_BINARY_DIR}/device_transport_example_maca.o)
+  add_custom_command(
+    OUTPUT ${_device_transport_example_obj}
+    COMMAND ${MACA_MXCC}
+            -std=c++20
+            -DUSE_MACA
+            -DMOONCAKE_EP_USE_MACA
+            -I${MACA_INCLUDE_DIR}
+            -I${CMAKE_CURRENT_SOURCE_DIR}/../include
+            -I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/include
+            -I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/etcd
+            -I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/k8s-lease
+            -I/usr/include/jsoncpp
+            -c ${WORKSPACE}/device_transport_example.cu
+            -o ${_device_transport_example_obj}
+    DEPENDS ${WORKSPACE}/device_transport_example.cu
+    VERBATIM)
+  add_executable(device_transport_example ${_device_transport_example_obj})
+  set_target_properties(device_transport_example PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_options(device_transport_example PRIVATE -no-pie)
+  target_link_libraries(device_transport_example PUBLIC
+    transfer_engine gflags::gflags glog::glog mccompiler)
 endif()
