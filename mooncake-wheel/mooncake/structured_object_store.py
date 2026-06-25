@@ -504,15 +504,24 @@ class MooncakeBundleTransfer:
         meta_info_keys: Optional[Sequence[str]] = None,
         data_cls: Optional[Any] = None,
         destinations: Optional[Mapping[str, Any]] = None,
+        rows: slice | StructuredMemberSlice | None = None,
     ) -> Any:
         """Materialize selected DataProto fields from structured object refs."""
         ref = _resolve_dataproto_ref(ref)
+        row_slice = _coerce_dataproto_row_slice(rows, ref.batch_size)
+        output_rows = (
+            ref.batch_size
+            if row_slice is None
+            else _slice_length(row_slice, ref.batch_size)
+        )
         batch_names, non_tensor_names = _resolve_dataproto_field_selection(
             ref, fields, batch_fields, non_tensor_fields
         )
         batch: dict[str, Any] = {}
         non_tensor_batch: dict[str, Any] = {}
         destination_map = destinations or {}
+        if row_slice is not None and destination_map:
+            raise ValueError("DataProto row slicing does not support destinations")
         requested = [
             *[("batch", name) for name in batch_names],
             *[("non_tensor_batch", name) for name in non_tensor_names],
@@ -537,6 +546,15 @@ class MooncakeBundleTransfer:
                 if name in destination_map
             }
             spec = self.read_spec(stage_ref).select_members(members)
+            if row_slice is not None:
+                for member in members:
+                    spec = spec.slice_member(
+                        member,
+                        axis=row_slice.axis,
+                        start=row_slice.start,
+                        end=row_slice.end,
+                        step=row_slice.step,
+                    )
             result = self.materialize_into(spec, stage_destinations)
             for name, location in entries:
                 value = result.objects[location.member]
@@ -547,22 +565,122 @@ class MooncakeBundleTransfer:
         for name, location in encoded_requests:
             stage_ref = ref.stage_refs[location.stage]
             encoded = ref.encoded_non_tensor[name]
-            members = list(encoded["payload_members"].values())
-            result = self.materialize(self.read_spec(stage_ref).select_members(members))
-            payload = {
-                payload_name: result.objects[member]
-                for payload_name, member in encoded["payload_members"].items()
-            }
-            values = _decode_structured_leaf(
-                encoded["codec"], payload, ref.batch_size, encoded.get("metadata")
-            )
-            array = np.empty(ref.batch_size, dtype=object)
+            if row_slice is None:
+                members = list(encoded["payload_members"].values())
+                result = self.materialize(
+                    self.read_spec(stage_ref).select_members(members)
+                )
+                payload = {
+                    payload_name: result.objects[member]
+                    for payload_name, member in encoded["payload_members"].items()
+                }
+                values = _decode_structured_leaf(
+                    encoded["codec"], payload, ref.batch_size, encoded.get("metadata")
+                )
+            else:
+                payload, metadata = self._read_structured_non_tensor_payload_slice(
+                    stage_ref,
+                    encoded,
+                    row_slice,
+                    ref.batch_size,
+                )
+                values = _decode_structured_leaf(
+                    encoded["codec"], payload, output_rows, metadata
+                )
+            array = np.empty(output_rows, dtype=object)
             array[:] = values
             non_tensor_batch[name] = array
         meta_info = _select_mapping(ref.meta_info, meta_info_keys)
         return _build_dataproto_like_result(
             batch, non_tensor_batch, meta_info, data_cls
         )
+
+    def _read_structured_non_tensor_payload_slice(
+        self,
+        stage_ref: RemoteBundleRef,
+        encoded: Mapping[str, Any],
+        row_slice: StructuredMemberSlice,
+        total_rows: int,
+    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+        start, end, step = _normalized_member_slice(row_slice, total_rows)
+        if step != 1:
+            raise ValueError(
+                "DataProto structured non-tensor slicing currently requires step=1"
+            )
+        codec = encoded["codec"]
+        payload_members = encoded["payload_members"]
+        manifest = self._bundle_store.resolve_manifest(stage_ref)
+        metadata = dict(encoded.get("metadata") or {})
+
+        def read_member(payload_name: str, row_start: int, row_end: int) -> Any:
+            member = payload_members[payload_name]
+            spec = (
+                self.read_spec(stage_ref)
+                .select_members([member])
+                .slice_member(member, axis=0, start=row_start, end=row_end)
+            )
+            return self.materialize(spec).objects[member]
+
+        def read_bytes(payload_name: str, byte_start: int, byte_end: int) -> bytes:
+            member = payload_members[payload_name]
+            payload_spec = manifest["buffers"][member]
+            return self._bundle_store.read_payload_range(
+                payload_spec, byte_start, byte_end - byte_start
+            )
+
+        if codec == "ndarray":
+            return {
+                "data": read_member("data", start, end),
+                "nulls": read_member("nulls", start, end),
+            }, metadata
+
+        if codec in {"ragged_tensor", "typed_ragged"}:
+            offsets = read_member("offsets", start, end + 1)
+            base = int(offsets[0])
+            limit = int(offsets[-1])
+            offsets = offsets - base
+            return {
+                "data": read_member("data", base, limit),
+                "offsets": offsets,
+                "shapes": read_member("shapes", start, end),
+                "ndims": read_member("ndims", start, end),
+                "nulls": read_member("nulls", start, end),
+            }, metadata
+
+        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "json_ragged"}:
+            offsets = read_member("offsets", start, end + 1)
+            base = int(offsets[0])
+            limit = int(offsets[-1])
+            offsets = offsets - base
+            if "media_encodings" in metadata:
+                metadata["media_encodings"] = metadata["media_encodings"][start:end]
+            return {
+                "data": read_bytes("data", base, limit),
+                "offsets": offsets,
+                "nulls": read_member("nulls", start, end),
+            }, metadata
+
+        if codec == "media_list_ragged":
+            row_offsets = read_member("row_offsets", start, end + 1)
+            item_start = int(row_offsets[0])
+            item_end = int(row_offsets[-1])
+            row_offsets = row_offsets - item_start
+            byte_offsets = read_member("byte_offsets", item_start, item_end + 1)
+            byte_start = int(byte_offsets[0])
+            byte_end = int(byte_offsets[-1])
+            byte_offsets = byte_offsets - byte_start
+            if "media_encodings" in metadata:
+                metadata["media_encodings"] = metadata["media_encodings"][
+                    item_start:item_end
+                ]
+            return {
+                "data": read_bytes("data", byte_start, byte_end),
+                "row_offsets": row_offsets,
+                "byte_offsets": byte_offsets,
+                "nulls": read_member("nulls", start, end),
+            }, metadata
+
+        raise ValueError(f"unknown structured non-tensor codec: {codec}")
 
     def cleanup_dataproto(self, ref: DataProtoRefLike) -> None:
         """Remove all structured object stages referenced by a DataProto handle."""
@@ -925,6 +1043,31 @@ def _validate_dataproto_fields_exist(
     missing = [name for name in names if name not in ref.field_index]
     if missing:
         raise KeyError(f"unknown DataProto fields: {missing}")
+
+
+def _coerce_dataproto_row_slice(
+    rows: slice | StructuredMemberSlice | None, total_rows: int
+) -> StructuredMemberSlice | None:
+    if rows is None:
+        return None
+    if isinstance(rows, StructuredMemberSlice):
+        if rows.axis != 0:
+            raise ValueError("DataProto row slicing currently supports axis=0 only")
+        _normalized_member_slice(rows, total_rows)
+        return rows
+    if isinstance(rows, slice):
+        start, end, step = rows.indices(total_rows)
+        if step <= 0:
+            raise ValueError("DataProto row slicing step must be positive")
+        return StructuredMemberSlice(axis=0, start=start, end=end, step=step)
+    raise TypeError("DataProto rows must be a slice or StructuredMemberSlice")
+
+
+def _slice_length(member_slice: StructuredMemberSlice, total_rows: int) -> int:
+    start, end, step = _normalized_member_slice(member_slice, total_rows)
+    if start >= end:
+        return 0
+    return 1 + (end - 1 - start) // step
 
 
 def _select_mapping(
@@ -1481,10 +1624,6 @@ class _StructuredObjectLayer:
         field_spec: Mapping[str, Any],
         member_slice: StructuredMemberSlice,
     ) -> Any:
-        if payload_spec.get("kind") == "tensor":
-            raise ValueError(
-                f"structured tensor member {name} does not support slicing"
-            )
         metadata_bytes = int(payload_spec.get("metadata_bytes", -1))
         shape = field_spec.get("shape")
         element_size = int(field_spec.get("element_size", 0))
@@ -1504,6 +1643,9 @@ class _StructuredObjectLayer:
         row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
         data_offset = metadata_bytes + start * row_width
         data_length = (end - start) * row_width
+        if payload_spec.get("kind") == "tensor":
+            tensor = self._bundle_store.read_tensor_payload(payload_spec)
+            return tensor[start:end]
         metadata = self._bundle_store.read_payload_range(
             payload_spec, 0, metadata_bytes
         )

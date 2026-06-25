@@ -1145,6 +1145,24 @@ def test_structured_object_torch_tensor_slice_uses_range_reads() -> None:
     assert store.get_into_ranges_calls >= 2
 
 
+def test_structured_object_native_torch_tensor_slice_falls_back_to_get_tensor() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    tensor = torch.arange(48, dtype=torch.int64).reshape(12, 4)
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"tensor": tensor})
+    )
+
+    result = transfer.materialize(
+        transfer.read_spec(ref)
+        .select_members(["tensor"])
+        .slice_member("tensor", axis=0, start=3, end=9)
+    )
+
+    assert torch.equal(result.objects["tensor"], tensor[3:9])
+    assert store.get_tensor_calls == 1
+
+
 def test_structured_object_tensor_object_buffer_uses_put_tensor_from() -> None:
     store, transfer = make_transfer()
     source = ctypes.create_string_buffer(b"tensor-payload")
@@ -1347,6 +1365,55 @@ def test_dataproto_helper_selects_fields_and_meta() -> None:
     assert np.array_equal(
         result["non_tensor_batch"]["reward"], data.non_tensor_batch["reward"]
     )
+
+
+def test_dataproto_helper_slices_tensor_and_object_rows() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    tensor = torch.arange(24, dtype=torch.int64).reshape(6, 4)
+    data = SimpleDataProto(
+        batch={
+            "tensor": tensor,
+            "array": np.arange(18, dtype=np.int64).reshape(6, 3),
+        },
+        non_tensor_batch={
+            "text": np.asarray(
+                ["a", "bb", "ccc", "dddd", "eeeee", "ffffff"], dtype=object
+            ),
+            "json": np.asarray(
+                [{"i": 0}, {"i": 1}, {"i": 2}, {"i": 3}, {"i": 4}, {"i": 5}],
+                dtype=object,
+            ),
+            "ragged": np.asarray(
+                [
+                    torch.arange(1, dtype=torch.float32),
+                    torch.arange(2, dtype=torch.float32),
+                    torch.arange(3, dtype=torch.float32),
+                    torch.arange(4, dtype=torch.float32),
+                    torch.arange(5, dtype=torch.float32),
+                    torch.arange(6, dtype=torch.float32),
+                ],
+                dtype=object,
+            ),
+        },
+    )
+    ref = transfer.put_dataproto(data)
+
+    result = transfer.get_dataproto(ref, rows=slice(2, 5))
+
+    assert torch.equal(result["batch"]["tensor"], tensor[2:5])
+    assert np.array_equal(result["batch"]["array"], data.batch["array"][2:5])
+    assert result["non_tensor_batch"]["text"].tolist() == ["ccc", "dddd", "eeeee"]
+    assert result["non_tensor_batch"]["json"].tolist() == [
+        {"i": 2},
+        {"i": 3},
+        {"i": 4},
+    ]
+    actual_ragged = result["non_tensor_batch"]["ragged"]
+    assert torch.equal(actual_ragged[0], data.non_tensor_batch["ragged"][2])
+    assert torch.equal(actual_ragged[1], data.non_tensor_batch["ragged"][3])
+    assert torch.equal(actual_ragged[2], data.non_tensor_batch["ragged"][4])
+    assert store.get_into_ranges_calls > 0
 
 
 def test_dataproto_helper_supports_dict_cls_and_reports_bad_cls() -> None:
