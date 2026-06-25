@@ -1379,6 +1379,8 @@ def test_dataproto_helper_selects_fields_and_meta() -> None:
         fields=["input_ids", "reward"],
         meta_info_keys=["step"],
     )
+    batch_only = transfer.get_dataproto(ref, batch_fields=["input_ids"])
+    non_tensor_only = transfer.get_dataproto(ref, non_tensor_fields=["reward"])
 
     assert set(result["batch"]) == {"input_ids"}
     assert set(result["non_tensor_batch"]) == {"reward"}
@@ -1386,6 +1388,14 @@ def test_dataproto_helper_selects_fields_and_meta() -> None:
     assert np.array_equal(result["batch"]["input_ids"], data.batch["input_ids"])
     assert np.array_equal(
         result["non_tensor_batch"]["reward"], data.non_tensor_batch["reward"]
+    )
+    assert set(batch_only["batch"]) == {"input_ids"}
+    assert batch_only["non_tensor_batch"] == {}
+    assert np.array_equal(batch_only["batch"]["input_ids"], data.batch["input_ids"])
+    assert non_tensor_only["batch"] == {}
+    assert set(non_tensor_only["non_tensor_batch"]) == {"reward"}
+    assert np.array_equal(
+        non_tensor_only["non_tensor_batch"]["reward"], data.non_tensor_batch["reward"]
     )
 
 
@@ -1842,6 +1852,517 @@ def test_dataproto_helper_reads_rollout_transfer_data_with_real_store() -> None:
         assert view["batch_fields"]["old_log_probs"]["stage"] == "logprob"
         assert view["batch_fields"]["advantages"]["stage"] == "rollout"
         assert view["non_tensor_fields"]["prompts"]["stage"] == "rollout"
+    finally:
+        transfer.cleanup_dataproto(ref)
+
+
+def test_dataproto_helper_reads_large_rollout_transfer_data_with_real_store() -> None:
+    pytest.importorskip("mooncake.store")
+    _store, transfer = real_transfer("structured-test-large-rollout-transfer")
+    batch_size = 96
+    prompt_len = 128
+    response_len = 64
+    total_len = prompt_len + response_len
+    row_ids = [f"large-rollout-row-{index}" for index in range(batch_size)]
+    token_grid = np.arange(batch_size * total_len, dtype=np.int64).reshape(
+        batch_size, total_len
+    )
+    input_ids = token_grid + 1000
+    attention_mask = (token_grid % 7 != 0).astype(np.int32)
+    position_ids = np.tile(np.arange(total_len, dtype=np.int64), (batch_size, 1))
+    responses = input_ids[:, prompt_len:]
+    response_mask = np.ones((batch_size, response_len), dtype=np.int32)
+    action_log_probs = np.linspace(
+        -3.0, 3.0, batch_size * response_len, dtype=np.float32
+    ).reshape(batch_size, response_len)
+    ref_log_probs = action_log_probs + np.float32(0.125)
+    values = np.linspace(0.0, 1.0, batch_size, dtype=np.float32)
+    rewards = values + np.float32(1.0)
+    advantages = values + np.float32(2.0)
+    returns = values + np.float32(3.0)
+    prompts = np.asarray(
+        ["" if index % 17 == 0 else f"prompt-{index}-" + "x" * (index % 23) for index in range(batch_size)],
+        dtype=object,
+    )
+    sample_meta = np.asarray(
+        [
+            {"row": index, "row_id": row_id, "prompt_len": prompt_len, "response_len": response_len}
+            for index, row_id in enumerate(row_ids)
+        ],
+        dtype=object,
+    )
+    ref = transfer.put_dataproto(
+        {
+            "batch": {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": responses,
+                "response_mask": response_mask,
+            },
+            "non_tensor_batch": {
+                "prompts": prompts,
+                "sample_meta": sample_meta,
+            },
+            "meta_info": {"roll_row_ids": row_ids, "global_step": 11},
+        },
+        namespace="roll",
+        partition="large-remote-batch",
+        stage="rollout",
+    )
+    ref = transfer.append_dataproto_fields(
+        ref,
+        {
+            "batch": {
+                "action_log_probs": action_log_probs,
+                "ref_log_probs": ref_log_probs,
+            },
+            "non_tensor_batch": {},
+            "meta_info": {"logprob_stage": "complete"},
+        },
+        stage="logprob",
+    )
+    ref = transfer.append_dataproto_fields(
+        ref,
+        {
+            "batch": {
+                "values": values,
+                "rewards": rewards,
+                "advantages": advantages,
+                "returns": returns,
+            },
+            "non_tensor_batch": {},
+            "meta_info": {"critic_stage": "complete"},
+        },
+        stage="rollout",
+    )
+    handle = export_dataproto_ref(ref)
+    gathered_rows = [95, 0, 63, 17, 42]
+
+    try:
+        selected = transfer.get_dataproto(
+            handle,
+            fields=["input_ids", "action_log_probs", "values", "prompts"],
+            rows=slice(12, 76),
+        )
+        gathered = transfer.get_dataproto(
+            handle,
+            fields=["responses", "ref_log_probs", "returns", "sample_meta"],
+            rows=gathered_rows,
+        )
+        destination = np.empty((len(gathered_rows), total_len), dtype=np.int64)
+        into = transfer.get_dataproto(
+            handle,
+            batch_fields=["position_ids"],
+            rows=gathered_rows,
+            destinations={"position_ids": destination},
+        )
+        meta_only = transfer.get_dataproto(handle, fields=[], meta_info_keys=["roll_row_ids"])
+        full_tail = transfer.get_dataproto(
+            handle,
+            fields=["attention_mask", "advantages"],
+            rows=slice(batch_size - 8, batch_size),
+        )
+
+        assert np.array_equal(selected["batch"]["input_ids"], input_ids[12:76])
+        assert np.array_equal(
+            selected["batch"]["action_log_probs"], action_log_probs[12:76]
+        )
+        assert np.array_equal(selected["batch"]["values"], values[12:76])
+        assert selected["non_tensor_batch"]["prompts"].tolist() == prompts[12:76].tolist()
+        assert np.array_equal(gathered["batch"]["responses"], responses[gathered_rows])
+        assert np.array_equal(
+            gathered["batch"]["ref_log_probs"], ref_log_probs[gathered_rows]
+        )
+        assert np.array_equal(gathered["batch"]["returns"], returns[gathered_rows])
+        assert gathered["non_tensor_batch"]["sample_meta"].tolist() == sample_meta[gathered_rows].tolist()
+        assert into["batch"]["position_ids"] is destination
+        assert np.array_equal(destination, position_ids[gathered_rows])
+        assert meta_only["batch"] == {}
+        assert meta_only["non_tensor_batch"] == {}
+        assert meta_only["meta_info"] == {"roll_row_ids": row_ids}
+        assert np.array_equal(
+            full_tail["batch"]["attention_mask"], attention_mask[batch_size - 8 :]
+        )
+        assert np.array_equal(full_tail["batch"]["advantages"], advantages[batch_size - 8 :])
+    finally:
+        transfer.cleanup_dataproto(ref)
+
+
+def test_dataproto_helper_selection_errors_and_destinations_with_real_store() -> None:
+    pytest.importorskip("mooncake.store")
+    _store, transfer = real_transfer("structured-test-selection-destinations")
+    batch_size = 12
+    input_ids = np.arange(batch_size * 12, dtype=np.int64).reshape(batch_size, 12)
+    scores = np.linspace(0.0, 1.0, batch_size, dtype=np.float32)
+    prompts = np.asarray([f"prompt-{index}" for index in range(batch_size)], dtype=object)
+    ref = transfer.put_dataproto(
+        {
+            "batch": {"input_ids": input_ids, "scores": scores},
+            "non_tensor_batch": {"prompts": prompts},
+            "meta_info": {"step": 1},
+        },
+        namespace="roll",
+        partition="selection-destinations",
+        stage="rollout",
+    )
+
+    try:
+        with pytest.raises(ValueError, match="fields cannot be combined"):
+            transfer.get_dataproto(ref, fields=["input_ids"], batch_fields=["scores"])
+        with pytest.raises(KeyError, match="unknown DataProto fields"):
+            transfer.get_dataproto(ref, fields=["missing"])
+        with pytest.raises(IndexError, match="out of range"):
+            transfer.get_dataproto(ref, fields=["input_ids"], rows=[batch_size])
+        with pytest.raises(TypeError, match="row indices"):
+            transfer.get_dataproto(ref, fields=["input_ids"], rows=["0"])
+        with pytest.raises(ValueError, match="step must be positive"):
+            transfer.get_dataproto(ref, fields=["input_ids"], rows=slice(None, None, -1))
+        with pytest.raises(ValueError, match="destination shape mismatch"):
+            transfer.get_dataproto(
+                ref,
+                batch_fields=["input_ids"],
+                rows=[0, 1, 2],
+                destinations={"input_ids": np.empty((2, 12), dtype=np.int64)},
+            )
+
+        scores_destination = np.empty((4,), dtype=np.float32)
+        result = transfer.get_dataproto(
+            ref,
+            batch_fields=["scores"],
+            rows=[11, 3, 3, 0],
+            destinations={"scores": scores_destination},
+        )
+        non_tensor_only = transfer.get_dataproto(
+            ref,
+            non_tensor_fields=["prompts"],
+            rows=[2, 4, 6],
+        )
+
+        assert result["batch"]["scores"] is scores_destination
+        assert np.array_equal(scores_destination, scores[[11, 3, 3, 0]])
+        assert result["non_tensor_batch"] == {}
+        assert non_tensor_only["batch"] == {}
+        assert non_tensor_only["non_tensor_batch"]["prompts"].tolist() == prompts[[2, 4, 6]].tolist()
+    finally:
+        transfer.cleanup_dataproto(ref)
+
+
+def test_dataproto_helper_imported_handle_same_stage_append_with_real_store() -> None:
+    pytest.importorskip("mooncake.store")
+    _store, transfer = real_transfer("structured-test-imported-handle-append")
+    batch_size = 8
+    input_ids = np.arange(batch_size * 6, dtype=np.int64).reshape(batch_size, 6)
+    masks = np.ones((batch_size, 6), dtype=np.int32)
+    values = np.linspace(1.0, 2.0, batch_size, dtype=np.float32)
+    rewards = values + np.float32(5.0)
+    ref = transfer.put_dataproto(
+        {
+            "batch": {"input_ids": input_ids, "masks": masks},
+            "non_tensor_batch": {},
+            "meta_info": {"step": 2},
+        },
+        namespace="roll",
+        partition="imported-handle-append",
+        stage="rollout",
+    )
+    imported = import_dataproto_ref(export_dataproto_ref(ref))
+    appended = transfer.append_dataproto_fields(
+        imported,
+        {
+            "batch": {"values": values, "rewards": rewards},
+            "non_tensor_batch": {},
+            "meta_info": {"critic": True},
+        },
+        stage="rollout",
+    )
+    handle = export_dataproto_ref(appended)
+
+    try:
+        result = transfer.get_dataproto(handle, fields=["input_ids", "values", "rewards"], rows=[7, 1, 4])
+        assert np.array_equal(result["batch"]["input_ids"], input_ids[[7, 1, 4]])
+        assert np.array_equal(result["batch"]["values"], values[[7, 1, 4]])
+        assert np.array_equal(result["batch"]["rewards"], rewards[[7, 1, 4]])
+        assert result["meta_info"] == {"step": 2, "critic": True}
+    finally:
+        transfer.cleanup_dataproto(appended)
+
+
+def test_bundle_manifest_rejects_tampered_cleanup_keys() -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put_bundle(b"meta", {"payload": b"abcdef"})
+    tampered = dict(ref.manifest)
+    tampered["cleanup_keys"] = ["other/object"]
+    write_manifest(store, ref.manifest_key, tampered)
+
+    with pytest.raises(ValueError, match="cleanup_keys"):
+        transfer.remove_bundle({"manifest_key": ref.manifest_key})
+
+
+def test_dataproto_helper_rollout_edge_cases_with_real_store() -> None:
+    pytest.importorskip("mooncake.store")
+    _store, transfer = real_transfer("structured-test-rollout-edge-cases")
+    batch_size = 10
+    row_ids = [f"edge-row-{index}" for index in range(batch_size)]
+    input_ids = np.arange(batch_size * 16, dtype=np.int64).reshape(batch_size, 16)
+    attention_mask = (input_ids % 2 == 0).astype(np.int32)
+    prompts = np.asarray(
+        ["", "short", None, "三", "bytes", "long-" + "x" * 64, "7", "8", "9", "tail"],
+        dtype=object,
+    )
+    scores = np.linspace(-1.0, 1.0, batch_size, dtype=np.float32)
+    values = scores + np.float32(2.0)
+    replacement_scores = scores + np.float32(10.0)
+    ref = transfer.put_dataproto(
+        {
+            "batch": {"input_ids": input_ids, "attention_mask": attention_mask},
+            "non_tensor_batch": {"prompts": prompts},
+            "meta_info": {"roll_row_ids": row_ids},
+        },
+        namespace="roll",
+        partition="edge-remote-batch",
+        stage="rollout",
+    )
+    ref = transfer.append_dataproto_fields(
+        ref,
+        {"batch": {"scores": scores}, "non_tensor_batch": {}, "meta_info": {}},
+        stage="scores",
+    )
+
+    try:
+        with pytest.raises(ValueError, match="already exist"):
+            transfer.append_dataproto_fields(
+                ref,
+                {"batch": {"scores": scores}, "non_tensor_batch": {}, "meta_info": {}},
+                stage="other_scores",
+            )
+        with pytest.raises(ValueError, match="batch size"):
+            transfer.append_dataproto_fields(
+                ref,
+                {
+                    "batch": {"bad": np.arange(batch_size - 1, dtype=np.int64)},
+                    "non_tensor_batch": {},
+                    "meta_info": {},
+                },
+                stage="bad_size",
+            )
+
+        empty = transfer.get_dataproto(
+            ref,
+            fields=["input_ids", "scores", "prompts"],
+            rows=[],
+        )
+        tail_and_repeat = transfer.get_dataproto(
+            ref,
+            fields=["input_ids", "attention_mask", "scores", "prompts"],
+            rows=[-1, 0, -1, 3],
+        )
+        step_slice = transfer.get_dataproto(
+            ref,
+            batch_fields=["input_ids", "scores"],
+            rows=slice(1, 9, 2),
+        )
+        ref = transfer.append_dataproto_fields(
+            ref,
+            {
+                "batch": {"values": values},
+                "non_tensor_batch": {},
+                "meta_info": {"same_stage": True},
+            },
+            stage="rollout",
+        )
+        same_stage = transfer.get_dataproto(
+            ref,
+            fields=["input_ids", "values", "prompts"],
+            rows=[2, 5, 9],
+        )
+        ref = transfer.append_dataproto_fields(
+            ref,
+            {
+                "batch": {"scores": replacement_scores},
+                "non_tensor_batch": {},
+                "meta_info": {"scores_overwritten": True},
+            },
+            stage="scores",
+            overwrite=True,
+        )
+        overwritten = transfer.get_dataproto(
+            ref,
+            fields=["scores", "values"],
+            rows=[0, 4, 9],
+        )
+
+        assert empty["batch"]["input_ids"].shape == (0, 16)
+        assert empty["batch"]["scores"].shape == (0,)
+        assert empty["non_tensor_batch"]["prompts"].tolist() == []
+        assert np.array_equal(tail_and_repeat["batch"]["input_ids"], input_ids[[9, 0, 9, 3]])
+        assert np.array_equal(
+            tail_and_repeat["batch"]["attention_mask"], attention_mask[[9, 0, 9, 3]]
+        )
+        assert np.array_equal(tail_and_repeat["batch"]["scores"], scores[[9, 0, 9, 3]])
+        assert tail_and_repeat["non_tensor_batch"]["prompts"].tolist() == prompts[[9, 0, 9, 3]].tolist()
+        assert np.array_equal(step_slice["batch"]["input_ids"], input_ids[1:9:2])
+        assert np.array_equal(step_slice["batch"]["scores"], scores[1:9:2])
+        assert np.array_equal(same_stage["batch"]["input_ids"], input_ids[[2, 5, 9]])
+        assert np.array_equal(same_stage["batch"]["values"], values[[2, 5, 9]])
+        assert same_stage["non_tensor_batch"]["prompts"].tolist() == prompts[[2, 5, 9]].tolist()
+        assert np.array_equal(overwritten["batch"]["scores"], replacement_scores[[0, 4, 9]])
+        assert np.array_equal(overwritten["batch"]["values"], values[[0, 4, 9]])
+        assert overwritten["meta_info"]["same_stage"] is True
+        assert overwritten["meta_info"]["scores_overwritten"] is True
+    finally:
+        transfer.cleanup_dataproto(ref)
+
+    with pytest.raises(Exception):
+        transfer.get_dataproto(ref, fields=["input_ids"])
+
+
+def test_structured_object_zero_byte_payload_skips_store_put() -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"empty": np.empty((4, 0), dtype=np.float32)})
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert result.objects["empty"].shape == (4, 0)
+    assert ref.manifest["buffers"]["empty"]["bytes"] == 0
+    assert ref.manifest["buffers"]["empty"]["chunks"] == []
+    assert store.objects == {ref.manifest_key: store.objects[ref.manifest_key], ref.manifest["meta"]["key"]: store.objects[ref.manifest["meta"]["key"]]}
+
+
+def test_dataproto_helper_multidim_boundary_reads_with_real_store() -> None:
+    pytest.importorskip("mooncake.store")
+    _store, transfer = real_transfer("structured-test-multidim-boundaries")
+    batch_size = 18
+    image_features = np.arange(batch_size * 3 * 16 * 16, dtype=np.float32).reshape(
+        batch_size, 3, 16, 16
+    )
+    logits = np.linspace(-2.0, 2.0, batch_size * 4 * 5 * 6, dtype=np.float32).reshape(
+        batch_size, 4, 5, 6
+    )
+    token_matrix = np.arange(batch_size * 7 * 9, dtype=np.int64).reshape(
+        batch_size, 7, 9
+    )
+    zero_width = np.empty((batch_size, 0), dtype=np.float32)
+    row_scores = np.linspace(10.0, 20.0, batch_size, dtype=np.float32)
+    byte_blobs = np.asarray(
+        [
+            b"",
+            b"alpha",
+            bytearray(b"beta"),
+            memoryview(b"gamma"),
+            *[f"blob-{index}".encode() for index in range(4, batch_size)],
+        ],
+        dtype=object,
+    )
+    json_meta = np.asarray(
+        [
+            None if index % 5 == 0 else {"row": index, "shape": [3, 16, 16]}
+            for index in range(batch_size)
+        ],
+        dtype=object,
+    )
+    ref = transfer.put_dataproto(
+        {
+            "batch": {
+                "image_features": image_features,
+                "logits": logits,
+                "token_matrix": token_matrix,
+                "zero_width": zero_width,
+            },
+            "non_tensor_batch": {
+                "byte_blobs": byte_blobs,
+                "json_meta": json_meta,
+            },
+            "meta_info": {"batch_size": batch_size, "layout": "multidim"},
+        },
+        namespace="roll",
+        partition="multidim-boundaries",
+        stage="rollout",
+    )
+    ref = transfer.append_dataproto_fields(
+        ref,
+        {
+            "batch": {"row_scores": row_scores},
+            "non_tensor_batch": {},
+            "meta_info": {"score_stage": "same-stage"},
+        },
+        stage="rollout",
+    )
+    handle = export_dataproto_ref(ref)
+    rows = [17, 0, 5, 17, 9]
+
+    try:
+        full = transfer.get_dataproto(
+            handle,
+            fields=["image_features", "zero_width", "byte_blobs", "json_meta"],
+        )
+        empty_slice = transfer.get_dataproto(
+            handle,
+            batch_fields=["image_features", "zero_width", "row_scores"],
+            rows=slice(4, 4),
+        )
+        duplicate_gather = transfer.get_dataproto(
+            handle,
+            fields=["logits", "token_matrix", "row_scores", "byte_blobs", "json_meta"],
+            rows=rows,
+        )
+        image_destination = np.empty((len(rows), 3, 16, 16), dtype=np.float32)
+        into = transfer.get_dataproto(
+            handle,
+            batch_fields=["image_features"],
+            rows=rows,
+            destinations={"image_features": image_destination},
+        )
+        step_batch = transfer.get_dataproto(
+            handle,
+            batch_fields=["logits", "token_matrix"],
+            rows=slice(2, 17, 3),
+        )
+        tail_non_tensor = transfer.get_dataproto(
+            handle,
+            non_tensor_fields=["byte_blobs", "json_meta"],
+            rows=slice(batch_size - 3, batch_size),
+        )
+        meta_selected = transfer.get_dataproto(
+            handle,
+            fields=[],
+            meta_info_keys=["layout", "score_stage"],
+        )
+
+        assert np.array_equal(full["batch"]["image_features"], image_features)
+        assert full["batch"]["zero_width"].shape == (batch_size, 0)
+        assert full["non_tensor_batch"]["byte_blobs"].tolist() == [
+            bytes(value) for value in byte_blobs.tolist()
+        ]
+        assert full["non_tensor_batch"]["json_meta"].tolist() == json_meta.tolist()
+        assert empty_slice["batch"]["image_features"].shape == (0, 3, 16, 16)
+        assert empty_slice["batch"]["zero_width"].shape == (0, 0)
+        assert empty_slice["batch"]["row_scores"].shape == (0,)
+        assert np.array_equal(duplicate_gather["batch"]["logits"], logits[rows])
+        assert np.array_equal(
+            duplicate_gather["batch"]["token_matrix"], token_matrix[rows]
+        )
+        assert np.array_equal(duplicate_gather["batch"]["row_scores"], row_scores[rows])
+        assert duplicate_gather["non_tensor_batch"]["byte_blobs"].tolist() == [
+            bytes(value) for value in byte_blobs[rows].tolist()
+        ]
+        assert duplicate_gather["non_tensor_batch"]["json_meta"].tolist() == json_meta[rows].tolist()
+        assert into["batch"]["image_features"] is image_destination
+        assert np.array_equal(image_destination, image_features[rows])
+        assert np.array_equal(step_batch["batch"]["logits"], logits[2:17:3])
+        assert np.array_equal(step_batch["batch"]["token_matrix"], token_matrix[2:17:3])
+        assert tail_non_tensor["batch"] == {}
+        assert tail_non_tensor["non_tensor_batch"]["byte_blobs"].tolist() == [
+            bytes(value) for value in byte_blobs[batch_size - 3 :].tolist()
+        ]
+        assert tail_non_tensor["non_tensor_batch"]["json_meta"].tolist() == json_meta[batch_size - 3 :].tolist()
+        assert meta_selected["batch"] == {}
+        assert meta_selected["non_tensor_batch"] == {}
+        assert meta_selected["meta_info"] == {
+            "layout": "multidim",
+            "score_stage": "same-stage",
+        }
     finally:
         transfer.cleanup_dataproto(ref)
 

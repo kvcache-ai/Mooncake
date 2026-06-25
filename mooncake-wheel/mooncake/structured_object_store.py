@@ -1436,22 +1436,22 @@ def _resolve_dataproto_field_selection(
                 if ref.field_index[name].section == "non_tensor_batch"
             ],
         )
-    if batch_fields is None:
+    if batch_fields is None and non_tensor_fields is None:
         batch_names = [
             name
             for name, location in ref.field_index.items()
             if location.section == "batch"
         ]
-    else:
-        batch_names = list(batch_fields)
-    if non_tensor_fields is None:
         non_tensor_names = [
             name
             for name, location in ref.field_index.items()
             if location.section == "non_tensor_batch"
         ]
     else:
-        non_tensor_names = list(non_tensor_fields)
+        batch_names = [] if batch_fields is None else list(batch_fields)
+        non_tensor_names = (
+            [] if non_tensor_fields is None else list(non_tensor_fields)
+        )
     _validate_dataproto_fields_exist(ref, [*batch_names, *non_tensor_names])
     return batch_names, non_tensor_names
 
@@ -2484,6 +2484,8 @@ class _BundleManifestStore:
         transfer_policy: BundleTransferPolicy,
         pre_registered: bool,
     ) -> tuple[dict[str, Any], list[str]]:
+        if len(value) == 0:
+            return {"key": key, "bytes": 0, "chunks": []}, []
         chunks = _split_view(value, chunk_bytes)
         chunk_keys = [
             key if len(chunks) == 1 else f"{key}/chunk/{index}"
