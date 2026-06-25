@@ -2004,86 +2004,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
     auto file = std::move(open_file_result.value());
 
-#ifdef USE_URING
-    // Try to use write_aligned for O_DIRECT I/O if file is UringFile
-    UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-    if (uring_file != nullptr) {
-        size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
-        size_t aligned_size = align_up(total_size, kDirectIOAlignment);
-
-        // Allocate aligned buffer if needed
-        void* write_buffer = nullptr;
-        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
-                                                           [](void*) {}};
-
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
-        } else {
-            // Allocate a temporary larger buffer
-            void* buf = nullptr;
-            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
-            if (ret != 0) {
-                LOG(ERROR)
-                    << "Failed to allocate aligned buffer for WriteBucket: "
-                    << strerror(ret);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            temp_buffer.reset(buf);
-            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
-                buf, [](void* p) { free(p); });
-            write_buffer = buf;
-            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
-                         << " requires " << aligned_size
-                         << " bytes, exceeds buffer size " << kAlignedBufferSize
-                         << ", using temporary allocation";
-        }
-
-        // Aggregate all iovs data into the aligned buffer
-        char* dst = static_cast<char*>(write_buffer);
-        for (const auto& iov : iovs) {
-            memcpy(dst, iov.iov_base, iov.iov_len);
-            dst += iov.iov_len;
-        }
-
-        // Zero-pad the remaining bytes
-        if (aligned_size > total_size) {
-            memset(dst, 0, aligned_size - total_size);
-        }
-
-        // Write using write_aligned
-        auto write_result =
-            uring_file->write_aligned(write_buffer, aligned_size, 0);
-        if (!write_result) {
-            LOG(ERROR) << "write_aligned failed for: " << bucket_id
-                       << ", error: " << write_result.error();
-            return tl::make_unexpected(write_result.error());
-        }
-        if (write_result.value() != aligned_size) {
-            LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
-                       << ", expected: " << aligned_size
-                       << ", got: " << write_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
-    } else
-#endif
     {
-        // Fallback to vector_write for non-UringFile
         auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
         if (!write_result) {
             LOG(ERROR) << "vector_write failed for: " << bucket_id
@@ -2097,6 +2018,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
+
+#ifdef USE_URING
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            auto sync_result = uring_file->datasync();
+            if (!sync_result) {
+                LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+#endif
 
         // Invalidate cache for this file since content changed
         {
@@ -2578,9 +2510,11 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
+    // Use O_DIRECT only for reads: O_DIRECT writes require 4096-byte alignment
+    // padding which corrupts meta file parsing and wastes disk space on data
+    // files. Writes still create a UringFile in buffered mode (use_direct_io
+    // = false) so they benefit from io_uring async submission and queue depth
+    // without the padding problem.
     if (file_storage_config_.use_uring && mode == FileMode::Read) {
         flags |= O_DIRECT;
     }
@@ -2593,8 +2527,9 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
-        return std::make_unique<UringFile>(path, fd, 32, true);
+    if (file_storage_config_.use_uring) {
+        bool use_direct_io = (mode == FileMode::Read);
+        return std::make_unique<UringFile>(path, fd, 32, use_direct_io);
     }
 #endif
     return std::make_unique<PosixFile>(path, fd);

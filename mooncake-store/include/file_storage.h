@@ -1,9 +1,13 @@
 #pragma once
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+
 #include "client_service.h"
 #include "client_buffer.hpp"
-#include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "storage_backend.h"
 
 namespace mooncake {
 
@@ -52,6 +56,16 @@ class FileStorage {
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
+
+    struct PromotionExecutionResult {
+        bool alloc_attempted = false;
+        bool write_attempted = false;
+        bool notify_success_attempted = false;
+        bool notify_failure_attempted = false;
+        bool completed = false;
+        ErrorCode terminal_error = ErrorCode::OK;
+    };
+
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -83,23 +97,38 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
-     * 4. Pulls and processes any pending L2->L1 promotion tasks queued by the
-     *    master (mirror of step 1+2 in the reverse direction).
+     * 4. Pulls any pending L2->L1 promotion tasks queued by the master and
+     *    dispatches them for execution (mirror of step 1+2 in the reverse
+     *    direction).
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
 
     /**
      * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
-     * Pulls promotion work from the master, stages a MEMORY replica for each
-     * key, copies the bytes from local SSD into that replica, and notifies the
-     * master on success. A failure on any single key is logged and skipped;
-     * the master-side reaper decrements the source replica's refcnt and
-     * erases the task entry on TTL expiry, and any orphaned PROCESSING
-     * MEMORY replica is reaped via the standard discarded-replicas path.
+     *
+     * Pulls promotion work from the master and either processes it
+     * synchronously or enqueues it for background workers. Each task stages a
+     * MEMORY replica, copies the bytes from local SSD into that replica, and
+     * notifies the master on success. FileStorage eagerly reports per-key
+     * failures so the master can release the promotion slot immediately, with
+     * the reaper acting as a long-stop.
+     *
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
+
+    PromotionExecutionResult ProcessPromotionTask(
+        const PromotionTaskItem& task,
+        const std::vector<std::string>& preferred_segments);
+
+    bool EnqueuePromotionTask(const PromotionTaskItem& task,
+                              bool allow_over_capacity_for_pulled_task = false);
+
+    void ReleasePromotionTask(const std::string& key,
+                              const std::string& tenant_id);
+
+    void PromotionWorkerThreadFunc();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
@@ -143,6 +172,11 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::atomic<bool> promotion_workers_running_{false};
+    std::vector<std::thread> promotion_worker_threads_;
+    std::mutex promotion_queue_mutex_;
+    std::condition_variable promotion_queue_cv_;
+    std::deque<PromotionTaskItem> promotion_task_queue_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
 };
