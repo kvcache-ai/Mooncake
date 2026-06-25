@@ -300,7 +300,19 @@ impl StorageOwnerState {
                 true
             }
         });
-        before - pending.len()
+        let swept = before - pending.len();
+        if swept > 0 {
+            super::super::registry::record_cold_restore_batch_items(
+                "staging_slots_swept",
+                swept as u64,
+            );
+            tracing::info!(
+                runtime = %self.runtime,
+                swept,
+                "swept expired cold restore staging slots"
+            );
+        }
+        swept
     }
 
     pub(in super::super) fn apply_cold_tier_usage_delta(

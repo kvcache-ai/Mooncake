@@ -570,6 +570,14 @@ fn spawn_restore_promotion_worker_if_needed(client: &StoreClient, resolved: &Res
                     execute_restore_promotion(&promoter, &task)
                 }))
                 .unwrap_or_else(|_| {
+                    registry::record_cold_tier_operation("restore_promote", "error", "panic");
+                    warn!(
+                        tenant = %task.tenant,
+                        key = %task.object_id.logical_key,
+                        route_key = %task.current.key.0,
+                        route_version = task.current.version.0,
+                        "restore promotion panicked"
+                    );
                     Err(StoreError::InvalidState(
                         "restore promotion panicked".to_string(),
                     ))

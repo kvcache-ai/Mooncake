@@ -3218,6 +3218,14 @@ impl StoreClient {
                         continue;
                     }
                 };
+                if batch.replies.len() != batch.indices.len() {
+                    hard_error = Some(StoreError::InvalidState(format!(
+                        "remote cold read batch reply count mismatch: expected {} actual {}",
+                        batch.indices.len(),
+                        batch.replies.len()
+                    )));
+                    continue;
+                }
                 for (i, reply) in batch.replies.into_iter().enumerate() {
                     let index = batch.indices[i];
                     if let Some(ref err) = reply.error {
@@ -3242,6 +3250,17 @@ impl StoreClient {
                             "remote cold read backpressured, will retry after first wave"
                         );
                         backpressured_cold_indices.push(index);
+                        continue;
+                    }
+                    cold_promote_pins.push((
+                        batch.owner_lease.clone(),
+                        reply.segment_name.clone(),
+                        reply.segment_offset,
+                        index,
+                    ));
+                    if let Err(error) = Self::validate_remote_cold_read_reply(&resolved[index], &reply)
+                    {
+                        hard_error = Some(error);
                         continue;
                     }
                     let segment_name = SegmentName::new(&reply.segment_name);
@@ -3274,12 +3293,6 @@ impl StoreClient {
                     } else {
                         None
                     };
-                    cold_promote_pins.push((
-                        batch.owner_lease.clone(),
-                        reply.segment_name.clone(),
-                        reply.segment_offset,
-                        index,
-                    ));
                     *wave0_owner_capacity
                         .entry(batch.owner_lease.runtime.clone())
                         .or_default() += 1;
@@ -3505,6 +3518,7 @@ impl StoreClient {
                 // Process retry results.
                 let mut retry_succeeded_pins: Vec<(ClientLease, String, u64, usize)> = Vec::new();
                 let mut still_backpressured: Vec<usize> = Vec::new();
+                let mut retry_error: Option<StoreError> = None;
                 for result in retry_batch_results {
                     let batch = match result {
                         Ok(b) => b,
@@ -3518,6 +3532,14 @@ impl StoreClient {
                             return Err(err);
                         }
                     };
+                    if batch.replies.len() != batch.indices.len() {
+                        retry_error = Some(StoreError::InvalidState(format!(
+                            "remote cold read retry batch reply count mismatch: expected {} actual {}",
+                            batch.indices.len(),
+                            batch.replies.len()
+                        )));
+                        continue;
+                    }
                     for (i, reply) in batch.replies.into_iter().enumerate() {
                         let index = batch.indices[i];
                         if let Some(ref err) = reply.error {
@@ -3528,13 +3550,26 @@ impl StoreClient {
                                 error = %err.message,
                                 "per-entry cold read retry error"
                             );
-                            return Err(StoreError::Transport(format!(
+                            retry_error = Some(StoreError::Transport(format!(
                                 "cold read retry failed for key={}: {}",
                                 resolved[index].key, err.message,
                             )));
+                            continue;
                         }
                         if reply.backpressure {
                             still_backpressured.push(index);
+                            continue;
+                        }
+                        retry_succeeded_pins.push((
+                            batch.owner_lease.clone(),
+                            reply.segment_name.clone(),
+                            reply.segment_offset,
+                            index,
+                        ));
+                        if let Err(error) =
+                            Self::validate_remote_cold_read_reply(&resolved[index], &reply)
+                        {
+                            retry_error = Some(error);
                             continue;
                         }
                         let segment_name = SegmentName::new(&reply.segment_name);
@@ -3567,12 +3602,6 @@ impl StoreClient {
                         } else {
                             None
                         };
-                        retry_succeeded_pins.push((
-                            batch.owner_lease.clone(),
-                            reply.segment_name.clone(),
-                            reply.segment_offset,
-                            index,
-                        ));
                         resolved[index].replica = ReplicaRoute {
                             owner: batch.owner_lease.runtime.clone(),
                             segment_name: segment_name.clone(),
@@ -3592,7 +3621,7 @@ impl StoreClient {
                     .iter()
                     .map(|(_, _, _, idx)| *idx)
                     .collect();
-                let retry_rdma_err = if !retry_rdma_indices.is_empty() {
+                let retry_rdma_err = if !retry_rdma_indices.is_empty() && retry_error.is_none() {
                     self.execute_remote_rdma_for_indices(
                         transport,
                         resolved,
@@ -3627,7 +3656,10 @@ impl StoreClient {
                     }
                 }
 
-                // Propagate RDMA error after ACK.
+                // Propagate errors after ACK.
+                if let Some(e) = retry_error {
+                    return Err(e);
+                }
                 if let Some(e) = retry_rdma_err {
                     return Err(e);
                 }
@@ -3733,6 +3765,33 @@ impl StoreClient {
         record_batch_get_path_items("remote_cold", remote_cold_indices.len() as u64);
         record_batch_get_path_items("backpressured", backpressured_cold_indices_count as u64);
         Ok(lengths)
+    }
+
+    fn validate_remote_cold_read_reply(
+        resolved: &ResolvedObject,
+        reply: &crate::control_plane::pb::ReadFromColdReply,
+    ) -> Result<()> {
+        let cold_backing = cold_tier::materialized_cold_backing(&resolved.route).ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "tenant={} key={} remote cold read reply has no materialized cold backing source",
+                resolved.tenant, resolved.key
+            ))
+        })?;
+        if reply.length != cold_backing.length {
+            return Err(StoreError::InvalidState(format!(
+                "tenant={} key={} remote cold read length mismatch: expected {} actual {}",
+                resolved.tenant, resolved.key, cold_backing.length, reply.length
+            )));
+        }
+        if let Some(expected) = cold_backing.checksum {
+            if reply.checksum != Some(expected) {
+                return Err(StoreError::InvalidState(format!(
+                    "tenant={} key={} remote cold read checksum mismatch: expected {} actual {:?}",
+                    resolved.tenant, resolved.key, expected, reply.checksum
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Execute remote RDMA reads for a given set of indices into `resolved`/`buffers`.
