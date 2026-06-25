@@ -10,7 +10,7 @@ authors = [
     { name = "Mooncake Authors" }
 ]
 requires-python = ">=3.8"
-dependencies = ["aiohttp", "requests"]
+dependencies = ["aiohttp", "fsspec", "requests"]
 keywords = ["mooncake", "data transfer", "kv cache", "llm inference"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -18,6 +18,9 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 readme = ""
+
+[project.optional-dependencies]
+file-io = ["safetensors", "torch"]
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"

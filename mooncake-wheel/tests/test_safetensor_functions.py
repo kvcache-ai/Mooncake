@@ -3,6 +3,7 @@ import os
 import time
 import tempfile
 import uuid
+from pathlib import Path
 from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
@@ -332,6 +333,128 @@ class TestSafetensorFunctions(unittest.TestCase):
             # Clean up the temporary file if it was created
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
+
+    def test_save_and_load_tensor_from_standard_file(self):
+        """Test generic tensor persistence with standard torch files."""
+        import torch
+
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        key_suffix = uuid.uuid4().hex
+        original_key = f"test_standard_tensor_{key_suffix}"
+        restored_key = f"test_standard_tensor_restored_{key_suffix}"
+
+        result = self.store.put_tensor(original_key, tensor)
+        self.assertEqual(result, 0)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            save_result = self.store.save_tensor_to_file(original_key, temp_filename)
+            self.assertEqual(save_result, 0)
+            self.assertTrue(os.path.exists(temp_filename))
+
+            loaded_tensor = self.store.load_tensor_from_file(
+                restored_key, temp_filename, filesystem="file"
+            )
+            self.assertIsNotNone(loaded_tensor)
+
+            restored_tensor = self.store.get_tensor(restored_key)
+            self.assertIsNotNone(restored_tensor)
+            self.assertTrue(torch.allclose(tensor, restored_tensor))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(original_key)
+            self.store.remove(restored_key)
+
+    def test_save_and_load_safetensor_with_filesystem_uri(self):
+        """Test filesystem-aware safetensor persistence through the client API."""
+        import torch
+
+        tensor = torch.tensor([[11.0, 12.0], [13.0, 14.0]], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        original_key = f"test_fs_tensor_{key_suffix}"
+        restored_key = f"test_fs_tensor_restored_{key_suffix}"
+
+        result = self.store.put_tensor(original_key, tensor)
+        self.assertEqual(result, 0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_path = Path(temp_dir) / "nested" / "kv_cache.safetensors"
+            file_uri = target_path.as_uri()
+
+            save_result = self.store.save_tensor_to_safetensor(
+                original_key,
+                file_uri,
+                filesystem="file",
+                tensor_name="kv_cache",
+            )
+            self.assertEqual(save_result, 0)
+            self.assertTrue(target_path.exists())
+
+            loaded_tensor = self.store.load_tensor_from_safetensor(
+                restored_key,
+                file_uri,
+                filesystem="file",
+                tensor_name="kv_cache",
+            )
+            self.assertIsNotNone(loaded_tensor)
+
+            restored_tensor = self.store.get_tensor(restored_key)
+            self.assertIsNotNone(restored_tensor)
+            self.assertTrue(torch.allclose(tensor, restored_tensor))
+
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.store.remove(original_key)
+        self.store.remove(restored_key)
+
+    def test_save_and_load_kv_cache_aliases(self):
+        """Test KV cache aliases for file persistence."""
+        import torch
+
+        tensor = torch.tensor([21.0, 22.0, 23.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        original_key = f"test_kv_cache_{key_suffix}"
+        restored_key = f"test_kv_cache_restored_{key_suffix}"
+
+        result = self.store.put_tensor(original_key, tensor)
+        self.assertEqual(result, 0)
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            save_result = self.store.save_kv_cache_to_file(
+                original_key,
+                temp_filename,
+                format="safetensors",
+                filesystem="file",
+            )
+            self.assertEqual(save_result, 0)
+
+            loaded_tensor = self.store.load_kv_cache_from_file(
+                restored_key,
+                temp_filename,
+                format="safetensors",
+                filesystem="file",
+            )
+            self.assertIsNotNone(loaded_tensor)
+
+            restored_tensor = self.store.get_tensor(restored_key)
+            self.assertIsNotNone(restored_tensor)
+            self.assertTrue(torch.allclose(tensor, restored_tensor))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(original_key)
+            self.store.remove(restored_key)
 
 
 if __name__ == "__main__":
