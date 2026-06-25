@@ -54,7 +54,7 @@ Status restoreCudaDeviceForLocation(const LocationParser& location,
     return Status::OK();
 }
 
-int detectDeviceFromPointer(void *ptr) {
+int detectDeviceFromPointer(void* ptr) {
     if (!ptr) return -1;
     cudaPointerAttributes attrs = {};
     auto err = cudaPointerGetAttributes(&attrs, ptr);
