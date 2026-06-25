@@ -24,6 +24,7 @@ class FileStorageTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
+        UnsetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
@@ -287,6 +288,14 @@ TEST_F(FileStorageTest, ReadStringFromEnv) {
 
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.storage_filepath, "/tmp/storage");
+}
+
+TEST_F(FileStorageTest, DeprecatedDistributedDescriptorFallsBackToBucket) {
+    SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "distributed_storage_backend");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_EQ(config.storage_backend_type, StorageBackendType::kBucket);
 }
 
 TEST_F(FileStorageTest, ReadInt64FromEnv) {
