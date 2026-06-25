@@ -419,7 +419,9 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         resp = await self.service.handle_exist(request)
         self.assertEqual(resp.status, 500)
         body = json.loads(resp.text)
-        self.assertIn("error", body)
+        # Assert the specific message so this pins the exists < 0 branch rather
+        # than any 500 (the except path returns {"error": str(e)} too).
+        self.assertEqual(body["error"], "Exist check failed")
 
     # ==================== /api/remove/{key} tests ====================
 
