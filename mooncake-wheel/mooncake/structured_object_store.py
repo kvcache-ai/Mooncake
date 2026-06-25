@@ -838,6 +838,7 @@ class MooncakeBundleTransfer:
             return array
 
         if _is_recursive_encoded_non_tensor(encoded):
+            metadata = _copy_recursive_metadata_for_leaf_updates(metadata)
             recursive_payload: dict[str, Any] = {}
             for node in metadata.get("nodes", []):
                 for key in ("missing_payload", "row_mask_payload", "lengths_payload"):
@@ -862,6 +863,7 @@ class MooncakeBundleTransfer:
                     },
                     indices,
                 )
+                leaf["metadata"] = _leaf_metadata
                 for name, value in leaf_payload.items():
                     recursive_payload[leaf_payload_members[name]] = value
                 recursive_payload[leaf_payload_members["missing"]] = read_member_indices(
@@ -1021,6 +1023,7 @@ class MooncakeBundleTransfer:
             )
 
         if _is_recursive_encoded_non_tensor(encoded):
+            metadata = _copy_recursive_metadata_for_leaf_updates(metadata)
             recursive_payload: dict[str, Any] = {}
             for node in metadata.get("nodes", []):
                 for key in ("missing_payload", "row_mask_payload", "lengths_payload"):
@@ -1044,6 +1047,7 @@ class MooncakeBundleTransfer:
                     row_slice,
                     total_rows,
                 )
+                leaf["metadata"] = _leaf_metadata
                 for name, value in leaf_payload.items():
                     recursive_payload[leaf_payload_members[name]] = value
                 recursive_payload[leaf_payload_members["missing"]] = read_member(
@@ -1599,7 +1603,16 @@ def _encode_structured_non_tensor_field(
 
 
 def _should_encode_recursive_structure(leaves: Sequence[_InferredLeaf]) -> bool:
-    return any(leaf.decision.codec == "ragged_tensor" for leaf in leaves)
+    return any(_should_encode_recursive_leaf(leaf) for leaf in leaves)
+
+
+def _should_encode_recursive_leaf(leaf: _InferredLeaf) -> bool:
+    codec = leaf.decision.codec
+    if codec in {"ragged_tensor", "bytes_ragged", "media_bytes", "media_list_ragged"}:
+        return True
+    if codec == "typed_ragged":
+        return any(isinstance(value, np.ndarray) for value in _non_null(leaf.values))
+    return False
 
 
 def _recursive_leaf_decision(values: list[Any], decision: _CodecDecision) -> _CodecDecision:
@@ -1808,6 +1821,14 @@ def _decode_structured_non_tensor_encoded(
     if _is_recursive_encoded_non_tensor(encoded):
         return _decode_structured_recursive_field(encoded, payload, rows)
     return _decode_structured_leaf(encoded["codec"], payload, rows, metadata)
+
+
+def _copy_recursive_metadata_for_leaf_updates(
+    metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    copied = dict(metadata)
+    copied["leaves"] = [dict(leaf) for leaf in metadata.get("leaves", [])]
+    return copied
 
 
 def _decode_structured_recursive_field(
@@ -4226,10 +4247,27 @@ def _is_bytes_like(value: Any) -> bool:
 
 
 def _is_media_list(value: Any) -> bool:
-    return (
-        isinstance(value, (list, tuple))
-        and len(value) > 0
-        and all(_is_pil_image(item) or _is_bytes_like(item) for item in value)
+    return isinstance(value, (list, tuple)) and all(
+        _is_pil_image(item) or _is_bytes_like(item) for item in value
+    )
+
+
+def _can_media_list(values: list[Any]) -> _CodecDecision:
+    nn = _non_null(values)
+    if not nn:
+        return _CodecDecision(
+            False, "media_list_ragged", "all rows are null", "media list"
+        )
+    if not all(_is_media_list(v) for v in nn):
+        return _CodecDecision(
+            False, "media_list_ragged", "not all rows are media list", "media list"
+        )
+    if not any(len(v) > 0 for v in nn):
+        return _CodecDecision(
+            False, "media_list_ragged", "all media lists are empty", "media list"
+        )
+    return _CodecDecision(
+        True, "media_list_ragged", "all non-null rows are media list", "media list"
     )
 
 
@@ -4408,7 +4446,7 @@ def _can_json(values: list[Any]) -> _CodecDecision:
 
 _CODEC_PREDICATES: tuple[Any, ...] = (
     _can_tensor,
-    lambda v: _check_all(v, _is_media_list, "media_list_ragged", "media list"),
+    _can_media_list,
     _can_numeric_sequence,
     _can_numeric_scalar,
     lambda v: _check_all(v, _is_bytes_like, "bytes_ragged", "bytes-like"),

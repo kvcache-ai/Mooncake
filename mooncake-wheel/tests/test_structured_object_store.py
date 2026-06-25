@@ -2610,6 +2610,45 @@ def test_dataproto_helper_nested_tensor_object_array_rows() -> None:
         _assert_tensor_object_equal(actual[row], expected)
 
 
+def test_dataproto_helper_dict_of_native_object_leaves_uses_recursive_codec() -> None:
+    _store, transfer = make_transfer()
+    samples = np.asarray(
+        [
+            {
+                "media": [b"a", b"bc"],
+                "blob": b"payload-0",
+                "scores": np.asarray([1, 2], dtype=np.int64),
+                "label": "x",
+            },
+            {
+                "media": [],
+                "blob": b"payload-1",
+                "scores": np.asarray([3], dtype=np.int64),
+                "label": "y",
+            },
+            {"label": "missing-native"},
+            None,
+        ],
+        dtype=object,
+    )
+
+    ref = transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"samples": samples}))
+    result = transfer.get_dataproto(ref)
+    actual = result["non_tensor_batch"]["samples"]
+
+    assert ref.encoded_non_tensor["samples"]["codec"] == "structured_recursive"
+    assert actual[0]["media"] == [b"a", b"bc"]
+    assert actual[0]["blob"] == b"payload-0"
+    assert actual[0]["scores"] == [1, 2]
+    assert actual[0]["label"] == "x"
+    assert actual[1]["media"] == []
+    assert actual[1]["blob"] == b"payload-1"
+    assert actual[1]["scores"] == [3]
+    assert actual[1]["label"] == "y"
+    assert actual[2] == {"label": "missing-native"}
+    assert actual[3] is None
+
+
 def test_dataproto_helper_reads_dict_of_tensors_rows_and_selected_field() -> None:
     torch = pytest.importorskip("torch")
     _store, transfer = make_transfer()
