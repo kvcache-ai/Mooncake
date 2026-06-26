@@ -3,6 +3,7 @@ use super::*;
 
 #[test]
 fn embedded_client_restores_cold_only_route_without_configured_cold_tier_target() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let cold_root = cold_tier_test_root("embedded-cold-restore");
     let writer_transport = Arc::new(TestTransport::new("embedded-cold-restore-writer-segment"));
@@ -59,6 +60,7 @@ fn embedded_client_restores_cold_only_route_without_configured_cold_tier_target(
 
 #[test]
 fn embedded_client_remote_cold_only_read_promotes_on_owner() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let cold_root = cold_tier_test_root("embedded-remote-cold-restore");
     let transport = Arc::new(TestTransport::new("embedded-remote-cold-owner-segment"));
@@ -126,6 +128,7 @@ fn embedded_client_remote_cold_only_read_promotes_on_owner() {
 
 #[test]
 fn put_and_batch_put_survive_cold_offload_and_memory_eviction() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let cold_root = cold_tier_test_root("put-batch-evict-restore");
     let transport = Arc::new(TestTransport::new("put-batch-evict-restore-segment"));
@@ -218,6 +221,7 @@ fn put_and_batch_put_survive_cold_offload_and_memory_eviction() {
 
 #[test]
 fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let cold_root = cold_tier_test_root("batch-readable-evict-range");
     let transport = Arc::new(TestTransport::new("batch-readable-evict-range-segment"));
@@ -260,7 +264,7 @@ fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
 
     assert_eq!(
         client
-            .batch_is_exist(&[ObjectRef::new("batch-readable-evict-target")])
+            .batch_is_readable(&[ObjectRef::new("batch-readable-evict-target")])
             .expect("batch_is_readable should succeed for evicted cold-only entry"),
         vec![true]
     );
@@ -272,6 +276,7 @@ fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
 
 #[test]
 fn batch_is_exist_reports_true_for_evicted_cold_only_entry() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let cold_root = cold_tier_test_root("batch-exist-evict-range");
     let transport = Arc::new(TestTransport::new("batch-exist-evict-range-segment"));
@@ -339,6 +344,7 @@ fn batch_is_exist_reports_true_for_evicted_cold_only_entry() {
 
 #[test]
 fn batch_get_restores_cold_only_entry_mixed_with_hot_entry() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("mixed-batch-cold-restore-segment"));
     let client = StoreClientBuilder::new(metadata, "mixed-batch-cold-restore")
@@ -381,7 +387,7 @@ fn batch_get_restores_cold_only_entry_mixed_with_hot_entry() {
     );
     assert_eq!(
         client
-            .batch_is_exist(&[ObjectRef::new("mixed-hot"), ObjectRef::new("mixed-cold")])
+            .batch_is_readable(&[ObjectRef::new("mixed-hot"), ObjectRef::new("mixed-cold")])
             .expect("batch_is_readable should succeed"),
         vec![true, true]
     );
@@ -497,6 +503,7 @@ fn cold_put_cas_error_removes_unpublished_pending_source() {
 /// `contains_readable_many` only checked hot replicas, not materialized cold backing.
 #[test]
 fn cold_only_data_visible_and_readable_with_active_readable_filter() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let cold_root = cold_tier_test_root("cold-only-readable-filter-e2e");
     let transport = Arc::new(TestTransport::new("cold-only-readable-filter-e2e-seg"));
