@@ -1873,6 +1873,10 @@ TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersEnvAndRejectsLoopback) {
         EXPECT_EQ(ResolveMooncakeHostId("127.0.0.1:5000"), "hostA");
     }
     {
+        ScopedEnvVar env("MOONCAKE_HOST_ID", "[::1]");
+        EXPECT_TRUE(ResolveMooncakeHostId("hostB:5000").empty());
+    }
+    {
         ScopedEnvVar env("MOONCAKE_HOST_ID");
         EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
         EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());

@@ -575,7 +575,7 @@ std::string ResolveMooncakeHostId(const std::string &local_hostname) {
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char c) { return std::tolower(c); });
     if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
-        lower == "::1") {
+        lower == "::1" || lower == "[::1]") {
         return "";
     }
     return host_id;

@@ -874,8 +874,19 @@ void MasterService::UpdateClientHostId(const UUID& client_id,
     if (host_id.empty()) {
         return;
     }
+    {
+        std::shared_lock<std::shared_mutex> lock(client_mutex_);
+        auto it = client_host_id_.find(client_id);
+        if (it != client_host_id_.end() && it->second == host_id) {
+            return;
+        }
+    }
+
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
-    client_host_id_[client_id] = host_id;
+    auto it = client_host_id_.find(client_id);
+    if (it == client_host_id_.end() || it->second != host_id) {
+        client_host_id_[client_id] = host_id;
+    }
 }
 
 std::string MasterService::GetClientHostId(const UUID& client_id) const {
@@ -4270,17 +4281,23 @@ size_t MasterService::GetKeyCount() const {
 auto MasterService::Ping(const UUID& client_id, const std::string& host_id)
     -> tl::expected<PingResponse, ErrorCode> {
     ClientStatus client_status;
+    bool need_host_update = false;
     {
-        std::unique_lock<std::shared_mutex> lock(client_mutex_);
-        if (!host_id.empty()) {
-            client_host_id_[client_id] = host_id;
-        }
+        std::shared_lock<std::shared_mutex> lock(client_mutex_);
         auto it = ok_client_.find(client_id);
         if (it != ok_client_.end()) {
             client_status = ClientStatus::OK;
         } else {
             client_status = ClientStatus::NEED_REMOUNT;
         }
+        if (!host_id.empty()) {
+            auto host_it = client_host_id_.find(client_id);
+            need_host_update =
+                host_it == client_host_id_.end() || host_it->second != host_id;
+        }
+    }
+    if (need_host_update) {
+        UpdateClientHostId(client_id, host_id);
     }
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!client_ping_queue_.push(pod_client_id)) {
