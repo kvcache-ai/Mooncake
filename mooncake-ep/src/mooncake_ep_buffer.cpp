@@ -202,7 +202,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
 
     auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -210,7 +210,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     };
 
     auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -218,7 +218,16 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MACA)
+        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
+                                 buffer.rdma_send_signal_buffer, rank,
+                                 num_ranks, phase_epoch, launch_stream);
+        CUDA_CHECK(cudaStreamSynchronize(launch_stream));
+        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
+                                 num_ranks, phase_epoch, launch_stream,
+                                 timeout_ticks);
+        CUDA_CHECK(cudaStreamSynchronize(launch_stream));
+#elif defined(MOONCAKE_EP_USE_MUSA)
         mooncake::mark_and_wait_phase_ack(
             gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
             rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
@@ -244,7 +253,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_send_done();
     } else {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);
@@ -358,7 +367,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
 
     auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -366,7 +375,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     };
 
     auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -374,7 +383,16 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MACA)
+        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
+                                 buffer.rdma_send_signal_buffer, rank,
+                                 num_ranks, phase_epoch, launch_stream);
+        CUDA_CHECK(cudaStreamSynchronize(launch_stream));
+        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
+                                 num_ranks, phase_epoch, launch_stream,
+                                 timeout_ticks);
+        CUDA_CHECK(cudaStreamSynchronize(launch_stream));
+#elif defined(MOONCAKE_EP_USE_MUSA)
         mooncake::mark_and_wait_phase_ack(
             gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
             rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
@@ -400,7 +418,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_send_done();
     } else {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);

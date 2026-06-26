@@ -5,7 +5,7 @@
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC,      \
                            ST_FUNC)                                           \
     {                                                                         \
-        constexpr int kLoopStride = 32 * (UNROLL_FACTOR);                     \
+        constexpr int kLoopStride = kEpWarpSize * (UNROLL_FACTOR);            \
         typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type    \
             unrolled_values[(UNROLL_FACTOR)];                                 \
         auto __src = (SRC);                                                   \
@@ -13,12 +13,12 @@
         for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride;    \
              __i += kLoopStride) {                                            \
             _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) \
-                unrolled_values[__j] = LD_FUNC(__src + __i + __j * 32);       \
+                unrolled_values[__j] = LD_FUNC(__src + __i + __j * kEpWarpSize); \
             _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) \
-                ST_FUNC(__dst + __i + __j * 32, unrolled_values[__j]);        \
+                ST_FUNC(__dst + __i + __j * kEpWarpSize, unrolled_values[__j]); \
         }                                                                     \
         for (int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID);         \
-             __i < (N); __i += 32)                                            \
+             __i < (N); __i += kEpWarpSize)                                   \
             ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                       \
     }
 
@@ -48,7 +48,7 @@ struct VecInt<16> {
 };
 
 // ---- TMA / mbarrier helpers (CUDA only) ----
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 
 __device__ __forceinline__ void fence_view_async_shared() {
     asm volatile("fence.proxy.async.shared::cta; \n" ::);
@@ -136,7 +136,7 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
 
-#endif  // MOONCAKE_EP_USE_MUSA
+#endif  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
 
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
@@ -185,16 +185,19 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
 #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
         recv_int_values[i] =
-            __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
+            __shfl_sync(kEpWarpMask, send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t *>(recv_int_values);
 }
 
 __forceinline__ __device__ int warp_reduce_sum(int value) {
-    value += __shfl_xor_sync(0xffffffff, value, 16);
-    value += __shfl_xor_sync(0xffffffff, value, 8);
-    value += __shfl_xor_sync(0xffffffff, value, 4);
-    value += __shfl_xor_sync(0xffffffff, value, 2);
-    value += __shfl_xor_sync(0xffffffff, value, 1);
+#ifdef MOONCAKE_EP_USE_MACA
+    value += __shfl_xor_sync(kEpWarpMask, value, 32);
+#endif
+    value += __shfl_xor_sync(kEpWarpMask, value, 16);
+    value += __shfl_xor_sync(kEpWarpMask, value, 8);
+    value += __shfl_xor_sync(kEpWarpMask, value, 4);
+    value += __shfl_xor_sync(kEpWarpMask, value, 2);
+    value += __shfl_xor_sync(kEpWarpMask, value, 1);
     return value;
 }
 

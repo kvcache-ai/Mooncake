@@ -5,6 +5,10 @@ from setuptools import setup
 import torch
 
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+use_maca = (
+    os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
+    or (hasattr(torch.version, "maca") and torch.version.maca is not None)
+)
 if use_musa:
     try:
         import torchada  # noqa: F401
@@ -49,16 +53,22 @@ if use_musa:
         "-O3",
     ]
 else:
-    cxx_args.append("-DUSE_CUDA")
+    if use_maca:
+        cxx_args.extend(["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"])
+    else:
+        cxx_args.append("-DUSE_CUDA")
     device_args = [
         abi_define,
         "-std=c++20",
-        "-DUSE_CUDA",
         "-Xcompiler",
         "-O3",
         "-Xcompiler",
         "-g0",
     ]
+    if use_maca:
+        device_args.extend(["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"])
+    else:
+        device_args.append("-DUSE_CUDA")
     # Link against the CUDA driver stub library if available.
     if CUDA_HOME is not None:
         cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")

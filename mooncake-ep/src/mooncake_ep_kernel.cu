@@ -127,7 +127,7 @@ void mark_and_wait_phase_ack(void* mxa_buffer,
 }
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
-__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * kEpWarpSize, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count, int32_t* active_ranks,
@@ -146,7 +146,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int phases) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
-    const auto warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto warp_id = thread_id / kEpWarpSize, lane_id = get_lane_id();
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_local_experts = num_experts / num_ranks;
@@ -190,7 +190,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         constexpr int kNumElemsPerRead = sizeof(int4) / EP_BF16_SIZE;
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
-        const auto num_threads = (num_warps - 1) * 32;
+        const auto num_threads = (num_warps - 1) * kEpWarpSize;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
@@ -245,7 +245,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // Issue sends
             if (dst_expert_idx >= 0) {
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
-                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+                slot_idx = __shfl_sync(kEpWarpMask, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
                 const auto src_ptr = reinterpret_cast<const void*>(rdma_x_src_idx);
@@ -275,7 +275,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             }
         }
     } else if (warp_id == num_warps - 1) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         // Participate in __syncthreads() barriers from data warps.
         // Each token iteration in the send loop above calls
         // __syncthreads() once; the count warp must match.
@@ -287,13 +287,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (sm_id == 0) {
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
+            for (int i = lane_id; i < num_experts; i += kEpWarpSize)
                 next_clean_buffer[i] = 0;
 
             // Notify before executing `int_p`
             __syncwarp();
             #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
+            for (int i = lane_id; i < num_experts; i += kEpWarpSize)
                 mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
         }
 
@@ -304,7 +304,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
         // Per lane count
         #pragma unroll 8
-        for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
+        for (int i = lane_id; i < num_tokens * num_topk; i += kEpWarpSize) {
             auto idx = static_cast<int>(__ldg(topk_idx + i));
             if (idx >= expert_begin_idx and idx < expert_end_idx)
                 expert_count[idx - expert_begin_idx] ++;
@@ -395,7 +395,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
         }
-        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * kEpWarpSize);
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
@@ -428,7 +428,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             }
         }
     } else {
-        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * kEpWarpSize);
     }
 }
 
@@ -447,11 +447,17 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
     constexpr int kNumMaxTopK = 11;
+#if defined(MOONCAKE_EP_USE_MACA)
+    // C500 uses 64-thread hardware waves. Use 15 waves per CTA to keep the
+    // block within 1024 threads while preserving enough send waves for top-k.
+    constexpr int kNumWarpsPerGroup = 3;
+    constexpr int kNumWarpGroups = 5;
+#elif defined(MOONCAKE_EP_USE_MUSA)
     constexpr int kNumWarpsPerGroup = 4;
-#ifdef MOONCAKE_EP_USE_MUSA
     // MT S5000 benefits from slightly more CTAs while keeping enough warps for top-k<=11.
     constexpr int kNumWarpGroups = 5;
 #else
+    constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
 #endif
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
@@ -459,6 +465,9 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_sms = cell_div(num_experts, kNumWarpGroups);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
+#if defined(MOONCAKE_EP_USE_MACA)
+    EP_HOST_ASSERT(!use_fp8);
+#endif
 
     // Workspace checks
     auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
@@ -484,13 +493,13 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
 
-    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * kEpWarpSize, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
 
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
-__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * kEpWarpSize, 1) void
 combine(void* combined_x, int32_t* active_ranks,
         void* mxa_buffer,
         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
@@ -511,7 +520,7 @@ combine(void* combined_x, int32_t* active_ranks,
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto num_threads = static_cast<int>(blockDim.x);
-    const auto warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto warp_id = thread_id / kEpWarpSize, lane_id = get_lane_id();
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
@@ -540,7 +549,7 @@ combine(void* combined_x, int32_t* active_ranks,
     // Clean up next buffer
     if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
         #pragma unroll
-        for (int i = lane_id; i < num_experts; i += 32)
+        for (int i = lane_id; i < num_experts; i += kEpWarpSize)
             next_clean_buffer[i] = 0;
 
         // Notify before executing `int_p`
@@ -596,7 +605,7 @@ combine(void* combined_x, int32_t* active_ranks,
         }
         // Put finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
-        mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * kEpWarpSize);
         if (sub_warp_id == 1 and lane_id == 0) {
             while (mc_ld_acquire(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
@@ -609,7 +618,7 @@ combine(void* combined_x, int32_t* active_ranks,
         }
         __syncwarp();
     } else {
-        mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * kEpWarpSize);
     }
 
     // Receiving phase
@@ -634,7 +643,7 @@ combine(void* combined_x, int32_t* active_ranks,
             }
         }
     }
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
     // mc_grid_sync() is a no-op on MUSA; use a block-wide fence/barrier before
     // reduction so threads see peer writes.
     __syncthreads();
@@ -645,8 +654,8 @@ combine(void* combined_x, int32_t* active_ranks,
 #endif
 
     // Reduce tokens with FP8 cast
-    EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
-    EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+    EP_DEVICE_ASSERT(num_topk <= kEpWarpSize and hidden_bf16_int4 <= num_threads);
+    EP_STATIC_ASSERT(kHidden % (kEpWarpSize * kNumElemsPerInt4) == 0, "Invalid vectorization");
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
             mc_fence();
@@ -699,8 +708,13 @@ void combine(void* combined_x, int32_t* active_ranks,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy) {
+#if defined(MOONCAKE_EP_USE_MACA)
+    constexpr int kNumWarpsPerGroup = 3;
+    constexpr int kNumWarpGroups = 5;
+#else
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
+#endif
     constexpr int kNumMaxTopk = 11;
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
@@ -729,7 +743,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_experts, rank, num_ranks, \
               timeout_ticks, phases, zero_copy); } break
 
-    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * kEpWarpSize, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
