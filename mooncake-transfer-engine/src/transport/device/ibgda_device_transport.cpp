@@ -522,7 +522,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     };
 
     static bool shouldUseProxyDoorbell() {
-#if defined(USE_MACA)
+#if defined(USE_MUSA) || defined(USE_MACA)
         return true;
 #else
         return false;

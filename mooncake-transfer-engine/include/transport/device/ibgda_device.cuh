@@ -136,9 +136,9 @@ __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
     // DBR write — always done (NIC polls doorbell record in GPU memory)
     mc_st_release_u32(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter),
                       mc_bswap32(num_posted));
-    // BF (Blue Flame) doorbell — only if BF register is mapped into GPU VA.
-    // On MUSA, musaHostRegisterIoMemory fails for MMIO addresses, so bf is
-    // NULL and we rely on DBR-only mode (slightly higher latency).
+    // BF (Blue Flame) doorbell — only for direct IBGDA when the BF register is
+    // mapped into GPU VA. Proxy-doorbell platforms publish a ring ticket above
+    // and leave bf null in the device context.
     if (qp->bf != nullptr) {
         auto* last_wqe = qp->wq + ((num_posted - 1) & qp->wqeid_mask);
         mc_st_release_u64(reinterpret_cast<uint64_t*>(qp->bf + qp->bf_offset),

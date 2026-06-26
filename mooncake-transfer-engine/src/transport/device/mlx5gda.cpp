@@ -41,13 +41,10 @@ static void print_cuda_error(const char* msg) {
 }
 
 // Create UAR for BF (Blue Flame) doorbell ringing.
-// On CUDA: registers the BF MMIO region into GPU address space so the
-//          GPU kernel can directly write the doorbell (lowest latency).
-// On MUSA: musaHostRegisterIoMemory is not supported for MMIO addresses,
-//          so we skip BF registration and return a UAR with reg_addr=NULL.
-//          The GPU kernel will use DBR-only mode (write to memory-mapped
-//          doorbell record, NIC polls it) — slightly higher latency but
-//          functionally correct.
+// CUDA direct IBGDA registers the BF MMIO region into GPU address space so the
+// device kernel can directly write the doorbell. Proxy-doorbell platforms keep
+// reg_addr as the host UAR mapping and let the host proxy ring BF; they do not
+// register the MMIO page into the accelerator VA space.
 static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
     struct mlx5dv_devx_uar* uar =
         mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
@@ -55,15 +52,7 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
         errno = EIO;
         return NULL;
     }
-#if defined(USE_MUSA)
-    // MUSA cannot map MMIO addresses into GPU VA.  Skip the
-    // musaHostRegister(IoMemory) call entirely — attempting it
-    // corrupts the MUSA runtime, causing all subsequent device-side
-    // fill operations to fail with "illegal memory access".
-    // Use DBR-only mode: the kernel writes to the doorbell record
-    // in GPU memory instead of the BF MMIO register.
-    uar->reg_addr = NULL;
-#else
+#if !defined(USE_MUSA) && !defined(USE_MACA)
     if (cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
                          cudaHostRegisterPortable | cudaHostRegisterMapped |
                              cudaHostRegisterIoMemory) != cudaSuccess) {
@@ -78,11 +67,13 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
 
 static void destroy_uar(struct mlx5dv_devx_uar* uar) {
     if (!uar) return;
+#if !defined(USE_MUSA) && !defined(USE_MACA)
     if (uar->reg_addr) {
         if (cudaHostUnregister(uar->reg_addr) != cudaSuccess) {
             print_cuda_error("Failed to unregister MMIO memory");
         }
     }
+#endif
     mlx5dv_devx_free_uar(uar);
 }
 
@@ -101,7 +92,7 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
 
     struct ibv_context* ctx = pd->context;
     void* cq_context = NULL;
-#if defined(USE_MACA)
+#if defined(USE_MUSA) || defined(USE_MACA)
     bool ctrl_host = true;
 #else
     bool ctrl_host = false;
@@ -234,7 +225,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     void* qp_context = NULL;
     void* cap = NULL;
     uint32_t cqe_version = 0;
-#if defined(USE_MACA)
+#if defined(USE_MUSA) || defined(USE_MACA)
     bool ctrl_host = true;
 #else
     bool ctrl_host = false;
