@@ -178,19 +178,18 @@ int WorkerPool::submitPostSend(
                         peer_segment_desc->devices[device_id].name);
         slice->peer_nic_path = peer_nic_path;
         if (globalConfig().log_rdma_slice_affinity) {
-            LOG(INFO) << "RDMA slice affinity: source_location="
-                      << sourceLocationOrUnknown(slice) << ", target_location="
-                      << resolveBufferLocation(
-                             peer_segment_desc->buffers[buffer_id],
-                             slice->rdma.dest_addr)
-                      << ", local_device_name=" << context_.deviceName()
-                      << ", peer_device_name="
-                      << peer_segment_desc->devices[device_id].name
-                      << ", target_id=" << slice->target_id
-                      << ", source_addr=" << slice->source_addr
-                      << ", dest_addr="
-                      << reinterpret_cast<void *>(slice->rdma.dest_addr)
-                      << ", length=" << slice->length;
+            VLOG(1) << "RDMA slice affinity: source_location="
+                    << sourceLocationOrUnknown(slice) << ", target_location="
+                    << resolveBufferLocation(
+                           peer_segment_desc->buffers[buffer_id],
+                           slice->rdma.dest_addr)
+                    << ", local_device_name=" << context_.deviceName()
+                    << ", peer_device_name="
+                    << peer_segment_desc->devices[device_id].name
+                    << ", target_id=" << slice->target_id
+                    << ", source_addr=" << slice->source_addr << ", dest_addr="
+                    << reinterpret_cast<void *>(slice->rdma.dest_addr)
+                    << ", length=" << slice->length;
         }
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
         slice_list_map[shard_id].push_back(slice);
@@ -429,21 +428,21 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             peer_segment_desc->devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
             if (globalConfig().log_rdma_slice_affinity) {
-                LOG(INFO) << "RDMA slice affinity: source_location="
-                          << sourceLocationOrUnknown(slice)
-                          << ", target_location="
-                          << resolveBufferLocation(
-                                 peer_segment_desc->buffers[buffer_id],
-                                 slice->rdma.dest_addr)
-                          << ", local_device_name=" << context_.deviceName()
-                          << ", peer_device_name="
-                          << peer_segment_desc->devices[device_id].name
-                          << ", target_id=" << slice->target_id
-                          << ", source_addr=" << slice->source_addr
-                          << ", dest_addr="
-                          << reinterpret_cast<void *>(slice->rdma.dest_addr)
-                          << ", length=" << slice->length
-                          << ", retry_cnt=" << slice->rdma.retry_cnt;
+                VLOG(1) << "RDMA slice affinity: source_location="
+                        << sourceLocationOrUnknown(slice)
+                        << ", target_location="
+                        << resolveBufferLocation(
+                               peer_segment_desc->buffers[buffer_id],
+                               slice->rdma.dest_addr)
+                        << ", local_device_name=" << context_.deviceName()
+                        << ", peer_device_name="
+                        << peer_segment_desc->devices[device_id].name
+                        << ", target_id=" << slice->target_id
+                        << ", source_addr=" << slice->source_addr
+                        << ", dest_addr="
+                        << reinterpret_cast<void *>(slice->rdma.dest_addr)
+                        << ", length=" << slice->length
+                        << ", retry_cnt=" << slice->rdma.retry_cnt;
             }
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
         }
