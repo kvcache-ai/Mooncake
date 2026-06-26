@@ -59,9 +59,8 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
             retry_count);
     }
 
-    auto hint = config.enable_dest_device_affinity
-                    ? std::string_view(local_hca)
-                    : std::string_view();
+    auto hint = config.enable_dest_device_affinity ? std::string_view(local_hca)
+                                                   : std::string_view();
     return RdmaTransport::selectDevice(peer_segment_desc, offset, length, hint,
                                        buffer_id, device_id, retry_count);
 }
@@ -158,10 +157,9 @@ int WorkerPool::submitPostSend(
                 continue;
             }
 
-            if (selectPeerDevice(peer_segment_desc.get(),
-                                 slice->rdma.dest_addr, slice->length,
-                                 context_.deviceName(), buffer_id,
-                                 device_id)) {
+            if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                                 slice->length, context_.deviceName(),
+                                 buffer_id, device_id)) {
                 slice->markFailed();
                 context_.engine().meta()->dumpMetadataContent(
                     peer_segment_desc->name, slice->rdma.dest_addr,
@@ -181,11 +179,10 @@ int WorkerPool::submitPostSend(
         slice->peer_nic_path = peer_nic_path;
         if (globalConfig().log_rdma_slice_affinity) {
             LOG(INFO) << "RDMA slice affinity: source_location="
-                      << sourceLocationOrUnknown(slice)
-                      << ", target_location="
-                      << resolveBufferLocation(peer_segment_desc
-                                                   ->buffers[buffer_id],
-                                               slice->rdma.dest_addr)
+                      << sourceLocationOrUnknown(slice) << ", target_location="
+                      << resolveBufferLocation(
+                             peer_segment_desc->buffers[buffer_id],
+                             slice->rdma.dest_addr)
                       << ", local_device_name=" << context_.deviceName()
                       << ", peer_device_name="
                       << peer_segment_desc->devices[device_id].name
@@ -420,8 +417,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             if (!peer_segment_desc ||
                 selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
                                  slice->length, context_.deviceName(),
-                                 buffer_id, device_id,
-                                 slice->rdma.retry_cnt)) {
+                                 buffer_id, device_id, slice->rdma.retry_cnt)) {
                 slice->markFailed();
                 processed_slice_count_++;
                 continue;
@@ -436,9 +432,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 LOG(INFO) << "RDMA slice affinity: source_location="
                           << sourceLocationOrUnknown(slice)
                           << ", target_location="
-                          << resolveBufferLocation(peer_segment_desc
-                                                       ->buffers[buffer_id],
-                                                   slice->rdma.dest_addr)
+                          << resolveBufferLocation(
+                                 peer_segment_desc->buffers[buffer_id],
+                                 slice->rdma.dest_addr)
                           << ", local_device_name=" << context_.deviceName()
                           << ", peer_device_name="
                           << peer_segment_desc->devices[device_id].name

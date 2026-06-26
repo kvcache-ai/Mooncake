@@ -761,8 +761,8 @@ int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
         }
 
         const auto location = resolveBufferLocation(buffer, offset);
-        device_id = desc->topology.selectDeviceByLocalHca(
-            location, local_hca, retry_count);
+        device_id = desc->topology.selectDeviceByLocalHca(location, local_hca,
+                                                          retry_count);
         if (device_id >= 0) return 0;
         device_id = desc->topology.selectDeviceByLocalHca(
             kWildcardLocation, local_hca, retry_count);

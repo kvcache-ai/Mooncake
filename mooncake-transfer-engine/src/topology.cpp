@@ -311,9 +311,9 @@ static void applyGpuHcaAffinityOverride(
 
 static void precomputeResolvedHcaPeerAffinity(
     const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
-    std::unordered_map<
-        std::string,
-        std::unordered_map<std::string, std::vector<int>>> &affinity_by_local) {
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, std::vector<int>>>
+        &affinity_by_local) {
     affinity_by_local.clear();
     const auto &config = globalConfig();
     if (!config.enable_hca_peer_affinity) return;
@@ -881,8 +881,8 @@ int Topology::resolve() {
                 hca_id_map[hca];
         }
     }
-    precomputeResolvedHcaPeerAffinity(
-        matrix_, hca_id_map, resolved_hca_peer_affinity_by_local_);
+    precomputeResolvedHcaPeerAffinity(matrix_, hca_id_map,
+                                      resolved_hca_peer_affinity_by_local_);
     return 0;
 }
 

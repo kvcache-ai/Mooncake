@@ -88,8 +88,7 @@ class Topology {
     int selectDevice(const std::string storage_type, std::string_view hint,
                      int retry_count = 0);
     int selectDeviceByLocalHca(const std::string storage_type,
-                               std::string_view local_hca,
-                               int retry_count = 0);
+                               std::string_view local_hca, int retry_count = 0);
 
     TopologyMatrix getMatrix() const { return matrix_; }
 
@@ -125,10 +124,9 @@ class Topology {
     };
     std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>
         resolved_matrix_;
-    std::unordered_map<
-        std::string /* local HCA */,
-        std::unordered_map<std::string /* storage type */,
-                           std::vector<int> /* peer HCA ids */>>
+    std::unordered_map<std::string /* local HCA */,
+                       std::unordered_map<std::string /* storage type */,
+                                          std::vector<int> /* peer HCA ids */>>
         resolved_hca_peer_affinity_by_local_;
 };
 

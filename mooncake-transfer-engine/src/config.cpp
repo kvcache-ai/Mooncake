@@ -43,8 +43,7 @@ std::vector<std::string> splitConfigString(const std::string& value,
     return result;
 }
 
-bool parseBoolConfigEnv(const char* value, const char* env_name,
-                        bool& output) {
+bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
     if (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0) {
         output = true;
         return true;
@@ -408,8 +407,7 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
-    if (config.enable_hca_peer_affinity &&
-        config.enable_dest_device_affinity) {
+    if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
         LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
                       "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
                       "the same time; falling back to default peer device "
