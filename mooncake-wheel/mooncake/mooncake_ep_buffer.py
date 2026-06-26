@@ -20,8 +20,12 @@ _USE_SPLIT_SEND_RECV = (
     or _USE_MACA
 )
 _MACA_PHASE_FENCE = os.getenv("MOONCAKE_EP_MACA_PHASE_FENCE", "p2p").lower()
-_USE_TORCH_ALLTOALL = _env_enabled("MOONCAKE_EP_USE_TORCH_ALLTOALL")
-_PROFILE_TORCH_ALLTOALL = _env_enabled("MOONCAKE_EP_PROFILE_TORCH_ALLTOALL")
+_DEBUG_INIT = _env_enabled("MOONCAKE_EP_DEBUG_INIT")
+
+
+def _debug_init(rank: int, message: str) -> None:
+    if _DEBUG_INIT:
+        print(f"[rank {rank}] {message}", flush=True)
 
 
 class EventOverlap:
@@ -84,53 +88,63 @@ class EventOverlap:
 
 class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+        from mooncake import ep
+
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group
-        self._use_torch_alltoall = _USE_TORCH_ALLTOALL
-        if self._use_torch_alltoall:
-            self.runtime = None
-        else:
-            from mooncake import ep
-
-            # NIC auto-detection happens inside ep.Buffer via Topology::discover().
-            self.runtime = ep.Buffer(
-                self.rank, self.group_size, num_ep_buffer_bytes
-            )
+        # NIC auto-detection happens inside ep.Buffer via Topology::discover().
+        _debug_init(self.rank, "before ep.Buffer")
+        self.runtime = ep.Buffer(
+            self.rank, self.group_size, num_ep_buffer_bytes
+        )
+        _debug_init(self.rank, "after ep.Buffer")
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
-        self._use_fallback = self._use_torch_alltoall or bool(
-            self.runtime is not None and self.runtime.ibgda_disabled()
-        )
+        self._use_fallback = bool(self.runtime.ibgda_disabled())
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
-        self._torch_alltoall_profile = {}
-        self._torch_alltoall_state = {}
         self._maca_phase_token: Optional[torch.Tensor] = None
         self._maca_phase_recv_tokens: Optional[List[torch.Tensor]] = None
         self.connect()
 
-    def _maca_phase_fence(self) -> None:
+    def _maca_phase_fence(self, send_event: Optional[Any] = None) -> None:
         if not _USE_MACA or _MACA_PHASE_FENCE in {"", "0", "off", "none"}:
             return
+
+        backend = dist.get_backend(self.group)
+        fence_device = torch.device("cpu" if backend == "gloo" else "cuda")
+
+        def wait_send_done() -> None:
+            if send_event is not None:
+                send_event.synchronize()
+            else:
+                torch.cuda.synchronize()
 
         # Compatibility fence between SEND and RECV.  The EP payload still
         # uses the P2P fast path; this only keeps rank phases aligned on MACA.
         if _MACA_PHASE_FENCE == "barrier":
-            torch.cuda.synchronize()
+            wait_send_done()
             dist.barrier(self.group)
             return
         if _MACA_PHASE_FENCE == "p2p":
-            if self._maca_phase_token is None:
+            wait_send_done()
+            if (
+                self._maca_phase_token is None
+                or self._maca_phase_token.device != fence_device
+            ):
                 self._maca_phase_token = torch.empty(
-                    1, dtype=torch.int32, device="cuda"
+                    1, dtype=torch.int32, device=fence_device
                 )
-            if self._maca_phase_recv_tokens is None:
+            if (
+                self._maca_phase_recv_tokens is None
+                or self._maca_phase_recv_tokens[0].device != fence_device
+            ):
                 self._maca_phase_recv_tokens = [
-                    torch.empty(1, dtype=torch.int32, device="cuda")
+                    torch.empty(1, dtype=torch.int32, device=fence_device)
                     for _ in range(self.group_size)
                 ]
             self._maca_phase_token.fill_(1)
@@ -161,18 +175,24 @@ class Buffer:
                 "MOONCAKE_EP_MACA_PHASE_FENCE must be one of: "
                 "p2p, allreduce, barrier, none"
             )
-        if self._maca_phase_token is None:
+        wait_send_done()
+        if (
+            self._maca_phase_token is None
+            or self._maca_phase_token.device != fence_device
+        ):
             self._maca_phase_token = torch.empty(
-                1, dtype=torch.int32, device="cuda"
+                1, dtype=torch.int32, device=fence_device
             )
         self._maca_phase_token.fill_(1)
         dist.all_reduce(
             self._maca_phase_token, op=dist.ReduceOp.SUM, group=self.group
         )
 
-    def _wrap_maca_recv_hook(self, hook: Optional[Callable]) -> Callable:
+    def _wrap_maca_recv_hook(
+        self, hook: Optional[Callable], send_event: Optional[Any]
+    ) -> Callable:
         def wrapped_hook() -> None:
-            self._maca_phase_fence()
+            self._maca_phase_fence(send_event)
             if hook is not None:
                 hook()
 
@@ -181,12 +201,11 @@ class Buffer:
     def connect(self, is_update: bool = False):
         from mooncake import ep
 
-        if self._use_torch_alltoall:
-            self._use_fallback = True
-            return
-
+        _debug_init(self.rank, f"connect start fallback={self._use_fallback}")
         if not self._use_fallback:
+            _debug_init(self.rank, "before get_mr_info")
             (raddr, rkey) = self.runtime.get_mr_info()
+            _debug_init(self.rank, "after get_mr_info")
 
             raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
             raddrs = [
@@ -256,57 +275,79 @@ class Buffer:
             dist.all_gather(interface_ids_list, interface_id_t, self.group)
             interface_ids = torch.cat(interface_ids_list).tolist()
 
-            from mooncake.ep import get_active_ranks
-            active_ranks_mask = get_active_ranks(self.backend).tolist()
+            active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
             self.runtime.sync_ibgda_peers(
                 raddrs, rkeys, peer_qpns, peer_lids,
                 subnet_prefixes, interface_ids, active_ranks_mask
             )
 
-        try:
-            local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers
-            local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
-            )
-            handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = [h.tolist() for h in handles]
-            from mooncake.ep import get_active_ranks
-            active_ranks_mask = get_active_ranks(self.backend).tolist()
-            self.runtime.sync_nvlink_ipc_handles(remote_handles,
-                                                 active_ranks_mask)
-        except Exception as e:
-            import warnings
+        if self.group_size == 1:
+            _debug_init(self.rank, "single-rank skip ipc handle export")
+            self._use_fallback = False
+            _debug_init(self.rank, "connect done fallback=False")
+            return
+        else:
+            try:
+                _debug_init(self.rank, "before get_ipc_handle")
+                local_handle_ints = self.runtime.get_ipc_handle()
+                _debug_init(
+                    self.rank, f"after get_ipc_handle len={len(local_handle_ints)}"
+                )
+                # pybind11 converts std::vector<int32_t> to a list of integers
+                local_handle_tensor = torch.tensor(
+                    local_handle_ints, dtype=torch.int32, device="cuda"
+                )
+                handles = [
+                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                    for _ in range(self.group_size)
+                ]
+                _debug_init(self.rank, "before all_gather ipc handles")
+                dist.all_gather(handles, local_handle_tensor, self.group)
+                _debug_init(self.rank, "after all_gather ipc handles")
+                remote_handles = [h.tolist() for h in handles]
+                _debug_init(self.rank, "before get_active_ranks")
+                active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
+                _debug_init(
+                    self.rank,
+                    f"before sync_nvlink_ipc_handles active={active_ranks_mask}",
+                )
+                self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+                _debug_init(self.rank, "after sync_nvlink_ipc_handles")
+            except Exception as e:
+                import warnings
 
-            warnings.warn(
-                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+                warnings.warn(
+                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         use_fast_path = False
         try:
+            _debug_init(self.rank, "before use_fast_path")
             use_fast_path = bool(self.runtime.use_fast_path())
+            _debug_init(self.rank, f"after use_fast_path fast={use_fast_path}")
         except Exception:
             ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
         self._use_fallback = not use_fast_path
+        _debug_init(self.rank, f"connect done fallback={self._use_fallback}")
 
 
     def update_ep_member(self):
-        if self._use_torch_alltoall:
-            return
         self.connect(True)
+
+    def _is_mooncake_backend(self) -> bool:
+        try:
+            return dist.get_backend(self.group) == "mooncake"
+        except Exception:
+            return False
 
     def _active_ranks_tensor(
         self, device: torch.device, dtype: torch.dtype = torch.int32
     ) -> torch.Tensor:
-        if self._use_torch_alltoall:
+        if not self._is_mooncake_backend():
             return torch.ones((self.group_size,), dtype=dtype, device=device)
 
         try:
@@ -326,15 +367,6 @@ class Buffer:
         num_ranks: int,
         num_experts: int,
     ) -> int:
-        if _USE_TORCH_ALLTOALL:
-            return (
-                4
-                * num_experts
-                * num_max_dispatch_tokens_per_rank
-                * (32 + hidden * 2)
-                + 4 * num_experts * 4
-            )
-
         from mooncake.ep import get_ep_buffer_size_hint
 
         return get_ep_buffer_size_hint(
@@ -426,7 +458,7 @@ class Buffer:
                 runtime_return_recv_hook,
             )
             if _USE_MACA:
-                hook = self._wrap_maca_recv_hook(hook)
+                hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
                     hook()
                     hook = None
@@ -525,7 +557,7 @@ class Buffer:
                 out,
             )
             if _USE_MACA:
-                hook = self._wrap_maca_recv_hook(hook)
+                hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
                     hook()
                     hook = None
@@ -582,23 +614,6 @@ class Buffer:
         def current_stream_wait(self):
             torch.cuda.synchronize()
 
-    class _CudaTimer:
-        def __init__(self, enabled: bool) -> None:
-            self.enabled = enabled
-            self.samples = {}
-
-        def measure(self, name: str, fn: Callable[[], Any]) -> Any:
-            if not self.enabled:
-                return fn()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            result = fn()
-            end.record()
-            torch.cuda.synchronize()
-            self.samples[name] = start.elapsed_time(end) / 1000.0
-            return result
-
     @staticmethod
     def _fp8_cast(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         assert x.dim() == 2 and x.size(1) % 128 == 0
@@ -611,185 +626,6 @@ class Buffer:
         x_scales = (x_amax / 448.0).view(m, -1)
         return x_fp8, x_scales
 
-    def _torch_alltoall_routed_dispatch(
-        self,
-        x: torch.Tensor,
-        topk_idx: torch.Tensor,
-        num_max_dispatch_tokens_per_rank: int,
-        num_experts: int,
-        return_recv_hook: bool,
-    ):
-        with torch.profiler.record_function("dispatch.torch_alltoall_routed"):
-            timer = Buffer._CudaTimer(_PROFILE_TORCH_ALLTOALL)
-            num_tokens = x.size(0)
-            num_topk = topk_idx.size(1)
-            num_ranks = self.group_size
-            num_local_experts = num_experts // num_ranks
-            max_messages_per_rank = num_tokens * num_topk
-
-            if x.dtype != torch.bfloat16:
-                raise NotImplementedError(
-                    "torch all-to-all fallback currently supports bfloat16 only"
-                )
-
-            from mooncake import ep
-
-            send_payload, send_route = timer.measure(
-                "dispatch_pack",
-                lambda: ep.torch_alltoall_pack_dispatch_fused(
-                    x.contiguous(),
-                    topk_idx.contiguous(),
-                    num_experts,
-                    num_ranks,
-                ),
-            )
-            recv_payload = torch.empty_like(send_payload)
-            timer.measure(
-                "dispatch_a2a_payload",
-                lambda: dist.all_to_all_single(
-                    recv_payload, send_payload, group=self.group
-                ),
-            )
-            if _PROFILE_TORCH_ALLTOALL:
-                timer.samples["dispatch_a2a_meta"] = 0.0
-            (
-                packed_recv_x,
-                packed_recv_src_info,
-                packed_recv_layout_range,
-                packed_recv_count,
-                return_src_pos,
-            ) = timer.measure(
-                "dispatch_compact",
-                lambda: ep.torch_alltoall_compact_dispatch_fused(
-                    recv_payload,
-                    num_local_experts,
-                    num_max_dispatch_tokens_per_rank,
-                ),
-            )
-            self._torch_alltoall_state = {
-                "send_route": send_route,
-                "return_src_pos": return_src_pos,
-                "num_tokens": num_tokens,
-                "num_topk": num_topk,
-                "max_messages_per_rank": max_messages_per_rank,
-            }
-            self._fallback_next_combine_buffer = torch.empty_like(packed_recv_x)
-            self._torch_alltoall_profile = timer.samples
-            hook = (lambda: None) if return_recv_hook else (lambda: None)
-            event = Buffer._DummyEvent()
-            return (
-                packed_recv_x,
-                None,
-                packed_recv_count,
-                packed_recv_src_info,
-                packed_recv_layout_range,
-                event,
-                hook,
-            )
-
-    def _torch_alltoall_routed_combine(
-        self,
-        x: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        layout_range: torch.Tensor,
-        zero_copy: bool,
-        return_recv_hook: bool,
-        out: Optional[torch.Tensor],
-    ):
-        with torch.profiler.record_function("combine.torch_alltoall_routed"):
-            timer = Buffer._CudaTimer(_PROFILE_TORCH_ALLTOALL)
-            expert_buffers = self._fallback_next_combine_buffer if zero_copy else x
-            if expert_buffers is None:
-                raise RuntimeError(
-                    "zero_copy combine called before dispatch buffer allocation"
-                )
-            if expert_buffers.dtype != torch.bfloat16:
-                expert_buffers = expert_buffers.to(torch.bfloat16)
-
-            num_tokens, num_topk = topk_idx.shape
-            num_ranks = self.group_size
-            max_messages_per_rank = num_tokens * num_topk
-            state = self._torch_alltoall_state
-            if not state:
-                raise RuntimeError("combine called without torch all-to-all dispatch state")
-
-            from mooncake import ep
-
-            send_payload = timer.measure(
-                "combine_pack",
-                lambda: ep.torch_alltoall_pack_combine(
-                    expert_buffers.contiguous(),
-                    state["return_src_pos"],
-                    num_ranks,
-                    max_messages_per_rank,
-                ),
-            )
-            recv_payload = torch.empty_like(send_payload)
-            timer.measure(
-                "combine_a2a_payload",
-                lambda: dist.all_to_all_single(
-                    recv_payload, send_payload, group=self.group
-                ),
-            )
-            combined = timer.measure(
-                "combine_reduce",
-                lambda: ep.torch_alltoall_reduce_combine(
-                    recv_payload,
-                    state["send_route"],
-                    topk_weights.contiguous(),
-                    out,
-                ),
-            )
-            self._torch_alltoall_profile = timer.samples
-            hook = (lambda: None) if return_recv_hook else (lambda: None)
-            event = Buffer._DummyEvent()
-            return combined, event, hook
-
-    def _torch_alltoall_dispatch(
-        self,
-        x: torch.Tensor,
-        topk_idx: torch.Tensor,
-        num_max_dispatch_tokens_per_rank: int,
-        num_experts: int,
-        use_fp8: bool,
-        return_recv_hook: bool,
-    ):
-        if use_fp8:
-            raise NotImplementedError(
-                "FP8 dispatch is not supported by torch all-to-all fallback"
-            )
-        return self._torch_alltoall_routed_dispatch(
-            x,
-            topk_idx,
-            num_max_dispatch_tokens_per_rank,
-            num_experts,
-            return_recv_hook,
-        )
-
-    def _torch_alltoall_combine(
-        self,
-        x: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        src_info: torch.Tensor,
-        layout_range: torch.Tensor,
-        num_max_dispatch_tokens_per_rank: int,
-        num_experts: int,
-        zero_copy: bool,
-        return_recv_hook: bool,
-        out: Optional[torch.Tensor],
-    ):
-        return self._torch_alltoall_routed_combine(
-            x,
-            topk_idx,
-            topk_weights,
-            layout_range,
-            zero_copy,
-            return_recv_hook,
-            out,
-        )
-
     def _fallback_dispatch(
         self,
         x: torch.Tensor,
@@ -799,16 +635,6 @@ class Buffer:
         use_fp8: bool,
         return_recv_hook: bool,
     ):
-        if self._use_torch_alltoall:
-            return self._torch_alltoall_dispatch(
-                x,
-                topk_idx,
-                num_max_dispatch_tokens_per_rank,
-                num_experts,
-                use_fp8,
-                return_recv_hook,
-            )
-
         with torch.profiler.record_function("dispatch"):
             num_tokens, hidden = x.shape
             k = topk_idx.size(1)
@@ -1031,20 +857,6 @@ class Buffer:
         return_recv_hook: bool,
         out: Optional[torch.Tensor],
     ):
-        if self._use_torch_alltoall:
-            return self._torch_alltoall_combine(
-                x,
-                topk_idx,
-                topk_weights,
-                src_info,
-                layout_range,
-                num_max_dispatch_tokens_per_rank,
-                num_experts,
-                zero_copy,
-                return_recv_hook,
-                out,
-            )
-
         with torch.profiler.record_function("combine"):
             num_tokens = topk_idx.size(0)
             hidden = (x if not zero_copy else self._fallback_next_combine_buffer).size(

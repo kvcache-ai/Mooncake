@@ -153,6 +153,22 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
+#ifdef MOONCAKE_EP_USE_MACA
+    // C500 reports 64-thread hardware warps. Do not split the last hardware
+    // warp by assigning only the final 32-thread pseudo-warp to count work.
+    // Reserve one full warp group from the data path, but write counts from a
+    // single 32-thread lane group to avoid duplicate per-expert increments.
+    const bool is_count_warp = warp_group_id == kNumWarpGroups - 1;
+    const bool is_count_worker = is_count_warp && sub_warp_id == 0;
+    const bool is_data_warp = warp_group_id < kNumWarpGroups - 1;
+    const int num_send_threads =
+        (kNumWarpGroups - 1) * kNumWarpsPerGroup * 32;
+#else
+    const bool is_count_warp = warp_id == num_warps - 1;
+    const bool is_count_worker = is_count_warp;
+    const bool is_data_warp = warp_id < num_warps - 1;
+    const int num_send_threads = (num_warps - 1) * 32;
+#endif
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
@@ -183,14 +199,16 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     // Expert counts
     __shared__ int shared_num_tokens_sent_per_expert[kNumWarpGroups];
 
-    // There are 2 kinds of warps in this part:
-    // 1. The first-kind warps for FP8 cast and sending top-k tokens
-    // 2. The last warp for reading `topk_idx` and count for per-expert information
-    if (warp_id < num_warps - 1) {
+    // There are 2 kinds of execution lanes in this part:
+    // 1. Data lanes for FP8 cast and sending top-k tokens.
+    // 2. Count lanes for reading `topk_idx` and per-expert token counts.
+    // MACA reserves a full warp group for the count path; CUDA keeps the
+    // original final 32-thread warp behavior.
+    if (is_data_warp) {
         constexpr int kNumElemsPerRead = sizeof(int4) / EP_BF16_SIZE;
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
-        const auto num_threads = (num_warps - 1) * 32;
+        const auto num_threads = num_send_threads;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
@@ -274,15 +292,17 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 lane_id == 0 ? mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
-    } else if (warp_id == num_warps - 1) {
-#ifdef MOONCAKE_EP_USE_MUSA
+    } else if (is_count_warp) {
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         // Participate in __syncthreads() barriers from data warps.
         // Each token iteration in the send loop above calls
-        // __syncthreads() once; the count warp must match.
+        // __syncthreads() once; the count path must match.
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             __syncthreads();
         }
 #endif
+    }
+    if (is_count_worker) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
             // The first SM is also responsible for cleaning the next buffer
@@ -634,9 +654,9 @@ combine(void* combined_x, int32_t* active_ranks,
             }
         }
     }
-#ifdef MOONCAKE_EP_USE_MUSA
-    // mc_grid_sync() is a no-op on MUSA; use a block-wide fence/barrier before
-    // reduction so threads see peer writes.
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+    // mc_grid_sync() is a no-op on split-kernel platforms; use a block-wide
+    // fence/barrier before reduction so threads see peer writes.
     __syncthreads();
     mc_fence();
     __syncthreads();

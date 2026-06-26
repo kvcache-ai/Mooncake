@@ -114,7 +114,6 @@ setup(
                 "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
-                "src/mooncake_ep_alltoall.cu",
             ],
             extra_compile_args={"cxx": cxx_args, "nvcc": device_args},
             libraries=cuda_libraries,
