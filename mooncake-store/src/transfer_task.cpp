@@ -485,7 +485,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         uint32_t submit_lba_count = std::min(
                             avail_blocks, std::min(task->remaining_lba,
                                                    nof_qos->blocks_per_chunk));
-                        int lba_off = task->lba_count - task->remaining_lba;
+                        // 64-bit: a NoF transfer can exceed 4 GiB, and once
+                        // lba_off * block_size crosses 2^32 the host-pointer
+                        // offset would wrap when computed in 32 bits (int *
+                        // uint32_t), making submit_ptr address the wrong part
+                        // of the buffer. submit_lba below is already widened.
+                        uint64_t lba_off =
+                            task->lba_count - task->remaining_lba;
                         uint64_t submit_lba = task->lba + lba_off;
                         void* submit_ptr = reinterpret_cast<void*>(
                             reinterpret_cast<char*>(task->ptr) +
