@@ -472,7 +472,10 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
-    snapshot_running_ = false;
+    {
+        std::lock_guard<std::mutex> lk(snapshot_thread_mutex_);
+        snapshot_running_ = false;
+    }
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
@@ -482,6 +485,7 @@ MasterService::~MasterService() {
 #endif
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
+    snapshot_thread_cv_.notify_all();
     task_cleanup_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
 
@@ -5160,8 +5164,18 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
 void MasterService::SnapshotThreadFunc() {
     LOG(INFO) << "[Snapshot] snapshot_thread started";
     while (snapshot_running_) {
-        std::this_thread::sleep_for(
-            std::chrono::seconds(snapshot_interval_seconds_));
+        // Wait for the next snapshot cycle, but allow fast shutdown.
+        {
+            std::unique_lock<std::mutex> lk(snapshot_thread_mutex_);
+            snapshot_thread_cv_.wait_for(
+                lk, std::chrono::seconds(snapshot_interval_seconds_),
+                [&] { return !snapshot_running_.load(); });
+        }
+
+        if (!snapshot_running_) {
+            break;
+        }
+
         if (!enable_snapshot_) {
             // Snapshot is disabled
             LOG(INFO)
