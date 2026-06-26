@@ -27,7 +27,7 @@ include_directories("../mooncake-transfer-engine/include")
 
 find_package(
   Python3
-  COMPONENTS Interpreter Development
+  COMPONENTS Interpreter Development.Module
   REQUIRED)
 
 execute_process(
