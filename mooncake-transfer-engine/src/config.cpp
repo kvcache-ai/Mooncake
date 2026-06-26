@@ -583,8 +583,6 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
-    LOG(INFO) << "log_rdma_slice_affinity = "
-              << (config.log_rdma_slice_affinity ? "true" : "false");
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
@@ -597,6 +595,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "log_rdma_slice_affinity = "
+              << (config.log_rdma_slice_affinity ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {
