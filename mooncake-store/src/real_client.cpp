@@ -2599,7 +2599,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     if (replica.is_disk_replica() &&
-        runtime_accelerator.IsDevicePointer(buffer_handle->ptr())) {
+        runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
         LOG(WARNING) << "DISK replica for key '" << key
                      << "' received a device pointer from the allocator; "
                      << "file I/O cannot write to GPU memory — read will fail. "
@@ -2907,7 +2907,7 @@ RealClient::batch_get_buffer_internal(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         if (replica.is_disk_replica() &&
-            runtime_accelerator.IsDevicePointer(buffer_handle->ptr())) {
+            runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << "DISK replica for key '" << key
                 << "' received a device pointer from the allocator; "

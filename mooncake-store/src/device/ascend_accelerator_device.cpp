@@ -42,16 +42,7 @@ class AscendAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         if (aclrtGetDevice(&logic_dev) != ACL_SUCCESS) {
             return -1;
         }
-#if defined(USE_ASCEND_DIRECT)
-        uint32_t physical_dev = 0;
-        if (aclrtGetPhyDevIdByLogicDevId(logic_dev, &physical_dev) !=
-            ACL_SUCCESS) {
-            return -1;
-        }
-        return static_cast<int32_t>(physical_dev);
-#else
         return logic_dev;
-#endif
     }
 
     void SetContext(int32_t device_id) const override {

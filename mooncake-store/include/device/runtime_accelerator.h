@@ -19,8 +19,6 @@ class RuntimeAccelerator {
     const AcceleratorDevice* FindDeviceForPointer(
         const void* ptr, PointerInfo* out_info = nullptr) const;
 
-    bool IsDevicePointer(const void* ptr) const;
-
     bool CopyToHost(void* dst, const void* src, size_t size) const;
 
     bool CopyFromHost(void* dst, const void* src, size_t size) const;

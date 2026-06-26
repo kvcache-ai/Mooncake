@@ -22,13 +22,10 @@ class AcceleratorRegistry {
 };
 
 const AcceleratorRegistry& GetAcceleratorRegistry();
-void RegisterAcceleratorDevice(const AcceleratorDevice& device);
 
 class AcceleratorDeviceRegistrar {
    public:
-    explicit AcceleratorDeviceRegistrar(const AcceleratorDevice& device) {
-        RegisterAcceleratorDevice(device);
-    }
+    explicit AcceleratorDeviceRegistrar(const AcceleratorDevice& device);
 };
 
 }  // namespace device

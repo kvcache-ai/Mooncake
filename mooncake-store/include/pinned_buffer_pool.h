@@ -48,7 +48,14 @@ class PinnedBufferPool {
 
         Buffer(const Buffer&) = delete;
         Buffer& operator=(const Buffer&) = delete;
-        Buffer(Buffer&& other) noexcept { *this = std::move(other); }
+        Buffer(Buffer&& other) noexcept
+            : pinned_host(std::move(other.pinned_host)),
+              pageable_host(std::move(other.pageable_host)),
+              data(other.data),
+              capacity(other.capacity) {
+            other.data = nullptr;
+            other.capacity = 0;
+        }
         Buffer& operator=(Buffer&& other) noexcept {
             if (this != &other) {
                 pinned_host = std::move(other.pinned_host);
@@ -74,7 +81,9 @@ class PinnedBufferPool {
                 if (pool_[i].capacity >= size) {
                     Buffer buf = std::move(pool_[i]);
                     // O(1) erase: swap with back then pop
-                    pool_[i] = std::move(pool_.back());
+                    if (i != pool_.size() - 1) {
+                        pool_[i] = std::move(pool_.back());
+                    }
                     pool_.pop_back();
                     return buf;
                 }

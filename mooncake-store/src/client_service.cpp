@@ -3343,10 +3343,14 @@ void Client::PutToLocalFile(const std::string& key,
         device::GetAcceleratorRegistry().RuntimeAccelerators();
 
     for (const auto& slice : slices) {
-        if (runtime_accelerator.IsDevicePointer(slice.ptr)) {
+        device::PointerInfo info{};
+        auto* device =
+            runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+        if (device) {
+            device->SetContext(info.device_id);
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!runtime_accelerator.CopyToHost(buf.data, slice.ptr,
-                                                slice.size)) {
+            if (!device->Copy(buf.data, slice.ptr, slice.size,
+                              device::CopyDirection::kDeviceToHost)) {
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
                 pinned_buffer_pool_->Release(std::move(buf));

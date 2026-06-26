@@ -19,8 +19,11 @@ struct PinnedHostBuffer {
     PinnedHostBuffer(const PinnedHostBuffer&) = delete;
     PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
 
-    PinnedHostBuffer(PinnedHostBuffer&& other) noexcept {
-        *this = std::move(other);
+    PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
+        : addr(other.addr), size(other.size), deleter(other.deleter) {
+        other.addr = nullptr;
+        other.size = 0;
+        other.deleter = nullptr;
     }
     PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept {
         if (this != &other) {

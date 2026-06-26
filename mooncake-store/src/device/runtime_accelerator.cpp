@@ -17,6 +17,7 @@ std::span<const AcceleratorDevice* const> RuntimeAccelerator::Devices() const {
 
 const AcceleratorDevice* RuntimeAccelerator::FindDeviceForPointer(
     const void* ptr, PointerInfo* out_info) const {
+    if (!ptr) return nullptr;
     for (auto* accelerator : devices_) {
         auto info = accelerator->QueryPointer(ptr);
         if (info.kind != MemoryKind::kDevice) continue;
@@ -24,10 +25,6 @@ const AcceleratorDevice* RuntimeAccelerator::FindDeviceForPointer(
         return accelerator;
     }
     return nullptr;
-}
-
-bool RuntimeAccelerator::IsDevicePointer(const void* ptr) const {
-    return FindDeviceForPointer(ptr) != nullptr;
 }
 
 bool RuntimeAccelerator::CopyToHost(void* dst, const void* src,
@@ -72,7 +69,15 @@ bool RuntimeAccelerator::CopyMaybeAccelerator(void* dst, const void* src,
     auto* accelerator = src_device ? src_device : dst_device;
     const auto& info = src_device ? src_info : dst_info;
     accelerator->SetContext(info.device_id);
-    return accelerator->Copy(dst, src, size, CopyDirection::kAuto);
+    CopyDirection direction = CopyDirection::kAuto;
+    if (src_device && dst_device) {
+        direction = CopyDirection::kDeviceToDevice;
+    } else if (src_device) {
+        direction = CopyDirection::kDeviceToHost;
+    } else if (dst_device) {
+        direction = CopyDirection::kHostToDevice;
+    }
+    return accelerator->Copy(dst, src, size, direction);
 }
 
 }  // namespace device
