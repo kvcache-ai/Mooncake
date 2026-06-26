@@ -24,9 +24,11 @@
 #include <glog/logging.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -46,6 +48,11 @@ static constexpr uint32_t kDefaultProxyRingSize = 64;
 
 static uint16_t bswap16(uint16_t v) { return __builtin_bswap16(v); }
 static uint32_t bswap32(uint32_t v) { return __builtin_bswap32(v); }
+
+static size_t roundUpToPage(size_t v) {
+    size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    return (v + page - 1) & ~(page - 1);
+}
 
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
@@ -206,12 +213,64 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int registerMemory(void* ptr, size_t bytes) override {
-        mr_ =
-            ibv_reg_mr(pd_, ptr, bytes,
-                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                           IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
+        int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                     IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+#if defined(USE_MACA)
+        CUmemorytype mem_type;
+        CUresult result = cuPointerGetAttribute(
+            &mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            reinterpret_cast<CUdeviceptr>(ptr));
+        if (result == CUDA_SUCCESS && mem_type == CU_MEMORYTYPE_DEVICE) {
+            CUdeviceptr alloc_base;
+            size_t alloc_size = 0;
+            result = cuMemGetAddressRange(
+                &alloc_base, &alloc_size, reinterpret_cast<CUdeviceptr>(ptr));
+            if (result != CUDA_SUCCESS) {
+                const char* err = nullptr;
+                cuGetErrorString(result, &err);
+                LOG(ERROR) << "[EP IBGDA] cuMemGetAddressRange failed: "
+                           << (err ? err : "<unknown>");
+                return -1;
+            }
+
+            int dmabuf_fd = -1;
+            result = cuMemGetHandleForAddressRange(
+                &dmabuf_fd, alloc_base, alloc_size,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+            if (result != CUDA_SUCCESS) {
+                const char* err = nullptr;
+                cuGetErrorString(result, &err);
+                LOG(ERROR) << "[EP IBGDA] failed to export dmabuf: "
+                           << (err ? err : "<unknown>");
+                return -1;
+            }
+
+            size_t reg_size = roundUpToPage(alloc_size);
+            mr_ = ibv_reg_dmabuf_mr(pd_, 0, reg_size,
+                                    reinterpret_cast<uintptr_t>(alloc_base),
+                                    dmabuf_fd, access);
+            int saved_errno = errno;
+            if (close(dmabuf_fd) != 0) {
+                PLOG(WARNING) << "[EP IBGDA] failed to close dmabuf fd";
+            }
+            if (!mr_) {
+                errno = saved_errno;
+                PLOG(WARNING) << "[EP IBGDA] ibv_reg_dmabuf_mr failed"
+                              << " base=0x" << std::hex
+                              << reinterpret_cast<uintptr_t>(alloc_base)
+                              << " size=" << std::dec << alloc_size
+                              << " reg_size=" << reg_size;
+                LOG(WARNING) << "[EP IBGDA] falling back to ibv_reg_mr for "
+                                "device memory";
+                mr_ = ibv_reg_mr(pd_, ptr, bytes, access);
+            }
+        } else
+#endif
+        {
+            mr_ = ibv_reg_mr(pd_, ptr, bytes, access);
+        }
         if (!mr_) {
-            LOG(ERROR) << "[EP IBGDA] ibv_reg_mr failed";
+            PLOG(ERROR) << "[EP IBGDA] memory registration failed";
             return -1;
         }
         mr_ptr_ = ptr;
@@ -435,7 +494,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     RdmaLocalMetadata localMetadata() const override {
         RdmaLocalMetadata meta;
-        meta.raddr = mr_ ? reinterpret_cast<int64_t>(mr_->addr) : 0;
+        meta.raddr = mr_ptr_ ? reinterpret_cast<int64_t>(mr_ptr_) : 0;
         meta.rkey = mr_ ? static_cast<int32_t>(mr_->rkey) : 0;
         meta.subnet_prefix = static_cast<int64_t>(gid_.global.subnet_prefix);
         meta.interface_id = static_cast<int64_t>(gid_.global.interface_id);

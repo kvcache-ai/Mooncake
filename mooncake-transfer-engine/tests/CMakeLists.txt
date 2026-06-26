@@ -82,6 +82,9 @@ if (USE_HIP)
 endif()
 
 if (USE_CUDA OR USE_MUSA OR USE_MACA)
+    option(BUILD_DEVICE_IBGDA_PROBES
+        "Build low-level IBGDA DeviceTransport bring-up probes" OFF)
+
     add_executable(device_p2p_transport_smoke_test
         ${WORKSPACE}/device_p2p_transport_smoke_test.cpp)
     target_link_libraries(device_p2p_transport_smoke_test PUBLIC transfer_engine)
@@ -93,12 +96,14 @@ if (USE_CUDA OR USE_MUSA OR USE_MACA)
     target_link_libraries(device_ibgda_transport_smoke_test
         PUBLIC transfer_engine gflags::gflags)
 
-    add_executable(device_ibgda_host_proxy_loopback_test
-        ${WORKSPACE}/device_ibgda_host_proxy_loopback_test.cpp)
-    target_link_libraries(device_ibgda_host_proxy_loopback_test
-        PUBLIC transfer_engine gflags::gflags glog::glog)
+    if(BUILD_DEVICE_IBGDA_PROBES)
+        add_executable(device_ibgda_host_proxy_loopback_test
+            ${WORKSPACE}/device_ibgda_host_proxy_loopback_test.cpp)
+        target_link_libraries(device_ibgda_host_proxy_loopback_test
+            PUBLIC transfer_engine gflags::gflags glog::glog)
+    endif()
 
-    if(USE_MACA)
+    if(USE_MACA AND BUILD_DEVICE_IBGDA_PROBES)
         find_program(MACA_MXCC
             NAMES mxcc
             HINTS

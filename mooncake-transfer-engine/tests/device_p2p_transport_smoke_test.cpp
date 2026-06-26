@@ -82,13 +82,7 @@ int main() {
           "TransferEngine::getOrCreateP2pTransport returned null");
     runTransportSmoke(*engine_transport);
 
-    auto* rdma_transport = engine.getOrCreateRdmaTransport();
-#if defined(USE_MACA) && !defined(USE_CUDA) && !defined(USE_MUSA)
-    check(rdma_transport == nullptr,
-          "MACA RDMA DeviceTransport should be unavailable for now");
-#else
-    (void)rdma_transport;
-#endif
+    (void)engine.getOrCreateRdmaTransport();
 
     std::cout << "device_p2p_transport_smoke_test passed\n";
     return 0;
