@@ -41,8 +41,6 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(rkeys);
     ctx.ibgda.local_atomic_base = rdma_send_signal_buffer;
     ctx.ibgda.remote_atomic_base = rdma_recv_signal_buffer;
-    (void)num_ranks;
-    (void)num_qps;
 
     return ctx;
 }

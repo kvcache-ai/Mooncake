@@ -284,7 +284,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
-        ctrl_buf_host_ = proxy_doorbell_ || std::getenv("MC_IBGDA_CTRL_HOST");
+        ctrl_buf_host_ = proxy_doorbell_;
         if (ctrl_buf_host_) {
             int ret = posix_memalign(&ctrl_buf_, 4096, kCtrlBufSize);
             if (ret != 0) {
@@ -338,15 +338,10 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int createQueuePairs(void* stream_ptr) override {
         auto stream = static_cast<cudaStream_t>(stream_ptr);
-        int wqe = 16384;
-        if (const char* env = std::getenv("MC_IBGDA_WQE")) {
-            int parsed = std::atoi(env);
-            if (parsed > 0) wqe = parsed;
-        }
         for (int i = 0; i < num_qps_; ++i) {
             mlx5gda_qp* qp =
                 mlx5gda_create_rc_qp(mpd_, ctrl_buf_, ctrl_buf_umem_,
-                                     ctrl_buf_heap_, pd_, wqe, 1, stream);
+                                     ctrl_buf_heap_, pd_, 16384, 1, stream);
             if (!qp) {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
                 return -1;
@@ -405,9 +400,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                     static_cast<char*>(ctrl_buf_dev_) + qp->send_cq->cq_offset),
                 .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
                     static_cast<char*>(ctrl_buf_dev_) + qp->dbr_offset),
-                .bf = std::getenv("MC_IBGDA_DISABLE_BF")
-                          ? nullptr
-                          : static_cast<char*>(qp->uar->reg_addr),
+                .bf = proxy_doorbell_ ? nullptr
+                                      : static_cast<char*>(qp->uar->reg_addr),
                 .doorbell_backend = proxy_doorbell_
                                         ? MLX5GDA_DOORBELL_PROXY
                                         : MLX5GDA_DOORBELL_DIRECT,
@@ -528,9 +522,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     };
 
     static bool shouldUseProxyDoorbell() {
-        if (const char* env = std::getenv("MC_IBGDA_DOORBELL_PROXY")) {
-            return std::atoi(env) != 0;
-        }
 #if defined(USE_MACA)
         return true;
 #else

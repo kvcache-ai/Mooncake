@@ -101,7 +101,11 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
 
     struct ibv_context* ctx = pd->context;
     void* cq_context = NULL;
-    bool ctrl_host = std::getenv("MC_IBGDA_CTRL_HOST") != nullptr;
+#if defined(USE_MACA)
+    bool ctrl_host = true;
+#else
+    bool ctrl_host = false;
+#endif
 
     if (cqe <= 0) {
         errno = EINVAL;
@@ -230,7 +234,11 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     void* qp_context = NULL;
     void* cap = NULL;
     uint32_t cqe_version = 0;
-    bool ctrl_host = std::getenv("MC_IBGDA_CTRL_HOST") != nullptr;
+#if defined(USE_MACA)
+    bool ctrl_host = true;
+#else
+    bool ctrl_host = false;
+#endif
 
     if (wqe <= 0) {
         errno = EINVAL;
