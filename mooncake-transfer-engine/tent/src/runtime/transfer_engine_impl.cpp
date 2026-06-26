@@ -362,6 +362,9 @@ Status TransferEngineImpl::construct() {
     enable_auto_failover_on_poll_ =
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
+    staging_max_queued_tasks_per_shard_ =
+        conf_->get("staging/max_queued_tasks_per_shard",
+                   ProxyManager::kDefaultMaxQueuedTasksPerShard);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
     runtime_queue_config_.limits.max_outstanding_owners =
@@ -462,7 +465,10 @@ Status TransferEngineImpl::construct() {
         }
     }
 
-    staging_proxy_ = std::make_unique<ProxyManager>(this);
+    staging_proxy_ = std::make_unique<ProxyManager>(
+        this, ProxyManager::kDefaultChunkSize,
+        ProxyManager::kDefaultChunkCount,
+        staging_max_queued_tasks_per_shard_);
 
     if (runtime_queue_config_.limits.deadline_aware &&
         runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
@@ -1921,6 +1927,9 @@ Status TransferEngineImpl::commitPreparedSubmit(
             if (!status.ok()) {
                 task.staging = false;
                 task.type = UNSPEC;
+                task.status = FAILED;
+                LOG(WARNING) << "Failed to submit staged transfer: "
+                             << status.ToString();
             } else {
                 task.post_time = std::chrono::steady_clock::now();
             }
@@ -2218,7 +2227,11 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             // non-staging path below.
             auto status =
                 staging_proxy_->submit(&task, (BatchID)batch, staging_params);
-            if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+            if (!status.ok()) {
+                task.staging = false;
+                task.type = UNSPEC;
+                return finishQueuedOwner(owner_id, FAILED);
+            }
             task.post_time = std::chrono::steady_clock::now();
             return markQueuedOwnerSubmitted(owner_id);
         }

@@ -23,15 +23,34 @@
 namespace mooncake {
 namespace tent {
 ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
-                           size_t chunk_count)
+                           size_t chunk_count,
+                           size_t max_queued_tasks_per_shard)
+    : ProxyManager(impl, chunk_size, chunk_count,
+                   max_queued_tasks_per_shard, true) {}
+
+std::unique_ptr<ProxyManager> ProxyManager::createWithoutWorkersForTest(
+    TransferEngineImpl* impl, size_t max_queued_tasks_per_shard) {
+    return std::unique_ptr<ProxyManager>(new ProxyManager(
+        impl, kDefaultChunkSize, kDefaultChunkCount,
+        max_queued_tasks_per_shard, false));
+}
+
+ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
+                           size_t chunk_count,
+                           size_t max_queued_tasks_per_shard,
+                           bool start_workers)
     : chunk_size_(chunk_size),
       chunk_count_(chunk_count),
+      max_queued_tasks_per_shard_(max_queued_tasks_per_shard),
       impl_(impl),
       shutdown_drain_timeout_(std::chrono::milliseconds(
-          impl->conf_->get("staging/shutdown_drain_timeout_ms", 30000L))) {
+          impl ? impl->conf_->get("staging/shutdown_drain_timeout_ms", 30000L)
+               : 30000L)) {
     running_ = true;
-    for (size_t i = 0; i < kShards; ++i) {
-        shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
+    if (start_workers) {
+        for (size_t i = 0; i < kShards; ++i) {
+            shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
+        }
     }
 }
 
@@ -353,16 +372,25 @@ Status ProxyManager::waitCrossStage(const Request& request,
 
 Status ProxyManager::submit(TaskInfo* task, BatchID batch,
                             const std::vector<std::string>& params) {
+    if (!task || batch == 0) {
+        return Status::InvalidArgument("invalid staging task" LOC_MARK);
+    }
     StagingTask staging_task;
     staging_task.native = task;
     staging_task.batch = batch;
     staging_task.params = params;
-    task->staging_status.store(PENDING, std::memory_order_relaxed);
     static std::atomic<size_t> next_queue_index(0);
     thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
     {
         std::lock_guard<std::mutex> lk(shards_[id].mu);
+        if (max_queued_tasks_per_shard_ > 0 &&
+            shards_[id].queued_tasks >= max_queued_tasks_per_shard_) {
+            return Status::TooManyRequests(
+                "staging proxy shard queue is full" LOC_MARK);
+        }
         shards_[id].queue.push(staging_task);
+        ++shards_[id].queued_tasks;
+        task->staging_status.store(PENDING, std::memory_order_relaxed);
     }
     shards_[id].cv.notify_one();
     return Status::OK();
@@ -454,6 +482,7 @@ void ProxyManager::runner(size_t id) {
 
             task = shard.queue.front();
             shard.queue.pop();
+            --shard.queued_tasks;
         }
 
         if (!task.native) continue;
