@@ -107,12 +107,24 @@ class LocalTransferAdmissionQueue {
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
 
+    class DispatchScheduler {
+       public:
+        void enqueue(QueueOwnerId owner_id);
+
+        std::vector<QueueOwnerId> pick(
+            size_t max_owners, size_t max_bytes,
+            const std::map<QueueOwnerId, QueueOwner>& owners);
+
+       private:
+        std::deque<QueueOwnerId> fifo_;
+    };
+
     QueueLimits limits_;
     Status limits_status_;
+    DispatchScheduler scheduler_;
     QueueOwnerId next_owner_id_{1};
     std::map<QueueOwnerId, QueueOwner> owners_;
     std::map<std::pair<uint64_t, size_t>, QueueOwnerId> public_to_owner_;
-    std::deque<QueueOwnerId> fifo_;
     size_t outstanding_owners_{0};
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
