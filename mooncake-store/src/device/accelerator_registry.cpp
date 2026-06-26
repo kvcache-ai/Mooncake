@@ -22,13 +22,13 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
     }
 
     RuntimeAccelerator RuntimeAccelerators(bool ensure = false) const override {
-        auto available_devices = available_devices_.load();
+        auto available_devices = std::atomic_load(&available_devices_);
         if (ensure || !available_devices) {
             std::lock_guard<std::mutex> lock(refresh_mutex_);
-            available_devices = available_devices_.load();
+            available_devices = std::atomic_load(&available_devices_);
             if (ensure || !available_devices) {
                 available_devices = BuildAvailableDevices();
-                available_devices_.store(available_devices);
+                std::atomic_store(&available_devices_, available_devices);
             }
         }
         return RuntimeAccelerator(*available_devices);
@@ -65,7 +65,7 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
 
     DeviceList registered_devices_;
     mutable std::mutex refresh_mutex_;
-    mutable std::atomic<std::shared_ptr<const DeviceList>> available_devices_;
+    mutable std::shared_ptr<const DeviceList> available_devices_;
 
     friend void RegisterStaticAcceleratorDevice(
         const AcceleratorDevice& device);
