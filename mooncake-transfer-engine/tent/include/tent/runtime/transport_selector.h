@@ -117,6 +117,19 @@ struct SelectionPolicy {
 
     // Transport preference list (evaluated in order)
     std::vector<TransportType> transports;
+
+    // --- Link-layer QoS attributes (RFC #2519 / #2568, step-1 schema only) ---
+    // These let a policy carry per-policy fabric QoS instead of the
+    // process-global MC_IB_SL / MC_IB_TC. nullopt = fall back to the global
+    // RdmaParams value (today's behavior). InfiniBand Service Level (0-15) and
+    // Traffic Class / DSCP (0-255).
+    std::optional<int> service_level;  // nullopt = use global default
+    std::optional<int> traffic_class;  // nullopt = use global default
+    // Named QP pool this policy's traffic should land on. Reserved here so the
+    // schema is forward-compatible: step 1 only parses/stores it; the actual
+    // per-class QP pool creation and routing is a follow-up (step 2). Unset =
+    // the current single "data QP" path.
+    std::optional<std::string> qp_pool;
 };
 
 /**
@@ -125,6 +138,12 @@ struct SelectionPolicy {
 struct SelectionResult {
     TransportType transport = UNSPEC;
     uint64_t device_mask = ~0ULL;  // Bitmask of allowed devices (~0 = all)
+    // Resolved link-layer QoS from the matched policy (RFC #2519 / #2568).
+    // nullopt = use the global RdmaParams default. Carried here for the
+    // follow-up that applies them at QP setup; step 1 only plumbs the values.
+    std::optional<int> service_level;
+    std::optional<int> traffic_class;
+    std::optional<std::string> qp_pool;
 };
 
 /**
