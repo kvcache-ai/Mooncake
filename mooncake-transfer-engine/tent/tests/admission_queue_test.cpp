@@ -252,15 +252,12 @@ TEST(AdmissionQueueTest, PreservesStagingReserveForStagingInternalOwners) {
     EXPECT_EQ(queue.outstandingBytes(), 100u);
 }
 
-TEST(AdmissionQueueTest, KeepsAdmissionOrderForDispatch) {
+TEST(AdmissionQueueTest, BlocksOnSameLaneHeadWhenByteWindowIsTooSmall) {
     LocalTransferAdmissionQueue queue({4, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status = queue.tryAdmit(
-        makeSubmit(1, 2,
-                   {makeOwner(0, 60),
-                    makeOwner(1, 10, QueueOwnerKind::StagingInternal)}),
-        admitted_ids);
+        makeSubmit(1, 2, {makeOwner(0, 60), makeOwner(1, 10)}), admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 2u);
@@ -295,7 +292,7 @@ TEST(AdmissionQueueTest, DispatchesHigherPriorityBeforeEarlierLowerPriority) {
     EXPECT_EQ(picked, expected_ids);
 }
 
-TEST(AdmissionQueueTest, PreservesFifoWithinSamePriority) {
+TEST(AdmissionQueueTest, PreservesFifoWithinSamePriorityLane) {
     LocalTransferAdmissionQueue queue({4, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
 
@@ -334,6 +331,29 @@ TEST(AdmissionQueueTest, OwnerKindDoesNotOverrideRequestPriority) {
 
     const std::vector<QueueOwnerId> expected_ids{admitted_ids[1],
                                                  admitted_ids[0]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, AlternatesOwnerKindWithinSamePriority) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(
+            1, 4,
+            {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM),
+             makeOwner(1, 10, QueueOwnerKind::StagingInternal, {}, PRIO_MEDIUM),
+             makeOwner(2, 10, QueueOwnerKind::StagingInternal, {}, PRIO_MEDIUM),
+             makeOwner(3, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 4u);
+
+    auto picked = queue.pickForDispatch(4, 128);
+
+    const std::vector<QueueOwnerId> expected_ids{
+        admitted_ids[1], admitted_ids[0], admitted_ids[2], admitted_ids[3]};
     EXPECT_EQ(picked, expected_ids);
 }
 

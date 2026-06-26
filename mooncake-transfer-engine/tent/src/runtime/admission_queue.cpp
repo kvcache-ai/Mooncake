@@ -73,9 +73,20 @@ Status validateLimits(const QueueLimits& limits) {
 
 }  // namespace
 
+size_t LocalTransferAdmissionQueue::DispatchScheduler::kindLane(
+    QueueOwnerKind kind) {
+    switch (kind) {
+        case QueueOwnerKind::StagingInternal:
+            return static_cast<size_t>(KindLane::StagingInternal);
+        case QueueOwnerKind::User:
+            return static_cast<size_t>(KindLane::User);
+    }
+    return static_cast<size_t>(KindLane::User);
+}
+
 void LocalTransferAdmissionQueue::DispatchScheduler::enqueue(
-    QueueOwnerId owner_id, int priority) {
-    queues_[priority].push_back(owner_id);
+    QueueOwnerId owner_id, int priority, QueueOwnerKind kind) {
+    queues_[static_cast<size_t>(priority)][kindLane(kind)].push_back(owner_id);
 }
 
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
@@ -86,24 +97,40 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
-    for (auto& queue : queues_) {
-        while (!queue.empty() && used_owners < max_owners) {
-            const auto owner_id = queue.front();
-            auto owner_it = owners.find(owner_id);
-            if (owner_it == owners.end() ||
-                owner_it->second.state != QueueState::Queued) {
-                queue.pop_front();
-                continue;
+    for (size_t priority = 0; priority < queues_.size(); ++priority) {
+        auto& priority_queues = queues_[priority];
+        while (used_owners < max_owners) {
+            bool made_progress = false;
+            for (size_t offset = 0; offset < priority_queues.size(); ++offset) {
+                const size_t lane = (next_kind_lane_[priority] + offset) %
+                                    priority_queues.size();
+                auto& queue = priority_queues[lane];
+
+                while (!queue.empty()) {
+                    const auto owner_id = queue.front();
+                    auto owner_it = owners.find(owner_id);
+                    if (owner_it == owners.end() ||
+                        owner_it->second.state != QueueState::Queued) {
+                        queue.pop_front();
+                        continue;
+                    }
+
+                    const size_t remaining_bytes = max_bytes - used_bytes;
+                    if (owner_it->second.request.length > remaining_bytes)
+                        return picked;
+
+                    queue.pop_front();
+                    picked.push_back(owner_id);
+                    ++used_owners;
+                    used_bytes += owner_it->second.request.length;
+                    next_kind_lane_[priority] =
+                        (lane + 1) % priority_queues.size();
+                    made_progress = true;
+                    break;
+                }
+                if (made_progress || used_owners >= max_owners) break;
             }
-
-            const size_t remaining_bytes = max_bytes - used_bytes;
-            if (owner_it->second.request.length > remaining_bytes)
-                return picked;
-
-            queue.pop_front();
-            picked.push_back(owner_id);
-            ++used_owners;
-            used_bytes += owner_it->second.request.length;
+            if (!made_progress) break;
         }
     }
     return picked;
@@ -224,7 +251,8 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         for (const auto derived_task_id : owner_input.derived_task_ids) {
             public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
         }
-        scheduler_.enqueue(owner_id, owner_input.request.priority);
+        scheduler_.enqueue(owner_id, owner_input.request.priority,
+                           owner_input.kind);
         admitted_owner_ids.push_back(owner_id);
     }
 

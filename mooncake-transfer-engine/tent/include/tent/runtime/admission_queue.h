@@ -31,8 +31,8 @@ namespace tent {
 
 using QueueOwnerId = uint64_t;
 
-// Owner kind is used only for admission accounting. It is not a dispatch
-// priority.
+// Owner kind separates user work from staging-internal work. Request priority
+// remains the primary dispatch ordering key.
 enum class QueueOwnerKind {
     User,
     StagingInternal,
@@ -110,17 +110,29 @@ class LocalTransferAdmissionQueue {
 
     class DispatchScheduler {
        public:
-        void enqueue(QueueOwnerId owner_id, int priority);
+        void enqueue(QueueOwnerId owner_id, int priority, QueueOwnerKind kind);
 
         std::vector<QueueOwnerId> pick(
             size_t max_owners, size_t max_bytes,
             const std::map<QueueOwnerId, QueueOwner>& owners);
 
        private:
+        enum class KindLane : size_t {
+            StagingInternal = 0,
+            User = 1,
+            Count = 2,
+        };
+
         static constexpr size_t kPriorityCount =
             static_cast<size_t>(PRIO_LOW) + 1;
 
-        std::array<std::deque<QueueOwnerId>, kPriorityCount> queues_;
+        using KindQueues = std::array<std::deque<QueueOwnerId>,
+                                      static_cast<size_t>(KindLane::Count)>;
+
+        static size_t kindLane(QueueOwnerKind kind);
+
+        std::array<KindQueues, kPriorityCount> queues_;
+        std::array<size_t, kPriorityCount> next_kind_lane_{};
     };
 
     QueueLimits limits_;
