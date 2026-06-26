@@ -86,23 +86,48 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    for (size_t i = 0; i < context_list_.size(); ++i) {
-        int ret =
-            context_list_[i]->registerMemoryRegion((uint64_t)addr, length);
+    if (context_list_.empty()) {
+        LOG(ERROR) << "UbTransport: no available context to register memory";
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
+    // URMA registers host memory into a host-global ubva space, so a given host
+    // virtual address may be registered with the driver exactly once per host
+    // (re-registering the same VA on another context is rejected by the driver
+    // as a duplicate, e.g. "registered twice within 500ms").  Register the
+    // buffer on the primary context, then share the resulting segment with the
+    // remaining contexts so every device's data path still has a valid local
+    // segment handle for this buffer.
+    int ret = context_list_[0]->registerMemoryRegion((uint64_t)addr, length);
+    if (ret) {
+        LOG(ERROR) << "UbTransport: cannot register LocalMemory on primary "
+                      "context";
+        return ret;
+    }
+    void* shared_seg = context_list_[0]->lastRegisteredSeg();
+    if (!shared_seg) {
+        LOG(ERROR) << "UbTransport: primary context returned null segment";
+        context_list_[0]->unregisterMemoryRegion((uint64_t)addr);
+        return ERR_CONTEXT;
+    }
+
+    for (size_t i = 1; i < context_list_.size(); ++i) {
+        ret =
+            context_list_[i]->adoptLocalSeg((uint64_t)addr, length, shared_seg);
         if (ret) {
-            LOG(ERROR) << "UbTransport: cannot register LocalMemory on context "
-                       << i;
-            // Roll back registrations that already succeeded on context[0..i-1]
-            // so URMA fully releases those VA ranges before we return.
+            LOG(ERROR) << "UbTransport: cannot share segment to context " << i;
             for (size_t j = 0; j < i; ++j)
                 context_list_[j]->unregisterMemoryRegion((uint64_t)addr);
             return ret;
         }
+    }
+
+    for (size_t i = 0; i < context_list_.size(); ++i) {
         ret =
             context_list_[i]->buildLocalBufferDesc((uint64_t)addr, buffer_desc);
         if (ret) {
             LOG(ERROR) << "UbTransport: build buffer description failed";
-            for (size_t j = 0; j <= i; ++j)
+            for (size_t j = 0; j < context_list_.size(); ++j)
                 context_list_[j]->unregisterMemoryRegion((uint64_t)addr);
             return ret;
         }

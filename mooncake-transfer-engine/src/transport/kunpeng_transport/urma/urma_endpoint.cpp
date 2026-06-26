@@ -182,6 +182,9 @@ int UrmaContext::deconstruct() {
                 break;
             }
         }
+        // Only unregister segments this context actually registered with the
+        // driver; adopted (shared) segments are owned by another context.
+        if (owned_segs_.find(seg_ptr) == owned_segs_.end()) continue;
         int ret = urma_unregister_seg(seg_ptr);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister segment";
@@ -189,6 +192,7 @@ int UrmaContext::deconstruct() {
     }
     seg_region_list_.clear();
     local_tseg_list_.clear();
+    owned_segs_.clear();
 
     for (auto& seg : imported_seg_list_) {
         int ret = urma_unimport_seg(seg);
@@ -334,9 +338,39 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
     }
     LOG(INFO) << "Local seg token id : " << seg->seg.token_id;
     local_tseg_list_.push_back(seg);
+    owned_segs_.insert(seg);
 
     RWSpinlock::WriteGuard guard(seg_region_lock_);
     seg_region_list_.emplace_back(seg, length);
+    return 0;
+}
+
+void* UrmaContext::lastRegisteredSeg() {
+    if (local_tseg_list_.empty()) return nullptr;
+    return local_tseg_list_.back();
+}
+
+int UrmaContext::adoptLocalSeg(uint64_t va, size_t length, void* seg) {
+    // URMA registers memory into a host-global ubva space: a given host VA can
+    // only be registered with the driver once (re-registering the same VA is
+    // rejected as a duplicate).  When the transport spans multiple devices we
+    // register the buffer on the primary context and reference the resulting
+    // segment here instead of calling urma_register_seg again.  This segment is
+    // NOT inserted into owned_segs_, so it will not be passed to
+    // urma_unregister_seg by this context.
+    (void)va;
+    (void)length;
+    auto* tseg = static_cast<urma_target_seg_t*>(seg);
+    if (!tseg) {
+        LOG(ERROR) << "adoptLocalSeg: null segment for va " << va;
+        return ERR_CONTEXT;
+    }
+    local_tseg_list_.push_back(tseg);
+
+    RWSpinlock::WriteGuard guard(seg_region_lock_);
+    // Use the segment's registered (page-aligned) range so seg() lookups by the
+    // original, possibly unaligned, address still match.
+    seg_region_list_.emplace_back(tseg, tseg->seg.len);
     return 0;
 }
 
@@ -367,9 +401,16 @@ int UrmaContext::unregisterMemoryRegion(uint64_t addr) {
 
                 seg_region_list_.erase(iter);
 
-                if (urma_unregister_seg(seg_ptr)) {
-                    LOG(ERROR) << "Failed to unregister memory " << seg_va;
-                    return ERR_CONTEXT;
+                // Only the context that actually registered the segment with
+                // the URMA driver may unregister it.  Adopted (shared) segments
+                // belonging to another context are simply dereferenced here.
+                auto owned_it = owned_segs_.find(seg_ptr);
+                if (owned_it != owned_segs_.end()) {
+                    owned_segs_.erase(owned_it);
+                    if (urma_unregister_seg(seg_ptr)) {
+                        LOG(ERROR) << "Failed to unregister memory " << seg_va;
+                        return ERR_CONTEXT;
+                    }
                 }
                 has_removed = true;
                 break;
