@@ -506,7 +506,17 @@ Status RdmaTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask *> task_list;
-    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    for (auto &request : entries) {
+        auto &task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest *>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 
@@ -702,7 +712,9 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     // Use existing endpoint or create new one.
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
-    return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+    int ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+    if (endpoint->retired()) context->deleteEndpointByPtr(endpoint.get());
+    return ret;
 }
 
 int RdmaTransport::initializeRdmaResources() {

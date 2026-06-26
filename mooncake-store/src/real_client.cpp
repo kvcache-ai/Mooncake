@@ -650,8 +650,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #endif
 
     std::optional<std::string> device_name =
-        (rdma_devices.empty() ? std::nullopt
-                              : std::make_optional(rdma_devices));
+        ((rdma_devices.empty() || rdma_devices == "auto-discovery")
+             ? std::nullopt
+             : std::make_optional(rdma_devices));
 
     // Validate required parameters
     if (local_hostname.empty()) {

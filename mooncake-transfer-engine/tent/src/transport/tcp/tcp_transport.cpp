@@ -152,6 +152,8 @@ Status TcpTransport::submitTransferTasks(
         tcp_batch->task_list.emplace_back();
         auto &task = tcp_batch->task_list.back();
         task.request = request;
+        task.progress_batch_id = batch->progress_batch_id;
+        task.notify_progress = batch->notify_progress;
         task.status_word.store(TransferStatusEnum::PENDING,
                                std::memory_order_release);
     }
@@ -211,6 +213,7 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
+    if (task->notify_progress) task->notify_progress(task->progress_batch_id);
 }
 
 Status TcpTransport::doTransferWithRetry(TcpTask *task) {

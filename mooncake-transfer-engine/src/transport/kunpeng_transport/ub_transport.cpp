@@ -186,8 +186,18 @@ Status UbTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask*> task_list;
-    task_list.reserve(batch_desc.task_list.size());
-    for (auto& task : batch_desc.task_list) task_list.push_back(&task);
+    task_list.reserve(entries.size());
+    for (auto& request : entries) {
+        auto& task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest*>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 
