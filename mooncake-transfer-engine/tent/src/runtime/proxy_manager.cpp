@@ -380,38 +380,42 @@ Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
 struct StageBufferCache {
     StageBufferCache(ProxyManager& mgr) : mgr(mgr) {}
 
-    uint64_t allocateLocal(const std::string& location, int idx = 0) {
+    Status allocateLocal(const std::string& location, uint64_t& addr,
+                         int idx = 0) {
         auto key = location + "-" + std::to_string(idx);
         if (local_stage_buffers.count(key)) {
-            return local_stage_buffers[key];
+            addr = local_stage_buffers[key];
+            return Status::OK();
         }
-        uint64_t addr = 0;
         auto status = mgr.pinStageBuffer(location, addr);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to pin local stage buffer: " << status
                        << ", location " << location;
-            return 0;
+            addr = 0;
+            return status;
         }
         local_stage_buffers[key] = addr;
-        return addr;
+        return Status::OK();
     }
 
-    uint64_t allocateRemote(const std::string& server_addr,
-                            const std::string& location, int idx = 0) {
+    Status allocateRemote(const std::string& server_addr,
+                          const std::string& location, uint64_t& addr,
+                          int idx = 0) {
         auto key = location + "-" + std::to_string(idx);
         if (remote_stage_buffers[server_addr].count(key)) {
-            return remote_stage_buffers[server_addr][key];
+            addr = remote_stage_buffers[server_addr][key];
+            return Status::OK();
         }
-        uint64_t addr = 0;
         auto status =
             ControlClient::pinStageBuffer(server_addr, location, addr);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to pin remote stage buffer: " << status
                        << ", location " << location;
-            return 0;
+            addr = 0;
+            return status;
         }
         remote_stage_buffers[server_addr][key] = addr;
-        return addr;
+        return Status::OK();
     }
 
     void reset() {
@@ -507,8 +511,8 @@ Status ProxyManager::transferEventLoop(
         remote_stage_buffer[kStageBuffers];
     if (local_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
-            local_stage_buffer[i] =
-                cache->allocateLocal(task.params[1], static_cast<int>(i));
+            CHECK_STATUS(cache->allocateLocal(
+                task.params[1], local_stage_buffer[i], static_cast<int>(i)));
             if (local_stage_buffer[i] == 0)
                 return Status::InternalError(
                     "Failed to pin local stage buffer");
@@ -516,8 +520,9 @@ Status ProxyManager::transferEventLoop(
     }
     if (remote_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
-            remote_stage_buffer[i] = cache->allocateRemote(
-                server_addr, task.params[2], static_cast<int>(i));
+            CHECK_STATUS(cache->allocateRemote(server_addr, task.params[2],
+                                               remote_stage_buffer[i],
+                                               static_cast<int>(i)));
             if (remote_stage_buffer[i] == 0)
                 return Status::InternalError(
                     "Failed to pin remote stage buffer");
@@ -846,13 +851,13 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
     bool remote_staging = !task.params[2].empty();
 
     if (local_staging) {
-        local_stage_buffer = cache->allocateLocal(task.params[1]);
+        CHECK_STATUS(cache->allocateLocal(task.params[1], local_stage_buffer));
         if (local_stage_buffer == 0)
             return Status::InternalError("Failed to pin local stage buffer");
     }
     if (remote_staging) {
-        remote_stage_buffer =
-            cache->allocateRemote(server_addr, task.params[2]);
+        CHECK_STATUS(cache->allocateRemote(server_addr, task.params[2],
+                                           remote_stage_buffer));
         if (remote_stage_buffer == 0)
             return Status::InternalError("Failed to pin remote stage buffer");
     }
