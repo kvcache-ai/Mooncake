@@ -13,7 +13,7 @@ on:
 
 jobs:
   build:
-    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !contains(inputs.tag, '-')) || !contains(github.ref_name, '-') }}
 
     strategy:
       max-parallel: 2
@@ -155,7 +155,7 @@ jobs:
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
-    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !contains(inputs.tag, '-')) || !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi
