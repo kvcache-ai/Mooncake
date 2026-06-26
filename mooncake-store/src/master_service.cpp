@@ -2188,8 +2188,10 @@ auto MasterService::GetReplicaList(const std::string& key,
         // TODO: NoF SSD support (ranhaojia)
         if (replica_list[0].is_memory_replica()) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
+            MasterMetricManager::instance().inc_mem_cache_hit_bytes(metadata.size);
         } else if (replica_list[0].is_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
+            MasterMetricManager::instance().inc_file_cache_hit_bytes(metadata.size);
         }
         MasterMetricManager::instance().inc_valid_get_nums();
         // Grant a lease to the object so it will not be removed
@@ -2310,8 +2312,10 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 if (replica_list[0].is_memory_replica()) {
                     MasterMetricManager::instance().inc_mem_cache_hit_nums();
+                    MasterMetricManager::instance().inc_mem_cache_hit_bytes(metadata.size);
                 } else if (replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
+                    MasterMetricManager::instance().inc_file_cache_hit_bytes(metadata.size);
                 }
                 MasterMetricManager::instance().inc_valid_get_nums();
                 GrantLeaseForGroup(tenant_state, key, metadata);
