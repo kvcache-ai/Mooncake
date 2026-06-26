@@ -583,6 +583,30 @@ rpc_interface: "eth0"
 rpc_port: 50051
 ```
 
+### Host-aware Local-first Allocation
+
+Mooncake can prefer memory segments on the writer's physical host before falling back to remote hosts. This is useful when colocating inference workers and store segments, because a store node failure only invalidates the KV cache written to that host instead of spreading one request's cache across the whole cluster.
+
+This feature is disabled by default. Enable it on the master and set a stable host identity for every client/store process:
+
+```bash
+# Master process
+MOONCAKE_LOCAL_FIRST_ALLOC=1 mooncake_master
+
+# Every Mooncake client/store process on the same physical host should use the same value.
+export MOONCAKE_HOST_ID=host-a
+```
+
+| Environment Variable | Process | Default | Description |
+|----------------------|---------|---------|-------------|
+| `MOONCAKE_LOCAL_FIRST_ALLOC` | Master | unset / disabled | Set to `1`, `true`, `yes`, or `on` to enable automatic host-aware local-first allocation |
+| `MOONCAKE_HOST_ID` | Client/store | derived from `local_hostname` when possible | Stable physical host identifier. All Mooncake processes on the same machine should use the same value |
+| `MOONCAKE_HOST_FALLBACK_POLICY` | Master | `ordered` | Remote fallback policy. The first implementation supports only `ordered`; other values warn and fall back to `ordered` |
+
+When enabled, the master applies local-first allocation only for memory replicas with `replica_num == 1` and no explicit `preferred_segment` or `preferred_segments`. Explicit preferred segments always take precedence. If the writer host has allocatable segments, Mooncake tries those segments first; if they are unavailable or full, it falls back to remote hosts in lexicographic host-id order. Within the same host, segment names are sorted and rotated by key hash so multiple segments on one host do not always receive the first allocation attempt.
+
+If `MOONCAKE_HOST_ID` is not set, the client derives a best-effort host id from `local_hostname` by removing the port. Empty, loopback, and wildcard values such as `localhost`, `127.0.0.1`, `0.0.0.0`, and `::1` are treated as unknown and do not trigger automatic local-first placement for that client.
+
 ---
 
 (reference-client-configuration-tuning)=
@@ -616,7 +640,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 
 ```{note}
-The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A only the `MC_*` engine variables below have any effect — `MOONCAKE_*` are ignored.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as `MOONCAKE_HOST_ID` and the `MC_*` engine variables below are still read by the C++ client.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
