@@ -145,6 +145,111 @@ struct InfinibandDevice {
     int numa_node;
 };
 
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+                return !std::isspace(ch);
+            }));
+}
+
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
+}
+
+static std::set<std::string> getIbvDeviceWhitelist() {
+    std::set<std::string> whitelist;
+    const char *env = std::getenv("MC_TE_FILTERS");
+    if (!env || !*env) {
+        return whitelist;
+    }
+
+    LOG(INFO) << "IB device whitelist: " << env;
+    std::string env_str(env);
+    size_t start = 0;
+    size_t pos = 0;
+    while ((pos = env_str.find(',', start)) != std::string::npos) {
+        std::string token = env_str.substr(start, pos - start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+        start = pos + 1;
+    }
+    if (start < env_str.length()) {
+        std::string token = env_str.substr(start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+    }
+    return whitelist;
+}
+
+static std::vector<InfinibandDevice> listInfiniBandDevices(
+    const std::vector<std::string> &filter) {
+    int num_devices = 0;
+    std::vector<InfinibandDevice> devices;
+    const auto whitelist = getIbvDeviceWhitelist();
+
+    struct ibv_device **device_list = ibv_get_device_list(&num_devices);
+    if (!device_list) {
+        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        return {};
+    }
+    if (device_list && num_devices <= 0) {
+        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        ibv_free_device_list(device_list);
+        return {};
+    }
+
+    for (int i = 0; i < num_devices; ++i) {
+        std::string device_name = ibv_get_device_name(device_list[i]);
+        if (!filter.empty() && std::find(filter.begin(), filter.end(),
+                                         device_name) == filter.end())
+            continue;
+
+        if (!whitelist.empty() &&
+            whitelist.find(device_name) == whitelist.end()) {
+            LOG(INFO) << "Skipping device: " << device_name;
+            continue;
+        }
+
+        // Check device availability before adding to the list
+        if (!isIbDeviceAvailable(device_list[i])) {
+            LOG(WARNING) << "Skipping unavailable device: " << device_name;
+            continue;
+        }
+
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+        // Get the PCI bus id for the infiniband device. Note that
+        // "/sys/class/infiniband/mlx5_X/" is a symlink to
+        // "/sys/devices/pciXXXX:XX/XXXX:XX:XX.X/infiniband/mlx5_X/".
+        snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
+                 device_name.c_str());
+        if (realpath(path, resolved_path) == NULL) {
+            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path
+                        << " failed";
+            continue;
+        }
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+        snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
+        std::ifstream(path) >> numa_node;
+
+        devices.push_back(InfinibandDevice{.name = std::move(device_name),
+                                           .pci_bus_id = std::move(pci_bus_id),
+                                           .numa_node = numa_node});
+    }
+    ibv_free_device_list(device_list);
+    return devices;
+}
+
 static void precomputeResolvedHcaPeerAffinity(
     const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
     std::unordered_map<std::string,
@@ -186,60 +291,6 @@ static void precomputeResolvedHcaPeerAffinity(
                 std::move(peer_preferred_hca);
         }
     }
-}
-
-static std::vector<InfinibandDevice> listInfiniBandDevices(
-    const std::vector<std::string> &filter) {
-    int num_devices = 0;
-    std::vector<InfinibandDevice> devices;
-
-    struct ibv_device **device_list = ibv_get_device_list(&num_devices);
-    if (!device_list) {
-        LOG(WARNING) << "No RDMA devices found, check your device installation";
-        return {};
-    }
-    if (device_list && num_devices <= 0) {
-        LOG(WARNING) << "No RDMA devices found, check your device installation";
-        ibv_free_device_list(device_list);
-        return {};
-    }
-
-    for (int i = 0; i < num_devices; ++i) {
-        std::string device_name = ibv_get_device_name(device_list[i]);
-        if (!filter.empty() && std::find(filter.begin(), filter.end(),
-                                         device_name) == filter.end())
-            continue;
-
-        // Check device availability before adding to the list
-        if (!isIbDeviceAvailable(device_list[i])) {
-            LOG(WARNING) << "Skipping unavailable device: " << device_name;
-            continue;
-        }
-
-        char path[PATH_MAX + 32];
-        char resolved_path[PATH_MAX];
-        // Get the PCI bus id for the infiniband device. Note that
-        // "/sys/class/infiniband/mlx5_X/" is a symlink to
-        // "/sys/devices/pciXXXX:XX/XXXX:XX:XX.X/infiniband/mlx5_X/".
-        snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
-                 device_name.c_str());
-        if (realpath(path, resolved_path) == NULL) {
-            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path
-                        << " failed";
-            continue;
-        }
-        std::string pci_bus_id = basename(resolved_path);
-
-        int numa_node = -1;
-        snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
-        std::ifstream(path) >> numa_node;
-
-        devices.push_back(InfinibandDevice{.name = std::move(device_name),
-                                           .pci_bus_id = std::move(pci_bus_id),
-                                           .numa_node = numa_node});
-    }
-    ibv_free_device_list(device_list);
-    return devices;
 }
 
 #ifdef USE_UB
