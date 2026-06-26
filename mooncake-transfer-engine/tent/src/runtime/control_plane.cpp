@@ -141,7 +141,16 @@ Status ControlClient::pinStageBuffer(const std::string& server_addr,
     request_raw = j.dump();
     CHECK_STATUS(
         tl_rpc_agent.call(server_addr, Pin, request_raw, response_raw));
-    addr = json::parse(response_raw).get<uint64_t>();
+    if (response_raw.empty()) {
+        return Status::RpcServiceError(
+            "pin stage buffer returned empty response" LOC_MARK);
+    }
+    json response = json::parse(response_raw);
+    if (response.is_object() && response.contains("error")) {
+        return Status::RpcServiceError(response["error"].get<std::string>() +
+                                       LOC_MARK);
+    }
+    addr = response.get<uint64_t>();
     return Status::OK();
 }
 
@@ -317,9 +326,14 @@ void ControlService::onDelegate(const std::string_view& request,
 void ControlService::onPinStageBuffer(const std::string_view& request,
                                       std::string& response) {
     std::string location = json::parse(request).get<std::string>();
-    uint64_t addr = impl_->lockStageBuffer(location);
-    json j = addr;
-    response = j.dump();
+    uint64_t addr = 0;
+    auto status = impl_->pinStageBuffer(location, addr);
+    if (!status.ok()) {
+        json j = {{"error", status.ToString()}};
+        response = j.dump();
+        return;
+    }
+    response = json(addr).dump();
 }
 
 void ControlService::onUnpinStageBuffer(const std::string_view& request,

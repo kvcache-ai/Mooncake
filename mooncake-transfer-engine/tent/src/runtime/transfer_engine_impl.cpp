@@ -2192,9 +2192,18 @@ Status TransferEngineImpl::transferSync(
 
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
     uint64_t addr = 0;
-    auto status = staging_proxy_->pinStageBuffer(location, addr);
+    auto status = pinStageBuffer(location, addr);
     if (!status.ok()) LOG(ERROR) << status.ToString();
     return addr;
+}
+
+Status TransferEngineImpl::pinStageBuffer(const std::string& location,
+                                          uint64_t& addr) {
+    addr = 0;
+    if (!staging_proxy_) {
+        return Status::InvalidEntry("staging proxy is not available" LOC_MARK);
+    }
+    return staging_proxy_->pinStageBuffer(location, addr);
 }
 
 Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {

@@ -161,6 +161,8 @@ class TransferEngineImpl {
 
     uint64_t lockStageBuffer(const std::string& location);
 
+    Status pinStageBuffer(const std::string& location, uint64_t& addr);
+
     Status unlockStageBuffer(uint64_t addr);
 
     // Test-only hook: replace the transport in a given slot after construct().
