@@ -347,6 +347,24 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     return picked;
 }
 
+Status LocalTransferAdmissionQueue::requeueForDispatch(QueueOwnerId owner_id) {
+    if (owner_id == 0) {
+        return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
+    }
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    }
+    auto& owner = owner_it->second;
+    if (owner.state != QueueState::Dispatching) {
+        return Status::InvalidEntry("queue owner is not dispatching" LOC_MARK);
+    }
+
+    owner.state = QueueState::Queued;
+    scheduler_.enqueue(owner_id, owner.request.priority, owner.kind);
+    return Status::OK();
+}
+
 Status LocalTransferAdmissionQueue::complete(
     QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
     if (owner_id == 0) {

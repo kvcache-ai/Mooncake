@@ -516,6 +516,29 @@ TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {
     EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
 }
 
+TEST(AdmissionQueueTest, RequeuesDispatchingOwnerWithoutRechargingAdmission) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.outstandingBytes(), 16u);
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    status = queue.requeueForDispatch(picked[0]);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.outstandingBytes(), 16u);
+
+    picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_EQ(picked[0], admitted_ids[0]);
+}
+
 TEST(AdmissionQueueTest, RetainsTerminalStatusUntilBatchRetire) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
