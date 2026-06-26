@@ -15,6 +15,7 @@
 #ifndef ADMISSION_QUEUE_H_
 #define ADMISSION_QUEUE_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -44,11 +45,11 @@ struct QueueLimits {
     size_t staging_owner_reserve{0};
     size_t staging_byte_reserve{0};
     // Opt-in deadline-aware dispatch (RFC #2519 step 2). When false (default),
-    // pickForDispatch keeps strict FIFO order — unchanged behavior. When true,
-    // owners carrying a deadline (request.deadline_ns != 0) are dispatched
-    // earliest-deadline-first; owners without a deadline keep FIFO order behind
-    // them. This only reorders selection within the existing capacity limits;
-    // it does not admit/reject or otherwise change what gets dispatched.
+    // pickForDispatch keeps strict FIFO order within each priority/kind lane.
+    // When true, owners carrying a deadline (request.deadline_ns != 0) are
+    // dispatched earliest-deadline-first within that lane; owners without a
+    // deadline keep FIFO order behind them. Request priority still determines
+    // dispatch order across lanes.
     bool deadline_aware{false};
     // Opt-in deadline-infeasible drop (RFC #2519 step 3). Local-decode MLU
     // threshold θ_local. 0 (default) disables drop entirely — behavior is the
@@ -172,12 +173,60 @@ class LocalTransferAdmissionQueue {
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
 
+    using OwnerMap = std::map<QueueOwnerId, QueueOwner>;
+
+    class DispatchScheduler {
+       public:
+        struct Candidate {
+            QueueOwnerId owner_id{0};
+            size_t priority{0};
+            size_t lane{0};
+            bool found{false};
+        };
+
+        void enqueue(QueueOwnerId owner_id, int priority, QueueOwnerKind kind,
+                     bool deadline_aware, const OwnerMap& owners);
+
+        void promoteDeadlineUrgentOwners(uint64_t now_ns,
+                                         uint64_t promotion_slack_ns,
+                                         const OwnerMap& owners);
+
+        Candidate next(const OwnerMap& owners);
+
+        void consume(const Candidate& candidate);
+
+       private:
+        static constexpr size_t kPriorityCount =
+            static_cast<size_t>(PRIO_LOW) + 1;
+
+        enum class KindLane {
+            StagingInternal = 0,
+            User = 1,
+            Count = 2,
+        };
+
+        struct LaneState {
+            std::deque<QueueOwnerId> queue;
+        };
+
+        using KindLanes =
+            std::array<LaneState, static_cast<size_t>(KindLane::Count)>;
+
+        struct PriorityClass {
+            KindLanes lanes;
+            size_t next_kind_lane{0};
+        };
+
+        static size_t laneForKind(QueueOwnerKind kind);
+
+        std::array<PriorityClass, kPriorityCount> classes_;
+    };
     QueueLimits limits_;
     Status limits_status_;
+    DispatchScheduler scheduler_;
     QueueOwnerId next_owner_id_{1};
-    std::map<QueueOwnerId, QueueOwner> owners_;
+    OwnerMap owners_;
     std::map<std::pair<uint64_t, size_t>, QueueOwnerId> public_to_owner_;
-    std::deque<QueueOwnerId> fifo_;
     size_t outstanding_owners_{0};
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};

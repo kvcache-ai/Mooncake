@@ -50,6 +50,16 @@ bool isSupportedOwnerKind(QueueOwnerKind kind) {
     return false;
 }
 
+bool isSupportedRequestPriority(int priority) {
+    switch (priority) {
+        case PRIO_HIGH:
+        case PRIO_MEDIUM:
+        case PRIO_LOW:
+            return true;
+    }
+    return false;
+}
+
 Status checkedAdd(size_t lhs, size_t rhs, size_t& out) {
     if (rhs > std::numeric_limits<size_t>::max() - lhs) {
         return Status::InvalidArgument(
@@ -73,6 +83,100 @@ Status validateLimits(const QueueLimits& limits) {
 
 }  // namespace
 
+size_t LocalTransferAdmissionQueue::DispatchScheduler::laneForKind(
+    QueueOwnerKind kind) {
+    return kind == QueueOwnerKind::StagingInternal
+               ? static_cast<size_t>(KindLane::StagingInternal)
+               : static_cast<size_t>(KindLane::User);
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::enqueue(
+    QueueOwnerId owner_id, int priority, QueueOwnerKind kind,
+    bool deadline_aware, const OwnerMap& owners) {
+    auto& queue = classes_[priority].lanes[laneForKind(kind)].queue;
+    if (!deadline_aware) {
+        queue.push_back(owner_id);
+        return;
+    }
+
+    const auto owner_it = owners.find(owner_id);
+    const uint64_t key =
+        owner_it == owners.end()
+            ? std::numeric_limits<uint64_t>::max()
+            : deadlineKey(owner_it->second.request.deadline_ns);
+    const auto pos = std::upper_bound(
+        queue.begin(), queue.end(), key, [&owners](uint64_t deadline,
+                                                   QueueOwnerId queued_id) {
+            const auto queued_it = owners.find(queued_id);
+            const uint64_t queued_deadline =
+                queued_it == owners.end()
+                    ? std::numeric_limits<uint64_t>::max()
+                    : deadlineKey(queued_it->second.request.deadline_ns);
+            return deadline < queued_deadline;
+        });
+    queue.insert(pos, owner_id);
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::promoteDeadlineUrgentOwners(
+    uint64_t now_ns, uint64_t promotion_slack_ns, const OwnerMap& owners) {
+    if (promotion_slack_ns == 0) return;
+
+    for (auto& priority_class : classes_) {
+        for (auto& lane : priority_class.lanes) {
+            std::stable_partition(
+                lane.queue.begin(), lane.queue.end(), [&](QueueOwnerId id) {
+                    const auto owner_it = owners.find(id);
+                    if (owner_it == owners.end() ||
+                        owner_it->second.state != QueueState::Queued) {
+                        return false;
+                    }
+                    const uint64_t deadline =
+                        owner_it->second.request.deadline_ns;
+                    return deadline > now_ns &&
+                           deadline - now_ns < promotion_slack_ns;
+                });
+        }
+    }
+}
+
+LocalTransferAdmissionQueue::DispatchScheduler::Candidate
+LocalTransferAdmissionQueue::DispatchScheduler::next(const OwnerMap& owners) {
+    for (size_t priority = PRIO_HIGH; priority < classes_.size(); ++priority) {
+        auto& priority_class = classes_[priority];
+        for (size_t offset = 0; offset < priority_class.lanes.size(); ++offset) {
+            const size_t lane =
+                (priority_class.next_kind_lane + offset) %
+                priority_class.lanes.size();
+            auto& queue = priority_class.lanes[lane].queue;
+            while (!queue.empty()) {
+                const auto owner_it = owners.find(queue.front());
+                if (owner_it != owners.end() &&
+                    owner_it->second.state == QueueState::Queued) {
+                    return Candidate{queue.front(), priority, lane, true};
+                }
+                queue.pop_front();
+            }
+        }
+    }
+    return {};
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::consume(
+    const Candidate& candidate) {
+    if (!candidate.found || candidate.priority >= classes_.size() ||
+        candidate.lane >= classes_[candidate.priority].lanes.size()) {
+        return;
+    }
+
+    auto& priority_class = classes_[candidate.priority];
+    auto& queue = priority_class.lanes[candidate.lane].queue;
+    if (!queue.empty() && queue.front() == candidate.owner_id) {
+        queue.pop_front();
+        priority_class.next_kind_lane =
+            (candidate.lane + 1) % priority_class.lanes.size();
+    }
+}
+
 LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
     : limits_(limits), limits_status_(validateLimits(limits)) {}
 
@@ -94,6 +198,10 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         if (!isSupportedOwnerKind(owner.kind)) {
             return Status::InvalidArgument(
                 "unsupported queue owner kind" LOC_MARK);
+        }
+        if (!isSupportedRequestPriority(owner.request.priority)) {
+            return Status::InvalidArgument(
+                "unsupported queue request priority" LOC_MARK);
         }
         if (owner.request.length == 0) {
             return Status::InvalidArgument("empty transfer request" LOC_MARK);
@@ -185,27 +293,8 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         for (const auto derived_task_id : owner_input.derived_task_ids) {
             public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
         }
-        // RFC #2519 step 2: keep fifo_ ordered on admission so pickForDispatch
-        // never has to re-sort. Default (deadline_aware == false) appends in
-        // strict FIFO. When deadline-aware, insert at the earliest-deadline-
-        // first position; upper_bound places a new owner *after* existing
-        // owners with the same deadline, preserving FIFO order among ties.
-        if (limits_.deadline_aware) {
-            const uint64_t key = deadlineKey(owner.request.deadline_ns);
-            auto pos = std::upper_bound(
-                fifo_.begin(), fifo_.end(), key,
-                [this](uint64_t k, QueueOwnerId id) {
-                    auto it = owners_.find(id);
-                    uint64_t d =
-                        (it == owners_.end())
-                            ? std::numeric_limits<uint64_t>::max()
-                            : deadlineKey(it->second.request.deadline_ns);
-                    return k < d;
-                });
-            fifo_.insert(pos, owner_id);
-        } else {
-            fifo_.push_back(owner_id);
-        }
+        scheduler_.enqueue(owner_id, owner_input.request.priority,
+                           owner_input.kind, limits_.deadline_aware, owners_);
         admitted_owner_ids.push_back(owner_id);
     }
 
@@ -231,12 +320,9 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
 
-    // RFC #2519 step 2 (opt-in): earliest-deadline-first dispatch. When
-    // deadline_aware, fifo_ is kept EDF-ordered at admission time (see
-    // tryAdmit's ordered insert), so there is nothing to sort here — we just
-    // consume from the front. This keeps the hot dispatch path O(picked)
-    // instead of re-sorting the whole queue on every call. Default
-    // (deadline_aware == false) is plain FIFO.
+    // RFC #2519 step 2 (opt-in): each priority/kind lane is kept EDF-ordered
+    // at admission time, so the scheduler only consumes lane fronts here.
+    // Request priority remains the outer ordering rule.
     //
     // RFC #2519 step 3 (opt-in): drop is active only when a positive threshold,
     // deadline awareness, and a bandwidth provider are all present.
@@ -258,20 +344,11 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
                              .count()))
             : 0;
 
-    // Deadline proximity promotion: partition fifo_ so owners with critical
-    // slack (deadline approaching within promotion_slack_ns) appear before
-    // owners with comfortable slack or no deadline. stable_partition preserves
-    // relative EDF order within each group.
+    // Deadline proximity promotion runs within each priority/kind lane.
     if (promotion_enabled) {
-        std::stable_partition(fifo_.begin(), fifo_.end(), [&](QueueOwnerId id) {
-            auto it = owners_.find(id);
-            if (it == owners_.end() || it->second.state != QueueState::Queued) {
-                return false;
-            }
-            const uint64_t dl = it->second.request.deadline_ns;
-            if (dl == 0 || dl <= now_ns) return false;
-            return (dl - now_ns) < limits_.promotion_slack_ns;
-        });
+        scheduler_.promoteDeadlineUrgentOwners(now_ns,
+                                               limits_.promotion_slack_ns,
+                                               owners_);
     }
 
     // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
@@ -305,25 +382,18 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
-    while (!fifo_.empty() && used_owners < max_owners) {
-        auto owner_id = fifo_.front();
-        auto owner_it = owners_.find(owner_id);
-        // Non-queued entries should not normally remain in fifo_, but stale
-        // entries are skipped defensively so retireBatch() does not need to
-        // scan the dispatch queue.
-        if (owner_it == owners_.end() ||
-            owner_it->second.state != QueueState::Queued) {
-            fifo_.pop_front();
-            continue;
-        }
+    while (used_owners < max_owners && used_bytes < max_bytes) {
+        const auto candidate = scheduler_.next(owners_);
+        if (!candidate.found) break;
 
-        // Step 3: an owner predicted to miss its deadline is dropped (not
-        // dispatched) and does not consume the dispatch budget. Because the
-        // queue is EDF-ordered, later owners have looser deadlines, so we keep
-        // scanning rather than stopping.
+        auto owner_it = owners_.find(candidate.owner_id);
+        if (owner_it == owners_.end()) continue;
+
+        // Step 3: a dropped owner does not consume dispatch budget. Continue
+        // at the same priority so an infeasible head cannot block its lane.
         if (shouldDrop(owner_it->second)) {
-            fifo_.pop_front();
-            dropOwner(owner_id, owner_it->second);
+            scheduler_.consume(candidate);
+            dropOwner(candidate.owner_id, owner_it->second);
             continue;
         }
 
@@ -331,9 +401,9 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         const size_t remaining_bytes = max_bytes - used_bytes;
         if (owner.request.length > remaining_bytes) break;
 
-        fifo_.pop_front();
+        scheduler_.consume(candidate);
         owner_it->second.state = QueueState::Dispatching;
-        picked.push_back(owner_id);
+        picked.push_back(candidate.owner_id);
         ++used_owners;
         used_bytes += owner.request.length;
     }
