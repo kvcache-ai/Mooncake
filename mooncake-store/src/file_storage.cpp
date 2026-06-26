@@ -416,14 +416,27 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
-            LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
-                       << result.error();
+            LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess failed with error: "
+                       << result.error() << " keys count: " << keys.size();
             return result.error();
         }
         return ErrorCode::OK;
     };
 
+    // Collect keys drained from master queue but not found in local memory.
+    // These need to be reported back as failed so the master can clean up
+    // orphaned offloading_tasks and release the source replica refcount.
+    std::vector<OffloadTaskItem> failed_tasks;
+    // Per-drop-point counters for diagnosis.
+    int drop_key_missing = 0;   // individual key missing from query result
+    int drop_d2h_staging = 0;   // D2H copy failed
+    int drop_write_fail = 0;    // BatchOffload write failed (INVALID_READ)
+    // Count keys that were in offloading_objects but not in any bucket
+    // (skipped by GroupOffloadingKeysByBucket due to size limit or IsExist)
+    std::unordered_set<std::string> all_bucket_keys;
+
     for (const auto& keys : buckets_keys) {
+        for (const auto& k : keys) all_bucket_keys.insert(k);
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
@@ -442,18 +455,23 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
+            std::vector<std::string> missing_user_keys;
             auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
-                                                        user_batch_object);
-            if (!query_result) {
-                LOG(ERROR) << "BatchQuerySlices failed with error: "
-                           << query_result.error();
-                continue;
-            }
-            for (size_t i = 0; i < storage_keys.size(); ++i) {
-                auto it = user_batch_object.find(user_keys[i]);
+                                                        user_batch_object,
+                                                        missing_user_keys);
+            // BatchQuerySegmentSlices is now best-effort: it always returns
+            // OK, with missing keys reported via missing_user_keys. Keys
+            // present in user_batch_object go to batch_object; the rest
+            // are reported as failed.
+            for (const auto& storage_key : storage_keys) {
+                const auto& user_key = task_by_storage_key[storage_key].key;
+                auto it = user_batch_object.find(user_key);
                 if (it != user_batch_object.end()) {
-                    batch_object.emplace(storage_keys[i],
+                    batch_object.emplace(storage_key,
                                          std::move(it->second));
+                } else {
+                    failed_tasks.push_back(task_by_storage_key[storage_key]);
+                    ++drop_key_missing;
                 }
             }
         }
@@ -504,6 +522,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
                         pinned_buffer_pool_->Release(buf);
                         obj_success = false;
+                        failed_tasks.push_back(task_by_storage_key[obj_key]);
+                        ++drop_d2h_staging;
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
@@ -558,11 +578,50 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 enable_offloading_ = false;
                 return tl::make_unexpected(offload_res.error());
             }
-            if (offload_res.error() != ErrorCode::INVALID_READ) {
+            if (offload_res.error() == ErrorCode::INVALID_READ) {
+                // BatchOffload partial write failure — these keys were not
+                // passed to bucket_complete_handler and become orphans.
+                for (const auto& [key, _] : host_batch_object) {
+                    failed_tasks.push_back(task_by_storage_key[key]);
+                    ++drop_write_fail;
+                }
+            } else {
                 return tl::make_unexpected(offload_res.error());
             }
         }
     }
+
+    // Report failed offload attempts back to the master so it can clean up
+    // orphaned offloading_tasks and release the source replica refcount.
+    // Use data_size=-1 as a sentinel to signal "offload failed".
+    int drop_not_in_bucket = 0;
+    for (const auto& [storage_key, task] : task_by_storage_key) {
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+            failed_tasks.push_back(task);
+            ++drop_not_in_bucket;
+        }
+    }
+    int drop_total = drop_key_missing + drop_d2h_staging + drop_write_fail + drop_not_in_bucket;
+    LOG(WARNING) << "[OFFLOAD] OffloadObjects summary: queued=" << offloading_objects.size()
+              << " dropped=" << drop_total
+              << " (key_missing=" << drop_key_missing
+              << " d2h_staging=" << drop_d2h_staging
+              << " write_fail=" << drop_write_fail
+              << " not_in_bucket=" << drop_not_in_bucket << ")";
+    if (!failed_tasks.empty()) {
+        std::vector<StorageObjectMetadata> failed_metadatas;
+        failed_metadatas.reserve(failed_tasks.size());
+        for (size_t i = 0; i < failed_tasks.size(); ++i) {
+            failed_metadatas.push_back(StorageObjectMetadata{
+                -1, 0, 0, -1, ""});
+        }
+        auto result = client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
+        if (!result) {
+            LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed tasks returned error: "
+                         << result.error() << " count: " << failed_tasks.size();
+        }
+    }
+
     return {};
 }
 
@@ -673,6 +732,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                    << offload_result.error();
         return offload_result;
     }
+
+    LOG(INFO) << "Successfully completed heartbeat with offloaded objects count: "
+              << offloading_objects.size();
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
@@ -864,10 +926,13 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
-    std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+    std::vector<std::string>& missing_keys) {
     auto batched_query_results = client_->BatchQuery(keys, tenant_id);
-    if (batched_query_results.empty())
-        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+    if (batched_query_results.empty()) {
+        missing_keys = keys;
+        return {};
+    }
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
             for (const auto& descriptor :
@@ -885,13 +950,16 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
                 }
             }
             if (batched_slices.find(keys[i]) == batched_slices.end()) {
-                LOG(ERROR) << "Key not found: " << keys[i];
-                return tl::make_unexpected(ErrorCode::INVALID_KEY);
+                missing_keys.push_back(keys[i]);
             }
         } else {
-            LOG(ERROR) << "Key not found: " << keys[i];
-            return tl::make_unexpected(batched_query_results[i].error());
+            missing_keys.push_back(keys[i]);
         }
+    }
+    if (!missing_keys.empty()) {
+        LOG(WARNING) << "[OFFLOAD] BatchQuerySegmentSlices: " << missing_keys.size()
+                     << "/" << keys.size() << " keys missing local memory replica, tenant="
+                     << tenant_id;
     }
     return {};
 }

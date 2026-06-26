@@ -1907,10 +1907,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
-                LOG(ERROR) << "Object size exceeds bucket size limit: "
-                           << "key=" << it->first
-                           << ", object_size=" << it->second << ", limit="
-                           << bucket_backend_config_.bucket_size_limit;
+                LOG(WARNING) << "[OFFLOAD] Object size exceeds bucket size limit: "
+                             << "key=" << it->first
+                             << ", object_size=" << it->second << ", limit="
+                             << bucket_backend_config_.bucket_size_limit;
                 ++it;
                 continue;
             }
@@ -1922,6 +1922,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                            << ", error=" << is_exist_result.error();
             }
             if (is_exist_result && is_exist_result.value()) {
+                LOG(WARNING) << "[OFFLOAD] Key already exists in storage backend, skipping: "
+                             << "key=" << it->first;
                 ++it;
                 continue;
             }

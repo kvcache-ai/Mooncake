@@ -108,7 +108,8 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
-        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        std::vector<std::string>& missing_keys);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
