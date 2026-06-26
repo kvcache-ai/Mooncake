@@ -14,6 +14,7 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -271,6 +272,46 @@ TEST(AdmissionQueueTest, BlocksOnSameLaneHeadWhenByteWindowIsTooSmall) {
     EXPECT_EQ(picked, expected_ids);
 }
 
+TEST(AdmissionQueueTest, UsesByteWindowBehindBlockedOwnerInOtherLane) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(
+            1, 3,
+            {makeOwner(0, 60, QueueOwnerKind::StagingInternal, {}, PRIO_HIGH),
+             makeOwner(1, 10, QueueOwnerKind::User, {}, PRIO_HIGH),
+             makeOwner(2, 10, QueueOwnerKind::StagingInternal, {}, PRIO_HIGH)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 3u);
+
+    auto picked = queue.pickForDispatch(2, 50);
+
+    const std::vector<QueueOwnerId> expected_ids{admitted_ids[1]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, UsesByteWindowBehindBlockedHigherPriorityLane) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2,
+                   {makeOwner(0, 60, QueueOwnerKind::User, {}, PRIO_HIGH),
+                    makeOwner(1, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 2u);
+
+    auto picked = queue.pickForDispatch(2, 50);
+
+    const std::vector<QueueOwnerId> expected_ids{admitted_ids[1]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
 TEST(AdmissionQueueTest, DispatchesHigherPriorityBeforeEarlierLowerPriority) {
     LocalTransferAdmissionQueue queue({4, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
@@ -355,6 +396,96 @@ TEST(AdmissionQueueTest, AlternatesOwnerKindWithinSamePriority) {
     const std::vector<QueueOwnerId> expected_ids{
         admitted_ids[1], admitted_ids[0], admitted_ids[2], admitted_ids[3]};
     EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, AgesMediumPriorityToHigh) {
+    QueueAgingConfig aging;
+    aging.medium_to_high = std::chrono::microseconds(10);
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0}, aging);
+    std::vector<QueueOwnerId> admitted_ids;
+
+    const auto base = LocalTransferAdmissionQueue::TimePoint{};
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM)}),
+        admitted_ids, base);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto medium_id = admitted_ids[0];
+
+    status = queue.tryAdmit(
+        makeSubmit(2, 1,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_HIGH)}),
+        admitted_ids, base + std::chrono::microseconds(20));
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto high_id = admitted_ids[0];
+
+    auto picked =
+        queue.pickForDispatch(2, 128, base + std::chrono::microseconds(20));
+
+    const std::vector<QueueOwnerId> expected_ids{medium_id, high_id};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, AgesLowPriorityToHigh) {
+    QueueAgingConfig aging;
+    aging.medium_to_high = std::chrono::microseconds(10);
+    aging.low_to_high = std::chrono::microseconds(10);
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0}, aging);
+    std::vector<QueueOwnerId> admitted_ids;
+
+    const auto base = LocalTransferAdmissionQueue::TimePoint{};
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_LOW)}),
+        admitted_ids, base);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto low_id = admitted_ids[0];
+
+    status = queue.tryAdmit(
+        makeSubmit(2, 1,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM)}),
+        admitted_ids, base + std::chrono::microseconds(20));
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto medium_id = admitted_ids[0];
+
+    status = queue.tryAdmit(
+        makeSubmit(3, 1,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_HIGH)}),
+        admitted_ids, base + std::chrono::microseconds(20));
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto high_id = admitted_ids[0];
+
+    auto picked =
+        queue.pickForDispatch(3, 128, base + std::chrono::microseconds(20));
+
+    const std::vector<QueueOwnerId> expected_ids{low_id, high_id, medium_id};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, AgingPreservesFifoWithinPromotedLane) {
+    QueueAgingConfig aging;
+    aging.medium_to_high = std::chrono::microseconds(10);
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0}, aging);
+    std::vector<QueueOwnerId> admitted_ids;
+
+    const auto base = LocalTransferAdmissionQueue::TimePoint{};
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM),
+                    makeOwner(1, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM)}),
+        admitted_ids, base);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 2u);
+
+    auto picked =
+        queue.pickForDispatch(2, 128, base + std::chrono::microseconds(20));
+
+    EXPECT_EQ(picked, admitted_ids);
 }
 
 TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {

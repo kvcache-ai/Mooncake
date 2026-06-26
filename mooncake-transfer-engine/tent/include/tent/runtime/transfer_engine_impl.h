@@ -294,6 +294,7 @@ class TransferEngineImpl {
     struct RuntimeQueueConfig {
         bool enabled{false};
         QueueLimits limits{};
+        QueueAgingConfig aging{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
         std::chrono::microseconds progress_fallback_interval{50000};

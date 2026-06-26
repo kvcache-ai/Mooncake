@@ -299,6 +299,10 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/staging_owner_reserve", 0UL);
     runtime_queue_config_.limits.staging_byte_reserve =
         conf_->get("runtime_queue/staging_byte_reserve", 0UL);
+    runtime_queue_config_.aging.medium_to_high = std::chrono::microseconds(
+        conf_->get("runtime_queue/medium_to_high_aging_us", 0UL));
+    runtime_queue_config_.aging.low_to_high = std::chrono::microseconds(
+        conf_->get("runtime_queue/low_to_high_aging_us", 0UL));
     runtime_queue_config_.max_dispatch_owners =
         conf_->get("runtime_queue/max_dispatch_owners", 64UL);
     runtime_queue_config_.max_dispatch_bytes =
@@ -313,7 +317,7 @@ Status TransferEngineImpl::construct() {
             "runtime queue dispatch window must be non-zero" LOC_MARK);
     }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
-        runtime_queue_config_.limits);
+        runtime_queue_config_.limits, runtime_queue_config_.aging);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else

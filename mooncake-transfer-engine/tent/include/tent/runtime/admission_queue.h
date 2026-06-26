@@ -16,6 +16,7 @@
 #define ADMISSION_QUEUE_H_
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -45,6 +46,12 @@ struct QueueLimits {
     size_t staging_byte_reserve{0};
 };
 
+struct QueueAgingConfig {
+    // Zero disables aging for the corresponding priority class.
+    std::chrono::microseconds medium_to_high{0};
+    std::chrono::microseconds low_to_high{0};
+};
+
 struct QueueOwnerInput {
     // Absolute task id within the caller's Batch, not relative to this submit.
     size_t owner_task_id{0};
@@ -64,7 +71,11 @@ struct QueueSubmit {
 // eventual TransferEngineImpl integration owns synchronization.
 class LocalTransferAdmissionQueue {
    public:
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
     explicit LocalTransferAdmissionQueue(QueueLimits limits);
+    LocalTransferAdmissionQueue(QueueLimits limits, QueueAgingConfig aging);
 
     LocalTransferAdmissionQueue(const LocalTransferAdmissionQueue&) = delete;
     LocalTransferAdmissionQueue& operator=(const LocalTransferAdmissionQueue&) =
@@ -75,9 +86,14 @@ class LocalTransferAdmissionQueue {
 
     Status tryAdmit(const QueueSubmit& submit,
                     std::vector<QueueOwnerId>& admitted_owner_ids);
+    Status tryAdmit(const QueueSubmit& submit,
+                    std::vector<QueueOwnerId>& admitted_owner_ids,
+                    TimePoint now);
 
     std::vector<QueueOwnerId> pickForDispatch(size_t max_owners,
                                               size_t max_bytes);
+    std::vector<QueueOwnerId> pickForDispatch(size_t max_owners,
+                                              size_t max_bytes, TimePoint now);
 
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
@@ -104,17 +120,20 @@ class LocalTransferAdmissionQueue {
         uint64_t batch_token{0};
         Request request{};
         QueueOwnerKind kind{QueueOwnerKind::User};
+        TimePoint enqueue_time{};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
 
     class DispatchScheduler {
        public:
-        void enqueue(QueueOwnerId owner_id, int priority, QueueOwnerKind kind);
+        explicit DispatchScheduler(QueueAgingConfig aging = {});
 
         std::vector<QueueOwnerId> pick(
             size_t max_owners, size_t max_bytes,
-            const std::map<QueueOwnerId, QueueOwner>& owners);
+            const std::map<QueueOwnerId, QueueOwner>& owners, TimePoint now);
+
+        void enqueue(QueueOwnerId owner_id, int priority, QueueOwnerKind kind);
 
        private:
         enum class KindLane : size_t {
@@ -131,8 +150,17 @@ class LocalTransferAdmissionQueue {
 
         static size_t kindLane(QueueOwnerKind kind);
 
+        void promoteAgedOwners(
+            TimePoint now, const std::map<QueueOwnerId, QueueOwner>& owners);
+
+        void promoteAgedPriority(
+            size_t from_priority, size_t to_priority,
+            std::chrono::microseconds threshold, TimePoint now,
+            const std::map<QueueOwnerId, QueueOwner>& owners);
+
         std::array<KindQueues, kPriorityCount> queues_;
         std::array<size_t, kPriorityCount> next_kind_lane_{};
+        QueueAgingConfig aging_;
     };
 
     QueueLimits limits_;

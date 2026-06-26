@@ -73,6 +73,10 @@ Status validateLimits(const QueueLimits& limits) {
 
 }  // namespace
 
+LocalTransferAdmissionQueue::DispatchScheduler::DispatchScheduler(
+    QueueAgingConfig aging)
+    : aging_(aging) {}
+
 size_t LocalTransferAdmissionQueue::DispatchScheduler::kindLane(
     QueueOwnerKind kind) {
     switch (kind) {
@@ -89,17 +93,70 @@ void LocalTransferAdmissionQueue::DispatchScheduler::enqueue(
     queues_[static_cast<size_t>(priority)][kindLane(kind)].push_back(owner_id);
 }
 
+void LocalTransferAdmissionQueue::DispatchScheduler::promoteAgedOwners(
+    TimePoint now, const std::map<QueueOwnerId, QueueOwner>& owners) {
+    promoteAgedPriority(PRIO_MEDIUM, PRIO_HIGH, aging_.medium_to_high, now,
+                        owners);
+    promoteAgedPriority(PRIO_LOW, PRIO_HIGH, aging_.low_to_high, now, owners);
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::promoteAgedPriority(
+    size_t from_priority, size_t to_priority,
+    std::chrono::microseconds threshold, TimePoint now,
+    const std::map<QueueOwnerId, QueueOwner>& owners) {
+    if (threshold <= std::chrono::microseconds::zero()) return;
+    if (from_priority == PRIO_HIGH || from_priority >= queues_.size() ||
+        to_priority >= queues_.size()) {
+        return;
+    }
+
+    for (size_t lane = 0; lane < queues_[from_priority].size(); ++lane) {
+        auto& queue = queues_[from_priority][lane];
+        auto& promoted_queue = queues_[to_priority][lane];
+        while (!queue.empty()) {
+            const auto owner_id = queue.front();
+            auto owner_it = owners.find(owner_id);
+            if (owner_it == owners.end() ||
+                owner_it->second.state != QueueState::Queued) {
+                queue.pop_front();
+                continue;
+            }
+
+            if (now - owner_it->second.enqueue_time < threshold) break;
+
+            auto insert_it = promoted_queue.end();
+            for (auto it = promoted_queue.begin(); it != promoted_queue.end();
+                 ++it) {
+                auto promoted_it = owners.find(*it);
+                if (promoted_it == owners.end() ||
+                    promoted_it->second.state != QueueState::Queued) {
+                    continue;
+                }
+                if (owner_it->second.enqueue_time <
+                    promoted_it->second.enqueue_time) {
+                    insert_it = it;
+                    break;
+                }
+            }
+            queue.pop_front();
+            promoted_queue.insert(insert_it, owner_id);
+        }
+    }
+}
+
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
     size_t max_owners, size_t max_bytes,
-    const std::map<QueueOwnerId, QueueOwner>& owners) {
+    const std::map<QueueOwnerId, QueueOwner>& owners, TimePoint now) {
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
+
+    promoteAgedOwners(now, owners);
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
     for (size_t priority = 0; priority < queues_.size(); ++priority) {
         auto& priority_queues = queues_[priority];
-        while (used_owners < max_owners) {
+        while (used_owners < max_owners && used_bytes < max_bytes) {
             bool made_progress = false;
             for (size_t offset = 0; offset < priority_queues.size(); ++offset) {
                 const size_t lane = (next_kind_lane_[priority] + offset) %
@@ -117,7 +174,7 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
 
                     const size_t remaining_bytes = max_bytes - used_bytes;
                     if (owner_it->second.request.length > remaining_bytes)
-                        return picked;
+                        break;
 
                     queue.pop_front();
                     picked.push_back(owner_id);
@@ -139,8 +196,20 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
 LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
     : limits_(limits), limits_status_(validateLimits(limits)) {}
 
+LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits,
+                                                         QueueAgingConfig aging)
+    : limits_(limits),
+      limits_status_(validateLimits(limits)),
+      scheduler_(aging) {}
+
 Status LocalTransferAdmissionQueue::tryAdmit(
     const QueueSubmit& submit, std::vector<QueueOwnerId>& admitted_owner_ids) {
+    return tryAdmit(submit, admitted_owner_ids, Clock::now());
+}
+
+Status LocalTransferAdmissionQueue::tryAdmit(
+    const QueueSubmit& submit, std::vector<QueueOwnerId>& admitted_owner_ids,
+    TimePoint now) {
     admitted_owner_ids.clear();
     CHECK_STATUS(limits_status_);
     if (submit.batch_token == 0) {
@@ -244,6 +313,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.batch_token = submit.batch_token;
         owner.request = owner_input.request;
         owner.kind = owner_input.kind;
+        owner.enqueue_time = now;
         owners_.emplace(owner_id, owner);
 
         public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
@@ -265,7 +335,12 @@ Status LocalTransferAdmissionQueue::tryAdmit(
 
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     size_t max_owners, size_t max_bytes) {
-    auto picked = scheduler_.pick(max_owners, max_bytes, owners_);
+    return pickForDispatch(max_owners, max_bytes, Clock::now());
+}
+
+std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
+    size_t max_owners, size_t max_bytes, TimePoint now) {
+    auto picked = scheduler_.pick(max_owners, max_bytes, owners_, now);
     for (const auto owner_id : picked) {
         owners_.find(owner_id)->second.state = QueueState::Dispatching;
     }
