@@ -1358,6 +1358,23 @@ MasterService::EraseMetadata(
     const std::string key = it->first;
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
+
+    // Clean up offloading_task + dec_refcnt before erasing metadata.
+    // When BatchEvict deletes metadata, Store Worker may still have an
+    // in-flight offload for this key. Without this cleanup the task
+    // becomes an orphan that only expires after 600s.
+    auto offload_it = tenant_state.offloading_tasks.find(key);
+    if (offload_it != tenant_state.offloading_tasks.end()) {
+        auto source = metadata.GetReplicaByID(offload_it->second.source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+        tenant_state.offloading_tasks.erase(offload_it);
+    }
+    tenant_state.processing_keys.erase(key);
+    tenant_state.replication_tasks.erase(key);
+    ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
+
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
@@ -1465,11 +1482,9 @@ void MasterService::ClearInvalidHandles(
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
                 if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
-                    tenant_state.processing_keys.erase(it->first);
-                    tenant_state.replication_tasks.erase(it->first);
-                    tenant_state.offloading_tasks.erase(it->first);
-                    ErasePromotionTaskIfPresent(tenant_state, it->first,
-                                                tenant_it->first);
+                    // EraseMetadata handles processing_keys,
+                    // replication_tasks, offloading_tasks (with
+                    // dec_refcnt), and promotion task cleanup.
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
                                        QuotaEraseMode::kFull, &shard);
                 } else {
@@ -2501,11 +2516,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
                 if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
-                    tenant_state.processing_keys.erase(key);
-                    tenant_state.replication_tasks.erase(key);
-                    tenant_state.offloading_tasks.erase(key);
-                    ErasePromotionTaskIfPresent(tenant_state, key,
-                                                object_id.tenant_id);
                     EraseMetadata(tenant_state, it, object_id.tenant_id,
                                   QuotaEraseMode::kFull, &shard);
                     it = tenant_state.metadata.end();
@@ -2529,7 +2539,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             metadata.put_start_time +
                                 put_start_release_timeout_sec_);
                     }
-                    tenant_state.processing_keys.erase(key);
                     EraseMetadata(tenant_state, it, object_id.tenant_id,
                                   QuotaEraseMode::kFull, &shard);
                     it = tenant_state.metadata.end();
@@ -2653,18 +2662,23 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
+        bool task_created = false;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state](Replica& replica) {
+            [this, &object_id, &tenant_state,
+             &task_created](Replica& replica) {
                 auto result = PushOffloadingQueue(object_id, replica);
                 if (result) {
-                    replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
-                        object_id.user_key,
-                        OffloadingTask{replica.id(),
-                                       std::chrono::system_clock::now()});
+                    if (!task_created) {
+                        replica.inc_refcnt();
+                        tenant_state.offloading_tasks.emplace(
+                            object_id.user_key,
+                            OffloadingTask{replica.id(),
+                                            std::chrono::system_clock::now()});
+                        task_created = true;
+                    }
                 }
             });
     }
@@ -2906,9 +2920,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // --- Step 0: stale handle cleanup ---
             if (it != tenant_state.metadata.end() &&
                 CleanupStaleHandles(it->second, alive_clients, &shard)) {
-                tenant_state.processing_keys.erase(key);
-                ErasePromotionTaskIfPresent(tenant_state, key,
-                                            object_id.tenant_id);
+                // EraseMetadata handles processing_keys, replication_tasks,
+                // offloading_tasks (with dec_refcnt), and promotion task cleanup.
                 EraseMetadata(tenant_state, it, object_id.tenant_id,
                               QuotaEraseMode::kFull, &shard);
                 it = tenant_state.metadata.end();
@@ -2965,8 +2978,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // If no COMPLETE replicas survive the preemption, this key
                     // effectively does not exist — fall through to Case A.
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
-                        ErasePromotionTaskIfPresent(tenant_state, key,
-                                                    object_id.tenant_id);
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -3766,7 +3777,6 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     }
 
     auto& tenant_state = accessor.GetTenantState();
-    ErasePromotionTaskIfPresent(tenant_state, key, object_id.tenant_id);
     accessor.Erase();
     return {};
 }
@@ -3829,8 +3839,6 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
-                ErasePromotionTaskIfPresent(tenant_state, it->first,
-                                            normalized_tenant);
                 it = EraseMetadata(tenant_state, it, normalized_tenant,
                                    QuotaEraseMode::kFull, &shard);
                 removed_count++;
@@ -3867,8 +3875,6 @@ long MasterService::RemoveAll(bool force) {
                     auto mem_rep_count = it->second.CountReplicas(
                         &Replica::fn_is_memory_replica);
                     total_freed_size += it->second.size * mem_rep_count;
-                    ErasePromotionTaskIfPresent(tenant_state, it->first,
-                                                tenant_it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
                                        QuotaEraseMode::kFull, &shard);
                     removed_count++;
@@ -3914,8 +3920,6 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
-                ErasePromotionTaskIfPresent(tenant_state, it->first,
-                                            normalized_tenant);
                 it = EraseMetadata(tenant_state, it, normalized_tenant,
                                    QuotaEraseMode::kFull, &shard);
                 removed_count++;
@@ -3983,11 +3987,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Clean up stale replica handles (consistent with single Remove)
             if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
-                tenant_state.processing_keys.erase(key);
-                tenant_state.replication_tasks.erase(key);
-                tenant_state.offloading_tasks.erase(key);
-                ErasePromotionTaskIfPresent(tenant_state, key,
-                                            normalized_tenant);
+                // EraseMetadata handles processing_keys,
+                // replication_tasks, offloading_tasks (with
+                // dec_refcnt), and promotion task cleanup.
                 EraseMetadata(tenant_state, it, normalized_tenant,
                               QuotaEraseMode::kFull, &shard);
                 if (tenant_state.Empty()) {
@@ -4028,7 +4030,6 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Remove object metadata
-            ErasePromotionTaskIfPresent(tenant_state, key, normalized_tenant);
             EraseMetadata(tenant_state, it, normalized_tenant,
                           QuotaEraseMode::kFull, &shard);
             if (tenant_state.Empty()) {
@@ -4266,6 +4267,10 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    int success_count = 0;
+    int failed_count = 0;
+    int orphan_count = 0;
+    int expired_count = 0;
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -4286,11 +4291,35 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
+                    if (metadata.data_size >= 0) {
+                        ++success_count;
+                    } else {
+                        ++failed_count;
+                    }
+                } else {
+                    ++expired_count;
+                }
+            } else {
+                // Metadata not found — two sub-cases:
+                // 1. Tenant exists: offloading_task may be orphaned (metadata
+                //    evicted/invalidated while offload was in-flight). Clean it.
+                // 2. No tenant: master restart re-registration, expected — skip.
+                if (accessor.TenantExists()) {
+                    auto& tenant_state = accessor.GetTenantState();
+                    auto task_it =
+                        tenant_state.offloading_tasks.find(object_id.user_key);
+                    if (task_it != tenant_state.offloading_tasks.end()) {
+                        tenant_state.offloading_tasks.erase(task_it);
+                        ++orphan_count;
+                    }
                 }
             }
         }
 
-        // Add LOCAL_DISK replica.
+        // Add LOCAL_DISK replica (skip if offload failed — data_size < 0 sentinel).
+        if (metadata.data_size < 0) {
+            continue;
+        }
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, object_id.user_key,
@@ -4302,6 +4331,14 @@ auto MasterService::NotifyOffloadSuccess(
                        << ", key=" << object_id.user_key;
             return tl::make_unexpected(res.error());
         }
+    }
+    if (!tasks.empty()) {
+        VLOG(1) << "[OFFLOAD] NotifyOffloadSuccess summary: total=" << tasks.size()
+                  << " success=" << success_count
+                  << " failed=" << failed_count
+                  << " orphan=" << orphan_count
+                  << " expired=" << expired_count
+                  << " client=" << client_id;
     }
     return {};
 }
@@ -4322,7 +4359,6 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             local_disk_segment_access.getClientByName();
         auto client_id_it = client_by_name.find(segment_name_it.value());
         if (client_id_it == client_by_name.end()) {
-            LOG(ERROR) << "Segment " << segment_name_it.value() << " not found";
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
         auto& client_local_disk_segment =
@@ -4885,10 +4921,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 if (!metadata.IsValid()) {
+                    auto next_key_it = std::next(key_it);
                     EraseMetadata(tenant_state, it, tenant_it->first,
                                   QuotaEraseMode::kFull, &shard);
+                    key_it = next_key_it;
+                } else {
+                    key_it = tenant_state.processing_keys.erase(key_it);
                 }
-                key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
             }
 
@@ -4901,10 +4940,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
+                    auto next_key_it = std::next(key_it);
                     EraseMetadata(tenant_state, it, tenant_it->first,
                                   QuotaEraseMode::kFull, &shard);
+                    key_it = next_key_it;
+                } else {
+                    key_it = tenant_state.processing_keys.erase(key_it);
                 }
-                key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
             }
             key_it++;
@@ -4944,12 +4986,16 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
+                auto next_task_it = std::next(task_it);
                 EraseMetadata(tenant_state, metadata_it, tenant_it->first,
                               QuotaEraseMode::kFull, &shard);
+                task_it = next_task_it;
+            } else {
+                task_it = tenant_state.replication_tasks.erase(task_it);
             }
-            task_it = tenant_state.replication_tasks.erase(task_it);
         }
 
+        int expired_offload_count = 0;
         for (auto task_it = tenant_state.offloading_tasks.begin();
              task_it != tenant_state.offloading_tasks.end();) {
             const auto ttl =
@@ -4967,8 +5013,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 }
             }
             LOG(WARNING) << "Offloading task expired for key: "
-                         << task_it->first;
+                         << task_it->first
+                         << " tenant=" << tenant_it->first;
             task_it = tenant_state.offloading_tasks.erase(task_it);
+            ++expired_offload_count;
         }
 
         for (auto task_it = tenant_state.promotion_tasks.begin();
