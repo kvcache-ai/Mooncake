@@ -46,6 +46,8 @@ class EtcdOpLogStore;
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+class HttpMetadataServer;
+struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
 namespace test {
@@ -90,6 +92,17 @@ class MasterService {
         const UUID& segment_id);
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
         const std::string& tenant_id) const;
+    bool IsTenantQuotaEnabled() const;
+    std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
+    std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
+        const std::string& tenant_id) const;
+    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
+        const std::string& tenant_id, uint64_t requested_quota_bytes);
+    std::optional<TenantQuotaSnapshot> DeleteTenantQuotaPolicy(
+        const std::string& tenant_id);
+    uint64_t GetDefaultTenantQuotaPolicy() const;
+    void SetDefaultTenantQuotaPolicy(uint64_t requested_quota_bytes);
+    uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -732,6 +745,24 @@ class MasterService {
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const UUID& client_id, const TaskCompleteRequest& request);
 
+    /**
+     * @brief Set the HttpMetadataServer pointer for cleanup on client timeout.
+     * @param server Pointer to HttpMetadataServer. If nullptr, cleanup is
+     * disabled.
+     */
+    void setHttpMetadataServer(HttpMetadataServer* server);
+
+    /**
+     * @brief Configure cleanup against a separately-deployed HTTP metadata
+     * server (not co-located in the master process). The master sends HTTP
+     * DELETE requests to this endpoint when a client times out. Only http://
+     * and https:// connection strings are supported; other schemes (etcd /
+     * redis / P2PHANDSHAKE) are ignored with a warning and leave cleanup
+     * disabled.
+     * @param metadata_connstring e.g. "http://host:8080/metadata".
+     */
+    void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
+
    private:
     void SnapshotThreadFunc();
 
@@ -783,6 +814,12 @@ class MasterService {
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
+    struct TenantQuotaEvictionResult {
+        uint64_t freed_bytes{0};
+        uint64_t evicted_objects{0};
+    };
+    TenantQuotaEvictionResult EvictTenantMemoryForQuota(
+        const std::string& tenant_id, uint64_t target_bytes);
 
     // Records effective-retention histograms for one key being evicted at
     // `now`. idle age is (now - last_accessed_at), recovered as
@@ -1191,6 +1228,10 @@ class MasterService {
     struct MetadataShard {
         mutable SharedMutex mutex;
         std::unordered_map<std::string, TenantState> tenants GUARDED_BY(mutex);
+        // Count of objects that have at least one completed LOCAL_DISK replica.
+        // Used to compute eviction_base = metadata.size() - disk_object_count,
+        // excluding disk-only objects from the eviction denominator.
+        long disk_object_count GUARDED_BY(mutex) = 0;
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -1248,6 +1289,34 @@ class MasterService {
         MetadataShard& get() { return shard_; }
 
         const MetadataShard& get() const { return shard_; }
+
+        // Called after adding a LOCAL_DISK replica. Increments
+        // disk_object_count if this is the first completed LOCAL_DISK
+        // replica for the object (i.e., exactly 1 completed disk replica now).
+        void OnDiskReplicaAdded(const ObjectMetadata& metadata) {
+            size_t disk_count = metadata.CountReplicas([](const Replica& r) {
+                return r.is_local_disk_replica() && r.is_completed();
+            });
+            if (disk_count == 1) shard_.disk_object_count++;
+        }
+
+        // Called after removing a LOCAL_DISK replica, or when erasing an
+        // object that had one. Pass had_completed_disk=true if the object
+        // had at least one completed LOCAL_DISK replica before the removal.
+        // When the entire object is being erased, call the one-arg overload.
+        void OnDiskReplicaRemoved(bool had_completed_disk,
+                                  const ObjectMetadata& metadata) {
+            if (!had_completed_disk) return;
+            bool still_has_disk = metadata.HasReplica([](const Replica& r) {
+                return r.is_local_disk_replica() && r.is_completed();
+            });
+            if (!still_has_disk) shard_.disk_object_count--;
+        }
+
+        // Overload for full object erasure — no metadata needed.
+        void OnDiskReplicaRemoved(bool had_completed_disk) {
+            if (had_completed_disk) shard_.disk_object_count--;
+        }
 
        private:
         MetadataShard& shard_;
@@ -1321,6 +1390,7 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const std::string& tenant_id);
+    void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
@@ -1333,6 +1403,8 @@ class MasterService {
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
+    uint64_t ComputeTenantQuotaDeficit(const std::string& tenant_id,
+                                       uint64_t incoming_quota_charge);
     tl::expected<void, ErrorCode> ReserveTenantQuota(
         const std::string& tenant_id, uint64_t bytes);
     void CommitTenantQuota(const std::string& tenant_id, uint64_t bytes);
@@ -1344,6 +1416,11 @@ class MasterService {
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
     uint64_t GetTenantQuotaCapacityBytes();
+    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
+        TenantState& tenant_state,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+        const std::string& tenant_id, QuotaEraseMode quota_mode,
+        MetadataShardAccessorRW* shard);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -1353,7 +1430,8 @@ class MasterService {
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
         ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+        MetadataShardAccessorRW* shard = nullptr);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -1458,6 +1536,8 @@ class MasterService {
 
     std::thread snapshot_thread_;
     std::atomic<bool> snapshot_running_{false};
+    std::mutex snapshot_thread_mutex_;
+    std::condition_variable snapshot_thread_cv_;
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
     std::atomic<bool> task_cleanup_running_{false};
@@ -1569,7 +1649,8 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id);
+            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
+                                    QuotaEraseMode::kFull, &shard_guard_);
             it_ = tenant_state_->metadata.end();
             MaybeEraseEmptyTenant();
         }
@@ -1684,6 +1765,20 @@ class MasterService {
         // Deserialize discarded replicas
         tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
             const msgpack::object& obj);
+    };
+
+    class TenantQuotaPolicySerializer {
+       public:
+        TenantQuotaPolicySerializer(MasterService* service)
+            : service_(service) {}
+
+        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+        tl::expected<void, SerializationError> Deserialize(
+            const std::vector<uint8_t>& data);
+        void Reset();
+
+       private:
+        MasterService* service_;
     };
 
     friend class MetadataAccessor;
@@ -1840,8 +1935,39 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_tenant_quota_;
-    const uint64_t default_tenant_quota_bytes_;
+    // Startup default used when restoring legacy snapshots without
+    // tenant_quota_policy.
+    const uint64_t configured_default_tenant_quota_bytes_;
+    // Runtime default policy, mutable through the tenant quota admin API.
+    std::atomic<uint64_t> default_tenant_quota_bytes_;
     const uint64_t tenant_quota_pool_capacity_bytes_;
+    mutable std::mutex tenant_quota_recompute_mutex_;
+
+    // HTTP metadata server pointer for cleanup on client timeout
+    // nullptr means cleanup is disabled
+    HttpMetadataServer* http_metadata_server_{nullptr};
+
+    // Remote HTTP metadata client, used when the metadata server is deployed
+    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
+    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+
+    // Cached HTTP metadata key prefix (initialized once at startup)
+    std::string http_metadata_prefix_;
+
+    // Async worker for remote cleanup: segments are enqueued from the client
+    // monitor thread so a slow/unreachable server never blocks heartbeats.
+    std::thread http_metadata_cleanup_thread_;
+    std::atomic<bool> http_metadata_cleanup_running_{false};
+    std::mutex http_metadata_cleanup_mutex_;
+    std::condition_variable http_metadata_cleanup_cv_;
+    std::vector<std::string> http_metadata_cleanup_queue_;
+
+    void HttpMetadataCleanupThreadFunc();
+
+    // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
+    // segment. For the co-located case this is synchronous (no network I/O);
+    // for the remote case it enqueues to the async cleanup worker.
+    void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
 
@@ -1849,6 +1975,7 @@ class MasterService {
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
+    const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;
@@ -1914,6 +2041,7 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
+    double offload_cap_ratio_ = 0.5;
 
     // Task manager
     ClientTaskManager task_manager_;

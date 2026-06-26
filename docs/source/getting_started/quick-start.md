@@ -19,7 +19,10 @@ pip install mooncake-transfer-engine-non-cuda numpy pyzmq
 
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
 
-> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
+> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies, but it still requires the system runtime libraries used by the transfer stack. On Ubuntu, install them with:
+> ```bash
+> sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
+> ```
 
 ## Transfer Engine Quick Start
 
@@ -41,7 +44,7 @@ def main():
 
     HOSTNAME = "localhost" # localhost for simple demo
     METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "rdma" # [rdma, tcp, ...]
+    PROTOCOL = "tcp" # use "rdma" on machines with RDMA devices configured
     DEVICE_NAME = "" # auto discovery if empty
 
     # Initialize server engine
@@ -59,12 +62,11 @@ def main():
     server_ptr = server_buffer.ctypes.data
     server_len = server_buffer.nbytes
 
-    # Register memory with Mooncake
-    if PROTOCOL == "rdma":
-        ret_value = server_engine.register_memory(server_ptr, server_len)
-        if ret_value != 0:
-            print("Mooncake memory registration failed.")
-            raise RuntimeError("Mooncake memory registration failed.")
+    # Register memory with Mooncake so the target address is advertised
+    ret_value = server_engine.register_memory(server_ptr, server_len)
+    if ret_value != 0:
+        print("Mooncake memory registration failed.")
+        raise RuntimeError("Mooncake memory registration failed.")
 
     print(f"Server initialized with session ID: {session_id}")
     print(f"Server buffer address: {server_ptr}, length: {server_len}")
@@ -86,11 +88,10 @@ def main():
         print("\nShutting down server...")
     finally:
         # Cleanup
-        if PROTOCOL == "rdma":
-            ret_value = server_engine.unregister_memory(server_ptr)
-            if ret_value != 0:
-                print("Mooncake memory deregistration failed.")
-                raise RuntimeError("Mooncake memory deregistration failed.")
+        ret_value = server_engine.unregister_memory(server_ptr)
+        if ret_value != 0:
+            print("Mooncake memory deregistration failed.")
+            raise RuntimeError("Mooncake memory deregistration failed.")
 
         socket.close()
         context.term()
@@ -127,7 +128,7 @@ def main():
     # Initialize client engine
     HOSTNAME = "localhost" # localhost for simple demo
     METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "rdma" # [rdma, tcp, ...]
+    PROTOCOL = "tcp" # use "rdma" on machines with RDMA devices configured
     DEVICE_NAME = "" # auto discovery if empty
 
     client_engine = TransferEngine()
@@ -144,12 +145,11 @@ def main():
     client_ptr = client_buffer.ctypes.data
     client_len = client_buffer.nbytes
 
-    # Register memory with Mooncake
-    if PROTOCOL == "rdma":
-        ret_value = client_engine.register_memory(client_ptr, client_len)
-        if ret_value != 0:
-            print("Mooncake memory registration failed.")
-            raise RuntimeError("Mooncake memory registration failed.")
+    # Register memory with Mooncake so the source address is advertised
+    ret_value = client_engine.register_memory(client_ptr, client_len)
+    if ret_value != 0:
+        print("Mooncake memory registration failed.")
+        raise RuntimeError("Mooncake memory registration failed.")
 
     print(f"Client initialized with session ID: {session_id}")
 
@@ -169,11 +169,10 @@ def main():
             print("Transfer failed!")
 
     # Cleanup
-    if PROTOCOL == "rdma":
-        ret_value = client_engine.unregister_memory(client_ptr)
-        if ret_value != 0:
-            print("Mooncake memory deregistration failed.")
-            raise RuntimeError("Mooncake memory deregistration failed.")
+    ret_value = client_engine.unregister_memory(client_ptr)
+    if ret_value != 0:
+        print("Mooncake memory deregistration failed.")
+        raise RuntimeError("Mooncake memory deregistration failed.")
 
     socket.close()
     context.term()

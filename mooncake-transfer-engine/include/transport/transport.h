@@ -115,14 +115,21 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
-        std::vector<uint32_t> dest_rkeys;
+        // EFA's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
+        // are 32-bit. Use a scoped alias so the width is defined in one place.
+#ifdef USE_EFA
+        using mr_key_t = uint64_t;
+#else
+        using mr_key_t = uint32_t;
+#endif
+        std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
 
         union {
             struct {
                 uint64_t dest_addr;
-                uint32_t source_lkey;
-                uint32_t dest_rkey;
+                mr_key_t source_lkey;
+                mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
                 volatile int *qp_depth;

@@ -1379,4 +1379,22 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
+
+int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
+    const std::string& segment_name) const {
+    auto client_it = client_by_name_.find(segment_name);
+    if (client_it == client_by_name_.end()) return 0;
+    auto disk_it = client_local_disk_segment_.find(client_it->second);
+    if (disk_it == client_local_disk_segment_.end()) return 0;
+    return disk_it->second->ssd_total_capacity_bytes;
+}
+
+int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
+    const std::string& segment_name) const {
+    auto client_it = client_by_name_.find(segment_name);
+    if (client_it == client_by_name_.end()) return 0;
+    auto disk_it = client_local_disk_segment_.find(client_it->second);
+    if (disk_it == client_local_disk_segment_.end()) return 0;
+    return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
+}
 }  // namespace mooncake
