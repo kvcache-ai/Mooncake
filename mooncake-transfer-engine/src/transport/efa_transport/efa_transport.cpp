@@ -59,8 +59,12 @@ static size_t detectBufferPageSize(void* addr) {
     bool in_range = false;
 
     while (std::getline(smaps, line)) {
-        // VMA header: "start-end perms offset dev inode [pathname]"
-        if (!line.empty() && std::isxdigit(line[0])) {
+        // VMA header: "start-end perms offset dev inode [pathname]".
+        // Cast to unsigned char before std::isxdigit: passing a (possibly
+        // signed) char whose value is > 0x7F is UB, since the argument must be
+        // representable as unsigned char or equal EOF.
+        if (!line.empty() &&
+            std::isxdigit(static_cast<unsigned char>(line[0]))) {
             unsigned long start = 0, end = 0;
             if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
                 in_range = (target >= start && target < end);
