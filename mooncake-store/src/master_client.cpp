@@ -317,8 +317,15 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
 };
 
-template <auto ServiceMethod, typename ReturnType, typename... Args>
-tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+// Common single-result RPC body. The caller-supplied preparer runs on the
+// coro_rpc_client immediately before send_request, letting callers attach
+// out-of-band data (e.g. the tenant id) without altering the argument tuple
+// or its type-code. This is the DRY core shared by invoke_rpc and
+// invoke_rpc_with_tenant.
+template <auto ServiceMethod, typename ReturnType, typename PrepareClient,
+          typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_internal(
+    PrepareClient preparer, Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -332,6 +339,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    preparer(client);
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
@@ -360,9 +368,19 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
         }());
 }
 
-template <auto ServiceMethod, typename ResultType, typename... Args>
-std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
-    size_t input_size, Args&&... args) {
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+    // No-op preparer: argument tuple and type-code are exactly as before.
+    return invoke_rpc_internal<ServiceMethod, ReturnType>(
+        [](auto&) {}, std::forward<Args>(args)...);
+}
+
+// Common batch RPC body. See invoke_rpc_internal for the preparer contract.
+template <auto ServiceMethod, typename ResultType, typename PrepareClient,
+          typename... Args>
+std::vector<tl::expected<ResultType, ErrorCode>>
+MasterClient::invoke_batch_rpc_internal(PrepareClient preparer,
+                                        size_t input_size, Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -377,6 +395,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    preparer(client);
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
@@ -409,6 +428,39 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             }
             co_return result->result();
         }());
+}
+
+template <auto ServiceMethod, typename ResultType, typename... Args>
+std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
+    size_t input_size, Args&&... args) {
+    // No-op preparer: argument tuple and type-code are exactly as before.
+    return invoke_batch_rpc_internal<ServiceMethod, ResultType>(
+        [](auto&) {}, input_size, std::forward<Args>(args)...);
+}
+
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_tenant(
+    const std::string& tenant_id, Args&&... args) {
+    // Tenant rides the request attachment so the argument tuple (and hence the
+    // type-code) stays byte-identical to v0.3.11. tenant_id outlives this send.
+    return invoke_rpc_internal<ServiceMethod, ReturnType>(
+        [&tenant_id](coro_rpc::coro_rpc_client& client) {
+            client.set_req_attachment(tenant_id);
+        },
+        std::forward<Args>(args)...);
+}
+
+template <auto ServiceMethod, typename ResultType, typename... Args>
+std::vector<tl::expected<ResultType, ErrorCode>>
+MasterClient::invoke_batch_rpc_with_tenant(const std::string& tenant_id,
+                                           size_t input_size, Args&&... args) {
+    // Tenant rides the request attachment so the argument tuple (and hence the
+    // type-code) stays byte-identical to v0.3.11. tenant_id outlives this send.
+    return invoke_batch_rpc_internal<ServiceMethod, ResultType>(
+        [&tenant_id](coro_rpc::coro_rpc_client& client) {
+            client.set_req_attachment(tenant_id);
+        },
+        input_size, std::forward<Args>(args)...);
 }
 
 MasterClient::~MasterClient() = default;
@@ -452,8 +504,8 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     ScopedVLogTimer timer(1, "MasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
 
-    auto result = invoke_rpc<&WrappedMasterService::ExistKey, bool>(object_key,
-                                                                    tenant_id_);
+    auto result = invoke_rpc_with_tenant<&WrappedMasterService::ExistKey, bool>(
+        tenant_id_, object_key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -463,8 +515,10 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
-        object_keys.size(), object_keys, tenant_id_);
+    auto result =
+        invoke_batch_rpc_with_tenant<&WrappedMasterService::BatchExistKey,
+                                     bool>(tenant_id_, object_keys.size(),
+                                           object_keys);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }
@@ -512,10 +566,10 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByRegex");
     timer.LogRequest("Regex=", str);
 
-    auto result = invoke_rpc<
+    auto result = invoke_rpc_with_tenant<
         &WrappedMasterService::GetReplicaListByRegex,
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(
-        str, tenant_id_);
+        tenant_id_, str);
 
     timer.LogResponseExpected(result);
     return result;
@@ -531,8 +585,9 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
-    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id);
+    auto result =
+        invoke_rpc_with_tenant<&WrappedMasterService::GetReplicaList,
+                               GetReplicaListResponse>(tenant_id, object_key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -549,9 +604,10 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   GetReplicaListResponse>(
-        object_keys.size(), object_keys, tenant_id);
+    auto result =
+        invoke_batch_rpc_with_tenant<&WrappedMasterService::BatchGetReplicaList,
+                                     GetReplicaListResponse>(
+            tenant_id, object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -760,7 +816,8 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     timer.LogRequest("action=remove_all_objects, force=", force);
 
     auto result =
-        invoke_rpc<&WrappedMasterService::RemoveAll, long>(force, tenant_id_);
+        invoke_rpc_with_tenant<&WrappedMasterService::RemoveAll, long>(
+            tenant_id_, force);
     timer.LogResponseExpected(result);
     return result;
 }

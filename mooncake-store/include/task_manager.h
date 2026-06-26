@@ -92,20 +92,24 @@ struct Task {
 };
 
 struct ReplicaCopyPayload {
-    std::string tenant_id = "default";
     std::string key;
     std::string source;
     std::vector<std::string> targets;
+    // Tenant identity carried as a trailing struct_pack::compatible<> field so
+    // that the struct_pack type-code (and JSON shape) stays compatible with
+    // v0.3.11 peers, which never had this field. Absent on the wire -> default.
+    struct_pack::compatible<std::string> tenant_id;
 };
-YLT_REFL(ReplicaCopyPayload, tenant_id, key, source, targets);
+YLT_REFL(ReplicaCopyPayload, key, source, targets, tenant_id);
 
 struct ReplicaMovePayload {
-    std::string tenant_id = "default";
     std::string key;
     std::string source;
     std::string target;
+    // See ReplicaCopyPayload: trailing compatible<> for v0.3.11 wire-compat.
+    struct_pack::compatible<std::string> tenant_id;
 };
-YLT_REFL(ReplicaMovePayload, tenant_id, key, source, target);
+YLT_REFL(ReplicaMovePayload, key, source, target, tenant_id);
 
 template <TaskType T>
 struct TaskPayloadTraits;
