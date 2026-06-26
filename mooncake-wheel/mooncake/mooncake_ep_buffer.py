@@ -19,13 +19,6 @@ _USE_SPLIT_SEND_RECV = (
     _env_enabled("MOONCAKE_EP_USE_MUSA")
     or _USE_MACA
 )
-_MACA_PHASE_FENCE = os.getenv("MOONCAKE_EP_MACA_PHASE_FENCE", "p2p").lower()
-_DEBUG_INIT = _env_enabled("MOONCAKE_EP_DEBUG_INIT")
-
-
-def _debug_init(rank: int, message: str) -> None:
-    if _DEBUG_INIT:
-        print(f"[rank {rank}] {message}", flush=True)
 
 
 class EventOverlap:
@@ -97,11 +90,9 @@ class Buffer:
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group
         # NIC auto-detection happens inside ep.Buffer via Topology::discover().
-        _debug_init(self.rank, "before ep.Buffer")
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes
         )
-        _debug_init(self.rank, "after ep.Buffer")
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
@@ -109,10 +100,11 @@ class Buffer:
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
         self._maca_phase_token: Optional[torch.Tensor] = None
         self._maca_phase_recv_tokens: Optional[List[torch.Tensor]] = None
+        self._warned_active_ranks_without_mooncake_backend = False
         self.connect()
 
     def _maca_phase_fence(self, send_event: Optional[Any] = None) -> None:
-        if not _USE_MACA or _MACA_PHASE_FENCE in {"", "0", "off", "none"}:
+        if not _USE_MACA:
             return
 
         backend = dist.get_backend(self.group)
@@ -126,55 +118,6 @@ class Buffer:
 
         # Compatibility fence between SEND and RECV.  The EP payload still
         # uses the P2P fast path; this only keeps rank phases aligned on MACA.
-        if _MACA_PHASE_FENCE == "barrier":
-            wait_send_done()
-            dist.barrier(self.group)
-            return
-        if _MACA_PHASE_FENCE == "p2p":
-            wait_send_done()
-            if (
-                self._maca_phase_token is None
-                or self._maca_phase_token.device != fence_device
-            ):
-                self._maca_phase_token = torch.empty(
-                    1, dtype=torch.int32, device=fence_device
-                )
-            if (
-                self._maca_phase_recv_tokens is None
-                or self._maca_phase_recv_tokens[0].device != fence_device
-            ):
-                self._maca_phase_recv_tokens = [
-                    torch.empty(1, dtype=torch.int32, device=fence_device)
-                    for _ in range(self.group_size)
-                ]
-            self._maca_phase_token.fill_(1)
-            ops = []
-            for peer in range(self.group_size):
-                if peer == self.rank:
-                    continue
-                ops.append(
-                    dist.P2POp(
-                        dist.isend, self._maca_phase_token, peer, self.group
-                    )
-                )
-                ops.append(
-                    dist.P2POp(
-                        dist.irecv,
-                        self._maca_phase_recv_tokens[peer],
-                        peer,
-                        self.group,
-                    )
-                )
-            if not ops:
-                return
-            for work in dist.batch_isend_irecv(ops):
-                work.wait()
-            return
-        if _MACA_PHASE_FENCE != "allreduce":
-            raise ValueError(
-                "MOONCAKE_EP_MACA_PHASE_FENCE must be one of: "
-                "p2p, allreduce, barrier, none"
-            )
         wait_send_done()
         if (
             self._maca_phase_token is None
@@ -183,10 +126,36 @@ class Buffer:
             self._maca_phase_token = torch.empty(
                 1, dtype=torch.int32, device=fence_device
             )
+        if (
+            self._maca_phase_recv_tokens is None
+            or self._maca_phase_recv_tokens[0].device != fence_device
+        ):
+            self._maca_phase_recv_tokens = [
+                torch.empty(1, dtype=torch.int32, device=fence_device)
+                for _ in range(self.group_size)
+            ]
         self._maca_phase_token.fill_(1)
-        dist.all_reduce(
-            self._maca_phase_token, op=dist.ReduceOp.SUM, group=self.group
-        )
+        ops = []
+        for peer in range(self.group_size):
+            if peer == self.rank:
+                continue
+            ops.append(
+                dist.P2POp(
+                    dist.isend, self._maca_phase_token, peer, self.group
+                )
+            )
+            ops.append(
+                dist.P2POp(
+                    dist.irecv,
+                    self._maca_phase_recv_tokens[peer],
+                    peer,
+                    self.group,
+                )
+            )
+        if not ops:
+            return
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
 
     def _wrap_maca_recv_hook(
         self, hook: Optional[Callable], send_event: Optional[Any]
@@ -197,15 +166,12 @@ class Buffer:
                 hook()
 
         return wrapped_hook
-    
+
     def connect(self, is_update: bool = False):
         from mooncake import ep
 
-        _debug_init(self.rank, f"connect start fallback={self._use_fallback}")
         if not self._use_fallback:
-            _debug_init(self.rank, "before get_mr_info")
             (raddr, rkey) = self.runtime.get_mr_info()
-            _debug_init(self.rank, "after get_mr_info")
 
             raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
             raddrs = [
@@ -282,17 +248,13 @@ class Buffer:
             )
 
         if self.group_size == 1:
-            _debug_init(self.rank, "single-rank skip ipc handle export")
+            # No peer can import this IPC handle in single-rank EP.  Skipping
+            # export also avoids unnecessary driver IPC calls on MACA.
             self._use_fallback = False
-            _debug_init(self.rank, "connect done fallback=False")
             return
         else:
             try:
-                _debug_init(self.rank, "before get_ipc_handle")
                 local_handle_ints = self.runtime.get_ipc_handle()
-                _debug_init(
-                    self.rank, f"after get_ipc_handle len={len(local_handle_ints)}"
-                )
                 # pybind11 converts std::vector<int32_t> to a list of integers
                 local_handle_tensor = torch.tensor(
                     local_handle_ints, dtype=torch.int32, device="cuda"
@@ -301,18 +263,10 @@ class Buffer:
                     torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
                     for _ in range(self.group_size)
                 ]
-                _debug_init(self.rank, "before all_gather ipc handles")
                 dist.all_gather(handles, local_handle_tensor, self.group)
-                _debug_init(self.rank, "after all_gather ipc handles")
                 remote_handles = [h.tolist() for h in handles]
-                _debug_init(self.rank, "before get_active_ranks")
                 active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
-                _debug_init(
-                    self.rank,
-                    f"before sync_nvlink_ipc_handles active={active_ranks_mask}",
-                )
                 self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
-                _debug_init(self.rank, "after sync_nvlink_ipc_handles")
             except Exception as e:
                 import warnings
 
@@ -324,16 +278,12 @@ class Buffer:
 
         use_fast_path = False
         try:
-            _debug_init(self.rank, "before use_fast_path")
             use_fast_path = bool(self.runtime.use_fast_path())
-            _debug_init(self.rank, f"after use_fast_path fast={use_fast_path}")
         except Exception:
             ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
         self._use_fallback = not use_fast_path
-        _debug_init(self.rank, f"connect done fallback={self._use_fallback}")
-
 
     def update_ep_member(self):
         self.connect(True)
@@ -348,6 +298,21 @@ class Buffer:
         self, device: torch.device, dtype: torch.dtype = torch.int32
     ) -> torch.Tensor:
         if not self._is_mooncake_backend():
+            if not self._warned_active_ranks_without_mooncake_backend:
+                import warnings
+
+                try:
+                    backend = dist.get_backend(self.group)
+                except Exception:
+                    backend = "unknown"
+                warnings.warn(
+                    "Mooncake EP active_ranks is only available with the "
+                    f"mooncake process group; got backend={backend}. "
+                    "Treating all ranks as active.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned_active_ranks_without_mooncake_backend = True
             return torch.ones((self.group_size,), dtype=dtype, device=device)
 
         try:

@@ -1,7 +1,6 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
 #include <cstdlib>
-#include <cstring>
 #include <sstream>
 #include <transfer_engine.h>
 
@@ -27,10 +26,7 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
 
 static bool macaHostPhaseFenceCoversPeers() {
 #ifdef MOONCAKE_EP_USE_MACA
-    const char* env = std::getenv("MOONCAKE_EP_MACA_PHASE_FENCE");
-    if (env == nullptr || env[0] == '\0') return true;
-    return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0 &&
-           std::strcmp(env, "none") != 0;
+    return true;
 #else
     return false;
 #endif
