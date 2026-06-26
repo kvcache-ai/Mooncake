@@ -81,6 +81,12 @@ class TentMetrics {
     void recordWriteFailed(size_t bytes);
     void recordTransportFailover();
 
+    // Record the deadline feasibility ratio (MLU) for a completed transfer
+    // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
+    // where window_seconds is (deadline - submit_time). mlu < 1 means the
+    // transfer met its deadline; mlu >= 1 means it missed. Observability only.
+    void recordDeadlineMLU(double mlu);
+
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
     std::string getJsonMetrics();
@@ -160,6 +166,17 @@ class TentMetrics {
     ylt::metric::histogram_t write_size_{
         "tent_write_size_bytes", "Write request size distribution in bytes",
         kSizeBuckets};
+
+    // Deadline feasibility ratio (MLU) distribution for transfers that carried
+    // a deadline. Stored in per-mille (MLU x 1000) so the histogram can use
+    // integer observe() like the others; the 1000 boundary is MLU == 1.0, the
+    // feasible/infeasible line (< 1000 met the deadline, >= 1000 missed it).
+    static inline const std::vector<double> kMluPerMilleBuckets{
+        100, 250, 500, 750, 900, 1000, 1250, 1500, 2000, 5000};
+    ylt::metric::histogram_t deadline_mlu_{
+        "tent_deadline_mlu_permille",
+        "Deadline feasibility ratio (MLU x 1000) distribution",
+        kMluPerMilleBuckets};
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
