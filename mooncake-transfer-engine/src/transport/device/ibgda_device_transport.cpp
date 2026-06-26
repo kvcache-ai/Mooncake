@@ -54,6 +54,11 @@ static size_t roundUpToPage(size_t v) {
     return (v + page - 1) & ~(page - 1);
 }
 
+static uintptr_t roundDownToPage(uintptr_t v) {
+    uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    return v & ~(page - 1);
+}
+
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
     return ((a->s6_addr32[0] | a->s6_addr32[1]) == 0 &&
@@ -245,24 +250,25 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 return -1;
             }
 
-            size_t reg_size = roundUpToPage(alloc_size);
-            mr_ = ibv_reg_dmabuf_mr(pd_, 0, reg_size,
-                                    reinterpret_cast<uintptr_t>(alloc_base),
-                                    dmabuf_fd, access);
+            uintptr_t alloc_base_u = reinterpret_cast<uintptr_t>(alloc_base);
+            uintptr_t reg_iova = roundDownToPage(alloc_base_u);
+            size_t reg_delta = alloc_base_u - reg_iova;
+            size_t reg_size = roundUpToPage(alloc_size + reg_delta);
+            mr_ = ibv_reg_dmabuf_mr(pd_, 0, reg_size, reg_iova, dmabuf_fd,
+                                    access);
             int saved_errno = errno;
             if (close(dmabuf_fd) != 0) {
                 PLOG(WARNING) << "[EP IBGDA] failed to close dmabuf fd";
             }
             if (!mr_) {
                 errno = saved_errno;
-                PLOG(WARNING) << "[EP IBGDA] ibv_reg_dmabuf_mr failed"
-                              << " base=0x" << std::hex
-                              << reinterpret_cast<uintptr_t>(alloc_base)
-                              << " size=" << std::dec << alloc_size
-                              << " reg_size=" << reg_size;
-                LOG(WARNING) << "[EP IBGDA] falling back to ibv_reg_mr for "
-                                "device memory";
-                mr_ = ibv_reg_mr(pd_, ptr, bytes, access);
+                PLOG(ERROR) << "[EP IBGDA] ibv_reg_dmabuf_mr failed"
+                            << " base=0x" << std::hex << alloc_base_u
+                            << " iova=0x" << reg_iova << std::dec
+                            << " size=" << alloc_size
+                            << " delta=" << reg_delta
+                            << " reg_size=" << reg_size;
+                return -1;
             }
         } else
 #endif
