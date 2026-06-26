@@ -21,12 +21,25 @@
 
 namespace mooncake {
 namespace tent {
-ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
-                           size_t chunk_count)
-    : chunk_size_(chunk_size), chunk_count_(chunk_count), impl_(impl) {
+ProxyManager::ProxyManager(TransferEngineImpl* impl,
+                           size_t max_queued_tasks_per_shard)
+    : ProxyManager(impl, max_queued_tasks_per_shard, true) {}
+
+std::unique_ptr<ProxyManager> ProxyManager::createWithoutWorkersForTest(
+    TransferEngineImpl* impl, size_t max_queued_tasks_per_shard) {
+    return std::unique_ptr<ProxyManager>(
+        new ProxyManager(impl, max_queued_tasks_per_shard, false));
+}
+
+ProxyManager::ProxyManager(TransferEngineImpl* impl,
+                           size_t max_queued_tasks_per_shard,
+                           bool start_workers)
+    : max_queued_tasks_per_shard_(max_queued_tasks_per_shard), impl_(impl) {
     running_ = true;
-    for (size_t i = 0; i < kShards; ++i) {
-        shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
+    if (start_workers) {
+        for (size_t i = 0; i < kShards; ++i) {
+            shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
+        }
     }
 }
 
@@ -36,7 +49,7 @@ Status ProxyManager::deconstruct() {
     running_ = false;
     for (size_t i = 0; i < kShards; ++i) {
         shards_[i].cv.notify_all();
-        shards_[i].thread.join();
+        if (shards_[i].thread.joinable()) shards_[i].thread.join();
     }
     for (auto entry : stage_buffers_) {
         impl_->unregisterLocalMemory(entry.second.chunks);
@@ -164,16 +177,25 @@ Status ProxyManager::waitCrossStage(const Request& request,
 
 Status ProxyManager::submit(TaskInfo* task, BatchID batch,
                             const std::vector<std::string>& params) {
+    if (!task || batch == 0) {
+        return Status::InvalidArgument("invalid staging task" LOC_MARK);
+    }
     StagingTask staging_task;
     staging_task.native = task;
     staging_task.batch = batch;
     staging_task.params = params;
-    task->staging_status = PENDING;
     static std::atomic<size_t> next_queue_index(0);
     thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
     {
         std::lock_guard<std::mutex> lk(shards_[id].mu);
+        if (max_queued_tasks_per_shard_ > 0 &&
+            shards_[id].queued_tasks >= max_queued_tasks_per_shard_) {
+            return Status::TooManyRequests(
+                "staging proxy shard queue is full" LOC_MARK);
+        }
         shards_[id].queue.push(staging_task);
+        ++shards_[id].queued_tasks;
+        task->staging_status = PENDING;
     }
     shards_[id].cv.notify_one();
     return Status::OK();
@@ -262,6 +284,7 @@ void ProxyManager::runner(size_t id) {
 
             task = shard.queue.front();
             shard.queue.pop();
+            --shard.queued_tasks;
         }
 
         if (!task.native) continue;
@@ -280,8 +303,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
-    const size_t kStageBuffers =
-        std::min(chunk_count_, static_cast<size_t>(16));
+    const size_t kStageBuffers = std::min(kChunkCount, static_cast<size_t>(16));
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
     if (local_staging) {
@@ -329,10 +351,10 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     std::unordered_set<uint64_t> local_locked;
     std::unordered_set<uint64_t> remote_locked;
 
-    for (size_t offset = 0; offset < request.length; offset += chunk_size_) {
+    for (size_t offset = 0; offset < request.length; offset += kChunkSize) {
         size_t id = chunks.size();
         Chunk chunk{offset,
-                    std::min(chunk_size_, request.length - offset),
+                    std::min(kChunkSize, request.length - offset),
                     local_staging ? local_stage_buffer[id % kStageBuffers]
                                   : (uint64_t)request.source + offset,
                     remote_staging ? remote_stage_buffer[id % kStageBuffers]
@@ -544,8 +566,8 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
             return Status::InternalError("Failed to pin remote stage buffer");
     }
 
-    for (size_t offset = 0; offset < request.length; offset += chunk_size_) {
-        size_t chunk_length = std::min(chunk_size_, request.length - offset);
+    for (size_t offset = 0; offset < request.length; offset += kChunkSize) {
+        size_t chunk_length = std::min(kChunkSize, request.length - offset);
 
         if (!local_staging)
             local_stage_buffer = (uint64_t)request.source + offset;
@@ -590,12 +612,12 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
 Status ProxyManager::allocateStageBuffers(const std::string& location) {
     if (stage_buffers_.count(location)) return Status::OK();
     StageBuffers buf;
-    auto total_size = chunk_size_ * chunk_count_;
+    auto total_size = kChunkSize * kChunkCount;
     CHECK_STATUS(
         impl_->allocateLocalMemory(&buf.chunks, total_size, location, true));
     CHECK_STATUS(impl_->registerLocalMemory(buf.chunks, total_size));
-    buf.bitmap = new std::atomic_flag[chunk_count_];
-    for (size_t i = 0; i < chunk_count_; ++i)
+    buf.bitmap = new std::atomic_flag[kChunkCount];
+    for (size_t i = 0; i < kChunkCount; ++i)
         buf.bitmap[i].clear(std::memory_order_relaxed);
     stage_buffers_[location] = std::move(buf);
     return Status::OK();
@@ -621,10 +643,10 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
     }
 
     auto& buf = it->second;
-    for (size_t i = 0; i < chunk_count_; ++i) {
+    for (size_t i = 0; i < kChunkCount; ++i) {
         if (!buf.bitmap[i].test_and_set(std::memory_order_acquire)) {
             addr = reinterpret_cast<uint64_t>(static_cast<char*>(buf.chunks) +
-                                              i * chunk_size_);
+                                              i * kChunkSize);
             return Status::OK();
         }
     }
@@ -634,10 +656,10 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
 Status ProxyManager::unpinStageBuffer(uint64_t addr) {
     for (auto& [location, buf] : stage_buffers_) {
         auto base = reinterpret_cast<uint64_t>(buf.chunks);
-        auto end = base + chunk_size_ * chunk_count_;
+        auto end = base + kChunkSize * kChunkCount;
         if (addr >= base && addr < end) {
-            size_t index = (addr - base) / chunk_size_;
-            if (index >= chunk_count_)
+            size_t index = (addr - base) / kChunkSize;
+            if (index >= kChunkCount)
                 return Status::InvalidArgument("Invalid buffer index");
             buf.bitmap[index].clear(std::memory_order_release);
             return Status::OK();

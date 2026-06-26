@@ -15,6 +15,8 @@
 #ifndef PROXY_MANAGER_H_
 #define PROXY_MANAGER_H_
 
+#include <memory>
+
 #include "tent/common/types.h"
 #include "tent/common/status.h"
 #include "tent/common/concurrent/thread_pool.h"
@@ -36,6 +38,10 @@ struct StagingTask {
 };
 
 class ProxyManager {
+   public:
+    static constexpr size_t kDefaultMaxQueuedTasksPerShard = 1024;
+
+   private:
     struct StageBuffers {
         void* chunks;
         std::atomic_flag* bitmap;
@@ -44,9 +50,13 @@ class ProxyManager {
     };
 
    public:
-    explicit ProxyManager(TransferEngineImpl* impl,
-                          size_t chunk_size = 4 * 1024 * 1024,
-                          size_t chunk_count = 64);
+    explicit ProxyManager(
+        TransferEngineImpl* impl,
+        size_t max_queued_tasks_per_shard = kDefaultMaxQueuedTasksPerShard);
+
+    static std::unique_ptr<ProxyManager> createWithoutWorkersForTest(
+        TransferEngineImpl* impl,
+        size_t max_queued_tasks_per_shard = kDefaultMaxQueuedTasksPerShard);
 
     ~ProxyManager();
 
@@ -77,6 +87,9 @@ class ProxyManager {
                                           uint64_t offset);
 
    private:
+    ProxyManager(TransferEngineImpl* impl, size_t max_queued_tasks_per_shard,
+                 bool start_workers);
+
     void runner(size_t id);
 
     Status transferEventLoop(StagingTask& task, StageBufferCache* cache);
@@ -112,8 +125,9 @@ class ProxyManager {
                            std::future<Status>& handle);
 
    private:
-    const size_t chunk_size_;
-    const size_t chunk_count_;
+    static constexpr size_t kChunkSize = 4 * 1024 * 1024;
+    static constexpr size_t kChunkCount = 64;
+    const size_t max_queued_tasks_per_shard_;
     TransferEngineImpl* impl_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
     std::atomic<bool> running_;
@@ -122,6 +136,7 @@ class ProxyManager {
         std::mutex mu;
         std::condition_variable cv;
         std::queue<StagingTask> queue;
+        size_t queued_tasks{0};
     };
     const static size_t kShards = 8;
     WorkerShard shards_[kShards];

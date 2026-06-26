@@ -289,6 +289,9 @@ Status TransferEngineImpl::construct() {
     enable_auto_failover_on_poll_ =
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
+    staging_max_queued_tasks_per_shard_ =
+        conf_->get("staging/max_queued_tasks_per_shard",
+                   ProxyManager::kDefaultMaxQueuedTasksPerShard);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
     runtime_queue_config_.limits.max_outstanding_owners =
@@ -368,7 +371,8 @@ Status TransferEngineImpl::construct() {
         }
     }
 
-    staging_proxy_ = std::make_unique<ProxyManager>(this);
+    staging_proxy_ = std::make_unique<ProxyManager>(
+        this, staging_max_queued_tasks_per_shard_);
 
     if (enable_progress_worker_) {
         progress_worker_ = std::make_unique<ProgressWorker>(
@@ -1447,7 +1451,15 @@ Status TransferEngineImpl::commitPreparedSubmit(
 
         if (owner.staging) {
             task.staging = true;
-            staging_proxy_->submit(&task, (BatchID)batch, owner.staging_params);
+            auto status = staging_proxy_->submit(&task, (BatchID)batch,
+                                                 owner.staging_params);
+            if (!status.ok()) {
+                task.staging = false;
+                task.type = UNSPEC;
+                task.status = FAILED;
+                LOG(WARNING) << "Failed to submit staged transfer: "
+                             << status.ToString();
+            }
             continue;
         }
 
@@ -1638,7 +1650,15 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             task.staging = true;
             auto status =
                 staging_proxy_->submit(&task, (BatchID)batch, staging_params);
-            if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+            if (!status.ok()) {
+                task.staging = false;
+                task.type = UNSPEC;
+                if (status.IsTooManyRequests()) {
+                    CHECK_STATUS(runtime_queue_->requeueForDispatch(owner_id));
+                    return Status::OK();
+                }
+                return finishQueuedOwner(owner_id, FAILED);
+            }
             return markQueuedOwnerSubmitted(owner_id);
         }
     }
