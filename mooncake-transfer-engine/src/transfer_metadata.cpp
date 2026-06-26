@@ -1211,7 +1211,11 @@ TransferMetadata::lookupSegmentCacheByName(const std::string &segment_name) {
 
     lookup.segment_id = iter->second;
     lookup.segment_name = segment_name;
-    lookup.desc = segment_id_to_desc_map_[lookup.segment_id];
+    auto desc_iter = segment_id_to_desc_map_.find(lookup.segment_id);
+    if (desc_iter == segment_id_to_desc_map_.end() || !desc_iter->second) {
+        return lookup;
+    }
+    lookup.desc = desc_iter->second;
     lookup.fresh = isSegmentCacheFreshLocked(lookup.segment_id);
     if (!lookup.fresh) {
         lookup.refresh_owner =
@@ -1229,6 +1233,7 @@ TransferMetadata::lookupSegmentCacheByID(SegmentID segment_id) {
 
     lookup.segment_id = segment_id;
     lookup.desc = iter->second;
+    if (!lookup.desc) return lookup;
     lookup.segment_name = lookup.desc->name;
     lookup.fresh = isSegmentCacheFreshLocked(segment_id);
     if (!lookup.fresh) {

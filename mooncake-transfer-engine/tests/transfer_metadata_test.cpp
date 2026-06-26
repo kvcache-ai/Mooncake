@@ -248,6 +248,14 @@ TEST_F(TransferMetadataTest, SegmentCacheTracksMetadataVersionChanges) {
     ASSERT_EQ(metadata_client->segmentMetadataVersionChangeCount(), 2);
 }
 
+TEST_F(TransferMetadataTest, SegmentCacheIgnoresNullDescriptor) {
+    metadata_client->updateSegmentCacheEntry(4444444, "null_remote_segment",
+                                             nullptr);
+
+    auto desc = metadata_client->getSegmentDescByID(4444444);
+    ASSERT_FALSE(desc);
+}
+
 // add, get and remove RPCMetaEntryMeta
 TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     if (metadata_server == P2PHANDSHAKE) {
