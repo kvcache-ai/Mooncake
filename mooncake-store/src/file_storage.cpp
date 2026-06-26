@@ -423,16 +423,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return ErrorCode::OK;
     };
 
-    // Collect keys drained from master queue but not found in local memory.
-    // These need to be reported back as failed so the master can clean up
-    // orphaned offloading_tasks and release the source replica refcount.
+    // Collect keys drained from master queue but not actually offloaded.
+    // Report them back with data_size=-1 sentinel so the master can clean up
+    // orphaned offloading_tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
-    // Per-drop-point counters for diagnosis.
-    int drop_key_missing = 0;   // individual key missing from query result
-    int drop_d2h_staging = 0;   // D2H copy failed
-    int drop_write_fail = 0;    // BatchOffload write failed (INVALID_READ)
-    // Count keys that were in offloading_objects but not in any bucket
-    // (skipped by GroupOffloadingKeysByBucket due to size limit or IsExist)
     std::unordered_set<std::string> all_bucket_keys;
 
     for (const auto& keys : buckets_keys) {
@@ -471,7 +465,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                                          std::move(it->second));
                 } else {
                     failed_tasks.push_back(task_by_storage_key[storage_key]);
-                    ++drop_key_missing;
                 }
             }
         }
@@ -523,7 +516,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         pinned_buffer_pool_->Release(buf);
                         obj_success = false;
                         failed_tasks.push_back(task_by_storage_key[obj_key]);
-                        ++drop_d2h_staging;
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
@@ -579,11 +571,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 return tl::make_unexpected(offload_res.error());
             }
             if (offload_res.error() == ErrorCode::INVALID_READ) {
-                // BatchOffload partial write failure — these keys were not
-                // passed to bucket_complete_handler and become orphans.
                 for (const auto& [key, _] : host_batch_object) {
                     failed_tasks.push_back(task_by_storage_key[key]);
-                    ++drop_write_fail;
                 }
             } else {
                 return tl::make_unexpected(offload_res.error());
@@ -591,23 +580,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     }
 
-    // Report failed offload attempts back to the master so it can clean up
-    // orphaned offloading_tasks and release the source replica refcount.
-    // Use data_size=-1 as a sentinel to signal "offload failed".
-    int drop_not_in_bucket = 0;
+    // Keys skipped by GroupOffloadingKeysByBucket don't appear in any bucket,
+    // so they never reach BatchOffload or complete_handler.
     for (const auto& [storage_key, task] : task_by_storage_key) {
         if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
             failed_tasks.push_back(task);
-            ++drop_not_in_bucket;
         }
     }
-    int drop_total = drop_key_missing + drop_d2h_staging + drop_write_fail + drop_not_in_bucket;
-    LOG(WARNING) << "[OFFLOAD] OffloadObjects summary: queued=" << offloading_objects.size()
-              << " dropped=" << drop_total
-              << " (key_missing=" << drop_key_missing
-              << " d2h_staging=" << drop_d2h_staging
-              << " write_fail=" << drop_write_fail
-              << " not_in_bucket=" << drop_not_in_bucket << ")";
+
     if (!failed_tasks.empty()) {
         std::vector<StorageObjectMetadata> failed_metadatas;
         failed_metadatas.reserve(failed_tasks.size());
@@ -955,11 +935,6 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
         } else {
             missing_keys.push_back(keys[i]);
         }
-    }
-    if (!missing_keys.empty()) {
-        LOG(WARNING) << "[OFFLOAD] BatchQuerySegmentSlices: " << missing_keys.size()
-                     << "/" << keys.size() << " keys missing local memory replica, tenant="
-                     << tenant_id;
     }
     return {};
 }

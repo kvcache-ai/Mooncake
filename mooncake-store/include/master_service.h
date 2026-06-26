@@ -1581,11 +1581,6 @@ class MasterService {
             }
         }
 
-        // Check if the tenant exists in the shard (does NOT create it)
-        bool TenantExists() const NO_THREAD_SAFETY_ANALYSIS {
-            return tenant_state_ != nullptr;
-        }
-
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr &&

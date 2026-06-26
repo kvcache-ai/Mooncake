@@ -4267,10 +4267,6 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    int success_count = 0;
-    int failed_count = 0;
-    int orphan_count = 0;
-    int expired_count = 0;
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -4291,27 +4287,6 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
-                    if (metadata.data_size >= 0) {
-                        ++success_count;
-                    } else {
-                        ++failed_count;
-                    }
-                } else {
-                    ++expired_count;
-                }
-            } else {
-                // Metadata not found — two sub-cases:
-                // 1. Tenant exists: offloading_task may be orphaned (metadata
-                //    evicted/invalidated while offload was in-flight). Clean it.
-                // 2. No tenant: master restart re-registration, expected — skip.
-                if (accessor.TenantExists()) {
-                    auto& tenant_state = accessor.GetTenantState();
-                    auto task_it =
-                        tenant_state.offloading_tasks.find(object_id.user_key);
-                    if (task_it != tenant_state.offloading_tasks.end()) {
-                        tenant_state.offloading_tasks.erase(task_it);
-                        ++orphan_count;
-                    }
                 }
             }
         }
@@ -4331,14 +4306,6 @@ auto MasterService::NotifyOffloadSuccess(
                        << ", key=" << object_id.user_key;
             return tl::make_unexpected(res.error());
         }
-    }
-    if (!tasks.empty()) {
-        VLOG(1) << "[OFFLOAD] NotifyOffloadSuccess summary: total=" << tasks.size()
-                  << " success=" << success_count
-                  << " failed=" << failed_count
-                  << " orphan=" << orphan_count
-                  << " expired=" << expired_count
-                  << " client=" << client_id;
     }
     return {};
 }
@@ -4995,7 +4962,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
         }
 
-        int expired_offload_count = 0;
         for (auto task_it = tenant_state.offloading_tasks.begin();
              task_it != tenant_state.offloading_tasks.end();) {
             const auto ttl =
@@ -5016,7 +4982,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
                          << task_it->first
                          << " tenant=" << tenant_it->first;
             task_it = tenant_state.offloading_tasks.erase(task_it);
-            ++expired_offload_count;
         }
 
         for (auto task_it = tenant_state.promotion_tasks.begin();
