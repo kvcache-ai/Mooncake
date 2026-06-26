@@ -98,16 +98,6 @@ __device__ __forceinline__ void mc_rdma_put(
     const void* send_ptr,
     void* recv_ptr,  // local VA of the recv slot (for raddr computation)
     uint32_t nbytes, int lane_id) {
-#ifdef MOONCAKE_EP_USE_MACA
-    (void)ctx;
-    (void)channel;
-    (void)dst_rank;
-    (void)qps_per_rank;
-    (void)send_ptr;
-    (void)recv_ptr;
-    (void)nbytes;
-    (void)lane_id;
-#else
     if (lane_id == 0) {
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
@@ -116,7 +106,6 @@ __device__ __forceinline__ void mc_rdma_put(
         mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
                      send_ptr, recv_raddr, nbytes);
     }
-#endif
 }
 
 // ---------------------------------------------------------------------------

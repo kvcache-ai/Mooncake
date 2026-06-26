@@ -3,15 +3,15 @@
 // Wraps mlx5gda_qp_devctx and issues RDMA writes/atomics via
 // device-side WQE construction.
 //
-// On MUSA: BF (Blue Flame) doorbell is not available (musaHostRegisterIoMemory
-// doesn't support MMIO), so qp->bf is NULL and the kernel uses DBR-only mode.
-// All other IBGDA logic (WQE construction, CQ polling, DBR write) is shared.
+// Some platforms cannot safely write mlx5 UAR/MMIO from device code.  Those
+// platforms use the proxy-doorbell backend: device code publishes IBGDA work
+// requests into a host-mapped ring, and a host proxy rings DBR/UAR/BF.
 #pragma once
 
 #include <cstdint>
 #include "transport/device/device_ops.cuh"
 
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 #include <cuda/atomic>
 #endif
 #include <transport/device/ibgda/mlx5gda.h>
@@ -50,7 +50,7 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
 }
 
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
     uint32_t old;
     do {
         old = atomicCAS(&qp->mutex, 0u, 1u);
@@ -62,12 +62,18 @@ __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
 }
 
 __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
     mc_st_release_u32(&qp->mutex, 0u);
 #else
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
     lock.store(0u, cuda::memory_order_release);
 #endif
+}
+
+__device__ __forceinline__ bool mc_ibgda_proxy_enabled(
+    const mlx5gda_qp_devctx* qp) {
+    return qp->doorbell_backend == MLX5GDA_DOORBELL_PROXY &&
+           qp->proxy_ring != nullptr;
 }
 
 __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
@@ -89,8 +95,44 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
     if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
 }
 
+__device__ __forceinline__ bool mc_ibgda_proxy_publish_doorbell(
+    mlx5gda_qp_devctx* qp, uint32_t first_wq_head, uint32_t wqe_count) {
+    mlx5gda_proxy_ring* ring = qp->proxy_ring;
+    uint64_t tail = ring->producer_tail;
+    uint64_t completion =
+        *const_cast<volatile uint64_t*>(&ring->completion_head);
+    uint64_t capacity = static_cast<uint64_t>(ring->size_mask + 1);
+    uint32_t spins = 0;
+    while (tail - completion >= capacity) {
+        if (++spins > 100000000u) {
+            ring->error_head = tail;
+            return false;
+        }
+        __threadfence_system();
+        completion = *const_cast<volatile uint64_t*>(&ring->completion_head);
+    }
+
+    auto* slot = &ring->slots[tail & ring->size_mask];
+    slot->state = MLX5GDA_PROXY_SLOT_FREE;
+    slot->wqe_count = wqe_count;
+    slot->wq_head = first_wq_head + wqe_count;
+    slot->seq = tail;
+    __threadfence_system();
+    mc_st_release_u32(&slot->state, MLX5GDA_PROXY_SLOT_POSTED);
+    mc_st_release_u64(&ring->producer_tail, tail + 1);
+    return true;
+}
+
 __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
     uint32_t num_posted = static_cast<uint32_t>(qp->wq_head);
+    if (mc_ibgda_proxy_enabled(qp)) {
+        if (!mc_ibgda_proxy_publish_doorbell(qp, num_posted - 1, 1)) {
+            printf("[EP IBGDA] proxy doorbell publish failed\n");
+            __trap();
+        }
+        return;
+    }
+
     // DBR write — always done (NIC polls doorbell record in GPU memory)
     mc_st_release_u32(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter),
                       mc_bswap32(num_posted));

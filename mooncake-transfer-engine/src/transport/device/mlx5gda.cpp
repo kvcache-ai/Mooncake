@@ -188,6 +188,7 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
     cq->cq_offset = cq_offset;
     cq->dbr_offset = dbr_offset;
     cq->cqe = num_cqe;
+    cq->collapsed = 1;
     cq->cqn = cqn;
     cq->uar = uar;
     cq->mcq = mlx5_cq;

@@ -24,6 +24,44 @@ struct mlx5gda_wqebb {
     uint64_t qwords[8];  // 64 bytes
 };
 
+enum mlx5gda_doorbell_backend : uint32_t {
+    MLX5GDA_DOORBELL_DIRECT = 0,
+    MLX5GDA_DOORBELL_PROXY = 1,
+};
+
+enum mlx5gda_proxy_slot_state : uint32_t {
+    MLX5GDA_PROXY_SLOT_FREE = 0,
+    MLX5GDA_PROXY_SLOT_POSTED = 1,
+    MLX5GDA_PROXY_SLOT_DONE = 2,
+    MLX5GDA_PROXY_SLOT_ERROR = 3,
+};
+
+struct alignas(64) mlx5gda_proxy_ring_slot {
+    uint32_t state;
+    uint32_t wqe_count;
+    uint32_t wq_head;
+    uint32_t reserved;
+    uint64_t seq;
+};
+
+struct alignas(64) mlx5gda_proxy_ring {
+    uint32_t size_mask;
+    uint32_t reserved0[15];
+
+    uint64_t producer_tail;
+    uint64_t reserved1[7];
+
+    uint64_t consumer_head;
+    uint64_t doorbell_tail;
+    uint64_t reserved2[6];
+
+    uint64_t completion_head;
+    uint64_t error_head;
+    uint64_t reserved3[6];
+
+    struct mlx5gda_proxy_ring_slot slots[];
+};
+
 struct mlx5gda_rdma_write_wqe {
     struct mlx5_wqe_ctrl_seg ctrl;
     struct mlx5_wqe_raddr_seg raddr;
@@ -42,6 +80,7 @@ struct mlx5gda_cq {
     struct mlx5dv_devx_uar *uar;  // uar is allocated but not used
     uint32_t cqn;
     uint32_t cqe;
+    uint8_t collapsed;
     size_t cq_offset;
     size_t dbr_offset;
 };
@@ -82,6 +121,10 @@ struct mlx5gda_qp_devctx {
     uint32_t bf_offset;  // toggle on every post
     uint16_t wq_head;    // next free wqeid
     uint16_t wq_tail;    // last non-completed wqeid
+    uint32_t doorbell_backend;
+    struct mlx5gda_proxy_ring *proxy_ring;
+    uint32_t proxy_batch;
+    uint32_t reserved;
 };
 
 struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,

@@ -25,9 +25,13 @@
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 
 #include "cuda_alike.h"
 #include "transport/device/ibgda/memheap.h"
@@ -38,6 +42,10 @@ namespace mooncake {
 namespace device {
 
 static constexpr size_t kCtrlBufSize = 1024ULL * 1024 * 1024;  // 1 GiB
+static constexpr uint32_t kDefaultProxyRingSize = 64;
+
+static uint16_t bswap16(uint16_t v) { return __builtin_bswap16(v); }
+static uint32_t bswap32(uint32_t v) { return __builtin_bswap32(v); }
 
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
@@ -86,7 +94,18 @@ static std::string autoDetectNic(const std::vector<std::string>& filter) {
 class IbgdaDeviceTransportImpl : public RdmaTransport {
    public:
     explicit IbgdaDeviceTransportImpl(std::vector<std::string> filter)
-        : device_filter_(std::move(filter)) {}
+        : device_filter_(std::move(filter)) {
+        proxy_doorbell_ = shouldUseProxyDoorbell();
+        if (const char* env = std::getenv("MC_IBGDA_PROXY_RING_SIZE")) {
+            int parsed = std::atoi(env);
+            if (parsed > 0) proxy_ring_size_ = parsed;
+        }
+        proxy_ring_size_ = roundUpPowerOfTwo(proxy_ring_size_);
+        if (const char* env = std::getenv("MC_IBGDA_PROXY_BATCH")) {
+            int parsed = std::atoi(env);
+            if (parsed > 0) proxy_batch_ = parsed;
+        }
+    }
 
     ~IbgdaDeviceTransportImpl() override { teardown(); }
 
@@ -200,7 +219,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
-        if (std::getenv("MC_IBGDA_CTRL_HOST")) {
+        ctrl_buf_host_ = proxy_doorbell_ || std::getenv("MC_IBGDA_CTRL_HOST");
+        if (ctrl_buf_host_) {
             int ret = posix_memalign(&ctrl_buf_, 4096, kCtrlBufSize);
             if (ret != 0) {
                 LOG(ERROR) << "[EP IBGDA] posix_memalign ctrl_buf failed: "
@@ -222,7 +242,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                            << cudaGetErrorString(err);
                 return -1;
             }
-            LOG(INFO) << "[EP IBGDA] Using host control buffer probe mode";
+            LOG(INFO) << "[EP IBGDA] Using host-backed mapped control buffer"
+                      << " (proxy_doorbell=" << proxy_doorbell_ << ")";
         } else {
             cudaError_t err = cudaMalloc(&ctrl_buf_, kCtrlBufSize);
             if (err != cudaSuccess) {
@@ -271,6 +292,45 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 return -1;
             }
             cudaStreamSynchronize(stream);
+
+            mlx5gda_proxy_ring* proxy_ring_host = nullptr;
+            mlx5gda_proxy_ring* proxy_ring_dev = nullptr;
+            if (proxy_doorbell_) {
+                if (!ctrl_buf_host_) {
+                    LOG(ERROR)
+                        << "[EP IBGDA] proxy doorbell requires host-backed "
+                           "mapped control memory";
+                    mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
+                    return -1;
+                }
+                size_t ring_bytes = sizeof(mlx5gda_proxy_ring) +
+                                    proxy_ring_size_ *
+                                        sizeof(mlx5gda_proxy_ring_slot);
+                size_t ring_offset = memheap_aligned_alloc(
+                    ctrl_buf_heap_, ring_bytes, 64);
+                if (ring_offset == static_cast<size_t>(-1)) {
+                    LOG(ERROR) << "[EP IBGDA] proxy ring allocation failed";
+                    mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
+                    return -1;
+                }
+                proxy_ring_host = reinterpret_cast<mlx5gda_proxy_ring*>(
+                    static_cast<char*>(ctrl_buf_) + ring_offset);
+                proxy_ring_dev = reinterpret_cast<mlx5gda_proxy_ring*>(
+                    static_cast<char*>(ctrl_buf_dev_) + ring_offset);
+                std::memset(proxy_ring_host, 0, ring_bytes);
+                proxy_ring_host->size_mask = proxy_ring_size_ - 1;
+                proxy_lanes_.push_back(ProxyLane{
+                    .qp = qp,
+                    .ring_host = proxy_ring_host,
+                    .ring_dev = proxy_ring_dev,
+                    .ring_offset = ring_offset,
+                    .cq_dbr = reinterpret_cast<mlx5gda_cq_dbr*>(
+                        static_cast<char*>(ctrl_buf_) +
+                        qp->send_cq->dbr_offset),
+                    .cq_ci = 0,
+                });
+            }
+
             mlx5gda_qp_devctx devctx{
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
@@ -283,6 +343,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 .bf = std::getenv("MC_IBGDA_DISABLE_BF")
                           ? nullptr
                           : static_cast<char*>(qp->uar->reg_addr),
+                .doorbell_backend = proxy_doorbell_
+                                        ? MLX5GDA_DOORBELL_PROXY
+                                        : MLX5GDA_DOORBELL_DIRECT,
+                .proxy_ring = proxy_ring_dev,
+                .proxy_batch = proxy_batch_,
             };
             cudaMemcpy(
                 static_cast<char*>(qp_devctxs_) + i * sizeof(mlx5gda_qp_devctx),
@@ -293,7 +358,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int recreateQueuePairs(void* stream_ptr) override {
-        auto stream = static_cast<cudaStream_t>(stream_ptr);
+        stopProxyWorker();
+        for (const auto& lane : proxy_lanes_) {
+            memheap_free(ctrl_buf_heap_, lane.ring_offset);
+        }
+        proxy_lanes_.clear();
         for (auto* qp : qps_) {
             if (qp) mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
         }
@@ -360,6 +429,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             cudaMemcpy(static_cast<char*>(rkeys_) + i * sizeof(uint32_t), &rkey,
                        sizeof(uint32_t), cudaMemcpyHostToDevice);
         }
+        if (proxy_doorbell_) startProxyWorker();
         return 0;
     }
 
@@ -383,7 +453,187 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int gidIndex() const override { return gid_index_; }
 
    private:
+    struct ProxyLane {
+        mlx5gda_qp* qp = nullptr;
+        mlx5gda_proxy_ring* ring_host = nullptr;
+        mlx5gda_proxy_ring* ring_dev = nullptr;
+        size_t ring_offset = static_cast<size_t>(-1);
+        mlx5gda_cq_dbr* cq_dbr = nullptr;
+        uint64_t cq_ci = 0;
+    };
+
+    static bool shouldUseProxyDoorbell() {
+        if (const char* env = std::getenv("MC_IBGDA_DOORBELL_PROXY")) {
+            return std::atoi(env) != 0;
+        }
+#if defined(USE_MACA)
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    static uint32_t roundUpPowerOfTwo(uint32_t v) {
+        if (v <= 1) return 1;
+        --v;
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        return v + 1;
+    }
+
+    void postHostDoorbell(mlx5gda_qp* qp, mlx5gda_wq_dbr* dbr,
+                          mlx5gda_wqebb* wq, uint32_t wq_head) {
+        dbr->send_counter = bswap32(wq_head);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        *reinterpret_cast<volatile uint64_t*>(qp->uar->reg_addr) =
+            wq[(wq_head - 1) & (qp->num_wqebb - 1)].qwords[0];
+    }
+
+    void updateCqConsumerIndex(ProxyLane& lane) {
+        auto* ci_be = reinterpret_cast<volatile uint32_t*>(lane.cq_dbr);
+        *ci_be = bswap32(static_cast<uint32_t>(lane.cq_ci));
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+
+    static bool isSuccessCqeOpcode(uint8_t opcode) {
+        return opcode == 0x0 || opcode == 0xF;
+    }
+
+    bool pollProxyCompletionNormal(ProxyLane& lane, uint32_t expect_wq_head) {
+        auto* cq = reinterpret_cast<mlx5_cqe64*>(
+            static_cast<char*>(ctrl_buf_) + lane.qp->send_cq->cq_offset);
+        uint32_t cqe_mask = lane.qp->send_cq->cqe - 1;
+        uint16_t expect16 = static_cast<uint16_t>(expect_wq_head);
+        mlx5_cqe64* cqe = &cq[lane.cq_ci & cqe_mask];
+        uint8_t op_own = cqe->op_own;
+        uint8_t opcode = op_own >> 4;
+        uint8_t owner = op_own & 0x1;
+        uint8_t expected_owner =
+            static_cast<uint8_t>((lane.cq_ci / (cqe_mask + 1)) & 0x1);
+        if (owner != expected_owner) return false;
+        if (opcode == 0xD) {
+            LOG(ERROR) << "[EP IBGDA] proxy CQ requester error"
+                       << " syndrome=0x" << std::hex
+                       << static_cast<uint64_t>(cqe->timestamp >> 56)
+                       << std::dec;
+            return false;
+        }
+        if (!isSuccessCqeOpcode(opcode)) return false;
+
+        uint16_t completed =
+            static_cast<uint16_t>(bswap16(cqe->wqe_counter) + 1);
+        ++lane.cq_ci;
+        updateCqConsumerIndex(lane);
+        return static_cast<int16_t>(completed - expect16) >= 0;
+    }
+
+    bool pollProxyCompletionCollapsed(ProxyLane& lane,
+                                      uint32_t expect_wq_head) {
+        auto* cq = reinterpret_cast<mlx5_cqe64*>(
+            static_cast<char*>(ctrl_buf_) + lane.qp->send_cq->cq_offset);
+        uint32_t num_cqe = lane.qp->send_cq->cqe;
+        uint16_t expect16 = static_cast<uint16_t>(expect_wq_head);
+        for (uint32_t i = 0; i < num_cqe; ++i) {
+            mlx5_cqe64* cqe = &cq[i];
+            uint8_t opcode = cqe->op_own >> 4;
+            if (opcode == 0xD) {
+                LOG(ERROR) << "[EP IBGDA] proxy collapsed CQ requester error"
+                           << " syndrome=0x" << std::hex
+                           << static_cast<uint64_t>(cqe->timestamp >> 56)
+                           << std::dec;
+                return false;
+            }
+            if (!isSuccessCqeOpcode(opcode)) continue;
+            uint16_t completed =
+                static_cast<uint16_t>(bswap16(cqe->wqe_counter) + 1);
+            if (static_cast<int16_t>(completed - expect16) >= 0) return true;
+        }
+        return false;
+    }
+
+    bool pollProxyCompletion(ProxyLane& lane, uint32_t expect_wq_head) {
+        for (int attempt = 0; attempt < 10000; ++attempt) {
+            bool completed = lane.qp->send_cq->collapsed
+                                 ? pollProxyCompletionCollapsed(lane,
+                                                                expect_wq_head)
+                                 : pollProxyCompletionNormal(lane,
+                                                             expect_wq_head);
+            if (completed) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        return false;
+    }
+
+    void drainProxyLane(ProxyLane& lane) {
+        auto* ring = lane.ring_host;
+        auto* producer_tail =
+            reinterpret_cast<std::atomic<uint64_t>*>(&ring->producer_tail);
+        auto* completion_head =
+            reinterpret_cast<std::atomic<uint64_t>*>(&ring->completion_head);
+        uint64_t available = producer_tail->load(std::memory_order_acquire);
+        uint64_t head = ring->consumer_head;
+        if (head == available) return;
+
+        auto* wq = reinterpret_cast<mlx5gda_wqebb*>(
+            static_cast<char*>(ctrl_buf_) + lane.qp->wq_offset);
+        auto* dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
+            static_cast<char*>(ctrl_buf_) + lane.qp->dbr_offset);
+        auto* first_slot = &ring->slots[head & ring->size_mask];
+        if (first_slot->state != MLX5GDA_PROXY_SLOT_POSTED ||
+            first_slot->seq != head || first_slot->wqe_count == 0) {
+            ring->error_head = head;
+            return;
+        }
+
+        uint32_t wq_head = first_slot->wq_head;
+        postHostDoorbell(lane.qp, dbr, wq, wq_head);
+        if (!pollProxyCompletion(lane, wq_head)) {
+            ring->error_head = head;
+            return;
+        }
+        first_slot->state = MLX5GDA_PROXY_SLOT_DONE;
+        ring->consumer_head = head + 1;
+        ring->doorbell_tail = head + 1;
+        completion_head->store(head + 1, std::memory_order_release);
+    }
+
+    void startProxyWorker() {
+        if (proxy_worker_running_.load(std::memory_order_acquire)) return;
+        proxy_worker_stop_.store(false, std::memory_order_release);
+        proxy_worker_running_.store(true, std::memory_order_release);
+        proxy_worker_ = std::thread([this] {
+            while (!proxy_worker_stop_.load(std::memory_order_acquire)) {
+                bool did_work = false;
+                for (auto& lane : proxy_lanes_) {
+                    uint64_t before = lane.ring_host->consumer_head;
+                    drainProxyLane(lane);
+                    did_work |= lane.ring_host->consumer_head != before;
+                }
+                if (!did_work) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
+                }
+            }
+            proxy_worker_running_.store(false, std::memory_order_release);
+        });
+    }
+
+    void stopProxyWorker() {
+        proxy_worker_stop_.store(true, std::memory_order_release);
+        if (proxy_worker_.joinable()) proxy_worker_.join();
+        proxy_worker_running_.store(false, std::memory_order_release);
+    }
+
     void teardown() {
+        stopProxyWorker();
+        for (const auto& lane : proxy_lanes_) {
+            memheap_free(ctrl_buf_heap_, lane.ring_offset);
+        }
+        proxy_lanes_.clear();
         for (auto* qp : qps_) {
             if (qp) mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
         }
@@ -397,7 +647,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             ctrl_buf_umem_ = nullptr;
         }
         if (ctrl_buf_) {
-            if (std::getenv("MC_IBGDA_CTRL_HOST")) {
+            if (ctrl_buf_host_) {
                 cudaHostUnregister(ctrl_buf_);
                 free(ctrl_buf_);
             } else {
@@ -448,6 +698,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     // Control buffer
     void* ctrl_buf_ = nullptr;  // GPU VA
     void* ctrl_buf_dev_ = nullptr;
+    bool ctrl_buf_host_ = false;
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
 
@@ -455,6 +706,13 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     std::vector<mlx5gda_qp*> qps_;
     int num_ranks_ = 0;
     int num_qps_ = 0;
+    bool proxy_doorbell_ = false;
+    uint32_t proxy_ring_size_ = kDefaultProxyRingSize;
+    uint32_t proxy_batch_ = 4;
+    std::vector<ProxyLane> proxy_lanes_;
+    std::thread proxy_worker_;
+    std::atomic<bool> proxy_worker_stop_{false};
+    std::atomic<bool> proxy_worker_running_{false};
 
     // Device-visible tables
     void* raddrs_ = nullptr;
