@@ -1049,6 +1049,11 @@ uint64_t MasterService::RequestedMemoryQuotaCharge(
     return static_cast<uint64_t>(charge);
 }
 
+bool MasterService::ShouldProtectZeroChargeMetadataCreate(
+    uint64_t requested_quota_charge) const {
+    return enable_multi_tenants_ && requested_quota_charge == 0;
+}
+
 uint64_t MasterService::ComputeTenantQuotaDeficit(
     const std::string& tenant_id, uint64_t incoming_quota_charge) {
     uint64_t deficit = incoming_quota_charge;
@@ -2834,6 +2839,17 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     auto attempt_once =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+        std::unique_lock<std::mutex> zero_charge_policy_lock(
+            tenant_quota_policy_mutex_, std::defer_lock);
+        if (ShouldProtectZeroChargeMetadataCreate(requested_quota_charge)) {
+            zero_charge_policy_lock.lock();
+            auto latest_tenant_result =
+                NormalizeTenantIdForWriteLocked(tenant_id);
+            if (!latest_tenant_result) {
+                return tl::make_unexpected(latest_tenant_result.error());
+            }
+        }
+
         auto now = std::chrono::system_clock::now();
         std::optional<size_t> retry_shard_idx;
         {
@@ -3263,6 +3279,17 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     auto attempt_once =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+        std::unique_lock<std::mutex> zero_charge_policy_lock(
+            tenant_quota_policy_mutex_, std::defer_lock);
+        if (ShouldProtectZeroChargeMetadataCreate(requested_quota_charge)) {
+            zero_charge_policy_lock.lock();
+            auto latest_tenant_result =
+                NormalizeTenantIdForWriteLocked(tenant_id);
+            if (!latest_tenant_result) {
+                return tl::make_unexpected(latest_tenant_result.error());
+            }
+        }
+
         auto now = std::chrono::system_clock::now();
         std::optional<size_t> case_a_retry_shard_idx;
         {
@@ -5020,12 +5047,12 @@ auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -8414,12 +8441,12 @@ std::string MasterService::FormatTimestamp(
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,
     const std::vector<std::string>& targets) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -8476,12 +8503,12 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::string& target) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, object_id);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";

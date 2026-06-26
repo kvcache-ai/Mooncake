@@ -1,5 +1,6 @@
 #include "master_service.h"
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <future>
@@ -16,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include "allocation_strategy.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
@@ -51,6 +53,66 @@ class BlockingTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
     std::promise<void> allow_save_promise_;
     std::future<void> allow_save_;
 };
+
+#ifdef USE_NOF
+class BlockingAllocationStrategy final : public AllocationStrategy {
+   public:
+    BlockingAllocationStrategy()
+        : allow_allocation_(allow_allocation_promise_.get_future()) {}
+
+    std::future<void> AllocationStarted() {
+        return allocation_started_promise_.get_future();
+    }
+
+    void AllowAllocation() { allow_allocation_promise_.set_value(); }
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num,
+        const std::vector<std::string>& preferred_segments,
+        const std::set<std::string>& excluded_segments,
+        const ReplicaType replica_type) override {
+        BlockOnce();
+        return delegate_.Allocate(allocator_manager, slice_length, replica_num,
+                                  preferred_segments, excluded_segments,
+                                  replica_type);
+    }
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num,
+        const std::vector<std::string>& preferred_segments,
+        const std::set<std::string>& excluded_segments,
+        const ReplicaType replica_type,
+        const SsdMetricsProvider* ssd_provider) override {
+        (void)ssd_provider;
+        return Allocate(allocator_manager, slice_length, replica_num,
+                        preferred_segments, excluded_segments, replica_type);
+    }
+
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const std::string& segment_name) override {
+        return delegate_.AllocateFrom(allocator_manager, slice_length,
+                                      segment_name);
+    }
+
+   private:
+    void BlockOnce() {
+        bool expected = true;
+        if (block_next_allocation_.compare_exchange_strong(expected, false)) {
+            allocation_started_promise_.set_value();
+            allow_allocation_.wait();
+        }
+    }
+
+    RandomAllocationStrategy delegate_;
+    std::atomic<bool> block_next_allocation_{true};
+    std::promise<void> allocation_started_promise_;
+    std::promise<void> allow_allocation_promise_;
+    std::future<void> allow_allocation_;
+};
+#endif
 
 class MasterServiceTenantQuotaTest : public ::testing::Test {
    protected:
@@ -99,6 +161,24 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         return client_id;
     }
 
+#ifdef USE_NOF
+    UUID MountNoFSegment(MasterService& service, size_t size = 4096,
+                         std::string name = "quota_nof_segment") {
+        NoFSegment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.base = kSegmentBase + next_segment_offset_;
+        segment.size = size;
+        segment.te_endpoint = segment.name;
+        next_segment_offset_ += size + 4096;
+
+        UUID client_id = generate_uuid();
+        auto result = service.MountNoFSegment(segment, client_id);
+        EXPECT_TRUE(result.has_value()) << toString(result.error());
+        return client_id;
+    }
+#endif
+
     ReplicateConfig MemoryConfig() {
         ReplicateConfig config;
         config.replica_num = 1;
@@ -132,6 +212,13 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         MasterService& service, std::unique_ptr<TenantQuotaPolicyStore> store) {
         service.tenant_quota_policy_store_ = std::move(store);
     }
+
+#ifdef USE_NOF
+    void ReplaceAllocationStrategy(
+        MasterService& service, std::shared_ptr<AllocationStrategy> strategy) {
+        service.allocation_strategy_ = std::move(strategy);
+    }
+#endif
 
     tl::expected<void, ErrorCode> ReserveTenantQuotaForTest(
         MasterService& service, const std::string& tenant_id, uint64_t bytes) {
@@ -533,6 +620,62 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(exists.has_value()) << toString(exists.error());
     EXPECT_TRUE(exists.value());
 }
+
+#ifdef USE_NOF
+TEST_F(MasterServiceTenantQuotaTest,
+       DeletePolicyWaitsForZeroChargePutStartMetadataCreate) {
+    MasterService service(MakeConfig({{"tenant-a", 1000}}));
+    UUID client_id = MountNoFSegment(service);
+
+    auto blocking_strategy = std::make_shared<BlockingAllocationStrategy>();
+    auto* blocking_strategy_ptr = blocking_strategy.get();
+    auto allocation_started = blocking_strategy_ptr->AllocationStarted();
+    ReplaceAllocationStrategy(service, std::move(blocking_strategy));
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.nof_replica_num = 1;
+
+    std::optional<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        put_result;
+    std::thread put_thread([&] {
+        put_result.emplace(
+            service.PutStart(client_id, "nof-key", "tenant-a", 128, config));
+    });
+
+    if (allocation_started.wait_for(std::chrono::seconds(5)) !=
+        std::future_status::ready) {
+        blocking_strategy_ptr->AllowAllocation();
+        put_thread.join();
+        FAIL() << "timed out waiting for PutStart allocation";
+    }
+
+    using DeleteResult =
+        tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>;
+    std::optional<DeleteResult> delete_result;
+    std::thread delete_thread([&] {
+        delete_result.emplace(service.DeleteTenantQuotaPolicy("tenant-a"));
+    });
+
+    ASSERT_TRUE(WaitForTenantQuotaPolicyMutexContention(service))
+        << "DeleteTenantQuotaPolicy did not wait for zero-charge PutStart";
+
+    blocking_strategy_ptr->AllowAllocation();
+    put_thread.join();
+    delete_thread.join();
+
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_TRUE(put_result->has_value()) << toString(put_result->error());
+    ASSERT_TRUE(delete_result.has_value());
+    ASSERT_FALSE(delete_result->has_value());
+    EXPECT_EQ(delete_result->error(), ErrorCode::TENANT_NOT_EMPTY);
+
+    auto snapshot = Snapshot(service, "tenant-a");
+    EXPECT_EQ(snapshot.used_bytes, 0);
+    EXPECT_EQ(snapshot.reserved_bytes, 0);
+    EXPECT_EQ(snapshot.metadata_object_count, 1);
+}
+#endif
 
 TEST_F(MasterServiceTenantQuotaTest,
        EffectiveQuotaUsesOnlyExplicitPolicyAndScalesProportionally) {

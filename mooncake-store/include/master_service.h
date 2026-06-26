@@ -67,9 +67,15 @@ class MasterServiceTenantQuotaTest;
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
- * 2. metadata_shards_[shard_idx_].mutex
- * 3. tenant_quota_shards_[shard_idx_].mutex
- * 4. segment_mutex_
+ * 2. tenant_quota_policy_mutex_
+ * 3. snapshot_mutex_
+ * 4. metadata_shards_[shard_idx_].mutex
+ * 5. tenant_quota_shards_[shard_idx_].mutex
+ * 6. segment_mutex_
+ *
+ * Strict tenant admission and policy mutation paths that need both
+ * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
+ * policy mutex first, then snapshot_mutex_.
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
@@ -1403,6 +1409,8 @@ class MasterService {
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
+    bool ShouldProtectZeroChargeMetadataCreate(
+        uint64_t requested_quota_charge) const;
     uint64_t ComputeTenantQuotaDeficit(const std::string& tenant_id,
                                        uint64_t incoming_quota_charge);
     tl::expected<void, ErrorCode> ReserveTenantQuota(
