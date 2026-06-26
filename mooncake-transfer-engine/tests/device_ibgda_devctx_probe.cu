@@ -31,6 +31,8 @@ DEFINE_bool(device_api_put, false,
             "Issue loopback RDMA WRITE through mc_ibgda_put");
 DEFINE_bool(device_api_red_add, false,
             "Issue RDMA masked atomic add through mc_ibgda_red_add");
+DEFINE_int32(requests, 1,
+             "Number of Device API operations issued by the initiator");
 
 namespace {
 
@@ -94,20 +96,28 @@ __global__ void loopbackKernel(mlx5gda_qp_devctx* qps, uint64_t src,
 
 __global__ void deviceApiPutKernel(mooncake::device::IbgdaContext ctx,
                                    int src_rank, int dst_rank,
-                                   uint64_t src, uint64_t dst, uint64_t* out) {
-    mooncake::device::mc_ibgda_put(ctx, 0, dst_rank, src_rank, 1,
-                                   reinterpret_cast<const void*>(src), dst,
-                                   sizeof(uint64_t));
-    out[0] = 1;
+                                   uint64_t src, uint64_t dst, int requests,
+                                   uint64_t* out) {
+    for (int i = 0; i < requests; ++i) {
+        mooncake::device::mc_ibgda_put(
+            ctx, 0, dst_rank, src_rank, 1,
+            reinterpret_cast<const void*>(src + i * sizeof(uint64_t)),
+            dst + i * sizeof(uint64_t), sizeof(uint64_t));
+    }
+    out[0] = requests;
 }
 
 __global__ void deviceApiRedAddKernel(mooncake::device::IbgdaContext ctx,
                                       int src_rank, int dst_rank,
                                       uint64_t scratch, uint64_t dst,
-                                      int32_t value, uint64_t* out) {
-    mooncake::device::mc_ibgda_red_add(ctx, 0, dst_rank, src_rank, 1, scratch,
-                                       dst, value);
-    out[0] = 2;
+                                      int32_t value, int requests,
+                                      uint64_t* out) {
+    for (int i = 0; i < requests; ++i) {
+        mooncake::device::mc_ibgda_red_add(
+            ctx, 0, dst_rank, src_rank, 1, scratch + i * sizeof(uint64_t),
+            dst + i * sizeof(uint64_t), value);
+    }
+    out[0] = requests;
 }
 
 __global__ void ringDoorbellOnlyKernel(mlx5gda_qp_devctx* qps, uint64_t* out) {
@@ -217,6 +227,7 @@ int main(int argc, char** argv) {
               "--world_size must be 1 or 2");
         check(FLAGS_rank >= 0 && FLAGS_rank < FLAGS_world_size,
               "invalid --rank");
+        check(FLAGS_requests > 0, "--requests must be positive");
         check(FLAGS_gpu_id >= 0 && FLAGS_gpu_id < device_count,
               "invalid --gpu_id");
         checkCuda(cudaSetDevice(FLAGS_gpu_id), "cudaSetDevice");
@@ -264,16 +275,22 @@ int main(int argc, char** argv) {
 
         if (FLAGS_loopback || FLAGS_host_wqe_device_db || FLAGS_device_api_put ||
             FLAGS_device_api_red_add) {
+            size_t words = static_cast<size_t>(FLAGS_requests) * 2;
             uint64_t* buf = nullptr;
-            checkCuda(cudaMalloc(&buf, 2 * sizeof(uint64_t)), "cudaMalloc buf");
-            const uint64_t init[2] = {0xaabbccddeeff0011ULL, 0};
-            checkCuda(cudaMemcpy(buf, init, sizeof(init), cudaMemcpyHostToDevice),
+            std::vector<uint64_t> init(words, 0);
+            for (int i = 0; i < FLAGS_requests; ++i) {
+                init[i] = 0xaabbccddeeff0011ULL + static_cast<uint64_t>(i);
+            }
+            checkCuda(cudaMalloc(&buf, words * sizeof(uint64_t)),
+                      "cudaMalloc buf");
+            checkCuda(cudaMemcpy(buf, init.data(), words * sizeof(uint64_t),
+                                 cudaMemcpyHostToDevice),
                       "cudaMemcpy init");
             checkCuda(cudaMemsetAsync(out, 0, 5 * sizeof(uint64_t), stream),
                       "cudaMemsetAsync before registerMemory");
             checkCuda(cudaStreamSynchronize(stream),
                       "cudaStreamSynchronize before registerMemory");
-            check(rdma->registerMemory(buf, 2 * sizeof(uint64_t)) == 0,
+            check(rdma->registerMemory(buf, words * sizeof(uint64_t)) == 0,
                   "RdmaTransport::registerMemory failed");
             checkCuda(cudaGetLastError(), "cudaGetLastError after registerMemory");
             checkCuda(cudaMemsetAsync(out, 0, 5 * sizeof(uint64_t), stream),
@@ -337,7 +354,8 @@ int main(int argc, char** argv) {
             bool is_initiator = FLAGS_world_size == 1 || FLAGS_rank == 0;
             int dst_rank = FLAGS_world_size == 1 ? 0 : 1;
             uint64_t remote_dst =
-                static_cast<uint64_t>(addrs[dst_rank]) + sizeof(uint64_t);
+                static_cast<uint64_t>(addrs[dst_rank]) +
+                static_cast<uint64_t>(FLAGS_requests) * sizeof(uint64_t);
 
             if (FLAGS_device_api_put && is_initiator) {
                 mooncake::device::IbgdaContext ctx{};
@@ -349,7 +367,7 @@ int main(int argc, char** argv) {
                 ctx.remote_atomic_base = buf;
                 deviceApiPutKernel<<<1, 1, 0, stream>>>(
                     ctx, FLAGS_rank, dst_rank, reinterpret_cast<uint64_t>(buf),
-                    remote_dst, out);
+                    remote_dst, FLAGS_requests, out);
                 checkCuda(cudaGetLastError(), "deviceApiPutKernel launch");
                 checkCuda(cudaStreamSynchronize(stream),
                           "deviceApiPutKernel sync");
@@ -363,7 +381,7 @@ int main(int argc, char** argv) {
                 ctx.remote_atomic_base = buf;
                 deviceApiRedAddKernel<<<1, 1, 0, stream>>>(
                     ctx, FLAGS_rank, dst_rank, reinterpret_cast<uint64_t>(buf),
-                    remote_dst, 7, out);
+                    remote_dst, 7, FLAGS_requests, out);
                 checkCuda(cudaGetLastError(), "deviceApiRedAddKernel launch");
                 checkCuda(cudaStreamSynchronize(stream),
                           "deviceApiRedAddKernel sync");
@@ -414,24 +432,38 @@ int main(int argc, char** argv) {
                 waitDone();
             }
 
-            uint64_t result[2] = {};
-            uint64_t expected = init[0];
-            if (FLAGS_device_api_red_add) expected = 7;
             int verify_rank = FLAGS_world_size == 1 ? FLAGS_rank : dst_rank;
             bool should_verify = FLAGS_rank == verify_rank ||
                                  FLAGS_loopback || FLAGS_host_wqe_device_db;
             auto deadline =
                 std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            std::vector<uint64_t> result(words, 0);
+            bool matched = false;
             do {
-                checkCuda(cudaMemcpy(result, buf, sizeof(result),
+                checkCuda(cudaMemcpy(result.data(), buf,
+                                     words * sizeof(uint64_t),
                                      cudaMemcpyDeviceToHost),
                           "cudaMemcpy result");
-                if (!should_verify || result[1] == expected) break;
+                matched = true;
+                if (FLAGS_device_api_red_add) {
+                    for (int i = 0; i < FLAGS_requests; ++i) {
+                        matched &=
+                            result[FLAGS_requests + i] ==
+                            static_cast<uint64_t>(7);
+                    }
+                } else if (FLAGS_device_api_put) {
+                    for (int i = 0; i < FLAGS_requests; ++i) {
+                        matched &= result[FLAGS_requests + i] == init[i];
+                    }
+                } else {
+                    matched = result[1] == init[0];
+                }
+                if (!should_verify || matched) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } while (std::chrono::steady_clock::now() < deadline);
             cudaFree(buf);
             if (should_verify) {
-                check(result[1] == expected, "RDMA result mismatch");
+                check(matched, "RDMA result mismatch");
             }
         }
 
