@@ -322,20 +322,21 @@ class PeerClientTestChildProcess {
         owns_process_ = true;
         return true;
 #else
+        std::vector<char*> argv_ptrs;
+        argv_ptrs.reserve(args.size() + 2);
+        argv_ptrs.push_back(
+            const_cast<char*>(PeerClientTestBinaryPath().c_str()));
+        for (const auto& arg : args) {
+            argv_ptrs.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv_ptrs.push_back(nullptr);
+
         pid_ = fork();
         if (pid_ < 0) {
             pid_ = -1;
             return false;
         }
         if (pid_ == 0) {
-            std::vector<char*> argv_ptrs;
-            argv_ptrs.reserve(args.size() + 2);
-            argv_ptrs.push_back(
-                const_cast<char*>(PeerClientTestBinaryPath().c_str()));
-            for (const auto& arg : args) {
-                argv_ptrs.push_back(const_cast<char*>(arg.c_str()));
-            }
-            argv_ptrs.push_back(nullptr);
             execv(PeerClientTestBinaryPath().c_str(), argv_ptrs.data());
             std::_Exit(127);
         }
