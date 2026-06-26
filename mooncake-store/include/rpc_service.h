@@ -76,6 +76,9 @@ class WrappedMasterService {
     tl::expected<RegisterClientResponse, ErrorCode> RegisterClient(
         const RegisterClientRequest& req);
 
+    tl::expected<UnregisterClientResponse, ErrorCode> UnregisterClient(
+        const UnregisterClientRequest& req);
+
     tl::expected<std::string, ErrorCode> ServiceReady();
 
    protected:

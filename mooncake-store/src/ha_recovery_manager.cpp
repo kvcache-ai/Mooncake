@@ -38,6 +38,23 @@ void HARecoveryManager::Stop() {
     }
 }
 
+void HARecoveryManager::EnterLocalOnly() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    // Abort + join any in-flight recovery thread (same discipline as Stop()).
+    if (need_abort_) {
+        need_abort_->store(true, std::memory_order_release);
+        abort_cv_.notify_all();
+    }
+    if (recovery_thread_.joinable()) {
+        recovery_thread_.join();
+    }
+    TransitionState(HAClientState::LOCAL_ONLY, "unregister: local-only");
+    // Stop async metadata sync; the client no longer pushes routes to master.
+    if (notifier_) {
+        notifier_->Stop(/*drop_pending=*/true);
+    }
+}
+
 tl::expected<void, ErrorCode> HARecoveryManager::SetSyncCompleted() {
     auto result = master_client_.SetSyncCompleted(client_id_);
     if (!result) {
@@ -89,7 +106,10 @@ void HARecoveryManager::HandleEvent(HAEvent event) {
             break;
 
         case HAEvent::MASTER_RECONNECTED:
-            if (current == HAClientState::DEGRADED) {
+            // Restart the notifier when leaving a local-only state (DEGRADED on
+            // master loss, or LOCAL_ONLY after a proactive unregister + rejoin).
+            if (current == HAClientState::DEGRADED ||
+                current == HAClientState::LOCAL_ONLY) {
                 if (notifier_) notifier_->Start();
             }
             if (current != HAClientState::SYNCING) {

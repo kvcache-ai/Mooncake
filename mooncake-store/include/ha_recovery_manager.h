@@ -49,9 +49,22 @@ class HARecoveryManager {
 
     void Stop();
 
+    /**
+     * @brief Enter a stable LOCAL_ONLY state after a proactive unregister:
+     * abort/join the recovery thread, force state to LOCAL_ONLY, and stop the
+     * async notifier (drop pending). The CALLER MUST have already stopped the
+     * heartbeat, so no HA event can transition the state back out.
+     */
+    void EnterLocalOnly();
+
     bool IsDegraded() const {
         return state_.load(std::memory_order_acquire) ==
                HAClientState::DEGRADED;
+    }
+
+    bool IsLocalService() const {
+        auto s = state_.load(std::memory_order_acquire);
+        return s == HAClientState::DEGRADED || s == HAClientState::LOCAL_ONLY;
     }
 
     HAClientState GetState() const {

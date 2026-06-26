@@ -231,6 +231,7 @@ void ClientMeta::OnDisconnected() {
     LOG(INFO) << "the client is disconnected" << ", client_id=" << client_id_;
     DoOnDisconnected();
     MasterMetricManager::instance().dec_active_clients();
+    MasterMetricManager::instance().inc_clients_disconnected_total();
 }
 
 void ClientMeta::OnRecovered() {
@@ -246,11 +247,20 @@ void ClientMeta::OnRecovered() {
     LOG(INFO) << "the client is recovered" << ", client_id=" << client_id_;
     DoOnRecovered();
     MasterMetricManager::instance().inc_active_clients();
+    MasterMetricManager::instance().inc_clients_recovered_total();
 }
 
 void ClientMeta::OnCrashed() {
-    LOG(INFO) << "the client is crashed, start to recycle meta"
-              << ", client_id=" << client_id_;
+    LOG(INFO) << "the client is crashed" << ", client_id=" << client_id_;
+    MasterMetricManager::instance().inc_clients_crashed_total();
+    RecycleMeta();
+}
+
+void ClientMeta::RecycleMeta() {
+    if (recycled_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    LOG(INFO) << "start to recycle client meta" << ", client_id=" << client_id_;
     SharedMutexLocker lock(&client_mutex_, shared_lock);
     auto segments_res = GetSegmentManager()->GetSegments();
     if (segments_res) {

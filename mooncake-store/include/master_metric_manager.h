@@ -84,6 +84,24 @@ class MasterMetricManager {
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
 
+    // Client RPC Metrics (requests / failures, like other RPCs)
+    void inc_register_client_requests(int64_t val = 1);
+    void inc_register_client_failures(int64_t val = 1);
+    void inc_unregister_client_requests(int64_t val = 1);
+    void inc_unregister_client_failures(int64_t val = 1);
+    int64_t get_register_client_requests();
+    int64_t get_register_client_failures();
+    int64_t get_unregister_client_requests();
+    int64_t get_unregister_client_failures();
+
+    // Client Lifecycle Metrics (Counters)
+    void inc_clients_disconnected_total(int64_t val = 1);
+    void inc_clients_recovered_total(int64_t val = 1);
+    void inc_clients_crashed_total(int64_t val = 1);
+    int64_t get_clients_disconnected_total();
+    int64_t get_clients_recovered_total();
+    int64_t get_clients_crashed_total();
+
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
@@ -344,6 +362,17 @@ class MasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+
+    // Client RPC Metrics (register/unregister requests + failures)
+    ylt::metric::counter_t register_client_requests_;
+    ylt::metric::counter_t register_client_failures_;
+    ylt::metric::counter_t unregister_client_requests_;
+    ylt::metric::counter_t unregister_client_failures_;
+
+    // Client Lifecycle Metrics
+    ylt::metric::counter_t clients_disconnected_total_;
+    ylt::metric::counter_t clients_recovered_total_;
+    ylt::metric::counter_t clients_crashed_total_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;

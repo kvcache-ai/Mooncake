@@ -59,6 +59,13 @@ class P2PClientService final : public ClientService {
     void Destroy() override;
 
     /**
+     * @brief Proactively unregister from the master, stop the heartbeat, and
+     * switch to a stable LOCAL_ONLY service.
+     */
+    tl::expected<void, ErrorCode> UnregisterClient()
+        EXCLUDES(registration_mutex_);
+
+    /**
      * @brief Single put data for a key.
      * @param key The object key.
      * @param slices Data slices.
@@ -251,11 +258,20 @@ class P2PClientService final : public ClientService {
     std::vector<Segment> CollectTierSegments() const;
 
     /**
-     * @brief Register the P2P client with the master server.
-     * Collects segments from mounted_segments_ and registers them.
-     * @return An ErrorCode indicating success or failure.
+     * @brief Register the P2P client with the master. On a re-registration from
+     * LOCAL_ONLY (heartbeat stopped), also restarts the heartbeat and drives
+     * metadata recovery back to FULL.
      */
-    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient() override;
+    tl::expected<RegisterClientResponse, ErrorCode> InnerRegisterClient()
+        override REQUIRES(registration_mutex_);
+
+    /**
+     * @brief Unregister body without the in-flight guard. Used by Stop() to
+     * unregister during shutdown (when the public UnregisterClient() would be
+     * rejected). The caller must hold registration_mutex_.
+     */
+    tl::expected<void, ErrorCode> InnerUnregisterClient()
+        REQUIRES(registration_mutex_);
 
     HeartbeatRequest build_heartbeat_request() override;
 
@@ -501,6 +517,7 @@ class P2PClientService final : public ClientService {
    private:
     void OnHAEvent(HAEvent event) override;
     void RegisterHttpMethods() override;
+    void RecordLocalInflight(bool entering) override;
 
    private:
     std::unique_ptr<P2PClientMetric> metrics_;

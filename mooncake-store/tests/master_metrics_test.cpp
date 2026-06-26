@@ -113,6 +113,43 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
 }
 
+TEST_F(MasterMetricsTest, RegisterUnregisterRpcMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.enable_metric_reporting = true;
+    WrappedCentralizedMasterService service_(service_config);
+
+    UUID client_id = generate_uuid();
+
+    // RegisterClient success -> requests=1, failures=0.
+    RegisterClientRequest reg;
+    reg.client_id = client_id;
+    ASSERT_TRUE(service_.RegisterClient(reg).has_value());
+    EXPECT_EQ(metrics.get_register_client_requests(), 1);
+    EXPECT_EQ(metrics.get_register_client_failures(), 0);
+
+    // RegisterClient duplicate -> requests=2, failures=1.
+    ASSERT_FALSE(service_.RegisterClient(reg).has_value());
+    EXPECT_EQ(metrics.get_register_client_requests(), 2);
+    EXPECT_EQ(metrics.get_register_client_failures(), 1);
+
+    // UnregisterClient success -> requests=1, failures=0.
+    UnregisterClientRequest unreg;
+    unreg.client_id = client_id;
+    unreg.deployment_mode = DeploymentMode::CENTRALIZATION;
+    ASSERT_TRUE(service_.UnregisterClient(unreg).has_value());
+    EXPECT_EQ(metrics.get_unregister_client_requests(), 1);
+    EXPECT_EQ(metrics.get_unregister_client_failures(), 0);
+
+    // UnregisterClient with the wrong deployment mode -> requests=2, failures=1.
+    UnregisterClientRequest bad;
+    bad.client_id = client_id;
+    bad.deployment_mode = DeploymentMode::P2P;
+    ASSERT_FALSE(service_.UnregisterClient(bad).has_value());
+    EXPECT_EQ(metrics.get_unregister_client_requests(), 2);
+    EXPECT_EQ(metrics.get_unregister_client_failures(), 1);
+}
+
 TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();

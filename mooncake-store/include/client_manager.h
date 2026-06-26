@@ -89,6 +89,12 @@ class ClientManager {
         -> tl::expected<RegisterClientResponse, ErrorCode>;
 
     /**
+     * @brief Proactively unregister a client and remove all routing metadata.
+     */
+    auto UnregisterClient(const UnregisterClientRequest& req)
+        -> tl::expected<UnregisterClientResponse, ErrorCode>;
+
+    /**
      * @brief Process a heartbeat from a client.
      * 1. maintain client healthy status machine:
      * - If client not in client_metas_: returns UNDEFINED + view_version,

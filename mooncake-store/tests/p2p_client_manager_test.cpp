@@ -10,6 +10,7 @@
 #undef private
 #undef protected
 #include "p2p_client_meta.h"
+#include "master_metric_manager.h"
 #include <set>
 
 namespace mooncake {
@@ -134,6 +135,148 @@ TEST_F(P2PClientManagerTest, RegisterComplexScenario) {
     auto segments_res = client3->GetSegments();
     ASSERT_TRUE(segments_res.has_value());
     EXPECT_EQ(segments_res.value().size(), 5);
+}
+
+// ============================================================
+// UnregisterClient
+// ============================================================
+
+TEST_F(P2PClientManagerTest, UnregisterClientSuccess) {
+    std::atomic<int> removal_count{0};
+    auto mgr = CreateManager();
+    mgr->SetSegmentRemovalCallback(
+        [&removal_count](const UUID& seg_id) { removal_count.fetch_add(1); });
+    mgr->Start();
+
+    UUID client_id = {100, 200};
+    auto seg1 = MakeP2PSegment({1, 1}, "seg1");
+    auto seg2 = MakeP2PSegment({1, 2}, "seg2");
+    auto req =
+        MakeP2PRegisterRequest(client_id, "10.0.0.1", 50051, {seg1, seg2});
+    ASSERT_TRUE(mgr->RegisterClient(req).has_value());
+    EXPECT_EQ(mgr->GetAllClients().size(), 1);
+
+    auto res = mgr->UnregisterClient(
+        UnregisterClientRequest{client_id, DeploymentMode::P2P});
+    ASSERT_TRUE(res.has_value());
+
+    // Client and all its segments are gone.
+    EXPECT_EQ(mgr->GetClient(client_id), nullptr);
+    EXPECT_EQ(mgr->GetAllClients().size(), 0);
+    // Both segments unmounted -> removal callback fired twice.
+    EXPECT_EQ(removal_count.load(), 2);
+}
+
+TEST_F(P2PClientManagerTest, UnregisterClientNotFoundIsIdempotent) {
+    auto mgr = CreateManager();
+    mgr->Start();
+
+    // Unregistering an absent client is a no-op success.
+    auto res = mgr->UnregisterClient(
+        UnregisterClientRequest{{999, 999}, DeploymentMode::P2P});
+    EXPECT_TRUE(res.has_value());
+}
+
+TEST_F(P2PClientManagerTest, UnregisterClientWrongDeploymentMode) {
+    auto mgr = CreateManager();
+    mgr->Start();
+
+    UUID client_id = {100, 200};
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest(client_id))
+                    .has_value());
+
+    auto res = mgr->UnregisterClient(
+        UnregisterClientRequest{client_id, DeploymentMode::CENTRALIZATION});
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::ILLEGAL_CLIENT);
+    // Client still present (request rejected before cleanup).
+    EXPECT_NE(mgr->GetClient(client_id), nullptr);
+}
+
+TEST_F(P2PClientManagerTest, UnregisterThenReRegister) {
+    auto mgr = CreateManager();
+    mgr->Start();
+
+    UUID client_id = {100, 200};
+    auto seg = MakeP2PSegment({1, 1}, "seg1");
+    ASSERT_TRUE(
+        mgr->RegisterClient(
+               MakeP2PRegisterRequest(client_id, "10.0.0.1", 50051, {seg}))
+            .has_value());
+
+    ASSERT_TRUE(mgr->UnregisterClient(
+                       UnregisterClientRequest{client_id, DeploymentMode::P2P})
+                    .has_value());
+    EXPECT_EQ(mgr->GetClient(client_id), nullptr);
+
+    // Re-registering the same client_id succeeds (no CLIENT_ALREADY_EXISTS).
+    ASSERT_TRUE(
+        mgr->RegisterClient(
+               MakeP2PRegisterRequest(client_id, "10.0.0.1", 50051, {seg}))
+            .has_value());
+    EXPECT_NE(mgr->GetClient(client_id), nullptr);
+}
+
+// ============================================================
+// Lifecycle Metrics (active_clients gauge / disconnected /
+// recovered / crashed counters). The register/unregister RPC
+// request/failure counters live in the WrappedMasterService layer
+// (see MasterMetricsTest.RegisterUnregisterRpcMetrics).
+// ============================================================
+
+TEST_F(P2PClientManagerTest, RegisterUnregisterActiveGauge) {
+    MasterMetricManager::instance().reset_all_metrics();
+    auto& m = MasterMetricManager::instance();
+
+    auto mgr = CreateManager();
+    mgr->Start();
+
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest({1, 0})).has_value());
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest({2, 0})).has_value());
+    EXPECT_EQ(m.get_active_clients(), 2);
+
+    // Proactively unregister a HEALTH client: active-- and NOT counted a crash.
+    ASSERT_TRUE(
+        mgr->UnregisterClient(
+               UnregisterClientRequest{{1, 0}, DeploymentMode::P2P})
+            .has_value());
+    EXPECT_EQ(m.get_active_clients(), 1);
+    EXPECT_EQ(m.get_clients_crashed_total(), 0);
+}
+
+TEST_F(P2PClientManagerTest, HealthTransitionMetrics) {
+    MasterMetricManager::instance().reset_all_metrics();
+    auto& m = MasterMetricManager::instance();
+
+    const int disconnect_sec = 1;
+    const int crash_sec = 2;
+    auto mgr = CreateManager(disconnect_sec, crash_sec);
+    // Manual control over status transitions (mirror ForEachClientHealthEffect).
+    mgr->StopClientMonitor();
+
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest({1, 0})).has_value());
+    EXPECT_EQ(m.get_active_clients(), 1);
+
+    // > disconnect_sec, < crash_sec -> DISCONNECTION.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    mgr->ClientMonitorFunc();
+    EXPECT_EQ(m.get_clients_disconnected_total(), 1);
+    EXPECT_EQ(m.get_active_clients(), 0);  // disconnect decrements active gauge
+
+    // Heartbeat recovers the client -> recovered++, active++.
+    ASSERT_TRUE(
+        mgr->Heartbeat(HeartbeatRequest{.client_id = UUID{1, 0}, .tasks = {}})
+            .has_value());
+    EXPECT_EQ(m.get_clients_recovered_total(), 1);
+    EXPECT_EQ(m.get_active_clients(), 1);
+
+    // Cross disconnect threshold again, then crash threshold.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    mgr->ClientMonitorFunc();  // -> DISCONNECTION (disconnected_total = 2)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    mgr->ClientMonitorFunc();  // -> CRASHED + removed
+    EXPECT_EQ(m.get_clients_crashed_total(), 1);
+    EXPECT_EQ(mgr->GetAllClients().size(), 0);
 }
 
 // ============================================================

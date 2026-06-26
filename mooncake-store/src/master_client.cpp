@@ -89,6 +89,11 @@ struct RpcNameTraits<&WrappedMasterService::RegisterClient> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UnregisterClient> {
+    static constexpr const char* value = "UnregisterClient";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::QueryClientStatus> {
     static constexpr const char* value = "QueryClientStatus";
 };
@@ -323,6 +328,18 @@ tl::expected<RegisterClientResponse, ErrorCode> MasterClient::RegisterClient(
 
     auto result = invoke_rpc<&WrappedMasterService::RegisterClient,
                              RegisterClientResponse>(req);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<UnregisterClientResponse, ErrorCode>
+MasterClient::UnregisterClient(const UnregisterClientRequest& req) {
+    ScopedVLogTimer timer(1, "MasterClient::UnregisterClient");
+    timer.LogRequest("client_id=", client_id_,
+                     ", deployment_mode=", req.deployment_mode);
+
+    auto result = invoke_rpc<&WrappedMasterService::UnregisterClient,
+                             UnregisterClientResponse>(req);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -181,6 +181,14 @@ class MasterClient {
     [[nodiscard]] tl::expected<RegisterClientResponse, ErrorCode>
     RegisterClient(const RegisterClientRequest& req);
 
+    /**
+     * @brief Unregister client from the master
+     * @param req request with the client id to unregister
+     * @return tl::expected<UnregisterClientResponse, ErrorCode>
+     */
+    [[nodiscard]] tl::expected<UnregisterClientResponse, ErrorCode>
+    UnregisterClient(const UnregisterClientRequest& req);
+
    protected:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr)
         : client_id_(client_id), metrics_(metrics) {

@@ -2,6 +2,7 @@
 
 #include <boost/functional/hash.hpp>
 #include "segment_manager.h"
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <ylt/util/expected.hpp>
@@ -77,7 +78,12 @@ class ClientMeta {
     virtual void DoOnDisconnected() = 0;
     void OnRecovered();
     virtual void DoOnRecovered() = 0;
+    // Crash hook: counts the crash and recycles the meta (segments). Like
+    // OnDisconnected/OnRecovered, the metric accounting lives inside the hook.
     void OnCrashed();
+    // Releases the meta's resources (unmounts its segments) WITHOUT any crash
+    // accounting. Reused by both OnCrashed() and a proactive UnregisterClient().
+    void RecycleMeta();
 
    public:
     UUID get_client_id() const { return client_id_; }
@@ -101,6 +107,7 @@ class ClientMeta {
     mutable SharedMutex client_mutex_;
     UUID client_id_;
     ClientHealthState health_state_ GUARDED_BY(client_mutex_);
+    std::atomic<bool> recycled_{false};
 };
 
 }  // namespace mooncake

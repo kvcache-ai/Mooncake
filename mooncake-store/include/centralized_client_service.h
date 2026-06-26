@@ -232,7 +232,8 @@ class CentralizedClientService
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
-    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient() override;
+    tl::expected<RegisterClientResponse, ErrorCode> InnerRegisterClient()
+        override REQUIRES(registration_mutex_);
 
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     BatchGetOffloadObjectFromStorage(const std::vector<std::string>& keys,
@@ -389,7 +390,7 @@ class CentralizedClientService
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
-    SharedMutex mounted_segments_mutex_;
+    SharedMutex mounted_segments_mutex_ ACQUIRED_AFTER(registration_mutex_);
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
     // File storage for offloading

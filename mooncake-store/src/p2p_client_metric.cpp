@@ -54,7 +54,9 @@ RequestMetric::RequestMetric(const std::string& prefix,
       unpin_key_latency_failure(prefix + "_unpin_key_latency_failure_us",
                                 "UnPinKey rollback RPC latency for failed "
                                 "requests (us)",
-                                kLatencyBucket, labels) {}
+                                kLatencyBucket, labels),
+      inflight(prefix + "_inflight",
+               "Number of currently in-flight requests", labels) {}
 
 void RequestMetric::serialize(std::string& str) {
     get_requests.serialize(str);
@@ -77,6 +79,7 @@ void RequestMetric::serialize(std::string& str) {
     unpin_key_failures.serialize(str);
     unpin_key_latency_success.serialize(str);
     unpin_key_latency_failure.serialize(str);
+    inflight.serialize(str);
 }
 
 std::string RequestMetric::summary_metrics() {
@@ -93,6 +96,8 @@ std::string RequestMetric::summary_metrics() {
        << " requests, " << write_revoke_failures.value() << " failures\n";
     ss << "UnPinKey rollback: " << unpin_key_requests.value() << " requests, "
        << unpin_key_failures.value() << " failures\n";
+
+    ss << "In-flight: " << inflight.value() << " requests\n";
 
     return ss.str();
 }

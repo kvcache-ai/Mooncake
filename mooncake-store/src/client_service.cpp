@@ -118,7 +118,11 @@ void ClientService::Stop() {
 }
 
 void ClientService::StopHeartbeat() {
-    // Stop ping thread only after no need to contact master anymore
+    MutexLocker lk(&registration_mutex_);
+    InnerStopHeartbeat();
+}
+
+void ClientService::InnerStopHeartbeat() {
     if (heartbeat_running_) {
         {
             std::lock_guard<std::mutex> lock(heartbeat_mtx_);
@@ -165,6 +169,17 @@ void ClientService::StartHeartbeat(const std::string& master_server_entry) {
         this->HeartbeatThreadMain(is_ha_mode, std::move(current_master_address),
                                   master_server_entry);
     });
+}
+
+tl::expected<RegisterClientResponse, ErrorCode>
+ClientService::RegisterClient() {
+    MutexLocker lk(&registration_mutex_);
+    InflightTracker::Guard guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(WARNING) << "inflight guard invalid";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    return InnerRegisterClient();
 }
 
 ErrorCode ClientService::ConnectToMaster(
@@ -567,21 +582,7 @@ void ClientService::HeartbeatThreadMain(
     // Increment after a heartbeat failure, reset after a heartbeat success
     int heartbeat_fail_count = 0;
 
-    auto register_client = [this]() {
-        LOG(INFO) << "Sending RegisterClientRequest"
-                  << ", client_id=" << client_id_;
-        auto res = RegisterClient();
-        if (!res) {
-            LOG(ERROR) << "Failed to register client"
-                       << ", client_id=" << client_id_
-                       << ", error=" << res.error();
-        } else {
-            LOG(INFO) << "Client registered successfully"
-                      << ", client_id=" << client_id_
-                      << ", view_version=" << res.value().view_version;
-            OnHAEvent(HAEvent::MASTER_RECONNECTED);
-        }
-    };
+    auto register_client = [this]() { HeartbeatTryRegister(); };
     // Use another thread to register client to avoid blocking the heartbeat
     // thread
     std::future<void> register_client_future;
@@ -638,7 +639,48 @@ void ClientService::WaitForNextHeartbeat(int interval_ms) {
                            [this] { return !heartbeat_running_; });
 }
 
-bool ClientService::HandleHeartbeatResponse(
+void ClientService::HeartbeatTryRegister() NO_THREAD_SAFETY_ANALYSIS {
+    MutexLocker lk(&registration_mutex_, /*lock_now=*/false);
+    if (!lk.TryLock()) {
+        // try_lock to avoid a deadlock between the unregister path and this
+        // background worker:
+        // 1. UnregisterClient/StopHeartbeat hold registration_mutex_ while
+        // joining the heartbeat thread
+        // 2. this worker should take registration_mutex_ to register. Thus it
+        // has a conflict with unregister method.
+        LOG(INFO)
+            << "Skip heartbeat-driven register: op in progress, client_id="
+            << client_id_;
+        return;
+    }
+    InflightTracker::Guard guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        // Service is shutting down; do not register at the master.
+        LOG(INFO) << "Skip heartbeat-driven register: shutting down, client_id="
+                  << client_id_;
+        return;
+    }
+    tl::expected<RegisterClientResponse, ErrorCode> res;
+    try {
+        res = InnerRegisterClient();
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "InnerRegisterClient threw, client_id=" << client_id_
+                   << ", what=" << e.what();
+        return;
+    } catch (...) {
+        LOG(ERROR) << "InnerRegisterClient threw unknown, client_id="
+                   << client_id_;
+        return;
+    }
+    // Recovery is driven inside InnerRegisterClient on a successful register,
+    // so nothing more to do here besides surfacing a failure.
+    if (!res) {
+        LOG(ERROR) << "Failed to register client, client_id=" << client_id_
+                   << ", error=" << res.error();
+    }
+}
+
+void ClientService::HandleHeartbeatResponse(
     const HeartbeatResponse& response,
     const std::string& current_master_address,
     const std::function<void()>& register_client,
@@ -666,7 +708,6 @@ bool ClientService::HandleHeartbeatResponse(
         register_client_future =
             std::async(std::launch::async, register_client);
     }
-    return true;
 }
 
 void ClientService::HandleHeartbeatTaskResult(

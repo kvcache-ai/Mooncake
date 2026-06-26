@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ylt/metric/gauge.hpp>
+
 #include "client_metric.h"
 
 namespace mooncake {
@@ -32,6 +34,9 @@ struct RequestMetric {
     ylt::metric::counter_t unpin_key_failures;
     ylt::metric::histogram_t unpin_key_latency_success;
     ylt::metric::histogram_t unpin_key_latency_failure;
+
+    // Number of currently in-flight requests of this direction (gauge).
+    ylt::metric::gauge_t inflight;
 
     explicit RequestMetric(
         const std::string& prefix,

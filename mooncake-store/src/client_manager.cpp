@@ -257,6 +257,52 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
     return response;
 }
 
+auto ClientManager::UnregisterClient(const UnregisterClientRequest& req)
+    -> tl::expected<UnregisterClientResponse, ErrorCode> {
+    if (req.deployment_mode != GetDeploymentMode()) {
+        LOG(ERROR) << "UnregisterClient: architecture mismatch"
+                   << ", client_mode=" << static_cast<int>(req.deployment_mode)
+                   << ", master_mode=" << static_cast<int>(GetDeploymentMode())
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    const auto& client_id = req.client_id;
+    std::shared_ptr<ClientMeta> meta;
+    bool was_health = false;
+    {
+        SharedMutexLocker lock(&clients_mutex_);
+        auto it = client_metas_.find(client_id);
+        if (it == client_metas_.end()) {
+            // Idempotent: already absent (crashed-out or double unregister).
+            UnregisterClientResponse response;
+            response.view_version = view_version_;
+            LOG(INFO) << "UnregisterClient: client not found (idempotent ok)"
+                      << ", client_id=" << client_id;
+            return response;
+        }
+        meta = std::move(it->second);
+        was_health = (meta->get_health_state().status == ClientStatus::HEALTH);
+        client_metas_.erase(it);
+    }
+
+    // The client is out of client_metas_ now. Recycle its segments WITHOUT crash
+    // accounting (this is a proactive unregister, not a crash).
+    meta->RecycleMeta();
+
+    // Decrement the active gauge only if the client was still HEALTH: the
+    // unhealthy path already decremented it in OnDisconnected().
+    if (was_health) {
+        MasterMetricManager::instance().dec_active_clients();
+    }
+
+    UnregisterClientResponse response;
+    response.view_version = view_version_;
+    LOG(INFO) << "UnregisterClient: client_id=" << client_id
+              << ", was_health=" << was_health;
+    return response;
+}
+
 auto ClientManager::Heartbeat(const HeartbeatRequest& req)
     -> tl::expected<HeartbeatResponse, ErrorCode> {
     const auto& client_id = req.client_id;

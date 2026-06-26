@@ -170,8 +170,6 @@ ErrorCode CentralizedClientService::Init(
 
     InitLocalBufferAllocator(config.local_buffer_size, config.protocol);
 
-    is_running_ = true;
-
     auto reg = RegisterClient();
     if (!reg) {
         LOG(ERROR) << "Failed to register centralized client with master: "
@@ -2038,7 +2036,8 @@ HeartbeatRequest CentralizedClientService::build_heartbeat_request() {
 }
 
 tl::expected<RegisterClientResponse, ErrorCode>
-CentralizedClientService::RegisterClient() {
+CentralizedClientService::InnerRegisterClient() {
+    // Runs under registration_mutex_; mounted_segments_mutex_ nests inside it.
     // This lock must be held until the register rpc is finished,
     // otherwise there will be corner cases, e.g., a segment is
     // unmounted successfully first, and then registered again in

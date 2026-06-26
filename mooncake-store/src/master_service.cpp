@@ -183,6 +183,11 @@ auto MasterService::RegisterClient(const RegisterClientRequest& req)
     return GetClientManager().RegisterClient(req);
 }
 
+auto MasterService::UnregisterClient(const UnregisterClientRequest& req)
+    -> tl::expected<UnregisterClientResponse, ErrorCode> {
+    return GetClientManager().UnregisterClient(req);
+}
+
 auto MasterService::Heartbeat(const HeartbeatRequest& req)
     -> tl::expected<HeartbeatResponse, ErrorCode> {
     return GetClientManager().Heartbeat(req);

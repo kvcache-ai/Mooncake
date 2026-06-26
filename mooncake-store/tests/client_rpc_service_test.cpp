@@ -562,4 +562,80 @@ TEST_F(ClientRpcServiceTest, WriteRevokeTokenMismatch) {
     ASSERT_TRUE(good_res.has_value());
 }
 
+// ============================================================================
+// Graceful stop (drain / reject new peer RPCs)
+// ============================================================================
+
+TEST_F(ClientRpcServiceTest, StopWhenIdleReturns) {
+    // No in-flight handlers -> Stop() drains and returns immediately (no hang).
+    rpc_service_->Stop();
+    SUCCEED();
+}
+
+TEST_F(ClientRpcServiceTest, StopRejectsNewPeerRpcs) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    // Before stopping: a PreWrite is admitted and reaches the backend.
+    PreWriteRequest pre;
+    pre.key = "drain_prewrite_admitted";
+    pre.size_bytes = 64;
+    pre.target_tier_id = tier_id;
+    ASSERT_TRUE(rpc_service_->PreWrite(pre).has_value());
+
+    // Stop (no in-flight -> returns immediately).
+    rpc_service_->Stop();
+
+    // After draining: every handler rejects new requests with a retryable code
+    // (the reject happens in the peer-RPC tracker guard, before any work).
+    PreWriteRequest pre2;
+    pre2.key = "drain_prewrite_rejected";
+    pre2.size_bytes = 64;
+    pre2.target_tier_id = tier_id;
+    auto pre_res = rpc_service_->PreWrite(pre2);
+    ASSERT_FALSE(pre_res.has_value());
+    EXPECT_EQ(pre_res.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    RemoteReadRequest read;
+    read.key = "k";
+    read.dest_buffers.push_back(CreateBufferDesc("seg", 0x1000, 100));
+    auto read_res = rpc_service_->ReadRemoteData(read);
+    ASSERT_FALSE(read_res.has_value());
+    EXPECT_EQ(read_res.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    RemoteWriteRequest write;
+    write.key = "k";
+    write.src_buffers.push_back(CreateBufferDesc("seg", 0x1000, 100));
+    auto write_res = rpc_service_->WriteRemoteData(write);
+    ASSERT_FALSE(write_res.has_value());
+    EXPECT_EQ(write_res.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    PinKeyRequest pin;
+    pin.key = "k";
+    pin.target_tier_id = std::nullopt;
+    auto pin_res = rpc_service_->PinKey(pin);
+    ASSERT_FALSE(pin_res.has_value());
+    EXPECT_EQ(pin_res.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(ClientRpcServiceTest, PeerInflightGaugeExportedInMetrics) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    // A service wired with a metric: each handler inc/dec peer_request.inflight.
+    P2PClientMetric metric(/*interval_seconds=*/0, /*labels=*/{});
+    ClientRpcService rpc(*data_manager_, &metric);
+
+    PreWriteRequest pre;
+    pre.key = "peer_inflight_metric_key";
+    pre.size_bytes = 64;
+    pre.target_tier_id = tier_id;
+    ASSERT_TRUE(rpc.PreWrite(pre).has_value());
+
+    // The gauge has been touched (back to 0 now) and is therefore exported.
+    std::string s;
+    metric.serialize(s);
+    EXPECT_NE(s.find("mooncake_p2p_peer_inflight"), std::string::npos) << s;
+}
+
 }  // namespace mooncake
