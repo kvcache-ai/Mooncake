@@ -72,7 +72,7 @@ endif()
 
 if(USE_MACA)
   if(NOT DEFINED MACA_RUNTIME_LIBS)
-    set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt mlx5)
+    set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
   endif()
   target_include_directories(transfer_engine PRIVATE ${MACA_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
