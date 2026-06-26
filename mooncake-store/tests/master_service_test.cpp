@@ -8,17 +8,52 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_set>
-#include <utility>
 
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake::test {
+
+class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(const char* name) : name_(name) {
+        Capture();
+        ::unsetenv(name_.c_str());
+    }
+
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        Capture();
+        ::setenv(name_.c_str(), value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_value_.has_value()) {
+            ::setenv(name_.c_str(), previous_value_->c_str(), 1);
+        } else {
+            ::unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    void Capture() {
+        const char* value = ::getenv(name_.c_str());
+        if (value != nullptr) {
+            previous_value_ = value;
+        }
+    }
+
+    std::string name_;
+    std::optional<std::string> previous_value_;
+};
 
 class MasterServiceTest : public ::testing::Test {
    protected:
@@ -37,13 +72,15 @@ class MasterServiceTest : public ::testing::Test {
 
     Segment MakeSegment(std::string name = "test_segment",
                         size_t base = kDefaultSegmentBase,
-                        size_t size = kDefaultSegmentSize) const {
+                        size_t size = kDefaultSegmentSize,
+                        std::string host_id = "") const {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
         segment.base = base;
         segment.size = size;
         segment.te_endpoint = segment.name;
+        segment.host_id = std::move(host_id);
         return segment;
     }
 
@@ -65,9 +102,10 @@ class MasterServiceTest : public ::testing::Test {
 
     MountedSegmentContext PrepareSimpleSegment(
         MasterService& service, std::string name = "test_segment",
-        size_t base = kDefaultSegmentBase,
-        size_t size = kDefaultSegmentSize) const {
-        Segment segment = MakeSegment(std::move(name), base, size);
+        size_t base = kDefaultSegmentBase, size_t size = kDefaultSegmentSize,
+        std::string host_id = "") const {
+        Segment segment =
+            MakeSegment(std::move(name), base, size, std::move(host_id));
         UUID client_id = generate_uuid();
         auto mount_result = service.MountSegment(segment, client_id);
         EXPECT_TRUE(mount_result.has_value());
@@ -1827,6 +1865,136 @@ TEST_F(MasterServiceTest, PutWithPreferredSegments) {
     auto put_end_result =
         service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
+}
+
+TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersEnvAndRejectsLoopback) {
+    {
+        ScopedEnvVar env("MOONCAKE_HOST_ID", " hostA ");
+        EXPECT_EQ(ResolveMooncakeHostId("127.0.0.1:5000"), "hostA");
+    }
+    {
+        ScopedEnvVar env("MOONCAKE_HOST_ID");
+        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+        EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("127.0.0.1:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("::1").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("[::1]:5000").empty());
+    }
+}
+
+TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
+    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
+    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "local_first_key",
+                                      "default", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+}
+
+TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
+    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
+    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host2 = PrepareSimpleSegment(
+        service, "segment_host2", 0x400000000, kDefaultSegmentSize, "host2");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "ordered_fallback_key",
+                                      "default", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host2");
+}
+
+TEST_F(MasterServiceTest, LocalFirstPutFallsBackWhenLocalSegmentIsFull) {
+    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
+    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto local = PrepareSimpleSegment(
+        service, "segment_host1", 0x300000000, 1024, "host1");
+    [[maybe_unused]] const auto remote = PrepareSimpleSegment(
+        service, "segment_host2", 0x400000000, kDefaultSegmentSize, "host2");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+
+    auto fill_start = service.PutStart(writer_client_id, "fill_local_segment",
+                                       "default", 1024, config);
+    ASSERT_TRUE(fill_start.has_value());
+    ASSERT_EQ(fill_start->size(), 1u);
+    EXPECT_EQ((*fill_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+    ASSERT_TRUE(service
+                    .PutEnd(writer_client_id, "fill_local_segment", "default",
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    auto fallback_start = service.PutStart(
+        writer_client_id, "fallback_after_local_full", "default", 1, config);
+    ASSERT_TRUE(fallback_start.has_value());
+    ASSERT_EQ(fallback_start->size(), 1u);
+    EXPECT_EQ((*fallback_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host2");
+}
+
+TEST_F(MasterServiceTest, ExplicitPreferredSegmentOverridesLocalFirst) {
+    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
+    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+    config.preferred_segment = "segment_host0";
+
+    auto put_start = service.PutStart(
+        writer_client_id, "explicit_preferred_key", "default", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host0");
 }
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {

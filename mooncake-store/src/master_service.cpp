@@ -1,8 +1,11 @@
 #include "master_service.h"
 
+#include <algorithm>
 #include <thread>
 #include <cassert>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -69,6 +72,28 @@ constexpr int kMaxTenantQuotaEvictionRetries = 2;
 // falls back according to `offload_force_evict_`.
 // NOTE: Both offloading_queue_limit_ and offload_cap_ratio_ are now
 // configurable via --offloading_queue_limit and --offload_cap_ratio flags.
+
+std::string ToLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return value;
+}
+
+bool ResolveLocalFirstAllocEnabled() {
+    const std::string value =
+        ToLowerAscii(GetEnvStringOr("MOONCAKE_LOCAL_FIRST_ALLOC", ""));
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+std::string ResolveHostFallbackPolicy() {
+    const std::string policy = ToLowerAscii(
+        GetEnvStringOr("MOONCAKE_HOST_FALLBACK_POLICY", "ordered"));
+    if (!policy.empty() && policy != "ordered") {
+        LOG(WARNING) << "Unsupported MOONCAKE_HOST_FALLBACK_POLICY=" << policy
+                     << ", falling back to ordered";
+    }
+    return "ordered";
+}
 
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
@@ -205,6 +230,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                     ? AllocationStrategyType::CXL
                                     : config.allocation_strategy_type),
       allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
+      local_first_alloc_enabled_(ResolveLocalFirstAllocEnabled()),
+      host_fallback_policy_(ResolveHostFallbackPolicy()),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -232,6 +259,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
     } else {
         http_metadata_prefix_ = "mooncake/";
     }
+    LOG(INFO) << "Host-aware local-first allocation "
+              << (local_first_alloc_enabled_ ? "enabled" : "disabled")
+              << ", fallback_policy=" << host_fallback_policy_;
 
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
@@ -683,6 +713,7 @@ void MasterService::SetDefaultTenantQuotaPolicy(
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    ErrorCode mount_result = ErrorCode::OK;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     {
         ScopedSegmentAccess segment_access =
@@ -716,12 +747,15 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         auto err = segment_access.MountSegment(segment, client_id);
         if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
             // Return OK because this is an idempotent operation
-            return {};
+            mount_result = err;
         } else if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
     }
-    RecomputeTenantEffectiveQuotas();
+    UpdateClientHostId(client_id, segment.host_id);
+    if (mount_result == ErrorCode::OK) {
+        RecomputeTenantEffectiveQuotas();
+    }
     return {};
 }
 
@@ -757,6 +791,12 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        for (const auto& segment : segments) {
+            if (!segment.host_id.empty()) {
+                client_host_id_[client_id] = segment.host_id;
+                break;
+            }
+        }
         if (ok_client_.contains(client_id)) {
             LOG(WARNING) << "client_id=" << client_id
                          << ", warn=client_already_remounted";
@@ -827,6 +867,21 @@ std::unordered_set<UUID, boost::hash<UUID>>
 MasterService::getAliveClientsSnapshot() const {
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     return ok_client_;
+}
+
+void MasterService::UpdateClientHostId(const UUID& client_id,
+                                       const std::string& host_id) {
+    if (host_id.empty()) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(client_mutex_);
+    client_host_id_[client_id] = host_id;
+}
+
+std::string MasterService::GetClientHostId(const UUID& client_id) const {
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    auto it = client_host_id_.find(client_id);
+    return it == client_host_id_.end() ? std::string() : it->second;
 }
 
 size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
@@ -2376,6 +2431,14 @@ auto MasterService::AllocateAndInsertMetadata(
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     if (config.replica_num > 0) {
+        const bool has_explicit_preferred = !config.preferred_segment.empty() ||
+                                            !config.preferred_segments.empty();
+        std::string writer_host_id;
+        if (local_first_alloc_enabled_ && config.replica_num == 1 &&
+            !has_explicit_preferred) {
+            writer_host_id = GetClientHostId(client_id);
+        }
+
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
@@ -2385,6 +2448,15 @@ auto MasterService::AllocateAndInsertMetadata(
             preferred_segments.push_back(config.preferred_segment);
         } else if (!config.preferred_segments.empty()) {
             preferred_segments = config.preferred_segments;
+        } else if (!writer_host_id.empty()) {
+            preferred_segments =
+                allocator_access.GetHostOrderedSegments(writer_host_id, key);
+            if (!preferred_segments.empty()) {
+                VLOG(1) << "key=" << key
+                        << ", writer_host_id=" << writer_host_id
+                        << ", local_first_preferred_segments="
+                        << preferred_segments.size();
+            }
         }
 
         const SsdMetricsProvider* ssd_provider = nullptr;
@@ -2558,6 +2630,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #endif
+
+    UpdateClientHostId(client_id, config.host_id);
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -2966,6 +3040,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #endif
+
+    UpdateClientHostId(client_id, config.host_id);
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -4191,15 +4267,20 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-auto MasterService::Ping(const UUID& client_id)
+auto MasterService::Ping(const UUID& client_id, const std::string& host_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> lock(client_mutex_);
     ClientStatus client_status;
-    auto it = ok_client_.find(client_id);
-    if (it != ok_client_.end()) {
-        client_status = ClientStatus::OK;
-    } else {
-        client_status = ClientStatus::NEED_REMOUNT;
+    {
+        std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        if (!host_id.empty()) {
+            client_host_id_[client_id] = host_id;
+        }
+        auto it = ok_client_.find(client_id);
+        if (it != ok_client_.end()) {
+            client_status = ClientStatus::OK;
+        } else {
+            client_status = ClientStatus::NEED_REMOUNT;
+        }
     }
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!client_ping_queue_.push(pod_client_id)) {
@@ -7261,6 +7342,7 @@ void MasterService::ClientMonitorFunc() {
                         ok_client_.erase(it);
                         MasterMetricManager::instance().dec_active_clients();
                     }
+                    client_host_id_.erase(client_id);
                 }
 
                 ScopedSegmentAccess segment_access =

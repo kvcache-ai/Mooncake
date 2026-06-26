@@ -454,9 +454,10 @@ struct Segment {
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
     std::string protocol;
+    std::string host_id{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
  * @brief Allocation strategy type for segment allocation

@@ -2,7 +2,9 @@
 
 #include <boost/functional/hash.hpp>
 #include <chrono>
+#include <map>
 #include <ostream>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -174,6 +176,9 @@ class ScopedSegmentAccess {
     ErrorCode GetAllSegments(
         std::vector<std::pair<Segment, UUID>>& all_segments);
 
+    std::vector<std::string> GetHostOrderedSegments(
+        const std::string& writer_host_id, const std::string& key) const;
+
     ErrorCode GetAllSegmentNames(std::vector<std::string>& all_segment_names);
 
     /**
@@ -317,10 +322,23 @@ class ScopedAllocatorAccess {
                                    std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager), lock_(mutex) {}
 
+    explicit ScopedAllocatorAccess(
+        const AllocatorManager& allocator_manager,
+        const std::map<std::string, std::set<std::string>>& segments_by_host,
+        std::shared_mutex& mutex)
+        : allocator_manager_(allocator_manager),
+          segments_by_host_(&segments_by_host),
+          lock_(mutex) {}
+
     const AllocatorManager& getAllocatorManager() { return allocator_manager_; }
+
+    std::vector<std::string> GetHostOrderedSegments(
+        const std::string& writer_host_id, const std::string& key) const;
 
    private:
     const AllocatorManager& allocator_manager_;
+    const std::map<std::string, std::set<std::string>>* segments_by_host_{
+        nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -424,7 +442,8 @@ class SegmentManager {
      * @return ScopedAllocatorAccess object that holds the lock
      */
     ScopedAllocatorAccess getAllocatorAccess() {
-        return ScopedAllocatorAccess(allocator_manager_, segment_mutex_);
+        return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
+                                     segment_mutex_);
     }
 
     ScopedLocalDiskSegmentAccess getLocalDiskSegmentAccess() {
@@ -456,6 +475,8 @@ class SegmentManager {
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
         segment_id_by_name_;  // segment name -> segment_id
+    std::map<std::string, std::set<std::string>>
+        segments_by_host_;  // host_id -> allocatable segment names
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
                        boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment
