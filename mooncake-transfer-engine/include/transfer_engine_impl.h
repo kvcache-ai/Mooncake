@@ -33,7 +33,7 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
 #include "transport/device/device_transport.h"
 #endif
 #ifdef WITH_METRICS
@@ -344,7 +344,7 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
     // Device transport accessors — lazily created, owned by this impl.
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
@@ -427,7 +427,7 @@ class TransferEngineImpl {
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
     // Device transports (P2P + IBGDA) — lazily created, owned by this impl.
     // Referenced by EP and future CPU-proxy paths.
     std::unique_ptr<device::P2pTransport> p2p_transport_;
