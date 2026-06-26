@@ -2189,7 +2189,7 @@ auto MasterService::GetReplicaList(const std::string& key,
         if (replica_list[0].is_memory_replica()) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
             MasterMetricManager::instance().inc_mem_cache_hit_bytes(metadata.size);
-        } else if (replica_list[0].is_disk_replica()) {
+        } else if (replica_list[0].is_local_disk_replica() || replica_list[0].is_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
             MasterMetricManager::instance().inc_file_cache_hit_bytes(metadata.size);
         }
@@ -2313,7 +2313,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 if (replica_list[0].is_memory_replica()) {
                     MasterMetricManager::instance().inc_mem_cache_hit_nums();
                     MasterMetricManager::instance().inc_mem_cache_hit_bytes(metadata.size);
-                } else if (replica_list[0].is_disk_replica()) {
+                } else if (replica_list[0].is_local_disk_replica() || replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
                     MasterMetricManager::instance().inc_file_cache_hit_bytes(metadata.size);
                 }
