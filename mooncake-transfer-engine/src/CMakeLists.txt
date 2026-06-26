@@ -29,10 +29,8 @@ if(USE_ETCD)
       target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
     endif()
   else()
-    add_dependencies(transfer_engine build_etcd_wrapper)
-    set(ETCD_WRAPPER_LIB
-        ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so
-    )
+    add_dependencies(transfer_engine build_ha_wrapper)
+    set(ETCD_WRAPPER_LIB ${HA_WRAPPER_LIB})
     target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
   endif()
 endif()
@@ -97,8 +95,8 @@ if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 
-  # Optional dmabuf MR registration path (requires hsa-runtime64 and a
-  # kernel with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
+  # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
+  # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
   option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)
   if(USE_HIP_DMABUF)
     find_package(hsa-runtime64 CONFIG)
@@ -107,7 +105,8 @@ if(USE_HIP)
       target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
       message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
     else()
-      message(STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
+      message(
+        STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
     endif()
   else()
     message(STATUS "HIP dmabuf MR registration disabled (USE_HIP_DMABUF=OFF)")

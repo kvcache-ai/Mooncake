@@ -1,7 +1,7 @@
 #include "k8s_lease_helper.h"
 
 #ifdef STORE_USE_K8S_LEASE
-#include "libk8s_lease_wrapper.h"
+#include "libmooncake_ha_wrapper.h"
 #endif
 
 #include <glog/logging.h>

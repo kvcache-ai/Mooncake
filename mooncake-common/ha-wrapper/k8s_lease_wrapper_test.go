@@ -14,21 +14,21 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// swapClient replaces globalClient and returns the old one.
+// swapClient replaces k8sGlobalClient and returns the old one.
 func swapClient(newClient kubernetes.Interface) kubernetes.Interface {
-	clientMutex.Lock()
-	defer clientMutex.Unlock()
-	old := globalClient
-	globalClient = newClient
+	k8sClientMutex.Lock()
+	defer k8sClientMutex.Unlock()
+	old := k8sGlobalClient
+	k8sGlobalClient = newClient
 	return old
 }
 
-// swapInitClientFn replaces initClientFn and returns the old one.
+// swapInitClientFn replaces k8sInitClientFn and returns the old one.
 func swapInitClientFn(newFn func() error) func() error {
-	clientMutex.Lock()
-	defer clientMutex.Unlock()
-	old := initClientFn
-	initClientFn = newFn
+	k8sClientMutex.Lock()
+	defer k8sClientMutex.Unlock()
+	old := k8sInitClientFn
+	k8sInitClientFn = newFn
 	return old
 }
 
@@ -77,9 +77,9 @@ func TestPatchPodLabelAutoInitializesClient(t *testing.T) {
 	initCalls := 0
 	oldInitFn := swapInitClientFn(func() error {
 		initCalls++
-		clientMutex.Lock()
-		globalClient = fakeClient
-		clientMutex.Unlock()
+		k8sClientMutex.Lock()
+		k8sGlobalClient = fakeClient
+		k8sClientMutex.Unlock()
 		return nil
 	})
 	defer swapInitClientFn(oldInitFn)
@@ -89,7 +89,7 @@ func TestPatchPodLabelAutoInitializesClient(t *testing.T) {
 		t.Fatalf("patchPodLabel(set) failed: %v", err)
 	}
 	if initCalls != 1 {
-		t.Fatalf("initClientFn calls = %d, want 1", initCalls)
+		t.Fatalf("k8sInitClientFn calls = %d, want 1", initCalls)
 	}
 
 	pod, err := fakeClient.CoreV1().Pods("default").Get(
@@ -105,7 +105,7 @@ func TestPatchPodLabelAutoInitializesClient(t *testing.T) {
 		t.Fatalf("patchPodLabel(remove) failed: %v", err)
 	}
 	if initCalls != 1 {
-		t.Fatalf("initClientFn calls after second patch = %d, want 1", initCalls)
+		t.Fatalf("k8sInitClientFn calls after second patch = %d, want 1", initCalls)
 	}
 
 	pod, err = fakeClient.CoreV1().Pods("default").Get(

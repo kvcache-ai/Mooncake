@@ -6,6 +6,9 @@ package main
 #include <string.h>
 
 // Trampoline to invoke C/C++ callback safely from Go via cgo.
+#ifndef MOONCAKE_K8S_CALLBACK_TRAMPOLINES
+#define MOONCAKE_K8S_CALLBACK_TRAMPOLINES
+
 typedef void (*holder_change_cb_t)(void* ctx,
                                     const char* holder, size_t holderSize,
                                     int64_t leaseTransitions);
@@ -15,6 +18,8 @@ static inline void call_holder_change_cb(holder_change_cb_t func, void* ctx,
                                           int64_t leaseTransitions) {
   func(ctx, holder, holderSize, leaseTransitions);
 }
+
+#endif  // MOONCAKE_K8S_CALLBACK_TRAMPOLINES
 */
 import "C"
 
@@ -54,36 +59,36 @@ type watchState struct {
 }
 
 var (
-	globalClient kubernetes.Interface
-	clientMutex  sync.Mutex
-	initClientFn = initClient
+	k8sGlobalClient kubernetes.Interface
+	k8sClientMutex  sync.Mutex
+	k8sInitClientFn = initK8sClient
 
-	elections     = make(map[string]*electionState)
-	electionMutex sync.Mutex
+	k8sElections     = make(map[string]*electionState)
+	k8sElectionMutex sync.Mutex
 
-	watches    = make(map[string]*watchState)
-	watchMutex sync.Mutex
+	k8sWatches    = make(map[string]*watchState)
+	k8sWatchMutex sync.Mutex
 )
 
 func electionKey(namespace, leaseName string) string {
 	return namespace + "/" + leaseName
 }
 
-func ensureClientInitialized() error {
-	clientMutex.Lock()
-	initialized := globalClient != nil
-	clientMutex.Unlock()
+func ensureK8sClientInitialized() error {
+	k8sClientMutex.Lock()
+	initialized := k8sGlobalClient != nil
+	k8sClientMutex.Unlock()
 	if initialized {
 		return nil
 	}
-	return initClientFn()
+	return k8sInitClientFn()
 }
 
-// initClient creates the K8s clientset from in-cluster config or KUBECONFIG.
-func initClient() error {
-	clientMutex.Lock()
-	defer clientMutex.Unlock()
-	if globalClient != nil {
+// initK8sClient creates the K8s clientset from in-cluster config or KUBECONFIG.
+func initK8sClient() error {
+	k8sClientMutex.Lock()
+	defer k8sClientMutex.Unlock()
+	if k8sGlobalClient != nil {
 		return nil
 	}
 
@@ -107,22 +112,22 @@ func initClient() error {
 	if err != nil {
 		return fmt.Errorf("failed to create k8s clientset: %w", err)
 	}
-	globalClient = client
+	k8sGlobalClient = client
 	return nil
 }
 
 // runElection starts a leader election goroutine for the given namespace/leaseName.
 func runElection(namespace, leaseName, identity string,
 	leaseDurationSec, renewDeadlineSec, retryPeriodSec int) error {
-	if err := ensureClientInitialized(); err != nil {
+	if err := ensureK8sClientInitialized(); err != nil {
 		return err
 	}
 
 	key := electionKey(namespace, leaseName)
 
-	electionMutex.Lock()
-	if _, exists := elections[key]; exists {
-		electionMutex.Unlock()
+	k8sElectionMutex.Lock()
+	if _, exists := k8sElections[key]; exists {
+		k8sElectionMutex.Unlock()
 		return fmt.Errorf("election already running for %s", key)
 	}
 
@@ -132,15 +137,15 @@ func runElection(namespace, leaseName, identity string,
 		elected: make(chan struct{}),
 		lost:    make(chan struct{}),
 	}
-	elections[key] = state
-	electionMutex.Unlock()
+	k8sElections[key] = state
+	k8sElectionMutex.Unlock()
 
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      leaseName,
 			Namespace: namespace,
 		},
-		Client: globalClient.CoordinationV1(),
+		Client: k8sGlobalClient.CoordinationV1(),
 		LockConfig: resourcelock.ResourceLockConfig{
 			Identity: identity,
 		},
@@ -165,18 +170,18 @@ func runElection(namespace, leaseName, identity string,
 			OnStoppedLeading: func() {
 				close(state.lost)
 				// Auto-cleanup: remove from map so the same key can be reused.
-				electionMutex.Lock()
-				if elections[key] == state {
-					delete(elections, key)
+				k8sElectionMutex.Lock()
+				if k8sElections[key] == state {
+					delete(k8sElections, key)
 				}
-				electionMutex.Unlock()
+				k8sElectionMutex.Unlock()
 			},
 		},
 	})
 	if err != nil {
-		electionMutex.Lock()
-		delete(elections, key)
-		electionMutex.Unlock()
+		k8sElectionMutex.Lock()
+		delete(k8sElections, key)
+		k8sElectionMutex.Unlock()
 		cancel()
 		return fmt.Errorf("failed to create leader elector: %w", err)
 	}
@@ -187,14 +192,14 @@ func runElection(namespace, leaseName, identity string,
 
 // getHolder reads the current Lease holder identity and transitions.
 func getHolder(namespace, leaseName string) (string, int64, error) {
-	if err := ensureClientInitialized(); err != nil {
+	if err := ensureK8sClientInitialized(); err != nil {
 		return "", 0, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	lease, err := globalClient.CoordinationV1().Leases(namespace).Get(ctx, leaseName, metav1.GetOptions{})
+	lease, err := k8sGlobalClient.CoordinationV1().Leases(namespace).Get(ctx, leaseName, metav1.GetOptions{})
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to get lease: %w", err)
 	}
@@ -221,7 +226,7 @@ func getHolder(namespace, leaseName string) (string, int64, error) {
 
 //export K8sLeaseInit
 func K8sLeaseInit(errMsg **C.char) C.int {
-	if err := ensureClientInitialized(); err != nil {
+	if err := ensureK8sClientInitialized(); err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
@@ -256,9 +261,9 @@ func K8sLeaseWaitElected(
 ) C.int {
 	key := electionKey(C.GoString(ns), C.GoString(leaseName))
 
-	electionMutex.Lock()
-	state, exists := elections[key]
-	electionMutex.Unlock()
+	k8sElectionMutex.Lock()
+	state, exists := k8sElections[key]
+	k8sElectionMutex.Unlock()
 
 	if !exists {
 		*errMsg = C.CString("no election running for " + key)
@@ -290,9 +295,9 @@ func K8sLeaseWaitLost(
 ) C.int {
 	key := electionKey(C.GoString(ns), C.GoString(leaseName))
 
-	electionMutex.Lock()
-	state, exists := elections[key]
-	electionMutex.Unlock()
+	k8sElectionMutex.Lock()
+	state, exists := k8sElections[key]
+	k8sElectionMutex.Unlock()
 
 	if !exists {
 		// Already cleaned up by OnStoppedLeading — election is over.
@@ -315,9 +320,9 @@ func K8sLeaseCancelElection(
 ) C.int {
 	key := electionKey(C.GoString(ns), C.GoString(leaseName))
 
-	electionMutex.Lock()
-	state, exists := elections[key]
-	electionMutex.Unlock()
+	k8sElectionMutex.Lock()
+	state, exists := k8sElections[key]
+	k8sElectionMutex.Unlock()
 
 	if !exists {
 		// Idempotent — no error if no election
@@ -374,27 +379,27 @@ func K8sLeaseWatchHolder(
 		*errMsg = C.CString("callback function is nil")
 		return -1
 	}
-	if err := ensureClientInitialized(); err != nil {
+	if err := ensureK8sClientInitialized(); err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
 
-	watchMutex.Lock()
-	if _, exists := watches[key]; exists {
-		watchMutex.Unlock()
+	k8sWatchMutex.Lock()
+	if _, exists := k8sWatches[key]; exists {
+		k8sWatchMutex.Unlock()
 		*errMsg = C.CString("watch already running for " + key)
 		return -1
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	watches[key] = &watchState{cancel: cancel}
-	watchMutex.Unlock()
+	k8sWatches[key] = &watchState{cancel: cancel}
+	k8sWatchMutex.Unlock()
 
 	go func() {
 		defer func() {
-			watchMutex.Lock()
-			delete(watches, key)
-			watchMutex.Unlock()
+			k8sWatchMutex.Lock()
+			delete(k8sWatches, key)
+			k8sWatchMutex.Unlock()
 		}()
 
 		for {
@@ -404,7 +409,7 @@ func K8sLeaseWatchHolder(
 			default:
 			}
 
-			watcher, err := globalClient.CoordinationV1().Leases(nsStr).Watch(ctx, metav1.ListOptions{
+			watcher, err := k8sGlobalClient.CoordinationV1().Leases(nsStr).Watch(ctx, metav1.ListOptions{
 				FieldSelector: "metadata.name=" + ln,
 			})
 			if err != nil {
@@ -475,9 +480,9 @@ func K8sLeaseCancelWatch(
 ) C.int {
 	key := electionKey(C.GoString(ns), C.GoString(leaseName))
 
-	watchMutex.Lock()
-	state, exists := watches[key]
-	watchMutex.Unlock()
+	k8sWatchMutex.Lock()
+	state, exists := k8sWatches[key]
+	k8sWatchMutex.Unlock()
 
 	if !exists {
 		// Idempotent
@@ -491,7 +496,7 @@ func K8sLeaseCancelWatch(
 // patchPodLabel sets or removes a label on a pod using a JSON merge patch.
 // If value is non-nil, the label is set; if nil, the label is removed.
 func patchPodLabel(namespace, podName, labelKey string, value interface{}) error {
-	if err := ensureClientInitialized(); err != nil {
+	if err := ensureK8sClientInitialized(); err != nil {
 		return err
 	}
 
@@ -510,7 +515,7 @@ func patchPodLabel(namespace, podName, labelKey string, value interface{}) error
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err = globalClient.CoreV1().Pods(namespace).Patch(
+	_, err = k8sGlobalClient.CoreV1().Pods(namespace).Patch(
 		ctx, podName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to patch pod label: %w", err)
@@ -545,5 +550,3 @@ func K8sRemovePodLabel(
 	}
 	return 0
 }
-
-func main() {}

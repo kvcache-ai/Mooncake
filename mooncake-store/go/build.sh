@@ -54,7 +54,7 @@ if [ "$USE_ETCD" = "ON" ]; then
     if [ "$USE_ETCD_LEGACY" = "ON" ]; then
         CGO_LDFLAGS+=" -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
     else
-        CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/etcd -letcd_wrapper"
+        CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/ha-wrapper -lmooncake_ha_wrapper"
     fi
 fi
 
