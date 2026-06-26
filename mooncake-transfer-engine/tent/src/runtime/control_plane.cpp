@@ -102,7 +102,8 @@ inline void to_json(json& j, const Request& r) {
              {"source", reinterpret_cast<uintptr_t>(r.source)},
              {"target_id", r.target_id},
              {"target_offset", r.target_offset},
-             {"length", r.length}};
+             {"length", r.length},
+             {"priority", r.priority}};
 }
 
 inline void from_json(const json& j, Request& r) {
@@ -118,6 +119,7 @@ inline void from_json(const json& j, Request& r) {
     r.target_id = j.at("target_id").get<int>();
     r.target_offset = j.at("target_offset").get<uint64_t>();
     r.length = j.at("length").get<size_t>();
+    r.priority = j.value("priority", static_cast<int>(PRIO_HIGH));
 }
 
 Status ControlClient::delegate(const std::string& server_addr,
@@ -226,7 +228,7 @@ Status ControlService::start(uint16_t& port, bool ipv6_) {
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
                                       std::string& response) {
-    // Re-use the cached dump shared across concurrent peer fetches.
+    // Reuse the cached dump shared across concurrent peer fetches.
     auto cached = manager_->getLocalDumpedJson();
     response = *cached;
 }

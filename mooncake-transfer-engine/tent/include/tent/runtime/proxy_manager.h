@@ -61,6 +61,21 @@ class ProxyManager {
 
     Status unpinStageBuffer(uint64_t addr);
 
+    static Request makeCrossStageRequest(const Request& request,
+                                         uint64_t local_stage_buffer,
+                                         uint64_t remote_stage_buffer,
+                                         uint64_t chunk_length);
+
+    static Request makeLocalStageRequest(const Request& request,
+                                         uint64_t local_stage_buffer,
+                                         uint64_t chunk_length,
+                                         uint64_t offset);
+
+    static Request makeRemoteStageRequest(const Request& request,
+                                          uint64_t remote_stage_buffer,
+                                          uint64_t chunk_length,
+                                          uint64_t offset);
+
    private:
     void runner(size_t id);
 
