@@ -71,9 +71,6 @@ endif()
 # dialect.  Older CMake (such as the CI Docker image) cannot enable CUDA20 and
 # fails at generate time.  Opt in explicitly with -DBUILD_DEVICE_TRANSPORT_EXAMPLE=ON
 # when building manually on a host with a recent CMake and 2 GPUs.
-option(BUILD_DEVICE_TRANSPORT_EXAMPLE
-       "Build the two-rank Device API P2P example (requires CUDA or MACA and 2 GPUs)"
-       OFF)
 if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
   enable_language(CUDA)
   add_executable(device_transport_example

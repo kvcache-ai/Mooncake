@@ -46,6 +46,11 @@ endif()
 
 include_directories(../mooncake-common/include)
 include_directories(include)
+
+option(BUILD_DEVICE_TRANSPORT_EXAMPLE
+       "Build DeviceTransport examples and device-code tests that require CUDA/MACA compilation"
+       OFF)
+
 add_subdirectory(include)
 add_subdirectory(src)
 

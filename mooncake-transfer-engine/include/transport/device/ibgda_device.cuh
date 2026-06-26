@@ -84,8 +84,8 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
             *reinterpret_cast<volatile uint16_t*>(&qp->cq->wqe_counter);
         uint8_t opcode = qp->cq->op_own >> 4;
         if (opcode == 0xD)
-            printf("[EP IBGDA] Requester error: syndrome=0x%lx\n",
-                   qp->cq->timestamp >> 56);
+            printf("[EP IBGDA] Requester error: syndrome=0x%llx\n",
+                   static_cast<unsigned long long>(qp->cq->timestamp >> 56));
         if (!(opcode == 0x0 || opcode == 0xF)) {
             printf("[EP IBGDA] Unexpected CQE opcode=0x%x, trapping\n", opcode);
             __trap();
