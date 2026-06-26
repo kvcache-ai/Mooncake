@@ -75,6 +75,21 @@ class RedisHelper {
     ErrorCode GetMasterView(std::string& master_address,
                             ViewVersionId& version);
 
+    // === Serialization (public for testability) ===
+
+    /**
+     * @brief Serialize leader value as JSON.
+     */
+    static std::string SerializeLeaderValue(const std::string& address,
+                                            ViewVersionId epoch, int ttl_sec);
+
+    /**
+     * @brief Parse leader value from JSON. Returns false on parse failure.
+     */
+    static bool ParseLeaderValue(const std::string& json,
+                                 std::string& out_address,
+                                 ViewVersionId& out_epoch);
+
    private:
     // === Internal helpers ===
 
@@ -109,19 +124,6 @@ class RedisHelper {
      *        Used internally by Connect and for the polling connection.
      */
     redisContext* CreateConnection();
-
-    /**
-     * @brief Serialize leader value as JSON.
-     */
-    static std::string SerializeLeaderValue(const std::string& address,
-                                            ViewVersionId epoch, int ttl_sec);
-
-    /**
-     * @brief Parse leader value from JSON. Returns false on parse failure.
-     */
-    static bool ParseLeaderValue(const std::string& json,
-                                 std::string& out_address,
-                                 ViewVersionId& out_epoch);
 
     // === Redis key naming ===
 
