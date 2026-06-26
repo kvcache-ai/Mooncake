@@ -506,6 +506,7 @@ fn cold_restore_concurrent_reads_share_single_backend_flight() {
 
 #[test]
 fn debug_evict_all_waits_for_pending_offload_claim_race() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let root = cold_tier_test_root("debug-evict-all-claim-race");
     let client = Arc::new(
@@ -563,6 +564,7 @@ fn debug_evict_all_waits_for_pending_offload_claim_race() {
 
 #[test]
 fn debug_evict_all_removes_all_dram_replicas() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let root = cold_tier_test_root("debug-evict-all");
     let client = StoreClientBuilder::new(metadata, "debug-evict-all")
@@ -617,6 +619,7 @@ fn debug_evict_all_removes_all_dram_replicas() {
 /// missing the PendingOffload case (no cold copy on disk either).
 #[test]
 fn debug_evict_all_succeeds_with_pending_offload_and_disabled_device() {
+    let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let root = cold_tier_test_root("debug-evict-all-pending-disabled");
     // Use EvictTriggered mode so the write path does NOT auto-publish

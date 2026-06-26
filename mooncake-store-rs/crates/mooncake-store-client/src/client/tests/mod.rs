@@ -2954,6 +2954,37 @@ fn test_storage_nodes() -> &'static Mutex<Vec<Arc<StoreClient>>> {
     STORAGE_NODES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+struct ColdTierEnvGuard {
+    _guard: parking_lot::lock_api::ReentrantMutexGuard<
+        'static,
+        parking_lot::RawMutex,
+        parking_lot::RawThreadId,
+        (),
+    >,
+    previous: Option<String>,
+}
+
+impl Drop for ColdTierEnvGuard {
+    fn drop(&mut self) {
+        const ENABLE_COLD_TIER_ENV: &str = "MC_STORE_RS_ENABLE_COLD_TIER";
+        match self.previous.take() {
+            Some(value) => std::env::set_var(ENABLE_COLD_TIER_ENV, value),
+            None => std::env::remove_var(ENABLE_COLD_TIER_ENV),
+        }
+    }
+}
+
+fn enable_cold_tier_for_test() -> ColdTierEnvGuard {
+    let guard = crate::observability::test_process_lock().lock();
+    const ENABLE_COLD_TIER_ENV: &str = "MC_STORE_RS_ENABLE_COLD_TIER";
+    let previous = std::env::var(ENABLE_COLD_TIER_ENV).ok();
+    std::env::set_var(ENABLE_COLD_TIER_ENV, "1");
+    ColdTierEnvGuard {
+        _guard: guard,
+        previous,
+    }
+}
+
 fn wait_for_runtime_visibility(client: &StoreClient, runtime: &ClientRuntimeId) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {

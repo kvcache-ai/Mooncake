@@ -355,13 +355,9 @@ impl StoreClient {
     ) -> Result<Option<ObjectRoute>> {
         self.finalize_tenant_quota_put(reservation, route, value_len)?;
         log_route_publish_sample(&self.lease.runtime, route, value_len, operation);
-        // Fire-and-forget: the cold tier scheduler may CAS a PendingOffload
-        // cold_backing onto the authoritative route, but the caller should not
-        // observe that — the put writer is not necessarily the offload owner.
-        let _ = self
+        Ok(self
             .cold_tier
-            .on_route_published(self.storage_owner.as_ref(), route);
-        Ok(None)
+            .on_route_published(self.storage_owner.as_ref(), route))
     }
 
     fn finalize_tenant_quota_delete(
@@ -910,9 +906,9 @@ impl StoreClient {
                 "explicit migration requires at least one target segment".to_string(),
             ));
         }
-        if !plan.all_or_nothing && matches!(plan.mode, ExplicitMigrationMode::Move) {
+        if !plan.all_or_nothing {
             return Err(StoreError::Unsupported(
-                "partial-success explicit move is not supported".to_string(),
+                "partial-success explicit migration is not supported".to_string(),
             ));
         }
         if matches!(plan.mode, ExplicitMigrationMode::Move) && plan.target_segments.len() != 1 {
@@ -1991,6 +1987,9 @@ impl StoreClient {
                 &local_segments,
                 &readable_runtimes,
             ) else {
+                if cold_tier::materialized_cold_backing(candidate).is_some() {
+                    continue;
+                }
                 *route = None;
                 continue;
             };
@@ -3189,7 +3188,7 @@ impl StoreClient {
                         s.spawn(move || {
                             let request = crate::control_plane::pb::BatchReadFromColdRequest {
                                 namespace: ns,
-                                authority: String::new(),
+                                authority: group.owner_lease.runtime.stable_id.0.clone(),
                                 targets: group.targets,
                             };
                             let reply =
@@ -3500,7 +3499,7 @@ impl StoreClient {
                             s.spawn(move || {
                                 let request = crate::control_plane::pb::BatchReadFromColdRequest {
                                     namespace: ns,
-                                    authority: String::new(),
+                                    authority: group.owner_lease.runtime.stable_id.0.clone(),
                                     targets: group.targets,
                                 };
                                 let reply = control_client

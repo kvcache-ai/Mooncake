@@ -1181,9 +1181,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
             let Some(route) = self.query_route_by_object_id_inner(&object_id)? else {
                 return Ok(0);
             };
-            Ok(self
-                .select_readable_replica_with_refresh(&route)?
-                .map(|replica| replica.length as usize)
+            if let Some(replica) = self.select_readable_replica_with_refresh(&route)? {
+                return Ok(replica.length as usize);
+            }
+            Ok(cold_tier::materialized_cold_backing(&route)
+                .map(|cold_backing| cold_backing.length as usize)
                 .unwrap_or(0))
         })();
         tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
