@@ -40,6 +40,16 @@ bool isSupportedOwnerKind(QueueOwnerKind kind) {
     return false;
 }
 
+bool isSupportedRequestPriority(int priority) {
+    switch (priority) {
+        case PRIO_HIGH:
+        case PRIO_MEDIUM:
+        case PRIO_LOW:
+            return true;
+    }
+    return false;
+}
+
 Status checkedAdd(size_t lhs, size_t rhs, size_t& out) {
     if (rhs > std::numeric_limits<size_t>::max() - lhs) {
         return Status::InvalidArgument(
@@ -64,8 +74,8 @@ Status validateLimits(const QueueLimits& limits) {
 }  // namespace
 
 void LocalTransferAdmissionQueue::DispatchScheduler::enqueue(
-    QueueOwnerId owner_id) {
-    fifo_.push_back(owner_id);
+    QueueOwnerId owner_id, int priority) {
+    queues_[priority].push_back(owner_id);
 }
 
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
@@ -76,22 +86,25 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
-    while (!fifo_.empty() && used_owners < max_owners) {
-        const auto owner_id = fifo_.front();
-        auto owner_it = owners.find(owner_id);
-        if (owner_it == owners.end() ||
-            owner_it->second.state != QueueState::Queued) {
-            fifo_.pop_front();
-            continue;
+    for (auto& queue : queues_) {
+        while (!queue.empty() && used_owners < max_owners) {
+            const auto owner_id = queue.front();
+            auto owner_it = owners.find(owner_id);
+            if (owner_it == owners.end() ||
+                owner_it->second.state != QueueState::Queued) {
+                queue.pop_front();
+                continue;
+            }
+
+            const size_t remaining_bytes = max_bytes - used_bytes;
+            if (owner_it->second.request.length > remaining_bytes)
+                return picked;
+
+            queue.pop_front();
+            picked.push_back(owner_id);
+            ++used_owners;
+            used_bytes += owner_it->second.request.length;
         }
-
-        const size_t remaining_bytes = max_bytes - used_bytes;
-        if (owner_it->second.request.length > remaining_bytes) break;
-
-        fifo_.pop_front();
-        picked.push_back(owner_id);
-        ++used_owners;
-        used_bytes += owner_it->second.request.length;
     }
     return picked;
 }
@@ -117,6 +130,10 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         if (!isSupportedOwnerKind(owner.kind)) {
             return Status::InvalidArgument(
                 "unsupported queue owner kind" LOC_MARK);
+        }
+        if (!isSupportedRequestPriority(owner.request.priority)) {
+            return Status::InvalidArgument(
+                "unsupported queue request priority" LOC_MARK);
         }
         if (owner.request.length == 0) {
             return Status::InvalidArgument("empty transfer request" LOC_MARK);
@@ -207,7 +224,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         for (const auto derived_task_id : owner_input.derived_task_ids) {
             public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
         }
-        scheduler_.enqueue(owner_id);
+        scheduler_.enqueue(owner_id, owner_input.request.priority);
         admitted_owner_ids.push_back(owner_id);
     }
 

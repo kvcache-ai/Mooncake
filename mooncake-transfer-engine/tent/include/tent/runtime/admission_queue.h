@@ -15,6 +15,7 @@
 #ifndef ADMISSION_QUEUE_H_
 #define ADMISSION_QUEUE_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -109,14 +110,17 @@ class LocalTransferAdmissionQueue {
 
     class DispatchScheduler {
        public:
-        void enqueue(QueueOwnerId owner_id);
+        void enqueue(QueueOwnerId owner_id, int priority);
 
         std::vector<QueueOwnerId> pick(
             size_t max_owners, size_t max_bytes,
             const std::map<QueueOwnerId, QueueOwner>& owners);
 
        private:
-        std::deque<QueueOwnerId> fifo_;
+        static constexpr size_t kPriorityCount =
+            static_cast<size_t>(PRIO_LOW) + 1;
+
+        std::array<std::deque<QueueOwnerId>, kPriorityCount> queues_;
     };
 
     QueueLimits limits_;
