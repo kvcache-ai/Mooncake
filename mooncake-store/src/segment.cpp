@@ -27,15 +27,13 @@ bool IsMsgpackInteger(const msgpack::object& object) {
            object.type == msgpack::type::NEGATIVE_INTEGER;
 }
 
-void AddHostSegment(std::map<std::string, std::set<std::string>>& index,
-                    const Segment& segment) {
+void AddHostSegment(HostSegmentIndex& index, const Segment& segment) {
     if (!segment.host_id.empty()) {
-        index[segment.host_id].insert(segment.name);
+        index[segment.host_id][segment.name].insert(segment.id);
     }
 }
 
-void RemoveHostSegment(std::map<std::string, std::set<std::string>>& index,
-                       const Segment& segment) {
+void RemoveHostSegment(HostSegmentIndex& index, const Segment& segment) {
     if (segment.host_id.empty()) {
         return;
     }
@@ -43,15 +41,22 @@ void RemoveHostSegment(std::map<std::string, std::set<std::string>>& index,
     if (host_it == index.end()) {
         return;
     }
-    host_it->second.erase(segment.name);
+    auto name_it = host_it->second.find(segment.name);
+    if (name_it == host_it->second.end()) {
+        return;
+    }
+    name_it->second.erase(segment.id);
+    if (name_it->second.empty()) {
+        host_it->second.erase(name_it);
+    }
     if (host_it->second.empty()) {
         index.erase(host_it);
     }
 }
 
 std::vector<std::string> BuildHostOrderedSegments(
-    const std::map<std::string, std::set<std::string>>& segments_by_host,
-    const std::string& writer_host_id, const std::string& key) {
+    const HostSegmentIndex& segments_by_host, const std::string& writer_host_id,
+    const std::string& key) {
     std::vector<std::string> ordered_segments;
     if (writer_host_id.empty() || segments_by_host.empty()) {
         return ordered_segments;
@@ -68,9 +73,15 @@ std::vector<std::string> BuildHostOrderedSegments(
     const size_t host_count = segments_by_host.size();
     auto host_it = start_it;
     for (size_t host_idx = 0; host_idx < host_count; ++host_idx) {
-        const auto& names = host_it->second;
-        if (!names.empty()) {
-            std::vector<std::string> host_segments(names.begin(), names.end());
+        const auto& segments_by_name = host_it->second;
+        if (!segments_by_name.empty()) {
+            std::vector<std::string> host_segments;
+            host_segments.reserve(segments_by_name.size());
+            for (const auto& [name, segment_ids] : segments_by_name) {
+                if (!segment_ids.empty()) {
+                    host_segments.push_back(name);
+                }
+            }
             const size_t start =
                 std::hash<std::string>{}(key) % host_segments.size();
             for (size_t i = 0; i < host_segments.size(); ++i) {

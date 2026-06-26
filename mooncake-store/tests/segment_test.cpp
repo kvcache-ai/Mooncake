@@ -424,6 +424,60 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
     }
 }
 
+TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
+    SegmentManager segment_manager;
+
+    Segment segment0;
+    segment0.id = generate_uuid();
+    segment0.name = "shared_host_segment";
+    segment0.size = 1024 * 1024 * 16;
+    segment0.base = 0x100000000;
+    segment0.host_id = "host1";
+
+    Segment segment1;
+    segment1.id = generate_uuid();
+    segment1.name = segment0.name;
+    segment1.size = 1024 * 1024 * 16;
+    segment1.base = 0x200000000;
+    segment1.host_id = "host1";
+
+    UUID client_id = generate_uuid();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment0, client_id),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment1, client_id),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_EQ(ordered.size(), 1u);
+        EXPECT_EQ(ordered[0], segment0.name);
+    }
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment0.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment0.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_EQ(ordered.size(), 1u);
+        EXPECT_EQ(ordered[0], segment1.name);
+    }
+}
+
 TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
     SegmentManager segment_manager;
 
