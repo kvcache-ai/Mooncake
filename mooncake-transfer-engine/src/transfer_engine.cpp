@@ -179,7 +179,7 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
 device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
     return impl_->getOrCreateP2pTransport(num_ranks);
 }
@@ -595,7 +595,7 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
         return impl_->getTransport(proto);
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
 device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
     if (use_tent_) return nullptr;
     return impl_->getOrCreateP2pTransport(num_ranks);

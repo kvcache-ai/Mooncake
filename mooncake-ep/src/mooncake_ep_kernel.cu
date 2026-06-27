@@ -153,6 +153,22 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
+#ifdef MOONCAKE_EP_USE_MACA
+    // C500 reports 64-thread hardware warps. Do not split the last hardware
+    // warp by assigning only the final 32-thread pseudo-warp to count work.
+    // Reserve one full warp group from the data path, but write counts from a
+    // single 32-thread lane group to avoid duplicate per-expert increments.
+    const bool is_count_warp = warp_group_id == kNumWarpGroups - 1;
+    const bool is_count_worker = is_count_warp && sub_warp_id == 0;
+    const bool is_data_warp = warp_group_id < kNumWarpGroups - 1;
+    const int num_send_threads =
+        (kNumWarpGroups - 1) * kNumWarpsPerGroup * 32;
+#else
+    const bool is_count_warp = warp_id == num_warps - 1;
+    const bool is_count_worker = is_count_warp;
+    const bool is_data_warp = warp_id < num_warps - 1;
+    const int num_send_threads = (num_warps - 1) * 32;
+#endif
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
@@ -183,14 +199,16 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     // Expert counts
     __shared__ int shared_num_tokens_sent_per_expert[kNumWarpGroups];
 
-    // There are 2 kinds of warps in this part:
-    // 1. The first-kind warps for FP8 cast and sending top-k tokens
-    // 2. The last warp for reading `topk_idx` and count for per-expert information
-    if (warp_id < num_warps - 1) {
+    // There are 2 kinds of execution lanes in this part:
+    // 1. Data lanes for FP8 cast and sending top-k tokens.
+    // 2. Count lanes for reading `topk_idx` and per-expert token counts.
+    // MACA reserves a full warp group for the count path; CUDA keeps the
+    // original final 32-thread warp behavior.
+    if (is_data_warp) {
         constexpr int kNumElemsPerRead = sizeof(int4) / EP_BF16_SIZE;
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
-        const auto num_threads = (num_warps - 1) * 32;
+        const auto num_threads = num_send_threads;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
@@ -274,49 +292,51 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 lane_id == 0 ? mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
-    } else if (warp_id == num_warps - 1) {
-#ifdef MOONCAKE_EP_USE_MUSA
+    } else if (is_count_warp) {
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         // Participate in __syncthreads() barriers from data warps.
         // Each token iteration in the send loop above calls
-        // __syncthreads() once; the count warp must match.
+        // __syncthreads() once; the count path must match.
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             __syncthreads();
         }
 #endif
-        EP_DEVICE_ASSERT(num_sms > 1);
-        if (sm_id == 0) {
-            // The first SM is also responsible for cleaning the next buffer
+        if (is_count_worker) {
+            EP_DEVICE_ASSERT(num_sms > 1);
+            if (sm_id == 0) {
+                // The first SM is also responsible for cleaning the next buffer
+                #pragma unroll
+                for (int i = lane_id; i < num_experts; i += 32)
+                    next_clean_buffer[i] = 0;
+
+                // Notify before executing `int_p`
+                __syncwarp();
+                #pragma unroll
+                for (int i = lane_id; i < num_experts; i += 32)
+                    mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
+            }
+
+            // This SM should be responsible for some destination experts, read `topk_idx` for them
+            int expert_count[kNumWarpGroups] = {0};
+            const auto expert_begin_idx = sm_id * kNumWarpGroups;
+            const auto expert_end_idx = min(expert_begin_idx + kNumWarpGroups, num_experts);
+
+            // Per lane count
+            #pragma unroll 8
+            for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
+                auto idx = static_cast<int>(__ldg(topk_idx + i));
+                if (idx >= expert_begin_idx and idx < expert_end_idx)
+                    expert_count[idx - expert_begin_idx] ++;
+            }
+
+            // Warp reduce
             #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
-                next_clean_buffer[i] = 0;
-
-            // Notify before executing `int_p`
-            __syncwarp();
-            #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
-                mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
-        }
-
-        // This SM should be responsible for some destination experts, read `topk_idx` for them
-        int expert_count[kNumWarpGroups] = {0};
-        const auto expert_begin_idx = sm_id * kNumWarpGroups;
-        const auto expert_end_idx = min(expert_begin_idx + kNumWarpGroups, num_experts);
-
-        // Per lane count
-        #pragma unroll 8
-        for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
-            auto idx = static_cast<int>(__ldg(topk_idx + i));
-            if (idx >= expert_begin_idx and idx < expert_end_idx)
-                expert_count[idx - expert_begin_idx] ++;
-        }
-
-        // Warp reduce
-        #pragma unroll
-        for (int i = expert_begin_idx; i < expert_end_idx; ++ i) {
-            auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
-            if (lane_id == 0) {
-                shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
-                mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+            for (int i = expert_begin_idx; i < expert_end_idx; ++ i) {
+                auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
+                if (lane_id == 0) {
+                    shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
+                    mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+                }
             }
         }
     }
@@ -329,7 +349,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
-        while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+        while (mc_ld_acquire(atomic_finish_counter_per_expert +
+                             responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
             mc_red_add(comm_ctx, dst_rank, dst_expert_local_idx % num_qp_per_rank, num_qp_per_rank,
@@ -634,9 +655,9 @@ combine(void* combined_x, int32_t* active_ranks,
             }
         }
     }
-#ifdef MOONCAKE_EP_USE_MUSA
-    // mc_grid_sync() is a no-op on MUSA; use a block-wide fence/barrier before
-    // reduction so threads see peer writes.
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+    // mc_grid_sync() is a no-op on split-kernel platforms; use a block-wide
+    // fence/barrier before reduction so threads see peer writes.
     __syncthreads();
     mc_fence();
     __syncthreads();
@@ -692,8 +713,9 @@ void combine(void* combined_x, int32_t* active_ranks,
              void* cuda_counter_buffer, void* cuda_data_buffer,
              void* raddrs, void* rkeys, void* qp_devctxs,
              const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
-             const void* x, const int64_t* topk_idx, const float* topk_weights,
-             const int* src_info, const int64_t* layout_range,
+             const void* x, const int64_t* topk_idx,
+             const float* topk_weights, const int* src_info,
+             const int64_t* layout_range,
              int* next_clean_buffer,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,

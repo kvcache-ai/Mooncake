@@ -48,7 +48,7 @@ struct VecInt<16> {
 };
 
 // ---- TMA / mbarrier helpers (CUDA only) ----
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 
 __device__ __forceinline__ void fence_view_async_shared() {
     asm volatile("fence.proxy.async.shared::cta; \n" ::);
@@ -58,7 +58,7 @@ __device__ __forceinline__ void fence_barrier_init() {
     asm volatile("fence.mbarrier_init.release.cluster; \n" ::);
 }
 
-__device__ __forceinline__ void mbarrier_init(uint64_t *mbar_ptr,
+__device__ __forceinline__ void mbarrier_init(uint64_t* mbar_ptr,
                                               uint32_t arrive_count) {
     auto mbar_int_ptr =
         static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
@@ -66,8 +66,8 @@ __device__ __forceinline__ void mbarrier_init(uint64_t *mbar_ptr,
                  "r"(mbar_int_ptr));
 }
 
-__device__ __forceinline__ void mbarrier_wait(uint64_t *mbar_ptr,
-                                              uint32_t &phase) {
+__device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr,
+                                              uint32_t& phase) {
     auto mbar_int_ptr =
         static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
     asm volatile(
@@ -84,7 +84,7 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t *mbar_ptr,
 }
 
 __device__ __forceinline__ void mbarrier_arrive_and_expect_tx(
-    uint64_t *mbar_ptr, int num_bytes) {
+    uint64_t* mbar_ptr, int num_bytes) {
     auto mbar_int_ptr =
         static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
     asm volatile(
@@ -100,9 +100,9 @@ __device__ __forceinline__ void tma_store_fence() {
 constexpr uint64_t kEvictFirst = 0x12f0000000000000;
 constexpr uint64_t kEvictNormal = 0x1000000000000000;
 
-__device__ __forceinline__ void tma_load_1d(const void *smem_ptr,
-                                            const void *gmem_ptr,
-                                            uint64_t *mbar_ptr, int num_bytes,
+__device__ __forceinline__ void tma_load_1d(const void* smem_ptr,
+                                            const void* gmem_ptr,
+                                            uint64_t* mbar_ptr, int num_bytes,
                                             bool evict_first = true) {
     auto mbar_int_ptr =
         static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
@@ -116,8 +116,8 @@ __device__ __forceinline__ void tma_load_1d(const void *smem_ptr,
         : "memory");
 }
 
-__device__ __forceinline__ void tma_store_1d(const void *smem_ptr,
-                                             const void *gmem_ptr,
+__device__ __forceinline__ void tma_store_1d(const void* smem_ptr,
+                                             const void* gmem_ptr,
                                              int num_bytes,
                                              bool evict_first = true) {
     auto smem_int_ptr =
@@ -136,7 +136,7 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
 
-#endif  // MOONCAKE_EP_USE_MUSA
+#endif  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
 
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
@@ -150,43 +150,43 @@ __host__ __device__ dtype_t align(dtype_t a, dtype_t b) {
 
 __forceinline__ __device__ void get_channel_task_range(int num_tokens,
                                                        int num_sms, int sm_id,
-                                                       int &token_start_idx,
-                                                       int &token_end_idx) {
+                                                       int& token_start_idx,
+                                                       int& token_end_idx) {
     int num_tokens_per_sm = cell_div(num_tokens, num_sms);
     token_start_idx = min(num_tokens_per_sm * sm_id, num_tokens);
     token_end_idx = min(token_start_idx + num_tokens_per_sm, num_tokens);
 }
 
 template <typename dtype_a_t, typename dtype_b_t>
-__device__ __forceinline__ dtype_b_t pack2(const dtype_a_t &x,
-                                           const dtype_a_t &y) {
+__device__ __forceinline__ dtype_b_t pack2(const dtype_a_t& x,
+                                           const dtype_a_t& y) {
     EP_STATIC_ASSERT(sizeof(dtype_a_t) * 2 == sizeof(dtype_b_t),
                      "Invalid dtypes");
     dtype_b_t packed;
-    auto unpacked_ptr = reinterpret_cast<dtype_a_t *>(&packed);
+    auto unpacked_ptr = reinterpret_cast<dtype_a_t*>(&packed);
     unpacked_ptr[0] = x, unpacked_ptr[1] = y;
     return packed;
 }
 
 template <typename dtype_a_t, typename dtype_b_t>
-__device__ __forceinline__ void unpack2(const dtype_b_t &packed, dtype_a_t &x,
-                                        dtype_a_t &y) {
+__device__ __forceinline__ void unpack2(const dtype_b_t& packed, dtype_a_t& x,
+                                        dtype_a_t& y) {
     EP_STATIC_ASSERT(sizeof(dtype_a_t) * 2 == sizeof(dtype_b_t),
                      "Invalid dtypes");
-    auto unpacked_ptr = reinterpret_cast<const dtype_a_t *>(&packed);
+    auto unpacked_ptr = reinterpret_cast<const dtype_a_t*>(&packed);
     x = unpacked_ptr[0], y = unpacked_ptr[1];
 }
 
 template <typename dtype_t>
-__device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
+__device__ __forceinline__ dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
     EP_STATIC_ASSERT(sizeof(dtype_t) % sizeof(int) == 0, "");
-    auto send_int_values = reinterpret_cast<int *>(&ptr);
+    auto send_int_values = reinterpret_cast<int*>(&ptr);
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
 #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
         recv_int_values[i] =
             __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
-    return *reinterpret_cast<dtype_t *>(recv_int_values);
+    return *reinterpret_cast<dtype_t*>(recv_int_values);
 }
 
 __forceinline__ __device__ int warp_reduce_sum(int value) {

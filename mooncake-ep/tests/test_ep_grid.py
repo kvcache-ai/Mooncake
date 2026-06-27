@@ -22,6 +22,13 @@ def using_musa_backend() -> bool:
     }
 
 
+def using_maca_backend() -> bool:
+    return (
+        os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
+        or bool(getattr(torch.version, "maca", None))
+    )
+
+
 def import_torchada_if_needed():
     if not using_musa_backend():
         return
@@ -289,8 +296,9 @@ def make_test_name(cfg):
 
 
 def generate_tests():
+    fp8_options = [False] if using_maca_backend() else [False, True]
     test_grid = {
-        "use_fp8": [False, True],
+        "use_fp8": fp8_options,
         "zero_copy": [False, True],
         "async_finish": [False, True],
         "return_recv_hook": [False, True],
