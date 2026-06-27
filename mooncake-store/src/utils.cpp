@@ -551,6 +551,36 @@ std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     return env_val ? std::string(env_val) : default_value;
 }
 
+std::string ResolveMooncakeHostId(const std::string &local_hostname) {
+    auto trim = [](std::string value) {
+        const auto begin = value.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) {
+            return std::string();
+        }
+        const auto end = value.find_last_not_of(" \t\r\n");
+        return value.substr(begin, end - begin + 1);
+    };
+
+    std::string host_id = trim(GetEnvStringOr("MOONCAKE_HOST_ID", ""));
+    if (host_id.empty()) {
+        const std::string hostname = trim(local_hostname);
+        host_id = (hostname == "::1") ? hostname
+                                      : trim(getHostNameWithoutPort(hostname));
+    }
+    if (host_id.empty()) {
+        return "";
+    }
+
+    std::string lower = host_id;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
+        lower == "::1" || lower == "[::1]") {
+        return "";
+    }
+    return host_id;
+}
+
 static std::string SanitizeKey(const std::string &key) {
     // Set of invalid filesystem characters to be replaced
     constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
