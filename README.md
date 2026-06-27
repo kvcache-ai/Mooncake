@@ -209,6 +209,8 @@ The following hardware partners and cloud platforms are supported by the Mooncak
       <td align="center"><img src="image/partners/amd_logo.png" alt="AMD" height="26" /><br/><sub>AMD</sub></td>
       <td align="center"><img src="image/partners/aliyun_logo.png" alt="Alibaba Cloud" height="24" /><br/><sub>Alibaba Cloud</sub></td>
       <td align="center"><img src="image/partners/aws-logo.png" alt="AWS" height="24" /><br/><sub>AWS</sub></td>
+      <td align="center"><img src="image/partners/sunrise_logo.png" alt="Sunrise" height="26" /><br/><sub>Sunrise</sub></td>
+      <td align="center"><img src="image/partners/hygon_logo.png" alt="Hygon" height="26" /><br/><sub>Hygon</sub></td>
     </tr>
   </table>
 </div>
@@ -255,9 +257,9 @@ pip install mooncake-transfer-engine-npu
 
 > [!IMPORTANT]
 > - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
-> - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies.
+> - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies, but it still needs system runtime libraries such as `libcurl4`, `libibverbs1`, `rdma-core`, `librdmacm1`, `libnuma1`, and `liburing2` on Ubuntu. In a fresh environment, run `sudo apt-get update` before installing them.
 > - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
-> - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
+> - If users encounter problems such as missing `lib*.so`, first install the corresponding system runtime libraries. If the issue persists, uninstall the package and build the binaries manually.
 
 ### Build From Source
 

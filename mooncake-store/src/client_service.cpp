@@ -393,18 +393,23 @@ Client::~Client() {
 static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
-        int iv = std::stoi(ev_ad);
-        if (iv == 1) {
-            LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
-            return true;
-        } else if (iv == 0) {
-            LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
-            return false;
-        } else {
-            LOG(WARNING)
-                << "invalid MC_MS_AUTO_DISC value: " << ev_ad
-                << ", should be 0 or 1, using default: auto discovery not set";
+        try {
+            int iv = std::stoi(ev_ad);
+            if (iv == 1) {
+                LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
+                return true;
+            } else if (iv == 0) {
+                LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
+                return false;
+            }
+        } catch (const std::exception&) {
+            // A non-numeric or out-of-range value makes std::stoi throw; fall
+            // through to the warning below and use the default instead of
+            // letting the exception abort client initialization.
         }
+        LOG(WARNING)
+            << "invalid MC_MS_AUTO_DISC value: " << ev_ad
+            << ", should be 0 or 1, using default: auto discovery not set";
     }
     return std::nullopt;
 }

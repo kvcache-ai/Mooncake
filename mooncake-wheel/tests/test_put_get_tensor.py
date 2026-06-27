@@ -279,7 +279,7 @@ class TestCodecInference(unittest.TestCase):
     def test_json(self):
         d = _choose_leaf_codec([{"a": 1}, {"b": 2}])
         self.assertTrue(d.accepted)
-        self.assertEqual(d.codec, "json_ragged")
+        self.assertEqual(d.codec, "msgpack_ragged")
 
     def test_json_rejects_late_non_serializable(self):
         values = [{"ok": i} for i in range(200)] + [object()]
@@ -364,6 +364,46 @@ class TestCodecInference(unittest.TestCase):
         self.assertIsNone(x_leaf.values[0])
         self.assertIsInstance(x_leaf.values[1], type(MISSING))
         self.assertIsNone(x_leaf.values[2])
+
+    def test_infer_dict_of_tensors(self):
+        import torch
+
+        leaves, nodes = [], []
+        infer_structure(
+            "r",
+            [
+                {"tokens": torch.arange(2, dtype=torch.int64), "score": 1.0},
+                {"tokens": torch.arange(3, dtype=torch.int64), "score": 2.0},
+                {"tokens": torch.arange(1, dtype=torch.int64), "score": None},
+            ],
+            leaves,
+            nodes,
+        )
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].node_type, "dict")
+        by_path = {leaf.path: leaf for leaf in leaves}
+        self.assertEqual(by_path["r.tokens"].decision.codec, "ragged_tensor")
+        self.assertEqual(by_path["r.score"].decision.codec, "ndarray")
+
+    def test_infer_dict_of_tensors_missing_keys_and_null_rows(self):
+        import torch
+
+        leaves, nodes = [], []
+        rows = [
+            {"tokens": torch.arange(2, dtype=torch.float32), "label": None},
+            None,
+            {"label": 3},
+            {"tokens": None, "label": 4},
+        ]
+        infer_structure("r", rows, leaves, nodes)
+        self.assertEqual(nodes[0].row_mask, [True, False, True, True])
+        by_path = {leaf.path: leaf for leaf in leaves}
+        tokens = by_path["r.tokens"]
+        self.assertTrue(torch.equal(tokens.values[0], rows[0]["tokens"]))
+        self.assertIsNone(tokens.values[1])
+        self.assertIsInstance(tokens.values[2], type(MISSING))
+        self.assertIsNone(tokens.values[3])
+        self.assertEqual(tokens.decision.codec, "ragged_tensor")
 
     def test_escape_key_in_path(self):
         self.assertEqual(_escape_key("simple"), "simple")
