@@ -28,6 +28,15 @@ using mooncake::device::mc_atomic_add_release;
 using mooncake::device::mc_fence;
 using mooncake::device::mc_fence_barrier_fence;
 
+__device__ __forceinline__ int ep_qp_channel(int expert_local_idx,
+                                             int qps_per_rank,
+                                             int active_qps_per_rank) {
+    int active_qps = active_qps_per_rank;
+    if (active_qps <= 0 || active_qps > qps_per_rank)
+        active_qps = qps_per_rank;
+    return expert_local_idx % active_qps;
+}
+
 __global__ void mark_phase_ack_kernel(void* mxa_buffer,
                                       const int32_t* nvlink_available,
                                       void* const* ipc_peer_ptrs,
@@ -143,7 +152,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int64_t timeout_ticks,
-         int phases) {
+         int phases, int active_qps_per_rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -265,8 +274,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     mc_fence();
                 } else {
                     // IBGDA path — send directly from source buffer
-                    mc_rdma_put(comm_ctx, dst_expert_local_idx % num_qp_per_rank, dst_rank, num_qp_per_rank,
-                                      src_ptr, dst_ptr, num_bytes_per_msg, lane_id);
+                    mc_rdma_put(comm_ctx,
+                                ep_qp_channel(dst_expert_local_idx,
+                                              num_qp_per_rank,
+                                              active_qps_per_rank),
+                                dst_rank, num_qp_per_rank, src_ptr, dst_ptr,
+                                num_bytes_per_msg, lane_id);
                 }
 
                 // Increase counter after finishing
@@ -332,8 +345,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
-            mc_red_add(comm_ctx, dst_rank, dst_expert_local_idx % num_qp_per_rank, num_qp_per_rank,
-                       signal_ptr, static_cast<int32_t>(-num_tokens_sent - 1));
+            mc_red_add(comm_ctx, dst_rank,
+                       ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
+                                     active_qps_per_rank),
+                       num_qp_per_rank, signal_ptr,
+                       static_cast<int32_t>(-num_tokens_sent - 1));
         } else {
             mc_st_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
         }
@@ -445,7 +461,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
+              void* workspace, cudaStream_t stream, int64_t timeout_ticks,
+              int phases, int active_qps_per_rank) {
     constexpr int kNumMaxTopK = 11;
     constexpr int kNumWarpsPerGroup = 4;
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -482,7 +499,8 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
+              num_topk, num_experts, rank, num_ranks, timeout_ticks, phases, \
+              active_qps_per_rank); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -506,7 +524,7 @@ combine(void* combined_x, int32_t* active_ranks,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int64_t timeout_ticks,
-        int phases, bool zero_copy) {
+        int phases, bool zero_copy, int active_qps_per_rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -590,8 +608,11 @@ combine(void* combined_x, int32_t* active_ranks,
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 __syncwarp();
-                mc_rdma_put(comm_ctx, local_expert_idx % num_qp_per_rank, dst_rank, num_qp_per_rank,
-                                  buf_ptr, dst_ptr, num_bytes_per_slot, lane_id);
+                mc_rdma_put(comm_ctx,
+                            ep_qp_channel(local_expert_idx, num_qp_per_rank,
+                                          active_qps_per_rank),
+                            dst_rank, num_qp_per_rank, buf_ptr, dst_ptr,
+                            num_bytes_per_slot, lane_id);
             }
         }
         // Put finishing flag
@@ -601,7 +622,10 @@ combine(void* combined_x, int32_t* active_ranks,
             while (mc_ld_acquire(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
                 int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
-                mc_signal(comm_ctx, dst_rank, local_expert_idx % num_qp_per_rank, num_qp_per_rank, signal_ptr, 1);
+                mc_signal(comm_ctx, dst_rank,
+                          ep_qp_channel(local_expert_idx, num_qp_per_rank,
+                                        active_qps_per_rank),
+                          num_qp_per_rank, signal_ptr, 1);
             } else {
                 mc_st_release(rdma_recv_signal_buffer + global_expert_idx, 1);
             }
@@ -698,7 +722,8 @@ void combine(void* combined_x, int32_t* active_ranks,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, cudaStream_t stream,
-             int64_t timeout_ticks, int phases, bool zero_copy) {
+             int64_t timeout_ticks, int phases, bool zero_copy,
+             int active_qps_per_rank) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
     constexpr int kNumMaxTopk = 11;
@@ -727,7 +752,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
-              timeout_ticks, phases, zero_copy); } break
+              timeout_ticks, phases, zero_copy, active_qps_per_rank); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
