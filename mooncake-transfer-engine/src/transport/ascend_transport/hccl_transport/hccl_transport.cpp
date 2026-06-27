@@ -60,7 +60,7 @@ HcclTransport::~HcclTransport() {
 }
 
 void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
-    aclrtStream stream;
+    aclrtStream stream = nullptr;
     int ret = aclrtSetDevice(deviceLogicId);
     if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtSetDevice error, ret: " << ret;
@@ -69,6 +69,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
     ret = aclrtCreateStream(&stream);
     if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtCreateStream error, ret: " << ret;
+        return;
     }
 
     int transfer_max_retry_cnt = getTransferMaxRetryCnt();
@@ -82,6 +83,9 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
             initiator_cond_.wait(lock);
         }
         if (!running_ && allReqQueues_[selfIdx].empty()) {
+            if (stream) {
+                aclrtDestroyStream(stream);
+            }
             return;
         }
         auto start = std::chrono::high_resolution_clock::now();
@@ -219,6 +223,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                 (void)addOpfence;
                 (void)stop;
             }
+            break;
         }
 
         for (auto slice : slice_list) {
