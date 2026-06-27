@@ -27,6 +27,8 @@
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
+#include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/utils/logging/LogLevel.h>
 #include "utils/type_util.h"
 #include "fmt/format.h"
 
@@ -49,6 +51,14 @@ struct S3Env {
     std::string secret_key;
 
     bool use_virtual_addressing = true;
+
+    bool use_https = true;
+
+    Aws::Client::RequestChecksumCalculation request_checksum =
+        Aws::Client::RequestChecksumCalculation::WHEN_SUPPORTED;
+
+    Aws::Client::ResponseChecksumValidation response_checksum =
+        Aws::Client::ResponseChecksumValidation::WHEN_SUPPORTED;
 
     int64_t connect_timeout_ms = kDefaultS3ConnectTimeoutMs;
 
@@ -92,6 +102,46 @@ void AssignTimeoutFromEnv(const char *env_name, int64_t default_value,
     target = default_value;
 }
 
+Aws::Utils::Logging::LogLevel ParseLogLevel(const std::string &value) {
+    if (value == "off") return Aws::Utils::Logging::LogLevel::Off;
+    if (value == "fatal") return Aws::Utils::Logging::LogLevel::Fatal;
+    if (value == "warn") return Aws::Utils::Logging::LogLevel::Warn;
+    if (value == "info") return Aws::Utils::Logging::LogLevel::Info;
+    if (value == "debug") return Aws::Utils::Logging::LogLevel::Debug;
+    if (value == "trace") return Aws::Utils::Logging::LogLevel::Trace;
+    if (!value.empty()) {
+        LOG(WARNING) << "Invalid MOONCAKE_AWS_LOG_LEVEL value: " << value
+                     << ", falling back to Error";
+    }
+    return Aws::Utils::Logging::LogLevel::Error;
+}
+
+Aws::Client::RequestChecksumCalculation ParseRequestChecksum(
+    const std::string &value) {
+    if (value == "when_required") {
+        return Aws::Client::RequestChecksumCalculation::WHEN_REQUIRED;
+    }
+    if (!value.empty()) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_AWS_S3_REQUEST_CHECKSUM value: " << value
+            << ", falling back to when_supported";
+    }
+    return Aws::Client::RequestChecksumCalculation::WHEN_SUPPORTED;
+}
+
+Aws::Client::ResponseChecksumValidation ParseResponseChecksum(
+    const std::string &value) {
+    if (value == "when_required") {
+        return Aws::Client::ResponseChecksumValidation::WHEN_REQUIRED;
+    }
+    if (!value.empty()) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_AWS_S3_RESPONSE_CHECKSUM value: " << value
+            << ", falling back to when_supported";
+    }
+    return Aws::Client::ResponseChecksumValidation::WHEN_SUPPORTED;
+}
+
 }  // namespace
 
 bool S3Helper::aws_initialized = false;
@@ -113,6 +163,24 @@ void S3Helper::InitAPI() {
     AssignBoolFromEnv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING",
                       s3_env.use_virtual_addressing);
 
+    AssignBoolFromEnv("MOONCAKE_AWS_S3_USE_HTTPS", s3_env.use_https);
+
+    {
+        std::string tmp;
+        AssignStringFromEnv("MOONCAKE_AWS_LOG_LEVEL", tmp);
+        options_.loggingOptions.logLevel = ParseLogLevel(tmp);
+    }
+    {
+        std::string tmp;
+        AssignStringFromEnv("MOONCAKE_AWS_S3_REQUEST_CHECKSUM", tmp);
+        s3_env.request_checksum = ParseRequestChecksum(tmp);
+    }
+    {
+        std::string tmp;
+        AssignStringFromEnv("MOONCAKE_AWS_S3_RESPONSE_CHECKSUM", tmp);
+        s3_env.response_checksum = ParseResponseChecksum(tmp);
+    }
+
     AssignTimeoutFromEnv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS",
                          kDefaultS3ConnectTimeoutMs, s3_env.connect_timeout_ms);
     AssignTimeoutFromEnv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS",
@@ -132,7 +200,10 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
 
     config.connectTimeoutMs = s3_env.connect_timeout_ms;
     config.requestTimeoutMs = s3_env.request_timeout_ms;
-    config.scheme = Aws::Http::Scheme::HTTPS;
+    config.scheme = s3_env.use_https ? Aws::Http::Scheme::HTTPS
+                                      : Aws::Http::Scheme::HTTP;
+    config.checksumConfig.requestChecksumCalculation = s3_env.request_checksum;
+    config.checksumConfig.responseChecksumValidation = s3_env.response_checksum;
 
     if (!region.empty()) {
         config.region = region;
@@ -163,7 +234,10 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         "requestTimeoutMs={} "
         "scheme={} "
         "credentials={}/{} "
-        "useVirtualAddressing={}",
+        "useVirtualAddressing={} "
+        "logLevel={} "
+        "requestChecksum={} "
+        "responseChecksum={}",
         config.region.empty() ? "unset" : config.region,
         config.endpointOverride.empty() ? "unset" : config.endpointOverride,
         bucket_.empty() ? "unset" : bucket_, config.connectTimeoutMs,
@@ -171,7 +245,16 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         config.scheme == Aws::Http::Scheme::HTTPS ? "HTTPS" : "HTTP",
         !s3_env.access_key.empty() ? "set" : "unset",
         !s3_env.secret_key.empty() ? "set" : "unset",
-        s3_env.use_virtual_addressing ? "true" : "false");
+        s3_env.use_virtual_addressing ? "true" : "false",
+        Aws::Utils::Logging::GetLogLevelName(options_.loggingOptions.logLevel),
+        s3_env.request_checksum ==
+                Aws::Client::RequestChecksumCalculation::WHEN_SUPPORTED
+            ? "when_supported"
+            : "when_required",
+        s3_env.response_checksum ==
+                Aws::Client::ResponseChecksumValidation::WHEN_SUPPORTED
+            ? "when_supported"
+            : "when_required");
 
     s3_client_ = Aws::S3::S3Client(
         credentials, config,
