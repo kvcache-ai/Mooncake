@@ -1,6 +1,10 @@
 #include "file_storage.h"
 
+#include <cmath>
+#include <locale>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <vector>
 
 #include "aligned_client_buffer.hpp"
@@ -13,6 +17,57 @@
 #endif
 
 namespace mooncake {
+
+namespace {
+
+double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
+    if (raw_value.empty()) {
+        return default_value;
+    }
+
+    std::istringstream stream(raw_value);
+    stream.imbue(std::locale::classic());
+
+    double value = 0.0;
+    stream >> value;
+    if (stream.fail()) {
+        return default_value;
+    }
+    if (!stream.eof() || !std::isfinite(value) || value <= 0.0 || value > 1.0) {
+        return default_value;
+    }
+    return value;
+}
+
+double GetEnvRatioOr(const char* name, double default_value) {
+    const auto raw_value = GetEnvStringOr(name, "");
+    return ParseEnvRatioOr(raw_value, default_value);
+}
+
+double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
+                     double default_value) {
+    const auto preferred_value = GetEnvStringOr(preferred_name, "");
+    if (!preferred_value.empty()) {
+        return ParseEnvRatioOr(preferred_value, default_value);
+    }
+    return GetEnvRatioOr(fallback_name, default_value);
+}
+
+bool GetEnvBoolStringOr(const char* name, bool default_value) {
+    const auto raw_value =
+        GetEnvStringOr(name, default_value ? "true" : "false");
+    if (raw_value == "1" || raw_value == "true" || raw_value == "TRUE" ||
+        raw_value == "True") {
+        return true;
+    }
+    if (raw_value == "0" || raw_value == "false" || raw_value == "FALSE" ||
+        raw_value == "False") {
+        return false;
+    }
+    return default_value;
+}
+
+}  // namespace
 
 using gpu_staging::CopyDeviceToHost;
 using gpu_staging::IsDevicePointer;
@@ -85,6 +140,18 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.client_buffer_gc_ttl_ms =
         GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
+
+    config.enable_disk_watermark_eviction =
+        GetEnvBoolStringOr("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION",
+                           config.enable_disk_watermark_eviction);
+    config.disk_eviction_high_watermark_ratio =
+        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO",
+                      "MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO",
+                      config.disk_eviction_high_watermark_ratio);
+    config.disk_eviction_low_watermark_ratio =
+        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO",
+                      "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
+                      config.disk_eviction_low_watermark_ratio);
 
     auto use_uring_str =
         GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
@@ -169,6 +236,25 @@ bool FileStorageConfig::Validate() const {
     }
     if (heartbeat_interval_seconds <= 0) {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
+        return false;
+    }
+    if (disk_eviction_low_watermark_ratio <= 0.0 ||
+        disk_eviction_low_watermark_ratio > 1.0) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_low_watermark_ratio must be in (0, 1]";
+        return false;
+    }
+    if (disk_eviction_high_watermark_ratio <= 0.0 ||
+        disk_eviction_high_watermark_ratio > 1.0) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_high_watermark_ratio must be in (0, 1]";
+        return false;
+    }
+    if (disk_eviction_low_watermark_ratio >=
+        disk_eviction_high_watermark_ratio) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_low_watermark_ratio must be lower than "
+                   << "disk_eviction_high_watermark_ratio";
         return false;
     }
     return true;
@@ -461,31 +547,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        auto eviction_handler = [this](const std::vector<std::string>&
-                                           evicted_keys) {
-            if (evicted_keys.empty()) return;
-            std::unordered_map<std::string, std::vector<std::string>>
-                keys_by_tenant;
-            for (const auto& storage_key : evicted_keys) {
-                auto [tenant_id, key] =
-                    ParseTenantScopedStorageKey(storage_key);
-                keys_by_tenant[tenant_id].push_back(key);
-            }
-            for (const auto& [tenant_id, keys] : keys_by_tenant) {
-                auto results = client_->BatchEvictDiskReplica(
-                    keys, tenant_id, ReplicaType::LOCAL_DISK);
-                for (size_t i = 0; i < results.size(); ++i) {
-                    if (!results[i]) {
-                        LOG(WARNING)
-                            << "Failed to notify master about evicted local "
-                               "disk key: "
-                            << keys[i] << ", tenant_id=" << tenant_id
-                            << ", error: " << results[i].error();
-                    }
-                }
-            }
-        };
-
         // D2H staging: replace device slices with host memory slices
         // so that storage_backend (ConcatSlicesToString / BuildBucket /
         // WriteBucket) always receives host pointers.
@@ -544,7 +605,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             return res;
         };
         auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler, eviction_handler);
+            host_batch_object, bucket_complete_handler,
+            [this](const std::vector<std::string>& evicted_keys) {
+                return NotifyEvictedDiskReplicas(evicted_keys);
+            });
 
         // Release staging buffers back to pool (Buffer is POD, no destructor)
         for (auto& buf : staging_bufs) {
@@ -562,6 +626,75 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 return tl::make_unexpected(offload_res.error());
             }
         }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
+    const std::vector<std::string>& evicted_keys) {
+    if (evicted_keys.empty()) return {};
+
+    std::optional<ErrorCode> first_error;
+    std::unordered_map<std::string, std::vector<std::string>> keys_by_tenant;
+    for (const auto& storage_key : evicted_keys) {
+        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_key);
+        keys_by_tenant[tenant_id].push_back(key);
+    }
+
+    for (const auto& [tenant_id, keys] : keys_by_tenant) {
+        auto results = client_->BatchEvictDiskReplica(keys, tenant_id,
+                                                      ReplicaType::LOCAL_DISK);
+        if (results.size() != keys.size()) {
+            LOG(ERROR) << "BatchEvictDiskReplica returned " << results.size()
+                       << " result(s) for " << keys.size()
+                       << " key(s), tenant_id=" << tenant_id;
+            if (!first_error.has_value()) {
+                first_error = ErrorCode::INTERNAL_ERROR;
+            }
+            continue;
+        }
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    VLOG(1)
+                        << "Master no longer tracks evicted local disk key: "
+                        << keys[i] << ", tenant_id=" << tenant_id;
+                    continue;
+                }
+                if (!first_error.has_value()) {
+                    first_error = results[i].error();
+                }
+                LOG(WARNING)
+                    << "Failed to notify master about evicted local disk key: "
+                    << keys[i] << ", tenant_id=" << tenant_id
+                    << ", error: " << results[i].error();
+            }
+        }
+    }
+    if (first_error.has_value()) {
+        return tl::make_unexpected(first_error.value());
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
+    if (!config_.enable_disk_watermark_eviction) {
+        return {};
+    }
+
+    auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
+        config_.disk_eviction_high_watermark_ratio,
+        config_.disk_eviction_low_watermark_ratio,
+        [this](const std::vector<std::string>& evicted_keys) {
+            return NotifyEvictedDiskReplicas(evicted_keys);
+        });
+    if (!eviction_result) {
+        return tl::make_unexpected(eviction_result.error());
+    }
+    if (!eviction_result.value().empty()) {
+        LOG(INFO) << "Disk watermark eviction removed "
+                  << eviction_result.value().size() << " LOCAL_DISK key(s)";
     }
     return {};
 }
@@ -663,24 +796,29 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    if (offloading_objects.empty()) {
-        return {};
-    }
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
-    auto offload_result = OffloadObjects(offloading_objects);
-    if (!offload_result) {
-        LOG(ERROR) << "Failed to persist objects with error: "
-                   << offload_result.error();
-        return offload_result;
+    if (!offloading_objects.empty()) {
+        auto offload_result = OffloadObjects(offloading_objects);
+        if (!offload_result) {
+            LOG(ERROR) << "Failed to persist objects with error: "
+                       << offload_result.error();
+            return offload_result;
+        }
+
+        // Drive any pending L2->L1 promotion work for this client. Keep the
+        // existing scheduling semantics: promotion is processed after an
+        // offload heartbeat returns work for this tick.
+        (void)ProcessPromotionTasks();
     }
 
-    // Drive any pending L2->L1 promotion work for this client. Failures
-    // inside ProcessPromotionTasks are logged per-key and do not propagate;
-    // promotion is best-effort and must never break offload.
-    (void)ProcessPromotionTasks();
-
-    // TODO(eviction): Implement an LRU eviction mechanism to manage local
-    // storage capacity.
+    // Proactive disk watermarks keep LOCAL_DISK usage below the configured
+    // low watermark even when no new write arrives to trigger reactive
+    // eviction.
+    auto disk_eviction_result = RunDiskWatermarkEviction();
+    if (!disk_eviction_result) {
+        LOG(WARNING) << "Disk watermark eviction failed: "
+                     << disk_eviction_result.error();
+    }
     return {};
 }
 

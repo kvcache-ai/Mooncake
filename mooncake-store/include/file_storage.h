@@ -83,8 +83,10 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
-     * 4. Pulls and processes any pending L2->L1 promotion tasks queued by the
-     *    master (mirror of step 1+2 in the reverse direction).
+     * 4. If offload work was returned, pulls and processes any pending L2->L1
+     *    promotion tasks queued by the master (mirror of step 1+2 in the
+     *    reverse direction).
+     * 5. Runs proactive local-disk watermark eviction.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
@@ -102,6 +104,11 @@ class FileStorage {
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
+
+    tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
+
+    tl::expected<void, ErrorCode> NotifyEvictedDiskReplicas(
+        const std::vector<std::string>& evicted_keys);
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
