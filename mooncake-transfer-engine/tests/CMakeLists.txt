@@ -35,6 +35,12 @@ add_executable(rdma_loopback_test ${WORKSPACE}/rdma_loopback_test.cpp)
 target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
+# Regression test for #2017 (registerLocalMemory must auto-chunk buffers larger
+# than the device max_mr_size; loopback WRITE past the boundary must succeed).
+add_executable(rdma_large_mr_test ${WORKSPACE}/rdma_large_mr_test.cpp)
+target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest gtest_main )
+# add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA dev + metadata server
+
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
 target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine gtest gtest_main )
