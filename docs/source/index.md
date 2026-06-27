@@ -123,6 +123,7 @@ performance/mooncake/index
 :caption: Design Documents
 :maxdepth: 2
 
+design/project-spec
 design/architecture
 design/mooncake-store
 design/p2p-store
