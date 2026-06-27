@@ -26,7 +26,11 @@
 
 namespace mooncake {
 
-static constexpr size_t kBufferSize = 1u << 24;
+// Prototype upper bound for per-rank staging/scratch buffers. Generic PG paths
+// still default to the historical 16MB effective chunking, while direct-P2P
+// experiments may opt into a larger effective scratch region via env knobs.
+static constexpr size_t kBufferSize = 128u << 20;
+static constexpr size_t kDefaultBufferSize = 16u << 20;
 static constexpr size_t kMaxNumRanks = 64;
 
 struct SegmentInfo {
@@ -92,7 +96,8 @@ void launchP2pReduceScatterSlottedGraphKernel(
     at::Tensor& output, at::Tensor& input, void* local_recv_base,
     void** peer_ptrs, int32_t* available, size_t tensorSize,
     size_t slotStride, int slots, int rank, int numRanks,
-    const uint32_t* baseSequenceSlot, cudaStream_t stream);
+    const uint32_t* baseSequenceSlot, uint32_t* sequenceCounter,
+    uint32_t reserveIncrement, cudaStream_t stream);
 
 void launchP2pReduceScatterSlottedChunkedKernel(
     at::Tensor& output, at::Tensor& input, void* local_recv_base,
@@ -161,7 +166,7 @@ void launchP2pAllgatherStoreSignalSlottedGraphKernel(
     void* input, void* output, void* local_recv_base, void** peer_ptrs,
     int32_t* available, size_t tensorSize, size_t slotStride, int slots,
     int rank, int numRanks, const uint32_t* baseSequenceSlot,
-    cudaStream_t stream);
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream);
 
 void launchP2pAllgatherStoreSignalSlottedChunkedKernel(
     void* input, void* output, void* local_recv_base, void** peer_ptrs,
@@ -179,6 +184,17 @@ void launchP2pAllgatherDirectOutputStoreSignalKernel(
     void* input, void** output_peer_ptrs, void* local_recv_base,
     void** scratch_peer_ptrs, int32_t* available, size_t tensorSize, int rank,
     int numRanks, uint32_t sequence, cudaStream_t stream);
+
+void launchP2pAllgatherDirectOutputStoreSignalGraphKernel(
+    void* input, void** output_peer_ptrs, void* local_recv_base,
+    void** scratch_peer_ptrs, int32_t* available, size_t tensorSize, int rank,
+    int numRanks, const uint32_t* sequenceSlot, cudaStream_t stream);
+
+void launchP2pAllgatherDirectOutputSlottedGraphKernel(
+    void* input, void** output_peer_ptrs, void* local_recv_base,
+    void** scratch_peer_ptrs, int32_t* available, size_t tensorSize, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream);
 
 void launchIpcAllgatherStoreKernel(void* input, const uintptr_t* outPtrs,
                                    int rank, int numRanks, size_t tensorSize,

@@ -113,7 +113,7 @@ void launchP2pReduceScatterSlottedGraphKernel_##suffix(                      \
     type* output, const type* input, void* local_recv_base, void** peer_ptrs, \
     int32_t* available, size_t numElements, size_t slotStrideBytes, int slots,\
     int rank, int numRanks, const uint32_t* baseSequenceSlot,                \
-    cudaStream_t stream);
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream);
 
 DECL_P2P_RS_GRAPH(uint8, uint8_t)
 DECL_P2P_RS_GRAPH(int8, int8_t)
@@ -130,7 +130,7 @@ void launchP2pReduceScatterSlottedGraphKernel_bf16(
     void* output, const void* input, void* local_recv_base, void** peer_ptrs,
     int32_t* available, size_t numElements, size_t slotStrideBytes, int slots,
     int rank, int numRanks, const uint32_t* baseSequenceSlot,
-    cudaStream_t stream);
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream);
 
 void launchP2pReduceScatterSlottedChunkedKernel_uint8(
     uint8_t* output, const uint8_t* input, void* local_recv_base,

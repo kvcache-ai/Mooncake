@@ -107,6 +107,29 @@ static int deviceStoreSignalSlots() {
     return static_cast<int>(parsed);
 }
 
+static size_t directP2pEffectiveBufferSize() {
+    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_BUFFER_MB");
+    if (!value || value[0] == '\0') return kDefaultBufferSize;
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || parsed == 0) return kDefaultBufferSize;
+    const size_t mb = static_cast<size_t>(parsed);
+    const size_t max_mb = kBufferSize >> 20;
+    const size_t clamped_mb = std::min(std::max<size_t>(mb, 16), max_mb);
+    return clamped_mb << 20;
+}
+
+static size_t directP2pSlotStride(size_t effectiveBufferSize,
+                                  size_t signalBytes, int slots,
+                                  int activeSize) {
+    if (slots <= 0 || activeSize <= 0 || effectiveBufferSize <= signalBytes) {
+        return 0;
+    }
+    return (((effectiveBufferSize - signalBytes) / static_cast<size_t>(slots) /
+             static_cast<size_t>(activeSize)) &
+            ~static_cast<size_t>(7));
+}
+
 static bool useDirectP2pCurrentStream() {
     const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_CURRENT_STREAM");
     return value && value[0] != '\0' && value[0] != '0';
@@ -119,6 +142,11 @@ static bool useDirectP2pNoEventWork() {
 
 static bool useDirectP2pOutputAllgatherPoc() {
     const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_OUTPUT_AG");
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+static bool useDirectP2pAllReduceDirectOutputAllgatherPoc() {
+    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AR_DIRECT_OUTPUT_AG");
     return value && value[0] != '\0' && value[0] != '0';
 }
 
@@ -146,6 +174,20 @@ static bool directP2pCountEnabled() {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
+static bool directP2pAllReduceStageProfileEnabled() {
+    const char* value = std::getenv("MOONCAKE_PG_AR_STAGE_PROFILE");
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+static uint64_t directP2pAllReduceStageProfileLimit() {
+    const char* value = std::getenv("MOONCAKE_PG_AR_STAGE_PROFILE_LIMIT");
+    if (!value || value[0] == '\0') return 8;
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || parsed == 0) return 8;
+    return parsed;
+}
+
 static bool useDirectP2pChunked() {
     const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_CHUNKED");
     return value && value[0] != '\0' && value[0] != '0';
@@ -153,6 +195,11 @@ static bool useDirectP2pChunked() {
 
 static bool useDirectP2pDeviceSequence() {
     const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_DEVICE_SEQUENCE");
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+static bool useFusedDirectP2pDeviceSequenceReserve() {
+    const char* value = std::getenv("MOONCAKE_PG_FUSED_DEVICE_SEQUENCE");
     return value && value[0] != '\0' && value[0] != '0';
 }
 
@@ -270,6 +317,17 @@ static std::string directP2pAllgatherOutputKey(int backendIndex, int sequence,
     return "mooncake_pg_direct_p2p_ag_output/" +
            std::to_string(backendIndex) + "/" + std::to_string(sequence) +
            "/" + std::to_string(rank);
+}
+
+static uint64_t directP2pIpcHandleFingerprint(
+    const cudaIpcMemHandle_t& handle) {
+    const auto* handle_bytes = reinterpret_cast<const unsigned char*>(&handle);
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof(cudaIpcMemHandle_t); ++i) {
+        hash ^= static_cast<uint64_t>(handle_bytes[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
 static std::string directP2pAllgatherSyncKey(int backendIndex, int rank,
@@ -968,14 +1026,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             disableDirectP2pDuringCudaGraphCapture() &&
             isCudaStreamCapturing(stream.stream());
         const int store_signal_slots = deviceStoreSignalSlots();
+        const size_t direct_buffer_size = directP2pEffectiveBufferSize();
         const size_t direct_signal_bytes =
             static_cast<size_t>(store_signal_slots) * kMaxNumRanks *
             sizeof(uint32_t) * 2;
-        const size_t direct_slot_stride =
-            (((kBufferSize - direct_signal_bytes) /
-              static_cast<size_t>(store_signal_slots) /
-              static_cast<size_t>(meta_->activeSize)) &
-             ~static_cast<size_t>(7));
+        const size_t direct_slot_stride = directP2pSlotStride(
+            direct_buffer_size, direct_signal_bytes, store_signal_slots,
+            meta_->activeSize);
         const bool use_device_sequence = useDirectP2pDeviceSequence() &&
             directP2pDeviceSequenceCounter_ && directP2pDeviceSequenceSlots_;
         const size_t direct_ar_segment_bytes =
@@ -1004,12 +1061,21 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                    direct_ar_chunk_bytes)
                 : 1;
             const size_t direct_ag_chunk_count = direct_rs_chunk_count;
+            const bool want_ar_direct_output_ag =
+                useDirectP2pAllReduceDirectOutputAllgatherPoc() &&
+                use_device_sequence && !use_chunked_ar;
+            const size_t direct_ag_sequence_count =
+                want_ar_direct_output_ag ? 1 : direct_ag_chunk_count;
+            const bool fuse_device_sequence_reserve =
+                use_device_sequence && useFusedDirectP2pDeviceSequenceReserve() &&
+                !use_chunked_ar && !want_ar_direct_output_ag;
             const size_t segment_numel =
                 direct_ar_segment_bytes / tensor.element_size();
             auto local_segment = at::from_blob(
                 static_cast<char*>(tensor.data_ptr()) +
                     static_cast<size_t>(rank_) * direct_ar_segment_bytes,
                 {static_cast<int64_t>(segment_numel)}, tensor.options());
+            DirectP2pOutputPeerCache* ar_output_cache = nullptr;
 
             const uint32_t sequence = directP2pAllgatherSequence_;
             const uint32_t* rs_device_sequence_slot = nullptr;
@@ -1025,19 +1091,44 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                     directP2pDeviceSequenceSlotCursor_++;
                 ag_device_sequence_slot = directP2pDeviceSequenceSlots_ +
                     directP2pDeviceSequenceSlotCursor_++;
-                launchP2pReserveSequence(
-                    directP2pDeviceSequenceCounter_,
-                    const_cast<uint32_t*>(rs_device_sequence_slot),
-                    static_cast<uint32_t>(direct_rs_chunk_count),
-                    stream.stream());
-                launchP2pReserveSequence(
-                    directP2pDeviceSequenceCounter_,
-                    const_cast<uint32_t*>(ag_device_sequence_slot),
-                    static_cast<uint32_t>(direct_ag_chunk_count),
-                    stream.stream());
+                if (!fuse_device_sequence_reserve) {
+                    launchP2pReserveSequence(
+                        directP2pDeviceSequenceCounter_,
+                        const_cast<uint32_t*>(rs_device_sequence_slot),
+                        static_cast<uint32_t>(direct_rs_chunk_count),
+                        stream.stream());
+                    launchP2pReserveSequence(
+                        directP2pDeviceSequenceCounter_,
+                        const_cast<uint32_t*>(ag_device_sequence_slot),
+                        static_cast<uint32_t>(direct_ag_sequence_count),
+                        stream.stream());
+                }
             } else {
                 directP2pAllgatherSequence_ += static_cast<uint32_t>(
-                    direct_rs_chunk_count + direct_ag_chunk_count);
+                    direct_rs_chunk_count + direct_ag_sequence_count);
+            }
+
+            const bool profile_ar_stages =
+                directP2pAllReduceStageProfileEnabled() && rank_ == 0 &&
+                directP2pAllReduceStageProfileCount_ <
+                    directP2pAllReduceStageProfileLimit();
+            if (directP2pAllReduceStageProfileEnabled() && rank_ == 0 &&
+                directP2pAllReduceStageProfileCount_ == 0) {
+                LOG(WARNING)
+                    << "MOONCAKE_PG_AR_STAGE_PROFILE enabled bytes="
+                    << tensorSize << " segment_bytes="
+                    << direct_ar_segment_bytes << " chunked="
+                    << use_chunked_ar << " fused_sequence="
+                    << fuse_device_sequence_reserve;
+            }
+            cudaEvent_t ar_profile_start = nullptr;
+            cudaEvent_t ar_profile_rs_done = nullptr;
+            cudaEvent_t ar_profile_ag_done = nullptr;
+            if (profile_ar_stages) {
+                cudaEventCreate(&ar_profile_start);
+                cudaEventCreate(&ar_profile_rs_done);
+                cudaEventCreate(&ar_profile_ag_done);
+                cudaEventRecord(ar_profile_start, stream.stream());
             }
 
             if (use_chunked_ar && use_device_sequence) {
@@ -1064,7 +1155,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                     directP2pTransport_->availableTablePtr(),
                     direct_ar_segment_bytes, direct_slot_stride,
                     store_signal_slots, rank_, meta_->activeSize,
-                    rs_device_sequence_slot, stream.stream());
+                    rs_device_sequence_slot,
+                    fuse_device_sequence_reserve
+                        ? directP2pDeviceSequenceCounter_
+                        : nullptr,
+                    static_cast<uint32_t>(direct_rs_chunk_count),
+                    stream.stream());
             } else {
                 launchP2pReduceScatterSlottedKernel(
                     local_segment, tensor, recv_buffer_[0],
@@ -1075,9 +1171,153 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                     stream.stream());
             }
 
+            if (profile_ar_stages) {
+                cudaEventRecord(ar_profile_rs_done, stream.stream());
+            }
+
             const uint32_t ag_sequence =
                 sequence + static_cast<uint32_t>(direct_rs_chunk_count);
-            if (use_chunked_ar && use_device_sequence) {
+            if (want_ar_direct_output_ag) {
+                const auto output_ptr =
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr());
+                CUdeviceptr base_ptr = 0;
+                size_t alloc_size = 0;
+                CUresult cu_err = cuMemGetAddressRange(
+                    &base_ptr, &alloc_size,
+                    reinterpret_cast<CUdeviceptr>(tensor.data_ptr()));
+                TORCH_CHECK(cu_err == CUDA_SUCCESS,
+                            "AR direct-output AG cuMemGetAddressRange failed: ",
+                            static_cast<int>(cu_err));
+                const uint64_t local_offset =
+                    output_ptr - static_cast<uintptr_t>(base_ptr);
+                TORCH_CHECK(local_offset + tensorSize <= alloc_size,
+                            "AR direct-output AG tensor exceeds allocation: offset=",
+                            local_offset, " tensor_bytes=", tensorSize,
+                            " alloc_size=", alloc_size);
+                cudaIpcMemHandle_t handle;
+                cudaError_t ipc_err = cudaIpcGetMemHandle(
+                    &handle, reinterpret_cast<void*>(base_ptr));
+                TORCH_CHECK(ipc_err == cudaSuccess,
+                            "AR direct-output AG cudaIpcGetMemHandle failed: ",
+                            cudaGetErrorString(ipc_err));
+
+                std::vector<uint8_t> local_bytes(
+                    sizeof(cudaIpcMemHandle_t) + sizeof(uint64_t) * 2);
+                std::memcpy(local_bytes.data(), &handle,
+                            sizeof(cudaIpcMemHandle_t));
+                std::memcpy(local_bytes.data() + sizeof(cudaIpcMemHandle_t),
+                            &local_offset, sizeof(uint64_t));
+                uint64_t local_alloc_size = static_cast<uint64_t>(alloc_size);
+                std::memcpy(local_bytes.data() + sizeof(cudaIpcMemHandle_t) +
+                                sizeof(uint64_t),
+                            &local_alloc_size, sizeof(uint64_t));
+                meta_->store->set(directP2pAllgatherOutputKey(
+                                      meta_->backendIndex, sequence, rank_),
+                                  local_bytes);
+
+                std::vector<std::string> keys;
+                keys.reserve(meta_->activeSize);
+                for (int j = 0; j < meta_->activeSize; ++j) {
+                    keys.push_back(directP2pAllgatherOutputKey(
+                        meta_->backendIndex, sequence, j));
+                }
+                BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
+                    std::chrono::milliseconds(1)));
+                waiter.wait([&] { return meta_->store->check(keys); });
+
+                struct PeerOutputMeta {
+                    cudaIpcMemHandle_t handle;
+                    uint64_t offset;
+                    uint64_t alloc_size;
+                };
+                std::vector<PeerOutputMeta> peer_meta(meta_->activeSize);
+                std::string cache_key = std::to_string(tensorSize) + ":" +
+                    std::to_string(meta_->activeSize);
+                for (int j = 0; j < meta_->activeSize; ++j) {
+                    auto data = meta_->store->get(keys[j]);
+                    TORCH_CHECK(data.size() ==
+                                    sizeof(cudaIpcMemHandle_t) +
+                                        sizeof(uint64_t) * 2,
+                                "Invalid AR direct-output AG handle size.");
+                    std::memcpy(&peer_meta[j].handle, data.data(),
+                                sizeof(cudaIpcMemHandle_t));
+                    std::memcpy(&peer_meta[j].offset,
+                                data.data() + sizeof(cudaIpcMemHandle_t),
+                                sizeof(uint64_t));
+                    std::memcpy(&peer_meta[j].alloc_size,
+                                data.data() + sizeof(cudaIpcMemHandle_t) +
+                                    sizeof(uint64_t),
+                                sizeof(uint64_t));
+                    TORCH_CHECK(peer_meta[j].offset + tensorSize <=
+                                    peer_meta[j].alloc_size,
+                                "AR direct-output AG peer tensor exceeds allocation.");
+                    cache_key += ":" +
+                        std::to_string(
+                            directP2pIpcHandleFingerprint(peer_meta[j].handle)) +
+                        ":" + std::to_string(peer_meta[j].offset) + ":" +
+                        std::to_string(peer_meta[j].alloc_size);
+                }
+
+                auto cache_it =
+                    directP2pAllReduceOutputPeerCache_.find(cache_key);
+                if (cache_it == directP2pAllReduceOutputPeerCache_.end()) {
+                    DirectP2pOutputPeerCache cache;
+                    cache.peer_ptrs_host.assign(meta_->activeSize, nullptr);
+                    cache.ready = true;
+                    for (int j = 0; j < meta_->activeSize; ++j) {
+                        if (j == rank_) {
+                            cache.peer_ptrs_host[j] = tensor.data_ptr();
+                            continue;
+                        }
+                        void* peer_base = nullptr;
+                        ipc_err = cudaIpcOpenMemHandle(
+                            &peer_base, peer_meta[j].handle,
+                            cudaIpcMemLazyEnablePeerAccess);
+                        if (ipc_err != cudaSuccess) {
+                            cache.ready = false;
+                            LOG(WARNING)
+                                << "AR direct-output AG failed to open rank "
+                                << j << " output handle: "
+                                << cudaGetErrorString(ipc_err);
+                            continue;
+                        }
+                        cache.peer_ptrs_host[j] =
+                            static_cast<char*>(peer_base) + peer_meta[j].offset;
+                    }
+                    if (cache.ready) {
+                        cudaError_t malloc_err = cudaMalloc(
+                            &cache.peer_ptrs_dev,
+                            static_cast<size_t>(meta_->activeSize) *
+                                sizeof(void*));
+                        TORCH_CHECK(malloc_err == cudaSuccess,
+                                    "AR direct-output AG peer table cudaMalloc failed: ",
+                                    cudaGetErrorString(malloc_err));
+                        cudaError_t table_err = cudaMemcpy(
+                            cache.peer_ptrs_dev, cache.peer_ptrs_host.data(),
+                            static_cast<size_t>(meta_->activeSize) *
+                                sizeof(void*),
+                            cudaMemcpyHostToDevice);
+                        TORCH_CHECK(table_err == cudaSuccess,
+                                    "AR direct-output AG peer table copy failed: ",
+                                    cudaGetErrorString(table_err));
+                    }
+                    cache_it = directP2pAllReduceOutputPeerCache_
+                                   .emplace(std::move(cache_key),
+                                            std::move(cache))
+                                   .first;
+                }
+                if (cache_it->second.ready) ar_output_cache = &cache_it->second;
+            }
+
+            if (ar_output_cache) {
+                launchP2pAllgatherDirectOutputSlottedGraphKernel(
+                    local_segment.data_ptr(), ar_output_cache->peer_ptrs_dev,
+                    recv_buffer_[0], directP2pTransport_->peerPtrsTablePtr(),
+                    directP2pTransport_->availableTablePtr(),
+                    direct_ar_segment_bytes, store_signal_slots, rank_,
+                    meta_->activeSize, ag_device_sequence_slot,
+                    stream.stream());
+            } else if (use_chunked_ar && use_device_sequence) {
                 launchP2pAllgatherStoreSignalSlottedChunkedGraphKernel(
                     local_segment.data_ptr(), tensor.data_ptr(), recv_buffer_[0],
                     directP2pTransport_->peerPtrsTablePtr(),
@@ -1101,7 +1341,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                     directP2pTransport_->availableTablePtr(),
                     direct_ar_segment_bytes, direct_slot_stride,
                     store_signal_slots, rank_, meta_->activeSize,
-                    ag_device_sequence_slot, stream.stream());
+                    ag_device_sequence_slot,
+                    fuse_device_sequence_reserve
+                        ? directP2pDeviceSequenceCounter_
+                        : nullptr,
+                    static_cast<uint32_t>(direct_ag_chunk_count),
+                    stream.stream());
             } else {
                 launchP2pAllgatherStoreSignalSlottedKernel(
                     local_segment.data_ptr(), tensor.data_ptr(), recv_buffer_[0],
@@ -1110,6 +1355,34 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                     direct_ar_segment_bytes, direct_slot_stride,
                     store_signal_slots, rank_, meta_->activeSize, ag_sequence,
                     stream.stream());
+            }
+
+            if (profile_ar_stages) {
+                cudaEventRecord(ar_profile_ag_done, stream.stream());
+                cudaEventSynchronize(ar_profile_ag_done);
+                float rs_ms = 0.0f;
+                float ag_ms = 0.0f;
+                float total_ms = 0.0f;
+                cudaEventElapsedTime(&rs_ms, ar_profile_start,
+                                     ar_profile_rs_done);
+                cudaEventElapsedTime(&ag_ms, ar_profile_rs_done,
+                                     ar_profile_ag_done);
+                cudaEventElapsedTime(&total_ms, ar_profile_start,
+                                     ar_profile_ag_done);
+                LOG(WARNING)
+                    << "MOONCAKE_PG_AR_STAGE_PROFILE rank=" << rank_
+                    << " bytes=" << tensorSize
+                    << " segment_bytes=" << direct_ar_segment_bytes
+                    << " chunked=" << use_chunked_ar
+                    << " device_sequence=" << use_device_sequence
+                    << " fused_sequence=" << fuse_device_sequence_reserve
+                    << " rs_us=" << (rs_ms * 1000.0f)
+                    << " ag_us=" << (ag_ms * 1000.0f)
+                    << " total_us=" << (total_ms * 1000.0f);
+                cudaEventDestroy(ar_profile_start);
+                cudaEventDestroy(ar_profile_rs_done);
+                cudaEventDestroy(ar_profile_ag_done);
+                directP2pAllReduceStageProfileCount_++;
             }
 
             cudaError_t launch_err = cudaGetLastError();
@@ -1123,6 +1396,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                           << " bytes=" << tensorSize
                           << " segment_bytes=" << direct_ar_segment_bytes
                           << " seq=" << sequence
+                          << " buffer_bytes=" << direct_buffer_size
                           << " device_sequence=" << use_device_sequence
                           << " chunked=" << use_chunked_ar
                           << " rs_chunks=" << direct_rs_chunk_count
@@ -1181,6 +1455,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                       << " full_active="
                       << (meta_->activeSize == meta_->size)
                       << " sum=" << (opts.reduceOp == c10d::ReduceOp::SUM)
+                      << " buffer_bytes=" << direct_buffer_size
                       << " slot_stride=" << direct_slot_stride
                       << " max_bytes=" << directP2pAllReduceMaxBytes();
         }
@@ -1278,6 +1553,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
         const int store_signal_slots = use_store_signal_slotted
             ? deviceStoreSignalSlots()
             : 1;
+        const size_t direct_buffer_size = directP2pEffectiveBufferSize();
         const int ring_channels = use_device_ring ? deviceRingAllgatherChannels() : 1;
         const int fifo_slots = use_fifo_ring
             ? deviceRingAllgatherFifoSlots(meta_->activeSize)
@@ -1289,10 +1565,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                    ? directP2pFifoSignalBytesFor(ring_channels, fifo_slots)
                    : directP2pSignalBytesFor(ring_channels));
         const size_t direct_slot_stride = use_store_signal_slotted
-            ? (((kBufferSize - direct_signal_bytes) /
-                static_cast<size_t>(store_signal_slots) /
-                static_cast<size_t>(meta_->activeSize)) &
-               ~static_cast<size_t>(7))
+            ? directP2pSlotStride(direct_buffer_size, direct_signal_bytes,
+                                  store_signal_slots, meta_->activeSize)
             : 0;
         const size_t direct_data_bytes = use_store_signal_slotted
             ? tensorSize
@@ -1325,7 +1599,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
             (!overlaps_output || use_store_signal || use_store_signal_slotted) &&
             (use_store_signal_slotted
                  ? (tensorSize <= direct_slot_stride || use_chunked_slotted)
-                 : direct_data_bytes + direct_signal_bytes <= kBufferSize)) {
+                 : direct_data_bytes + direct_signal_bytes <= direct_buffer_size)) {
             const bool use_current_stream =
                 use_store_signal || use_store_signal_slotted ||
                 useDirectP2pCurrentStream();
@@ -1340,6 +1614,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
             }
             const uint32_t sequence = directP2pAllgatherSequence_;
             const uint32_t* device_sequence_slot = nullptr;
+            const bool fuse_device_sequence_reserve =
+                use_device_sequence && useFusedDirectP2pDeviceSequenceReserve() &&
+                !use_chunked_slotted && !use_direct_output;
             if (use_device_sequence) {
                 const uint32_t slot_capacity = directP2pDeviceSequenceSlotCapacity();
                 TORCH_CHECK(directP2pDeviceSequenceSlotCursor_ < slot_capacity,
@@ -1347,11 +1624,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                             "MOONCAKE_PG_DIRECT_P2P_DEVICE_SEQUENCE_SLOTS larger.");
                 device_sequence_slot = directP2pDeviceSequenceSlots_ +
                     directP2pDeviceSequenceSlotCursor_++;
-                launchP2pReserveSequence(
-                    directP2pDeviceSequenceCounter_,
-                    const_cast<uint32_t*>(device_sequence_slot),
-                    static_cast<uint32_t>(direct_chunk_count),
-                    enq_stream.stream());
+                if (!fuse_device_sequence_reserve) {
+                    launchP2pReserveSequence(
+                        directP2pDeviceSequenceCounter_,
+                        const_cast<uint32_t*>(device_sequence_slot),
+                        static_cast<uint32_t>(direct_chunk_count),
+                        enq_stream.stream());
+                }
             } else {
                 directP2pAllgatherSequence_ +=
                     static_cast<uint32_t>(direct_chunk_count);
@@ -1461,7 +1740,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                 if (cache_it->second.ready) output_cache = &cache_it->second;
             }
 
-            if (output_cache && !use_device_sequence) {
+            if (output_cache && use_device_sequence) {
+                launchP2pAllgatherDirectOutputStoreSignalGraphKernel(
+                    inputBuffer.data_ptr(), output_cache->peer_ptrs_dev,
+                    recv_buffer_[0], directP2pTransport_->peerPtrsTablePtr(),
+                    directP2pTransport_->availableTablePtr(), tensorSize, rank_,
+                    meta_->activeSize, device_sequence_slot, enq_stream.stream());
+            } else if (output_cache) {
                 launchP2pAllgatherDirectOutputStoreSignalKernel(
                     inputBuffer.data_ptr(), output_cache->peer_ptrs_dev,
                     recv_buffer_[0], directP2pTransport_->peerPtrsTablePtr(),
@@ -1494,7 +1779,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                     recv_buffer_[0], directP2pTransport_->peerPtrsTablePtr(),
                     directP2pTransport_->availableTablePtr(), tensorSize,
                     direct_slot_stride, store_signal_slots, rank_,
-                    meta_->activeSize, device_sequence_slot, enq_stream.stream());
+                    meta_->activeSize, device_sequence_slot,
+                    fuse_device_sequence_reserve
+                        ? directP2pDeviceSequenceCounter_
+                        : nullptr,
+                    static_cast<uint32_t>(direct_chunk_count),
+                    enq_stream.stream());
             } else if (use_store_signal_slotted) {
                 launchP2pAllgatherStoreSignalSlottedKernel(
                     inputBuffer.data_ptr(), outputBuffer.data_ptr(),
@@ -1551,6 +1841,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                           << " size=" << meta_->activeSize
                           << " bytes=" << tensorSize
                           << " seq=" << sequence
+                          << " buffer_bytes=" << direct_buffer_size
                           << " device_sequence=" << use_device_sequence
                           << " slotted=" << use_store_signal_slotted
                           << " chunked=" << use_chunked_slotted
@@ -1586,6 +1877,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                       << " chunked=" << use_chunked_slotted
                       << " data_bytes=" << direct_data_bytes
                       << " signal_bytes=" << direct_signal_bytes
+                      << " buffer_bytes=" << direct_buffer_size
                       << " slot_stride=" << direct_slot_stride;
         }
         return worker_->putTaskCuda(
@@ -1638,14 +1930,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             disableDirectP2pDuringCudaGraphCapture() &&
             isCudaStreamCapturing(stream.stream());
         const int store_signal_slots = deviceStoreSignalSlots();
+        const size_t direct_buffer_size = directP2pEffectiveBufferSize();
         const size_t direct_signal_bytes =
             static_cast<size_t>(store_signal_slots) * kMaxNumRanks *
             sizeof(uint32_t) * 2;
-        const size_t direct_slot_stride =
-            (((kBufferSize - direct_signal_bytes) /
-              static_cast<size_t>(store_signal_slots) /
-              static_cast<size_t>(meta_->activeSize)) &
-             ~static_cast<size_t>(7));
+        const size_t direct_slot_stride = directP2pSlotStride(
+            direct_buffer_size, direct_signal_bytes, store_signal_slots,
+            meta_->activeSize);
         const bool use_chunked_rs = useDirectP2pChunked() &&
             tensorSize > direct_slot_stride && direct_slot_stride > 0;
         const size_t direct_chunk_bytes = use_chunked_rs
@@ -1666,6 +1957,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                 tensorSize * static_cast<size_t>(meta_->activeSize)) {
             const uint32_t sequence = directP2pAllgatherSequence_;
             const uint32_t* device_sequence_slot = nullptr;
+            const bool fuse_device_sequence_reserve =
+                use_device_sequence && useFusedDirectP2pDeviceSequenceReserve() &&
+                !use_chunked_rs;
             if (use_device_sequence) {
                 const uint32_t slot_capacity = directP2pDeviceSequenceSlotCapacity();
                 TORCH_CHECK(directP2pDeviceSequenceSlotCursor_ < slot_capacity,
@@ -1673,10 +1967,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                             "MOONCAKE_PG_DIRECT_P2P_DEVICE_SEQUENCE_SLOTS larger.");
                 device_sequence_slot = directP2pDeviceSequenceSlots_ +
                     directP2pDeviceSequenceSlotCursor_++;
-                launchP2pReserveSequence(
-                    directP2pDeviceSequenceCounter_,
-                    const_cast<uint32_t*>(device_sequence_slot),
-                    static_cast<uint32_t>(direct_chunk_count), stream.stream());
+                if (!fuse_device_sequence_reserve) {
+                    launchP2pReserveSequence(
+                        directP2pDeviceSequenceCounter_,
+                        const_cast<uint32_t*>(device_sequence_slot),
+                        static_cast<uint32_t>(direct_chunk_count),
+                        stream.stream());
+                }
             } else {
                 directP2pAllgatherSequence_ +=
                     static_cast<uint32_t>(direct_chunk_count);
@@ -1702,7 +1999,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                     directP2pTransport_->peerPtrsTablePtr(),
                     directP2pTransport_->availableTablePtr(), tensorSize,
                     direct_slot_stride, store_signal_slots, rank_, meta_->activeSize,
-                    device_sequence_slot, stream.stream());
+                    device_sequence_slot,
+                    fuse_device_sequence_reserve
+                        ? directP2pDeviceSequenceCounter_
+                        : nullptr,
+                    static_cast<uint32_t>(direct_chunk_count), stream.stream());
             } else {
                 launchP2pReduceScatterSlottedKernel(
                     outputBuffer, inputBuffer, recv_buffer_[0],
@@ -1721,6 +2022,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                           << " size=" << meta_->activeSize
                           << " bytes=" << tensorSize
                           << " seq=" << sequence
+                          << " buffer_bytes=" << direct_buffer_size
                           << " device_sequence=" << use_device_sequence
                           << " chunked=" << use_chunked_rs
                           << " chunks=" << direct_chunk_count
@@ -1748,6 +2050,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                       << " full_active="
                       << (meta_->activeSize == meta_->size)
                       << " sum=" << (opts.reduceOp == c10d::ReduceOp::SUM)
+                      << " buffer_bytes=" << direct_buffer_size
                       << " slot_stride=" << direct_slot_stride
                       << " chunked=" << use_chunked_rs
                       << " input_bytes="

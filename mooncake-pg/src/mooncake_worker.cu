@@ -14,6 +14,46 @@
 
 namespace mooncake {
 
+static int p2pAllgatherBlockCap() {
+    const char* value = std::getenv("MOONCAKE_PG_AG_BLOCKS");
+    if (!value || value[0] == '\0') return 512;
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0) return 512;
+    if (parsed > 512) return 512;
+    return static_cast<int>(parsed);
+}
+
+static int clampP2pAllgatherBlocks(int blocks) {
+    const int cap = p2pAllgatherBlockCap();
+    return blocks < 1 ? 1 : (blocks > cap ? cap : blocks);
+}
+
+static int p2pEnvBlockCap(const char* primary, const char* fallback) {
+    const char* value = std::getenv(primary);
+    if ((!value || value[0] == '\0') && fallback != nullptr) {
+        value = std::getenv(fallback);
+    }
+    if (!value || value[0] == '\0') return 512;
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0) return 512;
+    if (parsed > 512) return 512;
+    return static_cast<int>(parsed);
+}
+
+static int clampP2pReduceScatterStoreBlocks(int blocks) {
+    const int cap = p2pEnvBlockCap("MOONCAKE_PG_RS_STORE_BLOCKS",
+                                   "MOONCAKE_PG_RS_BLOCKS");
+    return blocks < 1 ? 1 : (blocks > cap ? cap : blocks);
+}
+
+static int clampP2pReduceScatterReduceBlocks(int blocks) {
+    const int cap = p2pEnvBlockCap("MOONCAKE_PG_RS_REDUCE_BLOCKS",
+                                   "MOONCAKE_PG_RS_BLOCKS");
+    return blocks < 1 ? 1 : (blocks > cap ? cap : blocks);
+}
+
 // ── Kernel functions ──────────────────────────────────────────────
 // Both CUDA and MUSA share the same kernel bodies. Parameters use plain
 // C++ types (int instead of c10d::OpType / c10d::ReduceOp::RedOpType)
@@ -831,8 +871,13 @@ void launchP2pReserveSequence(uint32_t* counter, uint32_t* sequenceSlot,
 __global__ void p2pSlottedReuseWaitGraphKernel(
     const char* local_recv_base, const int32_t* available,
     size_t consumeSignalOffset, const uint32_t* baseSequenceSlot,
-    uint32_t chunkIndex, int slots, int numRanks) {
+    uint32_t chunkIndex, int slots, int numRanks, uint32_t* sequenceCounter,
+    uint32_t reserveIncrement) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (chunkIndex == 0 && sequenceCounter != nullptr) {
+        *const_cast<uint32_t*>(baseSequenceSlot) =
+            atomicAdd(sequenceCounter, reserveIncrement);
+    }
     const uint32_t sequence = *baseSequenceSlot + chunkIndex;
     if (sequence < static_cast<uint32_t>(slots)) return;
 
@@ -1405,8 +1450,9 @@ void launchP2pReduceScatterSlottedKernelTyped(
     const size_t elements_per_block = threads;
     int blocks_x = static_cast<int>((numElements + elements_per_block - 1) /
                                     elements_per_block);
-    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
-    dim3 store_grid(blocks_x, numRanks, 1);
+    const int store_blocks_x = clampP2pReduceScatterStoreBlocks(blocks_x);
+    const int reduce_blocks_x = clampP2pReduceScatterReduceBlocks(blocks_x);
+    dim3 store_grid(store_blocks_x, numRanks, 1);
     p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
         static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
         slot, numRanks, sequence, slots);
@@ -1417,7 +1463,7 @@ void launchP2pReduceScatterSlottedKernelTyped(
     p2pReduceScatterSlottedProduceWaitKernel<<<1, 1, 0, stream>>>(
         static_cast<char*>(local_recv_base), peer_ptrs, available,
         produceSignalOffset, slot, rank, numRanks, sequence);
-    p2pReduceScatterSlottedLocalReduceKernel<<<blocks_x, threads, 0, stream>>>(
+    p2pReduceScatterSlottedLocalReduceKernel<<<reduce_blocks_x, threads, 0, stream>>>(
         output, static_cast<const char*>(local_recv_base), numElements,
         slotStrideBytes, slot, numRanks);
     p2pSlottedConsumeNotifyKernel<<<1, 1, 0, stream>>>(
@@ -1483,8 +1529,9 @@ void launchP2pReduceScatterSlottedChunkedKernelTyped(
         const size_t produceSignalOffset = kBufferSize - signalBytes;
         const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
         int blocks_x = static_cast<int>((thisChunk + threads - 1) / threads);
-        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
-        dim3 store_grid(blocks_x, numRanks, 1);
+        const int store_blocks_x = clampP2pReduceScatterStoreBlocks(blocks_x);
+        const int reduce_blocks_x = clampP2pReduceScatterReduceBlocks(blocks_x);
+        dim3 store_grid(store_blocks_x, numRanks, 1);
         p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
             static_cast<const char*>(local_recv_base), available,
             consumeSignalOffset, slot, numRanks, sequence, slots);
@@ -1495,8 +1542,8 @@ void launchP2pReduceScatterSlottedChunkedKernelTyped(
         p2pReduceScatterSlottedProduceWaitKernel<<<1, 1, 0, stream>>>(
             static_cast<char*>(local_recv_base), peer_ptrs, available,
             produceSignalOffset, slot, rank, numRanks, sequence);
-        p2pReduceScatterSlottedLocalReduceChunkKernel<<<blocks_x, threads, 0,
-                                                        stream>>>(
+        p2pReduceScatterSlottedLocalReduceChunkKernel<<<reduce_blocks_x,
+                                                        threads, 0, stream>>>(
             output, static_cast<const char*>(local_recv_base), offset,
             thisChunk, slotStrideBytes, slot, numRanks);
         p2pSlottedConsumeNotifyKernel<<<1, 1, 0, stream>>>(
@@ -1551,11 +1598,31 @@ void launchP2pReduceScatterSlottedGraphKernelTyped(
     scalar_t* output, const scalar_t* input, void* local_recv_base,
     void** peer_ptrs, int32_t* available, size_t numElements,
     size_t slotStrideBytes, int slots, int rank, int numRanks,
-    const uint32_t* baseSequenceSlot, cudaStream_t stream) {
+    const uint32_t* baseSequenceSlot, uint32_t* sequenceCounter,
+    uint32_t reserveIncrement, cudaStream_t stream) {
+#ifndef __MUSA__
+    const bool profile = [rank] {
+        const char* value = std::getenv("MOONCAKE_PG_RS_PROFILE");
+        if (!value || value[0] == '\0' || value[0] == '0') return false;
+        const char* rank_value = std::getenv("MOONCAKE_PG_RS_PROFILE_RANK");
+        if (!rank_value || rank_value[0] == '\0') return true;
+        char* end = nullptr;
+        long parsed = std::strtol(rank_value, &end, 10);
+        return end != rank_value && static_cast<int>(parsed) == rank;
+    }();
+    cudaEvent_t ev[6]{};
+    if (profile) {
+        for (auto& event : ev) {
+            cudaEventCreate(&event);
+        }
+        cudaEventRecord(ev[0], stream);
+    }
+#endif
     constexpr int threads = 256;
     int blocks_x = static_cast<int>((numElements + threads - 1) / threads);
-    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
-    dim3 store_grid(blocks_x, numRanks, 1);
+    const int store_blocks_x = clampP2pReduceScatterStoreBlocks(blocks_x);
+    const int reduce_blocks_x = clampP2pReduceScatterReduceBlocks(blocks_x);
+    dim3 store_grid(store_blocks_x, numRanks, 1);
     const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
                                sizeof(uint32_t);
     const size_t produceSignalOffset = kBufferSize - signalBytes;
@@ -1563,22 +1630,66 @@ void launchP2pReduceScatterSlottedGraphKernelTyped(
     constexpr uint32_t chunkIndex = 0;
     p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
         static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
-        baseSequenceSlot, chunkIndex, slots, numRanks);
+        baseSequenceSlot, chunkIndex, slots, numRanks, sequenceCounter,
+        reserveIncrement);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[1], stream);
+#endif
     p2pReduceScatterStoreToSlottedScratchGraphKernel<<<store_grid, threads, 0,
                                                        stream>>>(
         input, peer_ptrs, available, numElements, slotStrideBytes,
         baseSequenceSlot, chunkIndex, slots, rank, numRanks);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[2], stream);
+#endif
     p2pSlottedProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
         static_cast<char*>(local_recv_base), peer_ptrs, available,
         produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
         numRanks);
-    p2pReduceScatterSlottedLocalReduceGraphKernel<<<blocks_x, threads, 0,
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[3], stream);
+#endif
+    p2pReduceScatterSlottedLocalReduceGraphKernel<<<reduce_blocks_x, threads, 0,
                                                     stream>>>(
         output, static_cast<const char*>(local_recv_base), numElements,
         slotStrideBytes, baseSequenceSlot, chunkIndex, slots, numRanks);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[4], stream);
+#endif
     p2pSlottedConsumeNotifyGraphKernel<<<1, 1, 0, stream>>>(
         peer_ptrs, available, consumeSignalOffset, baseSequenceSlot, chunkIndex,
         slots, rank, numRanks);
+#ifndef __MUSA__
+    if (profile) {
+        cudaEventRecord(ev[5], stream);
+        cudaEventSynchronize(ev[5]);
+        float reuse_wait_ms = 0.0f;
+        float store_ms = 0.0f;
+        float produce_wait_ms = 0.0f;
+        float reduce_ms = 0.0f;
+        float consume_ms = 0.0f;
+        float total_ms = 0.0f;
+        cudaEventElapsedTime(&reuse_wait_ms, ev[0], ev[1]);
+        cudaEventElapsedTime(&store_ms, ev[1], ev[2]);
+        cudaEventElapsedTime(&produce_wait_ms, ev[2], ev[3]);
+        cudaEventElapsedTime(&reduce_ms, ev[3], ev[4]);
+        cudaEventElapsedTime(&consume_ms, ev[4], ev[5]);
+        cudaEventElapsedTime(&total_ms, ev[0], ev[5]);
+        std::fprintf(
+            stderr,
+            "MOONCAKE_PG_RS_SLOTTED_GRAPH_PROFILE rank=%d ranks=%d "
+            "elements=%zu slot_stride=%zu reuse_wait_us=%.3f "
+            "store_us=%.3f produce_wait_us=%.3f reduce_us=%.3f "
+            "consume_us=%.3f total_us=%.3f\n",
+            rank, numRanks, numElements, slotStrideBytes,
+            reuse_wait_ms * 1000.0f, store_ms * 1000.0f,
+            produce_wait_ms * 1000.0f, reduce_ms * 1000.0f,
+            consume_ms * 1000.0f, total_ms * 1000.0f);
+        for (auto& event : ev) {
+            cudaEventDestroy(event);
+        }
+    }
+#endif
 }
 
 #define DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(scalar_t, suffix)                    \
@@ -1586,10 +1697,12 @@ void launchP2pReduceScatterSlottedGraphKernelTyped(
         scalar_t* output, const scalar_t* input, void* local_recv_base,       \
         void** peer_ptrs, int32_t* available, size_t numElements,             \
         size_t slotStrideBytes, int slots, int rank, int numRanks,            \
-        const uint32_t* baseSequenceSlot, cudaStream_t stream) {              \
+        const uint32_t* baseSequenceSlot, uint32_t* sequenceCounter,          \
+        uint32_t reserveIncrement, cudaStream_t stream) {                    \
         launchP2pReduceScatterSlottedGraphKernelTyped(                       \
             output, input, local_recv_base, peer_ptrs, available, numElements,\
-            slotStrideBytes, slots, rank, numRanks, baseSequenceSlot, stream);\
+            slotStrideBytes, slots, rank, numRanks, baseSequenceSlot,         \
+            sequenceCounter, reserveIncrement, stream);                      \
     }
 
 DEF_LAUNCH_P2P_RS_SLOTTED_GRAPH(uint8_t, uint8)
@@ -1607,17 +1720,20 @@ void launchP2pReduceScatterSlottedGraphKernel_bf16(
     void* output, const void* input, void* local_recv_base, void** peer_ptrs,
     int32_t* available, size_t numElements, size_t slotStrideBytes, int slots,
     int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    uint32_t* sequenceCounter, uint32_t reserveIncrement,
     cudaStream_t stream) {
 #ifdef __MUSA__
     launchP2pReduceScatterSlottedGraphKernelTyped(
         static_cast<mt_bfloat16*>(output), static_cast<const mt_bfloat16*>(input),
         local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
-        slots, rank, numRanks, baseSequenceSlot, stream);
+        slots, rank, numRanks, baseSequenceSlot, sequenceCounter,
+        reserveIncrement, stream);
 #else
     launchP2pReduceScatterSlottedGraphKernelTyped(
         static_cast<at::BFloat16*>(output), static_cast<const at::BFloat16*>(input),
         local_recv_base, peer_ptrs, available, numElements, slotStrideBytes,
-        slots, rank, numRanks, baseSequenceSlot, stream);
+        slots, rank, numRanks, baseSequenceSlot, sequenceCounter,
+        reserveIncrement, stream);
 #endif
 }
 
@@ -1637,11 +1753,13 @@ void launchP2pReduceScatterSlottedChunkedGraphKernelTyped(
          offset += chunkElements, ++chunkIndex) {
         const size_t thisChunk = std::min(chunkElements, fullNumElements - offset);
         int blocks_x = static_cast<int>((thisChunk + threads - 1) / threads);
-        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
-        dim3 store_grid(blocks_x, numRanks, 1);
+        const int store_blocks_x = clampP2pReduceScatterStoreBlocks(blocks_x);
+        const int reduce_blocks_x = clampP2pReduceScatterReduceBlocks(blocks_x);
+        dim3 store_grid(store_blocks_x, numRanks, 1);
         p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
             static_cast<const char*>(local_recv_base), available,
-            consumeSignalOffset, baseSequenceSlot, chunkIndex, slots, numRanks);
+            consumeSignalOffset, baseSequenceSlot, chunkIndex, slots, numRanks,
+            nullptr, 0);
         p2pReduceScatterStoreChunkToSlottedScratchGraphKernel<<<store_grid,
                                                                 threads, 0,
                                                                 stream>>>(
@@ -1652,8 +1770,9 @@ void launchP2pReduceScatterSlottedChunkedGraphKernelTyped(
             static_cast<char*>(local_recv_base), peer_ptrs, available,
             produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
             numRanks);
-        p2pReduceScatterSlottedLocalReduceChunkGraphKernel<<<blocks_x, threads,
-                                                             0, stream>>>(
+        p2pReduceScatterSlottedLocalReduceChunkGraphKernel<<<reduce_blocks_x,
+                                                             threads, 0,
+                                                             stream>>>(
             output, static_cast<const char*>(local_recv_base), offset,
             thisChunk, slotStrideBytes, baseSequenceSlot, chunkIndex, slots,
             numRanks);
@@ -1857,6 +1976,31 @@ __global__ void p2pAllgatherDirectOutputProduceWaitKernel(
     }
 }
 
+__global__ void p2pAllgatherDirectOutputProduceWaitGraphKernel(
+    char* local_recv_base, void** scratch_peer_ptrs, const int32_t* available,
+    size_t produceSignalOffset, int rank, int numRanks,
+    const uint32_t* sequenceSlot) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const uint32_t sequence = *sequenceSlot;
+    __threadfence_system();
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        auto* peer_base = static_cast<char*>(scratch_peer_ptrs[peer]);
+        auto* peerProduce = reinterpret_cast<uint32_t*>(peer_base +
+                                                        produceSignalOffset);
+        p2pAgSignalStore(peerProduce + rank, sequence, 2);
+    }
+    __threadfence_system();
+
+    auto* produce = reinterpret_cast<volatile uint32_t*>(local_recv_base +
+                                                         produceSignalOffset);
+    for (int peer = 0; peer < numRanks; ++peer) {
+        if (!available[peer]) continue;
+        while (produce[peer] < sequence) {
+        }
+    }
+}
+
 void launchP2pAllgatherStoreSignalKernel(
     void* input, void* output, void* local_recv_base, void** peer_ptrs,
     int32_t* available, size_t tensorSize, int rank, int numRanks,
@@ -1913,7 +2057,7 @@ void launchP2pAllgatherStoreSignalKernel(
     int copy_blocks = static_cast<int>(
         (outputBytes + threads * sizeof(uint64_t) - 1) /
         (threads * sizeof(uint64_t)));
-    copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+    copy_blocks = clampP2pAllgatherBlocks(copy_blocks);
     p2pAllgatherStoreLocalCopyKernel<<<copy_blocks, threads, 0, stream>>>(
         static_cast<const char*>(local_recv_base), static_cast<char*>(output),
         outputBytes);
@@ -2067,7 +2211,7 @@ void launchP2pAllgatherStoreSignalSlottedChunkedKernel(
         int blocks_x = static_cast<int>(
             (thisChunk + threads * sizeof(uint64_t) - 1) /
             (threads * sizeof(uint64_t)));
-        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+        blocks_x = clampP2pAllgatherBlocks(blocks_x);
         dim3 store_grid(blocks_x, numRanks, 1);
         p2pSlottedReuseWaitKernel<<<1, 1, 0, stream>>>(
             static_cast<const char*>(local_recv_base), available,
@@ -2083,7 +2227,7 @@ void launchP2pAllgatherStoreSignalSlottedChunkedKernel(
         int copy_blocks = static_cast<int>(
             (thisChunk + threads * sizeof(uint64_t) - 1) /
             (threads * sizeof(uint64_t)));
-        copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+        copy_blocks = clampP2pAllgatherBlocks(copy_blocks);
         dim3 copy_grid(copy_blocks, numRanks, 1);
         p2pAllgatherStoreSlottedLocalCopyChunkKernel<<<copy_grid, threads, 0,
                                                        stream>>>(
@@ -2099,12 +2243,31 @@ void launchP2pAllgatherStoreSignalSlottedGraphKernel(
     void* input, void* output, void* local_recv_base, void** peer_ptrs,
     int32_t* available, size_t tensorSize, size_t slotStride, int slots,
     int rank, int numRanks, const uint32_t* baseSequenceSlot,
-    cudaStream_t stream) {
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream) {
+#ifndef __MUSA__
+    const bool profile = [rank] {
+        const char* value = std::getenv("MOONCAKE_PG_STORE_SIGNAL_PROFILE");
+        if (!value || value[0] == '\0' || value[0] == '0') return false;
+        const char* rank_value =
+            std::getenv("MOONCAKE_PG_STORE_SIGNAL_PROFILE_RANK");
+        if (!rank_value || rank_value[0] == '\0') return true;
+        char* end = nullptr;
+        long parsed = std::strtol(rank_value, &end, 10);
+        return end != rank_value && static_cast<int>(parsed) == rank;
+    }();
+    cudaEvent_t ev[6]{};
+    if (profile) {
+        for (auto& event : ev) {
+            cudaEventCreate(&event);
+        }
+        cudaEventRecord(ev[0], stream);
+    }
+#endif
     constexpr int threads = 256;
     int blocks_x = static_cast<int>(
         (tensorSize + threads * sizeof(uint64_t) - 1) /
         (threads * sizeof(uint64_t)));
-    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    blocks_x = clampP2pAllgatherBlocks(blocks_x);
     dim3 store_grid(blocks_x, numRanks, 1);
     const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
                                sizeof(uint32_t);
@@ -2113,27 +2276,71 @@ void launchP2pAllgatherStoreSignalSlottedGraphKernel(
     constexpr uint32_t chunkIndex = 0;
     p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
         static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
-        baseSequenceSlot, chunkIndex, slots, numRanks);
+        baseSequenceSlot, chunkIndex, slots, numRanks, sequenceCounter,
+        reserveIncrement);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[1], stream);
+#endif
     p2pAllgatherStoreToSlottedScratchGraphKernel<<<store_grid, threads, 0,
                                                    stream>>>(
         static_cast<const char*>(input), peer_ptrs, available, tensorSize,
         slotStride, baseSequenceSlot, chunkIndex, slots, rank, numRanks);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[2], stream);
+#endif
     p2pSlottedProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
         static_cast<char*>(local_recv_base), peer_ptrs, available,
         produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
         numRanks);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[3], stream);
+#endif
     int copy_blocks = static_cast<int>(
         (tensorSize + threads * sizeof(uint64_t) - 1) /
         (threads * sizeof(uint64_t)));
-    copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+    copy_blocks = clampP2pAllgatherBlocks(copy_blocks);
     dim3 copy_grid(copy_blocks, numRanks, 1);
     p2pAllgatherStoreSlottedLocalCopyGraphKernel<<<copy_grid, threads, 0,
                                                    stream>>>(
         static_cast<const char*>(local_recv_base), static_cast<char*>(output),
         tensorSize, slotStride, baseSequenceSlot, chunkIndex, slots, numRanks);
+#ifndef __MUSA__
+    if (profile) cudaEventRecord(ev[4], stream);
+#endif
     p2pSlottedConsumeNotifyGraphKernel<<<1, 1, 0, stream>>>(
         peer_ptrs, available, consumeSignalOffset, baseSequenceSlot, chunkIndex,
         slots, rank, numRanks);
+#ifndef __MUSA__
+    if (profile) {
+        cudaEventRecord(ev[5], stream);
+        cudaEventSynchronize(ev[5]);
+        float reuse_wait_ms = 0.0f;
+        float store_ms = 0.0f;
+        float produce_wait_ms = 0.0f;
+        float local_copy_ms = 0.0f;
+        float consume_ms = 0.0f;
+        float total_ms = 0.0f;
+        cudaEventElapsedTime(&reuse_wait_ms, ev[0], ev[1]);
+        cudaEventElapsedTime(&store_ms, ev[1], ev[2]);
+        cudaEventElapsedTime(&produce_wait_ms, ev[2], ev[3]);
+        cudaEventElapsedTime(&local_copy_ms, ev[3], ev[4]);
+        cudaEventElapsedTime(&consume_ms, ev[4], ev[5]);
+        cudaEventElapsedTime(&total_ms, ev[0], ev[5]);
+        std::fprintf(
+            stderr,
+            "MOONCAKE_PG_STORE_SIGNAL_SLOTTED_GRAPH_PROFILE rank=%d "
+            "ranks=%d bytes=%zu slot_stride=%zu reuse_wait_us=%.3f "
+            "store_us=%.3f produce_wait_us=%.3f local_copy_us=%.3f "
+            "consume_us=%.3f total_us=%.3f\n",
+            rank, numRanks, tensorSize, slotStride, reuse_wait_ms * 1000.0f,
+            store_ms * 1000.0f, produce_wait_ms * 1000.0f,
+            local_copy_ms * 1000.0f, consume_ms * 1000.0f,
+            total_ms * 1000.0f);
+        for (auto& event : ev) {
+            cudaEventDestroy(event);
+        }
+    }
+#endif
 }
 
 void launchP2pAllgatherStoreSignalSlottedChunkedGraphKernel(
@@ -2153,11 +2360,12 @@ void launchP2pAllgatherStoreSignalSlottedChunkedGraphKernel(
         int blocks_x = static_cast<int>(
             (thisChunk + threads * sizeof(uint64_t) - 1) /
             (threads * sizeof(uint64_t)));
-        blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+        blocks_x = clampP2pAllgatherBlocks(blocks_x);
         dim3 store_grid(blocks_x, numRanks, 1);
         p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
             static_cast<const char*>(local_recv_base), available,
-            consumeSignalOffset, baseSequenceSlot, chunkIndex, slots, numRanks);
+            consumeSignalOffset, baseSequenceSlot, chunkIndex, slots, numRanks,
+            nullptr, 0);
         p2pAllgatherStoreToSlottedScratchGraphKernel<<<store_grid, threads, 0,
                                                        stream>>>(
             static_cast<const char*>(input) + offset, peer_ptrs, available,
@@ -2170,7 +2378,7 @@ void launchP2pAllgatherStoreSignalSlottedChunkedGraphKernel(
         int copy_blocks = static_cast<int>(
             (thisChunk + threads * sizeof(uint64_t) - 1) /
             (threads * sizeof(uint64_t)));
-        copy_blocks = copy_blocks < 1 ? 1 : (copy_blocks > 512 ? 512 : copy_blocks);
+        copy_blocks = clampP2pAllgatherBlocks(copy_blocks);
         dim3 copy_grid(copy_blocks, numRanks, 1);
         p2pAllgatherStoreSlottedLocalCopyChunkGraphKernel<<<copy_grid, threads,
                                                             0, stream>>>(
@@ -2201,6 +2409,57 @@ void launchP2pAllgatherDirectOutputStoreSignalKernel(
     p2pAllgatherDirectOutputProduceWaitKernel<<<1, 1, 0, stream>>>(
         static_cast<char*>(local_recv_base), scratch_peer_ptrs, available,
         kProduceSignalOffset, rank, numRanks, sequence);
+}
+
+void launchP2pAllgatherDirectOutputStoreSignalGraphKernel(
+    void* input, void** output_peer_ptrs, void* local_recv_base,
+    void** scratch_peer_ptrs, int32_t* available, size_t tensorSize, int rank,
+    int numRanks, const uint32_t* sequenceSlot, cudaStream_t stream) {
+    constexpr size_t kProduceSignalOffset =
+        kBufferSize - kMaxNumRanks * sizeof(uint32_t);
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    p2pAllgatherDirectOutputStoreKernel<<<store_grid, threads, 0, stream>>>(
+        static_cast<const char*>(input), output_peer_ptrs, available,
+        tensorSize, rank, numRanks);
+    p2pAllgatherDirectOutputProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), scratch_peer_ptrs, available,
+        kProduceSignalOffset, rank, numRanks, sequenceSlot);
+}
+
+void launchP2pAllgatherDirectOutputSlottedGraphKernel(
+    void* input, void** output_peer_ptrs, void* local_recv_base,
+    void** scratch_peer_ptrs, int32_t* available, size_t tensorSize, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream) {
+    constexpr int threads = 256;
+    int blocks_x = static_cast<int>(
+        (tensorSize + threads * sizeof(uint64_t) - 1) /
+        (threads * sizeof(uint64_t)));
+    blocks_x = blocks_x < 1 ? 1 : (blocks_x > 512 ? 512 : blocks_x);
+    dim3 store_grid(blocks_x, numRanks, 1);
+    const size_t signalBytes = static_cast<size_t>(slots) * kMaxNumRanks *
+                               sizeof(uint32_t);
+    const size_t produceSignalOffset = kBufferSize - signalBytes;
+    const size_t consumeSignalOffset = kBufferSize - 2 * signalBytes;
+    constexpr uint32_t chunkIndex = 0;
+    p2pSlottedReuseWaitGraphKernel<<<1, 1, 0, stream>>>(
+        static_cast<const char*>(local_recv_base), available, consumeSignalOffset,
+        baseSequenceSlot, chunkIndex, slots, numRanks, nullptr, 0);
+    p2pAllgatherDirectOutputStoreKernel<<<store_grid, threads, 0, stream>>>(
+        static_cast<const char*>(input), output_peer_ptrs, available,
+        tensorSize, rank, numRanks);
+    p2pSlottedProduceWaitGraphKernel<<<1, 1, 0, stream>>>(
+        static_cast<char*>(local_recv_base), scratch_peer_ptrs, available,
+        produceSignalOffset, baseSequenceSlot, chunkIndex, slots, rank,
+        numRanks);
+    p2pSlottedConsumeNotifyGraphKernel<<<1, 1, 0, stream>>>(
+        scratch_peer_ptrs, available, consumeSignalOffset, baseSequenceSlot,
+        chunkIndex, slots, rank, numRanks);
 }
 
 __global__ void ipcAllgatherStoreKernel(const char* input,
