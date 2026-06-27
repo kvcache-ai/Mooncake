@@ -10,7 +10,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_NOF
@@ -650,26 +650,37 @@ void MemcpyWorkerPool::workerThread() {
         if (task.state) {
             try {
                 bool ok = true;
+                auto runtime_accelerator =
+                    device::GetAcceleratorRegistry().RuntimeAccelerators();
                 for (const auto& op : task.operations) {
-                    int src_dev = -1, dst_dev = -1;
-                    bool src_on_gpu =
-                        gpu_staging::IsDevicePointer(op.src, &src_dev);
-                    bool dst_on_gpu =
-                        gpu_staging::IsDevicePointer(op.dest, &dst_dev);
+                    device::PointerInfo src_info;
+                    device::PointerInfo dst_info;
+                    auto* src_device = runtime_accelerator.FindDeviceForPointer(
+                        op.src, &src_info);
+                    auto* dst_device = runtime_accelerator.FindDeviceForPointer(
+                        op.dest, &dst_info);
 
-                    if (!src_on_gpu && !dst_on_gpu) {
-                        std::memcpy(op.dest, op.src, op.size);
-                    } else {
-                        int dev = src_on_gpu ? src_dev : dst_dev;
-                        gpu_staging::SetDevice(dev);
-                        if (!gpu_staging::CopyAuto(op.dest, op.src, op.size)) {
+                    if (src_device || dst_device) {
+                        if (src_device && dst_device &&
+                            src_device != dst_device) {
                             LOG(ERROR)
-                                << "GPU memcpy failed: src_dev=" << src_dev
-                                << " dst_dev=" << dst_dev
+                                << "GPU memcpy failed: source and destination "
+                                   "belong to different accelerator runtimes"
+                                << " src_dev=" << src_info.device_id
+                                << " dst_dev=" << dst_info.device_id
                                 << " size=" << op.size;
                             ok = false;
                             break;
                         }
+                    }
+                    if (!runtime_accelerator.CopyMaybeAccelerator(
+                            op.dest, op.src, op.size)) {
+                        LOG(ERROR) << "GPU memcpy failed: src_dev="
+                                   << src_info.device_id
+                                   << " dst_dev=" << dst_info.device_id
+                                   << " size=" << op.size;
+                        ok = false;
+                        break;
                     }
                 }
 
