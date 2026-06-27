@@ -30,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "common.h"
 #include "topology.h"
@@ -50,9 +51,15 @@ class TransferMetadata {
     };
 
     struct BufferDesc {
+        static constexpr const char *STATE_READY = "READY";
+        static constexpr const char *STATE_DRAINING = "DRAINING";
+        static constexpr const char *STATE_REMOVED = "REMOVED";
+
         std::string name;
         uint64_t addr;
         uint64_t length;
+        // Empty means legacy READY.
+        std::string state;
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
@@ -107,6 +114,10 @@ class TransferMetadata {
         uint64_t cxl_base_addr;
         // TODO : make these two a union or a std::variant
         std::string timestamp;
+        // Monotonic metadata publish version. Segment name/id may be reused
+        // after replacement, so readers treat a version change as invalidating
+        // resources derived from the old descriptor.
+        uint64_t metadata_version = 0;
         // this is for ascend
         RankInfoDesc rank_info;
 
@@ -183,6 +194,10 @@ class TransferMetadata {
 
     int syncSegmentCache(const std::string &segment_name);
 
+    void updateSegmentCacheEntry(
+        SegmentID segment_id, const std::string &segment_name,
+        const std::shared_ptr<SegmentDesc> &desc);
+
     int removeSegmentDesc(const std::string &segment_name);
 
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
@@ -225,16 +240,39 @@ class TransferMetadata {
 
     void dumpMetadataContentUnlocked();
 
-   private:
     int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
+
     std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
         Json::Value &segmentJSON, const std::string &segment_name);
+
+    uint64_t segmentMetadataVersionChangeCount() const {
+        return segment_metadata_version_change_count_.load(
+            std::memory_order_relaxed);
+    }
+
+   private:
     int receivePeerMetadata(const Json::Value &peer_json,
                             Json::Value &local_json);
     int receivePeerNotify(const Json::Value &peer_json,
                           Json::Value &local_json);
     int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
     std::string getFullMetadataKey(const std::string &segment_name) const;
+    void updateSegmentCacheEntryLocked(
+        SegmentID segment_id, const std::string &segment_name,
+        const std::shared_ptr<SegmentDesc> &desc);
+    bool isSegmentCacheFreshLocked(SegmentID segment_id) const;
+    struct SegmentCacheLookup {
+        SegmentID segment_id = 0;
+        std::string segment_name;
+        std::shared_ptr<SegmentDesc> desc;
+        bool fresh = false;
+        bool refresh_owner = false;
+    };
+    SegmentCacheLookup lookupSegmentCacheByName(
+        const std::string &segment_name);
+    SegmentCacheLookup lookupSegmentCacheByID(SegmentID segment_id);
+    std::shared_ptr<SegmentDesc> getLocalSegmentDescByName(
+        const std::string &segment_name);
 
     bool p2p_handshake_mode_{false};
     std::string common_key_prefix_;
@@ -244,6 +282,8 @@ class TransferMetadata {
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
+    std::unordered_map<uint64_t, uint64_t> segment_cache_update_ns_map_;
+    std::unordered_set<uint64_t> segment_refreshing_ids_;
 
     RWSpinlock notify_lock_;
     std::vector<NotifyDesc> notifys;
@@ -252,6 +292,7 @@ class TransferMetadata {
     RpcMetaDesc local_rpc_meta_;
 
     std::atomic<SegmentID> next_segment_id_;
+    std::atomic<uint64_t> segment_metadata_version_change_count_{0};
 
     std::shared_ptr<HandShakePlugin> handshake_plugin_;
     std::shared_ptr<MetadataStoragePlugin> storage_plugin_;

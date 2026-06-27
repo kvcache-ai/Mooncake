@@ -17,8 +17,10 @@
 #include <json/value.h>
 
 #include <cassert>
+#include <chrono>
 #include <set>
-#include <algorithm>
+#include <sstream>
+#include <thread>
 
 #include "common.h"
 #include "config.h"
@@ -46,6 +48,52 @@ static inline std::string extractProtocolFromConnString(
         return conn_string.substr(0, pos);
     }
     return "etcd";
+}
+
+static uint64_t metadataDeregisterGraceMs() {
+    uint64_t min_grace_ms =
+        globalConfig().metacache ? globalConfig().metadata_cache_ttl_ms : 0;
+    const char *env = std::getenv("MC_METADATA_DEREG_GRACE_MS");
+    if (!env || !*env) return min_grace_ms;
+    try {
+        uint64_t grace_ms = std::stoull(env);
+        if (grace_ms < min_grace_ms) {
+            LOG(WARNING) << "MC_METADATA_DEREG_GRACE_MS=" << grace_ms
+                         << " is less than MC_METADATA_CACHE_TTL_MS="
+                         << min_grace_ms << ", using " << min_grace_ms;
+            return min_grace_ms;
+        }
+        return grace_ms;
+    } catch (const std::exception &e) {
+        LOG(WARNING) << "Invalid MC_METADATA_DEREG_GRACE_MS=" << env
+                     << ", using " << min_grace_ms << ": " << e.what();
+        return min_grace_ms;
+    }
+}
+
+static void decodeBufferState(const Json::Value &bufferJSON,
+                              TransferMetadata::BufferDesc &buffer) {
+    if (bufferJSON.isMember("state")) {
+        buffer.state = bufferJSON["state"].asString();
+    } else {
+        buffer.state = TransferMetadata::BufferDesc::STATE_READY;
+    }
+}
+
+static void normalizeSegmentDescVersions(
+    TransferMetadata::SegmentDesc &desc) {
+    if (desc.metadata_version == 0) desc.metadata_version = 1;
+    for (auto &buffer : desc.buffers) {
+        if (buffer.state.empty())
+            buffer.state = TransferMetadata::BufferDesc::STATE_READY;
+    }
+}
+
+static void bumpSegmentMetadataVersion(
+    TransferMetadata::SegmentDesc &desc) {
+    uint64_t now_ns = getCurrentTimeInNano();
+    desc.metadata_version =
+        now_ns > desc.metadata_version ? now_ns : desc.metadata_version + 1;
 }
 
 struct TransferNotifyUtil {
@@ -222,6 +270,8 @@ static int encodeMultiProtocolSegmentDesc(
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
     }
+    segmentJSON["metadata_version"] =
+        static_cast<Json::UInt64>(desc.metadata_version);
     Json::Value protocolJSON(Json::arrayValue);
     for (const auto &proto : protocols) {
         if (proto == "rdma") {
@@ -246,6 +296,7 @@ static int encodeMultiProtocolSegmentDesc(
     Json::Value buffersJSON(Json::arrayValue);
     for (const auto &buffer : desc.buffers) {
         Json::Value bufferJSON;
+        if (!buffer.state.empty()) bufferJSON["state"] = buffer.state;
         bufferJSON["name"] = buffer.name;
         bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
         bufferJSON["protocol"] = buffer.protocol;
@@ -318,6 +369,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
+    segmentJSON["metadata_version"] =
+        static_cast<Json::UInt64>(desc.metadata_version);
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
     }
@@ -338,6 +391,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
+            if (!buffer.state.empty()) bufferJSON["state"] = buffer.state;
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -364,6 +418,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
+            if (!buffer.state.empty()) bufferJSON["state"] = buffer.state;
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -378,6 +433,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
+            if (!buffer.state.empty()) bufferJSON["state"] = buffer.state;
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -396,6 +452,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
+            if (!buffer.state.empty()) bufferJSON["state"] = buffer.state;
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -435,6 +492,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
+            if (!buffer.state.empty()) bufferJSON["state"] = buffer.state;
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -449,6 +507,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
+            if (!buffer.state.empty()) bufferJSON["state"] = buffer.state;
             bufferJSON["name"] = buffer.name;
             bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -515,6 +574,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    if (segmentJSON.isMember("metadata_version"))
+        desc->metadata_version = segmentJSON["metadata_version"].asUInt64();
     if (segmentJSON.isMember("rdma_server_name"))
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
@@ -556,6 +617,7 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
 
         if (buffer_protocol == "cxl") {
             TransferMetadata::BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.offset = bufferJSON["offset"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -569,6 +631,7 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
             desc->buffers.push_back(buffer);
         } else if (buffer_protocol == "rdma") {
             TransferMetadata::BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -595,6 +658,7 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
             desc->buffers.push_back(buffer);
         } else if (buffer_protocol == "tcp") {
             TransferMetadata::BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -664,6 +728,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    if (segmentJSON.isMember("metadata_version"))
+        desc->metadata_version = segmentJSON["metadata_version"].asUInt64();
     if (segmentJSON.isMember("rdma_server_name"))
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
@@ -684,6 +750,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -729,6 +796,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -753,6 +821,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     } else if (desc->protocol == "tcp") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -769,6 +838,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                desc->protocol == "sunrise_link") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -810,6 +880,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -845,6 +916,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
+            decodeBufferState(bufferJSON, buffer);
             buffer.name = bufferJSON["name"].asString();
             buffer.offset = bufferJSON["offset"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -972,38 +1044,47 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     for (const auto &[name, desc] : updates) {
         auto it = segment_name_to_id_map_.find(name);
         if (it != segment_name_to_id_map_.end()) {
-            segment_id_to_desc_map_[it->second] = desc;
+            updateSegmentCacheEntryLocked(it->second, name, desc);
         }
     }
     return 0;
 }
 
+void TransferMetadata::updateSegmentCacheEntry(
+    SegmentID segment_id, const std::string &segment_name,
+    const std::shared_ptr<SegmentDesc> &desc) {
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    updateSegmentCacheEntryLocked(segment_id, segment_name, desc);
+}
+
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByName(const std::string &segment_name,
                                        bool force_update) {
-    if (globalConfig().metacache && !force_update) {
-        RWSpinlock::ReadGuard guard(segment_lock_);
-        auto iter = segment_name_to_id_map_.find(segment_name);
-        if (iter != segment_name_to_id_map_.end())
-            return segment_id_to_desc_map_[iter->second];
-    }
+    auto local_desc = getLocalSegmentDescByName(segment_name);
+    if (local_desc) return local_desc;
 
-    // Check if it's LOCAL_SEGMENT_ID
-    {
-        RWSpinlock::ReadGuard guard(segment_lock_);
-        auto iter = segment_name_to_id_map_.find(segment_name);
-        if (iter != segment_name_to_id_map_.end() &&
-            iter->second == LOCAL_SEGMENT_ID) {
-            return segment_id_to_desc_map_[iter->second];
-        }
+    SegmentCacheLookup cached;
+    if (globalConfig().metacache && !force_update) {
+        cached = lookupSegmentCacheByName(segment_name);
+        if (cached.fresh) return cached.desc;
+        if (cached.desc && !cached.refresh_owner) return cached.desc;
     }
 
     // Fetch segment descriptor without holding lock (may involve network I/O)
     auto segment_desc = this->getSegmentDesc(segment_name);
-    if (!segment_desc) return nullptr;
+    if (!segment_desc) {
+        if (cached.desc && cached.refresh_owner) {
+            RWSpinlock::WriteGuard guard(segment_lock_);
+            segment_refreshing_ids_.erase(cached.segment_id);
+        }
+        return cached.desc;
+    }
 
     // Update cache with write lock
     RWSpinlock::WriteGuard guard(segment_lock_);
+    if (cached.desc && cached.refresh_owner) {
+        segment_refreshing_ids_.erase(cached.segment_id);
+    }
     auto iter = segment_name_to_id_map_.find(segment_name);
     SegmentID segment_id;
     if (iter != segment_name_to_id_map_.end()) {
@@ -1011,37 +1092,48 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
     } else {
         segment_id = next_segment_id_.fetch_add(1);
     }
-    segment_id_to_desc_map_[segment_id] = segment_desc;
-    segment_name_to_id_map_[segment_name] = segment_id;
+    updateSegmentCacheEntryLocked(segment_id, segment_name, segment_desc);
     return segment_desc;
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
-    if (segment_id != LOCAL_SEGMENT_ID &&
-        (!globalConfig().metacache || force_update)) {
-        // Get segment name without holding lock during network I/O
-        std::string segment_name;
-        {
-            RWSpinlock::ReadGuard guard(segment_lock_);
-            if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
-            segment_name = segment_id_to_desc_map_[segment_id]->name;
-        }
-
-        // Fetch segment descriptor without holding lock (may involve network
-        // I/O)
-        auto segment_desc = getSegmentDesc(segment_name);
-        if (!segment_desc) return nullptr;
-
-        // Update cache with write lock
-        RWSpinlock::WriteGuard guard(segment_lock_);
-        segment_id_to_desc_map_[segment_id] = segment_desc;
-        return segment_id_to_desc_map_[segment_id];
-    } else {
+    if (segment_id == LOCAL_SEGMENT_ID) {
         RWSpinlock::ReadGuard guard(segment_lock_);
         if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
         return segment_id_to_desc_map_[segment_id];
     }
+
+    std::string segment_name;
+    SegmentCacheLookup cached;
+
+    if (globalConfig().metacache && !force_update) {
+        cached = lookupSegmentCacheByID(segment_id);
+        if (!cached.desc) return nullptr;
+        if (cached.fresh) return cached.desc;
+        if (!cached.refresh_owner) return cached.desc;
+        segment_name = cached.segment_name;
+    } else {
+        // Get segment name without holding lock during network I/O.
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
+        segment_name = segment_id_to_desc_map_[segment_id]->name;
+    }
+
+    // Fetch segment descriptor without holding lock (may involve network I/O).
+    auto segment_desc = getSegmentDesc(segment_name);
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        if (cached.refresh_owner) segment_refreshing_ids_.erase(segment_id);
+        if (segment_desc) {
+            updateSegmentCacheEntryLocked(segment_id, segment_name,
+                                          segment_desc);
+            return segment_id_to_desc_map_[segment_id];
+        }
+    }
+
+    if (globalConfig().metacache && !force_update) return cached.desc;
+    return nullptr;
 }
 
 TransferMetadata::SegmentID TransferMetadata::getSegmentID(
@@ -1061,21 +1153,107 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     if (segment_name_to_id_map_.count(segment_name))
         return segment_name_to_id_map_[segment_name];
     SegmentID id = next_segment_id_.fetch_add(1);
-    segment_id_to_desc_map_[id] = segment_desc;
-    segment_name_to_id_map_[segment_name] = id;
+    updateSegmentCacheEntryLocked(id, segment_name, segment_desc);
     return id;
+}
+
+void TransferMetadata::updateSegmentCacheEntryLocked(
+    SegmentID segment_id, const std::string &segment_name,
+    const std::shared_ptr<SegmentDesc> &desc) {
+    auto old_iter = segment_id_to_desc_map_.find(segment_id);
+    if (segment_id != LOCAL_SEGMENT_ID &&
+        old_iter != segment_id_to_desc_map_.end() && old_iter->second && desc &&
+        old_iter->second->metadata_version != desc->metadata_version) {
+        segment_metadata_version_change_count_.fetch_add(
+            1, std::memory_order_relaxed);
+        LOG(INFO) << "Segment metadata version changed in cache: id="
+                     << segment_id << " name=" << segment_name
+                     << " old_name=" << old_iter->second->name
+                     << " old_version="
+                     << old_iter->second->metadata_version
+                     << " new_version=" << desc->metadata_version;
+    }
+
+    segment_id_to_desc_map_[segment_id] = desc;
+    segment_name_to_id_map_[segment_name] = segment_id;
+    segment_cache_update_ns_map_[segment_id] = getCurrentTimeInNano();
+}
+
+bool TransferMetadata::isSegmentCacheFreshLocked(SegmentID segment_id) const {
+    if (segment_id == LOCAL_SEGMENT_ID) return true;
+    if (!globalConfig().metacache) return false;
+    uint64_t ttl_ms = globalConfig().metadata_cache_ttl_ms;
+    if (ttl_ms == 0) return true;
+    auto iter = segment_cache_update_ns_map_.find(segment_id);
+    if (iter == segment_cache_update_ns_map_.end()) return false;
+    uint64_t now_ns = getCurrentTimeInNano();
+    uint64_t ttl_ns = ttl_ms * 1000ULL * 1000ULL;
+    return now_ns >= iter->second && now_ns - iter->second <= ttl_ns;
+}
+
+std::shared_ptr<TransferMetadata::SegmentDesc>
+TransferMetadata::getLocalSegmentDescByName(const std::string &segment_name) {
+    RWSpinlock::ReadGuard guard(segment_lock_);
+    auto iter = segment_name_to_id_map_.find(segment_name);
+    if (iter == segment_name_to_id_map_.end() ||
+        iter->second != LOCAL_SEGMENT_ID) {
+        return nullptr;
+    }
+    return segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+}
+
+TransferMetadata::SegmentCacheLookup
+TransferMetadata::lookupSegmentCacheByName(const std::string &segment_name) {
+    SegmentCacheLookup lookup;
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    auto iter = segment_name_to_id_map_.find(segment_name);
+    if (iter == segment_name_to_id_map_.end()) return lookup;
+
+    lookup.segment_id = iter->second;
+    lookup.segment_name = segment_name;
+    auto desc_iter = segment_id_to_desc_map_.find(lookup.segment_id);
+    if (desc_iter == segment_id_to_desc_map_.end() || !desc_iter->second) {
+        return lookup;
+    }
+    lookup.desc = desc_iter->second;
+    lookup.fresh = isSegmentCacheFreshLocked(lookup.segment_id);
+    if (!lookup.fresh) {
+        lookup.refresh_owner =
+            segment_refreshing_ids_.insert(lookup.segment_id).second;
+    }
+    return lookup;
+}
+
+TransferMetadata::SegmentCacheLookup
+TransferMetadata::lookupSegmentCacheByID(SegmentID segment_id) {
+    SegmentCacheLookup lookup;
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    auto iter = segment_id_to_desc_map_.find(segment_id);
+    if (iter == segment_id_to_desc_map_.end()) return lookup;
+
+    lookup.segment_id = segment_id;
+    lookup.desc = iter->second;
+    if (!lookup.desc) return lookup;
+    lookup.segment_name = lookup.desc->name;
+    lookup.fresh = isSegmentCacheFreshLocked(segment_id);
+    if (!lookup.fresh) {
+        lookup.refresh_owner = segment_refreshing_ids_.insert(segment_id).second;
+    }
+    return lookup;
 }
 
 int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
     std::shared_ptr<SegmentDesc> desc;
     {
-        RWSpinlock::ReadGuard guard(segment_lock_);
+        RWSpinlock::WriteGuard guard(segment_lock_);
         auto it = segment_id_to_desc_map_.find(segment_id);
         if (it == segment_id_to_desc_map_.end() || !it->second) {
             LOG(ERROR) << "Segment descriptor " << segment_id << " not found";
             return ERR_METADATA;
         }
-        desc = it->second;
+        desc = std::make_shared<SegmentDesc>(*it->second);
+        bumpSegmentMetadataVersion(*desc);
+        it->second = desc;
     }
     return this->updateSegmentDesc(desc->name, *desc);
 }
@@ -1084,8 +1262,11 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
                                       const std::string &segment_name,
                                       std::shared_ptr<SegmentDesc> &&desc) {
     RWSpinlock::WriteGuard guard(segment_lock_);
+    if (desc) normalizeSegmentDescVersions(*desc);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
+    segment_cache_update_ns_map_[segment_id] = getCurrentTimeInNano();
+    segment_refreshing_ids_.erase(segment_id);
     return 0;
 }
 
@@ -1095,6 +1276,8 @@ int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
         int segment_id = segment_name_to_id_map_[segment_name];
         segment_name_to_id_map_.erase(segment_name);
         segment_id_to_desc_map_.erase(segment_id);
+        segment_cache_update_ns_map_.erase(segment_id);
+        segment_refreshing_ids_.erase(segment_id);
     }
     return 0;
 }
@@ -1107,7 +1290,10 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
-        segment_desc->buffers.push_back(buffer_desc);
+        BufferDesc updated_buffer = buffer_desc;
+        if (updated_buffer.state.empty())
+            updated_buffer.state = BufferDesc::STATE_READY;
+        segment_desc->buffers.push_back(updated_buffer);
     }
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
@@ -1116,6 +1302,46 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
     bool addr_exist = false;
+    std::shared_ptr<SegmentDesc> draining_desc;
+    std::shared_ptr<SegmentDesc> removed_desc;
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        auto new_segment_desc = std::make_shared<SegmentDesc>();
+        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        *new_segment_desc = *segment_desc;
+        segment_desc = new_segment_desc;
+        for (auto iter = segment_desc->buffers.begin();
+             iter != segment_desc->buffers.end(); ++iter) {
+            if (iter->addr == (uint64_t)addr
+#ifdef USE_CXL
+                ||
+                (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+#endif
+            ) {
+                if (update_metadata) {
+                    iter->state = BufferDesc::STATE_DRAINING;
+                    bumpSegmentMetadataVersion(*segment_desc);
+                    draining_desc =
+                        std::make_shared<SegmentDesc>(*segment_desc);
+                }
+                addr_exist = true;
+                break;
+            }
+        }
+    }
+    if (!addr_exist) {
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+
+    if (draining_desc) {
+        int ret = updateSegmentDesc(draining_desc->name, *draining_desc);
+        if (ret) return ret;
+        uint64_t grace_ms = metadataDeregisterGraceMs();
+        if (grace_ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
+        }
+    }
+
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
@@ -1131,16 +1357,17 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
 #endif
             ) {
                 segment_desc->buffers.erase(iter);
-                addr_exist = true;
+                if (update_metadata) bumpSegmentMetadataVersion(*segment_desc);
+                removed_desc = std::make_shared<SegmentDesc>(*segment_desc);
                 break;
             }
         }
     }
-    if (addr_exist) {
-        if (update_metadata) return updateLocalSegmentDesc();
-        return 0;
+
+    if (update_metadata && removed_desc) {
+        return updateSegmentDesc(removed_desc->name, *removed_desc);
     }
-    return ERR_ADDRESS_NOT_REGISTERED;
+    return 0;
 }
 
 int TransferMetadata::addRpcMetaEntry(const std::string &server_name,

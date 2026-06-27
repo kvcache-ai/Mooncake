@@ -759,6 +759,10 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
     for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
          ++buffer_id) {
         const auto &buffer = buffers[buffer_id];
+        if (!buffer.state.empty() &&
+            buffer.state != TransferMetadata::BufferDesc::STATE_READY) {
+            continue;
+        }
 
         // Check if offset is within buffer range
         if (offset < buffer.addr || length > buffer.length ||

@@ -240,6 +240,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.metacache = false;
     }
 
+    const char* metadata_cache_ttl_ms =
+        std::getenv("MC_METADATA_CACHE_TTL_MS");
+    if (metadata_cache_ttl_ms) {
+        try {
+            uint64_t val = std::stoull(metadata_cache_ttl_ms);
+            if (val <= 3600ULL * 1000ULL) {
+                config.metadata_cache_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_METADATA_CACHE_TTL_MS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_METADATA_CACHE_TTL_MS environment "
+                            "value: "
+                         << metadata_cache_ttl_ms << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
@@ -523,6 +541,9 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
+    LOG(INFO) << "metacache = " << (config.metacache ? "true" : "false");
+    LOG(INFO) << "metadata_cache_ttl_ms = "
+              << config.metadata_cache_ttl_ms;
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;

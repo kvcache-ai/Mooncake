@@ -79,6 +79,10 @@ next data transfer attempt.
 
 Evicted and deleted endpoints are moved to an internal `waiting_list_` and reclaimed asynchronously once their outstanding slices drain. Reclaim runs on every new endpoint insertion, and additionally on a ~1 Hz heartbeat from the per-context `monitorWorker`, so the waiting list drains even under failure load where new insertions stall while evictions continue.
 
+### Metadata Version Reliability
+
+Transfer Engine treats segment names and segment ids as lookup handles rather than stable metadata identities. Replacement nodes may reuse both values, and memory registration can also change descriptor contents. Published segment descriptors therefore carry a single `metadata_version`; RDMA workers use version changes to invalidate cached endpoints and rail health derived from older descriptors. See [Transfer Metadata Version Reliability](metadata-generation-reliability.md) for the detailed design.
+
 ### Fault Handling
 In a multi-NIC environment, one common failure scenario is the temporary unavailability of a specific NIC, while other routes may still connect two nodes.
 Mooncake Store is designed to adeptly manage such temporary

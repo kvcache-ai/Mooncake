@@ -82,6 +82,8 @@ int WorkerPool::submitPostSend(
                            << target_id;
                 return ERR_INVALID_ARGUMENT;
             }
+            auto &peer_segment_desc = segment_desc_map[target_id];
+            recordPeerMetadataVersion(target_id, *peer_segment_desc);
         }
     }
 #else
@@ -89,9 +91,18 @@ int WorkerPool::submitPostSend(
         segment_desc_map;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id))
+        if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id);
+            if (!segment_desc_map[target_id]) {
+                segment_desc_map.clear();
+                LOG(ERROR) << "Cannot get target segment description #"
+                           << target_id;
+                return ERR_INVALID_ARGUMENT;
+            }
+            auto &peer_segment_desc = segment_desc_map[target_id];
+            recordPeerMetadataVersion(target_id, *peer_segment_desc);
+        }
     }
 #endif  // CONFIG_CACHE_SEGMENT_DESC
 
@@ -126,6 +137,7 @@ int WorkerPool::submitPostSend(
                 failed_target_ids[slice->target_id] = getCurrentTimeInNano();
                 continue;
             }
+            recordPeerMetadataVersion(slice->target_id, *peer_segment_desc);
 
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
@@ -154,7 +166,7 @@ int WorkerPool::submitPostSend(
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
                 if (alt_dev_id == (size_t)device_id) continue;
                 auto alt_path =
-                    MakeNicPath(peer_segment_desc->name,
+                    MakeNicPath(peer_segment_desc->nicPathServerName(),
                                 peer_segment_desc->devices[alt_dev_id].name);
                 if (isRailAvailable(alt_path)) {
                     device_id = alt_dev_id;
@@ -419,6 +431,10 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             processed_slice_count_++;
         } else {
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
+            if (peer_segment_desc) {
+                recordPeerMetadataVersion(slice->target_id,
+                                          *peer_segment_desc);
+            }
             int buffer_id, device_id;
             if (!peer_segment_desc ||
                 RdmaTransport::selectDevice(peer_segment_desc.get(),
@@ -612,6 +628,63 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
         return true;
     }
     return false;
+}
+
+void WorkerPool::clearRailState(
+    const std::vector<std::string> &peer_nic_paths) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    for (const auto &peer_nic_path : peer_nic_paths) {
+        rail_states_.erase(peer_nic_path);
+    }
+}
+
+std::vector<std::string> WorkerPool::buildPeerNicPaths(
+    const Transport::SegmentDesc &desc) const {
+    std::vector<std::string> peer_nic_paths;
+    peer_nic_paths.reserve(desc.devices.size());
+    for (const auto &device : desc.devices) {
+        peer_nic_paths.push_back(
+            MakeNicPath(desc.nicPathServerName(), device.name));
+    }
+    return peer_nic_paths;
+}
+
+void WorkerPool::recordPeerMetadataVersion(
+    SegmentID segment_id, const Transport::SegmentDesc &desc) {
+    auto new_paths = buildPeerNicPaths(desc);
+    std::vector<std::string> stale_paths;
+    bool metadata_version_changed = false;
+
+    {
+        std::lock_guard<std::mutex> lock(target_metadata_lock_);
+        auto &state = target_metadata_[segment_id];
+        if (!state.initialized) {
+            state.initialized = true;
+            state.metadata_version = desc.metadata_version;
+            state.peer_nic_paths = std::move(new_paths);
+            return;
+        }
+
+        metadata_version_changed =
+            state.metadata_version != desc.metadata_version;
+        if (metadata_version_changed) {
+            stale_paths = state.peer_nic_paths;
+            LOG(INFO) << "Peer segment metadata version changed: segment_id="
+                         << segment_id << " name=" << desc.name
+                         << " old_version=" << state.metadata_version
+                         << " new_version=" << desc.metadata_version
+                         << ", invalidating old RDMA endpoints";
+        }
+        state.metadata_version = desc.metadata_version;
+        state.peer_nic_paths = std::move(new_paths);
+    }
+
+    if (!metadata_version_changed) return;
+
+    for (const auto &peer_nic_path : stale_paths) {
+        context_.deleteEndpoint(peer_nic_path);
+    }
+    clearRailState(stale_paths);
 }
 
 // Unified retry logic: increment retry count and return whether retry is
