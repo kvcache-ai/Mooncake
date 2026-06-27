@@ -49,54 +49,77 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
 
 // StandbyMetadataStore implementation
 bool HotStandbyService::StandbyMetadataStore::PutMetadata(
-    const std::string& key, const StandbyObjectMetadata& metadata) {
+    const std::string& tenant_id, const std::string& key,
+    const StandbyObjectMetadata& metadata) {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
-    VLOG(2) << "StandbyMetadataStore: stored metadata for key=" << key
-            << ", replicas=" << metadata.replicas.size()
+    store_[normalized][key] = metadata;
+    VLOG(2) << "StandbyMetadataStore: stored metadata for tenant=" << normalized
+            << ", key=" << key << ", replicas=" << metadata.replicas.size()
             << ", size=" << metadata.size;
     return true;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
                                                   const std::string& payload) {
-    // Legacy interface - create empty metadata
+    // Legacy interface - create empty metadata for default tenant
     StandbyObjectMetadata metadata;
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
+    store_["default"][key] = metadata;
     return true;
 }
 
 std::optional<StandbyObjectMetadata>
 HotStandbyService::StandbyMetadataStore::GetMetadata(
-    const std::string& key) const {
+    const std::string& tenant_id, const std::string& key) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        return it->second;
-    }
-    return std::nullopt;
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return std::nullopt;
+    auto it = tenant_it->second.find(key);
+    if (it == tenant_it->second.end()) return std::nullopt;
+    return it->second;
 }
 
-bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {
+bool HotStandbyService::StandbyMetadataStore::Remove(
+    const std::string& tenant_id, const std::string& key) {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        store_.erase(it);
-        return true;
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return false;
+    auto it = tenant_it->second.find(key);
+    if (it == tenant_it->second.end()) return false;
+    tenant_it->second.erase(it);
+    if (tenant_it->second.empty()) {
+        store_.erase(tenant_it);
     }
-    return false;
+    return true;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Exists(
-    const std::string& key) const {
+    const std::string& tenant_id, const std::string& key) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_.find(key) != store_.end();
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return false;
+    return tenant_it->second.find(key) != tenant_it->second.end();
 }
 
 size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_.size();
+    size_t total = 0;
+    for (const auto& [tid, tenant_map] : store_) {
+        total += tenant_map.size();
+    }
+    return total;
+}
+
+size_t HotStandbyService::StandbyMetadataStore::GetKeyCountForTenant(
+    const std::string& tenant_id) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(normalized);
+    return it == store_.end() ? 0 : it->second.size();
 }
 
 void HotStandbyService::StandbyMetadataStore::Clear() {
@@ -105,12 +128,14 @@ void HotStandbyService::StandbyMetadataStore::Clear() {
 }
 
 void HotStandbyService::StandbyMetadataStore::Snapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<StandbyObjectEntry>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     out.clear();
-    out.reserve(store_.size());
-    for (const auto& kv : store_) {
-        out.emplace_back(kv.first, kv.second);
+    for (const auto& [tenant_id, tenant_store] : store_) {
+        for (const auto& [key, metadata] : tenant_store) {
+            out.push_back(StandbyObjectEntry{NormalizeTenantId(tenant_id), key,
+                                             metadata});
+        }
     }
 }
 
@@ -286,8 +311,13 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
-    for (const auto& kv : snapshot.metadata) {
-        metadata_store_->PutMetadata(kv.first, kv.second);
+    for (const auto& entry : snapshot.metadata) {
+        metadata_store_->PutMetadata(entry.tenant_id, entry.key,
+                                     entry.metadata);
+    }
+    // Load segment registry from snapshot
+    if (oplog_applier_) {
+        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
     }
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     baseline_seq_id = snapshot.snapshot_sequence_id;
@@ -382,6 +412,11 @@ void HotStandbyService::NotifySyncStatus() {
     }
 }
 
+void HotStandbyService::SetCatchUpOpLogStoreForTesting(
+    std::shared_ptr<OpLogStore> store) {
+    catch_up_oplog_store_for_testing_ = std::move(store);
+}
+
 void HotStandbyService::OnWatcherEvent(StandbyEvent event) {
     state_machine_.ProcessEvent(event);
 }
@@ -425,6 +460,7 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
         if (status.applied_seq_id == 0) {
             status.applied_seq_id = applied_seq_id_.load();  // Fallback
         }
+        status.unresolved_gap_count = oplog_applier_->GetUnresolvedGapCount();
     } else {
         status.applied_seq_id = applied_seq_id_.load();
     }
@@ -471,6 +507,10 @@ bool HotStandbyService::IsReadyForPromotion() const {
             << "will be synced after promotion.";
     }
 
+    // NOTE: unresolved-gap check is deferred to PromoteLockedInternal, which
+    // runs gap resolution + final catch-up first and only rejects promotion
+    // when gaps remain after both attempts. Checking here would return a
+    // misleading UNAVAILABLE_IN_CURRENT_STATUS before gap resolution runs.
     return true;
 }
 
@@ -490,6 +530,7 @@ void HotStandbyService::ResolvePromotionGapsLocked() {
         LOG(INFO) << "Promotion gap resolve (attempt " << (retry + 1) << "/"
                   << kMaxGapResolveRetries << "): attempted=" << res.attempted
                   << ", fetched=" << res.fetched
+                  << ", applied_puts=" << res.applied_puts
                   << ", applied_deletes=" << res.applied_deletes;
         if (res.fetched == res.attempted) {
             return;
@@ -506,16 +547,98 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         LOG(INFO) << "Promotion does not require final OpLog catch-up";
         return ErrorCode::OK;
     }
-
-    LOG(INFO) << "Final catch-up sync before promotion...";
-    auto catch_up_store = OpLogStoreFactory::Create(
-        config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
-        config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
-    if (!catch_up_store) {
-        LOG(ERROR) << "Failed to create oplog_store for final catch-up";
+    if (!oplog_applier_) {
+        LOG(ERROR) << "Final catch-up requires OpLogApplier";
         return ErrorCode::INTERNAL_ERROR;
     }
 
+    std::shared_ptr<OpLogStore> catch_up_store;
+    if (catch_up_oplog_store_for_testing_) {
+        catch_up_store = catch_up_oplog_store_for_testing_;
+    } else {
+        auto created = OpLogStoreFactory::Create(
+            config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
+            config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
+        if (!created) {
+            LOG(ERROR) << "Failed to create oplog_store for final catch-up";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        catch_up_store = std::move(created);
+    }
+
+    if (!config_.fail_closed_on_incomplete_catch_up) {
+        LOG(WARNING) << "fail_closed_on_incomplete_catch_up=false; using "
+                        "legacy best-effort catch-up (migration mode)";
+        return FinalCatchUpBestEffortLocked(catch_up_store,
+                                            current_applied_seq_id);
+    }
+
+    uint64_t durable_max_seq = 0;
+    ErrorCode max_err = catch_up_store->GetMaxSequenceId(durable_max_seq);
+    if (max_err == ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
+        LOG(INFO) << "Final catch-up: OpLog store is empty";
+        return ErrorCode::OK;
+    }
+    if (max_err != ErrorCode::OK) {
+        LOG(ERROR) << "Final catch-up: GetMaxSequenceId failed, err="
+                   << static_cast<int>(max_err);
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+
+    static constexpr size_t kBatchSize = 1000;
+    static constexpr size_t kMaxCatchUpBatches = 100;
+    static constexpr auto kMaxCatchUpDuration = std::chrono::seconds(30);
+
+    uint64_t read_from_seq = current_applied_seq_id;
+    auto catch_up_start = std::chrono::steady_clock::now();
+    size_t total_applied = 0;
+    size_t batch_count = 0;
+
+    while (GetLocalLastAppliedSequenceIdLocked() < durable_max_seq) {
+        auto elapsed = std::chrono::steady_clock::now() - catch_up_start;
+        if (elapsed > kMaxCatchUpDuration) {
+            LOG(ERROR) << "Final catch-up timed out before durable max seq. "
+                       << "applied=" << GetLocalLastAppliedSequenceIdLocked()
+                       << ", durable_max=" << durable_max_seq
+                       << ", total_applied=" << total_applied;
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        if (batch_count >= kMaxCatchUpBatches) {
+            LOG(ERROR) << "Final catch-up hit batch limit before durable max. "
+                       << "applied=" << GetLocalLastAppliedSequenceIdLocked()
+                       << ", durable_max=" << durable_max_seq
+                       << ", batches=" << batch_count;
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        std::vector<OpLogEntry> batch;
+        ErrorCode read_err =
+            catch_up_store->ReadOpLogSince(read_from_seq, kBatchSize, batch);
+        if (read_err != ErrorCode::OK) {
+            LOG(ERROR) << "Final catch-up read failed at seq=" << read_from_seq
+                       << ", err=" << static_cast<int>(read_err);
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        if (batch.empty()) {
+            LOG(ERROR) << "Final catch-up read empty batch before max. "
+                       << "read_from=" << read_from_seq
+                       << ", durable_max=" << durable_max_seq;
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        total_applied += oplog_applier_->ApplyOpLogEntries(batch);
+        read_from_seq = batch.back().sequence_id;
+        ++batch_count;
+    }
+    LOG(INFO) << "Final catch-up complete. applied="
+              << GetLocalLastAppliedSequenceIdLocked()
+              << ", durable_max=" << durable_max_seq
+              << ", total_applied=" << total_applied
+              << ", batches=" << batch_count;
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::FinalCatchUpBestEffortLocked(
+    std::shared_ptr<OpLogStore> catch_up_store,
+    uint64_t current_applied_seq_id) {
     static constexpr size_t kBatchSize = 1000;
     static constexpr size_t kMaxCatchUpBatches = 100;
     static constexpr auto kMaxCatchUpDuration = std::chrono::seconds(30);
@@ -536,7 +659,6 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
                          << total_applied;
             break;
         }
-
         if (batch_count >= kMaxCatchUpBatches) {
             LOG(WARNING) << "Final catch-up: reached max batch limit ("
                          << kMaxCatchUpBatches
@@ -544,7 +666,6 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
                          << total_applied;
             break;
         }
-
         std::vector<OpLogEntry> batch;
         ErrorCode read_err =
             catch_up_store->ReadOpLogSince(read_from_seq, kBatchSize, batch);
@@ -558,14 +679,14 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         if (batch.empty()) {
             break;
         }
-
-        total_applied += oplog_applier_->ApplyOpLogEntries(batch);
+        if (oplog_applier_) {
+            total_applied += oplog_applier_->ApplyOpLogEntries(batch);
+        }
         read_from_seq = batch.back().sequence_id;
         ++batch_count;
     }
-
-    LOG(INFO) << "Final catch-up sync done. total_applied=" << total_applied
-              << ", batches=" << batch_count;
+    LOG(INFO) << "Final catch-up (best-effort) done. total_applied="
+              << total_applied << ", batches=" << batch_count;
     return ErrorCode::OK;
 }
 
@@ -592,16 +713,43 @@ ErrorCode HotStandbyService::Promote() {
               << current_applied_seq_id << ", lag: " << status.lag_entries
               << " entries" << ", state: " << StandbyStateToString(GetState());
 
+    auto internal_err = PromoteLockedInternal(current_applied_seq_id);
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
+    }
+
+    lock.unlock();
+    Stop();
+
+    if (config_.enable_oplog_following) {
+        LOG(INFO) << "Standby promoted to Primary successfully. "
+                  << "All remaining OpLog entries have been synced.";
+    } else {
+        LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::PromoteLockedInternal(
+    uint64_t current_applied_seq_id) {
     if (oplog_replicator_) {
         oplog_replicator_->Stop();
     }
-
     ResolvePromotionGapsLocked();
-
-    auto catch_up_err = FinalCatchUpForPromotionLocked(current_applied_seq_id);
+    ErrorCode catch_up_err =
+        FinalCatchUpForPromotionLocked(current_applied_seq_id);
     if (catch_up_err != ErrorCode::OK) {
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
         return catch_up_err;
+    }
+    ResolvePromotionGapsLocked();
+    if (config_.fail_closed_on_unresolved_gaps && oplog_applier_ &&
+        oplog_applier_->HasUnresolvedGaps()) {
+        LOG(ERROR) << "PromoteLockedInternal: unresolved gaps remain after "
+                   << "second gap resolution. gap_count="
+                   << oplog_applier_->GetUnresolvedGapCount();
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
     }
 
     uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
@@ -613,6 +761,51 @@ ErrorCode HotStandbyService::Promote() {
     if (!promotion_success.allowed) {
         LOG(ERROR) << "Cannot finish promotion: " << promotion_success.reason;
         return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    if (!IsReadyForPromotion()) {
+        LOG(ERROR) << "Standby is not ready for promotion, state="
+                   << StandbyStateToString(GetState());
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    // Trigger PROMOTE event
+    auto result = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
+    if (!result.allowed) {
+        LOG(ERROR) << "Cannot promote: " << result.reason;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    StandbySyncStatus status = GetSyncStatus();
+    uint64_t current_applied_seq_id = status.applied_seq_id;
+
+    LOG(INFO) << "Promoting Standby to Primary. Applied seq_id: "
+              << current_applied_seq_id << ", lag: " << status.lag_entries
+              << " entries"
+              << ", state: " << StandbyStateToString(GetState());
+
+    auto internal_err = PromoteLockedInternal(current_applied_seq_id);
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
+    }
+
+    // Export snapshot BEFORE unlocking mutex (atomic promotion + export)
+    uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    out.oplog_sequence_id = latest_applied_seq_id;
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+    } else {
+        out.objects.clear();
+    }
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
     }
 
     lock.unlock();
@@ -644,13 +837,44 @@ uint64_t HotStandbyService::GetLatestAppliedSequenceId() const {
 }
 
 bool HotStandbyService::ExportMetadataSnapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<StandbyObjectEntry>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!metadata_store_) {
         out.clear();
         return false;
     }
     metadata_store_->Snapshot(out);
+    return true;
+}
+
+bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsRunning()) {
+        return false;
+    }
+
+    // Get applied sequence ID (inline to avoid recursive mutex lock)
+    if (oplog_applier_) {
+        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
+        out.oplog_sequence_id = expected_seq > 0 ? expected_seq - 1 : 0;
+    } else {
+        out.oplog_sequence_id = applied_seq_id_.load();
+    }
+
+    // Export object metadata
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+    } else {
+        out.objects.clear();
+    }
+
+    // Export segments from OpLogApplier's registry (Patch B)
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
     return true;
 }
 
