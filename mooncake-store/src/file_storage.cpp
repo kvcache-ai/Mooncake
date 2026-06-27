@@ -491,6 +491,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // WriteBucket) always receives host pointers.
         std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
         std::vector<PinnedBufferPool::Buffer> staging_bufs;
+#if defined(USE_SUNRISE)
+        std::vector<std::vector<char>> staging_bufs_host;
+#endif
 
         for (auto& [obj_key, slices] : batch_object) {
             std::vector<Slice> host_slices;
@@ -499,8 +502,23 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 int device_id = -1;
                 if (IsDevicePointer(slice.ptr, &device_id)) {
                     SetDevice(device_id);
+#if defined(USE_SUNRISE)
+                    std::vector<char> pageable_buf(slice.size);
+                    bool d2h_ok = CopyDeviceToHost(pageable_buf.data(),
+                                                   slice.ptr, slice.size);
+                    if (!d2h_ok) {
+                        LOG(ERROR) << "D2H staging failed for key: " << obj_key;
+                        obj_success = false;
+                        break;
+                    }
+                    staging_bufs_host.push_back(std::move(pageable_buf));
+                    host_slices.emplace_back(
+                        Slice{staging_bufs_host.back().data(), slice.size});
+#else
                     auto buf = pinned_buffer_pool_->Acquire(slice.size);
-                    if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                    bool d2h_ok =
+                        CopyDeviceToHost(buf.data, slice.ptr, slice.size);
+                    if (!d2h_ok) {
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
                         pinned_buffer_pool_->Release(buf);
                         obj_success = false;
@@ -508,6 +526,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
                     staging_bufs.push_back(buf);
+#endif
                 } else {
                     host_slices.push_back(slice);
                 }

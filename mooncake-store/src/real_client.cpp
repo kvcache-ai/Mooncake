@@ -861,6 +861,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
+            } else if (this->protocol == "sunrise_link") {
+#if defined(USE_SUNRISE)
+                sunrise_segment_ptrs_.emplace_back(ptr,
+                                                   SunriseSegmentDeleter{});
+#else
+                LOG(ERROR)
+                    << "sunrise_link protocol requires USE_SUNRISE build";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
@@ -1039,9 +1048,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Validate protocol is supported
-    if (protocol != "tcp" && protocol != "rdma") {
+    if (protocol != "tcp" && protocol != "rdma" && protocol != "sunrise_link") {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << protocol
-                   << ", must be 'tcp' or 'rdma'";
+                   << ", must be 'tcp', 'rdma', or 'sunrise_link'";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1119,6 +1128,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+#if defined(USE_SUNRISE)
+    sunrise_segment_ptrs_.clear();
+#endif
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -1693,7 +1705,11 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    auto scatter_result = scatter_host_to_maybe_device(
+        buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
+    if (!scatter_result) {
+        return tl::unexpected(scatter_result.error());
+    }
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
 
@@ -1771,7 +1787,12 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            buffer_handle.ptr(), value.data(), value.size_bytes(),
+            "put_batch:" + key);
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         auto slices = split_into_slices(buffer_handle);
         buffer_handles.emplace_back(std::move(*alloc_result));
         batched_slices.emplace(key, std::move(slices));
@@ -1875,8 +1896,12 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     // Copy all parts into the contiguous buffer
     size_t offset = 0;
     for (const auto &value : values) {
-        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
-               value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
+            value.size_bytes(), "put_multi_value");
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         offset += value.size_bytes();
     }
 
@@ -3725,7 +3750,11 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    auto scatter_result = scatter_host_to_maybe_device(
+        buffer_handle.ptr(), value.data(), value.size_bytes(), "upsert:" + key);
+    if (!scatter_result) {
+        return tl::unexpected(scatter_result.error());
+    }
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
 
@@ -3971,8 +4000,12 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     auto &buffer_handle = *alloc_result;
     size_t offset = 0;
     for (const auto &value : values) {
-        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
-               value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
+            value.size_bytes(), "upsert_parts:" + key);
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         offset += value.size_bytes();
     }
 
@@ -4055,7 +4088,12 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            buffer_handle.ptr(), value.data(), value.size_bytes(),
+            "upsert_batch:" + key);
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         auto slices = split_into_slices(buffer_handle);
         buffer_handles.emplace_back(std::move(*alloc_result));
         batched_slices.emplace(key, std::move(slices));
