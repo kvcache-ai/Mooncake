@@ -90,6 +90,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
                        GetEnvStringOr("MOONCAKE_USE_URING", "false"));
     config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
+    config.offload_worker_count = GetEnvOr<uint32_t>(
+        "MOONCAKE_OFFLOAD_WORKER_COUNT", config.offload_worker_count);
 
     return config;
 }
@@ -171,6 +173,10 @@ bool FileStorageConfig::Validate() const {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
         return false;
     }
+    if (offload_worker_count < 1) {
+        LOG(ERROR) << "FileStorageConfig: offload_worker_count must >= 1";
+        return false;
+    }
     return true;
 }
 
@@ -228,6 +234,10 @@ FileStorage::~FileStorage() {
     client_buffer_gc_running_ = false;
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
+    }
+    // Stop offload worker pool (after heartbeat/gc threads are joined)
+    if (offload_pool_) {
+        offload_pool_->stop();
     }
 }
 
@@ -303,6 +313,13 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return scan_meta_result;
     }
 
+    // Create worker pool for parallel bucket offloading
+    if (config_.offload_worker_count > 1) {
+        offload_pool_ =
+            std::make_unique<ThreadPool>(config_.offload_worker_count);
+        LOG(INFO) << "Offload worker pool started with "
+                  << config_.offload_worker_count << " threads";
+    }
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
@@ -423,145 +440,200 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return ErrorCode::OK;
     };
 
-    for (const auto& keys : buckets_keys) {
-        std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        std::unordered_map<std::string, std::vector<std::string>>
-            storage_keys_by_tenant;
-        for (const auto& storage_key : keys) {
-            const auto it = task_by_storage_key.find(storage_key);
-            if (it != task_by_storage_key.end()) {
-                storage_keys_by_tenant[it->second.tenant_id].push_back(
-                    storage_key);
-            }
-        }
-        for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
-            std::vector<std::string> user_keys;
-            user_keys.reserve(storage_keys.size());
-            for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key[storage_key].key);
-            }
-            std::unordered_map<std::string, std::vector<Slice>>
-                user_batch_object;
-            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
-                                                        user_batch_object);
-            if (!query_result) {
-                LOG(ERROR) << "BatchQuerySlices failed with error: "
-                           << query_result.error();
-                continue;
-            }
-            for (size_t i = 0; i < storage_keys.size(); ++i) {
-                auto it = user_batch_object.find(user_keys[i]);
-                if (it != user_batch_object.end()) {
-                    batch_object.emplace(storage_keys[i],
-                                         std::move(it->second));
+    if (!offload_pool_ || buckets_keys.size() <= 1) {
+        // Serial path (original behavior, or only one bucket)
+        for (const auto& keys : buckets_keys) {
+            auto result =
+                ProcessOneBucket(keys, task_by_storage_key, complete_handler);
+            if (!result) {
+                if (result.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                    MutexLocker locker(&offloading_mutex_);
+                    enable_offloading_ = false;
+                    return result;
+                }
+                if (result.error() != ErrorCode::INVALID_READ) {
+                    return result;
                 }
             }
         }
-        if (batch_object.empty()) {
+    } else {
+        // Parallel path: dispatch buckets to worker pool
+        std::vector<std::future<tl::expected<void, ErrorCode>>> futures;
+        futures.reserve(buckets_keys.size());
+        for (const auto& keys : buckets_keys) {
+            auto promise =
+                std::make_shared<std::promise<tl::expected<void, ErrorCode>>>();
+            auto future = promise->get_future();
+            offload_pool_->enqueue([this, keys = keys, &task_by_storage_key,
+                                    &complete_handler, promise]() {
+                try {
+                    auto result = ProcessOneBucket(keys, task_by_storage_key,
+                                                   complete_handler);
+                    promise->set_value(std::move(result));
+                } catch (...) {
+                    promise->set_exception(std::current_exception());
+                }
+            });
+            futures.push_back(std::move(future));
+        }
+        for (auto& f : futures) {
+            try {
+                auto result = f.get();
+                if (!result) {
+                    if (result.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                        MutexLocker locker(&offloading_mutex_);
+                        enable_offloading_ = false;
+                        return result;
+                    }
+                    if (result.error() != ErrorCode::INVALID_READ) {
+                        return result;
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Offload worker threw exception: " << e.what();
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            } catch (...) {
+                LOG(ERROR) << "Offload worker threw unknown exception";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessOneBucket(
+    const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, OffloadTaskItem>& task_by_storage_key,
+    const std::function<ErrorCode(const std::vector<std::string>&,
+                                  std::vector<StorageObjectMetadata>&)>&
+        complete_handler) {
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    std::unordered_map<std::string, std::vector<std::string>>
+        storage_keys_by_tenant;
+    for (const auto& storage_key : keys) {
+        const auto it = task_by_storage_key.find(storage_key);
+        if (it != task_by_storage_key.end()) {
+            storage_keys_by_tenant[it->second.tenant_id].push_back(storage_key);
+        }
+    }
+    for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
+        std::vector<std::string> user_keys;
+        user_keys.reserve(storage_keys.size());
+        for (const auto& storage_key : storage_keys) {
+            auto it2 = task_by_storage_key.find(storage_key);
+            if (it2 != task_by_storage_key.end()) {
+                user_keys.push_back(it2->second.key);
+            }
+        }
+        std::unordered_map<std::string, std::vector<Slice>> user_batch_object;
+        auto query_result =
+            BatchQuerySegmentSlices(user_keys, tenant_id, user_batch_object);
+        if (!query_result) {
+            LOG(ERROR) << "BatchQuerySlices failed with error: "
+                       << query_result.error();
             continue;
         }
-
-        auto eviction_handler = [this](const std::vector<std::string>&
-                                           evicted_keys) {
-            if (evicted_keys.empty()) return;
-            std::unordered_map<std::string, std::vector<std::string>>
-                keys_by_tenant;
-            for (const auto& storage_key : evicted_keys) {
-                auto [tenant_id, key] =
-                    ParseTenantScopedStorageKey(storage_key);
-                keys_by_tenant[tenant_id].push_back(key);
-            }
-            for (const auto& [tenant_id, keys] : keys_by_tenant) {
-                auto results = client_->BatchEvictDiskReplica(
-                    keys, tenant_id, ReplicaType::LOCAL_DISK);
-                for (size_t i = 0; i < results.size(); ++i) {
-                    if (!results[i]) {
-                        LOG(WARNING)
-                            << "Failed to notify master about evicted local "
-                               "disk key: "
-                            << keys[i] << ", tenant_id=" << tenant_id
-                            << ", error: " << results[i].error();
-                    }
-                }
-            }
-        };
-
-        // D2H staging: replace device slices with host memory slices
-        // so that storage_backend (ConcatSlicesToString / BuildBucket /
-        // WriteBucket) always receives host pointers.
-        std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
-        std::vector<PinnedBufferPool::Buffer> staging_bufs;
-
-        for (auto& [obj_key, slices] : batch_object) {
-            std::vector<Slice> host_slices;
-            bool obj_success = true;
-            for (const auto& slice : slices) {
-                int device_id = -1;
-                if (IsDevicePointer(slice.ptr, &device_id)) {
-                    SetDevice(device_id);
-                    auto buf = pinned_buffer_pool_->Acquire(slice.size);
-                    if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
-                        LOG(ERROR) << "D2H staging failed for key: " << obj_key;
-                        pinned_buffer_pool_->Release(buf);
-                        obj_success = false;
-                        break;
-                    }
-                    host_slices.emplace_back(Slice{buf.data, slice.size});
-                    staging_bufs.push_back(buf);
-                } else {
-                    host_slices.push_back(slice);
-                }
-            }
-            if (obj_success) {
-                host_batch_object[obj_key] = std::move(host_slices);
+        for (size_t i = 0; i < storage_keys.size(); ++i) {
+            auto it = user_batch_object.find(user_keys[i]);
+            if (it != user_batch_object.end()) {
+                batch_object.emplace(storage_keys[i], std::move(it->second));
             }
         }
+    }
+    if (batch_object.empty()) {
+        return {};
+    }
 
-        auto offload_start = std::chrono::steady_clock::now();
-        auto bucket_complete_handler =
-            [this, offload_start, complete_handler](
-                const std::vector<std::string>& keys,
-                std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
-            auto res = complete_handler(keys, metadatas);
-            if (res == ErrorCode::OK && ssd_metric_) {
-                auto elapsed_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - offload_start)
-                        .count();
-                int64_t total_bytes = 0;
-                for (const auto& metadata : metadatas) {
-                    total_bytes += metadata.data_size;
+    auto eviction_handler = [this](
+                                const std::vector<std::string>& evicted_keys) {
+        if (evicted_keys.empty()) return;
+        std::unordered_map<std::string, std::vector<std::string>>
+            keys_by_tenant;
+        for (const auto& storage_key : evicted_keys) {
+            auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_key);
+            keys_by_tenant[tenant_id].push_back(key);
+        }
+        for (const auto& [tenant_id, keys] : keys_by_tenant) {
+            auto results = client_->BatchEvictDiskReplica(
+                keys, tenant_id, ReplicaType::LOCAL_DISK);
+            for (size_t i = 0; i < results.size(); ++i) {
+                if (!results[i]) {
+                    LOG(WARNING)
+                        << "Failed to notify master about evicted local "
+                           "disk key: "
+                        << keys[i] << ", tenant_id=" << tenant_id
+                        << ", error: " << results[i].error();
                 }
-                ssd_metric_->ssd_write_ops.inc(keys.size());
-                ssd_metric_->ssd_write_bytes.inc(total_bytes);
-                ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
-                ssd_metric_->ssd_total_ops.inc(keys.size());
-                ssd_metric_->ssd_total_bytes.inc(total_bytes);
-                ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
             }
-            return res;
-        };
-        auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler, eviction_handler);
+        }
+    };
 
-        // Release staging buffers back to pool (Buffer is POD, no destructor)
-        for (auto& buf : staging_bufs) {
-            pinned_buffer_pool_->Release(buf);
-        }
-        if (!offload_res) {
-            LOG(ERROR) << "Failed to store objects with error: "
-                       << offload_res.error();
-            if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
-                MutexLocker locker(&offloading_mutex_);
-                enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
+    // D2H staging
+    std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
+    std::vector<PinnedBufferPool::Buffer> staging_bufs;
+
+    for (auto& [obj_key, slices] : batch_object) {
+        std::vector<Slice> host_slices;
+        bool obj_success = true;
+        for (const auto& slice : slices) {
+            int device_id = -1;
+            if (IsDevicePointer(slice.ptr, &device_id)) {
+                SetDevice(device_id);
+                auto buf = pinned_buffer_pool_->Acquire(slice.size);
+                if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                    LOG(ERROR) << "D2H staging failed for key: " << obj_key;
+                    pinned_buffer_pool_->Release(buf);
+                    obj_success = false;
+                    break;
+                }
+                host_slices.emplace_back(Slice{buf.data, slice.size});
+                staging_bufs.push_back(buf);
+            } else {
+                host_slices.push_back(slice);
             }
-            if (offload_res.error() != ErrorCode::INVALID_READ) {
-                return tl::make_unexpected(offload_res.error());
-            }
         }
+        if (obj_success) {
+            host_batch_object[obj_key] = std::move(host_slices);
+        }
+    }
+
+    auto offload_start = std::chrono::steady_clock::now();
+    auto bucket_complete_handler =
+        [this, offload_start, complete_handler](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        auto res = complete_handler(keys, metadatas);
+        if (res == ErrorCode::OK && ssd_metric_) {
+            auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - offload_start)
+                    .count();
+            int64_t total_bytes = 0;
+            for (const auto& metadata : metadatas) {
+                total_bytes += metadata.data_size;
+            }
+            ssd_metric_->ssd_write_ops.inc(keys.size());
+            ssd_metric_->ssd_write_bytes.inc(total_bytes);
+            ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
+            ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
+            ssd_metric_->ssd_total_ops.inc(keys.size());
+            ssd_metric_->ssd_total_bytes.inc(total_bytes);
+            ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
+            ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
+        }
+        return res;
+    };
+    auto offload_res = storage_backend_->BatchOffload(
+        host_batch_object, bucket_complete_handler, eviction_handler);
+
+    // Release staging buffers
+    for (auto& buf : staging_bufs) {
+        pinned_buffer_pool_->Release(buf);
+    }
+    if (!offload_res) {
+        LOG(ERROR) << "Failed to store objects with error: "
+                   << offload_res.error();
+        return tl::make_unexpected(offload_res.error());
     }
     return {};
 }

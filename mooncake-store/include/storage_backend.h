@@ -228,6 +228,10 @@ struct FileStorageConfig {
 
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
+    // Number of worker threads for parallel bucket offloading.
+    // 1 = serial (original behavior), >1 = parallel.
+    // Configurable via MOONCAKE_OFFLOAD_WORKER_COUNT env var.
+    uint32_t offload_worker_count = 4;
 
     // Validates the configuration for correctness and consistency
     bool Validate() const;

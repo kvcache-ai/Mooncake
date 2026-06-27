@@ -1,4 +1,5 @@
 #pragma once
+#include "thread_pool.h"
 
 #include "client_service.h"
 #include "client_buffer.hpp"
@@ -76,6 +77,15 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
+    // Process a single offload bucket (BatchQuery + D2H + BatchOffload +
+    // Notify). Extracted from OffloadObjects to support parallel dispatch.
+    tl::expected<void, ErrorCode> ProcessOneBucket(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key,
+        const std::function<ErrorCode(const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&)>&
+            complete_handler);
 
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.
@@ -139,6 +149,9 @@ class FileStorage {
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
+    // Worker pool for parallel bucket offloading (nullptr if
+    // offload_worker_count <= 1)
+    std::unique_ptr<ThreadPool> offload_pool_;
     std::atomic<bool> heartbeat_running_;
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
