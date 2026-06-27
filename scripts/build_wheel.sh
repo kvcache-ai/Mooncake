@@ -17,7 +17,7 @@ BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD_DIR_ABS}/mooncake-common/etcd:${BUILD_DIR_ABS}/mooncake-common/k8s-lease:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD_DIR_ABS}/mooncake-common/ha-wrapper:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -62,16 +62,10 @@ if [ -f ${BUILD_DIR}/mooncake-common/src/libmooncake_common.so ]; then
     cp ${BUILD_DIR}/mooncake-common/src/libmooncake_common.so mooncake-wheel/mooncake/libmooncake_common.so
 fi
 
-# Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
-if [ -f ${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so ]; then
-    echo "Copying libetcd_wrapper.so..."
-    cp ${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
-fi
-
-# Copy libk8s_lease_wrapper.so to mooncake directory (only when STORE_USE_K8S_LEASE is set)
-if [ -f ${BUILD_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.so ]; then
-    echo "Copying libk8s_lease_wrapper.so..."
-    cp ${BUILD_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.so mooncake-wheel/mooncake/libk8s_lease_wrapper.so
+# Copy unified Go HA wrapper (when Go-based etcd or k8s support is enabled)
+if [ -f ${BUILD_DIR}/mooncake-common/ha-wrapper/libmooncake_ha_wrapper.so ]; then
+    echo "Copying libmooncake_ha_wrapper.so..."
+    cp ${BUILD_DIR}/mooncake-common/ha-wrapper/libmooncake_ha_wrapper.so mooncake-wheel/mooncake/libmooncake_ha_wrapper.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)

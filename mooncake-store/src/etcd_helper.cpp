@@ -1,7 +1,7 @@
 #include "etcd_helper.h"
 
 #ifdef STORE_USE_ETCD
-#include "libetcd_wrapper.h"
+#include "libmooncake_ha_wrapper.h"
 #endif
 
 #include <glog/logging.h>

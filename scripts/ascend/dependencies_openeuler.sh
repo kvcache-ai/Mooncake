@@ -74,7 +74,7 @@ echo "This script installs (same scope as root dependencies.sh):"
 echo "  - openEuler/RHEL system packages (dnf/yum)"
 echo "  - Git submodules (pybind11, yalantinglibs, ...)"
 echo "  - yalantinglibs (from extern/ submodule)"
-echo "  - Go ${GOVER} (for USE_ETCD / libetcd_wrapper.so)"
+echo "  - Go ${GOVER} (for USE_ETCD / libmooncake_ha_wrapper.so)"
 echo "Run scripts/ascend/dependencies_ascend_installation.sh afterward for Ascend extras."
 echo
 
