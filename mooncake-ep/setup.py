@@ -15,11 +15,20 @@ if use_musa:
         ) from e
 
 
+import torch.utils.cpp_extension as cpp_extension  # noqa: E402
 from torch.utils.cpp_extension import (  # noqa: E402
     BuildExtension,
     CUDAExtension,
     CUDA_HOME,
 )
+
+if use_musa and CUDA_HOME is None and os.getenv("CUDA_HOME"):
+    # MUSA PyTorch wheels may report torch.cuda as not compiled, causing
+    # torch.utils.cpp_extension.CUDA_HOME to stay None even when CUDA_HOME is
+    # set to the MUSA SDK compatibility path.  CUDAExtension consults the
+    # module-level CUDA_HOME when resolving library paths, so patch it here.
+    cpp_extension.CUDA_HOME = os.getenv("CUDA_HOME")
+    CUDA_HOME = cpp_extension.CUDA_HOME
 
 
 torch_version = re.match(r"\d+(?:\.\d+)*", torch.__version__).group()
@@ -28,6 +37,10 @@ module_name = "mooncake.ep" + version_suffix
 
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
+include_dirs = [
+    os.path.join(current_dir, "include"),
+    os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+]
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
@@ -37,7 +50,11 @@ cuda_library_dirs = []
 
 if use_musa:
     cuda_libraries = []
-    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    musa_defines = [
+        "-DUSE_MUSA",
+        "-DMOONCAKE_EP_USE_MUSA=1",
+        "-DC10_CUDA_NO_CMAKE_CONFIGURE_FILE",
+    ]
     cxx_args += musa_defines
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
@@ -72,10 +89,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name=module_name,
-            include_dirs=[
-                os.path.join(current_dir, "include"),
-                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-            ],
+            include_dirs=include_dirs,
             sources=[
                 "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",

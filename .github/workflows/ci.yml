@@ -297,6 +297,10 @@ jobs:
       run: git config --global --add safe.directory $GITHUB_WORKSPACE
       shell: bash
 
+    - name: Install MUSA PyTorch dependencies
+      run: scripts/setup_musa_ci.sh
+      shell: bash
+
     - name: Configure project
       run: |
         apt update -y
@@ -304,14 +308,14 @@ jobs:
         bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. -DUSE_MUSA=ON -DWITH_EP=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-include ${CUDA_HOME}/include/cuda_runtime_api.h" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG -g0" -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -g0"
       shell: bash
 
     - name: Build project
       run: |
-        cd build
         source ~/.bashrc
-        cmake --build .
+        cd build
+        MAX_JOBS=1 cmake --build . --parallel 1
         cmake --install .
       shell: bash
 
