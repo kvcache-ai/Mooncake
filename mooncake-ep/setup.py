@@ -37,7 +37,10 @@ cuda_library_dirs = []
 
 if use_musa:
     cuda_libraries = []
-    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    musa_defines = [
+        "-DUSE_MUSA",
+        "-DMOONCAKE_EP_USE_MUSA=1",
+    ]
     cxx_args += musa_defines
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
@@ -79,7 +82,9 @@ setup(
             sources=[
                 "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",
+                "src/mooncake_ep_elastic_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
+                "src/mooncake_ep_elastic_kernel.cu",
             ],
             extra_compile_args={"cxx": cxx_args, "nvcc": device_args},
             libraries=cuda_libraries,
