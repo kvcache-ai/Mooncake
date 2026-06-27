@@ -250,6 +250,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     };
     std::unordered_map<uintptr_t, DirectP2pOutputPeerCache>
         directP2pOutputPeerCache_;
+    std::unordered_map<std::string, DirectP2pOutputPeerCache>
+        directP2pAllReduceOutputPeerCache_;
+    uint64_t directP2pAllReduceStageProfileCount_{0};
     uint32_t* directP2pHostSignals_{nullptr};
     size_t directP2pHostSignalsBytes_{0};
     SegmentInfo rank_info;
