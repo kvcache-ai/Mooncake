@@ -17,6 +17,7 @@ set(MOONCAKE_STORE_SOURCES
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp
+    tenant_quota_policy_store.cpp
     rpc_service.cpp
     master_admin_service.cpp
     offset_allocator.cpp
@@ -258,6 +259,7 @@ target_link_libraries(
          gflags::gflags
          ${EXTRA_LIBS}
          ${SPDK_STATIC_LIBS}
+         yaml-cpp
          asio_shared
   PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
