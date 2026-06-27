@@ -216,12 +216,29 @@ constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
+// Backoff window (seconds) for best-effort SSD prefetch after DRAM is
+// saturated: while active, prefetch is skipped so eviction/offload can
+// reclaim memory instead of competing with promotion. 0 disables the backoff.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC =
+    "ssd_prefetch_cooldown_sec";
+// De-duplication / rate-limit TTL (seconds): the same key is prefetched at
+// most once per this period, suppressing duplicate triggers from concurrent
+// probes.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC =
+    "ssd_prefetch_dedup_ttl_sec";
+// Max wait budget (milliseconds) on get when an SSD-only key has a prefetch
+// in flight. Polls every 1 ms and returns early once promotion completes.
+constexpr const char* CONFIG_KEY_SSD_GET_WAIT_MS = "ssd_get_wait_ms";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
 static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+static constexpr size_t DEFAULT_SSD_PREFETCH_COOLDOWN_SEC = 5;
+static constexpr size_t DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC = 30;
+// SSD->DRAM promotion p90 ~3 ms; 10 ms is enough headroom without wasting TTFT.
+static constexpr size_t DEFAULT_SSD_GET_WAIT_MS = 10;
 
 inline std::string NormalizeTenantId(const std::string& tenant_id) {
     return tenant_id.empty() ? "default" : tenant_id;

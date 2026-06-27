@@ -163,6 +163,21 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    /**
+     * @brief Asks a remote holder node to prefetch (promote SSD->DRAM) the
+     * given keys. Used for cross-node SSD prefetch: the holder must register
+     * the promotion task itself (Master validates holder_id == client_id), so
+     * the requester delegates via this RPC instead of calling
+     * RegisterPrefetchTask locally. Best-effort: errors are logged, not
+     * propagated, and never block the originating exist() call.
+     * @param client_addr Network address of the holder's offload RPC service.
+     * @param keys SSD-only keys held by the remote node.
+     * @param sizes Object sizes (bytes), index-aligned with keys.
+     */
+    void prefetch_offload_object(const std::string &client_addr,
+                                 const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -225,7 +240,10 @@ class PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine,
         const std::string &ipc_socket_path, bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default") = 0;
+        const std::string &tenant_id = "default",
+        int64_t ssd_prefetch_cooldown_sec = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+        int64_t ssd_prefetch_dedup_ttl_sec =
+            DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -338,10 +356,12 @@ class PyClient {
     virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                          bool force = false) = 0;
 
-    virtual int isExist(const std::string &key) = 0;
+    virtual int isExist(const std::string &key,
+                        const ExistOptions &options = ExistOptions{}) = 0;
 
     virtual std::vector<int> batchIsExist(
-        const std::vector<std::string> &keys) = 0;
+        const std::vector<std::string> &keys,
+        const ExistOptions &options = ExistOptions{}) = 0;
 
     virtual int64_t getSize(const std::string &key) = 0;
 

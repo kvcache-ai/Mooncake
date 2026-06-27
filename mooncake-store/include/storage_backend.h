@@ -881,6 +881,14 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
 
+    /**
+     * @brief Undo a successful metadata commit when NotifyOffloadSuccess fails.
+     * Caller must delete on-disk bucket files separately via CleanupOrphanedBucket.
+     */
+    void RollbackCommittedBucket(int64_t bucket_id,
+                                 const std::vector<std::string>& keys,
+                                 int64_t data_size, int64_t meta_size);
+
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.
     // FinalizeEviction waits for in-flight reads and deletes the files.

@@ -33,6 +33,11 @@ struct mooncake_replicate_config {
 };
 typedef struct mooncake_replicate_config mooncake_replicate_config_t;
 
+struct mooncake_exist_options {
+    int prefetch_to_memory;
+};
+typedef struct mooncake_exist_options mooncake_exist_options_t;
+
 /*
  * All memory pointed to by the "char *" parameters will not be used
  * after the C function returns.
@@ -99,6 +104,14 @@ int mooncake_store_is_exist(mooncake_store_t store, const char *key);
 
 int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
                                   size_t count, int *results_out);
+
+int mooncake_store_is_exist_with_options(
+    mooncake_store_t store, const char *key,
+    const mooncake_exist_options_t *options);
+
+int mooncake_store_batch_is_exist_with_options(
+    mooncake_store_t store, const char **keys, size_t count, int *results_out,
+    const mooncake_exist_options_t *options);
 
 int64_t mooncake_store_get_size(mooncake_store_t store, const char *key);
 

@@ -992,6 +992,55 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         });
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::GetReplicaListForPrefetch(const std::string& key) {
+    ScopedVLogTimer timer(1, "GetReplicaListForPrefetch");
+    timer.LogRequest("key=", key);
+    auto result = master_service_.GetReplicaListForPrefetch(key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaListForPrefetch(
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "BatchGetReplicaListForPrefetch");
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
+    results.reserve(keys.size());
+
+    for (const auto& key : keys) {
+        results.emplace_back(master_service_.GetReplicaListForPrefetch(key));
+    }
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                VLOG(1) << "BatchGetReplicaListForPrefetch failed for key[" << i
+                        << "] '" << keys[i] << "': " << toString(error);
+            } else {
+                LOG(ERROR) << "BatchGetReplicaListForPrefetch failed for key["
+                           << i << "] '" << keys[i]
+                           << "': " << toString(error);
+            }
+        }
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "RegisterPrefetchTask");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result = master_service_.RegisterPrefetchTask(client_id, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id) {
@@ -2019,6 +2068,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListForPrefetch>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetReplicaListForPrefetch>(
+        &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
@@ -2137,6 +2192,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterPrefetchTask>(
         &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(

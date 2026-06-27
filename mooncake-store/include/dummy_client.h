@@ -21,16 +21,18 @@ class DummyClient : public PyClient {
 
     int64_t unregister_shm();
 
-    int setup_real(const std::string &local_hostname,
-                   const std::string &metadata_server,
-                   size_t global_segment_size, size_t local_buffer_size,
-                   const std::string &protocol, const std::string &rdma_devices,
-                   const std::string &master_server_addr,
-                   const std::shared_ptr<TransferEngine> &transfer_engine,
-                   const std::string &ipc_socket_path,
-                   bool enable_ssd_offload = false,
-                   const std::string &ssd_offload_path = "",
-                   const std::string &tenant_id = "default") {
+    int setup_real(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string &protocol, const std::string &rdma_devices,
+        const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, bool enable_ssd_offload = false,
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default",
+        int64_t ssd_prefetch_cooldown_sec = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+        int64_t ssd_prefetch_dedup_ttl_sec =
+            DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC) {
         // Dummy client does not support real setup
         return -1;
     };
@@ -147,9 +149,11 @@ class DummyClient : public PyClient {
     std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                  bool force = false);
 
-    int isExist(const std::string &key);
+    int isExist(const std::string &key,
+                const ExistOptions &options = ExistOptions{});
 
-    std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                  const ExistOptions &options = ExistOptions{});
 
     int64_t getSize(const std::string &key);
 

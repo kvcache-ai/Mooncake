@@ -1759,6 +1759,15 @@ PYBIND11_MODULE(store, m) {
             return oss.str();
         });
 
+    py::class_<ExistOptions>(m, "ExistOptions")
+        .def(py::init<>())
+        .def_readwrite("prefetch_to_memory", &ExistOptions::prefetch_to_memory)
+        .def("__str__", [](const ExistOptions &options) {
+            std::ostringstream oss;
+            oss << options;
+            return oss.str();
+        });
+
     py::enum_<ReplicaStatus>(m, "ReplicaStatus")
         .value("UNDEFINED", ReplicaStatus::UNDEFINED)
         .value("INITIALIZED", ReplicaStatus::INITIALIZED)
@@ -2028,7 +2037,11 @@ PYBIND11_MODULE(store, m) {
                const py::object &engine = py::none(),
                bool enable_ssd_offload = false,
                const std::string &ssd_offload_path = "",
-               const std::string &tenant_id = "default") {
+               const std::string &tenant_id = "default",
+               int64_t ssd_prefetch_cooldown_sec =
+                   DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+               int64_t ssd_prefetch_dedup_ttl_sec =
+                   DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2040,14 +2053,19 @@ PYBIND11_MODULE(store, m) {
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path, tenant_id);
+                    ssd_offload_path, tenant_id, ssd_prefetch_cooldown_sec,
+                    ssd_prefetch_dedup_ttl_sec);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none(),
             py::arg("enable_ssd_offload") = false,
-            py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default")
+            py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
+            py::arg("ssd_prefetch_cooldown_sec") =
+                DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+            py::arg("ssd_prefetch_dedup_ttl_sec") =
+                DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2078,7 +2096,14 @@ PYBIND11_MODULE(store, m) {
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
             "  ssd_offload_path: SSD storage directory path (overrides env "
-            "var).")
+            "var).\n"
+            "  ssd_prefetch_cooldown_sec: SSD prefetch memory-pressure backoff "
+            "in seconds (default 5, 0 disables).\n"
+            "  ssd_prefetch_dedup_ttl_sec: SSD prefetch per-key dedup/"
+            "rate-limit TTL in seconds (default 30, 0 disables).\n"
+            "  ssd_get_wait_ms: get-side prefetch wait budget in milliseconds "
+            "(default 10, poll 1ms with early exit; 0 disables). Env "
+            "MOONCAKE_SSD_GET_WAIT_MS overrides this.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
@@ -2184,20 +2209,26 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"), py::arg("force") = false,
             "Batch remove objects by keys. Returns a list of status codes "
             "(0=success, negative=error code) for each key.")
-        .def("is_exist",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
-                 py::gil_scoped_release release;
-                 return self.store_->isExist(key);
-             })
+        .def(
+            "is_exist",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const ExistOptions &options) {
+                py::gil_scoped_release release;
+                return self.store_->isExist(key, options);
+            },
+            py::arg("key"), py::arg("options") = ExistOptions{})
         .def(
             "batch_is_exist",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+               const std::vector<std::string> &keys,
+               const ExistOptions &options) {
                 py::gil_scoped_release release;
-                return self.store_->batchIsExist(keys);
+                return self.store_->batchIsExist(keys, options);
             },
-            py::arg("keys"),
-            "Check if multiple objects exist. Returns list of results: 1 if "
+            py::arg("keys"), py::arg("options") = ExistOptions{},
+            "Check if multiple objects exist. When options.prefetch_to_memory "
+            "is True, triggers SSD-to-DRAM promotion for keys that only have "
+            "LOCAL_DISK replicas. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def("close",
              [](MooncakeStorePyWrapper &self) {

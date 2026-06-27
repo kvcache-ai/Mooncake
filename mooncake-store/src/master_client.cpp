@@ -38,6 +38,21 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListForPrefetch> {
+    static constexpr const char* value = "GetReplicaListForPrefetch";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListForPrefetch> {
+    static constexpr const char* value = "BatchGetReplicaListForPrefetch";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterPrefetchTask> {
+    static constexpr const char* value = "RegisterPrefetchTask";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
     static constexpr const char* value = "CalcCacheStats";
 };
@@ -526,6 +541,40 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
                              GetReplicaListResponse>(object_key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListForPrefetch(const std::string& object_key) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListForPrefetch");
+    timer.LogRequest("object_key=", object_key);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaListForPrefetch,
+                             GetReplicaListResponse>(object_key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListForPrefetch(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaListForPrefetch");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForPrefetch,
+                         GetReplicaListResponse>(object_keys.size(), object_keys);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchTask");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result = invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
+        client_id, key);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -299,6 +299,26 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Read-only replica metadata for SSD prefetch.
+     *
+     * Unlike GetReplicaList, does not grant a lease, bump access metrics, or
+     * enqueue promotion-on-hit work.
+     */
+    auto GetReplicaListForPrefetch(const std::string& key)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
+     * @brief Register an in-flight promotion task for SSD prefetch.
+     *
+     * Records a PromotionTask on the master without the promotion-on-hit
+     * frequency/watermark gates and without pushing onto the holder client's
+     * promotion_objects heartbeat queue. The caller must execute the transfer
+     * via FileStorage::PrefetchKeys (PromotionAllocStart path).
+     */
+    auto RegisterPrefetchTask(const UUID& client_id, const std::string& key)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
      * slice
@@ -1137,6 +1157,8 @@ class MasterService {
         uint64_t object_size;
         std::chrono::system_clock::time_point start_time;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
+        bool from_prefetch{
+            false};  // set by RegisterPrefetchTask; enables protect lease
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards

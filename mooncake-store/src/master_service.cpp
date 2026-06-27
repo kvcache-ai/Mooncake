@@ -1442,6 +1442,90 @@ auto MasterService::GetReplicaList(const std::string& key,
     return resp;
 }
 
+auto MasterService::GetReplicaListForPrefetch(const std::string& key)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+
+    // NOTE: prefetch path is not tenant-aware; scope to the default tenant.
+    MetadataAccessorRO accessor(this, MakeObjectIdentity(key, "default"));
+    if (!accessor.Exists()) {
+        VLOG(1) << "prefetch_metadata key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    const auto& metadata = accessor.Get();
+
+    std::vector<Replica::Descriptor> replica_list;
+    metadata.VisitReplicas(
+        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+            replica_list.emplace_back(replica.get_descriptor());
+        });
+
+    if (replica_list.empty()) {
+        LOG(WARNING) << "prefetch_metadata key=" << key
+                     << ", error=replica_not_ready";
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    return GetReplicaListResponse(std::move(replica_list),
+                                  default_kv_lease_ttl_);
+}
+
+auto MasterService::RegisterPrefetchTask(const UUID& client_id,
+                                         const std::string& key)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    // NOTE: prefetch path is not tenant-aware; scope to the default tenant.
+    MetadataAccessorRW accessor(this, MakeObjectIdentity(key, "default"));
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& tenant_state = accessor.GetTenantState();
+
+    if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
+        return {};
+    }
+
+    if (tenant_state.promotion_tasks.count(key) > 0) {
+        return {};
+    }
+
+    if (promotion_in_flight_.load(std::memory_order_relaxed) >=
+        promotion_queue_limit_) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+
+    Replica* source = nullptr;
+    metadata.VisitReplicas(&Replica::fn_is_local_disk_replica,
+                           [&source](Replica& r) {
+                               if (source == nullptr) source = &r;
+                           });
+    if (source == nullptr) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    auto holder_id = source->get_local_disk_client_id();
+    if (!holder_id.has_value() || holder_id.value() != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    source->inc_refcnt();
+    const uint64_t object_size =
+        source->get_descriptor().get_local_disk_descriptor().object_size;
+
+    tenant_state.promotion_tasks.emplace(
+        key, PromotionTask{.source_id = source->id(),
+                           .alloc_id = 0,
+                           .object_size = object_size,
+                           .start_time = std::chrono::system_clock::now(),
+                           .holder_id = holder_id.value(),
+                           .from_prefetch = true});
+    promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
+    VLOG(1) << "prefetch_task_registered key=" << key
+            << " size=" << object_size;
+    return {};
+}
+
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
@@ -3650,6 +3734,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    const bool from_prefetch = task_it->second.from_prefetch;
 
     bool committed = false;
     Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
@@ -3693,6 +3778,12 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
 
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Prefetch-promoted keys get the same lease as exist/get so DRAM survives
+    // until the subsequent get() (see ssd-prefetch.md §5.3).
+    if (from_prefetch) {
+        GrantLeaseForGroup(tenant_state, object_id.user_key, metadata);
     }
     return {};
 }

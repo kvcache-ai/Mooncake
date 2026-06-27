@@ -1013,6 +1013,57 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
 }
 
+tl::expected<QueryResult, ErrorCode> Client::QueryForPrefetch(
+    const std::string& object_key) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto result = master_client_.GetReplicaListForPrefetch(object_key);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return QueryResult(
+        std::move(result.value().replicas),
+        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryForPrefetch(
+    const std::vector<std::string>& object_keys) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto response =
+        master_client_.BatchGetReplicaListForPrefetch(object_keys);
+
+    if (response.size() != object_keys.size()) {
+        LOG(ERROR) << "BatchQueryForPrefetch response size mismatch. Expected: "
+                   << object_keys.size() << ", Got: " << response.size();
+        std::vector<tl::expected<QueryResult, ErrorCode>> results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(response.size());
+    for (size_t i = 0; i < response.size(); ++i) {
+        if (response[i]) {
+            results.emplace_back(QueryResult(
+                std::move(response[i].value().replicas),
+                start_time + std::chrono::milliseconds(
+                                 response[i].value().lease_ttl_ms)));
+        } else {
+            results.emplace_back(tl::unexpected(response[i].error()));
+        }
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> Client::RegisterPrefetchTask(
+    const std::string& object_key) {
+    return master_client_.RegisterPrefetchTask(client_id_, object_key);
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
     return BatchQuery(object_keys, master_client_.tenant_id());

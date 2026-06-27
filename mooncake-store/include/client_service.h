@@ -128,6 +128,23 @@ class Client {
     tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
+     * @brief Read-only replica metadata for SSD prefetch (no lease / no
+     * promotion-on-hit side effects).
+     */
+    tl::expected<QueryResult, ErrorCode> QueryForPrefetch(
+        const std::string& object_key);
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryForPrefetch(
+        const std::vector<std::string>& object_keys);
+
+    /**
+     * @brief Register a master-side promotion task for SSD prefetch without
+     * using the promotion-on-hit heartbeat queue.
+     */
+    tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const std::string& object_key);
+
+    /**
      * @brief Queries replica lists for object keys that match a regex pattern.
      * @param str The regular expression string to match against object keys.
      * @return An expected object containing a map from object keys to their

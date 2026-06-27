@@ -860,7 +860,11 @@ std::vector<int> DummyClient::batchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
-int DummyClient::isExist(const std::string& key) {
+int DummyClient::isExist(const std::string& key, const ExistOptions& options) {
+    if (options.prefetch_to_memory) {
+        LOG(WARNING) << "SSD prefetch is not supported in DummyClient mode; "
+                     << "prefetch_to_memory option ignored.";
+    }
     auto result = invoke_rpc<&RealClient::isExist_internal, bool>(key);
 
     if (result.has_value()) {
@@ -870,8 +874,12 @@ int DummyClient::isExist(const std::string& key) {
     }
 }
 
-std::vector<int> DummyClient::batchIsExist(
-    const std::vector<std::string>& keys) {
+std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
+                                           const ExistOptions& options) {
+    if (options.prefetch_to_memory) {
+        LOG(WARNING) << "SSD prefetch is not supported in DummyClient mode; "
+                     << "prefetch_to_memory option ignored.";
+    }
     auto internal_results =
         invoke_batch_rpc<&RealClient::batchIsExist_internal, bool>(keys.size(),
                                                                    keys);

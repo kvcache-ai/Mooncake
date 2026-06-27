@@ -143,6 +143,22 @@ struct ReplicateConfig {
     }
 };
 
+/**
+ * @brief Options for is_exist / batch_is_exist (RFC #2213).
+ *
+ * Mirrors the ReplicateConfig pattern: a struct leaves room for future
+ * extensions without changing the function signature each time.
+ */
+struct ExistOptions {
+    bool prefetch_to_memory = false;
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const ExistOptions& options) noexcept {
+        os << "ExistOptions: { prefetch_to_memory: "
+           << options.prefetch_to_memory << " }";
+        return os;
+    }
+};
+
 enum class ReplicaWriteMode {
     SINGLE_REPLICA,
     FLEXIBLE_DUAL_REPLICA,

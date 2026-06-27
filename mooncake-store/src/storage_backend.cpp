@@ -1329,23 +1329,19 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         return tl::make_unexpected(write_bucket_result.error());
     }
-    if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket->keys, metadatas);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket->keys.size()
-                       << ", Bucket id: " << bucket_id;
-            return tl::make_unexpected(error_code);
-        }
-    }
 
-    // Commit to metadata maps under exclusive lock.
-    // Check for duplicate keys and rollback if any found.
+    const std::vector<std::string> committed_keys = bucket->keys;
+    const int64_t bucket_data_size = bucket->data_size;
+    const int64_t bucket_meta_size = bucket->meta_size;
+    std::vector<StorageObjectMetadata> metadatas_for_notify = metadatas;
+
+    // Commit local metadata before notifying master so concurrent BatchLoad
+    // never observes a LOCAL_DISK replica while object_bucket_map_ is empty.
     {
         SharedMutexLocker lock(&mutex_);
 
         // Pre-check for duplicates before modifying any state
-        for (const auto& key : bucket->keys) {
+        for (const auto& key : committed_keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
                 LOG(WARNING)
                     << "Duplicate key detected in BatchOffload: " << key
@@ -1358,19 +1354,34 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
 
         // No duplicates found, safe to commit
-        total_size_ += bucket->data_size + bucket->meta_size;
+        total_size_ += bucket_data_size + bucket_meta_size;
         object_bucket_map_.reserve(object_bucket_map_.size() +
-                                   bucket->keys.size());
-        for (size_t i = 0; i < bucket->keys.size(); ++i) {
+                                   committed_keys.size());
+        for (size_t i = 0; i < committed_keys.size(); ++i) {
             auto [it, inserted] = object_bucket_map_.insert(
-                {bucket->keys[i], std::move(metadatas[i])});
+                {committed_keys[i], std::move(metadatas[i])});
             if (!inserted) {
                 LOG(ERROR) << "Unexpected duplicate key after pre-check: "
-                           << bucket->keys[i] << ", bucket_id=" << bucket_id;
+                           << committed_keys[i] << ", bucket_id=" << bucket_id;
             }
         }
         buckets_.emplace(bucket_id, std::move(bucket));
         lru_index_.emplace(0LL, bucket_id);
+    }
+
+    if (complete_handler != nullptr) {
+        auto error_code =
+            complete_handler(committed_keys, metadatas_for_notify);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Complete handler failed: " << error_code
+                       << ", Key count: " << committed_keys.size()
+                       << ", Bucket id: " << bucket_id
+                       << ". Rolling back local metadata commit.";
+            RollbackCommittedBucket(bucket_id, committed_keys, bucket_data_size,
+                                    bucket_meta_size);
+            CleanupOrphanedBucket(bucket_id);
+            return tl::make_unexpected(error_code);
+        }
     }
 
     return bucket_id;
@@ -2124,6 +2135,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
+}
+
+void BucketStorageBackend::RollbackCommittedBucket(
+    int64_t bucket_id, const std::vector<std::string>& keys,
+    int64_t data_size, int64_t meta_size) {
+    SharedMutexLocker lock(&mutex_);
+    for (const auto& key : keys) {
+        object_bucket_map_.erase(key);
+    }
+    buckets_.erase(bucket_id);
+    for (auto it = lru_index_.begin(); it != lru_index_.end();) {
+        if (it->second == bucket_id) {
+            it = lru_index_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    total_size_ -= data_size + meta_size;
 }
 
 void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {

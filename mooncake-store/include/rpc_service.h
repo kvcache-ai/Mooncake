@@ -59,6 +59,12 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default");
 
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForPrefetch(
+        const std::string& key);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForPrefetch(const std::vector<std::string>& keys);
+
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
@@ -197,6 +203,9 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    tl::expected<void, ErrorCode> RegisterPrefetchTask(const UUID& client_id,
+                                                       const std::string& key);
 
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>

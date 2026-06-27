@@ -152,6 +152,23 @@ class MasterClient {
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
 
     /**
+     * @brief Read-only replica metadata query for best-effort SSD prefetch.
+     *
+     * Unlike GetReplicaList, this does NOT grant a lease, update the access
+     * sketch, bump cache-hit / valid-get counters, or enqueue a promotion. It
+     * is purely used to decide whether a key is SSD-only and worth prefetching,
+     * so probing must not perturb eviction/offload pacing or metrics.
+     * @param object_key Key to query.
+     * @return Replica list on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListForPrefetch(const std::string& object_key);
+
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForPrefetch(
+        const std::vector<std::string>& object_keys);
+
+    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
@@ -432,6 +449,21 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Registers a prefetch (SSD->DRAM promotion) task on the master.
+     *
+     * Creates a promotion_tasks entry consumed by PromotionAllocStart, but
+     * deliberately does NOT go through the promotion admission gate
+     * (TryPushPromotionQueue) and does NOT push to the holder's
+     * promotion_objects heartbeat queue. This keeps the dedicated prefetch path
+     * separate from promotion-on-hit and avoids double-promoting the same key.
+     * @param client_id The UUID of the client requesting the prefetch.
+     * @param key The object key to promote from SSD to DRAM.
+     * @return An empty expected on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key);
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a

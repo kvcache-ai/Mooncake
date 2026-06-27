@@ -58,6 +58,14 @@ mooncake::ReplicateConfig to_replicate_config(
     return config;
 }
 
+mooncake::ExistOptions to_exist_options(
+    const mooncake_exist_options_t *c_options) {
+    mooncake::ExistOptions options;
+    if (!c_options) return options;
+    options.prefetch_to_memory = c_options->prefetch_to_memory != 0;
+    return options;
+}
+
 StoreHandle *as_handle(mooncake_store_t store) {
     return static_cast<StoreHandle *>(store);
 }
@@ -271,6 +279,42 @@ int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
 
         auto results = as_client(store)->batchIsExist(key_vec);
 
+        for (size_t i = 0; i < count; ++i) {
+            results_out[i] = (i < results.size()) ? results[i] : -1;
+        }
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_is_exist_with_options(
+    mooncake_store_t store, const char *key,
+    const mooncake_exist_options_t *options) {
+    if (!store || !key) return -1;
+    try {
+        return as_client(store)->isExist(std::string(key),
+                                         to_exist_options(options));
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_batch_is_exist_with_options(
+    mooncake_store_t store, const char **keys, size_t count, int *results_out,
+    const mooncake_exist_options_t *options) {
+    if (!store || !keys || !results_out) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!keys[i]) return -1;
+    }
+    try {
+        std::vector<std::string> key_vec;
+        key_vec.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            key_vec.emplace_back(keys[i]);
+        }
+        auto results =
+            as_client(store)->batchIsExist(key_vec, to_exist_options(options));
         for (size_t i = 0; i < count; ++i) {
             results_out[i] = (i < results.size()) ? results[i] : -1;
         }
