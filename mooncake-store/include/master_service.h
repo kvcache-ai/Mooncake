@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
@@ -861,7 +862,8 @@ class MasterService {
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
             std::string group_id_ = "", std::string tenant_id_ = "default",
-            std::string user_key_ = {})
+            std::string user_key_ = {},
+            std::optional<AgentHints> agent_hints_ = std::nullopt)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -871,6 +873,7 @@ class MasterService {
               user_key(std::move(user_key_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
+              agent_hints(std::move(agent_hints_)),
               hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
@@ -904,7 +907,9 @@ class MasterService {
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
-        const bool hard_pinned{false};          // immutable, set at creation
+        std::optional<AgentHints> agent_hints
+            GUARDED_BY(lock);           // optional agent metadata
+        const bool hard_pinned{false};  // immutable, set at creation
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
         uint64_t reserved_quota_charge_bytes{0};
@@ -1075,7 +1080,8 @@ class MasterService {
             if (soft_pin_timeout) {
                 soft_pin_timeout =
                     std::max(*soft_pin_timeout,
-                             now + std::chrono::milliseconds(soft_ttl));
+                             now + std::chrono::milliseconds(
+                                       EffectiveSoftPinTtlLocked(soft_ttl)));
             }
         }
 
@@ -1088,7 +1094,8 @@ class MasterService {
             }
             return soft_pin_timeout &&
                    *soft_pin_timeout <=
-                       now + std::chrono::milliseconds(soft_ttl / 2);
+                       now + std::chrono::milliseconds(
+                                 EffectiveSoftPinTtlLocked(soft_ttl) / 2);
         }
 
         // Check if the lease has expired
@@ -1119,6 +1126,36 @@ class MasterService {
         bool IsHardPinned() const { return hard_pinned; }
 
         bool IsGrouped() const { return !group_id.empty(); }
+
+        std::optional<AgentHints> GetAgentHints() const {
+            SpinLocker locker(&lock);
+            return agent_hints;
+        }
+
+        void UpdateSoftPinAndAgentHints(
+            bool enable_soft_pin, std::optional<AgentHints> new_agent_hints) {
+            SpinLocker locker(&lock);
+            if (enable_soft_pin && !soft_pin_timeout) {
+                soft_pin_timeout.emplace();
+                MasterMetricManager::instance().inc_soft_pin_key_count(1);
+            } else if (!enable_soft_pin && soft_pin_timeout &&
+                       !new_agent_hints.has_value()) {
+                soft_pin_timeout.reset();
+                MasterMetricManager::instance().dec_soft_pin_key_count(1);
+            }
+            // A neutral/discard hint is still metadata; same-size upsert can
+            // clear soft pin only when it also omits agent_hints.
+            agent_hints = std::move(new_agent_hints);
+        }
+
+        uint64_t EffectiveSoftPinTtlLocked(uint64_t default_soft_ttl) const
+            REQUIRES(lock) {
+            if (!agent_hints.has_value() || agent_hints->cache_ttl_ms <= 0) {
+                return default_soft_ttl;
+            }
+            return std::max(default_soft_ttl,
+                            static_cast<uint64_t>(agent_hints->cache_ttl_ms));
+        }
 
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater
@@ -1662,7 +1699,8 @@ class MasterService {
                     std::vector<Replica> replicas, bool enable_soft_pin,
                     bool enable_hard_pin = false,
                     ObjectDataType data_type = ObjectDataType::UNKNOWN,
-                    std::string group_id = "") {
+                    std::string group_id = "",
+                    std::optional<AgentHints> agent_hints = std::nullopt) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -1671,10 +1709,11 @@ class MasterService {
             auto result = tenant_state_->metadata.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(object_id_.user_key),
-                std::forward_as_tuple(
-                    client_id, now, total_length, std::move(replicas),
-                    enable_soft_pin, enable_hard_pin, data_type, group_id,
-                    object_id_.tenant_id, object_id_.user_key));
+                std::forward_as_tuple(client_id, now, total_length,
+                                      std::move(replicas), enable_soft_pin,
+                                      enable_hard_pin, data_type, group_id,
+                                      object_id_.tenant_id, object_id_.user_key,
+                                      std::move(agent_hints)));
             it_ = result.first;
         }
 

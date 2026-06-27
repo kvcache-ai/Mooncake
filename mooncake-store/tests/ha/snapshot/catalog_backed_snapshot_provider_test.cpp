@@ -177,10 +177,17 @@ TEST_P(CatalogBackedSnapshotProviderTest,
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
-    // 10 + replica_count: current writer format (data_type + hard_pinned +
-    // trailing group_id). Regression test for the live snapshot restore
-    // failure against the latest metadata layout.
+    // 10 + replica_count: data_type + hard_pinned + trailing group_id. This
+    // pins the writer format immediately before agent_hints was appended.
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithGroupId);
+    ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithAgentHints) {
+    // 11 + replica_count: current writer format after the optional
+    // agent_hints annotation was appended. The standby reader does not need the
+    // annotation, but it must tolerate the trailing field.
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithAgentHints);
     ExpectLoadsDefaultObject();
 }
 

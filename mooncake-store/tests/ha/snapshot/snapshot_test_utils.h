@@ -53,13 +53,16 @@ struct CatalogBackendParam {
 //   kDataTypeAndHardPinned:
 //                    9 + replica_count, data_type plus trailing hard_pinned
 //   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
-//                    (the current writer format)
+//                    (the writer format before optional agent_hints)
+//   kWithAgentHints: 11 + replica_count, data_type + hard_pinned + group_id +
+//                    agent_hints
 enum class SnapshotMetadataFormat {
     kLegacy,
     kDataTypeOnly,
     kHardPinnedOnly,
     kDataTypeAndHardPinned,
     kWithGroupId,
+    kWithAgentHints,
 };
 
 class ScopedEnvVar {
@@ -136,6 +139,35 @@ inline void PackDiskReplica(
     packer.pack(object_size);
 }
 
+inline void PackAgentHintsV1Fields(
+    MsgpackPacker& packer, std::string_view workflow_id = "workflow-1",
+    std::string_view agent_id = "agent-1", std::string_view step_id = "step-1",
+    int64_t step_index = 1, int64_t total_steps = 2,
+    std::string_view parent_step_id = "parent-step",
+    std::vector<std::string> children_step_ids = {"child-step"},
+    std::string_view tool_name = "search",
+    int64_t expected_tool_duration_ms = 1000, int64_t cache_ttl_ms = 60000,
+    std::string_view shared_prefix_hash = "prefix-hash",
+    std::string_view reuse_hint = "keep") {
+    packer.pack(std::string(workflow_id));
+    packer.pack(std::string(agent_id));
+    packer.pack(std::string(step_id));
+    packer.pack(step_index);
+    packer.pack(total_steps);
+    packer.pack(std::string(parent_step_id));
+    packer.pack(children_step_ids);
+    packer.pack(std::string(tool_name));
+    packer.pack(expected_tool_duration_ms);
+    packer.pack(cache_ttl_ms);
+    packer.pack(std::string(shared_prefix_hash));
+    packer.pack(std::string(reuse_hint));
+}
+
+inline void PackAgentHintsV1(MsgpackPacker& packer) {
+    packer.pack_array(12);
+    PackAgentHintsV1Fields(packer);
+}
+
 inline std::vector<uint8_t> BuildSegmentsPayload() {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     SegmentSerializer serializer(&segment_manager);
@@ -167,6 +199,30 @@ inline std::vector<uint8_t> WrapShardIntoMetadataRoot(
     return ToByteVector(root_buffer);
 }
 
+// Wraps one shard in the full MasterService::MetadataSerializer root shape.
+inline std::vector<uint8_t> WrapShardIntoMasterMetadataRoot(
+    const msgpack::sbuffer& shard_buffer, uint32_t shard_idx) {
+    auto compressed_shard =
+        zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                      shard_buffer.size(), 3);
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(1);
+    root_packer.pack(shard_idx);
+    root_packer.pack_bin(compressed_shard.size());
+    root_packer.pack_bin_body(
+        reinterpret_cast<const char*>(compressed_shard.data()),
+        compressed_shard.size());
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(uint64_t{10});
+    return ToByteVector(root_buffer);
+}
+
 inline std::vector<uint8_t> BuildMetadataPayload(
     const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
@@ -177,18 +233,25 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     const bool include_data_type =
         format == SnapshotMetadataFormat::kDataTypeOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithAgentHints;
     const bool include_hard_pinned =
         format == SnapshotMetadataFormat::kHardPinnedOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithAgentHints;
     const bool include_group_id =
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithAgentHints;
+    const bool include_agent_hints =
+        format == SnapshotMetadataFormat::kWithAgentHints;
     constexpr uint32_t kReplicaCount = 1;
-    // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
+    // 7 leading fields + replicas + optional data_type/hard_pinned/group_id/
+    // agent_hints.
     const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
                               (include_hard_pinned ? 1 : 0) +
-                              (include_group_id ? 1 : 0);
+                              (include_group_id ? 1 : 0) +
+                              (include_agent_hints ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -215,6 +278,9 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     }
     if (include_group_id) {
         shard_packer.pack(std::string("test-group"));
+    }
+    if (include_agent_hints) {
+        PackAgentHintsV1(shard_packer);
     }
 
     return WrapShardIntoMetadataRoot(shard_buffer);
