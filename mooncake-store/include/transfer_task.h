@@ -534,6 +534,17 @@ class TransferSubmitter {
                                TransferMetric* transfer_metric = nullptr,
                                int numa_socket_id = 0);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    /**
+     * @brief Set level protocols for multi-protocol support
+     * @param level_protocols Mapping of storage level to protocol
+     */
+    void set_level_protocols(
+        const std::unordered_map<StorageLevel, std::string>& level_protocols) {
+        level_protocols_ = level_protocols;
+    }
+#endif
+
     /**
      * @brief Submit an asynchronous transfer operation
      *
@@ -598,6 +609,10 @@ class TransferSubmitter {
     bool memcpy_enabled_;
     const std::string local_hostname_;
     TransferMetric* transfer_metric_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Store Level to protocol mapping for multi-protocol support
+    std::unordered_map<StorageLevel, std::string> level_protocols_;
+#endif
 
     /**
      * @brief Select the optimal transfer strategy
@@ -658,6 +673,19 @@ class TransferSubmitter {
 
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    /**
+     * @brief Submit transfer engine operation asynchronously (multi-protocol)
+     */
+    std::optional<TransferFuture> mp_submitTransferEngineOperation(
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        std::string& proto);
+
+    std::optional<TransferFuture> mp_submitTransfer(
+        std::vector<TransferRequest>& requests, std::string& proto);
+#endif
 };
 
 }  // namespace mooncake
