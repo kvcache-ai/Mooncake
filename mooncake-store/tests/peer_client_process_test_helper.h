@@ -12,8 +12,11 @@
 #include <thread>
 #include <vector>
 
+#include <async_simple/coro/SyncAwait.h>
 #include <glog/logging.h>
 #include <json/json.h>
+#include <ylt/coro_io/client_pool.hpp>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_rpc_service.h"
@@ -68,6 +71,123 @@ inline bool ParseJsonString(const std::string& json_str, Json::Value& value) {
                          &value, &errs);
 }
 
+class PeerClientTestControlRpcService {
+   public:
+    explicit PeerClientTestControlRpcService(DataManager& data_manager)
+        : data_manager_(data_manager) {}
+
+    tl::expected<void, ErrorCode> PutKey(const std::string& key,
+                                         const std::string& data) {
+        std::vector<Slice> slices{
+            {const_cast<char*>(data.data()), data.size()}};
+        auto put_result = data_manager_.Put(key, slices);
+        if (!put_result.has_value()) {
+            return tl::make_unexpected(put_result.error());
+        }
+        return put_result.value()->Wait();
+    }
+
+    tl::expected<void, ErrorCode> DeleteKey(const std::string& key) {
+        auto delete_result = data_manager_.Delete(key, /*tier_id=*/std::nullopt,
+                                                  /*notify_master=*/false);
+        if (!delete_result.has_value() &&
+            delete_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            return tl::make_unexpected(delete_result.error());
+        }
+        return {};
+    }
+
+   private:
+    DataManager& data_manager_;
+};
+
+inline void RegisterPeerClientTestControlRpcService(
+    coro_rpc::coro_rpc_server& server,
+    PeerClientTestControlRpcService& service) {
+    server.register_handler<&PeerClientTestControlRpcService::PutKey>(&service);
+    server.register_handler<&PeerClientTestControlRpcService::DeleteKey>(
+        &service);
+}
+
+class PeerClientTestControlClient {
+   public:
+    tl::expected<void, ErrorCode> Connect(const std::string& endpoint) {
+        endpoint_ = endpoint;
+        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
+            pool_conf{};
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
+            pool_conf.client_config.socket_config =
+                coro_io::ib_socket_t::config_t{};
+        }
+
+        client_pools_ =
+            std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+                pool_conf);
+        client_pool_ = client_pools_->at(endpoint);
+        return {};
+    }
+
+    void Reset() {
+        client_pool_.reset();
+        client_pools_.reset();
+        endpoint_.clear();
+    }
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> PutKey(
+        const std::string& key, const std::string& data) {
+        if (!client_pool_) {
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+
+        auto ret = co_await client_pool_->send_request(
+            [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+                return client
+                    .send_request<&PeerClientTestControlRpcService::PutKey>(
+                        key, data);
+            });
+        if (!ret.has_value()) {
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+
+        auto rpc_result = co_await ret.value();
+        if (!rpc_result) {
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        co_return rpc_result->result();
+    }
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> DeleteKey(
+        const std::string& key) {
+        if (!client_pool_) {
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+
+        auto ret = co_await client_pool_->send_request(
+            [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+                return client
+                    .send_request<&PeerClientTestControlRpcService::DeleteKey>(
+                        key);
+            });
+        if (!ret.has_value()) {
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+
+        auto rpc_result = co_await ret.value();
+        if (!rpc_result) {
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        co_return rpc_result->result();
+    }
+
+   private:
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
+    std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+        client_pool_;
+    std::string endpoint_;
+};
+
 class PeerClientRpcServerStack {
    public:
     ~PeerClientRpcServerStack() { Stop(); }
@@ -105,10 +225,13 @@ class PeerClientRpcServerStack {
             std::move(tiered_backend), transfer_engine_,
             /*lock_shard_count=*/1024, local_transfer_config);
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
+        control_service_ =
+            std::make_unique<PeerClientTestControlRpcService>(*data_manager_);
 
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
             /*thread_num=*/1, port_);
         RegisterClientRpcService(*server_, *rpc_service_);
+        RegisterPeerClientTestControlRpcService(*server_, *control_service_);
 
         server_thread_ = std::thread([this]() {
             auto ec = server_->start();
@@ -166,6 +289,7 @@ class PeerClientRpcServerStack {
             server_thread_.join();
         }
         server_.reset();
+        control_service_.reset();
         rpc_service_.reset();
         data_manager_.reset();
         transfer_engine_.reset();
@@ -176,6 +300,7 @@ class PeerClientRpcServerStack {
     std::shared_ptr<TransferEngine> transfer_engine_;
     std::unique_ptr<DataManager> data_manager_;
     std::unique_ptr<ClientRpcService> rpc_service_;
+    std::unique_ptr<PeerClientTestControlRpcService> control_service_;
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::thread server_thread_;
 };
@@ -398,6 +523,7 @@ class ScopedPeerClientRpcServerProcess {
     bool Start(const std::optional<std::string>& pre_put_key = std::nullopt,
                const std::optional<std::string>& pre_put_data = std::nullopt,
                const std::optional<std::string>& state_file = std::nullopt) {
+        control_client_.Reset();
         port_ = static_cast<uint16_t>(getFreeTcpPort());
         std::vector<std::string> args = {
             "--mooncake-child-mode=rpc-server",
@@ -414,13 +540,36 @@ class ScopedPeerClientRpcServerProcess {
             return false;
         }
         if (state_file.has_value()) {
-            return WaitForStateFile(*state_file);
+            if (!WaitForStateFile(*state_file)) {
+                process_.Stop();
+                return false;
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        auto connect_result = control_client_.Connect(endpoint());
+        if (!connect_result.has_value()) {
+            process_.Stop();
+            control_client_.Reset();
+            return false;
+        }
         return true;
     }
 
-    void Stop() { process_.Stop(); }
+    void Stop() {
+        control_client_.Reset();
+        process_.Stop();
+    }
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> PutKey(
+        const std::string& key, const std::string& data) {
+        co_return co_await control_client_.PutKey(key, data);
+    }
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> DeleteKey(
+        const std::string& key) {
+        co_return co_await control_client_.DeleteKey(key);
+    }
 
     uint16_t port() const { return port_; }
     std::string endpoint() const {
@@ -429,6 +578,7 @@ class ScopedPeerClientRpcServerProcess {
 
    private:
     PeerClientTestChildProcess process_;
+    PeerClientTestControlClient control_client_;
     uint16_t port_ = 0;
 };
 

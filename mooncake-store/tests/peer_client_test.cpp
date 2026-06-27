@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <future>
 #include <memory>
 #include <csignal>
@@ -19,47 +20,65 @@ namespace mooncake {
 
 class PeerClientTest : public ::testing::Test {
    protected:
-    void SetUp() override {
+    static void SetUpTestSuite() {
         google::InitGoogleLogging("PeerClientTest");
         FLAGS_logtostderr = 1;
-        StartConnectedServer();
+
+        state_file_path_ = testing::MakeTempStateFilePath();
+        ASSERT_TRUE(
+            server_process_.Start(std::nullopt, std::nullopt, state_file_path_))
+            << "Failed to start suite rpc-server child process";
+        suite_tier_id_ = testing::ReadTierIdFromStateFile(*state_file_path_);
+        ASSERT_TRUE(suite_tier_id_.has_value()) << "Failed to load suite tier";
     }
 
-    void TearDown() override {
-        peer_client_.reset();
+    static void TearDownTestSuite() {
         server_process_.Stop();
         CleanupStateFile();
         google::ShutdownGoogleLogging();
     }
 
-    void StartConnectedServer(
-        const std::optional<std::string>& pre_put_key = std::nullopt,
-        const std::optional<std::string>& pre_put_data = std::nullopt) {
+    void SetUp() override { StartConnectedServer(); }
+
+    void TearDown() override {
+        for (const auto& key : cleanup_keys_) {
+            auto delete_result =
+                async_simple::coro::syncAwait(server_process_.DeleteKey(key));
+            ASSERT_TRUE(delete_result.has_value())
+                << "Failed to delete cleanup key " << key << ": "
+                << static_cast<int>(delete_result.error());
+        }
+        cleanup_keys_.clear();
         peer_client_.reset();
-        server_process_.Stop();
-        CleanupStateFile();
+    }
 
-        state_file_path_ = testing::MakeTempStateFilePath();
-        ASSERT_TRUE(
-            server_process_.Start(pre_put_key, pre_put_data, state_file_path_))
-            << "Failed to start rpc-server child process";
-
+    void StartConnectedServer() {
+        peer_client_.reset();
         peer_client_ = std::make_unique<PeerClient>();
         auto connect_result = peer_client_->Connect(server_process_.endpoint());
         ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
     }
 
+    // Keeps the old helper name to minimize test churn. It now seeds the
+    // long-lived child process instead of restarting it.
     void RestartServerWithPrePut(const std::string& key,
                                  const std::string& data) {
-        StartConnectedServer(key, data);
+        auto put_result =
+            async_simple::coro::syncAwait(server_process_.PutKey(key, data));
+        ASSERT_TRUE(put_result.has_value())
+            << "Failed to seed remote key " << key << ": "
+            << static_cast<int>(put_result.error());
+        TrackRemoteKeyForCleanup(key);
     }
 
-    std::optional<UUID> GetTierId() const {
-        if (!state_file_path_.has_value()) {
-            return std::nullopt;
+    void TrackRemoteKeyForCleanup(const std::string& key) {
+        if (std::find(cleanup_keys_.begin(), cleanup_keys_.end(), key) ==
+            cleanup_keys_.end()) {
+            cleanup_keys_.push_back(key);
         }
-        return testing::ReadTierIdFromStateFile(*state_file_path_);
     }
+
+    std::optional<UUID> GetTierId() const { return suite_tier_id_; }
 
     RemoteBufferDesc CreateBufferDesc(const std::string& endpoint,
                                       uintptr_t addr, uint64_t size) const {
@@ -123,7 +142,7 @@ class PeerClientTest : public ::testing::Test {
     }
 
    private:
-    void CleanupStateFile() {
+    static void CleanupStateFile() {
         if (!state_file_path_.has_value()) {
             return;
         }
@@ -134,9 +153,15 @@ class PeerClientTest : public ::testing::Test {
 
    protected:
     std::unique_ptr<PeerClient> peer_client_;
-    testing::ScopedPeerClientRpcServerProcess server_process_;
-    std::optional<std::string> state_file_path_;
+    std::vector<std::string> cleanup_keys_;
+    static testing::ScopedPeerClientRpcServerProcess server_process_;
+    static std::optional<std::string> state_file_path_;
+    static std::optional<UUID> suite_tier_id_;
 };
+
+testing::ScopedPeerClientRpcServerProcess PeerClientTest::server_process_;
+std::optional<std::string> PeerClientTest::state_file_path_;
+std::optional<UUID> PeerClientTest::suite_tier_id_;
 
 // ============================================================================
 // Connect Tests
@@ -522,6 +547,7 @@ TEST_F(PeerClientTest, ConcurrentAsyncPreWriteSameKey) {
         async_simple::coro::syncAwait(peer_client_->AsyncWriteCommit(commit));
     ASSERT_TRUE(commit_res.has_value()) << "Winner WriteCommit failed: "
                                         << static_cast<int>(commit_res.error());
+    TrackRemoteKeyForCleanup(key);
 }
 
 TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
@@ -542,6 +568,7 @@ TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
     ASSERT_TRUE(commit_res.has_value())
         << "AsyncWriteCommit failed: " << static_cast<int>(commit_res.error());
 
+    TrackRemoteKeyForCleanup(key);
     ExpectKeyExists(key);
 }
 
@@ -829,6 +856,7 @@ TEST_F(PeerClientTest, SyncWriteCommitAfterPreWrite) {
     ASSERT_TRUE(commit_res.has_value())
         << "WriteCommit failed: " << static_cast<int>(commit_res.error());
 
+    TrackRemoteKeyForCleanup(key);
     ExpectKeyExists(key);
 }
 
