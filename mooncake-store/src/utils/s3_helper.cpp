@@ -107,9 +107,8 @@ Aws::Client::RequestChecksumCalculation ParseRequestChecksum(
         return Aws::Client::RequestChecksumCalculation::WHEN_REQUIRED;
     }
     if (!value.empty()) {
-        LOG(WARNING)
-            << "Invalid MOONCAKE_AWS_S3_REQUEST_CHECKSUM value: " << value
-            << ", falling back to when_supported";
+        LOG(WARNING) << "Invalid MOONCAKE_AWS_S3_REQUEST_CHECKSUM value: "
+                     << value << ", falling back to when_supported";
     }
     return Aws::Client::RequestChecksumCalculation::WHEN_SUPPORTED;
 }
@@ -120,9 +119,8 @@ Aws::Client::ResponseChecksumValidation ParseResponseChecksum(
         return Aws::Client::ResponseChecksumValidation::WHEN_REQUIRED;
     }
     if (!value.empty()) {
-        LOG(WARNING)
-            << "Invalid MOONCAKE_AWS_S3_RESPONSE_CHECKSUM value: " << value
-            << ", falling back to when_supported";
+        LOG(WARNING) << "Invalid MOONCAKE_AWS_S3_RESPONSE_CHECKSUM value: "
+                     << value << ", falling back to when_supported";
     }
     return Aws::Client::ResponseChecksumValidation::WHEN_SUPPORTED;
 }
@@ -180,8 +178,8 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
 
     config.connectTimeoutMs = s3_env.connect_timeout_ms;
     config.requestTimeoutMs = s3_env.request_timeout_ms;
-    config.scheme = s3_env.use_https ? Aws::Http::Scheme::HTTPS
-                                      : Aws::Http::Scheme::HTTP;
+    config.scheme =
+        s3_env.use_https ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
     config.checksumConfig.requestChecksumCalculation = s3_env.request_checksum;
     config.checksumConfig.responseChecksumValidation = s3_env.response_checksum;
 
