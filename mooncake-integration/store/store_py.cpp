@@ -20,6 +20,7 @@
 
 #include "integration_utils.h"
 #include "buffer_pool.h"
+#include "gpu_staging_utils.h"
 
 // Forward declaration for EngramStore bindings
 namespace mooncake {
@@ -839,15 +840,46 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
-        return batch_write_tensor_impl(
-            keys, infos, config, "put",
-            [this](const std::vector<std::string> &write_keys,
-                   const std::vector<void *> &buffer_ptrs,
-                   const std::vector<size_t> &buffer_sizes,
-                   const ReplicateConfig &write_config) {
-                return store_->batch_put_from(write_keys, buffer_ptrs,
-                                              buffer_sizes, write_config);
-            });
+        auto group_ids_error =
+            ValidateGroupIdsForBatchConfig(config, keys.size(), "put");
+        if (!group_ids_error.empty()) return group_ids_error;
+
+        std::vector<int> results(keys.size(), 0);
+        {
+            py::gil_scoped_release release_gil;
+
+            std::vector<std::string> valid_keys;
+            std::vector<std::vector<void *>> all_buffers;
+            std::vector<std::vector<size_t>> all_sizes;
+            std::vector<size_t> original_indices;
+
+            for (size_t i = 0; i < infos.size(); ++i) {
+                if (!infos[i].valid()) {
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+                valid_keys.push_back(keys[i]);
+                all_buffers.push_back(
+                    {const_cast<void *>(
+                         reinterpret_cast<const void *>(&infos[i].metadata)),
+                     reinterpret_cast<void *>(infos[i].data_ptr)});
+                all_sizes.push_back({infos[i].metadata.header.data_offset,
+                                     infos[i].tensor_size});
+                original_indices.push_back(i);
+            }
+
+            if (!valid_keys.empty()) {
+                ReplicateConfig write_config =
+                    MakeIndexedConfig(config, original_indices);
+                std::vector<int> op_results =
+                    store_->batch_put_from_multi_buffers(
+                        valid_keys, all_buffers, all_sizes, write_config);
+                for (size_t i = 0; i < op_results.size(); ++i) {
+                    results[original_indices[i]] = op_results[i];
+                }
+            }
+        }
+        return results;
     }
 
     std::vector<int> batch_put_tensor_impl(
@@ -1407,55 +1439,34 @@ class MooncakeStorePyWrapper {
                 results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        // 2. Prepare Buffers and Execute (GIL Released)
+        // 2. Zero-copy: pass metadata and data as separate buffers
         {
             py::gil_scoped_release release_gil;
 
             std::vector<std::string> valid_keys;
-            std::vector<void *> buffer_ptrs;
-            std::vector<size_t> buffer_sizes;
+            std::vector<std::vector<void *>> all_buffers;
+            std::vector<std::vector<size_t>> all_sizes;
             std::vector<size_t> original_indices;
-
-            std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
 
             for (size_t i = 0; i < infos.size(); ++i) {
                 if (!infos[i].valid()) continue;
 
-                size_t total_size =
-                    sizeof(TensorMetadata) + infos[i].tensor_size;
-                auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
-
-                if (!alloc_result) {
-                    LOG(ERROR)
-                        << "Failed to allocate buffer for key: " << keys[i];
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
-
-                // Copy Metadata & Data
-                char *dst = static_cast<char *>(alloc_result->ptr());
-                memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
-                if (infos[i].tensor_size > 0) {
-                    memcpy(dst + sizeof(TensorMetadata),
-                           reinterpret_cast<void *>(infos[i].data_ptr),
-                           infos[i].tensor_size);
-                }
-
                 valid_keys.push_back(keys[i]);
-                buffer_ptrs.push_back(alloc_result->ptr());
-                buffer_sizes.push_back(total_size);
+                all_buffers.push_back(
+                    {const_cast<void *>(
+                         reinterpret_cast<const void *>(&infos[i].metadata)),
+                     reinterpret_cast<void *>(infos[i].data_ptr)});
+                all_sizes.push_back({infos[i].metadata.header.data_offset,
+                                     infos[i].tensor_size});
                 original_indices.push_back(i);
-
-                temp_allocations.push_back(
-                    std::make_unique<BufferHandle>(std::move(*alloc_result)));
             }
 
             if (!valid_keys.empty()) {
                 ReplicateConfig write_config =
                     MakeIndexedConfig(config, original_indices);
-                std::vector<int> op_results = store_->batch_upsert_from(
-                    valid_keys, buffer_ptrs, buffer_sizes, write_config);
+                std::vector<int> op_results =
+                    store_->batch_upsert_from_multi_buffers(
+                        valid_keys, all_buffers, all_sizes, write_config);
                 for (size_t i = 0; i < op_results.size(); ++i) {
                     results[original_indices[i]] = op_results[i];
                 }
@@ -2553,6 +2564,25 @@ PYBIND11_MODULE(store, m) {
             py::arg("config") = ReplicateConfig{},
             "Upsert object data directly from pre-allocated buffers for "
             "multiple keys")
+        .def(
+            "batch_upsert_from_multi_buffers",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_upsert_from_multi_buffers(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Upsert object data directly from multiple pre-allocated buffers "
+            "for multiple keys")
         .def(
             "upsert",
             [](MooncakeStorePyWrapper &self, const std::string &key,

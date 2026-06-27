@@ -7,6 +7,12 @@
 #endif
 
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -107,6 +113,51 @@ inline void SetDevice(int device_id) {
 #endif
 }
 
+class DeviceGuard {
+   public:
+    explicit DeviceGuard(int device_id) {
+        if (device_id < 0) return;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+        if (cudaGetDevice(&previous_device_) == cudaSuccess) {
+            active_ = true;
+        }
+        cudaSetDevice(device_id);
+#elif defined(USE_HIP)
+        if (hipGetDevice(&previous_device_) == hipSuccess) {
+            active_ = true;
+        }
+        hipSetDevice(device_id);
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+        if (aclrtGetDevice(&previous_device_) == ACL_SUCCESS) {
+            active_ = true;
+        }
+        aclrtSetDevice(device_id);
+#else
+        (void)device_id;
+#endif
+    }
+
+    ~DeviceGuard() {
+        if (!active_) return;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+        cudaSetDevice(previous_device_);
+#elif defined(USE_HIP)
+        hipSetDevice(previous_device_);
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+        aclrtSetDevice(previous_device_);
+#endif
+    }
+
+    DeviceGuard(const DeviceGuard&) = delete;
+    DeviceGuard& operator=(const DeviceGuard&) = delete;
+
+   private:
+    int previous_device_{-1};
+    bool active_{false};
+};
+
 // Copy host memory to device. Caller must have called SetDevice first.
 inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
@@ -162,5 +213,110 @@ inline bool IsHostPointer(const void* ptr) {
     return true;  // CPU-only build: all pointers are host
 #endif
 }
+/// GPU-safe memcpy: auto-detects pointer types and dispatches to CopyAuto
+/// for GPU pointers, std::memcpy for host pointers.
+inline bool MemcpySafe(void* dst, const void* src, size_t size) {
+    if (size == 0) return true;
+    int src_dev = -1, dst_dev = -1;
+    bool src_gpu = IsDevicePointer(src, &src_dev);
+    bool dst_gpu = IsDevicePointer(dst, &dst_dev);
+    if (!src_gpu && !dst_gpu) {
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    int dev = src_gpu ? src_dev : dst_dev;
+    DeviceGuard guard(dev);
+    return CopyAuto(dst, src, size);
+}
+
+inline bool PinMemoryEnabled() {
+    const char* pin_env = std::getenv("MC_STORE_PIN_MEMORY");
+    return !(pin_env &&
+             (std::string(pin_env) == "0" || std::string(pin_env) == "false"));
+}
+
+inline size_t PinMemoryMaxBytes() {
+    const char* max_env = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
+    if (!max_env || max_env[0] == '\0') return 0;
+    char* end = nullptr;
+    unsigned long long value = std::strtoull(max_env, &end, 10);
+    if (end == max_env) return 0;
+    if (value > std::numeric_limits<size_t>::max()) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return static_cast<size_t>(value);
+}
+
+std::mutex& PinnedHostMemoryMutex();
+
+size_t& PinnedHostMemoryBytes();
+
+std::unordered_map<void*, size_t>& PinnedHostMemoryRegions();
+
+inline bool TryPinHostMemory(void* ptr, size_t size, const char* name) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+    if (!PinMemoryEnabled() || ptr == nullptr || size == 0) return false;
+
+    std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
+    auto& regions = PinnedHostMemoryRegions();
+    if (regions.find(ptr) != regions.end()) return true;
+
+    size_t max_bytes = PinMemoryMaxBytes();
+    size_t current = PinnedHostMemoryBytes();
+    if (max_bytes > 0 && (current > max_bytes || size > max_bytes - current)) {
+        LOG(WARNING) << "Skip cudaHostRegister for " << name << " size=" << size
+                     << " because MC_STORE_PIN_MEMORY_MAX_BYTES=" << max_bytes
+                     << " current_pinned=" << current;
+        return false;
+    }
+
+    auto cuda_ret = cudaHostRegister(ptr, size, 0);
+    if (cuda_ret != cudaSuccess) {
+        LOG(WARNING) << "cudaHostRegister failed for " << name
+                     << " size=" << size << ": " << cudaGetErrorString(cuda_ret)
+                     << "; GPU copies will use pageable fallback";
+        return false;
+    }
+
+    PinnedHostMemoryBytes() += size;
+    regions[ptr] = size;
+    LOG(INFO) << "cudaHostRegister OK for " << name << ", size=" << size;
+    return true;
+#else
+    (void)ptr;
+    (void)size;
+    (void)name;
+    return false;
+#endif
+}
+
+inline void UnpinHostMemory(void* ptr, const char* name) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+    if (ptr == nullptr) return;
+
+    std::lock_guard<std::mutex> lock(PinnedHostMemoryMutex());
+    auto& regions = PinnedHostMemoryRegions();
+    auto it = regions.find(ptr);
+    if (it == regions.end()) return;
+
+    size_t size = it->second;
+    auto cuda_ret = cudaHostUnregister(ptr);
+    if (cuda_ret != cudaSuccess) {
+        LOG(WARNING) << "cudaHostUnregister failed for " << name
+                     << " size=" << size << ": "
+                     << cudaGetErrorString(cuda_ret);
+        return;
+    }
+
+    regions.erase(it);
+    PinnedHostMemoryBytes() -= size;
+#else
+    (void)ptr;
+    (void)name;
+#endif
+}
+
 }  // namespace gpu_staging
 }  // namespace mooncake

@@ -28,6 +28,7 @@ set(MOONCAKE_STORE_SOURCES
     shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    gpu_staging_utils.cpp
     serialize/serializer.cpp
     storage/distributed/distributed_storage_backend.cpp
     ha/leadership/leader_coordinator_factory.cpp

@@ -64,6 +64,15 @@ class Client {
    public:
     virtual ~Client();
 
+    /**
+     * @brief Reinitialize TransferSubmitter with a staging allocator.
+     *
+     * Called by RealClient after its client buffer allocator is ready,
+     * so that ensureRegisteredForRDMA can stage unregistered user buffers.
+     */
+    void setStagingAllocator(
+        std::shared_ptr<ClientBufferAllocator> staging_allocator);
+
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
 
@@ -668,7 +677,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
-    void InitTransferSubmitter();
+    void InitTransferSubmitter(
+        std::shared_ptr<ClientBufferAllocator> staging_allocator = nullptr);
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);

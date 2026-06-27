@@ -20,6 +20,7 @@
 #include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
+#include "client_buffer.hpp"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -285,8 +286,17 @@ class TransferFuture {
      */
     TransferStrategy strategy() const;
 
+    /**
+     * @brief Attach staging buffer handles that must stay alive until transfer
+     * completes. Used by ensureRegisteredForRDMA to keep staging memory valid.
+     */
+    void attachStagingHandles(std::vector<BufferHandle> handles) {
+        staging_handles_ = std::move(handles);
+    }
+
    private:
     std::shared_ptr<OperationState> state_;
+    std::vector<BufferHandle> staging_handles_;
 };
 
 /**
@@ -528,11 +538,11 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
-    explicit TransferSubmitter(TransferEngine& engine,
-                               std::shared_ptr<StorageBackend>& backend,
-                               const std::string& local_hostname,
-                               TransferMetric* transfer_metric = nullptr,
-                               int numa_socket_id = 0);
+    explicit TransferSubmitter(
+        TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+        const std::string& local_hostname,
+        std::shared_ptr<ClientBufferAllocator> staging_allocator,
+        TransferMetric* transfer_metric = nullptr, int numa_socket_id = 0);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -585,11 +595,23 @@ class TransferSubmitter {
                                       const std::string& local_endpoint);
 
    private:
+    /**
+     * @brief Ensure all slices are in RDMA-registered memory.
+     *
+     * For each slice NOT registered with the transfer engine, copies its
+     * data into a staging buffer (from staging_allocator_) that IS registered.
+     * Returns the prepared slices and staging handles that must stay alive
+     * until the transfer completes.
+     */
+    std::pair<std::vector<Slice>, std::vector<BufferHandle>>
+    ensureRegisteredForRDMA(const std::vector<Slice>& slices);
+
     TransferEngine& engine_;
     // Cached at construction: the local transport endpoint never changes for
     // the lifetime of the TransferSubmitter, so we avoid calling
     // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
     const std::string local_endpoint_;
+    std::shared_ptr<ClientBufferAllocator> staging_allocator_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;

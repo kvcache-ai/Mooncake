@@ -168,28 +168,28 @@ class RealClient : public PyClient {
     /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
-     * @param buffer Pointer to Store-managed registered memory, either
-     * explicitly registered with register_buffer() or inside the setup-time
-     * local buffer
+     * @param buffer Pointer to the source data buffer
      * @param size Size of the data to put
      * @return 0 on success, negative value on error
-     * @note The buffer address must resolve to Store-managed registered memory,
-     * either an explicit register_buffer() region or the setup-time local
-     * buffer
+     * @note Registered buffers are used directly for RDMA writes. Unregistered
+     * buffers are staged in the transfer layer when RDMA requires registered
+     * source memory.
      */
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
 
     /**
-     * @brief Put one object directly from a registered data buffer plus a
-     * registered metadata buffer
+     * @brief Put one object directly from a data buffer plus a metadata buffer
      * @param key Key of the object to put
-     * @param buffer Pointer to the registered data buffer
-     * @param metadata_buffer Pointer to the registered metadata buffer
+     * @param buffer Pointer to the data buffer
+     * @param metadata_buffer Pointer to the metadata buffer
      * @param size Size of the data buffer in bytes
      * @param metadata_size Size of the metadata buffer in bytes
      * @param config Replication configuration
      * @return 0 on success, negative value on error
+     * @note Registered buffers are used directly for RDMA writes. Unregistered
+     * buffers are staged in the transfer layer when RDMA requires registered
+     * source memory.
      */
     int put_from_with_metadata(
         const std::string &key, void *buffer, void *metadata_buffer,
@@ -205,9 +205,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must resolve to Store-managed registered
-     * memory, either explicit register_buffer() regions or the setup-time local
-     * buffer
+     * @note Registered buffers are used directly for RDMA writes. Unregistered
+     * buffers are staged in the transfer layer when RDMA requires registered
+     * source memory.
      */
 
     std::vector<int> batch_put_from(
@@ -225,9 +225,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must resolve to Store-managed registered
-     * memory, either explicit register_buffer() regions or the setup-time local
-     * buffer
+     * @note Registered buffers are used directly for RDMA writes. Unregistered
+     * buffers are staged in the transfer layer when RDMA requires registered
+     * source memory.
      */
     std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,
@@ -252,6 +252,12 @@ class RealClient : public PyClient {
     std::vector<int> batch_upsert_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     int upsert_parts(const std::string &key,
@@ -591,6 +597,13 @@ class RealClient : public PyClient {
     std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> upsert_parts_internal(

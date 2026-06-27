@@ -34,6 +34,7 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.hpp"
+#include "gpu_staging_utils.h"
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
@@ -838,7 +839,8 @@ ErrorCode Client::InitTransferEngine(
     return ErrorCode::OK;
 }
 
-void Client::InitTransferSubmitter() {
+void Client::InitTransferSubmitter(
+    std::shared_ptr<ClientBufferAllocator> staging_allocator) {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
@@ -847,12 +849,19 @@ void Client::InitTransferSubmitter() {
         GetConfiguredNumaSocketId().value_or(GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
+        std::move(staging_allocator),
         metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
 #else
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
+        std::move(staging_allocator),
         metrics_ ? &metrics_->transfer_metric : nullptr);
 #endif
+}
+
+void Client::setStagingAllocator(
+    std::shared_ptr<ClientBufferAllocator> staging_allocator) {
+    InitTransferSubmitter(std::move(staging_allocator));
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -2713,6 +2722,12 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+    gpu_staging::UnpinHostMemory(reinterpret_cast<void*>(it->second.base),
+                                 "segment");
+#endif
+
     int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(it->second.base));
     if (rc != 0) {
@@ -2786,6 +2801,16 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+        {
+            // Pin segment buffer by default so GPU→host copies use DMA.
+            // Opt out with MC_STORE_PIN_MEMORY=0.
+            // Cap with MC_STORE_PIN_MEMORY_MAX_BYTES=N.
+            gpu_staging::TryPinHostMemory((void*)buffer, size, "segment");
+        }
+#endif
+
         Segment segment;
         segment.id = generate_uuid();
         segment.name = local_hostname_;
@@ -2803,6 +2828,17 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+            gpu_staging::UnpinHostMemory((void*)buffer, "segment");
+#endif
+            int unregister_rc =
+                transfer_engine_->unregisterLocalMemory((void*)buffer);
+            if (unregister_rc != 0) {
+                LOG(WARNING) << "Failed to unregister transfer buffer after "
+                                "mount failure, ret="
+                             << unregister_rc;
+            }
             return tl::unexpected(err);
         }
 
