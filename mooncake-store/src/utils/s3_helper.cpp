@@ -10,6 +10,7 @@
 #include <aws/s3/model/DeleteObjectsRequest.h>
 #include <aws/s3/model/ObjectIdentifier.h>
 #include <aws/s3/model/Delete.h>
+#include <algorithm>
 #include <optional>
 #include <fstream>
 #include <iostream>
@@ -101,28 +102,18 @@ void AssignTimeoutFromEnv(const char *env_name, int64_t default_value,
     target = default_value;
 }
 
-Aws::Client::RequestChecksumCalculation ParseRequestChecksum(
-    const std::string &value) {
-    if (value == "when_required") {
-        return Aws::Client::RequestChecksumCalculation::WHEN_REQUIRED;
+template <typename T>
+T ParseChecksumMode(const std::string &value) {
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    if (lower == "when_required") return T::WHEN_REQUIRED;
+    if (lower == "when_supported") return T::WHEN_SUPPORTED;
+    if (!lower.empty()) {
+        LOG(WARNING) << "Invalid value: " << value
+                     << ", falling back to when_supported";
     }
-    if (!value.empty()) {
-        LOG(WARNING) << "Invalid MOONCAKE_AWS_S3_REQUEST_CHECKSUM value: "
-                     << value << ", falling back to when_supported";
-    }
-    return Aws::Client::RequestChecksumCalculation::WHEN_SUPPORTED;
-}
-
-Aws::Client::ResponseChecksumValidation ParseResponseChecksum(
-    const std::string &value) {
-    if (value == "when_required") {
-        return Aws::Client::ResponseChecksumValidation::WHEN_REQUIRED;
-    }
-    if (!value.empty()) {
-        LOG(WARNING) << "Invalid MOONCAKE_AWS_S3_RESPONSE_CHECKSUM value: "
-                     << value << ", falling back to when_supported";
-    }
-    return Aws::Client::ResponseChecksumValidation::WHEN_SUPPORTED;
+    return T::WHEN_SUPPORTED;
 }
 
 }  // namespace
@@ -151,12 +142,14 @@ void S3Helper::InitAPI() {
     {
         std::string tmp;
         AssignStringFromEnv("MOONCAKE_AWS_S3_REQUEST_CHECKSUM", tmp);
-        s3_env.request_checksum = ParseRequestChecksum(tmp);
+        s3_env.request_checksum =
+            ParseChecksumMode<Aws::Client::RequestChecksumCalculation>(tmp);
     }
     {
         std::string tmp;
         AssignStringFromEnv("MOONCAKE_AWS_S3_RESPONSE_CHECKSUM", tmp);
-        s3_env.response_checksum = ParseResponseChecksum(tmp);
+        s3_env.response_checksum =
+            ParseChecksumMode<Aws::Client::ResponseChecksumValidation>(tmp);
     }
 
     AssignTimeoutFromEnv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS",
