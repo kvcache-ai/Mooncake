@@ -15,6 +15,7 @@
 #ifndef RDMA_ENDPOINT_H
 #define RDMA_ENDPOINT_H
 
+#include <atomic>
 #include <queue>
 
 #include "rdma_context.h"
@@ -93,6 +94,14 @@ class RdmaEndPoint {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
+    // CONNECTED only means local QPs have reached RTS. A passive endpoint must
+    // still confirm the peer has completed its active setup before posting WRs.
+    bool readyToSend() const {
+        return connected() && ready_to_send_.load(std::memory_order_relaxed);
+    }
+
+    bool readyAckTimedOut() const;
+
     bool retired() const {
         auto status = status_.load(std::memory_order_relaxed);
         return status == DESTROYING || status == DESTROYED;
@@ -122,6 +131,8 @@ class RdmaEndPoint {
     // Resets only pre-connected handshake attempts. Once an endpoint has ever
     // reached CONNECTED, it is retired instead of being reused.
     int resetConnection(const std::string &reason);
+    int sendReadyAck(const std::string &peer_server_name,
+                     const HandShakeDesc &local_desc);
 
    public:
     const std::string toString() const;
@@ -166,6 +177,8 @@ class RdmaEndPoint {
    private:
     static constexpr uint64_t kWaitExistingHandshakeTimeoutNano =
         10 * 1000000000ull;  // 10 seconds
+    static constexpr uint64_t kReadyAckTimeoutNano =
+        10 * 1000000000ull;  // 10 seconds
     static constexpr uint32_t kWaitExistingHandshakeSpinCount = 500;
     static constexpr uint32_t kWaitExistingHandshakeInitialSleepUs = 50;
     static constexpr uint32_t kWaitExistingHandshakeMaxSleepUs = 2000;
@@ -189,6 +202,8 @@ class RdmaEndPoint {
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
     bool has_connected_;
+    std::atomic<bool> ready_to_send_;
+    std::atomic<uint64_t> ready_wait_start_ts_;
 
     volatile int *wr_depth_list_;
     int max_wr_depth_;
