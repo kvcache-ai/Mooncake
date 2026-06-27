@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 
 #include "transfer_engine.h"
@@ -37,6 +38,36 @@ class TransportTest : public ::testing::Test {
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+};
+
+class DummyTransport : public Transport {
+   public:
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::OK();
+    }
+
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool = true) override {
+        return 0;
+    }
+
+    int unregisterLocalMemory(void*, bool = true) override { return 0; }
+
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+
+    const char* getName() const override { return "dummy"; }
 };
 
 static int CreateTempFile() {
@@ -170,6 +201,13 @@ TEST_F(TransportTest, ReadEmptyFile) {
     EXPECT_EQ(bytesRead, static_cast<ssize_t>(0));
 
     close(fd);
+}
+
+TEST_F(TransportTest, AllocateBatchIDRejectsOversizedBatch) {
+    DummyTransport transport;
+    auto batch_id = transport.allocateBatchID(
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1);
+    EXPECT_EQ(batch_id, INVALID_BATCH_ID);
 }
 }  // namespace mooncake
 
