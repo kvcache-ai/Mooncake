@@ -333,6 +333,84 @@ TEST(AdmissionQueueTest, DispatchesHigherPriorityBeforeEarlierLowerPriority) {
     EXPECT_EQ(picked, expected_ids);
 }
 
+TEST(AdmissionQueueTest, DispatchPriorityPaysByBytes) {
+    LocalTransferAdmissionQueue queue({32, 1024, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    std::vector<QueueOwnerInput> owners;
+
+    for (size_t i = 0; i < 10; ++i) {
+        owners.push_back(makeOwner(i, 16, QueueOwnerKind::User, {}, PRIO_HIGH));
+    }
+    for (size_t i = 0; i < 10; ++i) {
+        owners.push_back(
+            makeOwner(10 + i, 16, QueueOwnerKind::User, {}, PRIO_LOW));
+    }
+
+    const size_t slot_count = owners.size();
+    auto status = queue.tryAdmit(makeSubmit(1, slot_count, std::move(owners)),
+                                 admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 20u);
+
+    auto picked = queue.pickForDispatch(10, 160);
+
+    const std::vector<QueueOwnerId> expected_ids{
+        admitted_ids[0], admitted_ids[1],  admitted_ids[2], admitted_ids[3],
+        admitted_ids[4], admitted_ids[10], admitted_ids[5], admitted_ids[6],
+        admitted_ids[7], admitted_ids[8]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, UsesByteCreditsBehindHigherPriorityOwner) {
+    LocalTransferAdmissionQueue queue({4, 256, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2,
+                   {makeOwner(0, 80, QueueOwnerKind::User, {}, PRIO_HIGH),
+                    makeOwner(1, 16, QueueOwnerKind::User, {}, PRIO_LOW)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 2u);
+
+    auto picked = queue.pickForDispatch(2, 128);
+
+    const std::vector<QueueOwnerId> expected_ids{admitted_ids[1],
+                                                 admitted_ids[0]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, KeepsByteCreditsSeparateAcrossOwnerKinds) {
+    LocalTransferAdmissionQueue queue({16, 512, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    std::vector<QueueOwnerInput> owners;
+
+    owners.push_back(
+        makeOwner(0, 80, QueueOwnerKind::StagingInternal, {}, PRIO_HIGH));
+    for (size_t i = 1; i <= 8; ++i) {
+        owners.push_back(makeOwner(i, 16, QueueOwnerKind::User, {}, PRIO_HIGH));
+    }
+
+    const size_t slot_count = owners.size();
+    auto status = queue.tryAdmit(makeSubmit(1, slot_count, std::move(owners)),
+                                 admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 9u);
+
+    auto picked = queue.pickForDispatch(4, 128);
+    const std::vector<QueueOwnerId> first_expected{
+        admitted_ids[1], admitted_ids[2], admitted_ids[3], admitted_ids[4]};
+    EXPECT_EQ(picked, first_expected);
+
+    picked = queue.pickForDispatch(4, 128);
+    const std::vector<QueueOwnerId> second_expected{
+        admitted_ids[0], admitted_ids[5], admitted_ids[6], admitted_ids[7]};
+    EXPECT_EQ(picked, second_expected);
+}
+
 TEST(AdmissionQueueTest, PreservesFifoWithinSamePriorityLane) {
     LocalTransferAdmissionQueue queue({4, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;

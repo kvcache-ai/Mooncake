@@ -147,10 +147,41 @@ class LocalTransferAdmissionQueue {
         static constexpr size_t kPriorityCount =
             static_cast<size_t>(PRIO_LOW) + 1;
 
-        using KindQueues = std::array<std::deque<QueueOwnerId>,
-                                      static_cast<size_t>(KindLane::Count)>;
+        struct PickResult {
+            QueueOwnerId owner_id{0};
+            size_t byte_charge{0};
+            bool has_owner{false};
+            bool blocked_by_credit{false};
+            bool blocked_by_window{false};
+        };
+
+        struct LaneState {
+            std::deque<QueueOwnerId> queue;
+            size_t deficit_bytes{0};
+        };
+
+        using KindLanes =
+            std::array<LaneState, static_cast<size_t>(KindLane::Count)>;
+
+        struct PriorityClass {
+            KindLanes lanes;
+            size_t next_kind_lane{0};
+        };
 
         static size_t kindLane(QueueOwnerKind kind);
+
+        static size_t priorityWeight(size_t priority);
+
+        size_t quantumForPriority(size_t priority, size_t max_bytes) const;
+
+        void addDeficit(size_t priority, size_t lane, size_t max_bytes);
+
+        bool hasQueuedOwner(size_t priority,
+                            const std::map<QueueOwnerId, QueueOwner>& owners);
+
+        PickResult pickFromPriority(
+            size_t priority, size_t remaining_bytes,
+            const std::map<QueueOwnerId, QueueOwner>& owners);
 
         void promoteAgedOwners(
             TimePoint now, const std::map<QueueOwnerId, QueueOwner>& owners);
@@ -160,8 +191,8 @@ class LocalTransferAdmissionQueue {
             std::chrono::microseconds threshold, TimePoint now,
             const std::map<QueueOwnerId, QueueOwner>& owners);
 
-        std::array<KindQueues, kPriorityCount> queues_;
-        std::array<size_t, kPriorityCount> next_kind_lane_{};
+        std::array<PriorityClass, kPriorityCount> classes_;
+        size_t next_priority_{0};
         QueueAgingConfig aging_;
     };
 

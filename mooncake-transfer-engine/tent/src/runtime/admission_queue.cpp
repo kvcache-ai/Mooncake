@@ -14,6 +14,7 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <algorithm>
 #include <limits>
 #include <set>
 
@@ -90,7 +91,113 @@ size_t LocalTransferAdmissionQueue::DispatchScheduler::kindLane(
 
 void LocalTransferAdmissionQueue::DispatchScheduler::enqueue(
     QueueOwnerId owner_id, int priority, QueueOwnerKind kind) {
-    queues_[static_cast<size_t>(priority)][kindLane(kind)].push_back(owner_id);
+    classes_[static_cast<size_t>(priority)]
+        .lanes[kindLane(kind)]
+        .queue.push_back(owner_id);
+}
+
+size_t LocalTransferAdmissionQueue::DispatchScheduler::priorityWeight(
+    size_t priority) {
+    switch (priority) {
+        case PRIO_HIGH:
+            return 4;
+        case PRIO_MEDIUM:
+            return 2;
+        case PRIO_LOW:
+            return 1;
+        default:
+            return 1;
+    }
+}
+
+size_t LocalTransferAdmissionQueue::DispatchScheduler::quantumForPriority(
+    size_t priority, size_t max_bytes) const {
+    const size_t base_quantum =
+        std::max<size_t>(max_bytes / 8 + (max_bytes % 8 != 0), 1);
+    const size_t weight = priorityWeight(priority);
+    if (base_quantum > std::numeric_limits<size_t>::max() / weight) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return base_quantum * weight;
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::addDeficit(
+    size_t priority, size_t lane, size_t max_bytes) {
+    auto& lane_state = classes_[priority].lanes[lane];
+    const size_t quantum = quantumForPriority(priority, max_bytes);
+    if (lane_state.deficit_bytes >= max_bytes ||
+        quantum > max_bytes - lane_state.deficit_bytes) {
+        lane_state.deficit_bytes = max_bytes;
+        return;
+    }
+    lane_state.deficit_bytes += quantum;
+}
+
+bool LocalTransferAdmissionQueue::DispatchScheduler::hasQueuedOwner(
+    size_t priority, const std::map<QueueOwnerId, QueueOwner>& owners) {
+    auto& priority_class = classes_[priority];
+    bool has_owner = false;
+    for (auto& lane : priority_class.lanes) {
+        while (!lane.queue.empty()) {
+            const auto owner_id = lane.queue.front();
+            auto owner_it = owners.find(owner_id);
+            if (owner_it != owners.end() &&
+                owner_it->second.state == QueueState::Queued) {
+                has_owner = true;
+                break;
+            }
+            lane.queue.pop_front();
+        }
+        if (lane.queue.empty()) {
+            lane.deficit_bytes = 0;
+        }
+    }
+    return has_owner;
+}
+
+LocalTransferAdmissionQueue::DispatchScheduler::PickResult
+LocalTransferAdmissionQueue::DispatchScheduler::pickFromPriority(
+    size_t priority, size_t remaining_bytes,
+    const std::map<QueueOwnerId, QueueOwner>& owners) {
+    auto& priority_class = classes_[priority];
+    PickResult blocked;
+    for (size_t offset = 0; offset < priority_class.lanes.size(); ++offset) {
+        const size_t lane = (priority_class.next_kind_lane + offset) %
+                            priority_class.lanes.size();
+        auto& lane_state = priority_class.lanes[lane];
+
+        while (!lane_state.queue.empty()) {
+            const auto owner_id = lane_state.queue.front();
+            auto owner_it = owners.find(owner_id);
+            if (owner_it == owners.end() ||
+                owner_it->second.state != QueueState::Queued) {
+                lane_state.queue.pop_front();
+                continue;
+            }
+
+            const size_t byte_charge = owner_it->second.request.length;
+            blocked.has_owner = true;
+            if (byte_charge > remaining_bytes) {
+                blocked.blocked_by_window = true;
+                break;
+            }
+            if (byte_charge > lane_state.deficit_bytes) {
+                blocked.blocked_by_credit = true;
+                break;
+            }
+
+            lane_state.queue.pop_front();
+            priority_class.next_kind_lane =
+                (lane + 1) % priority_class.lanes.size();
+            lane_state.deficit_bytes -= byte_charge;
+            if (lane_state.queue.empty()) {
+                lane_state.deficit_bytes = 0;
+            }
+            return PickResult{owner_id, byte_charge, true, false, false};
+        }
+    }
+
+    return blocked;
 }
 
 void LocalTransferAdmissionQueue::DispatchScheduler::promoteAgedOwners(
@@ -105,14 +212,16 @@ void LocalTransferAdmissionQueue::DispatchScheduler::promoteAgedPriority(
     std::chrono::microseconds threshold, TimePoint now,
     const std::map<QueueOwnerId, QueueOwner>& owners) {
     if (threshold <= std::chrono::microseconds::zero()) return;
-    if (from_priority == PRIO_HIGH || from_priority >= queues_.size() ||
-        to_priority >= queues_.size()) {
+    if (from_priority == PRIO_HIGH || from_priority >= classes_.size() ||
+        to_priority >= classes_.size()) {
         return;
     }
 
-    for (size_t lane = 0; lane < queues_[from_priority].size(); ++lane) {
-        auto& queue = queues_[from_priority][lane];
-        auto& promoted_queue = queues_[to_priority][lane];
+    for (size_t lane = 0; lane < classes_[from_priority].lanes.size(); ++lane) {
+        auto& source_lane = classes_[from_priority].lanes[lane];
+        auto& target_lane = classes_[to_priority].lanes[lane];
+        auto& queue = source_lane.queue;
+        auto& promoted_queue = target_lane.queue;
         while (!queue.empty()) {
             const auto owner_id = queue.front();
             auto owner_it = owners.find(owner_id);
@@ -139,7 +248,13 @@ void LocalTransferAdmissionQueue::DispatchScheduler::promoteAgedPriority(
                 }
             }
             queue.pop_front();
+            if (promoted_queue.empty()) {
+                target_lane.deficit_bytes = 0;
+            }
             promoted_queue.insert(insert_it, owner_id);
+        }
+        if (queue.empty()) {
+            source_lane.deficit_bytes = 0;
         }
     }
 }
@@ -154,41 +269,41 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
-    for (size_t priority = 0; priority < queues_.size(); ++priority) {
-        auto& priority_queues = queues_[priority];
-        while (used_owners < max_owners && used_bytes < max_bytes) {
-            bool made_progress = false;
-            for (size_t offset = 0; offset < priority_queues.size(); ++offset) {
-                const size_t lane = (next_kind_lane_[priority] + offset) %
-                                    priority_queues.size();
-                auto& queue = priority_queues[lane];
+    while (used_owners < max_owners && used_bytes < max_bytes) {
+        bool made_progress = false;
+        bool blocked_by_credit = false;
+        bool blocked_by_window = false;
+        const size_t start_priority = next_priority_;
+        for (size_t offset = 0; offset < classes_.size(); ++offset) {
+            const size_t priority = (start_priority + offset) % classes_.size();
+            if (!hasQueuedOwner(priority, owners)) continue;
 
-                while (!queue.empty()) {
-                    const auto owner_id = queue.front();
-                    auto owner_it = owners.find(owner_id);
-                    if (owner_it == owners.end() ||
-                        owner_it->second.state != QueueState::Queued) {
-                        queue.pop_front();
-                        continue;
-                    }
-
-                    const size_t remaining_bytes = max_bytes - used_bytes;
-                    if (owner_it->second.request.length > remaining_bytes)
-                        break;
-
-                    queue.pop_front();
-                    picked.push_back(owner_id);
-                    ++used_owners;
-                    used_bytes += owner_it->second.request.length;
-                    next_kind_lane_[priority] =
-                        (lane + 1) % priority_queues.size();
-                    made_progress = true;
-                    break;
+            auto& priority_class = classes_[priority];
+            for (size_t lane = 0; lane < priority_class.lanes.size(); ++lane) {
+                if (!priority_class.lanes[lane].queue.empty()) {
+                    addDeficit(priority, lane, max_bytes);
                 }
-                if (made_progress || used_owners >= max_owners) break;
             }
-            if (!made_progress) break;
+            while (used_owners < max_owners && used_bytes < max_bytes) {
+                auto result =
+                    pickFromPriority(priority, max_bytes - used_bytes, owners);
+                if (!result.has_owner) break;
+                blocked_by_credit =
+                    blocked_by_credit || result.blocked_by_credit;
+                blocked_by_window =
+                    blocked_by_window || result.blocked_by_window;
+                if (result.owner_id == 0) break;
+
+                picked.push_back(result.owner_id);
+                ++used_owners;
+                used_bytes += result.byte_charge;
+                next_priority_ = (priority + 1) % classes_.size();
+                made_progress = true;
+            }
+            if (used_owners >= max_owners || used_bytes >= max_bytes) break;
         }
+        if (!made_progress && !blocked_by_credit) break;
+        if (!made_progress && blocked_by_window && !blocked_by_credit) break;
     }
     return picked;
 }
