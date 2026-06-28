@@ -325,6 +325,24 @@ The above presents two samples from our trace dataset. The trace includes the ti
 Please kindly cite our papers if you find the papers or the traces are useful:
 
 ```bibtex
+@inproceedings{qin2025mooncake,
+  author    = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
+  title     = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
+  booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
+  year      = {2025},
+  isbn      = {978-1-939133-45-8},
+  address   = {Santa Clara, CA},
+  pages     = {155--170},
+  url       = {https://www.usenix.org/conference/fast25/presentation/qin},
+  publisher = {USENIX Association},
+  month     = {feb},
+}
+```
+
+<details>
+<summary>Highlights</summary>
+
+```bibtex
 @misc{ren2026tentdeclarativeslicespraying,
   title     = {TENT: A Declarative Slice Spraying Engine for Performant and Resilient Data Movement in Disaggregated LLM Serving},
   author    = {Feng Ren and Ruoyu Qin and Teng Ma and Shangming Cai and Zheng Liu and Chao Lei and Dejiang Zhu and Ke Yang and Zheming Li and Jialei Cui and Weixiao Huang and Yikai Zhao and Yineng Zhang and Hao Wu and Xiang Gao and Yuhao Fu and Jinlei Jiang and Yongwei Wu and Mingxing Zhang},
@@ -356,18 +374,7 @@ Please kindly cite our papers if you find the papers or the traces are useful:
   keywords  = {Machine learning system, LLM serving, KVCache},
 }
 
-@inproceedings{qin2025mooncake,
-  author    = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
-  title     = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
-  booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
-  year      = {2025},
-  isbn      = {978-1-939133-45-8},
-  address   = {Santa Clara, CA},
-  pages     = {155--170},
-  url       = {https://www.usenix.org/conference/fast25/presentation/qin},
-  publisher = {USENIX Association},
-  month     = {feb},
-}
+
 
 @article{qin2024mooncake_arxiv,
   title  = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
