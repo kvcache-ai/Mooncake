@@ -199,17 +199,7 @@ run_test()
 
 parse()
 {
-    echo "===== Parsing test results ====="
-
-    if collect_and_validate_model_results "SUPPORT_MODELS" "vllm_server_remote.log" "$test_case_name" "paris"; then
-        save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
-        echo "✓ Test PASSED"
-        return 0
-    else
-        save_test_result "$test_case_name" "Fail" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
-        echo "✗ Test FAILED"
-        return 1
-    fi
+    parse_model_results "SUPPORT_MODELS" "vllm_server_remote.log" "$test_case_name" "paris"
 }
 
 case "$1" in
