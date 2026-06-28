@@ -190,9 +190,7 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
-Mooncake supports hardware backends across accelerator vendors, cloud fabrics, and standard datacenter interconnects.
-
-The following hardware partners and cloud platforms are supported by the Mooncake, covering GPUs, specialized AI accelerators, and cloud-native interconnects:
+Mooncake supports hardware backends across accelerator vendors, cloud fabrics, and standard datacenter interconnects, as listed below. See the [supported protocols](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html) and [Transfer Engine design docs](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html) for details.
 
 <div align="center">
   <table>
@@ -211,8 +209,6 @@ The following hardware partners and cloud platforms are supported by the Mooncak
     </tr>
   </table>
 </div>
-
-For complete protocol behavior, SDK requirements, and vendor-specific configuration, see the [supported protocols](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html), [build guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html), and [Transfer Engine design docs](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html).
 
 <h2 id="quick-start">🚀 Getting Started</h2>
 
