@@ -391,6 +391,6 @@ Monitor queue depths for each priority level (requires instrumentation).
 
 ## References
 
-- [TENT Overview](overview.md)
+- [TENT Overview](../overview.md)
 - [TENT Slice Spraying](slice-spraying.md)
-- [TENT C++ API](cpp-api.md)
+- [TENT C++ API](../api/cpp-api.md)
