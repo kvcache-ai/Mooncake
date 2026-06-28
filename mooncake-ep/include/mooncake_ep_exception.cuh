@@ -7,6 +7,8 @@
 #define EP_STATIC_ASSERT(cond, reason) static_assert(cond, reason)
 #endif
 
+#ifndef MOONCAKE_EP_EXCEPTION_CLASS_DEFINED
+#define MOONCAKE_EP_EXCEPTION_CLASS_DEFINED
 class EPException : public std::exception {
    private:
     std::string message = {};
@@ -20,6 +22,7 @@ class EPException : public std::exception {
 
     const char* what() const noexcept override { return message.c_str(); }
 };
+#endif
 
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(cmd)                                   \
