@@ -301,25 +301,11 @@ Install them without cloning the repository via the [Claude Code plugin marketpl
 
 The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.
 
-<h2 id="trace">📦 Open Source Trace</h2>
+<h2 id="trace">📦 Open Source Traces and Tools </h2>
 
-```json
-{
-    "timestamp": 27482,
-    "input_length": 6955,
-    "output_length": 52,
-    "hash_ids": [46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 2353, 2354]
-}
-{
-    "timestamp": 30535,
-    "input_length": 6472,
-    "output_length": 26,
-    "hash_ids": [46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 2366]
-}
-```
-The above presents two samples from our trace dataset. The trace includes the timing of request arrivals, the number of input tokens, the number of output tokens, and the remapped block hash. To protect our customers' privacy, we applied several mechanisms to remove user-related information while preserving the dataset's utility for simulated evaluation. More descriptions of the trace (e.g., up to 50% cache hit ratio) can be found in Section 4 of the technical report.
+We open-source anonymized request traces containing request arrival times, input and output token counts, and remapped block hashes. These traces are designed to support reproducible simulation and evaluation of caching behavior while preserving user privacy. The released traces and related details are available in [FAST25-release](FAST25-release).
 
-**_Update[Feb 21, 2025]: The updated [traces](FAST25-release/traces) used in our FAST'25 paper have been released! Please refer to the paper's appendix (found [here](FAST25-release/Mooncake-FAST25.pdf)) for more details._**
+Together with the released traces, we also provide two KV cache analysis tools: a [KV Cache Size Calculator](https://kvcache.ai/tools/kv-cache-size-calculator/) for calculating cache capacity across popular LLM model families, and a [KV Cache Hit Rate Simulator](https://kvcache.ai/tools/kv-cache-hit-rate-simulator/) for analyzing KV cache hit rates and planning cache capacity under different workloads and models. These tools help users better understand KV cache storage costs and caching effectiveness when analyzing or reproducing serving workloads. The tools are open-sourced at [here](https://github.com/kvcache-ai/kvcache-blog).
 
 <h2 id="citation">📑 Citation</h2>
 Please kindly cite our papers if you find the papers or the traces are useful:
@@ -340,7 +326,7 @@ Please kindly cite our papers if you find the papers or the traces are useful:
 ```
 
 <details>
-<summary>Highlights</summary>
+<summary>More</summary>
 
 ```bibtex
 @misc{ren2026tentdeclarativeslicespraying,
@@ -373,8 +359,6 @@ Please kindly cite our papers if you find the papers or the traces are useful:
   month     = {nov},
   keywords  = {Machine learning system, LLM serving, KVCache},
 }
-
-
 
 @article{qin2024mooncake_arxiv,
   title  = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
