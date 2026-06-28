@@ -45,7 +45,9 @@ class ProxyManager {
    public:
     static constexpr size_t kDefaultChunkSize = 4 * 1024 * 1024;
     static constexpr size_t kDefaultChunkCount = 64;
-    static constexpr size_t kDefaultMaxQueuedTasksPerShard = 1024;
+    // Zero preserves the legacy unbounded shard queue. Production callers may
+    // opt into backpressure through staging/max_queued_tasks_per_shard.
+    static constexpr size_t kDefaultMaxQueuedTasksPerShard = 0;
 
    private:
     struct StageBuffers {
@@ -61,7 +63,7 @@ class ProxyManager {
         size_t chunk_count = kDefaultChunkCount,
         size_t max_queued_tasks_per_shard = kDefaultMaxQueuedTasksPerShard);
 
-    static std::unique_ptr<ProxyManager> createWithoutWorkersForTest(
+    static std::unique_ptr<ProxyManager> createForTest(
         TransferEngineImpl* impl,
         size_t max_queued_tasks_per_shard = kDefaultMaxQueuedTasksPerShard);
 

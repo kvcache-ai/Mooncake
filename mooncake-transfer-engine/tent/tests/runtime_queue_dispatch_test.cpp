@@ -544,7 +544,6 @@ TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowFromTransportNotify) {
 
 TEST(RuntimeQueueDispatch, RuntimeQueueDrainsWithoutUserPolling) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
-    cfg->set("enable_progress_worker", true);
     cfg->set("runtime_queue/progress_fallback_interval_us", 1000UL);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
@@ -595,7 +594,6 @@ TEST(RuntimeQueueDispatch, RuntimeQueueDrainsWithoutUserPolling) {
 
 TEST(RuntimeQueueDispatch, EarlyFreeReclaimsAfterQueuedCompletion) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
-    cfg->set("enable_progress_worker", true);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 

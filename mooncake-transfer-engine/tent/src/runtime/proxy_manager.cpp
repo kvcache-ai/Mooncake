@@ -28,7 +28,7 @@ ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
     : ProxyManager(impl, chunk_size, chunk_count,
                    max_queued_tasks_per_shard, true) {}
 
-std::unique_ptr<ProxyManager> ProxyManager::createWithoutWorkersForTest(
+std::unique_ptr<ProxyManager> ProxyManager::createForTest(
     TransferEngineImpl* impl, size_t max_queued_tasks_per_shard) {
     return std::unique_ptr<ProxyManager>(new ProxyManager(
         impl, kDefaultChunkSize, kDefaultChunkCount,
