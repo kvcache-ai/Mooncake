@@ -217,24 +217,9 @@ The following hardware partners and cloud platforms are supported by the Mooncak
 
 For complete protocol behavior, SDK requirements, and vendor-specific configuration, see the [supported protocols](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html), [build guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html), and [Transfer Engine design docs](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html).
 
-<h2 id="quick-start">🚀 Quick Start</h2>
+<h2 id="quick-start">🚀 Getting Started</h2>
 
-### Before using Mooncake
-
-Mooncake is designed and optimized for high-speed RDMA networks. Though Mooncake supports TCP-only data transfer, we **strongly** recommend users to evaluate the functionality and performance of Mooncake with RDMA network support.
-
-The following need to be installed before running any component of Mooncake:
-- RDMA Driver & SDK, such as Mellanox OFED.
-- Python 3.10, virtual environment is recommended.
-- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
-- Cambricon Neuware, if the package is built with `-DUSE_MLU`. By default Mooncake looks for Neuware under `NEUWARE_HOME` or `/usr/local/neuware`.
-- Hygon DTK SDK, if the package is built with `-DUSE_HYGON`. By default Mooncake looks for DTK under `DTK_HOME` or `/opt/dtk`.
-- Iluvatar CoreX SDK, if the package is built with `-DUSE_COREX`. By default Mooncake looks for CoreX under `COREX_HOME` or `/usr/local/corex`.
-
-### Use Python package
-The simplest way to use Mooncake Transfer Engine is using `pip`:
-
-**For CUDA-enabled systems:**
+Install Mooncake using `pip`. The `mooncake-transfer-engine` package includes Mooncake Transfer Engine, Mooncake Store, Mooncake EP and PG:
 
 - CUDA < 13.0
 ```bash
@@ -245,40 +230,12 @@ pip install mooncake-transfer-engine
 pip install mooncake-transfer-engine-cuda13
 ```
 
-**For non-CUDA systems:**
-```bash
-pip install mooncake-transfer-engine-non-cuda
-```
+In addition to CUDA, Mooncake also supports other accelerator backends, along with flexible installation and deployment options. See the guides below for details:
 
-**For NPU systems:**
-```bash
-pip install mooncake-transfer-engine-npu
-```
+- [Quick Start](https://kvcache-ai.github.io/Mooncake/getting_started/quick-start.html)
+- [Build from Source](https://kvcache-ai.github.io/Mooncake/getting_started/build.html)
+- [Deployment Guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
 
-> [!IMPORTANT]
-> - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
-> - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies, but it still needs system runtime libraries such as `libcurl4`, `libibverbs1`, `rdma-core`, `librdmacm1`, `libnuma1`, and `liburing2` on Ubuntu. In a fresh environment, run `sudo apt-get update` before installing them.
-> - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
-> - If users encounter problems such as missing `lib*.so`, first install the corresponding system runtime libraries. If the issue persists, uninstall the package and build the binaries manually.
-
-### Build From Source
-
-For the default source build, use the automatic dependency script and standard CMake flow:
-
-```bash
-git clone https://github.com/kvcache-ai/Mooncake.git
-cd Mooncake
-
-sudo bash dependencies.sh
-
-mkdir build
-cd build
-cmake ..
-make -j
-sudo make install # optional, make it ready to be used by vLLM/SGLang
-```
-
-For custom accelerator backends, Docker deployment, NVMe-oF, EFA, CXL, Redis / HTTP metadata, Rust bindings, or other advanced build options, see the [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
 ### Skills for AI Assistants
 
