@@ -1,0 +1,363 @@
+name: Monthly Release
+
+on:
+  schedule:
+    # Run on the 1st of every month at 00:00 UTC
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version type (major, minor, patch)'
+        required: true
+        default: 'minor'
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      new_version: ${{ steps.bump_version.outputs.new_version }}
+      release_tag: ${{ steps.bump_version.outputs.release_tag }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install packaging
+
+      - name: Bump version
+        id: bump_version
+        run: |
+          # Read current version from pyproject.toml
+          CURRENT_VERSION=$(grep -oP 'version = "\K[^"]+' mooncake-wheel/pyproject.toml)
+          echo "Current version: $CURRENT_VERSION"
+
+          # Determine version bump type
+          VERSION_TYPE="${{ github.event.inputs.version_type }}"
+          if [ -z "$VERSION_TYPE" ]; then
+            VERSION_TYPE="minor"  # Default for scheduled releases
+          fi
+
+          # Parse version
+          IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
+
+          # Bump version based on type
+          case $VERSION_TYPE in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+          esac
+
+          NEW_VERSION="${major}.${minor}.${patch}"
+          RELEASE_TAG="v${NEW_VERSION}"
+
+          echo "New version: $NEW_VERSION"
+          echo "Release tag: $RELEASE_TAG"
+
+          # Update pyproject.toml
+          sed -i "s/version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/" mooncake-wheel/pyproject.toml
+
+          # Output for next jobs
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit version bump
+        run: |
+          git add mooncake-wheel/pyproject.toml
+          git commit -m "Release ${{ steps.bump_version.outputs.new_version }}
+
+Generated with [Claude Code](https://claude.ai/code)
+via [Happy](https://happy.engineering)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: Happy <yesreply@happy.engineering>"
+          git push origin main
+
+      - name: Create and push tag
+        run: |
+          git tag ${{ steps.bump_version.outputs.release_tag }}
+          git push origin ${{ steps.bump_version.outputs.release_tag }}
+
+  build-cuda:
+    needs: prepare-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    env:
+      BUILD_WITH_EP: "1"
+      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
+      TORCH_CUDA_ARCH_LIST: "8.0;9.0"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_tag }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android
+          df -h
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Configure project
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake .. -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build project
+        run: |
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+          cd build
+          make -j
+          sudo make install
+        shell: bash
+
+      - name: Build nvlink_allocator.so
+        run: |
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+        shell: bash
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-cuda-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
+  build-non-cuda:
+    needs: prepare-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    env:
+      BUILD_WITH_EP: "0"
+      NON_CUDA_BUILD: "1"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_tag }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Configure project
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build project
+        run: |
+          cd build
+          make -j
+          sudo make install
+        shell: bash
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-non-cuda-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
+  publish-release:
+    needs: [prepare-release, build-cuda, build-non-cuda]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_tag }}
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          echo "Collected wheels for release:"
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          # Mooncake ${{ needs.prepare-release.outputs.new_version }}
+
+          This is an automated monthly release of Mooncake Transfer Engine.
+
+          ## What's Included
+
+          - **CUDA builds**: Full-featured builds with CUDA 12.8 support and Expert Parallelism
+          - **Non-CUDA builds**: CPU-only builds for environments without GPU support
+
+          ## Python Support
+
+          - Python 3.10, 3.11, 3.12, 3.13
+
+          ## Installation
+
+          ### CUDA version (default):
+          ```bash
+          pip install mooncake-transfer-engine
+          ```
+
+          ### Non-CUDA version:
+          ```bash
+          pip install mooncake-transfer-engine-non-cuda
+          ```
+
+          ## Documentation
+
+          - [GitHub Repository](https://github.com/kvcache-ai/Mooncake)
+          - [Documentation](https://kvcache-ai.github.io/Mooncake/)
+
+          ---
+          *This release was automatically generated on $(date -u +"%Y-%m-%d")*
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.release_tag }}
+          name: Release ${{ needs.prepare-release.outputs.new_version }}
+          body_path: release_notes.md
+          files: mooncake-wheel/dist-release/*.whl
+          draft: false
+          prerelease: false
+
+      - name: Publish package to PyPI
+        if: github.repository == 'kvcache-ai/Mooncake'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist-release/
+          password: ${{ secrets.PYPI_API_TOKEN }}
