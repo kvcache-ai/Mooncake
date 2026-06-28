@@ -42,8 +42,21 @@ static size_t getChunkSize() {
     static const size_t val = [] {
         const char* env = std::getenv("MC_TCP_SLICE_SIZE");
         if (env) {
-            size_t v = std::stoull(env);
-            if (v > 0) return v;
+            try {
+                size_t v = std::stoull(env);
+                if (v > 0) return v;
+                LOG(WARNING)
+                    << "Ignore non-positive MC_TCP_SLICE_SIZE value: " << env
+                    << ", using default 65536";
+            } catch (const std::exception& e) {
+                // A non-numeric or out-of-range value makes std::stoull throw;
+                // fall through to the default instead of letting the exception
+                // propagate out of this static initializer and abort the
+                // transfer that first reads the chunk size.
+                LOG(WARNING)
+                    << "Invalid MC_TCP_SLICE_SIZE value: " << env
+                    << ". Error: " << e.what() << ", using default 65536";
+            }
         }
         return size_t(65536);  // 64KB default
     }();
