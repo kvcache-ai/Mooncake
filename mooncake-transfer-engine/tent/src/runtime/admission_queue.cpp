@@ -94,7 +94,7 @@ LocalTransferAdmissionQueue::DispatchScheduler::DispatchScheduler(
     QueueAgingConfig aging)
     : aging_(aging) {}
 
-size_t LocalTransferAdmissionQueue::DispatchScheduler::kindLane(
+size_t LocalTransferAdmissionQueue::DispatchScheduler::laneForKind(
     QueueOwnerKind kind) {
     switch (kind) {
         case QueueOwnerKind::StagingInternal:
@@ -108,7 +108,7 @@ size_t LocalTransferAdmissionQueue::DispatchScheduler::kindLane(
 void LocalTransferAdmissionQueue::DispatchScheduler::enqueue(
     QueueOwnerId owner_id, int priority, QueueOwnerKind kind) {
     classes_[static_cast<size_t>(priority)]
-        .lanes[kindLane(kind)]
+        .lanes[laneForKind(kind)]
         .queue.push_back(owner_id);
 }
 
@@ -191,7 +191,7 @@ LocalTransferAdmissionQueue::DispatchScheduler::pickFromPriority(
             }
 
             const size_t byte_charge = owner_it->second.request.length;
-            blocked.has_owner = true;
+            blocked.found = true;
             if (byte_charge > remaining_bytes) {
                 blocked.blocked_by_window = true;
                 break;
@@ -302,7 +302,7 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::DispatchScheduler::pick(
             while (used_owners < max_owners && used_bytes < max_bytes) {
                 auto result =
                     pickFromPriority(priority, max_bytes - used_bytes, owners);
-                if (!result.has_owner) break;
+                if (!result.found) break;
                 blocked_by_credit =
                     blocked_by_credit || result.blocked_by_credit;
                 blocked_by_window =
@@ -523,6 +523,7 @@ Status LocalTransferAdmissionQueue::requeueForDispatch(QueueOwnerId owner_id) {
     }
 
     owner.state = QueueState::Queued;
+    owner.enqueue_time = Clock::now();
     scheduler_.enqueue(owner_id, owner.request.priority, owner.kind);
     return Status::OK();
 }

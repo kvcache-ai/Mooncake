@@ -37,7 +37,7 @@ Request makeRequest(int priority) {
 }
 
 TEST(ProxyManagerTest, SubmitReturnsTooManyRequestsWhenShardQueueIsFull) {
-    auto proxy = ProxyManager::createWithoutWorkersForTest(nullptr, 1);
+    auto proxy = ProxyManager::createForTest(nullptr, 1);
 
     TaskInfo first;
     TaskInfo second;
@@ -84,7 +84,7 @@ TEST(ProxyManagerTest, InternalStageRequestsInheritPriority) {
 }
 
 TEST(ProxyManagerTest, UnboundedShardQueueKeepsLegacyAcceptBehavior) {
-    auto proxy = ProxyManager::createWithoutWorkersForTest(nullptr, 0);
+    auto proxy = ProxyManager::createForTest(nullptr, 0);
     std::vector<std::string> params{"server", "local", "remote"};
 
     TaskInfo first;

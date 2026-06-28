@@ -39,7 +39,7 @@ struct StagingTask {
 
 class ProxyManager {
    public:
-    static constexpr size_t kDefaultMaxQueuedTasksPerShard = 1024;
+    static constexpr size_t kDefaultMaxQueuedTasksPerShard = 0;
 
    private:
     struct StageBuffers {
@@ -54,7 +54,7 @@ class ProxyManager {
         TransferEngineImpl* impl,
         size_t max_queued_tasks_per_shard = kDefaultMaxQueuedTasksPerShard);
 
-    static std::unique_ptr<ProxyManager> createWithoutWorkersForTest(
+    static std::unique_ptr<ProxyManager> createForTest(
         TransferEngineImpl* impl,
         size_t max_queued_tasks_per_shard = kDefaultMaxQueuedTasksPerShard);
 

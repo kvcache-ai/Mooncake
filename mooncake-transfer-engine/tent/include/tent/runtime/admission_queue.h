@@ -141,6 +141,9 @@ class LocalTransferAdmissionQueue {
 
     static bool hasPublicTask(const BatchIndex& batch_index, size_t task_id);
 
+    // Weighted byte-deficit scheduler over request priorities and owner-kind
+    // lanes. It can skip a blocked head in another lane to use the dispatch
+    // byte window, while preserving FIFO order inside one priority/kind lane.
     class DispatchScheduler {
        public:
         explicit DispatchScheduler(QueueAgingConfig aging = {});
@@ -163,7 +166,7 @@ class LocalTransferAdmissionQueue {
         struct PickResult {
             QueueOwnerId owner_id{0};
             size_t byte_charge{0};
-            bool has_owner{false};
+            bool found{false};
             bool blocked_by_credit{false};
             bool blocked_by_window{false};
         };
@@ -181,7 +184,7 @@ class LocalTransferAdmissionQueue {
             size_t next_kind_lane{0};
         };
 
-        static size_t kindLane(QueueOwnerKind kind);
+        static size_t laneForKind(QueueOwnerKind kind);
 
         static size_t priorityWeight(size_t priority);
 

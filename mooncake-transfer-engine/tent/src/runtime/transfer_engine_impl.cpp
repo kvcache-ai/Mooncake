@@ -290,8 +290,7 @@ Status TransferEngineImpl::construct() {
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     staging_max_queued_tasks_per_shard_ =
-        conf_->get("staging/max_queued_tasks_per_shard",
-                   ProxyManager::kDefaultMaxQueuedTasksPerShard);
+        conf_->get("staging/max_queued_tasks_per_shard", 0UL);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
     runtime_queue_config_.limits.max_outstanding_owners =
