@@ -285,7 +285,7 @@ For custom accelerator backends, Docker deployment, NVMe-oF, EFA, CXL, Redis / H
 Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command.
 
 <details>
-<summary>More</summary>
+<summary>Details</summary>
 
 | Skill | Description |
 |-------|-------------|
