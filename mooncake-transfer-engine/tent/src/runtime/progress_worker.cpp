@@ -62,6 +62,7 @@ void ProgressWorker::notifyRuntimeQueueReady() {
     if (!running_.load(std::memory_order_acquire)) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (queue_ready_ || !order_.empty()) return;
         queue_ready_ = true;
     }
     cv_.notify_one();
@@ -69,7 +70,7 @@ void ProgressWorker::notifyRuntimeQueueReady() {
 
 void ProgressWorker::runner() {
     while (true) {
-        BatchID batch_id = 0;
+        std::deque<BatchID> batch_ids;
         bool queue_ready = false;
         bool fallback_due = false;
         bool queue_active = impl_->hasActiveRuntimeQueue();
@@ -90,31 +91,30 @@ void ProgressWorker::runner() {
             if (!running_.load(std::memory_order_acquire)) return;
             queue_ready = queue_ready_;
             queue_ready_ = false;
-            if (!order_.empty()) {
-                batch_id = order_.front();
-                order_.pop_front();
-                queued_.erase(batch_id);
-            }
+            batch_ids.swap(order_);
+            queued_.clear();
         }
+        bool did_work = false;
         if (queue_ready) {
             (void)impl_->progressRuntimeQueue();
-            (void)impl_->lazyFreeBatch();
+            did_work = true;
         }
         // progressBatch acquires the engine's progress_mutex_ and silently
         // returns InvalidArgument if the batch was freed before we got here.
         // PENDING means "kick again later"; the next notify wakes us up.
         // Terminal states are observed here; lazyFreeBatch reclaims a batch
         // only if freeBatch has already marked it free_requested.
-        if (batch_id) {
+        for (const auto batch_id : batch_ids) {
+            if (!batch_id) continue;
             TransferStatus s;
             (void)impl_->progressBatch(batch_id, s);
-            (void)impl_->progressRuntimeQueue();
-            (void)impl_->lazyFreeBatch();
+            did_work = true;
         }
-        if (fallback_due && !queue_ready && !batch_id && queue_active) {
+        if (fallback_due && !queue_ready && batch_ids.empty() && queue_active) {
             (void)impl_->progressRuntimeQueue();
-            (void)impl_->lazyFreeBatch();
+            did_work = true;
         }
+        if (did_work) (void)impl_->lazyFreeBatch();
     }
 }
 

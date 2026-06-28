@@ -194,6 +194,44 @@ TEST(AdmissionQueueTest, RejectsExistingPublicTaskConflictWithoutMutation) {
     EXPECT_EQ(admitted_ids[0], 2u);
 }
 
+TEST(AdmissionQueueTest, AllowsAdditionalOwnersInSameBatch) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3, {makeOwner(0, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto first_owner = admitted_ids[0];
+
+    status = queue.tryAdmit(
+        makeSubmit(1, 2, {makeOwner(1, 16, QueueOwnerKind::User, {2})}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto second_owner = admitted_ids[0];
+
+    QueueOwnerId resolved_owner = 0;
+    status = queue.resolveOwner(1, 0, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, first_owner);
+    status = queue.resolveOwner(1, 1, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, second_owner);
+    status = queue.resolveOwner(1, 2, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, second_owner);
+
+    auto picked = queue.pickForDispatch(2, 32);
+    ASSERT_EQ(picked.size(), 2u);
+    for (const auto owner_id : picked) {
+        status = queue.complete(owner_id, TransferStatusEnum::COMPLETED);
+        ASSERT_EQ(status.code(), Status::Code::kOk);
+    }
+    status = queue.retireBatch(1);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+}
+
 TEST(AdmissionQueueTest, AccountsPublicSlotsSeparatelyFromQueueOwners) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;

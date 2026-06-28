@@ -20,7 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <map>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -127,13 +127,26 @@ class LocalTransferAdmissionQueue {
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
 
+    using OwnerMap = std::unordered_map<QueueOwnerId, QueueOwner>;
+
+    struct PublicTaskOwner {
+        size_t task_id{0};
+        QueueOwnerId owner_id{0};
+    };
+
+    struct BatchIndex {
+        std::vector<QueueOwnerId> owner_ids;
+        std::vector<PublicTaskOwner> public_tasks;
+    };
+
+    static bool hasPublicTask(const BatchIndex& batch_index, size_t task_id);
+
     class DispatchScheduler {
        public:
         explicit DispatchScheduler(QueueAgingConfig aging = {});
 
-        std::vector<QueueOwnerId> pick(
-            size_t max_owners, size_t max_bytes,
-            const std::map<QueueOwnerId, QueueOwner>& owners, TimePoint now);
+        std::vector<QueueOwnerId> pick(size_t max_owners, size_t max_bytes,
+                                       const OwnerMap& owners, TimePoint now);
 
         void enqueue(QueueOwnerId owner_id, int priority, QueueOwnerKind kind);
 
@@ -176,20 +189,16 @@ class LocalTransferAdmissionQueue {
 
         void addDeficit(size_t priority, size_t lane, size_t max_bytes);
 
-        bool hasQueuedOwner(size_t priority,
-                            const std::map<QueueOwnerId, QueueOwner>& owners);
+        bool hasQueuedOwner(size_t priority, const OwnerMap& owners);
 
-        PickResult pickFromPriority(
-            size_t priority, size_t remaining_bytes,
-            const std::map<QueueOwnerId, QueueOwner>& owners);
+        PickResult pickFromPriority(size_t priority, size_t remaining_bytes,
+                                    const OwnerMap& owners);
 
-        void promoteAgedOwners(
-            TimePoint now, const std::map<QueueOwnerId, QueueOwner>& owners);
+        void promoteAgedOwners(TimePoint now, const OwnerMap& owners);
 
-        void promoteAgedPriority(
-            size_t from_priority, size_t to_priority,
-            std::chrono::microseconds threshold, TimePoint now,
-            const std::map<QueueOwnerId, QueueOwner>& owners);
+        void promoteAgedPriority(size_t from_priority, size_t to_priority,
+                                 std::chrono::microseconds threshold,
+                                 TimePoint now, const OwnerMap& owners);
 
         std::array<PriorityClass, kPriorityCount> classes_;
         size_t next_priority_{0};
@@ -200,8 +209,8 @@ class LocalTransferAdmissionQueue {
     Status limits_status_;
     DispatchScheduler scheduler_;
     QueueOwnerId next_owner_id_{1};
-    std::map<QueueOwnerId, QueueOwner> owners_;
-    std::map<std::pair<uint64_t, size_t>, QueueOwnerId> public_to_owner_;
+    OwnerMap owners_;
+    std::unordered_map<uint64_t, BatchIndex> batch_index_;
     size_t outstanding_owners_{0};
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
