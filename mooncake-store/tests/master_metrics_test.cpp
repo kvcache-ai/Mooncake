@@ -211,13 +211,13 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
 
     // Test ExistKey request
-    auto exist_result = service_.ExistKey(key, "default");
+    auto exist_result = service_.ExistKey(key);
     ASSERT_TRUE(exist_result.has_value() && exist_result.value());
     ASSERT_EQ(metrics.get_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_exist_key_failures(), 0);
 
     // Test GetReplicaList request
-    auto get_replica_result = service_.GetReplicaList(key, "default");
+    auto get_replica_result = service_.GetReplicaList(key);
     ASSERT_TRUE(get_replica_result.has_value());
     ASSERT_EQ(metrics.get_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_get_replica_list_failures(), 0);
@@ -369,7 +369,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_HITS], base_memory_hits);
     ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
 
-    auto get_replica_result = service_.GetReplicaList(key, "default");
+    auto get_replica_result = service_.GetReplicaList(key);
     ASSERT_TRUE(get_replica_result.has_value());
     stats_dict = metrics.calculate_cache_stats();
     expect_aliases(stats_dict);
@@ -387,7 +387,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
                                 stats_dict[CacheHitStat::MEMORY_HITS]) +
                1);
     for (int64_t i = 0; i < extra_gets; ++i) {
-        get_replica_result = service_.GetReplicaList(key, "default");
+        get_replica_result = service_.GetReplicaList(key);
         ASSERT_TRUE(get_replica_result.has_value());
     }
     stats_dict = metrics.calculate_cache_stats();
@@ -513,7 +513,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_TRUE(mount_result.has_value());
 
     // Test BatchExistKey request (should all return false initially)
-    auto batch_exist_result = service_.BatchExistKey(keys, "default");
+    auto batch_exist_result = service_.BatchExistKey(keys);
     ASSERT_EQ(batch_exist_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
@@ -550,7 +550,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_end_failed_items(), 0);
 
     // Test BatchExistKey again (should all return true now)
-    auto batch_exist_result2 = service_.BatchExistKey(keys, "default");
+    auto batch_exist_result2 = service_.BatchExistKey(keys);
     ASSERT_EQ(batch_exist_result2.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 2);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
