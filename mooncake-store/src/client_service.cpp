@@ -1490,6 +1490,7 @@ bool Client::RedirectToHotCache(const std::string& key,
 
     if (mem_desc.buffer_descriptor.size_ != blk->size) {
         LOG(ERROR) << "Cache hit but size mismatch for key: " << key;
+        hot_cache_->ReleaseHotKey(key);
         return false;
     }
 
