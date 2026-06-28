@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <map>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -173,7 +173,19 @@ class LocalTransferAdmissionQueue {
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
 
-    using OwnerMap = std::map<QueueOwnerId, QueueOwner>;
+    using OwnerMap = std::unordered_map<QueueOwnerId, QueueOwner>;
+
+    struct PublicTaskOwner {
+        size_t task_id{0};
+        QueueOwnerId owner_id{0};
+    };
+
+    struct BatchIndex {
+        std::vector<QueueOwnerId> owner_ids;
+        std::vector<PublicTaskOwner> public_tasks;
+    };
+
+    static bool hasPublicTask(const BatchIndex& batch_index, size_t task_id);
 
     class DispatchScheduler {
        public:
@@ -226,7 +238,7 @@ class LocalTransferAdmissionQueue {
     DispatchScheduler scheduler_;
     QueueOwnerId next_owner_id_{1};
     OwnerMap owners_;
-    std::map<std::pair<uint64_t, size_t>, QueueOwnerId> public_to_owner_;
+    std::unordered_map<uint64_t, BatchIndex> batch_index_;
     size_t outstanding_owners_{0};
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
