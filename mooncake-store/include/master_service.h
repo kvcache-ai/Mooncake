@@ -1527,6 +1527,8 @@ class MasterService {
 
     std::thread snapshot_thread_;
     std::atomic<bool> snapshot_running_{false};
+    std::mutex snapshot_thread_mutex_;
+    std::condition_variable snapshot_thread_cv_;
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
     std::atomic<bool> task_cleanup_running_{false};
@@ -2030,6 +2032,7 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
+    double offload_cap_ratio_ = 0.5;
 
     // Task manager
     ClientTaskManager task_manager_;

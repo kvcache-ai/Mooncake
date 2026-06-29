@@ -85,6 +85,31 @@ def _parse_segment_size(value) -> int:
     return int(value)
 
 
+def _parse_bool(value) -> bool:
+    """Interpret a config boolean that may arrive as a real bool, number, or string.
+
+    Config files and environment variables sometimes carry booleans as strings
+    ("true", "false", "yes", "no", "on", "off", "0", "1"). Using bool() directly
+    would treat any non-empty string (including "false") as True, so parse the
+    common textual forms and reject anything unrecognized instead of silently
+    defaulting to False, mirroring how _parse_segment_size rejects bad input.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    if not s:
+        return False
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
 @dataclass
 class MooncakeConfig:
     """The configuration class for Mooncake.
@@ -166,7 +191,7 @@ class MooncakeConfig:
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
-            enable_ssd_offload=bool(config.get("enable_ssd_offload", False)),
+            enable_ssd_offload=_parse_bool(config.get("enable_ssd_offload", False)),
             ssd_offload_path=str(config.get("ssd_offload_path", "")),
         )
 
@@ -194,7 +219,7 @@ class MooncakeConfig:
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
-                enable_ssd_offload=os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false").lower() in ("true", "1"),
+                enable_ssd_offload=_parse_bool(os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
             )
         return MooncakeConfig.from_file(config_file_path)
