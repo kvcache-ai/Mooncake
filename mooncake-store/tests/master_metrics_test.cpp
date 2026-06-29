@@ -833,8 +833,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     auto put_start_result =
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result =
-        service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // After PutEnd: MEMORY cache total should increment by 1.
@@ -852,14 +851,15 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
         service_.MountLocalDiskSegment(client_id, /*enable_offloading=*/true);
     ASSERT_TRUE(mount_disk_result.has_value());
 
-    OffloadTaskItem task{.tenant_id = "default", .key = key, .size =
-    static_cast<int64_t>(value_length)};
-    StorageObjectMetadata obj_meta{.bucket_id = 0,
-                                   .offset = 0,
-                                   .key_size = 0,
-                                   .data_size =
-                                   static_cast<int64_t>(value_length),
-                                   .transport_endpoint = "tcp://127.0.0.1:9999"};
+    OffloadTaskItem task{.tenant_id = "default",
+                         .key = key,
+                         .size = static_cast<int64_t>(value_length)};
+    StorageObjectMetadata obj_meta{
+        .bucket_id = 0,
+        .offset = 0,
+        .key_size = 0,
+        .data_size = static_cast<int64_t>(value_length),
+        .transport_endpoint = "tcp://127.0.0.1:9999"};
     auto offload_result =
         service_.NotifyOffloadSuccess(client_id, {task}, {obj_meta});
     ASSERT_TRUE(offload_result.has_value());
