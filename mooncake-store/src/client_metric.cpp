@@ -9,51 +9,6 @@
 
 namespace mooncake {
 
-namespace {
-
-std::string toLower(const std::string& str) {
-    std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return result;
-}
-
-bool parseMetricsEnabled() {
-    const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
-    if (!metric_env) {
-        return true;
-    }
-    std::string value = toLower(metric_env);
-    return (value == "1" || value == "true" || value == "yes" ||
-            value == "on" || value == "enable");
-}
-
-uint64_t parseMetricsInterval() {
-    const char* interval_env = std::getenv("MC_STORE_CLIENT_METRIC_INTERVAL");
-    if (!interval_env) {
-        // Default to disabled
-        return 0;
-    }
-
-    try {
-        uint64_t interval = std::stoull(interval_env);
-        if (interval == 0) {
-            LOG(INFO) << "Client metrics reporting disabled (interval=0) via "
-                         "MC_STORE_CLIENT_METRIC_INTERVAL";
-        } else {
-            LOG(INFO) << "Client metrics interval set to " << interval
-                      << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
-        }
-        return interval;
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "Failed to parse MC_STORE_CLIENT_METRIC_INTERVAL: "
-                     << interval_env << ", disabling metrics reporting";
-        return 0;
-    }
-}
-
-}  // anonymous namespace
-
 ClientMetric::ClientMetric(uint64_t interval_seconds,
                            const std::map<std::string, std::string>& labels)
     : transfer_metric(labels),
@@ -67,10 +22,6 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
 
 ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
 
-bool ClientMetric::IsEnabled() { return parseMetricsEnabled(); }
-
-uint64_t ClientMetric::GetDefaultInterval() { return parseMetricsInterval(); }
-
 void ClientMetric::serialize(std::string& str) {
     transfer_metric.serialize(str);
     master_client_metric.serialize(str);
@@ -83,6 +34,14 @@ std::string ClientMetric::summary_metrics() {
     ss << "\n";
     ss << master_client_metric.summary_metrics();
     return ss.str();
+}
+
+void ClientMetric::StartMetricReporting(uint64_t interval_seconds) {
+    StopMetricsReportingThread();
+    metrics_interval_seconds_ = interval_seconds;
+    if (metrics_interval_seconds_ > 0) {
+        StartMetricsReportingThread();
+    }
 }
 
 void ClientMetric::StartMetricsReportingThread() {

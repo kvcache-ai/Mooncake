@@ -40,7 +40,8 @@ class P2PClientService final : public ClientService {
      */
     P2PClientService(const std::string& metadata_connstring,
                      uint16_t http_port = 9003, bool enable_http_server = true,
-                     const std::map<std::string, std::string>& labels = {});
+                     const std::map<std::string, std::string>& labels = {},
+                     bool enable_metric_collection = true);
 
     virtual ~P2PClientService();
 

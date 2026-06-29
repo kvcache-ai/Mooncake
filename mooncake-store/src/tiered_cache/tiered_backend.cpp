@@ -650,7 +650,7 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
         std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
         auto it = shard.index.find(key);
         if (it == shard.index.end()) {
-            LOG(ERROR) << "Key not found: " << key;
+            VLOG(1) << "Key not found: " << key;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         entry = it->second;

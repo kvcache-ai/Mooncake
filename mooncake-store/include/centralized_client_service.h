@@ -108,7 +108,8 @@ class CentralizedClientService
     CentralizedClientService(
         const std::string& metadata_connstring, const std::string& protocol,
         uint16_t http_port = 9003, bool enable_http_server = true,
-        const std::map<std::string, std::string>& labels = {});
+        const std::map<std::string, std::string>& labels = {},
+        bool enable_metric_collection = true);
 
     ~CentralizedClientService() override;
 

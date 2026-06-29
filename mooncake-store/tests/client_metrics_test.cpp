@@ -526,93 +526,17 @@ TEST_F(ClientMetricsTest, P2PClientMetricBothLocalAndPeerTest) {
               << summary << std::endl;
 }
 
-// Test ClientMetric::Create returns nullptr when disabled
-TEST_F(ClientMetricsTest, ClientMetricCreateDisabledTest) {
-    // Save current env and set to disable
-    const char* original = std::getenv("MC_STORE_CLIENT_METRIC");
-
-    // Set to disable
-    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
-    auto metrics_disabled = ClientMetric::Create({});
-    EXPECT_EQ(metrics_disabled, nullptr);
-
-    // Set to enable
-    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
-    auto metrics_enabled = ClientMetric::Create({});
-    EXPECT_NE(metrics_enabled, nullptr);
-
-    // Restore original value
-    if (original) {
-        setenv("MC_STORE_CLIENT_METRIC", original, 1);
-    } else {
-        unsetenv("MC_STORE_CLIENT_METRIC");
-    }
+TEST_F(ClientMetricsTest, ClientMetricCreateReturnsInstance) {
+    auto metrics = ClientMetric::Create({});
+    EXPECT_NE(metrics, nullptr);
+    // Created without a reporting thread; interval is set at Init.
+    EXPECT_EQ(metrics->GetReportingInterval(), 0u);
 }
 
-// Test P2PClientMetric::Create returns nullptr when disabled
-TEST_F(ClientMetricsTest, P2PClientMetricCreateDisabledTest) {
-    // Save current env and set to disable
-    const char* original = std::getenv("MC_STORE_CLIENT_METRIC");
-
-    // Set to disable
-    setenv("MC_STORE_CLIENT_METRIC", "false", 1);
-    auto p2p_disabled = P2PClientMetric::Create({});
-    EXPECT_EQ(p2p_disabled, nullptr);
-
-    // Set to enable
-    setenv("MC_STORE_CLIENT_METRIC", "true", 1);
-    auto p2p_enabled = P2PClientMetric::Create({});
-    EXPECT_NE(p2p_enabled, nullptr);
-
-    // Restore original value
-    if (original) {
-        setenv("MC_STORE_CLIENT_METRIC", original, 1);
-    } else {
-        unsetenv("MC_STORE_CLIENT_METRIC");
-    }
-}
-
-// Test IsEnabled and GetDefaultInterval
-TEST_F(ClientMetricsTest, MetricEnvironmentVariablesTest) {
-    const char* original_metric = std::getenv("MC_STORE_CLIENT_METRIC");
-    const char* original_interval =
-        std::getenv("MC_STORE_CLIENT_METRIC_INTERVAL");
-
-    // Test IsEnabled with various values
-    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
-    EXPECT_TRUE(ClientMetric::IsEnabled());
-
-    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
-    EXPECT_FALSE(ClientMetric::IsEnabled());
-
-    setenv("MC_STORE_CLIENT_METRIC", "true", 1);
-    EXPECT_TRUE(ClientMetric::IsEnabled());
-
-    setenv("MC_STORE_CLIENT_METRIC", "false", 1);
-    EXPECT_FALSE(ClientMetric::IsEnabled());
-
-    // Test GetDefaultInterval
-    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "10", 1);
-    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 10);
-
-    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "0", 1);
-    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 0);
-
-    // Test with invalid value
-    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "invalid", 1);
-    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 0);
-
-    // Restore original values
-    if (original_metric) {
-        setenv("MC_STORE_CLIENT_METRIC", original_metric, 1);
-    } else {
-        unsetenv("MC_STORE_CLIENT_METRIC");
-    }
-    if (original_interval) {
-        setenv("MC_STORE_CLIENT_METRIC_INTERVAL", original_interval, 1);
-    } else {
-        unsetenv("MC_STORE_CLIENT_METRIC_INTERVAL");
-    }
+TEST_F(ClientMetricsTest, P2PClientMetricCreateReturnsInstance) {
+    auto p2p_metrics = P2PClientMetric::Create({});
+    EXPECT_NE(p2p_metrics, nullptr);
+    EXPECT_EQ(p2p_metrics->GetReportingInterval(), 0u);
 }
 
 }  // namespace mooncake::test

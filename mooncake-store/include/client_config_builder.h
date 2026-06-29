@@ -115,6 +115,13 @@ struct RealClientConfigBase {
     // Parsed runtime read/write config JSON.
     // Loaded from file path, inline JSON string, or env MC_RUNTIME_CONFIG
     Json::Value runtime_config_json;
+
+    // Whether to collect client metrics at all.
+    bool enable_metric_collection = true;
+
+    // Periodic client-metric reporting interval, in seconds.
+    // When it is 0, metric reporting is disabled.
+    uint64_t metric_report_interval_seconds = 10;
 };
 
 /**
@@ -230,14 +237,16 @@ class ClientConfigBuilder {
         const std::string& ipc_socket_path = "", bool enable_offload = false,
         uint16_t http_port = 9003, bool enable_http_server = true,
         const std::map<std::string, std::string>& labels = {},
-        uint16_t local_rpc_port = 50052,
-        const std::string& runtime_config = "") {
+        uint16_t local_rpc_port = 50052, const std::string& runtime_config = "",
+        bool enable_metric_collection = true,
+        uint64_t metric_report_interval_seconds = 10) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
             ipc_socket_path, http_port, enable_http_server, labels,
-            runtime_config);
+            runtime_config, enable_metric_collection,
+            metric_report_interval_seconds);
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
         config.local_rpc_port = local_rpc_port;
@@ -271,11 +280,18 @@ class ClientConfigBuilder {
             get_config_str(config, DictCommon::kIpcSocketPath);
         std::string runtime_config =
             get_config_str(config, DictCommon::kRuntimeConfig);
+        bool enable_metric_collection =
+            get_config_bool(config, DictCommon::kEnableMetricCollection,
+                            DictCommon::kDefaultEnableMetricCollection);
+        uint64_t metric_report_interval_seconds =
+            get_config_size(config, DictCommon::kMetricReportIntervalSeconds,
+                            DictCommon::kDefaultMetricReportIntervalSeconds);
 
         return build_centralized_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
             master_server_addr, global_segment_size, local_buffer_size, nullptr,
-            ipc_socket_path, false, 9003, true, {}, 50052, runtime_config);
+            ipc_socket_path, false, 9003, true, {}, 50052, runtime_config,
+            enable_metric_collection, metric_report_interval_seconds);
     }
 
     static P2PClientConfig build_p2p_real_client(
@@ -302,13 +318,16 @@ class ClientConfigBuilder {
         uint32_t p2p_key_lease_duration_ms = 0,
         uint32_t p2p_key_lease_scan_interval_ms = 0,
         const std::string& p2p_transfer_direction_mode = "reverse",
-        const std::string& runtime_config = "") {
+        const std::string& runtime_config = "",
+        bool enable_metric_collection = true,
+        uint64_t metric_report_interval_seconds = 10) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
             ipc_socket_path, http_port, enable_http_server, labels,
-            runtime_config);
+            runtime_config, enable_metric_collection,
+            metric_report_interval_seconds);
         config.client_rpc_port = client_rpc_port;
         config.rpc_thread_num = rpc_thread_num;
         config.lock_shard_count = lock_shard_count;
@@ -400,6 +419,12 @@ class ClientConfigBuilder {
                             DictP2P::kDefaultAsyncRouteQueueSize);
         std::string runtime_config =
             get_config_str(config, DictCommon::kRuntimeConfig);
+        bool enable_metric_collection =
+            get_config_bool(config, DictCommon::kEnableMetricCollection,
+                            DictCommon::kDefaultEnableMetricCollection);
+        uint64_t metric_report_interval_seconds =
+            get_config_size(config, DictCommon::kMetricReportIntervalSeconds,
+                            DictCommon::kDefaultMetricReportIntervalSeconds);
 
         return build_p2p_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
@@ -408,7 +433,8 @@ class ClientConfigBuilder {
             route_cache_max_memory, route_cache_ttl_ms, local_transfer_mode,
             memcpy_async_worker_num, 9003, true, {}, async_sender_thread_count,
             async_max_batch_size, async_route_queue_size, 0, 0, "reverse",
-            runtime_config);
+            runtime_config, enable_metric_collection,
+            metric_report_interval_seconds);
     }
 
    private:
@@ -423,11 +449,18 @@ class ClientConfigBuilder {
         static constexpr const char* kMasterServerAddr = "master_server_addr";
         static constexpr const char* kIpcSocketPath = "ipc_socket_path";
         static constexpr const char* kRuntimeConfig = "runtime_config";
+        // Shared by centralized and P2P clients.
+        static constexpr const char* kMetricReportIntervalSeconds =
+            "metric_report_interval_seconds";
+        static constexpr const char* kEnableMetricCollection =
+            "enable_metric_collection";
         // Defaults
         static constexpr size_t kDefaultLocalBufferSize = 1024 * 1024 * 16;
         static constexpr const char* kDefaultProtocol = "tcp";
         static constexpr const char* kDefaultMasterServerAddr =
             "127.0.0.1:50051";
+        static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 10;
+        static constexpr bool kDefaultEnableMetricCollection = true;
         // Limits
         static constexpr size_t kMinSegmentSize = 1024;
         static constexpr size_t kMaxSegmentSize = 1024ULL * 1024 * 1024 * 1024;
@@ -511,6 +544,30 @@ class ClientConfigBuilder {
         }
     }
 
+    static bool get_config_bool(
+        const std::unordered_map<std::string, std::string>& config,
+        const std::string& key, bool default_value) {
+        auto it = config.find(key);
+        if (it == config.end()) {
+            return default_value;
+        }
+        std::string value = it->second;
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (value == "1" || value == "true" || value == "yes" ||
+            value == "on" || value == "enable") {
+            return true;
+        }
+        if (value == "0" || value == "false" || value == "no" ||
+            value == "off" || value == "disable") {
+            return false;
+        }
+        LOG(WARNING) << "Invalid boolean value for config key '" << key
+                     << "': " << it->second
+                     << ", using default: " << default_value;
+        return default_value;
+    }
+
    private:
     static Json::Value LoadJsonConfig(const std::string& json_or_path) {
         Json::Value config;
@@ -561,7 +618,9 @@ class ClientConfigBuilder {
         const std::string& ipc_socket_path, uint16_t http_port = 9003,
         bool enable_http_server = true,
         const std::map<std::string, std::string>& labels = {},
-        const std::string& runtime_config = "") {
+        const std::string& runtime_config = "",
+        bool enable_metric_collection = true,
+        uint64_t metric_report_interval_seconds = 10) {
         // Parse local_hostname into IP and optional port.
         // Only set te_port when the user explicitly provides a port;
         // otherwise keep the default value (0 = randomly assigned).
@@ -598,6 +657,8 @@ class ClientConfigBuilder {
         config.http_port = http_port;
         config.enable_http_server = enable_http_server;
         config.labels = labels;
+        config.enable_metric_collection = enable_metric_collection;
+        config.metric_report_interval_seconds = metric_report_interval_seconds;
         std::string rc_source = runtime_config;
         if (runtime_config.empty()) {
             const char* env = std::getenv("MC_RUNTIME_CONFIG");

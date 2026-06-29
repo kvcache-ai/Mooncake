@@ -75,7 +75,8 @@ std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const CentralizedClientConfig& config) {
     auto client = std::make_shared<CentralizedClientService>(
         config.metadata_connstring, config.protocol, config.http_port,
-        config.enable_http_server, config.labels);
+        config.enable_http_server, config.labels,
+        config.enable_metric_collection);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -91,7 +92,7 @@ std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const P2PClientConfig& config) {
     auto client = std::make_shared<P2PClientService>(
         config.metadata_connstring, config.http_port, config.enable_http_server,
-        config.labels);
+        config.labels, config.enable_metric_collection);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
