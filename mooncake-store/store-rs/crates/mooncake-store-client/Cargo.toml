@@ -3,8 +3,13 @@ name = "mooncake-store-client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+gds = []
+
 [dependencies]
 libc = "0.2"
+io-uring = "0.7"
 mooncake-store-core           = { path = "../mooncake-store-core" }
 mooncake-store-route          = { path = "../mooncake-store-route" }
 mooncake-store-transport-core = { path = "../mooncake-store-transport-core" }

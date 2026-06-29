@@ -534,13 +534,29 @@ impl StoreClientBuilder {
                     reconcile_devices.push(alias_device);
                 }
             }
-            let backend = Arc::new(LocalDirPersistentStorageBackend::new_with_root(
-                resolved.root_dir.clone(),
-            ));
-            deferred_reconciles.push(DeferredColdTierReconcile::LocalDir(
-                backend.clone(),
-                reconcile_devices,
-            ));
+            let backend: Arc<dyn PersistentStorageBackend> = if resolved.kind == ColdTierKind::Ssd
+                && resolved.ssd_engine == ColdTierSsdEngine::ExtentStore
+            {
+                let backend = Arc::new(ExtentStoreStorageBackend::new(
+                    resolved
+                        .root_dir
+                        .join(encode_backend_component(&resolved.cold_tier_id)),
+                )?);
+                deferred_reconciles.push(DeferredColdTierReconcile::ExtentStore(
+                    backend.clone(),
+                    reconcile_devices,
+                ));
+                backend
+            } else {
+                let backend = Arc::new(LocalDirPersistentStorageBackend::new_with_root(
+                    resolved.root_dir.clone(),
+                ));
+                deferred_reconciles.push(DeferredColdTierReconcile::LocalDir(
+                    backend.clone(),
+                    reconcile_devices,
+                ));
+                backend
+            };
             cold_tier_handles.insert(resolved.cold_tier_id.clone(), backend);
         }
         // Register aliases so routes referencing old cold_tier_ids still resolve.

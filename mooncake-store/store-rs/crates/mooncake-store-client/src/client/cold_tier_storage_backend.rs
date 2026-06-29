@@ -63,36 +63,36 @@ const COLD_OBJECT_MANIFEST_SCHEMA_VERSION: u16 = 1;
 
 /// Metadata extracted from a cold payload header (length + optional xxh3 checksum).
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ColdPayloadMetadata {
-    length: u64,
-    checksum: Option<u64>,
+pub(super) struct ColdPayloadMetadata {
+    pub(super) length: u64,
+    pub(super) checksum: Option<u64>,
 }
 
 /// Route metadata embedded in a version-2 cold payload for reverse recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ColdObjectManifest {
-    key: ObjectKey,
-    namespace: Option<NamespaceScope>,
-    logical_key: Option<String>,
-    canonical_key: Option<String>,
-    sharing_scope: Option<String>,
-    qos_tier: Option<String>,
-    route_version: RouteVersion,
-    cold_tier_id: String,
-    object_locator: String,
-    length: u64,
-    checksum: Option<u64>,
+pub(super) struct ColdObjectManifest {
+    pub(super) key: ObjectKey,
+    pub(super) namespace: Option<NamespaceScope>,
+    pub(super) logical_key: Option<String>,
+    pub(super) canonical_key: Option<String>,
+    pub(super) sharing_scope: Option<String>,
+    pub(super) qos_tier: Option<String>,
+    pub(super) route_version: RouteVersion,
+    pub(super) cold_tier_id: String,
+    pub(super) object_locator: String,
+    pub(super) length: u64,
+    pub(super) checksum: Option<u64>,
 }
 
 /// A cold object recovered from disk during startup scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RecoveredColdObject {
-    manifest: ColdObjectManifest,
-    path: std::path::PathBuf,
-    metadata: ColdPayloadMetadata,
+pub(super) struct RecoveredColdObject {
+    pub(super) manifest: ColdObjectManifest,
+    pub(super) path: std::path::PathBuf,
+    pub(super) metadata: ColdPayloadMetadata,
 }
 
-fn write_backend_payload_atomically(
+pub(super) fn write_backend_payload_atomically(
     path: &std::path::Path,
     encoded: &[u8],
     label: &str,
@@ -264,7 +264,7 @@ fn read_optional_namespace(cursor: &mut &[u8]) -> Result<Option<NamespaceScope>>
     }
 }
 
-fn encode_cold_object_manifest(manifest: &ColdObjectManifest) -> Result<Vec<u8>> {
+pub(super) fn encode_cold_object_manifest(manifest: &ColdObjectManifest) -> Result<Vec<u8>> {
     let mut encoded = Vec::new();
     encoded.extend_from_slice(&COLD_OBJECT_MANIFEST_SCHEMA_VERSION.to_le_bytes());
     write_len_prefixed_string(&mut encoded, &manifest.key.0)?;
@@ -287,7 +287,7 @@ fn encode_cold_object_manifest(manifest: &ColdObjectManifest) -> Result<Vec<u8>>
     Ok(encoded)
 }
 
-fn decode_cold_object_manifest(mut encoded: &[u8]) -> Result<ColdObjectManifest> {
+pub(super) fn decode_cold_object_manifest(mut encoded: &[u8]) -> Result<ColdObjectManifest> {
     if encoded.len() < 2 {
         return Err(StoreError::InvalidState(
             "cold object manifest is missing schema version".to_string(),
@@ -373,7 +373,7 @@ fn decode_cold_object_manifest(mut encoded: &[u8]) -> Result<ColdObjectManifest>
     })
 }
 
-fn manifest_from_route(
+pub(super) fn manifest_from_route(
     route: &ObjectRoute,
     cold_backing: &mooncake_store_core::ColdBackingRoute,
 ) -> ColdObjectManifest {
@@ -418,7 +418,7 @@ pub struct ColdPayloadRef {
 }
 
 impl ColdPayloadRef {
-    fn new(data: Arc<dyn ColdPayloadRefData>) -> Self {
+    pub(super) fn new(data: Arc<dyn ColdPayloadRefData>) -> Self {
         Self { data }
     }
 
@@ -441,7 +441,7 @@ impl Deref for ColdPayloadRef {
     }
 }
 
-trait ColdPayloadRefData: Send + Sync {
+pub(super) trait ColdPayloadRefData: Send + Sync {
     fn as_slice(&self) -> &[u8];
 }
 
@@ -776,12 +776,121 @@ pub(crate) struct MountInfoEntry {
 
 #[path = "local_dir_cold_backend.rs"]
 mod local_dir_cold_backend;
-use local_dir_cold_backend::reconcile_cold_tier_startup;
 pub(crate) use local_dir_cold_backend::LocalDirPersistentStorageBackend;
 #[cfg(test)]
 pub(crate) use local_dir_cold_backend::{decode_backend_payload, encode_backend_payload};
+pub(super) use local_dir_cold_backend::{read_file_optional, remove_file_optional};
+use local_dir_cold_backend::{
+    reconcile_cold_tier_startup, try_register_recovered_cold_object, RecoveredObjectOutcome,
+};
+
+fn reconcile_extent_store_startup(
+    metadata: &dyn MetadataBackend,
+    route_directory: &dyn RouteDirectory,
+    observer: &ClientLease,
+    backend: &ExtentStoreStorageBackend,
+    devices: &[ResolvedColdTierTarget],
+) -> Result<()> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+    for device in devices {
+        let mut recovered_objects = backend.scan_recovered_objects(device)?;
+        recovered_objects.sort_by(|a, b| {
+            a.manifest
+                .key
+                .cmp(&b.manifest.key)
+                .then(b.manifest.route_version.cmp(&a.manifest.route_version))
+        });
+
+        let mut recovered_used_bytes = 0u64;
+        for recovered in &recovered_objects {
+            match try_register_recovered_cold_object(metadata, route_directory, observer, recovered)
+            {
+                Ok(
+                    RecoveredObjectOutcome::Registered | RecoveredObjectOutcome::AlreadyConsistent,
+                ) => {
+                    recovered_used_bytes =
+                        recovered_used_bytes.saturating_add(recovered.metadata.length);
+                }
+                Ok(RecoveredObjectOutcome::Superseded) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        route_key = %recovered.manifest.key.0,
+                        cold_tier_id = %recovered.manifest.cold_tier_id,
+                        %error,
+                        "extent store startup recovery: skipping object due to error"
+                    );
+                }
+            }
+        }
+
+        let routes = route_directory.list_routes_by_cold_backing(
+            observer,
+            &mooncake_store_core::ColdBackingRouteFilter {
+                device_id: Some(device.cold_tier_id.clone()),
+                ..mooncake_store_core::ColdBackingRouteFilter::default()
+            },
+        )?;
+        let mut routes_used_bytes = 0u64;
+        for route in &routes {
+            let route_result: Result<()> = (|| {
+                let Some(cold_backing) = route.cold_backing.as_ref() else {
+                    return Ok(());
+                };
+                if cold_backing.cold_tier_id != device.cold_tier_id
+                    || cold_backing.state != mooncake_store_core::ColdBackingState::Materialized
+                    || !backend.contains_materialized(cold_backing)?
+                {
+                    return Ok(());
+                }
+                if cold_backing.owner != observer.runtime {
+                    let mut next = route.clone();
+                    next.version = next.version.next();
+                    if let Some(next_backing) = next.cold_backing.as_mut() {
+                        next_backing.owner = observer.runtime.clone();
+                    }
+                    let cas = route_directory.compare_and_swap_local_route(
+                        observer,
+                        &route.key,
+                        Some(route.version),
+                        Some(&next),
+                    )?;
+                    if cas.applied {
+                        tracing::info!(
+                            route_key = %route.key.0,
+                            stale_owner = %cold_backing.owner,
+                            new_owner = %observer.runtime,
+                            "startup extent cold-tier adoption: updated stale owner"
+                        );
+                    }
+                }
+                routes_used_bytes = routes_used_bytes.saturating_add(cold_backing.length);
+                Ok(())
+            })();
+            if let Err(error) = route_result {
+                tracing::warn!(
+                    route_key = %route.key.0,
+                    %error,
+                    "extent store startup reconcile: skipping route due to error"
+                );
+            }
+        }
+
+        let used_bytes = routes_used_bytes.max(recovered_used_bytes);
+        if let Some(existing) = metadata.get_cold_tier_device(&device.cold_tier_id)? {
+            let mut update = mooncake_store_core::ColdTierDeviceUpdate::new(current_time_ms());
+            update.expected_updated_at_ms = Some(existing.updated_at_ms);
+            update.used_bytes = Some(used_bytes.max(existing.used_bytes));
+            update.reserved_bytes = Some(0);
+            metadata.update_cold_tier_device(&device.cold_tier_id, update)?;
+        }
+    }
+    Ok(())
+}
 
 pub(super) enum DeferredColdTierReconcile {
+    ExtentStore(Arc<ExtentStoreStorageBackend>, Vec<ResolvedColdTierTarget>),
     LocalDir(
         Arc<LocalDirPersistentStorageBackend>,
         Vec<ResolvedColdTierTarget>,
@@ -801,6 +910,15 @@ pub(super) fn run_deferred_cold_tier_reconciles(
     );
     for item in deferred {
         let result = match &item {
+            DeferredColdTierReconcile::ExtentStore(backend, devices) => {
+                reconcile_extent_store_startup(
+                    metadata,
+                    route_directory,
+                    lease,
+                    backend.as_ref(),
+                    devices,
+                )
+            }
             DeferredColdTierReconcile::LocalDir(backend, devices) => reconcile_cold_tier_startup(
                 metadata,
                 route_directory,
@@ -943,7 +1061,7 @@ pub(super) fn bootstrap_cold_tier_device(
 }
 
 /// Returns `(total_capacity_bytes, available_bytes)` for the filesystem containing `directory`.
-fn filesystem_capacity_bytes(directory: &std::path::Path) -> Result<(u64, u64)> {
+pub(super) fn filesystem_capacity_bytes(directory: &std::path::Path) -> Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
 
     let path = std::ffi::CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
@@ -1233,6 +1351,15 @@ mod cold_tier_storage_backend_tests {
     impl Drop for TestTempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+            if let Some(parent) = self.0.parent() {
+                if parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("mooncake-store-client-cold-backend-"))
+                {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
         }
     }
 
