@@ -693,7 +693,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     ReplaceTenantQuotaPolicyStore(service, std::move(blocking_store));
 
     auto snapshot_lock = LockSnapshotForTest(service);
-    std::optional<tl::expected<void, ErrorCode>> add_result;
+    std::optional<tl::expected<bool, ErrorCode>> add_result;
     std::thread add_thread([&] {
         Replica replica(client_id, 128, "disk-endpoint",
                         ReplicaStatus::COMPLETE);
