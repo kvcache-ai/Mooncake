@@ -183,10 +183,9 @@ TEST_F(P2PClientManagerTest, UnregisterThenReRegister) {
 
     UUID client_id = {100, 200};
     auto seg = MakeP2PSegment({1, 1}, "seg1");
-    ASSERT_TRUE(
-        mgr->RegisterClient(
-               MakeP2PRegisterRequest(client_id, "10.0.0.1", 50051, {seg}))
-            .has_value());
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest(
+                                        client_id, "10.0.0.1", 50051, {seg}))
+                    .has_value());
 
     ASSERT_TRUE(mgr->UnregisterClient(
                        UnregisterClientRequest{client_id, DeploymentMode::P2P})
@@ -194,10 +193,9 @@ TEST_F(P2PClientManagerTest, UnregisterThenReRegister) {
     EXPECT_EQ(mgr->GetClient(client_id), nullptr);
 
     // Re-registering the same client_id succeeds (no CLIENT_ALREADY_EXISTS).
-    ASSERT_TRUE(
-        mgr->RegisterClient(
-               MakeP2PRegisterRequest(client_id, "10.0.0.1", 50051, {seg}))
-            .has_value());
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest(
+                                        client_id, "10.0.0.1", 50051, {seg}))
+                    .has_value());
     EXPECT_NE(mgr->GetClient(client_id), nullptr);
 }
 
@@ -215,15 +213,16 @@ TEST_F(P2PClientManagerTest, RegisterUnregisterActiveGauge) {
     auto mgr = CreateManager();
     mgr->Start();
 
-    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest({1, 0})).has_value());
-    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest({2, 0})).has_value());
+    ASSERT_TRUE(
+        mgr->RegisterClient(MakeP2PRegisterRequest({1, 0})).has_value());
+    ASSERT_TRUE(
+        mgr->RegisterClient(MakeP2PRegisterRequest({2, 0})).has_value());
     EXPECT_EQ(m.get_active_clients(), 2);
 
     // Proactively unregister a HEALTH client: active-- and NOT counted a crash.
-    ASSERT_TRUE(
-        mgr->UnregisterClient(
-               UnregisterClientRequest{{1, 0}, DeploymentMode::P2P})
-            .has_value());
+    ASSERT_TRUE(mgr->UnregisterClient(
+                       UnregisterClientRequest{{1, 0}, DeploymentMode::P2P})
+                    .has_value());
     EXPECT_EQ(m.get_active_clients(), 1);
     EXPECT_EQ(m.get_clients_crashed_total(), 0);
 }
@@ -235,10 +234,12 @@ TEST_F(P2PClientManagerTest, HealthTransitionMetrics) {
     const int disconnect_sec = 1;
     const int crash_sec = 2;
     auto mgr = CreateManager(disconnect_sec, crash_sec);
-    // Manual control over status transitions (mirror ForEachClientHealthEffect).
+    // Manual control over status transitions (mirror
+    // ForEachClientHealthEffect).
     mgr->StopClientMonitor();
 
-    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest({1, 0})).has_value());
+    ASSERT_TRUE(
+        mgr->RegisterClient(MakeP2PRegisterRequest({1, 0})).has_value());
     EXPECT_EQ(m.get_active_clients(), 1);
 
     // > disconnect_sec, < crash_sec -> DISCONNECTION.

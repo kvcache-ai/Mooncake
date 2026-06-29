@@ -53,11 +53,11 @@ MasterMetricManager::MasterMetricManager()
       // Initialize client RPC counters (requests / failures)
       register_client_requests_("master_register_client_requests",
                                 "Total number of RegisterClient requests"),
-      register_client_failures_("master_register_client_failures",
-                                "Total number of failed RegisterClient requests"),
-      unregister_client_requests_(
-          "master_unregister_client_requests",
-          "Total number of UnregisterClient requests"),
+      register_client_failures_(
+          "master_register_client_failures",
+          "Total number of failed RegisterClient requests"),
+      unregister_client_requests_("master_unregister_client_requests",
+                                  "Total number of UnregisterClient requests"),
       unregister_client_failures_(
           "master_unregister_client_failures",
           "Total number of failed UnregisterClient requests"),

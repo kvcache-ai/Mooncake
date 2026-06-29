@@ -933,7 +933,8 @@ TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
     EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
     // (Re-registration back to FULL is driven via the public HTTP /register
-    // endpoint and is covered by P2PClientHttpEndpointsTest.HttpUnregisterThenRegister.)
+    // endpoint and is covered by
+    // P2PClientHttpEndpointsTest.HttpUnregisterThenRegister.)
 
     c->Stop();
     c->Destroy();

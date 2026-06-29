@@ -286,8 +286,8 @@ auto ClientManager::UnregisterClient(const UnregisterClientRequest& req)
         client_metas_.erase(it);
     }
 
-    // The client is out of client_metas_ now. Recycle its segments WITHOUT crash
-    // accounting (this is a proactive unregister, not a crash).
+    // The client is out of client_metas_ now. Recycle its segments WITHOUT
+    // crash accounting (this is a proactive unregister, not a crash).
     meta->RecycleMeta();
 
     // Decrement the active gauge only if the client was still HEALTH: the

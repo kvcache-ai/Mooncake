@@ -135,9 +135,10 @@ TEST_F(P2PRegisterConcurrencyTest, ConcurrentRegisterNoCrash) {
     for (auto& t : threads) t.join();
 
     // Registers serialize on registration_mutex_, so exactly one re-registers
-    // the client (HTTP 200); the rest hit the master with the same client_id and
-    // get CLIENT_ALREADY_EXISTS -> non-200. The point of the test is no crash and
-    // a consistent terminal state, not that every concurrent register succeeds.
+    // the client (HTTP 200); the rest hit the master with the same client_id
+    // and get CLIENT_ALREADY_EXISTS -> non-200. The point of the test is no
+    // crash and a consistent terminal state, not that every concurrent register
+    // succeeds.
     EXPECT_EQ(ok_count.load(), 1);
     ASSERT_TRUE(WaitFor([&] { return client->heartbeat_running_.load(); }));
     EXPECT_TRUE(client->registered_.load());
@@ -247,7 +248,8 @@ TEST_F(P2PRegisterConcurrencyTest, DuplicateRegisterIsNoop) {
     ASSERT_TRUE(WaitFor([&] { return client->registered_.load(); }));
     const bool hb_before = client->heartbeat_running_.load();
 
-    // Status is expected non-200 (ALREADY_EXISTS); we only care that state holds.
+    // Status is expected non-200 (ALREADY_EXISTS); we only care that state
+    // holds.
     HttpPost(Url(client, "/register"));
     EXPECT_TRUE(client->registered_.load());
     EXPECT_EQ(client->heartbeat_running_.load(), hb_before);

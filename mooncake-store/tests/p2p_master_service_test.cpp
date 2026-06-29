@@ -553,8 +553,9 @@ TEST_F(P2PMasterServiceTest, UnregisterClientPartialKeepsOtherOwner) {
     AddReplicaHelper(*service, "key1", 1024, client2, seg2.id);
 
     // Unregister client1 -> only its replica is removed.
-    ASSERT_TRUE(service->UnregisterClient(
-                           UnregisterClientRequest{client1, DeploymentMode::P2P})
+    ASSERT_TRUE(service
+                    ->UnregisterClient(
+                        UnregisterClientRequest{client1, DeploymentMode::P2P})
                     .has_value());
 
     EXPECT_EQ(service->GetClientManager().GetClient(client1), nullptr);
@@ -573,14 +574,14 @@ TEST_F(P2PMasterServiceTest, UnregisterClientIdempotent) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    ASSERT_TRUE(service->UnregisterClient(
-                           UnregisterClientRequest{client_id,
-                                                   DeploymentMode::P2P})
+    ASSERT_TRUE(service
+                    ->UnregisterClient(
+                        UnregisterClientRequest{client_id, DeploymentMode::P2P})
                     .has_value());
     // Second call: client already gone -> still OK (idempotent).
-    EXPECT_TRUE(service->UnregisterClient(
-                           UnregisterClientRequest{client_id,
-                                                   DeploymentMode::P2P})
+    EXPECT_TRUE(service
+                    ->UnregisterClient(
+                        UnregisterClientRequest{client_id, DeploymentMode::P2P})
                     .has_value());
 }
 

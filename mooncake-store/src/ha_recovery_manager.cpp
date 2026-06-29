@@ -106,8 +106,9 @@ void HARecoveryManager::HandleEvent(HAEvent event) {
             break;
 
         case HAEvent::MASTER_RECONNECTED:
-            // Restart the notifier when leaving a local-only state (DEGRADED on
-            // master loss, or LOCAL_ONLY after a proactive unregister + rejoin).
+            // Restart the notifier when leaving a local-only state
+            // (DEGRADED on master loss, or LOCAL_ONLY after a proactive
+            // unregister + rejoin).
             if (current == HAClientState::DEGRADED ||
                 current == HAClientState::LOCAL_ONLY) {
                 if (notifier_) notifier_->Start();

@@ -142,7 +142,8 @@ TEST_F(MasterMetricsTest, RegisterUnregisterRpcMetrics) {
     EXPECT_EQ(metrics.get_unregister_client_requests(), 1);
     EXPECT_EQ(metrics.get_unregister_client_failures(), 0);
 
-    // UnregisterClient with the wrong deployment mode -> requests=2, failures=1.
+    // UnregisterClient with the wrong deployment mode -> requests=2,
+    // failures=1.
     UnregisterClientRequest bad;
     bad.client_id = client_id;
     bad.deployment_mode = DeploymentMode::P2P;

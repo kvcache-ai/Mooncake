@@ -13,8 +13,6 @@ namespace mooncake {
 // Tracks in-flight operations and supports graceful draining via a rw lock.
 class InflightTracker {
    public:
-    // on_entering / on_leaving: fired when an admitted operation enters / leaves;
-    // drive an in-flight gauge. Either may be null.
     explicit InflightTracker(std::string name,
                              std::function<void()> on_entering = nullptr,
                              std::function<void()> on_leaving = nullptr)
@@ -75,6 +73,10 @@ class InflightTracker {
     }
 
     std::string name_;
+
+    // on_entering / on_leaving:
+    // 1. fired when an admitted operation enters / leaves;
+    // 2. drive an in-flight gauge. Either may be null.
     std::function<void()> on_entering_;
     std::function<void()> on_leaving_;
     std::atomic<bool> running_{true};

@@ -55,8 +55,9 @@ ClientRpcService::ClientRpcService(DataManager& data_manager,
                                    P2PClientMetric* metrics)
     : data_manager_(data_manager),
       metrics_(metrics),
-      peer_tracker_("peer RPCs", [this] { RecordPeerInflight(true); },
-                    [this] { RecordPeerInflight(false); }) {}
+      peer_tracker_(
+          "peer RPCs", [this] { RecordPeerInflight(true); },
+          [this] { RecordPeerInflight(false); }) {}
 
 void ClientRpcService::Stop() {
     peer_tracker_.Close();

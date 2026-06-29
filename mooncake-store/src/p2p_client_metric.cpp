@@ -55,8 +55,8 @@ RequestMetric::RequestMetric(const std::string& prefix,
                                 "UnPinKey rollback RPC latency for failed "
                                 "requests (us)",
                                 kLatencyBucket, labels),
-      inflight(prefix + "_inflight",
-               "Number of currently in-flight requests", labels) {}
+      inflight(prefix + "_inflight", "Number of currently in-flight requests",
+               labels) {}
 
 void RequestMetric::serialize(std::string& str) {
     get_requests.serialize(str);

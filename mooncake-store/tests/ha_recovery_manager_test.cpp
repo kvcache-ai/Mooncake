@@ -262,7 +262,8 @@ TEST_F(HARecoveryManagerTest, IsLocalServiceTrueForDegradedAndLocalOnly) {
     EXPECT_TRUE(mgr->IsLocalService());  // LOCAL_ONLY
 }
 
-TEST_F(HARecoveryManagerTest, ReconnectFromLocalOnlyRestartsNotifierAndRecovers) {
+TEST_F(HARecoveryManagerTest,
+       ReconnectFromLocalOnlyRestartsNotifierAndRecovers) {
     notifier_ =
         std::make_unique<AsyncMetadataNotifier>(*master_client_, client_id_,
                                                 /*sender_thread_count=*/1,

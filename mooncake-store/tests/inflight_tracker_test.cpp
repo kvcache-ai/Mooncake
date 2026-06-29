@@ -18,8 +18,7 @@ namespace mooncake {
 
 TEST(InflightTrackerTest, AdmitsAndFiresHook) {
     std::atomic<int> inflight{0};
-    InflightTracker tracker(
-        "test", [&] { ++inflight; }, [&] { --inflight; });
+    InflightTracker tracker("test", [&] { ++inflight; }, [&] { --inflight; });
     {
         auto g = tracker.Enter();
         EXPECT_TRUE(g.is_valid());
@@ -45,8 +44,7 @@ TEST(InflightTrackerTest, CloseRejectsNewGuards) {
 
 TEST(InflightTrackerTest, WaitBlocksUntilInflightReleased) {
     std::atomic<int> inflight{0};
-    InflightTracker tracker(
-        "test", [&] { ++inflight; }, [&] { --inflight; });
+    InflightTracker tracker("test", [&] { ++inflight; }, [&] { --inflight; });
     std::atomic<bool> guard_held{false};
     std::atomic<bool> release{false};
     std::atomic<bool> wait_returned{false};

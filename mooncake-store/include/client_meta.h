@@ -81,8 +81,8 @@ class ClientMeta {
     // Crash hook: counts the crash and recycles the meta (segments). Like
     // OnDisconnected/OnRecovered, the metric accounting lives inside the hook.
     void OnCrashed();
-    // Releases the meta's resources (unmounts its segments) WITHOUT any crash
-    // accounting. Reused by both OnCrashed() and a proactive UnregisterClient().
+    // Releases the meta's resources WITHOUT crash accounting.
+    // Reused by both OnCrashed() and a proactive UnregisterClient().
     void RecycleMeta();
 
    public:
