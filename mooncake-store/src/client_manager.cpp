@@ -251,7 +251,12 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
     OnClientRegistered(meta);
 
     SharedMutexLocker lock(&clients_mutex_);
-    // Write to client_metas_ (overwrites if re-registering after crash)
+    if (client_metas_.count(client_id)) {
+        LOG(WARNING)
+            << "RegisterClient: client already exists (lost registration race)"
+            << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+    }
     client_metas_[client_id] = std::move(meta);
 
     MasterMetricManager::instance().inc_active_clients();
