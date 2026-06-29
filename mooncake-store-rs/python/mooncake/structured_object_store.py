@@ -1032,9 +1032,11 @@ def _resolve_ndarray_read_plan(
             full_shape=shape,
             output_shape=shape,
             byte_offset=0,
-            byte_length=int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
-            if shape
-            else dtype.itemsize,
+            byte_length=(
+                int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+                if shape
+                else dtype.itemsize
+            ),
             step=1,
             cover_row_count=shape[0] if shape else 1,
         )

@@ -66,7 +66,9 @@ def extract_wheel(wheel_path: pathlib.Path, destination: pathlib.Path) -> None:
         wheel.extractall(destination)
 
 
-def copy_release_assets(release_root: pathlib.Path, target_root: pathlib.Path) -> list[str]:
+def copy_release_assets(
+    release_root: pathlib.Path, target_root: pathlib.Path
+) -> list[str]:
     release_package = release_root / "mooncake"
     target_package = target_root / "mooncake"
     if not release_package.is_dir():
@@ -112,7 +114,9 @@ def copy_release_assets(release_root: pathlib.Path, target_root: pathlib.Path) -
 def rebuild_record(root: pathlib.Path) -> None:
     dist_infos = sorted(root.glob("*.dist-info"))
     if len(dist_infos) != 1:
-        raise RuntimeError(f"expected one *.dist-info directory, found {len(dist_infos)}")
+        raise RuntimeError(
+            f"expected one *.dist-info directory, found {len(dist_infos)}"
+        )
     record_path = dist_infos[0] / "RECORD"
 
     rows: list[tuple[str, str, str]] = []
@@ -124,7 +128,11 @@ def rebuild_record(root: pathlib.Path) -> None:
             rows.append((relative, "", ""))
             continue
         payload = path.read_bytes()
-        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).decode().rstrip("=")
+        digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(payload).digest())
+            .decode()
+            .rstrip("=")
+        )
         rows.append((relative, f"sha256={digest}", str(len(payload))))
 
     with record_path.open("w", newline="") as record_file:
@@ -156,7 +164,9 @@ def main() -> None:
     if not release_wheel.exists():
         raise FileNotFoundError(release_wheel)
 
-    with tempfile.TemporaryDirectory(prefix="store-rs-wheel-") as target_tmp, tempfile.TemporaryDirectory(
+    with tempfile.TemporaryDirectory(
+        prefix="store-rs-wheel-"
+    ) as target_tmp, tempfile.TemporaryDirectory(
         prefix="mooncake-release-wheel-"
     ) as release_tmp:
         target_root = pathlib.Path(target_tmp)
