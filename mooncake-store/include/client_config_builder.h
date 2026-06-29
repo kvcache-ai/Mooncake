@@ -498,10 +498,10 @@ class ClientConfigBuilder {
         static constexpr size_t kDefaultLockShardCount = 1024;
         static constexpr size_t kDefaultRouteCacheMaxMemoryBytes =
             300ULL * 1024 * 1024;
-        static constexpr uint64_t kDefaultRouteCacheTtlMs = 5ULL * 60 * 1000;
+        static constexpr uint64_t kDefaultRouteCacheTtlMs = 1ULL * 60 * 1000;
         static constexpr const char* kDefaultLocalTransferMode = "te";
         static constexpr size_t kDefaultLocalMemcpyAsyncWorkerNum = 32;
-        static constexpr size_t kDefaultAsyncSenderThreadCount = 0;
+        static constexpr size_t kDefaultAsyncSenderThreadCount = 4;
         static constexpr size_t kDefaultAsyncMaxBatchSize = 2000;
         static constexpr size_t kDefaultAsyncRouteQueueSize = 0;
     };

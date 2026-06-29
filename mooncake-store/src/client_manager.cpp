@@ -217,11 +217,14 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
     }
 
     const auto& client_id = req.client_id;
-    auto it = client_metas_.find(client_id);
-    if (it != client_metas_.end()) {
-        LOG(WARNING) << "RegisterClient: client already exists"
-                     << ", client_id=" << client_id;
-        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+    {
+        SharedMutexLocker lock(&clients_mutex_, shared_lock);
+        auto it = client_metas_.find(client_id);
+        if (it != client_metas_.end()) {
+            LOG(WARNING) << "RegisterClient: client already exists"
+                         << ", client_id=" << client_id;
+            return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+        }
     }
 
     if (auto valid = ValidateRegisterRequest(req); !valid) {
