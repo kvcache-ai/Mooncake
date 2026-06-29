@@ -172,6 +172,11 @@ class ClientManager {
         ObjectIterateStrategy strategy);
 
    protected:
+    virtual tl::expected<void, ErrorCode> ValidateRegisterRequest(
+        const RegisterClientRequest& /*req*/) {
+        return {};
+    }
+
     /**
      * @brief Create architecture-specific ClientMeta
      */

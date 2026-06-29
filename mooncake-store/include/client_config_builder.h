@@ -121,7 +121,7 @@ struct RealClientConfigBase {
 
     // Periodic client-metric reporting interval, in seconds.
     // When it is 0, metric reporting is disabled.
-    uint64_t metric_report_interval_seconds = 10;
+    uint64_t metric_report_interval_seconds = 60;
 };
 
 /**
@@ -169,13 +169,13 @@ struct P2PClientConfig : RealClientConfigBase {
     // Aligned Node(64B) + hash_bucket(8B) + Key(assume 64B)
     // + P2PRouteData(each item is 96B and count is 8B)
     size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
-    uint64_t route_cache_ttl_ms = 5 * 60 * 1000;              // 5min
+    uint64_t route_cache_ttl_ms = 60 * 1000;                  // 1min
 
     // Async route notification.
     // async_sender_thread_count > 0 enables async notifier.
     // async_route_queue_size controls queue capacity
     // (minimum async_max_batch_size * async_sender_thread_count).
-    size_t async_sender_thread_count = 0;
+    size_t async_sender_thread_count = 4;
     size_t async_max_batch_size = 2000;
     size_t async_route_queue_size = 0;
 
@@ -239,7 +239,7 @@ class ClientConfigBuilder {
         const std::map<std::string, std::string>& labels = {},
         uint16_t local_rpc_port = 50052, const std::string& runtime_config = "",
         bool enable_metric_collection = true,
-        uint64_t metric_report_interval_seconds = 10) {
+        uint64_t metric_report_interval_seconds = 60) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -308,19 +308,19 @@ class ClientConfigBuilder {
         uint16_t client_rpc_port = 12345, uint32_t rpc_thread_num = 2,
         size_t lock_shard_count = 1024,
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
-        uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
+        uint64_t route_cache_ttl_ms = 60 * 1000,
         const std::string& local_transfer_mode = "te",
         size_t local_memcpy_async_worker_num = 32, uint16_t http_port = 9003,
         bool enable_http_server = true,
         const std::map<std::string, std::string>& labels = {},
-        size_t async_sender_thread_count = 0,
+        size_t async_sender_thread_count = 4,
         size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0,
         uint32_t p2p_key_lease_duration_ms = 0,
         uint32_t p2p_key_lease_scan_interval_ms = 0,
         const std::string& p2p_transfer_direction_mode = "reverse",
         const std::string& runtime_config = "",
         bool enable_metric_collection = true,
-        uint64_t metric_report_interval_seconds = 10) {
+        uint64_t metric_report_interval_seconds = 60) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -459,7 +459,7 @@ class ClientConfigBuilder {
         static constexpr const char* kDefaultProtocol = "tcp";
         static constexpr const char* kDefaultMasterServerAddr =
             "127.0.0.1:50051";
-        static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 10;
+        static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 60;
         static constexpr bool kDefaultEnableMetricCollection = true;
         // Limits
         static constexpr size_t kMinSegmentSize = 1024;
@@ -498,10 +498,10 @@ class ClientConfigBuilder {
         static constexpr size_t kDefaultLockShardCount = 1024;
         static constexpr size_t kDefaultRouteCacheMaxMemoryBytes =
             300ULL * 1024 * 1024;
-        static constexpr uint64_t kDefaultRouteCacheTtlMs = 5ULL * 60 * 1000;
+        static constexpr uint64_t kDefaultRouteCacheTtlMs = 1ULL * 60 * 1000;
         static constexpr const char* kDefaultLocalTransferMode = "te";
         static constexpr size_t kDefaultLocalMemcpyAsyncWorkerNum = 32;
-        static constexpr size_t kDefaultAsyncSenderThreadCount = 0;
+        static constexpr size_t kDefaultAsyncSenderThreadCount = 4;
         static constexpr size_t kDefaultAsyncMaxBatchSize = 2000;
         static constexpr size_t kDefaultAsyncRouteQueueSize = 0;
     };
@@ -620,7 +620,7 @@ class ClientConfigBuilder {
         const std::map<std::string, std::string>& labels = {},
         const std::string& runtime_config = "",
         bool enable_metric_collection = true,
-        uint64_t metric_report_interval_seconds = 10) {
+        uint64_t metric_report_interval_seconds = 60) {
         // Parse local_hostname into IP and optional port.
         // Only set te_port when the user explicitly provides a port;
         // otherwise keep the default value (0 = randomly assigned).

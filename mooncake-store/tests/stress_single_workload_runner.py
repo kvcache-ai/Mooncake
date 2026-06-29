@@ -163,7 +163,7 @@ def parse_metrics(output):
 def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
                          batch=1, p2p_local_transfer_mode="te",
                          local_memcpy_async_worker_num=32,
-                         route_cache_max_memory_mb=300, route_cache_ttl_ms=300000,
+                         route_cache_max_memory_mb=300, route_cache_ttl_ms=60000,
                          http_metadata_port=HTTP_METADATA_PORT):
     """Run a specific configuration for a single mode."""
     kill_existing_processes()
@@ -260,7 +260,7 @@ def main():
                         help="Async memcpy worker threads (memcpy mode only, list: 4,16,32)")
     parser.add_argument("--route_cache_max_memory_mb", type=str, default="300",
                         help="Max memory for RouteCache in MB (P2P mode, list: 100,300,600)")
-    parser.add_argument("--route_cache_ttl_ms", type=str, default="300000",
+    parser.add_argument("--route_cache_ttl_ms", type=str, default="60000",
                         help="TTL for RouteCache entries in ms (P2P mode, list: 60000,300000)")
     # Flags
     parser.add_argument("--matrix", action="store_true", help="Enable matrix sweep mode")

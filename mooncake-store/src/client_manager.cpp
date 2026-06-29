@@ -217,11 +217,20 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
     }
 
     const auto& client_id = req.client_id;
-    auto it = client_metas_.find(client_id);
-    if (it != client_metas_.end()) {
-        LOG(WARNING) << "RegisterClient: client already exists"
+    {
+        SharedMutexLocker lock(&clients_mutex_, shared_lock);
+        auto it = client_metas_.find(client_id);
+        if (it != client_metas_.end()) {
+            LOG(WARNING) << "RegisterClient: client already exists"
+                         << ", client_id=" << client_id;
+            return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+        }
+    }
+
+    if (auto valid = ValidateRegisterRequest(req); !valid) {
+        LOG(WARNING) << "RegisterClient: register request failed"
                      << ", client_id=" << client_id;
-        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+        return tl::make_unexpected(valid.error());
     }
 
     auto meta = CreateClientMeta(req);
@@ -242,7 +251,12 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
     OnClientRegistered(meta);
 
     SharedMutexLocker lock(&clients_mutex_);
-    // Write to client_metas_ (overwrites if re-registering after crash)
+    if (client_metas_.count(client_id)) {
+        LOG(WARNING)
+            << "RegisterClient: client already exists (lost registration race)"
+            << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+    }
     client_metas_[client_id] = std::move(meta);
 
     MasterMetricManager::instance().inc_active_clients();

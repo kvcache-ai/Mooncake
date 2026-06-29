@@ -157,6 +157,8 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     // the heartbeat with the same master entry.
     master_server_entry_ = config.master_server_entry;
 
+    local_ip_ = config.local_ip;
+
     // 1. Try to connect to master (allow failure for degraded startup)
     bool master_connected = false;
     ErrorCode err = ConnectToMaster(config.master_server_entry);
@@ -200,9 +202,8 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 
     // 5. Initialize transfer engine (local operation, no master dependency)
     if (config.transfer_engine == nullptr) {
-        err = InitTransferEngine(config.local_ip, config.te_port,
-                                 metadata_connstring_, config.protocol,
-                                 config.rdma_devices);
+        err = InitTransferEngine(config.te_port, metadata_connstring_,
+                                 config.protocol, config.rdma_devices);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return err;
@@ -1502,6 +1503,14 @@ std::vector<P2PClientService::ResolvedRoute> P2PClientService::LoadCachedRoutes(
             proxy.ip_address = item.ip_address;
             proxy.rpc_port = item.rpc_port;
             proxy.object_size = item.object_size;
+            if (proxy.ip_address.empty() || proxy.rpc_port == 0) {
+                LOG(ERROR) << "skip invalid cached p2p route, empty ip or zero "
+                              "port, key="
+                           << key << ", client_id=" << proxy.client_id
+                           << ", ip_address='" << proxy.ip_address << "'"
+                           << ", rpc_port=" << proxy.rpc_port;
+                continue;
+            }
             std::string endpoint =
                 proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
             auto& peer = GetOrCreatePeerClient(endpoint);
@@ -1534,6 +1543,13 @@ std::vector<P2PClientService::ResolvedRoute> P2PClientService::ReplicasToRoutes(
 
     for (const auto& replica : replicas) {
         auto proxy = replica.get_p2p_proxy_descriptor();
+        if (proxy.ip_address.empty() || proxy.rpc_port == 0) {
+            LOG(ERROR) << "skip invalid p2p route, empty ip or zero port"
+                       << ", client_id=" << proxy.client_id << ", ip_address='"
+                       << proxy.ip_address << "'"
+                       << ", rpc_port=" << proxy.rpc_port;
+            continue;
+        }
         std::string endpoint =
             proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
         auto& peer = GetOrCreatePeerClient(endpoint);

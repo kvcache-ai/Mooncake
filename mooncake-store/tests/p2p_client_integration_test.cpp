@@ -53,6 +53,8 @@ class P2PClientIntegrationTest : public ::testing::Test {
         }
         config.transfer_direction_mode = transfer_direction_mode;
 
+        config.async_sender_thread_count = 0;
+
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,
             config.enable_http_server, config.labels);

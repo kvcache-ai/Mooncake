@@ -53,6 +53,27 @@ std::unique_ptr<ClientIterator> P2PClientManager::InnerBuildClientIterator(
     }
 }
 
+tl::expected<void, ErrorCode> P2PClientManager::ValidateRegisterRequest(
+    const RegisterClientRequest& req) {
+    const std::string ip = req.ip_address.value_or("");
+    const uint16_t port = req.rpc_port.value_or(0);
+    LOG(INFO) << "RegisterClient(P2P): client_id=" << req.client_id
+              << ", ip_address='" << ip << "', rpc_port=" << port
+              << ", segments=" << req.segments.size();
+
+    if (ip.empty()) {
+        LOG(ERROR) << "RegisterClient(P2P): rejected, empty ip_address"
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (port == 0) {
+        LOG(ERROR) << "RegisterClient(P2P): rejected, invalid rpc_port=0"
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
+
 std::shared_ptr<ClientMeta> P2PClientManager::CreateClientMeta(
     const RegisterClientRequest& req) {
     auto meta = std::make_shared<P2PClientMeta>(

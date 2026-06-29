@@ -1182,11 +1182,11 @@ PYBIND11_MODULE(store, m) {
                uint32_t client_rpc_thread_num = 16,
                size_t lock_shard_count = 1024,
                size_t route_cache_max_memory = 300 * 1024 * 1024,
-               uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
+               uint64_t route_cache_ttl_ms = 60 * 1000,
                const std::string& local_transfer_mode = "te",
                size_t local_memcpy_async_worker_num = 32,
                uint16_t http_port = 9003, bool enable_http_server = true,
-               size_t async_sender_thread_count = 0,
+               size_t async_sender_thread_count = 4,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
                uint32_t p2p_key_lease_duration_ms = 5000,
@@ -1195,7 +1195,7 @@ PYBIND11_MODULE(store, m) {
                const py::object& engine = py::none(),
                const std::string& runtime_config = "",
                bool enable_metric_collection = true,
-               uint64_t metric_report_interval_seconds = 10) {
+               uint64_t metric_report_interval_seconds = 60) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1231,11 +1231,11 @@ PYBIND11_MODULE(store, m) {
             py::arg("client_rpc_thread_num") = 16,
             py::arg("lock_shard_count") = 1024,
             py::arg("route_cache_max_memory") = 300 * 1024 * 1024,
-            py::arg("route_cache_ttl_ms") = 5 * 60 * 1000,
+            py::arg("route_cache_ttl_ms") = 60 * 1000,
             py::arg("local_transfer_mode") = "te",
             py::arg("local_memcpy_async_worker_num") = 32,
             py::arg("http_port") = 9003, py::arg("enable_http_server") = true,
-            py::arg("async_sender_thread_count") = 0,
+            py::arg("async_sender_thread_count") = 4,
             py::arg("async_max_batch_size") = 2000,
             py::arg("async_route_queue_size") = 0,
             py::arg("p2p_key_lease_duration_ms") = 5000,
@@ -1243,7 +1243,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("p2p_transfer_direction_mode") = "reverse",
             py::arg("engine") = py::none(), py::arg("runtime_config") = "",
             py::arg("enable_metric_collection") = true,
-            py::arg("metric_report_interval_seconds") = 10,
+            py::arg("metric_report_interval_seconds") = 60,
             "Setup the store in P2P architecture.")
         .def(
             "setup",
@@ -1259,7 +1259,7 @@ PYBIND11_MODULE(store, m) {
                bool enable_http_server = true,
                const std::string& runtime_config = "",
                bool enable_metric_collection = true,
-               uint64_t metric_report_interval_seconds = 10) {
+               uint64_t metric_report_interval_seconds = 60) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1290,7 +1290,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_http_server") = true,
             py::arg("runtime_config") = "",
             py::arg("enable_metric_collection") = true,
-            py::arg("metric_report_interval_seconds") = 10)
+            py::arg("metric_report_interval_seconds") = 60)
         .def(
             "setup",
             [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {

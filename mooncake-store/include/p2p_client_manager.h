@@ -17,6 +17,10 @@ class P2PClientManager final : public ClientManager {
 
     std::unique_ptr<ClientIterator> InnerBuildClientIterator(
         ObjectIterateStrategy strategy) override;
+
+    tl::expected<void, ErrorCode> ValidateRegisterRequest(
+        const RegisterClientRequest& req) override;
+
     std::shared_ptr<ClientMeta> CreateClientMeta(
         const RegisterClientRequest& req) override;
 

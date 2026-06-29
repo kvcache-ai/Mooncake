@@ -296,10 +296,9 @@ tl::expected<void, ErrorCode> ClientService::CheckRegisterMemoryParams(
 }
 
 ErrorCode ClientService::InitTransferEngine(
-    const std::string& local_ip, uint16_t te_port,
-    const std::string& metadata_connstring, const std::string& protocol,
+    uint16_t te_port, const std::string& metadata_connstring,
+    const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    local_ip_ = local_ip;
     te_port_ = te_port;
     // this only performs RPC calls
     if (protocol == "rpc_only") {

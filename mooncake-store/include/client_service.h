@@ -493,15 +493,15 @@ class ClientService {
 
     /**
      * @brief Initializes the Transfer Engine.
-     * @param local_hostname Local hostname or IP.
+     * @param te_port Transfer engine port (0 means auto-bind).
      * @param metadata_connstring Connection string for metadata service.
      * @param protocol Transport protocol (e.g., "tcp", "rdma").
      * @param device_names Optional RDMA device names.
      * @return ErrorCode indicating success or failure.
      */
     ErrorCode InitTransferEngine(
-        const std::string& local_ip, uint16_t te_port,
-        const std::string& metadata_connstring, const std::string& protocol,
+        uint16_t te_port, const std::string& metadata_connstring,
+        const std::string& protocol,
         const std::optional<std::string>& device_names);
 
    protected:
