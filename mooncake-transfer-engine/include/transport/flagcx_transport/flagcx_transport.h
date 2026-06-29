@@ -9,11 +9,11 @@
 #ifndef FLAGCX_TRANSPORT_H_
 #define FLAGCX_TRANSPORT_H_
 
-#include <atomic>
-#include <condition_variable>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,12 +41,11 @@ namespace mooncake {
 //   - The data path resolves a cached connection per target segment
 //     (flagcxP2pEngineGetConn), looks up the remote rkey by absolute
 //     virtual address (flagcxP2pEngineMakeDesc -- the FlagCX equivalent
-//     of Mooncake's "rkey by dst_ptr"), then issues a one-sided
-//     WriteVectorSync (WRITE) or ReadVector + XferStatus poll (READ).
+//     of Mooncake's "rkey by dst_ptr"), then issues a non-blocking one-sided
+//     WriteVector (WRITE) or ReadVector (READ).
 //
-// A single I/O worker thread drains the slice queue so submitTransfer /
-// submitTransferTask stay non-blocking; completion is reported through
-// the usual TransferTask slice counters.
+// A lightweight completion thread polls submitted FlagCX transfer IDs and
+// reports completion through the usual TransferTask slice counters.
 //
 // Required runtime env: the FlagCX engine honours the standard FlagCX
 // knobs (FLAGCX_SOCKET_IFNAME selects the NIC the RPC endpoint binds /
@@ -90,10 +89,12 @@ class FlagCxTransport : public Transport {
     const char *getName() const override { return "flagcx"; }
 
     int allocateLocalSegment();
-    int doSlice(Slice *slice);
     // Issue a group of same-target, same-opcode slices as one multi-iov
-    // (multi-rail) transfer and mark each slice's completion.
+    // (multi-rail) transfer and record its transfer id for status checks.
     void runSliceGroup(const std::vector<Slice *> &group);
+    void submitSlices(const std::vector<Slice *> &slices);
+    bool pollPendingTransfers();
+    void completionLoop();
 
     // Find the engine MR handle whose registered region fully contains
     // [addr, addr+length).  Returns false if the source is unregistered.
@@ -116,15 +117,20 @@ class FlagCxTransport : public Transport {
     std::mutex reg_mu_;
     std::vector<Reg> regs_;
 
-    // Single-threaded I/O worker: all FlagCX ops happen in io_thread_.
-    // submitTransfer/Task pushes Slice* into io_queue_ and returns
-    // immediately.
-    void ioWorker();
-    std::thread io_thread_;
-    std::atomic<bool> running_{false};
-    std::mutex queue_mu_;
-    std::condition_variable queue_cv_;
-    std::deque<Slice *> io_queue_;
+    struct PendingTransfer {
+        FlagcxP2pConn *conn;
+        uint64_t transfer_id;
+        std::vector<Slice *> slices;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
+    std::mutex flagcx_mu_;
+    std::mutex submit_mu_;
+    std::mutex pending_mu_;
+    std::condition_variable pending_cv_;
+    std::vector<PendingTransfer> pending_;
+    std::atomic<bool> completion_running_{false};
+    std::thread completion_thread_;
 };
 
 }  // namespace mooncake
