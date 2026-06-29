@@ -39,3 +39,9 @@ if(USE_NOF)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
                                                        gflags::gflags)
 endif()
+
+# Add BatchEvict benchmark executable
+add_executable(batch_evict_bench batch_evict_bench.cpp)
+target_link_libraries(
+  batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
+                            gflags::gflags glog::glog pthread)
