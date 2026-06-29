@@ -68,6 +68,9 @@ class FIFOEndpointStore : public EndpointStore {
     void evictOne() override;
     void reclaim() override;
 
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> endpoint);
+    size_t testOnlyWaitingListSize();
+
    private:
     RdmaContext &context_;
     RWSpinlock endpoint_map_lock_;
@@ -98,6 +101,9 @@ class SIEVEEndpointStore : public EndpointStore {
     int remove(RdmaEndPoint *ep) override;
     void evictOne() override;
     void reclaim() override;
+
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> endpoint);
+    size_t testOnlyWaitingListSize();
 
    private:
     RdmaContext &context_;

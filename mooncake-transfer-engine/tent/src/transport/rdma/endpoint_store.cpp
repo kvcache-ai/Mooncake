@@ -128,6 +128,17 @@ void FIFOEndpointStore::reclaim() {
     for (auto& endpoint : to_delete) waiting_list_.erase(endpoint);
 }
 
+void FIFOEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> endpoint) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(std::move(endpoint));
+}
+
+size_t FIFOEndpointStore::testOnlyWaitingListSize() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    return waiting_list_.size();
+}
+
 size_t FIFOEndpointStore::size() { return endpoint_map_.size(); }
 
 void FIFOEndpointStore::clear() {
@@ -291,6 +302,19 @@ void SIEVEEndpointStore::reclaim() {
     }
     for (auto& endpoint : to_delete) waiting_list_.erase(endpoint);
     waiting_list_len_ -= to_delete.size();
+}
+
+void SIEVEEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> endpoint) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    if (waiting_list_.insert(std::move(endpoint)).second) {
+        waiting_list_len_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+size_t SIEVEEndpointStore::testOnlyWaitingListSize() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    return waiting_list_.size();
 }
 
 size_t SIEVEEndpointStore::size() { return endpoint_map_.size(); }
