@@ -262,10 +262,19 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // Best-effort rollback of already-registered chunks [0, up_to_ci].
     auto rollbackChunks = [&](size_t up_to_ci) {
         for (size_t ri = 0; ri <= up_to_ci && ri < chunks.size(); ++ri) {
-            metadata_->removeLocalMemoryBuffer(chunks[ri].first,
-                                               update_metadata);
-            for (auto &context : context_list_)
-                context->unregisterMemoryRegion(chunks[ri].first);
+            int rc = metadata_->removeLocalMemoryBuffer(chunks[ri].first,
+                                                        update_metadata);
+            if (rc)
+                LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
+                                "at "
+                             << chunks[ri].first << " (ret=" << rc << ")";
+            for (auto &context : context_list_) {
+                int ret = context->unregisterMemoryRegion(chunks[ri].first);
+                if (ret)
+                    LOG(WARNING) << "Rollback: failed to unregister chunk MR "
+                                    "at "
+                                 << chunks[ri].first << " (ret=" << ret << ")";
+            }
         }
     };
 
