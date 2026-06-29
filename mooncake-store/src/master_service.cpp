@@ -4779,6 +4779,7 @@ auto MasterService::NotifyOffloadSuccess(
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         bool handled_existing_object = false;
+        bool added_new_local_disk_replica = false;
         {
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
@@ -4812,6 +4813,7 @@ auto MasterService::NotifyOffloadSuccess(
                         obj_metadata.AddReplicas(std::move(replicas));
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
+                        added_new_local_disk_replica = true;
                     } else {
                         obj_metadata.VisitReplicas(
                             [client_id](const Replica& rep) {
@@ -4861,8 +4863,10 @@ auto MasterService::NotifyOffloadSuccess(
                            << ", key=" << object_id.user_key;
                 return tl::make_unexpected(res.error());
             }
+            added_new_local_disk_replica = true;
         }
-        if (local_disk_segment && metadata.data_size > 0) {
+        if (local_disk_segment && metadata.data_size > 0 &&
+            added_new_local_disk_replica) {
             local_disk_segment->ssd_used_bytes.fetch_add(
                 metadata.data_size, std::memory_order_relaxed);
         }
