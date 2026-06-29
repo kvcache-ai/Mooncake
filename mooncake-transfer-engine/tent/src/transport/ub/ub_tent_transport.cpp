@@ -16,6 +16,10 @@
 
 #include <glog/logging.h>
 
+#include <cstdlib>
+#include <sstream>
+#include <vector>
+
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_manager.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -24,6 +28,23 @@ namespace mooncake {
 namespace tent {
 
 using json = nlohmann::json;
+
+namespace {
+// Splits a comma-separated device list ("a,b ,c") into trimmed, non-empty
+// names.
+std::vector<std::string> parseDeviceFilter(const std::string& csv) {
+    std::vector<std::string> out;
+    std::stringstream ss(csv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        size_t b = item.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        size_t e = item.find_last_not_of(" \t");
+        out.push_back(item.substr(b, e - b + 1));
+    }
+    return out;
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -38,11 +59,37 @@ Status UbTentTransport::install(std::string& local_segment_name,
     local_segment_name_ = local_segment_name;
     control_service_ = metadata;
 
+    // Resolve which UB device(s) to use.  Production pins a specific (often
+    // bonded) device, e.g. device_name=bonding_dev_0, so that only ONE logical
+    // UB context is created -- matching the legacy old-TE UB behavior.  Without
+    // a filter we auto-discover every UB NIC on the host (used by unit tests).
+    // Resolution order:
+    //   1. TENT config key  transports/ub/device_name  (comma-separated)
+    //   2. Env var          MC_UB_DEVICE_NAME          (comma-separated)
+    //   3. (none)           discover all UB devices
+    std::string device_csv;
+    if (conf)
+        device_csv =
+            conf->get<std::string>("transports/ub/device_name", std::string());
+    if (device_csv.empty()) {
+        if (const char* env = std::getenv("MC_UB_DEVICE_NAME"))
+            device_csv = env;
+    }
+    std::vector<std::string> device_filter = parseDeviceFilter(device_csv);
+
     // Discover UB HCAs on this host.  Falls back to mock_urma_device when no
     // real HCAs are present (handled inside
     // UbTransport::initializeUbResources).
     te_topology_ = std::make_shared<mooncake::Topology>();
-    te_topology_->discover();
+    if (device_filter.empty()) {
+        LOG(INFO) << "UbTentTransport: no device filter set, discovering all "
+                     "UB devices";
+        te_topology_->discover();
+    } else {
+        LOG(INFO) << "UbTentTransport: restricting to UB device(s): "
+                  << device_csv;
+        te_topology_->discover(device_filter);
+    }
 
     // Build the bridge that replaces the standalone te_metadata_.
     // Use P2PHANDSHAKE so old-TE TransferMetadata stays in local-only mode
