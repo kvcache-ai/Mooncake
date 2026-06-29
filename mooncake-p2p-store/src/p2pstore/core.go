@@ -268,6 +268,7 @@ func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrL
 		if err != nil {
 			return err
 		}
+		offset = 0
 		for ; offset < size; offset += maxShardSize {
 			source := addr + uintptr(offset)
 			shard := payload.Shards[taskID]
@@ -275,7 +276,7 @@ func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrL
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err = store.performTransfer(ctx, source, shard)
+				err := store.performTransfer(ctx, source, shard)
 				if err != nil {
 					select {
 					case errChan <- err:
