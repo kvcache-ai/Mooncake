@@ -254,7 +254,8 @@ class NonHAReconnectTest : public ::testing::TestWithParam<TestMode> {
 
             auto config = ClientConfigBuilder::build_p2p_real_client(
                 local_hostname, "P2PHANDSHAKE", "tcp", std::nullopt,
-                master_addr, tiers_json, 0, nullptr, "", 0);
+                master_addr, tiers_json, 0, nullptr, "",
+                static_cast<uint16_t>(getFreeTcpPort()));
             auto client_opt = ClientService::Create(config);
             EXPECT_TRUE(client_opt.has_value());
             client_out = client_opt.value();
