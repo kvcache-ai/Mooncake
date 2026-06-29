@@ -32,6 +32,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "kv_event.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
@@ -48,6 +49,18 @@ class AllocationStrategy;
 class EvictionStrategy;
 class HttpMetadataServer;
 struct MetadataStoragePlugin;
+
+// Public read-only snapshot of a KV group manifest, returned by
+// MasterService::GetKvGroupManifest. Sets are exposed as sorted vectors so
+// callers (and tests) get a deterministic view without touching internal state.
+struct KvGroupManifestView {
+    std::string tenant_id;
+    std::string group_id;
+    KvBlockEventMetadata metadata;
+    std::vector<std::string> expected_object_keys;  // sorted
+    std::vector<std::string> current_object_keys;   // completed, sorted
+    uint64_t generation{0};
+};
 
 // Forward declarations for test classes
 namespace test {
@@ -323,6 +336,65 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id);
+
+    /**
+     * @brief Look up the KV event group manifest for a logical block group.
+     *
+     * Returns std::nullopt when no manifest exists for the (tenant, group)
+     * pair, e.g. when the writes did not carry kv_event_metadata. Intended for
+     * KV event bookkeeping and tests; it does not publish any event.
+     */
+    std::optional<KvGroupManifestView> GetKvGroupManifest(
+        const std::string& tenant_id, const std::string& group_id) const;
+
+    /**
+     * @brief Validate the KV event metadata carried by a full (non per-key)
+     * ReplicateConfig.
+     *
+     * Checks that every metadata item has a non-empty, unique group_id that is
+     * present in config.group_ids (when group_ids is set), and that each item
+     * can express completeness (expected_components or expected_object_count).
+     * Returns INVALID_PARAMS otherwise. A no-op (OK) when no metadata is set.
+     *
+     * This is a config-consistency check meant for the batch/RPC entry layer,
+     * which still sees the full group_ids list; per-key manifest validation is
+     * handled separately inside PutStart.
+     */
+    static tl::expected<void, ErrorCode> ValidateKvEventMetadataConfig(
+        const ReplicateConfig& config);
+
+    /**
+     * @brief Install the sink for Dynamo-compatible KV events.
+     *
+     * Pass nullptr (the default) to disable publishing, which keeps Mooncake
+     * behavior unchanged. Intended to be set once before serving traffic (e.g.
+     * at startup or in tests with a mock publisher).
+     */
+    void SetKvEventPublisher(std::shared_ptr<KvEventPublisher> publisher);
+
+    /**
+     * @brief Register / override the worker_id reported for a segment in KV
+     * events.
+     *
+     * This is the deployment-config / control-plane entry point for the
+     * segment->worker_id registry. An explicit registration takes precedence
+     * over the transport endpoint captured automatically at mount time, so a
+     * deployment can map a segment to a logical worker identity that differs
+     * from its te_endpoint. Passing an empty worker_id clears the explicit
+     * override (falling back to the mount-time value). Thread-safe.
+     */
+    void RegisterSegmentWorkerId(const std::string& segment_name,
+                                 const std::string& worker_id);
+
+    /**
+     * @brief Look up the worker_id currently associated with a segment name.
+     *
+     * Returns the explicit override when present, otherwise the worker_id
+     * captured at mount time (te_endpoint), or std::nullopt when the segment is
+     * unknown to the registry. Intended for diagnostics and tests.
+     */
+    std::optional<std::string> GetSegmentWorkerId(
+        const std::string& segment_name) const;
 
     /**
      * @brief Start a put operation for an object
@@ -1197,6 +1269,35 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    // Master-internal state tracking one logical Dynamo KV block group that
+    // opted into KV events. Lives in the same shard as the group's members
+    // (grouped keys are sharded by group_id), so it is protected by that
+    // shard's mutex. No event is published in this phase; this only models the
+    // group's completeness state.
+    struct KvGroupManifest {
+        std::string tenant_id;
+        std::string group_id;
+        KvBlockEventMetadata metadata;
+
+        // Expected physical object keys derived from metadata when
+        // expected_components is provided; may be empty if only
+        // expected_object_count is set.
+        std::unordered_set<std::string> expected_object_keys;
+        // Physical object keys whose write has completed (PutEnd).
+        std::unordered_set<std::string> current_object_keys;
+
+        // Physical placement: object_key -> owning worker / storage node id.
+        // Populated in a later phase (segment -> worker reverse lookup).
+        std::unordered_map<std::string, std::string> object_worker_ids;
+
+        // Per-worker event publish bookkeeping, reserved for the publisher
+        // phase. Unused while events are not emitted.
+        std::unordered_set<std::string> stored_event_published_workers;
+        std::unordered_set<std::string> removed_event_published_workers;
+
+        uint64_t generation{0};
+    };
+
     struct TenantState {
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
@@ -1208,10 +1309,14 @@ class MasterService {
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
 
+        std::unordered_map<std::string, KvGroupManifest>
+            kv_group_manifests;  // group_id → manifest
+
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && group_members.empty();
+                   promotion_tasks.empty() && group_members.empty() &&
+                   kv_group_manifests.empty();
         }
     };
 
@@ -1377,6 +1482,74 @@ class MasterService {
                                const std::string& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
+
+    // KV event manifest helpers. All operate on the group's shard tenant_state
+    // (caller must hold that shard's write lock).
+    //
+    // Finds the KvBlockEventMetadata entry in config whose group_id matches the
+    // given group. Returns nullptr when config carries no metadata for it.
+    static const KvBlockEventMetadata* FindKvEventMetadataForGroup(
+        const ReplicateConfig& config, const std::string& group_id);
+    // Validates the metadata for a key being put into group_id. Returns an
+    // error for structurally invalid metadata or a conflicting redefinition of
+    // an existing group manifest. A no-op (OK) when no metadata applies.
+    tl::expected<void, ErrorCode> ValidateKvManifestForKey(
+        const TenantState& tenant_state, const std::string& tenant_id,
+        const std::string& group_id, const std::string& key,
+        const ReplicateConfig& config) const;
+    // Creates the group manifest if it does not exist yet. Assumes validation
+    // already passed (idempotent for repeated identical metadata).
+    void UpsertKvManifestForKey(TenantState& tenant_state,
+                                const std::string& tenant_id,
+                                const std::string& group_id,
+                                const std::string& key,
+                                const ReplicateConfig& config);
+    // Marks a physical object key as completed in its group manifest, if any,
+    // records its owning worker, and publishes a BlockStored event if the
+    // logical block just became complete.
+    void MarkKvManifestObjectComplete(TenantState& tenant_state,
+                                      const std::string& group_id,
+                                      const std::string& key,
+                                      const std::string& worker_id);
+    // Handles removal/eviction of a physical object: publishes a BlockRemoved
+    // event if the logical block was previously stored and is now affected.
+    void OnKvManifestObjectRemoved(TenantState& tenant_state,
+                                   const std::string& group_id,
+                                   const std::string& key);
+    // Whether all expected objects of a group are completed.
+    static bool IsKvManifestComplete(const KvGroupManifest& manifest);
+    // Publishes BlockStored / BlockRemoved with dedup, mutating the manifest's
+    // published-worker bookkeeping. No-ops when no publisher is installed.
+    void MaybePublishKvBlockStored(KvGroupManifest& manifest,
+                                   const std::string& worker_id);
+    void MaybePublishKvBlockRemoved(KvGroupManifest& manifest);
+    // Derives the segment name that owns an object from its replica placement.
+    // Returns empty when placement is unknown.
+    static std::string DeriveSegmentNameFromMetadata(
+        const ObjectMetadata& metadata);
+    // Resolves a segment name to the worker_id reported in KV events using the
+    // segment->worker_id registry, falling back to the segment name itself when
+    // the segment is unregistered.
+    std::string ResolveWorkerId(const std::string& segment_name) const;
+    // Records the worker_id captured for a segment at mount time. Does not
+    // overwrite an explicit registration. No-op for empty inputs.
+    void AutoRegisterSegmentWorkerId(const std::string& segment_name,
+                                     const std::string& worker_id);
+    // Builds a unique event_id string for a manifest event.
+    std::string MakeKvEventId(const std::string& tenant_id,
+                              const std::string& group_id, const char* kind);
+
+    std::shared_ptr<KvEventPublisher> kv_event_publisher_;
+    std::atomic<uint64_t> kv_event_seq_{0};
+    // segment->worker_id registry, decoupled from KV-event manifest sharding so
+    // it can be consulted while holding a tenant shard lock. The explicit map
+    // is populated by RegisterSegmentWorkerId (deployment config / control
+    // plane) and wins over the auto map, which is populated at mount time with
+    // the segment's transport endpoint. Repopulated on remount; not part of the
+    // HA snapshot.
+    mutable std::shared_mutex segment_worker_registry_mutex_;
+    std::unordered_map<std::string, std::string> segment_worker_explicit_;
+    std::unordered_map<std::string, std::string> segment_worker_auto_;
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,

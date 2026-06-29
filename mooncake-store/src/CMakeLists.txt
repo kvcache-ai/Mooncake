@@ -8,6 +8,7 @@ set(MOONCAKE_STORE_SOURCES
     client_metric.cpp
     types.cpp
     master_client.cpp
+    kv_event.cpp
     utils.cpp
     mmap_arena.cpp
     master_metric_manager.cpp
@@ -114,6 +115,30 @@ else()
     FATAL_ERROR
       "xxHash library/header not found. Please install xxhash (development headers) and try again."
   )
+endif()
+
+# ZeroMQ (optional): enables the real ZMQ transport for Dynamo-compatible KV
+# events (kv_event_zmq_publisher.cpp). cppzmq (zmq.hpp) is a header-only C++
+# binding over libzmq. When absent, the KV-event manifest/encoder still build;
+# only the live ZMQ publisher is omitted.
+find_path(
+  ZMQ_INCLUDE_DIR
+  NAMES zmq.hpp
+  HINTS $ENV{CONDA_PREFIX}/include
+  PATHS /usr/include /usr/local/include)
+find_library(
+  ZMQ_LIBRARY
+  NAMES zmq libzmq
+  HINTS $ENV{CONDA_PREFIX}/lib
+  PATHS /usr/lib /usr/local/lib /usr/lib64)
+if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+  message(STATUS "Found ZeroMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
+  set(MOONCAKE_STORE_HAS_ZMQ TRUE)
+  list(APPEND MOONCAKE_STORE_SOURCES kv_event_zmq_publisher.cpp)
+else()
+  message(
+    STATUS "ZeroMQ not found, real ZMQ KV-event transport will be disabled")
+  set(MOONCAKE_STORE_HAS_ZMQ FALSE)
 endif()
 
 if(USE_3FS)
@@ -270,6 +295,14 @@ endif()
 if(URING_LIB AND URING_INCLUDE)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
+endif()
+
+# Propagate ZeroMQ to mooncake_store (and, via PUBLIC, to tests/consumers that
+# need to build against the real ZMQ KV-event publisher).
+if(MOONCAKE_STORE_HAS_ZMQ)
+  target_compile_definitions(mooncake_store PUBLIC MOONCAKE_STORE_WITH_ZMQ)
+  target_include_directories(mooncake_store PUBLIC ${ZMQ_INCLUDE_DIR})
+  target_link_libraries(mooncake_store PUBLIC ${ZMQ_LIBRARY})
 endif()
 
 if(BUILD_SHARED_LIBS)

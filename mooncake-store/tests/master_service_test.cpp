@@ -18,6 +18,12 @@
 
 #include "types.h"
 
+#ifdef MOONCAKE_STORE_WITH_ZMQ
+#include <zmq.hpp>
+
+#include "kv_event_zmq_publisher.h"
+#endif
+
 namespace mooncake::test {
 
 class MasterServiceTest : public ::testing::Test {
@@ -644,6 +650,657 @@ TEST_F(MasterServiceTest, PutStartGroupIdsValidation) {
     ASSERT_TRUE(exists.has_value());
     EXPECT_TRUE(exists.value());
 }
+
+// ---------------------------------------------------------------------------
+// KV event metadata / group manifest tests (Phase 1: interface + manifest).
+// No KV event is published in this phase; these only verify the state model.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+KvBlockEventMetadata MakeKvMetadata(
+    const std::string& group_id, uint64_t block_hash,
+    const std::vector<KvBlockComponentSpec>& components) {
+    KvBlockEventMetadata meta;
+    meta.group_id = group_id;
+    meta.block_hash = block_hash;
+    meta.parent_block_hash = block_hash > 0 ? block_hash - 1 : 0;
+    meta.token_ids = {1, 2, 3, 4};
+    meta.block_size = 64;
+    meta.expected_object_count = static_cast<uint32_t>(components.size());
+    meta.expected_components = components;
+    return meta;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, KvEventMetadataAbsentLeavesNoManifest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    UUID client_id = generate_uuid();
+
+    const std::string key = "kv_no_meta_key";
+    const std::string group_id = FindGroupIdOnDifferentShard(key);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+
+    PutCompletedObject(*service_, client_id, key, config);
+
+    // Grouped object exists, but with no kv_event_metadata there is no manifest.
+    EXPECT_FALSE(service_->GetKvGroupManifest("default", group_id).has_value());
+    auto exists = service_->ExistKey(key, "default");
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value());
+}
+
+TEST_F(MasterServiceTest, KvEventManifestCreatedAndCompleted) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    UUID client_id = generate_uuid();
+
+    const std::string key = "kv_single_key";
+    const std::string group_id = FindGroupIdOnDifferentShard(key);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{MakeKvMetadata(
+        group_id, 10001, {KvBlockComponentSpec{key, "k", 0}})};
+
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, "default", 1024, config).has_value());
+
+    {
+        auto manifest = service_->GetKvGroupManifest("default", group_id);
+        ASSERT_TRUE(manifest.has_value());
+        EXPECT_EQ(manifest->group_id, group_id);
+        EXPECT_EQ(manifest->metadata.block_hash, 10001u);
+        EXPECT_EQ(manifest->metadata.block_size, 64u);
+        ASSERT_EQ(manifest->expected_object_keys.size(), 1u);
+        EXPECT_EQ(manifest->expected_object_keys[0], key);
+        // Not completed until PutEnd.
+        EXPECT_TRUE(manifest->current_object_keys.empty());
+    }
+
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+
+    {
+        auto manifest = service_->GetKvGroupManifest("default", group_id);
+        ASSERT_TRUE(manifest.has_value());
+        ASSERT_EQ(manifest->current_object_keys.size(), 1u);
+        EXPECT_EQ(manifest->current_object_keys[0], key);
+    }
+}
+
+TEST_F(MasterServiceTest, KvEventManifestSharedAcrossGroupMembers) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    UUID client_id = generate_uuid();
+
+    const std::string group_id = "kv_mha_group";
+    const std::string key_k = "kv_mha_10001_k";
+    const std::string key_v = "kv_mha_10001_v";
+
+    auto meta = MakeKvMetadata(
+        group_id, 10001,
+        {KvBlockComponentSpec{key_k, "k", 0}, KvBlockComponentSpec{key_v, "v",
+                                                                    1}});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{meta};
+
+    // Two physical objects of the same logical block. Each PutStart is per-key
+    // but carries the same group-level metadata (idempotent retry).
+    ASSERT_TRUE(service_->PutStart(client_id, key_k, "default", 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutStart(client_id, key_v, "default", 1024, config)
+                    .has_value());
+
+    {
+        auto manifest = service_->GetKvGroupManifest("default", group_id);
+        ASSERT_TRUE(manifest.has_value());
+        // A single manifest with both expected components.
+        ASSERT_EQ(manifest->expected_object_keys.size(), 2u);
+        EXPECT_EQ(manifest->expected_object_keys[0], key_k);
+        EXPECT_EQ(manifest->expected_object_keys[1], key_v);
+        EXPECT_TRUE(manifest->current_object_keys.empty());
+    }
+
+    ASSERT_TRUE(service_->PutEnd(client_id, key_k, "default", ReplicaType::MEMORY)
+                    .has_value());
+    {
+        auto manifest = service_->GetKvGroupManifest("default", group_id);
+        ASSERT_TRUE(manifest.has_value());
+        EXPECT_EQ(manifest->current_object_keys.size(), 1u);
+    }
+
+    ASSERT_TRUE(service_->PutEnd(client_id, key_v, "default", ReplicaType::MEMORY)
+                    .has_value());
+    {
+        auto manifest = service_->GetKvGroupManifest("default", group_id);
+        ASSERT_TRUE(manifest.has_value());
+        ASSERT_EQ(manifest->current_object_keys.size(), 2u);
+        EXPECT_EQ(manifest->current_object_keys[0], key_k);
+        EXPECT_EQ(manifest->current_object_keys[1], key_v);
+    }
+}
+
+TEST_F(MasterServiceTest, KvEventManifestConflictingMetadataRejected) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    UUID client_id = generate_uuid();
+
+    const std::string group_id = "kv_conflict_group";
+    const std::string key1 = "kv_conf_a";
+    const std::string key2 = "kv_conf_b";
+    const std::vector<KvBlockComponentSpec> components{
+        KvBlockComponentSpec{key1, "k", 0},
+        KvBlockComponentSpec{key2, "v", 1}};
+
+    ReplicateConfig config1;
+    config1.replica_num = 1;
+    config1.group_ids = std::vector<std::string>{group_id};
+    config1.kv_event_metadata =
+        std::vector<KvBlockEventMetadata>{MakeKvMetadata(group_id, 10001,
+                                                         components)};
+    ASSERT_TRUE(service_->PutStart(client_id, key1, "default", 1024, config1)
+                    .has_value());
+
+    // Same group, different block_hash -> conflicting redefinition.
+    ReplicateConfig config2;
+    config2.replica_num = 1;
+    config2.group_ids = std::vector<std::string>{group_id};
+    config2.kv_event_metadata =
+        std::vector<KvBlockEventMetadata>{MakeKvMetadata(group_id, 20002,
+                                                         components)};
+    auto conflict = service_->PutStart(client_id, key2, "default", 1024,
+                                       config2);
+    EXPECT_FALSE(conflict.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, conflict.error());
+
+    // Original manifest is unchanged.
+    auto manifest = service_->GetKvGroupManifest("default", group_id);
+    ASSERT_TRUE(manifest.has_value());
+    EXPECT_EQ(manifest->metadata.block_hash, 10001u);
+}
+
+TEST_F(MasterServiceTest, KvEventManifestErasedWhenGroupRemoved) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    UUID client_id = generate_uuid();
+
+    const std::string key = "kv_remove_key";
+    const std::string group_id = FindGroupIdOnDifferentShard(key);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{MakeKvMetadata(
+        group_id, 10001, {KvBlockComponentSpec{key, "k", 0}})};
+
+    PutCompletedObject(*service_, client_id, key, config);
+    ASSERT_TRUE(service_->GetKvGroupManifest("default", group_id).has_value());
+
+    ASSERT_TRUE(
+        service_->Remove(key, "default", /*force=*/true).has_value());
+
+    // Group is now empty, so its manifest is gone too.
+    EXPECT_FALSE(service_->GetKvGroupManifest("default", group_id).has_value());
+}
+
+TEST_F(MasterServiceTest, KvEventMetadataConfigValidation) {
+    auto make_valid = [](const std::string& g) {
+        return MakeKvMetadata(g, 1, {KvBlockComponentSpec{g + "_k", "k", 0}});
+    };
+
+    // Valid config passes.
+    {
+        ReplicateConfig c;
+        c.group_ids = std::vector<std::string>{"g0"};
+        c.kv_event_metadata =
+            std::vector<KvBlockEventMetadata>{make_valid("g0")};
+        EXPECT_TRUE(
+            MasterService::ValidateKvEventMetadataConfig(c).has_value());
+    }
+
+    // No metadata is a no-op (valid).
+    {
+        ReplicateConfig c;
+        c.group_ids = std::vector<std::string>{"g0"};
+        EXPECT_TRUE(
+            MasterService::ValidateKvEventMetadataConfig(c).has_value());
+    }
+
+    // Metadata group_id not present in group_ids.
+    {
+        ReplicateConfig c;
+        c.group_ids = std::vector<std::string>{"g0"};
+        c.kv_event_metadata =
+            std::vector<KvBlockEventMetadata>{make_valid("other")};
+        auto r = MasterService::ValidateKvEventMetadataConfig(c);
+        EXPECT_FALSE(r.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, r.error());
+    }
+
+    // Empty metadata group_id.
+    {
+        ReplicateConfig c;
+        c.group_ids = std::vector<std::string>{""};
+        c.kv_event_metadata =
+            std::vector<KvBlockEventMetadata>{make_valid("")};
+        EXPECT_FALSE(
+            MasterService::ValidateKvEventMetadataConfig(c).has_value());
+    }
+
+    // Duplicate metadata for the same group.
+    {
+        ReplicateConfig c;
+        c.group_ids = std::vector<std::string>{"g0", "g0"};
+        c.kv_event_metadata = std::vector<KvBlockEventMetadata>{
+            make_valid("g0"), make_valid("g0")};
+        EXPECT_FALSE(
+            MasterService::ValidateKvEventMetadataConfig(c).has_value());
+    }
+
+    // Missing completeness expectation (no components and zero count).
+    {
+        ReplicateConfig c;
+        c.group_ids = std::vector<std::string>{"g0"};
+        KvBlockEventMetadata meta;
+        meta.group_id = "g0";
+        meta.block_size = 64;
+        c.kv_event_metadata = std::vector<KvBlockEventMetadata>{meta};
+        EXPECT_FALSE(
+            MasterService::ValidateKvEventMetadataConfig(c).has_value());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KV event publisher tests (Phase 2). A mock publisher captures the events the
+// master would otherwise send over its single ZMQ stream.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class MockKvEventPublisher : public KvEventPublisher {
+   public:
+    void Publish(const KvEvent& event) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.push_back(event);
+    }
+
+    std::vector<KvEvent> Events() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return events_;
+    }
+
+    size_t CountOfType(KvEventType type) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t count = 0;
+        for (const auto& event : events_) {
+            if (event.type == type) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.clear();
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::vector<KvEvent> events_;
+};
+
+}  // namespace
+
+TEST_F(MasterServiceTest, KvEventEncoderRoundTrip) {
+    KvEvent stored;
+    stored.type = KvEventType::kBlockStored;
+    stored.event_id = "mooncake:default:g1:stored:1";
+    stored.tenant_id = "tenant-a";
+    stored.group_id = "g1";
+    stored.worker_id = "mooncake-node-3";
+    stored.medium = "EXTERNAL";
+    stored.block_hashes = {10001};
+    stored.parent_block_hash = 9999;
+    stored.token_ids = {101, 102, 103};
+    stored.block_size = 64;
+    stored.lora_name = "adapter";
+    stored.model_name = "llama";
+    stored.dp_rank = 2;
+
+    auto decoded = DecodeKvEventMap(EncodeKvEventMap(stored));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(stored, decoded.value());
+
+    KvEvent removed;
+    removed.type = KvEventType::kBlockRemoved;
+    removed.event_id = "mooncake:default:g1:removed:2";
+    removed.tenant_id = "tenant-a";
+    removed.group_id = "g1";
+    removed.worker_id = "mooncake-node-3";
+    removed.medium = "EXTERNAL";
+    removed.block_hashes = {10001};
+
+    auto decoded_removed = DecodeKvEventMap(EncodeKvEventMap(removed));
+    ASSERT_TRUE(decoded_removed.has_value());
+    EXPECT_EQ(removed, decoded_removed.value());
+
+    // Batch payload [timestamp, [events], dp_rank].
+    auto payload = EncodeKvEventBatchPayload({stored, removed}, 1234.5, 0);
+    auto batch = DecodeKvEventBatchPayload(payload);
+    ASSERT_TRUE(batch.has_value());
+    EXPECT_DOUBLE_EQ(batch->timestamp, 1234.5);
+    ASSERT_EQ(batch->events.size(), 2u);
+    EXPECT_EQ(batch->events[0], stored);
+    EXPECT_EQ(batch->events[1], removed);
+    ASSERT_TRUE(batch->dp_rank.has_value());
+    EXPECT_EQ(batch->dp_rank.value(), 0);
+}
+
+TEST_F(MasterServiceTest, KvEventPublishesSingleBlockStoredWhenComplete) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    auto publisher = std::make_shared<MockKvEventPublisher>();
+    service_->SetKvEventPublisher(publisher);
+    UUID client_id = generate_uuid();
+
+    const std::string group_id = "kv_pub_mha_group";
+    const std::string key_k = "kv_pub_10001_k";
+    const std::string key_v = "kv_pub_10001_v";
+    auto meta = MakeKvMetadata(
+        group_id, 10001,
+        {KvBlockComponentSpec{key_k, "k", 0},
+         KvBlockComponentSpec{key_v, "v", 1}});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{meta};
+
+    // Write + complete only K: not enough to publish.
+    ASSERT_TRUE(service_->PutStart(client_id, key_k, "default", 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key_k, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(publisher->CountOfType(KvEventType::kBlockStored), 0u);
+
+    // Complete V: logical block is now complete -> one BlockStored.
+    ASSERT_TRUE(service_->PutStart(client_id, key_v, "default", 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key_v, "default", ReplicaType::MEMORY)
+                    .has_value());
+
+    auto events = publisher->Events();
+    ASSERT_EQ(events.size(), 1u);
+    const KvEvent& ev = events[0];
+    EXPECT_EQ(ev.type, KvEventType::kBlockStored);
+    EXPECT_EQ(ev.source, "mooncake");
+    EXPECT_EQ(ev.tenant_id, "default");
+    EXPECT_EQ(ev.group_id, group_id);
+    EXPECT_EQ(ev.medium, "EXTERNAL");
+    EXPECT_EQ(ev.worker_id, "test_segment");
+    ASSERT_EQ(ev.block_hashes.size(), 1u);
+    EXPECT_EQ(ev.block_hashes[0], 10001u);
+    ASSERT_TRUE(ev.parent_block_hash.has_value());
+    EXPECT_EQ(ev.parent_block_hash.value(), 10000u);
+    EXPECT_EQ(ev.token_ids, meta.token_ids);
+    EXPECT_EQ(ev.block_size, 64u);
+    EXPECT_FALSE(ev.event_id.empty());
+}
+
+TEST_F(MasterServiceTest, KvEventNoDuplicateBlockStoredOnRepeatedPutEnd) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    auto publisher = std::make_shared<MockKvEventPublisher>();
+    service_->SetKvEventPublisher(publisher);
+    UUID client_id = generate_uuid();
+
+    const std::string group_id = FindGroupIdOnDifferentShard("kv_dup_key");
+    const std::string key = "kv_dup_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{MakeKvMetadata(
+        group_id, 555, {KvBlockComponentSpec{key, "k", 0}})};
+
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, "default", 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(publisher->CountOfType(KvEventType::kBlockStored), 1u);
+
+    // Repeated PutEnd must not re-publish.
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(publisher->CountOfType(KvEventType::kBlockStored), 1u);
+}
+
+TEST_F(MasterServiceTest, KvEventPublishesSingleBlockRemovedOnDelete) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    auto publisher = std::make_shared<MockKvEventPublisher>();
+    service_->SetKvEventPublisher(publisher);
+    UUID client_id = generate_uuid();
+
+    const std::string group_id = "kv_rm_mha_group";
+    const std::string key_k = "kv_rm_10001_k";
+    const std::string key_v = "kv_rm_10001_v";
+    auto meta = MakeKvMetadata(
+        group_id, 10001,
+        {KvBlockComponentSpec{key_k, "k", 0},
+         KvBlockComponentSpec{key_v, "v", 1}});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{meta};
+
+    PutCompletedObject(*service_, client_id, key_k, config);
+    PutCompletedObject(*service_, client_id, key_v, config);
+    ASSERT_EQ(publisher->CountOfType(KvEventType::kBlockStored), 1u);
+
+    publisher->Clear();
+
+    // Removing one component makes the logical block unavailable -> one removed.
+    ASSERT_TRUE(
+        service_->Remove(key_k, "default", /*force=*/true).has_value());
+    auto removed_events = publisher->Events();
+    ASSERT_EQ(removed_events.size(), 1u);
+    EXPECT_EQ(removed_events[0].type, KvEventType::kBlockRemoved);
+    EXPECT_EQ(removed_events[0].group_id, group_id);
+    EXPECT_EQ(removed_events[0].worker_id, "test_segment");
+    ASSERT_EQ(removed_events[0].block_hashes.size(), 1u);
+    EXPECT_EQ(removed_events[0].block_hashes[0], 10001u);
+    EXPECT_TRUE(removed_events[0].token_ids.empty());
+
+    // Removing the second component must not publish another BlockRemoved.
+    ASSERT_TRUE(
+        service_->Remove(key_v, "default", /*force=*/true).has_value());
+    EXPECT_EQ(publisher->CountOfType(KvEventType::kBlockRemoved), 1u);
+}
+
+TEST_F(MasterServiceTest, KvEventNotPublishedWithoutPublisher) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    UUID client_id = generate_uuid();
+
+    const std::string key = "kv_nopub_key";
+    const std::string group_id = FindGroupIdOnDifferentShard(key);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{MakeKvMetadata(
+        group_id, 777, {KvBlockComponentSpec{key, "k", 0}})};
+
+    // No publisher installed: must behave normally and not crash.
+    PutCompletedObject(*service_, client_id, key, config);
+    auto manifest = service_->GetKvGroupManifest("default", group_id);
+    ASSERT_TRUE(manifest.has_value());
+    EXPECT_EQ(manifest->current_object_keys.size(), 1u);
+    ASSERT_TRUE(
+        service_->Remove(key, "default", /*force=*/true).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// segment -> worker_id registry tests. worker_id in published events must
+// reflect the physical worker (transport endpoint) rather than the logical
+// segment name, with deployment-config overrides taking precedence.
+// ---------------------------------------------------------------------------
+
+TEST_F(MasterServiceTest, SegmentWorkerRegistryCapturesEndpointAtMount) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Unknown segment: no mapping yet.
+    EXPECT_FALSE(service_->GetSegmentWorkerId("unmounted_seg").has_value());
+
+    Segment segment = MakeSegment("reg_logical_seg");
+    segment.te_endpoint = "10.0.0.7:4400";
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    auto worker_id = service_->GetSegmentWorkerId("reg_logical_seg");
+    ASSERT_TRUE(worker_id.has_value());
+    EXPECT_EQ(worker_id.value(), "10.0.0.7:4400");
+}
+
+TEST_F(MasterServiceTest, KvEventWorkerIdReflectsSegmentEndpoint) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto publisher = std::make_shared<MockKvEventPublisher>();
+    service_->SetKvEventPublisher(publisher);
+
+    // Segment whose physical endpoint differs from its logical name.
+    Segment segment = MakeSegment("worker_seg_logical");
+    segment.te_endpoint = "10.0.0.7:4400";
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string group_id = "kv_worker_seg_group";
+    const std::string key = "kv_worker_seg_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "worker_seg_logical";
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{
+        MakeKvMetadata(group_id, 4242, {KvBlockComponentSpec{key, "k", 0}})};
+
+    PutCompletedObject(*service_, client_id, key, config);
+
+    auto events = publisher->Events();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].type, KvEventType::kBlockStored);
+    // worker_id is the transport endpoint, not the logical segment name.
+    EXPECT_EQ(events[0].worker_id, "10.0.0.7:4400");
+}
+
+TEST_F(MasterServiceTest, KvEventWorkerIdExplicitOverrideWins) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto publisher = std::make_shared<MockKvEventPublisher>();
+    service_->SetKvEventPublisher(publisher);
+
+    Segment segment = MakeSegment("override_seg");
+    segment.te_endpoint = "10.0.0.9:5500";
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Explicit registration (deployment config / control plane) wins over the
+    // mount-time endpoint.
+    service_->RegisterSegmentWorkerId("override_seg", "logical-worker-42");
+    auto wid = service_->GetSegmentWorkerId("override_seg");
+    ASSERT_TRUE(wid.has_value());
+    EXPECT_EQ(wid.value(), "logical-worker-42");
+
+    const std::string group_id = "kv_override_group";
+    const std::string key = "kv_override_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "override_seg";
+    config.group_ids = std::vector<std::string>{group_id};
+    config.kv_event_metadata = std::vector<KvBlockEventMetadata>{
+        MakeKvMetadata(group_id, 99, {KvBlockComponentSpec{key, "k", 0}})};
+    PutCompletedObject(*service_, client_id, key, config);
+
+    auto events = publisher->Events();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].worker_id, "logical-worker-42");
+
+    // Clearing the override falls back to the mount-time endpoint.
+    service_->RegisterSegmentWorkerId("override_seg", "");
+    auto fallback = service_->GetSegmentWorkerId("override_seg");
+    ASSERT_TRUE(fallback.has_value());
+    EXPECT_EQ(fallback.value(), "10.0.0.9:5500");
+}
+
+#ifdef MOONCAKE_STORE_WITH_ZMQ
+// ---------------------------------------------------------------------------
+// Real ZMQ transport: a SUB socket must receive and decode the 3-frame
+// SGLang/vLLM-compatible message produced by ZmqKvEventPublisher.
+// ---------------------------------------------------------------------------
+TEST_F(MasterServiceTest, ZmqKvEventPublisherRoundTrip) {
+    ZmqKvEventPublisherConfig config;
+    config.endpoint = "tcp://127.0.0.1:*";  // let ZMQ pick a free port
+    config.topic = "";
+    ZmqKvEventPublisher pub(config);
+    const std::string endpoint = pub.endpoint();
+    ASSERT_FALSE(endpoint.empty());
+
+    zmq::context_t ctx(1);
+    zmq::socket_t sub(ctx, zmq::socket_type::sub);
+    sub.set(zmq::sockopt::subscribe, "");
+    sub.set(zmq::sockopt::rcvtimeo, 200);  // ms per recv
+    sub.connect(endpoint);
+
+    KvEvent event;
+    event.type = KvEventType::kBlockStored;
+    event.event_id = "mooncake:default:zmqg:stored:1";
+    event.tenant_id = "default";
+    event.group_id = "zmqg";
+    event.worker_id = "10.1.2.3:7000";
+    event.medium = "EXTERNAL";
+    event.block_hashes = {424242};
+    event.parent_block_hash = 424241;
+    event.token_ids = {7, 8, 9};
+    event.block_size = 16;
+    event.dp_rank = 1;
+
+    // PUB/SUB has a slow-joiner window; republish until the SUB receives a
+    // full 3-frame message.
+    std::optional<KvEventBatch> received;
+    for (int attempt = 0; attempt < 100 && !received.has_value(); ++attempt) {
+        pub.Publish(event);
+        zmq::message_t topic_frame;
+        auto topic_res = sub.recv(topic_frame, zmq::recv_flags::none);
+        if (!topic_res.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        ASSERT_TRUE(topic_frame.more());
+
+        zmq::message_t seq_frame;
+        ASSERT_TRUE(sub.recv(seq_frame, zmq::recv_flags::none).has_value());
+        EXPECT_EQ(seq_frame.size(), 8u);
+        ASSERT_TRUE(seq_frame.more());
+
+        zmq::message_t payload_frame;
+        ASSERT_TRUE(sub.recv(payload_frame, zmq::recv_flags::none).has_value());
+        EXPECT_FALSE(payload_frame.more());
+        received = DecodeKvEventBatchPayload(
+            std::string(static_cast<const char*>(payload_frame.data()),
+                        payload_frame.size()));
+    }
+
+    ASSERT_TRUE(received.has_value());
+    ASSERT_EQ(received->events.size(), 1u);
+    EXPECT_EQ(received->events[0], event);
+    ASSERT_TRUE(received->dp_rank.has_value());
+    EXPECT_EQ(received->dp_rank.value(), 1);
+    EXPECT_GT(pub.published_count(), 0u);
+}
+#endif  // MOONCAKE_STORE_WITH_ZMQ
 
 TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
     std::unique_ptr<MasterService> service_(new MasterService());
