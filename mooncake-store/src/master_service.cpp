@@ -1307,7 +1307,8 @@ bool MasterService::HasCompletedMemoryCacheReplica(
 bool MasterService::HasCompletedDiskCacheReplica(
     const ObjectMetadata& metadata) {
     return metadata.HasReplica([](const Replica& replica) {
-        return replica.is_disk_replica() && replica.is_completed();
+        return (replica.is_disk_replica() || replica.is_local_disk_replica()) &&
+               replica.is_completed();
     });
 }
 

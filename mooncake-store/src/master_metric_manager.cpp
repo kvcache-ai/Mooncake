@@ -845,11 +845,23 @@ void MasterMetricManager::inc_mem_cache_hit_bytes(int64_t val) {
 void MasterMetricManager::inc_file_cache_hit_bytes(int64_t val) {
     file_cache_hit_bytes_.inc(val);
 }
+int64_t MasterMetricManager::get_mem_cache_hit_bytes() {
+    return mem_cache_hit_bytes_.value();
+}
+int64_t MasterMetricManager::get_file_cache_hit_bytes() {
+    return file_cache_hit_bytes_.value();
+}
 void MasterMetricManager::inc_mem_cache_nums(int64_t val) {
     mem_cache_nums_.inc(val);
 }
 void MasterMetricManager::inc_file_cache_nums(int64_t val) {
     file_cache_nums_.inc(val);
+}
+int64_t MasterMetricManager::get_mem_cache_nums() {
+    return mem_cache_nums_.value();
+}
+int64_t MasterMetricManager::get_file_cache_nums() {
+    return file_cache_nums_.value();
 }
 void MasterMetricManager::dec_mem_cache_nums(int64_t val) {
     mem_cache_nums_.dec(val);
