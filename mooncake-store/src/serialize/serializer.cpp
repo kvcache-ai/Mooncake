@@ -830,9 +830,13 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     const MountedSegment &mounted_segment, MsgpackPacker &packer) {
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
-    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data...]
+    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data...,
+    // protocol]
+    //
+    // protocol is appended at the end so that older snapshots (size==8) remain
+    // deserializable. New snapshots use size==9.
 
-    packer.pack_array(8);
+    packer.pack_array(9);
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -855,12 +859,16 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
             if (!result) {
                 return tl::unexpected(result.error());
             }
+            // Append protocol at the end (new field, see format comment).
+            packer.pack(mounted_segment.segment.protocol);
             return {};
         }
     }
 
     packer.pack(false);  // Mark no valid buffer allocator exists
     packer.pack_nil();
+    // Append protocol at the end (new field, see format comment).
+    packer.pack(mounted_segment.segment.protocol);
     return {};
 }
 
@@ -877,6 +885,18 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize MountedSegment invalid array size"));
+    }
+
+    // Snapshot format is versioned by array size:
+    //   size == 8: legacy snapshot, no protocol field (see issue #2636)
+    //   size == 9: current snapshot, with protocol as the last field
+    // Anything else is invalid.
+    if (obj.via.array.size != 8 && obj.via.array.size != 9) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize MountedSegment invalid array size: "
+                        "expected 8 (legacy) or 9 (with protocol), got {}",
+                        obj.via.array.size)));
     }
 
     MountedSegment mounted_segment;
@@ -917,6 +937,14 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                 return tl::unexpected(allocatorResult.error());
             }
         }
+
+        // protocol is the trailing field added for issue #2636. Legacy
+        // snapshots (size==8) leave it as the Segment default (empty string),
+        // matching the previous (buggy) behavior so the segment can still be
+        // re-mounted and the user can see they need to upgrade.
+        if (obj.via.array.size == 9) {
+            mounted_segment.segment.protocol = array[8].as<std::string>();
+        }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -931,9 +959,12 @@ Serializer<OffsetBufferAllocator>::serialize(
     const OffsetBufferAllocator &allocator, MsgpackPacker &packer) {
     // Use array structure to pack OffsetBufferAllocator
     // Format: [segment_name, base, total_size, current_size,
-    // transport_endpoint, offset_allocator]
+    // transport_endpoint, offset_allocator, replica_type]
+    //
+    // replica_type is appended at the end so that older snapshots (size==6)
+    // remain deserializable. New snapshots use size==7. See issue #2636.
 
-    packer.pack_array(6);
+    packer.pack_array(7);
 
     // Serialize basic properties
     packer.pack(allocator.segment_name_);
@@ -950,6 +981,9 @@ Serializer<OffsetBufferAllocator>::serialize(
         return tl::unexpected(result.error());
     }
 
+    // Append replica_type as int8 at the end (see format comment).
+    packer.pack(static_cast<int8_t>(allocator.replica_type_));
+
     return {};
 }
 
@@ -963,10 +997,18 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
                                "serialized state: not a msgpack array"));
     }
 
-    if (obj.via.array.size != 6) {
+    // Snapshot format is versioned by array size:
+    //   size == 6: legacy snapshot, no replica_type (defaults to MEMORY,
+    //              which is the same wrong behavior as before the fix)
+    //   size == 7: current snapshot, with replica_type as the last field
+    // Anything else is invalid.
+    if (obj.via.array.size != 6 && obj.via.array.size != 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            "deserialize OffsetBufferAllocator invalid array size"));
+            fmt::format("deserialize OffsetBufferAllocator invalid array "
+                        "size: expected 6 (legacy) or 7 (with replica_type), "
+                        "got {}",
+                        obj.via.array.size)));
     }
 
     try {
@@ -986,9 +1028,18 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
             return tl::unexpected(offset_allocator_result.error());
         }
 
+        // replica_type is the trailing field added for issue #2636. Legacy
+        // snapshots (size==6) fall back to ReplicaType::MEMORY, which matches
+        // the previous (buggy) behavior - i.e. a NoF SSD segment would have
+        // its metrics counted under the memory bucket.
+        ReplicaType replica_type = ReplicaType::MEMORY;
+        if (obj.via.array.size == 7) {
+            replica_type = static_cast<ReplicaType>(array[6].as<int8_t>());
+        }
+
         // Create OffsetBufferAllocator instance
         auto allocator = std::make_shared<OffsetBufferAllocator>(
-            segment_name, base, total_size, transport_endpoint);
+            segment_name, base, total_size, transport_endpoint, replica_type);
 
         // Set internal member variable values
         allocator->offset_allocator_ = offset_allocator_result.value();
