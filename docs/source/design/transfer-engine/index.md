@@ -267,7 +267,7 @@ instead; this example is for developers who need to call the low-level Transfer
 Engine API.
 
 Install Mooncake from PyPI before running this example. The package selected in
-the [Mooncake Store Quick Start installation step](../../getting_started/quick-start.md#installation)
+the [Quick Start installation step](../../getting_started/quick-start.md#installation)
 also provides the Transfer Engine Python bindings and runtime components.
 
 #### Runtime prerequisites

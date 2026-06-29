@@ -1,8 +1,8 @@
-# Mooncake Store Quick Start
+# Quick Start
 
-Mooncake Store is the user-facing distributed KV cache backend for vLLM and
-SGLang HiCache. Most users only need to install Mooncake, start
-`mooncake_master`, and configure their serving framework to use Mooncake Store.
+Mooncake provides two common integration paths for vLLM and SGLang: Transfer
+Engine for direct KV transfer in PD disaggregation, and Mooncake Store as a
+distributed KV cache backend.
 
 Transfer Engine is the lower-level transport layer used by these integrations.
 If you are developing directly against the Transfer Engine API, see the
@@ -34,47 +34,31 @@ pip install mooncake-transfer-engine-non-cuda
 > sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
 > ```
 
-## Start Mooncake Store
-
-For vLLM and SGLang HiCache, start the Mooncake master service first. Many
-serving-framework integrations use Mooncake's HTTP metadata endpoint, so the
-safest starter command is:
-
-```shell
-mooncake_master --enable_http_metadata_server=true
-```
-
-The master's default RPC port is `50051`.
-
-If your deployment uses `P2PHANDSHAKE` or an external etcd/Redis metadata
-service instead of the embedded HTTP metadata server, the minimal master command
-is:
-
-```shell
-mooncake_master
-```
-
-If the master runs in a container and its IP is dynamic, set
-`--rpc_interface=<ifname>` such as `--rpc_interface=eth0`. Mooncake Master will
-resolve the current IPv4 address from that interface at startup instead of
-relying on a fixed `--rpc_address`.
-
 ## Connect vLLM or SGLang
 
-Choose the serving framework path that matches your deployment:
+Choose the integration path that matches your serving deployment.
 
-| Framework | Mooncake path | Start here |
-|-----------|---------------|------------|
-| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](examples/sglang-integration/hicache-quick-start.md) |
-| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](examples/vllm-integration/kv-cache-storage.md) |
+### PD Disaggregation
 
-SGLang and vLLM also support PD disaggregation paths that use Mooncake Transfer
-Engine for direct KV transfer between prefill and decode workers. Those paths
-are configured through the serving framework guides, not by calling Transfer
-Engine APIs directly:
+PD disaggregation paths use Mooncake Transfer Engine for direct KV transfer
+between prefill and decode workers. Configure these paths through the serving
+framework guides, not by calling Transfer Engine APIs directly:
 
 - [SGLang Integration Overview](examples/sglang-integration/index.md)
 - [vLLM Integration Overview](examples/vllm-integration/index.md)
+
+### Mooncake Store
+
+Mooncake Store provides distributed KV cache storage for vLLM and SGLang
+HiCache:
+
+| Framework | Use case | Setup guide |
+|-----------|----------|-------------|
+| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](examples/sglang-integration/hicache-quick-start.md) |
+| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](examples/vllm-integration/kv-cache-storage.md) |
+
+The serving framework guides include the required Mooncake Store service
+startup and connector configuration for each path.
 
 ## Optional Python Smoke Test
 
@@ -115,8 +99,15 @@ skills, Mooncake provides built-in playbooks for common development tasks:
 | `/mooncake-ci-local` | Run pre-PR local validation with Mooncake's CI script. |
 | `/mooncake-api` | Work with Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
 
-See [AI Coding Assistant Skills](../community/ai-coding-assistant-skills.md) for
-installation commands and details.
+Install them from the Claude Code plugin marketplace without cloning the full
+repository:
+
+```text
+/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
+/plugin install mooncake-troubleshoot@mooncake
+/plugin install mooncake-ci-local@mooncake
+/plugin install mooncake-api@mooncake
+```
 
 ## Next Steps
 
