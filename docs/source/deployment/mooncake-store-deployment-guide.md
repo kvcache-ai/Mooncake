@@ -80,7 +80,7 @@ Configure the script with command-line flags (run with `--help` for the full lis
 - `--local-hostname`: the local machine's reachable IP address or hostname.
 - `--metadata-server`: the Transfer Engine metadata service, e.g. `P2PHANDSHAKE`, `http://127.0.0.1:8080/metadata`, or an etcd address.
 - `--master-server`: the Mooncake Store master address. Use `IP:Port` in default mode, or `etcd://IP:Port;IP:Port;...;IP:Port` in etcd-backed HA mode.
-- `--protocol`: transport, `tcp` / `rdma` / `cxl` / `ascend` (defaults to `rdma`).
+- `--protocol`: transport, `tcp` / `rdma` / `efa` / `cxi` / `cxl` / `ascend` (defaults to `rdma`).
 
 Then start the roles:
 
@@ -441,7 +441,7 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--allocation_strategy` | `random` | `random` (pure random, fastest), `free_ratio_first` (best load balance), or `cxl` (prefer CXL memory) |
+| `--allocation_strategy` | `random` | `random` (pure random, fastest), `free_ratio_first` (best DRAM load balance), `ssd_free_ratio_first` (prefer segments with more SSD headroom), or `cxl` (prefer CXL memory) |
 
 ### PutStart Timeouts
 
@@ -607,7 +607,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `metadata_server` | str | required | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
 | `global_segment_size` | int (bytes) | required | DRAM contributed to the cluster (the sample uses 3.2 GB) |
 | `local_buffer_size` | int (bytes) | required | Transfer Engine buffer |
-| `protocol` | str | required | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
+| `protocol` | str | required | `tcp` / `rdma` / `efa` / `cxi` / `cxl` / `ascend` |
 | `rdma_devices` | str | required | RDMA NIC(s), comma-separated (pass `""` for non-RDMA). **Keyword is `rdma_devices`, not `device_name`** |
 | `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
@@ -635,8 +635,8 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 |----------|-------------------------|---------|-------------|
 | `MOONCAKE_MASTER` | `master_server_addr` | — (required unless `MOONCAKE_CONFIG_PATH`) | Master `host:port` |
 | `MOONCAKE_TE_META_DATA_SERVER` | `metadata_server` | `P2PHANDSHAKE` | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
-| `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
-| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated; `auto-discovery` supported |
+| `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `efa` / `cxi` / `cxl` / `ascend` |
+| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated; leave empty for default auto-discovery. The Store client also treats the literal `auto-discovery` as empty |
 | `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |

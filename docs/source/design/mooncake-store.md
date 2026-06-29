@@ -554,7 +554,7 @@ Mooncake Store provides multiple built-in allocation strategies to control how s
 ./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
 ```
 
-Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive).
+Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`, `cxl` (case-sensitive).
 
 #### How to Choose
 
@@ -562,6 +562,7 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 |---|---|---|
 | `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
 | `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
+| `ssd_free_ratio_first` | SSD-offload deployments with uneven SSD headroom | Requires SSD usage metrics; falls back to random when metrics are unavailable |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
 
 **Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
@@ -569,6 +570,8 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 **Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
+
+**Use `ssd_free_ratio_first`** when SSD offload is enabled and segment SSD capacity can become imbalanced. The strategy ranks sampled candidates by SSD free ratio so new memory allocations prefer segments with more SSD headroom. See [SSD Free-Ratio-First Allocation](ssd-free-ratio-first-allocation.md) for the full design.
 
 **Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
 
@@ -600,6 +603,12 @@ An improved strategy built on top of `RandomAllocationStrategy`. Instead of pick
 The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6*N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
 
 The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`ssd_free_ratio_first` — SsdFreeRatioFirstAllocationStrategy**
+
+An SSD-aware variant of `free_ratio_first`. It samples candidates using the same bounded Best-of-N shape, but ranks each segment by SSD free ratio instead of DRAM free ratio. Preferred segments are still honored first, and remaining replicas fall back to random allocation when SSD metrics are missing or insufficient.
+
+Use this strategy with `--allocation_strategy=ssd_free_ratio_first` in deployments where memory segments have local SSD offload enabled and SSD headroom should influence placement.
 
 **`cxl` — CxlAllocationStrategy**
 
