@@ -393,9 +393,10 @@ TEST_F(SerializerTest, OffsetBufferAllocatorRejectsUnsupportedReplicaType) {
     packer.pack(static_cast<uint64_t>(64ULL * 1024 * 1024));
     packer.pack(static_cast<uint64_t>(0ULL));
     packer.pack(std::string("seg_bad_replica_type:12345"));
-    auto ser_oa = Serializer<offset_allocator::OffsetAllocator>::serialize(
-        *source.getOffsetAllocator(), packer);
-    ASSERT_TRUE(ser_oa.has_value());
+    auto serialize_oa =
+        Serializer<offset_allocator::OffsetAllocator>::serialize(
+            *source.getOffsetAllocator(), packer);
+    ASSERT_TRUE(serialize_oa.has_value());
     packer.pack(static_cast<int8_t>(ReplicaType::DISK));
 
     msgpack::object_handle handle = msgpack::unpack(sbuf.data(), sbuf.size());
