@@ -19,6 +19,7 @@
 #include <cassert>
 
 #include "config.h"
+#include "memory_location.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -31,11 +32,44 @@ namespace mooncake {
 
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
 
+static std::string resolveBufferLocation(
+    const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
+    std::string location = buffer.name;
+    SegmentsLocationInfo seg_info;
+    if (parseSegmentsLocation(buffer.name, seg_info)) {
+        location = resolveSegmentsLocation(seg_info, buffer.length,
+                                           offset - buffer.addr);
+    }
+    return location;
+}
+
+static const std::string &sourceLocationOrUnknown(Transport::Slice *slice) {
+    static const std::string kUnknown = "<unknown>";
+    return slice->source_location.empty() ? kUnknown : slice->source_location;
+}
+
+static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
+                            uint64_t offset, size_t length,
+                            const std::string &local_hca, int &buffer_id,
+                            int &device_id, int retry_count = 0) {
+    const auto &config = globalConfig();
+    if (config.enable_hca_peer_affinity) {
+        return RdmaTransport::selectDeviceByLocalHca(
+            peer_segment_desc, offset, length, local_hca, buffer_id, device_id,
+            retry_count);
+    }
+
+    auto hint = config.enable_dest_device_affinity ? std::string_view(local_hca)
+                                                   : std::string_view();
+    return RdmaTransport::selectDevice(peer_segment_desc, offset, length, hint,
+                                       buffer_id, device_id, retry_count);
+}
+
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
-      suspended_flag_(0),
+      parked_worker_count_(0),
       redispatch_counter_(0),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
@@ -111,12 +145,9 @@ int WorkerPool::submitPostSend(
         }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
-        auto hint = globalConfig().enable_dest_device_affinity
-                        ? context_.deviceName()
-                        : "";
-        if (RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                        slice->rdma.dest_addr, slice->length,
-                                        hint, buffer_id, device_id)) {
+        if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                             slice->length, context_.deviceName(), buffer_id,
+                             device_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -127,9 +158,9 @@ int WorkerPool::submitPostSend(
                 continue;
             }
 
-            if (RdmaTransport::selectDevice(
-                    peer_segment_desc.get(), slice->rdma.dest_addr,
-                    slice->length, hint, buffer_id, device_id)) {
+            if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                                 slice->length, context_.deviceName(),
+                                 buffer_id, device_id)) {
                 slice->markFailed();
                 context_.engine().meta()->dumpMetadataContent(
                     peer_segment_desc->name, slice->rdma.dest_addr,
@@ -173,6 +204,20 @@ int WorkerPool::submitPostSend(
         }
 
         slice->peer_nic_path = peer_nic_path;
+        if (globalConfig().log_rdma_slice_affinity) {
+            VLOG(1) << "RDMA slice affinity: source_location="
+                    << sourceLocationOrUnknown(slice) << ", target_location="
+                    << resolveBufferLocation(
+                           peer_segment_desc->buffers[buffer_id],
+                           slice->rdma.dest_addr)
+                    << ", local_device_name=" << context_.deviceName()
+                    << ", peer_device_name="
+                    << peer_segment_desc->devices[device_id].name
+                    << ", target_id=" << slice->target_id
+                    << ", source_addr=" << slice->source_addr << ", dest_addr="
+                    << reinterpret_cast<void *>(slice->rdma.dest_addr)
+                    << ", length=" << slice->length;
+        }
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
         slice_list_map[shard_id].push_back(slice);
         submitted_slice_count++;
@@ -189,7 +234,8 @@ int WorkerPool::submitPostSend(
     }
 
     submitted_slice_count_.fetch_add(submitted_slice_count);
-    if (suspended_flag_.load()) {
+    if (submitted_slice_count &&
+        parked_worker_count_.load(std::memory_order_acquire) > 0) {
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
     }
@@ -208,7 +254,6 @@ int WorkerPool::submitPostSend(
 void WorkerPool::performPostSend(int thread_id) {
     // Fast-fail if context is unhealthy due to catastrophic hardware failure
     if (!contextHealthy()) {
-        auto &local_slice_queue = collective_slice_queue_[thread_id];
         for (int shard_id = thread_id; shard_id < kShardCount;
              shard_id += kTransferWorkerCount) {
             if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) ==
@@ -421,10 +466,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
             int buffer_id, device_id;
             if (!peer_segment_desc ||
-                RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                            slice->rdma.dest_addr,
-                                            slice->length, buffer_id, device_id,
-                                            slice->rdma.retry_cnt)) {
+                selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                                 slice->length, context_.deviceName(),
+                                 buffer_id, device_id, slice->rdma.retry_cnt)) {
                 slice->markFailed();
                 processed_slice_count_++;
                 continue;
@@ -435,9 +479,34 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
+            if (globalConfig().log_rdma_slice_affinity) {
+                VLOG(1) << "RDMA slice affinity: source_location="
+                        << sourceLocationOrUnknown(slice)
+                        << ", target_location="
+                        << resolveBufferLocation(
+                               peer_segment_desc->buffers[buffer_id],
+                               slice->rdma.dest_addr)
+                        << ", local_device_name=" << context_.deviceName()
+                        << ", peer_device_name="
+                        << peer_segment_desc->devices[device_id].name
+                        << ", target_id=" << slice->target_id
+                        << ", source_addr=" << slice->source_addr
+                        << ", dest_addr="
+                        << reinterpret_cast<void *>(slice->rdma.dest_addr)
+                        << ", length=" << slice->length
+                        << ", retry_cnt=" << slice->rdma.retry_cnt;
+            }
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
         }
     }
+}
+
+bool WorkerPool::hasOutstandingCq(int thread_id) {
+    for (int cq_index = thread_id; cq_index < context_.cqCount();
+         cq_index += kTransferWorkerCount) {
+        if (*context_.cqOutstandingCount(cq_index) > 0) return true;
+    }
+    return false;
 }
 
 void WorkerPool::transferWorker(int thread_id) {
@@ -449,18 +518,21 @@ void WorkerPool::transferWorker(int thread_id) {
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
             submitted_slice_count_.load(std::memory_order_relaxed);
-        if (processed_slice_count == submitted_slice_count) {
+        if (processed_slice_count == submitted_slice_count &&
+            !hasOutstandingCq(thread_id)) {
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
-                suspended_flag_.fetch_add(1);
+                parked_worker_count_.fetch_add(1, std::memory_order_acq_rel);
                 // Double-check condition after acquiring lock to avoid lost
-                // wakeup
+                // wakeup. parked_worker_count_ is set before this check so
+                // producers that submit after it will notify this worker.
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
-                    submitted_slice_count_.load()) {
+                        submitted_slice_count_.load() &&
+                    !hasOutstandingCq(thread_id)) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
-                suspended_flag_.fetch_sub(1);
+                parked_worker_count_.fetch_sub(1, std::memory_order_acq_rel);
                 last_wait_ts = curr_wait_ts;
             }
             continue;

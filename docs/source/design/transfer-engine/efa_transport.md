@@ -4,6 +4,7 @@ This document describes how to build and use Mooncake with AWS Elastic Fabric Ad
 
 ## Prerequisites
 
+(efa-prerequisites-driver)=
 ### 1. AWS EFA Driver and libfabric
 
 EFA driver and libfabric should be pre-installed on AWS instances with EFA support (e.g., p6-b300.48xlarge, p6-b200.48xlarge, p5en.48xlarge, p5e.48xlarge, p5.48xlarge).
@@ -33,6 +34,22 @@ sudo ./dependencies.sh -y
 This installs all system packages, git submodules (including pybind11 and yalantinglibs), and Go.
 
 > **Note:** The EFA driver and libfabric are **not** installed by `dependencies.sh`. They must be pre-installed on the instance (see section 1 above).
+
+## Installing from PyPI (recommended)
+
+Pre-built EFA wheels are published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so two variants are published:
+
+```bash
+# GPU memory transfers (e.g., KV cache in vLLM) — built with USE_CUDA=ON
+pip install mooncake-transfer-engine-efa
+
+# CPU/DRAM-only transfers — built with USE_CUDA=OFF
+pip install mooncake-transfer-engine-efa-non-cuda
+```
+
+> **Note:** These wheels deliberately do **not** bundle `libfabric`/`libefa` (see the runtime note in [Building a Distributable Wheel](#efa-distributable-wheel)). They resolve to the system AWS EFA installation at runtime, so the EFA driver and libfabric from the [Prerequisites](#efa-prerequisites-driver) must still be present on the instance. Make sure `/opt/amazon/efa/lib` is on `LD_LIBRARY_PATH`.
+
+To build from source instead (for development, an unreleased revision, or a custom configuration), follow the sections below.
 
 ## Building Mooncake with EFA Support
 
@@ -80,11 +97,10 @@ cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/
 pip install -e ../mooncake-wheel --no-build-isolation
 ```
 
+(efa-distributable-wheel)=
 ### 3. Building a Distributable Wheel (optional)
 
-To produce a relocatable wheel for distribution (instead of the editable
-install above), use `scripts/build_wheel.sh`, which runs `auditwheel
-repair` to bundle non-system dependencies:
+To produce a relocatable wheel for distribution (instead of the editable install above), use `scripts/build_wheel.sh`, which runs `auditwheel repair` to bundle non-system dependencies:
 
 ```bash
 # After the cmake/make build above completes:
@@ -92,21 +108,19 @@ PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
 pip install dist/mooncake_transfer_engine-*.whl
 ```
 
-> **Important (EFA builds):** `auditwheel repair` excludes `libfabric`
-> and `libefa` from the wheel so they resolve to the system EFA
-> installation (`/opt/amazon/efa/lib`) at runtime. This is required
-> because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the
-> **same** system `libfabric`. If the wheel bundled its own copy, the
-> process would load two independent libfabric instances — Mooncake's
-> bundled one and NCCL's system one — and whichever initializes first
-> claims the EFA device, leaving the other with an empty provider list
-> (`fi_getinfo: provider efa output empty list`). NCCL then silently
-> falls back to the TCP provider and cross-node collectives such as
-> `all_gather_object` hang. Excluding libfabric/libefa (see
-> `scripts/build_wheel.sh`) keeps a single shared libfabric in the
-> process. If you are on an older Mooncake build whose wheel still bundles
-> libfabric, force the system copy with
-> `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
+To produce a wheel whose package name matches the published variants (`mooncake-transfer-engine-efa` / `-efa-non-cuda`), set the corresponding build-variant environment variable — this is exactly what the release pipeline does:
+
+```bash
+# GPU build (cmake was configured with USE_CUDA=ON):
+EFA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+
+# CPU build (cmake was configured with USE_CUDA=OFF):
+EFA_NON_CUDA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+```
+
+> **CI/CD:** EFA wheels are built and published automatically — see `.github/workflows/ci_efa.yml` (per-PR build validation) and `.github/workflows/release-efa.yaml` (tagged release to GitHub Release + PyPI). No EFA hardware is required to *build* the wheel: only the libfabric headers/library are needed to compile and link, which the CI runner obtains from the distro `libfabric-dev` package.
+
+> **Important (EFA builds):** `auditwheel repair` excludes `libfabric` and `libefa` from the wheel so they resolve to the system EFA installation (`/opt/amazon/efa/lib`) at runtime. This is required because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the **same** system `libfabric`. If the wheel bundled its own copy, the process would load two independent libfabric instances — Mooncake's bundled one and NCCL's system one — and whichever initializes first claims the EFA device, leaving the other with an empty provider list (`fi_getinfo: provider efa output empty list`). NCCL then silently falls back to the TCP provider and cross-node collectives such as `all_gather_object` hang. Excluding libfabric/libefa (see `scripts/build_wheel.sh`) keeps a single shared libfabric in the process. If you are on an older Mooncake build whose wheel still bundles libfabric, force the system copy with `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
 
 ## Verification
 
@@ -158,18 +172,10 @@ cd build && ctest --output-on-failure -R 'efa'
 
 Use `transfer_engine_bench` to measure EFA transport throughput between two nodes.
 
-The following commands are the GPU-to-GPU configuration that produces
-the headline numbers in the [Benchmark Results](#benchmark-results)
-tables (≈ 350 GB/s write on a p5en.48xlarge pair, ≈ 302 GB/s on
-p6-b200.48xlarge). Two things matter the most:
+The following commands are the GPU-to-GPU configuration that produces the headline numbers in the [Benchmark Results](#benchmark-results) tables (≈ 350 GB/s write on a p5en.48xlarge pair, ≈ 302 GB/s on p6-b200.48xlarge). Two things matter the most:
 
-- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU,
-  which in turn lets both NUMA nodes' NICs saturate. Pinning a single
-  GPU (the default `--gpu_id=0`) halves throughput because half the
-  NICs end up cross-NUMA.
-- `--block_size=1048576` (1MB, not the 64 KB default) — each block
-  becomes one `fi_write` / `fi_read`, so larger blocks amortize
-  per-op overhead and are the main knob for hitting line rate.
+- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU, which in turn lets both NUMA nodes' NICs saturate. Pinning a single GPU (the default `--gpu_id=0`) halves throughput because half the NICs end up cross-NUMA.
+- `--block_size=1048576` (1MB, not the 64 KB default) — each block becomes one `fi_write` / `fi_read`, so larger blocks amortize per-op overhead and are the main knob for hitting line rate.
 
 ### 1. Target Node (receiver)
 
@@ -182,9 +188,7 @@ p6-b200.48xlarge). Two things matter the most:
     --gpu_id=-1
 ```
 
-`--buffer_size` must be at least as large as the initiator's
-`--buffer_size` — the initiator writes into offsets `[0, buffer_size)`
-on the target, so keep these in sync.
+`--buffer_size` must be at least as large as the initiator's `--buffer_size` — the initiator writes into offsets `[0, buffer_size)` on the target, so keep these in sync.
 
 ### 2. Initiator Node (sender)
 
@@ -204,8 +208,7 @@ on the target, so keep these in sync.
     --report_unit=GB
 ```
 
-Replace `<target_hostname>:<target_port>` with the target node's
-address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
+Replace `<target_hostname>:<target_port>` with the target node's address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 > **CPU-to-CPU** (no GPUs): build with `-DUSE_CUDA=OFF`, **or** pass `--use_vram=false` to a CUDA-enabled binary. Drop `--gpu_id=-1` in that case — the bench will spread buffers across NUMA nodes instead.
 
@@ -231,11 +234,7 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 | `--init_mem` | true | Zero-fill the allocated buffer; rarely needs to change |
 | `--auto_discovery` | false | Auto-discover topology on init; off for reproducible runs |
 
-> **Note on EFA slicing:** EFA transport does not split each transfer
-> into fixed-size slices the way RDMA transport does — each transfer
-> is sent as a single `fi_write` / `fi_read` whose size equals
-> `block_size`, round-robin'd across NICs per request. **`block_size`
-> is the key tuning parameter** for EFA throughput.
+> **Note on EFA slicing:** EFA transport does not split each transfer into fixed-size slices the way RDMA transport does — each transfer is sent as a single `fi_write` / `fi_read` whose size equals `block_size`, round-robin'd across NICs per request. **`block_size` is the key tuning parameter** for EFA throughput.
 
 > **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
@@ -271,10 +270,7 @@ Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 1
 
 Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 
-> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and
-> current EFA tuning work. They are a lower bound for the current
-> code; we will re-sweep and update when a B200 pair is available
-> again.
+> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and current EFA tuning work. They are a lower bound for the current code; we will re-sweep and update when a B200 pair is available again.
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
 
@@ -374,20 +370,10 @@ Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA device
 
 ### Single-host loopback
 
-EFA NICs have no hardware loopback short-circuit: when a transfer's source and
-destination resolve to the same host, the data does not go out on the wire as
-GPUDirect/device RDMA. libfabric handles the same-host case in software, and
-there are **two distinct provider knobs** that select how:
+EFA NICs have no hardware loopback short-circuit: when a transfer's source and destination resolve to the same host, the data does not go out on the wire as GPUDirect/device RDMA. libfabric handles the same-host case in software, and there are **two distinct provider knobs** that select how:
 
-- **`FI_EFA_ENABLE_SHM_TRANSFER`** (default `1`, on): when on, the EFA
-  provider routes same-host peers through the **`shm` provider** — verifiable
-  at runtime, where libfabric reports `Opened fabric: shm` alongside
-  `Opened fabric: efa` even on a default (device-RDMA-enabled) configuration.
-  This SHM path is the one that supplies the same-host memcpy fast path; it is
-  active **by default**, independent of `FI_EFA_USE_DEVICE_RDMA`.
-- **`FI_EFA_USE_DEVICE_RDMA`** (default `1` after #2041): controls whether the
-  EFA RDM data path uses device RDMA vs libfabric's emulated RDM path. It is a
-  provider-level flag resolved at `fi_getinfo` time; Mooncake does not wrap it.
+- **`FI_EFA_ENABLE_SHM_TRANSFER`** (default `1`, on): when on, the EFA provider routes same-host peers through the **`shm` provider** — verifiable at runtime, where libfabric reports `Opened fabric: shm` alongside `Opened fabric: efa` even on a default (device-RDMA-enabled) configuration. This SHM path is the one that supplies the same-host memcpy fast path; it is active **by default**, independent of `FI_EFA_USE_DEVICE_RDMA`.
+- **`FI_EFA_USE_DEVICE_RDMA`** (default `1` after #2041): controls whether the EFA RDM data path uses device RDMA vs libfabric's emulated RDM path. It is a provider-level flag resolved at `fi_getinfo` time; Mooncake does not wrap it.
 
 ```{warning}
 **GPU (FI_HMEM_CUDA) buffers — known segfault.** The default same-host **SHM**
@@ -411,23 +397,16 @@ transfer — `__memcpy_avx_unaligned` ← `ofi_copy_to_mr_iov` ← `smr_copy_fro
   then fall back to device RDMA, which is GPU-aware and correct.
 ```
 
-For **host (DRAM) buffers** the SHM memcpy path is safe (host→host copy) and is
-the same-host fast path the measurements below exercise.
+For **host (DRAM) buffers** the SHM memcpy path is safe (host→host copy) and is the same-host fast path the measurements below exercise.
 
-Measured on p5.48xlarge (1 NIC, ~1.2 GiB per `put_from` call, host DRAM buffer,
-same-host producer/consumer in **separate processes**):
+Measured on p5.48xlarge (1 NIC, ~1.2 GiB per `put_from` call, host DRAM buffer, same-host producer/consumer in **separate processes**):
 
 | same-host path | per-write latency |
 |---|---:|
 | device RDMA (NIC round-trip, no fast-path for loopback) | ~830 ms |
 | SHM memcpy fast path (default) | ~390 ms |
 
-For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC)
-is ~340 ms — i.e., driving a same-host loopback through the NIC is *slower* than
-going over the wire to another host, because the NIC has no fast-path for
-loopback. Cross-host transfers always use device RDMA and are unaffected by
-`FI_EFA_ENABLE_SHM_TRANSFER`: leave it at its default on any process that also
-talks to remote peers.
+For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC) is ~340 ms — i.e., driving a same-host loopback through the NIC is *slower* than going over the wire to another host, because the NIC has no fast-path for loopback. Cross-host transfers always use device RDMA and are unaffected by `FI_EFA_ENABLE_SHM_TRANSFER`: leave it at its default on any process that also talks to remote peers.
 
 ### Tuning Tips
 
@@ -436,9 +415,7 @@ talks to remote peers.
 - **Write vs read:** write benefits from larger batches (peak at `batch=128`); on 16-NIC p5en read prefers smaller queues (peak at `batch=32`), but on 32-NIC p5 reads scale up to `batch=128` because the wider fabric absorbs larger in-flight queues.
 - For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU halves throughput because half the NICs end up cross-NUMA.
 - For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split (separate initiator/target instances per NUMA node) can help reduce contention when one instance can't saturate both nodes.
-- `--buffer_size` only needs `≥ block × batch × threads`; larger
-  values do not improve throughput. The example commands use 4 GB
-  because that is safe for any reasonable config.
+- `--buffer_size` only needs `≥ block × batch × threads`; larger values do not improve throughput. The example commands use 4 GB because that is safe for any reasonable config.
 
 ### First-request latency
 
@@ -461,7 +438,7 @@ The SRD shared-endpoint refactor (#1944) speeds up first-request latency two dif
   - Rust: `TransferEngine::warmup_efa_segment(name: &str)`
   - Python: `engine.warmup_efa_segment(segment_name)`
 
-  Call once per peer right after `openSegment`. The call is idempotent. Under this refactor `warmupSegment` itself is ~15× faster than the pre-#1944 code (1.1 s vs 17 s), bounded by the peer's single-threaded handshake RPC daemon (`accept` + JSON parse serialized on one thread), so it scales linearly with the number of fresh NIC pairs.
+Call once per peer right after `openSegment`. The call is idempotent. Under this refactor `warmupSegment` itself is ~15× faster than the pre-#1944 code (1.1 s vs 17 s), bounded by the peer's single-threaded handshake RPC daemon (`accept` + JSON parse serialized on one thread), so it scales linearly with the number of fresh NIC pairs.
 
 vLLM and SGLang do not currently call `warmupSegment` — they go through the generic `TransferEngine` interface and pick up the 4× cold-submit speedup automatically. The API is there for direct Mooncake callers that want the larger win.
 
@@ -556,12 +533,7 @@ vllm-router --policy round_robin \
   --host 0.0.0.0 --port 30000
 ```
 
-> **Do not add `--intra-node-data-parallel-size` here.** The prefill / decode
-> instances above are launched with `-tp 8` (pure tensor parallelism, data
-> parallel size = 1), so there is no intra-node DP to advertise. Only pass
-> `--intra-node-data-parallel-size N` when your instances actually run `N`-way
-> data parallelism per node (e.g. you launched them with `--data-parallel-size N`);
-> setting it to match `-tp 8` is wrong and will misroute requests.
+> **Do not add `--intra-node-data-parallel-size` here.** The prefill / decode instances above are launched with `-tp 8` (pure tensor parallelism, data parallel size = 1), so there is no intra-node DP to advertise. Only pass `--intra-node-data-parallel-size N` when your instances actually run `N`-way data parallelism per node (e.g. you launched them with `--data-parallel-size N`); setting it to match `-tp 8` is wrong and will misroute requests.
 
 ## Usage with SGLang
 
@@ -651,18 +623,9 @@ The trailing `8998` after `--prefill` must match the prefill's `--disaggregation
 
 ### Why libfabric instead of ibverbs?
 
-AWS EFA exposes an RDMA-capable device through the ibverbs interface, but it does
-**not** implement the full ibverbs API. In particular, EFA only supports
-**SRD** (Scalable Reliable Datagram) and **UD** (Unreliable Datagram) queue
-pairs — it does **not** support the **RC** (Reliable Connection) queue pairs
-that Mooncake's RDMA (`rdma`) transport is built on. Attempting to create an RC
-QP on an EFA device fails (`EOPNOTSUPP`), and SRD has no one-sided RC-style
-`ibv_post_send(RDMA_WRITE)` verb in the public ibverbs API.
+AWS EFA exposes an RDMA-capable device through the ibverbs interface, but it does **not** implement the full ibverbs API. In particular, EFA only supports **SRD** (Scalable Reliable Datagram) and **UD** (Unreliable Datagram) queue pairs — it does **not** support the **RC** (Reliable Connection) queue pairs that Mooncake's RDMA (`rdma`) transport is built on. Attempting to create an RC QP on an EFA device fails (`EOPNOTSUPP`), and SRD has no one-sided RC-style `ibv_post_send(RDMA_WRITE)` verb in the public ibverbs API.
 
-The portable way to drive EFA's SRD transport is libfabric, whose EFA provider
-exposes SRD through the `FI_EP_RDM` (Reliable Datagram Message) endpoint type and
-implements `fi_write` / `fi_read` (one-sided RMA) on top of it. Mooncake's EFA
-transport therefore targets libfabric directly rather than ibverbs.
+The portable way to drive EFA's SRD transport is libfabric, whose EFA provider exposes SRD through the `FI_EP_RDM` (Reliable Datagram Message) endpoint type and implements `fi_write` / `fi_read` (one-sided RMA) on top of it. Mooncake's EFA transport therefore targets libfabric directly rather than ibverbs.
 
 ### EFA Transport Architecture
 
@@ -691,15 +654,7 @@ Under the SRD shared-endpoint model every peer is addressed through one `fid_ep`
 └───────────────────────────────────────────────────────────┘
 ```
 
-> **Peer-map keying.** `peer_map_` is keyed by the **full** `host:port@nic`
-> path, *not* a port-stripped form. Under SGLang DP > 1 each DP worker on a
-> peer host is a separate process with its own Mooncake `TransferEngine` and
-> its own P2PHANDSHAKE RPC port; they share host + NIC but have distinct EFA
-> addresses. Normalizing the port away would collapse every DP worker on that
-> host onto one `EfaEndPoint`, so each arriving handshake would look like a
-> "peer reconnected" to the previous holder and trigger `fi_av_remove` +
-> `fi_av_insert` churn on every KV transfer. Keeping the port in the key costs
-> nothing in steady state (the port is stable for a worker's lifetime).
+> **Peer-map keying.** `peer_map_` is keyed by the **full** `host:port@nic` path, *not* a port-stripped form. Under SGLang DP > 1 each DP worker on a peer host is a separate process with its own Mooncake `TransferEngine` and its own P2PHANDSHAKE RPC port; they share host + NIC but have distinct EFA addresses. Normalizing the port away would collapse every DP worker on that host onto one `EfaEndPoint`, so each arriving handshake would look like a "peer reconnected" to the previous holder and trigger `fi_av_remove` + `fi_av_insert` churn on every KV transfer. Keeping the port in the key costs nothing in steady state (the port is stable for a worker's lifetime).
 
 ### Thread Safety
 
@@ -708,12 +663,7 @@ The EFA transport requests `FI_THREAD_SAFE` at the domain level and guards the s
 - Multiple submission threads may route slices through the same shared endpoint concurrently.
 - libfabric's EFA RDM endpoints are not thread-safe for concurrent `fi_write`/`fi_read` even under `FI_THREAD_SAFE` at the domain level — concurrent posts corrupt provider internals and completions silently vanish.
 
-CQ completion queues are polled by dedicated worker threads that run
-independently of submission threads. The poller count is `min(MC_EFA_CQ_THREADS,
-num_EFA_devices)`; `MC_EFA_CQ_THREADS` defaults to `1`, so a single poller
-round-robins every context's CQ (which already reaches ~99.9% of peak — see the
-SGLang env-var note above). Set `MC_EFA_CQ_THREADS=0` to lift the cap and spawn
-one poller per EFA device (the legacy behavior).
+CQ completion queues are polled by dedicated worker threads that run independently of submission threads. The poller count is `min(MC_EFA_CQ_THREADS, num_EFA_devices)`; `MC_EFA_CQ_THREADS` defaults to `1`, so a single poller round-robins every context's CQ (which already reaches ~99.9% of peak — see the SGLang env-var note above). Set `MC_EFA_CQ_THREADS=0` to lift the cap and spawn one poller per EFA device (the legacy behavior).
 
 ### EFA vs RoCE RDMA
 
@@ -728,12 +678,7 @@ one poller per EFA device (the legacy behavior).
 | Throughput CPU-to-CPU (16×200G, p5en) | 213 GB/s (tuned) | — |
 | AWS availability | All EFA-enabled instances | Not available on AWS |
 
-> Mooncake requests libfabric API ≥ 1.18 at `fi_getinfo`, which makes
-> `FI_EFA_USE_DEVICE_RDMA=1` the default on every supported EFA generation
-> (p5/p5e included). On this path `fi_write` / `fi_read` are hardware-offloaded
-> one-sided RMA over SRD — the host CPU is not in the data path. The
-> software-emulated RMA path only applies if you explicitly set
-> `FI_EFA_USE_DEVICE_RDMA=0`.
+> Mooncake requests libfabric API ≥ 1.18 at `fi_getinfo`, which makes `FI_EFA_USE_DEVICE_RDMA=1` the default on every supported EFA generation (p5/p5e included). On this path `fi_write` / `fi_read` are hardware-offloaded one-sided RMA over SRD — the host CPU is not in the data path. The software-emulated RMA path only applies if you explicitly set `FI_EFA_USE_DEVICE_RDMA=0`.
 
 ### Supported AWS Instance Types
 

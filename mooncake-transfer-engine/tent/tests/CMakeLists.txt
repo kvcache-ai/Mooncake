@@ -161,3 +161,15 @@ target_include_directories(tent_progress_worker_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_progress_worker_test
          COMMAND tent_progress_worker_test)
+
+add_executable(tent_runtime_queue_dispatch_test
+               runtime_queue_dispatch_test.cpp)
+target_link_libraries(tent_runtime_queue_dispatch_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_runtime_queue_dispatch_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_runtime_queue_dispatch_test
+         COMMAND tent_runtime_queue_dispatch_test)
