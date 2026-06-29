@@ -2811,6 +2811,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         metadata.AddReplicas(std::move(replicas));
         auto& shard = accessor.GetShard();
         shard.OnDiskReplicaAdded(metadata);
+        SyncCacheTotalAccounting(metadata);
         return {};
     }
 
