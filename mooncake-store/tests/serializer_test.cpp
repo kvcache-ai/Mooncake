@@ -218,8 +218,10 @@ TEST_F(SerializerTest, MountedSegmentProtocolRoundTrip) {
 
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(sbuf);
-    auto ser_result = Serializer<MountedSegment>::serialize(original, packer);
-    ASSERT_TRUE(ser_result.has_value()) << ser_result.error().message;
+    auto serialize_result =
+        Serializer<MountedSegment>::serialize(original, packer);
+    ASSERT_TRUE(serialize_result.has_value())
+        << serialize_result.error().message;
 
     msgpack::object_handle handle = msgpack::unpack(sbuf.data(), sbuf.size());
     const auto& obj = handle.get();
@@ -253,9 +255,10 @@ TEST_F(SerializerTest, OffsetBufferAllocatorReplicaTypeRoundTrip) {
 
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(sbuf);
-    auto ser_result =
+    auto serialize_result =
         Serializer<OffsetBufferAllocator>::serialize(original, packer);
-    ASSERT_TRUE(ser_result.has_value()) << ser_result.error().message;
+    ASSERT_TRUE(serialize_result.has_value())
+        << serialize_result.error().message;
 
     msgpack::object_handle handle = msgpack::unpack(sbuf.data(), sbuf.size());
     const auto& obj = handle.get();
@@ -348,9 +351,10 @@ TEST_F(SerializerTest, OffsetBufferAllocatorLegacyFormatCompat) {
     packer.pack(std::string("legacy_nof_seg:12345"));
     // 6th element: serialize the offset_allocator using the same path
     // the production writer uses, so the inner layout matches exactly.
-    auto ser_oa = Serializer<offset_allocator::OffsetAllocator>::serialize(
-        *source.getOffsetAllocator(), packer);
-    ASSERT_TRUE(ser_oa.has_value());
+    auto serialize_oa =
+        Serializer<offset_allocator::OffsetAllocator>::serialize(
+            *source.getOffsetAllocator(), packer);
+    ASSERT_TRUE(serialize_oa.has_value());
 
     msgpack::object_handle handle = msgpack::unpack(sbuf.data(), sbuf.size());
     const auto& obj = handle.get();
@@ -371,6 +375,36 @@ TEST_F(SerializerTest, OffsetBufferAllocatorLegacyFormatCompat) {
     // from a pre-fix snapshot continues to misreport as MEMORY. New
     // snapshots (size==7) carry the correct type.
     EXPECT_EQ(ReplicaType::MEMORY, restored->getReplicaType());
+}
+
+// OffsetBufferAllocator only has MEMORY and NOF_SSD accounting semantics.
+// Other ReplicaType values may be valid for object replicas, but they must not
+// be accepted as allocator types during snapshot restore.
+TEST_F(SerializerTest, OffsetBufferAllocatorRejectsUnsupportedReplicaType) {
+    OffsetBufferAllocator source(
+        "seg_bad_replica_type", 0x100000000ULL, 64ULL * 1024 * 1024,
+        "seg_bad_replica_type:12345", ReplicaType::MEMORY);
+
+    msgpack::sbuffer sbuf;
+    msgpack::packer<msgpack::sbuffer> packer(sbuf);
+    packer.pack_array(7);
+    packer.pack(std::string("seg_bad_replica_type"));
+    packer.pack(static_cast<uint64_t>(0x100000000ULL));
+    packer.pack(static_cast<uint64_t>(64ULL * 1024 * 1024));
+    packer.pack(static_cast<uint64_t>(0ULL));
+    packer.pack(std::string("seg_bad_replica_type:12345"));
+    auto ser_oa = Serializer<offset_allocator::OffsetAllocator>::serialize(
+        *source.getOffsetAllocator(), packer);
+    ASSERT_TRUE(ser_oa.has_value());
+    packer.pack(static_cast<int8_t>(ReplicaType::DISK));
+
+    msgpack::object_handle handle = msgpack::unpack(sbuf.data(), sbuf.size());
+    const auto& obj = handle.get();
+
+    auto de_result = Serializer<OffsetBufferAllocator>::deserialize(obj);
+    ASSERT_FALSE(de_result.has_value());
+    EXPECT_NE(std::string::npos,
+              de_result.error().message.find("invalid replica_type"));
 }
 
 }  // namespace mooncake::test

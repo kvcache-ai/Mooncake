@@ -1034,7 +1034,21 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
         // its metrics counted under the memory bucket.
         ReplicaType replica_type = ReplicaType::MEMORY;
         if (obj.via.array.size == 7) {
-            replica_type = static_cast<ReplicaType>(array[6].as<int8_t>());
+            auto raw_replica_type = array[6].as<int8_t>();
+            switch (raw_replica_type) {
+                case static_cast<int8_t>(ReplicaType::MEMORY):
+                    replica_type = ReplicaType::MEMORY;
+                    break;
+                case static_cast<int8_t>(ReplicaType::NOF_SSD):
+                    replica_type = ReplicaType::NOF_SSD;
+                    break;
+                default:
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        fmt::format("deserialize OffsetBufferAllocator "
+                                    "invalid replica_type: {}",
+                                    raw_replica_type)));
+            }
         }
 
         // Create OffsetBufferAllocator instance
