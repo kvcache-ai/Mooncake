@@ -528,9 +528,9 @@ def test_1d_tensor_tp(store, tenant):
             tenant=tenant,
         )
         expected = compute_tp_shard(full_weight, rank, tp_size)
-        assert result.shape == expected.shape, (
-            f"1d shape mismatch: {result.shape} vs {expected.shape}"
-        )
+        assert (
+            result.shape == expected.shape
+        ), f"1d shape mismatch: {result.shape} vs {expected.shape}"
         assert_tensor_equal(result, expected, f"1d rank {rank}")
 
     result = store.get_tensor_with_parallelism(
@@ -1095,9 +1095,9 @@ def test_batch_get_into_tp(store, allocator, tenant):
         for idx, (result, expected) in enumerate(
             [(results[0], shard_0), (results[1], shard_1)]
         ):
-            assert result.data_bytes == expected.nelement() * expected.element_size(), (
-                f"batch_into rank {idx}: data_bytes mismatch"
-            )
+            assert (
+                result.data_bytes == expected.nelement() * expected.element_size()
+            ), f"batch_into rank {idx}: data_bytes mismatch"
     finally:
         store.unregister_buffer(ptr0, buf_size)
         store.unregister_buffer(ptr1, buf_size)
@@ -1123,8 +1123,12 @@ def test_batch_get_into_full_reconstruction(store, allocator, tenant):
             tenant=tenant,
         )
 
-    size0 = TENSOR_METADATA_WIRE_SIZE + weight_sd0.nelement() * weight_sd0.element_size()
-    size1 = TENSOR_METADATA_WIRE_SIZE + weight_sd1.nelement() * weight_sd1.element_size()
+    size0 = (
+        TENSOR_METADATA_WIRE_SIZE + weight_sd0.nelement() * weight_sd0.element_size()
+    )
+    size1 = (
+        TENSOR_METADATA_WIRE_SIZE + weight_sd1.nelement() * weight_sd1.element_size()
+    )
     ptr0 = allocator.alloc(size0)
     ptr1 = allocator.alloc(size1)
     r0 = store.register_buffer(ptr0, size0)
@@ -1154,12 +1158,18 @@ def test_batch_get_into_full_reconstruction(store, allocator, tenant):
             (results[1], weight_sd1, "batch full into split_dim=1"),
         ]:
             expected_bytes = expected.nelement() * expected.element_size()
-            assert result.data_bytes == expected_bytes, f"{context}: data_bytes mismatch"
-            actual_data = (ctypes.c_ubyte * expected_bytes).from_address(result.data_ptr)
+            assert (
+                result.data_bytes == expected_bytes
+            ), f"{context}: data_bytes mismatch"
+            actual_data = (ctypes.c_ubyte * expected_bytes).from_address(
+                result.data_ptr
+            )
             expected_data = (ctypes.c_ubyte * expected_bytes).from_address(
                 expected.data_ptr()
             )
-            assert bytes(actual_data) == bytes(expected_data), f"{context}: bytes mismatch"
+            assert bytes(actual_data) == bytes(
+                expected_data
+            ), f"{context}: bytes mismatch"
     finally:
         store.unregister_buffer(ptr0, size0)
         store.unregister_buffer(ptr1, size1)
