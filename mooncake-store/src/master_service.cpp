@@ -2667,8 +2667,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state,
-             &task_created](Replica& replica) {
+            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
                 auto result = PushOffloadingQueue(object_id, replica);
                 if (result) {
                     if (!task_created) {
@@ -2676,7 +2675,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                         tenant_state.offloading_tasks.emplace(
                             object_id.user_key,
                             OffloadingTask{replica.id(),
-                                            std::chrono::system_clock::now()});
+                                           std::chrono::system_clock::now()});
                         task_created = true;
                     }
                 }
@@ -2921,7 +2920,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             if (it != tenant_state.metadata.end() &&
                 CleanupStaleHandles(it->second, alive_clients, &shard)) {
                 // EraseMetadata handles processing_keys, replication_tasks,
-                // offloading_tasks (with dec_refcnt), and promotion task cleanup.
+                // offloading_tasks (with dec_refcnt), and promotion task
+                // cleanup.
                 EraseMetadata(tenant_state, it, object_id.tenant_id,
                               QuotaEraseMode::kFull, &shard);
                 it = tenant_state.metadata.end();
@@ -4291,7 +4291,8 @@ auto MasterService::NotifyOffloadSuccess(
             }
         }
 
-        // Add LOCAL_DISK replica (skip if offload failed — data_size < 0 sentinel).
+        // Add LOCAL_DISK replica (skip if offload failed — data_size < 0
+        // sentinel).
         if (metadata.data_size < 0) {
             continue;
         }
@@ -4979,8 +4980,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 }
             }
             LOG(WARNING) << "Offloading task expired for key: "
-                         << task_it->first
-                         << " tenant=" << tenant_it->first;
+                         << task_it->first << " tenant=" << tenant_it->first;
             task_it = tenant_state.offloading_tasks.erase(task_it);
         }
 

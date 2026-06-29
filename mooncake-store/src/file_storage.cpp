@@ -450,9 +450,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
             std::vector<std::string> missing_user_keys;
-            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
-                                                        user_batch_object,
-                                                        missing_user_keys);
+            auto query_result = BatchQuerySegmentSlices(
+                user_keys, tenant_id, user_batch_object, missing_user_keys);
             // BatchQuerySegmentSlices is now best-effort: it always returns
             // OK, with missing keys reported via missing_user_keys. Keys
             // present in user_batch_object go to batch_object; the rest
@@ -461,8 +460,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 const auto& user_key = task_by_storage_key[storage_key].key;
                 auto it = user_batch_object.find(user_key);
                 if (it != user_batch_object.end()) {
-                    batch_object.emplace(storage_key,
-                                         std::move(it->second));
+                    batch_object.emplace(storage_key, std::move(it->second));
                 } else {
                     failed_tasks.push_back(task_by_storage_key[storage_key]);
                 }
@@ -592,12 +590,13 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         std::vector<StorageObjectMetadata> failed_metadatas;
         failed_metadatas.reserve(failed_tasks.size());
         for (size_t i = 0; i < failed_tasks.size(); ++i) {
-            failed_metadatas.push_back(StorageObjectMetadata{
-                -1, 0, 0, -1, ""});
+            failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
         }
-        auto result = client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
+        auto result =
+            client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
         if (!result) {
-            LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed tasks returned error: "
+            LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed tasks "
+                            "returned error: "
                          << result.error() << " count: " << failed_tasks.size();
         }
     }
@@ -713,8 +712,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return offload_result;
     }
 
-    LOG(INFO) << "Successfully completed heartbeat with offloaded objects count: "
-              << offloading_objects.size();
+    LOG(INFO)
+        << "Successfully completed heartbeat with offloaded objects count: "
+        << offloading_objects.size();
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
