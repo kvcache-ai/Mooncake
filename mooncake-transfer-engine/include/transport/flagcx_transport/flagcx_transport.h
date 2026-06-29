@@ -12,9 +12,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <flagcx_p2p.h>
@@ -41,8 +44,8 @@ namespace mooncake {
 //     of Mooncake's "rkey by dst_ptr"), then issues a non-blocking one-sided
 //     WriteVector (WRITE) or ReadVector (READ).
 //
-// getTransferStatus() polls submitted FlagCX transfer IDs and reports
-// completion through the usual TransferTask slice counters.
+// A lightweight completion thread polls submitted FlagCX transfer IDs and
+// reports completion through the usual TransferTask slice counters.
 //
 // Required runtime env: the FlagCX engine honours the standard FlagCX
 // knobs (FLAGCX_SOCKET_IFNAME selects the NIC the RPC endpoint binds /
@@ -90,7 +93,8 @@ class FlagCxTransport : public Transport {
     // (multi-rail) transfer and record its transfer id for status checks.
     void runSliceGroup(const std::vector<Slice *> &group);
     void submitSlices(const std::vector<Slice *> &slices);
-    void pollPendingTransfers();
+    bool pollPendingTransfers();
+    void completionLoop();
 
     // Find the engine MR handle whose registered region fully contains
     // [addr, addr+length).  Returns false if the source is unregistered.
@@ -123,7 +127,10 @@ class FlagCxTransport : public Transport {
     std::mutex flagcx_mu_;
     std::mutex submit_mu_;
     std::mutex pending_mu_;
+    std::condition_variable pending_cv_;
     std::vector<PendingTransfer> pending_;
+    std::atomic<bool> completion_running_{false};
+    std::thread completion_thread_;
 };
 
 }  // namespace mooncake

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -28,6 +29,10 @@ namespace mooncake {
 FlagCxTransport::FlagCxTransport() {}
 
 FlagCxTransport::~FlagCxTransport() {
+    completion_running_.store(false, std::memory_order_release);
+    pending_cv_.notify_all();
+    if (completion_thread_.joinable()) completion_thread_.join();
+
     {
         std::lock_guard<std::mutex> lk(pending_mu_);
         for (auto &p : pending_) {
@@ -93,6 +98,9 @@ int FlagCxTransport::install(std::string &local_server_name,
 
     if (allocateLocalSegment() != 0) return -1;
 
+    completion_running_.store(true, std::memory_order_release);
+    completion_thread_ = std::thread(&FlagCxTransport::completionLoop, this);
+
     LOG(INFO) << "FlagCxTransport: install OK (direct submit)";
     return 0;
 }
@@ -100,7 +108,7 @@ int FlagCxTransport::install(std::string &local_server_name,
 // Issue one batch of slices that all target the same segment and share an
 // opcode as a SINGLE multi-iov transfer. The engine fans the iovs out across
 // the conn's rails (NICs), so a deep batch keeps every NIC busy instead of one
-// block-at-a-time. Completion is marked by getTransferStatus().
+// block-at-a-time. Completion is marked by the completion polling thread.
 void FlagCxTransport::runSliceGroup(const std::vector<Slice *> &group) {
     if (group.empty()) return;
     bool ok = true;
@@ -164,9 +172,12 @@ void FlagCxTransport::runSliceGroup(const std::vector<Slice *> &group) {
                 s->status = Slice::POSTED;
                 s->ts = getCurrentTimeInNano();
             }
-            std::lock_guard<std::mutex> lk(pending_mu_);
-            pending_.push_back(
-                {conn, transfer_id, group, now + std::chrono::seconds(30)});
+            {
+                std::lock_guard<std::mutex> lk(pending_mu_);
+                pending_.push_back(
+                    {conn, transfer_id, group, now + std::chrono::seconds(30)});
+            }
+            pending_cv_.notify_one();
         }
     }
 
@@ -187,14 +198,14 @@ void FlagCxTransport::submitSlices(const std::vector<Slice *> &slices) {
     for (auto &kv : groups) runSliceGroup(kv.second);
 }
 
-void FlagCxTransport::pollPendingTransfers() {
+bool FlagCxTransport::pollPendingTransfers() {
     std::vector<PendingTransfer> local;
     {
         std::lock_guard<std::mutex> lk(pending_mu_);
         local.swap(pending_);
     }
 
-    if (local.empty()) return;
+    if (local.empty()) return false;
 
     std::vector<PendingTransfer> still_pending;
     const auto now = std::chrono::steady_clock::now();
@@ -218,6 +229,28 @@ void FlagCxTransport::pollPendingTransfers() {
     if (!still_pending.empty()) {
         std::lock_guard<std::mutex> lk(pending_mu_);
         for (auto &p : still_pending) pending_.push_back(std::move(p));
+        return true;
+    }
+    return false;
+}
+
+void FlagCxTransport::completionLoop() {
+    unsigned active_polls = 0;
+    while (completion_running_.load(std::memory_order_acquire)) {
+        if (pollPendingTransfers()) {
+            if (++active_polls >= 64) {
+                active_polls = 0;
+                std::this_thread::yield();
+            }
+            continue;
+        }
+
+        active_polls = 0;
+        std::unique_lock<std::mutex> lk(pending_mu_);
+        pending_cv_.wait(lk, [this] {
+            return !completion_running_.load(std::memory_order_acquire) ||
+                   !pending_.empty();
+        });
     }
 }
 
@@ -390,8 +423,6 @@ Status FlagCxTransport::submitTransferTask(
 
 Status FlagCxTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                           TransferStatus &status) {
-    pollPendingTransfers();
-
     auto &batch_desc = *reinterpret_cast<BatchDesc *>(batch_id);
     if (task_id >= batch_desc.task_list.size()) {
         return Status::InvalidArgument(
