@@ -39,15 +39,17 @@ Request makeRequest(int priority) {
 TEST(ProxyManagerTest, SubmitReturnsTooManyRequestsWhenShardQueueIsFull) {
     auto proxy = ProxyManager::createForTest(nullptr, 1);
 
-    TaskInfo first;
-    TaskInfo second;
+    constexpr size_t kProxyShards = 8;
+    std::vector<TaskInfo> tasks(kProxyShards + 1);
     std::vector<std::string> params{"server", "local", "remote"};
 
-    auto status = proxy->submit(&first, 1, params);
-    ASSERT_TRUE(status.ok()) << status.ToString();
-    EXPECT_EQ(first.staging_status, TransferStatusEnum::PENDING);
+    for (size_t i = 0; i < kProxyShards; ++i) {
+        auto status = proxy->submit(&tasks[i], i + 1, params);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        EXPECT_EQ(tasks[i].staging_status, TransferStatusEnum::PENDING);
+    }
 
-    status = proxy->submit(&second, 2, params);
+    auto status = proxy->submit(&tasks.back(), kProxyShards + 1, params);
     EXPECT_TRUE(status.IsTooManyRequests()) << status.ToString();
 }
 
