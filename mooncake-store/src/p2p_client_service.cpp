@@ -51,27 +51,34 @@ P2PClientService::P2PClientService(
 void P2PClientService::Stop() {
     LOG(INFO) << "P2PClientService::Stop() — begin";
 
-    // 1. Reject + drain the client's OWN in-flight API calls; also the
-    //    idempotency gate for Stop() (returns false if already shut down).
-    if (!MarkShuttingDown()) {
-        return;  // Already shut down.
-    }
+    {
+        // Holding registration_mutex_ first blocks new (un)registrations and
+        // lets active ones finish before MarkShuttingDown() drains the
+        // in-flight tracker
+        MutexLocker lk(&registration_mutex_);
 
-    // 2. Unregister client FIRST so the master stops routing NEW requests to us
-    // (also stops the heartbeat and enters LOCAL_ONLY). The in-flight tracker
-    // is already closed by step 1, so the public UnregisterClient() would now
-    // be rejected; go through the unguarded InnerUnregisterClient() instead.
-    if (registered_.load(std::memory_order_acquire)) {
-        try {
-            MutexLocker lk(&registration_mutex_);
-            auto r = InnerUnregisterClient();
-            if (!r) {
-                LOG(WARNING) << "Stop(): UnregisterClient failed: " << r.error()
-                             << " — continuing shutdown";
+        // 1. Reject + drain the client's OWN in-flight API calls; also the
+        //    idempotency gate for Stop() (returns false if already shut down).
+        if (!MarkShuttingDown()) {
+            return;  // Already shut down.
+        }
+
+        // 2. Unregister client FIRST so the master stops routing NEW requests
+        // to us (also stops the heartbeat and enters LOCAL_ONLY). The in-flight
+        // tracker is already closed by step 1, so the public UnregisterClient()
+        // would be rejected; call InnerUnregisterClient() directly.
+        if (registered_.load(std::memory_order_acquire)) {
+            try {
+                auto r = InnerUnregisterClient();
+                if (!r) {
+                    LOG(WARNING)
+                        << "Stop(): UnregisterClient failed: " << r.error()
+                        << " — continuing shutdown";
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Stop(): UnregisterClient threw: " << e.what()
+                           << " — continuing shutdown";
             }
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Stop(): UnregisterClient threw: " << e.what()
-                       << " — continuing shutdown";
         }
     }
 

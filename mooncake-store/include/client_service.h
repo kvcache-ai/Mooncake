@@ -675,7 +675,9 @@ class ClientService {
     std::atomic<bool> registered_{false};
 
     // Serializes register / unregister / stop-heartbeat.
-    // Lock order: registration_mutex_ -> heartbeat_mtx_.
+    // Lock order: registration_mutex_ -> local_inflight_tracker_.rwlock_, and
+    // registration_mutex_ -> heartbeat_mtx_. Stop() holds registration_mutex_
+    // before draining the in-flight tracker so this order is never inverted.
     Mutex registration_mutex_;
 
     InflightTracker local_inflight_tracker_{

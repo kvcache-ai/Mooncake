@@ -7,6 +7,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 
 namespace mooncake {
 
@@ -26,8 +27,28 @@ class InflightTracker {
         explicit Guard(InflightTracker* tracker) : lock_(tracker->rwlock_) {
             if (tracker->Admit()) {
                 tracker_ = tracker;
+            } else {
+                lock_.unlock();
             }
         }
+
+        Guard(Guard&& other) noexcept
+            : lock_(std::move(other.lock_)), tracker_(other.tracker_) {
+            other.tracker_ = nullptr;
+        }
+        Guard& operator=(Guard&& other) noexcept {
+            if (this != &other) {
+                if (tracker_) tracker_->Retire();
+                lock_ = std::move(other.lock_);
+                tracker_ = other.tracker_;
+                other.tracker_ = nullptr;
+            }
+            return *this;
+        }
+
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+
         ~Guard() {
             if (tracker_) {
                 tracker_->Retire();
