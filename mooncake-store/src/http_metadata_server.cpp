@@ -112,7 +112,12 @@ bool HttpMetadataServer::start() {
         return true;
     }
 
-    server_->async_start();
+    auto ec = server_->async_start();
+    if (ec.hasResult()) {
+        LOG(ERROR) << "Failed to start HTTP metadata server on " << host_ << ":"
+                   << port_;
+        return false;
+    }
     running_ = true;
     LOG(INFO) << "HTTP metadata server started on " << host_ << ":" << port_;
     return true;
