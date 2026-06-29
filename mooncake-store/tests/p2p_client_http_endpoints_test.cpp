@@ -11,10 +11,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -195,6 +197,41 @@ TEST_F(P2PClientHttpEndpointsTest, HttpRemoveAllLocal) {
             << "Get unexpectedly returned " << get_resp.status
             << " for key=" << key;
     }
+}
+
+// ============================================================================
+// /unregister + /register
+// ============================================================================
+
+TEST_F(P2PClientHttpEndpointsTest, HttpUnregisterThenRegister) {
+    // Unregister via HTTP -> 200, client switches to LOCAL_ONLY.
+    auto un = HttpPost(Url("/unregister"));
+    ASSERT_EQ(un.status, 200)
+        << "status=" << un.status << " body=" << un.resp_body;
+    EXPECT_EQ(un.resp_body, "OK");
+    EXPECT_EQ(client_->GetHealthStatus(), "LOCAL_ONLY");
+
+    // Local data ops still work while unregistered (local-only service).
+    const std::string key = "http_unreg_local";
+    ASSERT_EQ(HttpPost(Url("/put", "key=" + key), "v").status, 200);
+    EXPECT_EQ(HttpGet(Url("/get", "key=" + key)).status, 200);
+
+    // Re-register via HTTP -> 200, restoring routing for subsequent tests.
+    auto re = HttpPost(Url("/register"));
+    ASSERT_EQ(re.status, 200)
+        << "status=" << re.status << " body=" << re.resp_body;
+    EXPECT_EQ(re.resp_body, "OK");
+
+    // Recovery back to FULL is asynchronous.
+    bool full = false;
+    for (int i = 0; i < 50; ++i) {
+        if (client_->GetHealthStatus() == "FULL") {
+            full = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_TRUE(full) << "health=" << client_->GetHealthStatus();
 }
 
 }  // namespace testing

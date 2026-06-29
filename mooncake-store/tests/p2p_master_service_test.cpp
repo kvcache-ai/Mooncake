@@ -514,6 +514,78 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaObjectNotFound) {
 }
 
 // ============================================================
+// UnregisterClient Tests
+// ============================================================
+
+TEST_F(P2PMasterServiceTest, UnregisterClientRemovesReplicasAndSegments) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment("seg1");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg.id);
+
+    // Sanity: replica + segment + client present.
+    ASSERT_TRUE(service->GetReplicaList("key1").has_value());
+    ASSERT_TRUE(service->QuerySegments(seg.name).has_value());
+    ASSERT_NE(service->GetClientManager().GetClient(client_id), nullptr);
+
+    // Unregister cascades: segment unmount -> replica/object removal.
+    auto res = service->UnregisterClient(
+        UnregisterClientRequest{client_id, DeploymentMode::P2P});
+    ASSERT_TRUE(res.has_value());
+
+    EXPECT_EQ(service->GetClientManager().GetClient(client_id), nullptr);
+    EXPECT_FALSE(service->QuerySegments(seg.name).has_value());
+    auto get_res = service->GetReplicaList("key1");
+    EXPECT_FALSE(get_res.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_res.error());
+}
+
+TEST_F(P2PMasterServiceTest, UnregisterClientPartialKeepsOtherOwner) {
+    auto service = CreateService();
+    auto seg1 = MakeP2PSegment("seg1");
+    auto seg2 = MakeP2PSegment("seg2");
+    auto client1 = generate_uuid();
+    auto client2 = generate_uuid();
+    RegisterP2PClient(*service, client1, {seg1}, "10.0.0.1", 50051);
+    RegisterP2PClient(*service, client2, {seg2}, "10.0.0.2", 50052);
+    AddReplicaHelper(*service, "key1", 1024, client1, seg1.id);
+    AddReplicaHelper(*service, "key1", 1024, client2, seg2.id);
+
+    // Unregister client1 -> only its replica is removed.
+    ASSERT_TRUE(service
+                    ->UnregisterClient(
+                        UnregisterClientRequest{client1, DeploymentMode::P2P})
+                    .has_value());
+
+    EXPECT_EQ(service->GetClientManager().GetClient(client1), nullptr);
+    EXPECT_NE(service->GetClientManager().GetClient(client2), nullptr);
+
+    auto get_res = service->GetReplicaList("key1");
+    ASSERT_TRUE(get_res.has_value());
+    EXPECT_EQ(1, get_res.value().replicas.size());
+    EXPECT_EQ(client2,
+              get_res.value().replicas[0].get_p2p_proxy_descriptor().client_id);
+}
+
+TEST_F(P2PMasterServiceTest, UnregisterClientIdempotent) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    ASSERT_TRUE(service
+                    ->UnregisterClient(
+                        UnregisterClientRequest{client_id, DeploymentMode::P2P})
+                    .has_value());
+    // Second call: client already gone -> still OK (idempotent).
+    EXPECT_TRUE(service
+                    ->UnregisterClient(
+                        UnregisterClientRequest{client_id, DeploymentMode::P2P})
+                    .has_value());
+}
+
+// ============================================================
 // GetReplicaList + FilterReplicas Tests
 // ============================================================
 

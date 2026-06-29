@@ -382,7 +382,9 @@ TEST_P(NonHAReconnectTest, ClientDisconnectAndRecover) {
     ASSERT_TRUE(master_->CheckSegmentsMatch(all_segments))
         << "Client1 segments not fully visible after recovery";
 
+    client1->Stop();
     client1->Destroy();
+    client2->Stop();
     client2->Destroy();
 }
 
@@ -409,8 +411,9 @@ TEST_P(NonHAReconnectTest, ClientCrash) {
     // verify visibility
     ASSERT_TRUE(master_->CheckSegmentsMatch(all_segments));
 
-    // Pause client1 heartbeats
-    client1->Stop();
+    // Pause client1 heartbeats to simulate a crash (a real crash would not
+    // call Stop()/UnregisterClient — it simply stops sending heartbeats).
+    client1->StopHeartbeat();
 
     // Wait for crash state (crashed TTL = 4s)
     std::this_thread::sleep_for(std::chrono::seconds(3));

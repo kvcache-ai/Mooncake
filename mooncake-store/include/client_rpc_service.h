@@ -1,10 +1,12 @@
 #pragma once
 
+#include <chrono>
 #include <csignal>
 #include <memory>
 #include <ylt/util/tl/expected.hpp>
 #include "client_rpc_types.h"
 #include "data_manager.h"
+#include "inflight_tracker.h"
 #include "p2p_client_metric.h"
 #include "types.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -31,6 +33,12 @@ class ClientRpcService {
      */
     explicit ClientRpcService(DataManager& data_manager,
                               P2PClientMetric* metrics = nullptr);
+
+    /**
+     * @brief Stop serving peer RPCs: reject new incoming handlers and block
+     * until in-flight ones finish
+     */
+    void Stop();
 
     /**
      * @brief Read remote data: Client A requests Client B to read data and
@@ -71,8 +79,13 @@ class ClientRpcService {
     tl::expected<void, ErrorCode> UnPinKey(const UnPinKeyRequest& request);
 
    private:
+    void RecordPeerInflight(bool entering);
+
+   private:
     DataManager& data_manager_;  // Reference: owned by Client, same lifetime
     P2PClientMetric* metrics_;   // Optional: owned by P2PClientService
+
+    InflightTracker peer_tracker_;
 };
 
 /**

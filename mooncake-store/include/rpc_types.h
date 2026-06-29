@@ -149,6 +149,26 @@ struct RegisterClientResponse {
 YLT_REFL(RegisterClientResponse, view_version);
 
 /**
+ * @brief Request structure for UnregisterClient operation.
+ * Client calls this to proactively deregister itself and all its routing
+ * metadata (segments/replicas) from the master
+ */
+struct UnregisterClientRequest {
+    UUID client_id;
+    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
+};
+YLT_REFL(UnregisterClientRequest, client_id, deployment_mode);
+
+/**
+ * @brief Response structure for UnregisterClient operation.
+ * Returns the master's view_version (mirrors RegisterClientResponse).
+ */
+struct UnregisterClientResponse {
+    ViewVersionId view_version = 0;
+};
+YLT_REFL(UnregisterClientResponse, view_version);
+
+/**
  * @brief Request structure for QueryClientStatus operation.
  */
 struct QueryClientStatusRequest {

@@ -53,13 +53,38 @@ bool IsValidRequest(const RemoteWriteRequest& request) {
 
 ClientRpcService::ClientRpcService(DataManager& data_manager,
                                    P2PClientMetric* metrics)
-    : data_manager_(data_manager), metrics_(metrics) {}
+    : data_manager_(data_manager),
+      metrics_(metrics),
+      peer_tracker_(
+          "peer RPCs", [this] { RecordPeerInflight(true); },
+          [this] { RecordPeerInflight(false); }) {}
+
+void ClientRpcService::Stop() {
+    peer_tracker_.Close();
+    peer_tracker_.Wait();
+}
+
+void ClientRpcService::RecordPeerInflight(bool entering) {
+    if (!metrics_) return;
+    if (entering) {
+        metrics_->peer_request_metrics.inflight.inc();
+    } else {
+        metrics_->peer_request_metrics.inflight.dec();
+    }
+}
 
 tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     const RemoteReadRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::ReadRemoteData");
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.dest_buffers.size());
+
+    auto inflight_handle = peer_tracker_.Enter();
+    if (!inflight_handle.is_valid()) {
+        LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
+                     << ": client is draining/shutting down";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     if (metrics_) {
         metrics_->peer_request_metrics.read_remote_data.requests.inc();
@@ -116,6 +141,13 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.src_buffers.size());
 
+    auto inflight_handle = peer_tracker_.Enter();
+    if (!inflight_handle.is_valid()) {
+        LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
+                     << ": client is draining/shutting down";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     if (metrics_) {
         metrics_->peer_request_metrics.write_remote_data.requests.inc();
     }
@@ -161,6 +193,13 @@ tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(
     ScopedVLogTimer timer(1, "ClientRpcService::PreWrite");
     timer.LogRequest("key=", request.key, "size_bytes=", request.size_bytes);
 
+    auto inflight_handle = peer_tracker_.Enter();
+    if (!inflight_handle.is_valid()) {
+        LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
+                     << ": client is draining/shutting down";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     if (metrics_) {
         metrics_->peer_request_metrics.prewrite.requests.inc();
     }
@@ -204,6 +243,13 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
     const WriteCommitRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::WriteCommit");
     timer.LogRequest("key=", request.key);
+
+    auto inflight_handle = peer_tracker_.Enter();
+    if (!inflight_handle.is_valid()) {
+        LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
+                     << ": client is draining/shutting down";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     if (metrics_) {
         metrics_->peer_request_metrics.write_commit.requests.inc();
@@ -249,6 +295,13 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
     ScopedVLogTimer timer(1, "ClientRpcService::WriteRevoke");
     timer.LogRequest("key=", request.key);
 
+    auto inflight_handle = peer_tracker_.Enter();
+    if (!inflight_handle.is_valid()) {
+        LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
+                     << ": client is draining/shutting down";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     if (metrics_) {
         metrics_->peer_request_metrics.write_revoke.requests.inc();
     }
@@ -292,6 +345,13 @@ tl::expected<PinKeyResponse, ErrorCode> ClientRpcService::PinKey(
     const PinKeyRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::PinKey");
     timer.LogRequest("key=", request.key);
+
+    auto inflight_handle = peer_tracker_.Enter();
+    if (!inflight_handle.is_valid()) {
+        LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
+                     << ": client is draining/shutting down";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     if (metrics_) {
         metrics_->peer_request_metrics.pin_key.requests.inc();
@@ -340,6 +400,13 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
     const UnPinKeyRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::UnPinKey");
     timer.LogRequest("key=", request.key);
+
+    auto inflight_handle = peer_tracker_.Enter();
+    if (!inflight_handle.is_valid()) {
+        LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
+                     << ": client is draining/shutting down";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     if (metrics_) {
         metrics_->peer_request_metrics.unpin_key.requests.inc();

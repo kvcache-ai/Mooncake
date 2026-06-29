@@ -50,6 +50,28 @@ MasterMetricManager::MasterMetricManager()
       active_clients_("master_active_clients",
                       "Total number of active clients"),
 
+      // Initialize client RPC counters (requests / failures)
+      register_client_requests_("master_register_client_requests",
+                                "Total number of RegisterClient requests"),
+      register_client_failures_(
+          "master_register_client_failures",
+          "Total number of failed RegisterClient requests"),
+      unregister_client_requests_("master_unregister_client_requests",
+                                  "Total number of UnregisterClient requests"),
+      unregister_client_failures_(
+          "master_unregister_client_failures",
+          "Total number of failed UnregisterClient requests"),
+      // Initialize client lifecycle counters
+      clients_disconnected_total_(
+          "master_clients_disconnected_total",
+          "Total number of client disconnections detected by heartbeat"),
+      clients_recovered_total_(
+          "master_clients_recovered_total",
+          "Total number of client recoveries detected by heartbeat"),
+      clients_crashed_total_(
+          "master_clients_crashed_total",
+          "Total number of client crashes detected by heartbeat"),
+
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
@@ -367,6 +389,13 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     put_start_discarded_staging_size_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
+    register_client_requests_.inc(0);
+    register_client_failures_.inc(0);
+    unregister_client_requests_.inc(0);
+    unregister_client_failures_.inc(0);
+    clients_disconnected_total_.inc(0);
+    clients_recovered_total_.inc(0);
+    clients_crashed_total_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_end_requests_.inc(0);
@@ -629,6 +658,52 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+// Client RPC Metrics (requests / failures)
+void MasterMetricManager::inc_register_client_requests(int64_t val) {
+    register_client_requests_.inc(val);
+}
+void MasterMetricManager::inc_register_client_failures(int64_t val) {
+    register_client_failures_.inc(val);
+}
+void MasterMetricManager::inc_unregister_client_requests(int64_t val) {
+    unregister_client_requests_.inc(val);
+}
+void MasterMetricManager::inc_unregister_client_failures(int64_t val) {
+    unregister_client_failures_.inc(val);
+}
+
+// Client Lifecycle Metrics
+void MasterMetricManager::inc_clients_disconnected_total(int64_t val) {
+    clients_disconnected_total_.inc(val);
+}
+void MasterMetricManager::inc_clients_recovered_total(int64_t val) {
+    clients_recovered_total_.inc(val);
+}
+void MasterMetricManager::inc_clients_crashed_total(int64_t val) {
+    clients_crashed_total_.inc(val);
+}
+int64_t MasterMetricManager::get_register_client_requests() {
+    return register_client_requests_.value();
+}
+int64_t MasterMetricManager::get_register_client_failures() {
+    return register_client_failures_.value();
+}
+int64_t MasterMetricManager::get_unregister_client_requests() {
+    return unregister_client_requests_.value();
+}
+int64_t MasterMetricManager::get_unregister_client_failures() {
+    return unregister_client_failures_.value();
+}
+int64_t MasterMetricManager::get_clients_disconnected_total() {
+    return clients_disconnected_total_.value();
+}
+int64_t MasterMetricManager::get_clients_recovered_total() {
+    return clients_recovered_total_.value();
+}
+int64_t MasterMetricManager::get_clients_crashed_total() {
+    return clients_crashed_total_.value();
 }
 
 // cache hit rate metrics
@@ -1391,6 +1466,13 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
+    serialize_metric(register_client_requests_);
+    serialize_metric(register_client_failures_);
+    serialize_metric(unregister_client_requests_);
+    serialize_metric(unregister_client_failures_);
+    serialize_metric(clients_disconnected_total_);
+    serialize_metric(clients_recovered_total_);
+    serialize_metric(clients_crashed_total_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);

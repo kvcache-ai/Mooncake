@@ -49,18 +49,62 @@ P2PClientService::P2PClientService(
 }
 
 void P2PClientService::Stop() {
-    if (!MarkShuttingDown()) {
-        return;  // Already shut down.
-    }
-
     LOG(INFO) << "P2PClientService::Stop() — begin";
 
-    // Stop HA recovery thread first
+    {
+        // Holding registration_mutex_ first blocks new (un)registrations and
+        // lets active ones finish before MarkShuttingDown() drains the
+        // in-flight tracker
+        MutexLocker lk(&registration_mutex_);
+
+        // 1. Reject + drain the client's OWN in-flight API calls; also the
+        //    idempotency gate for Stop() (returns false if already shut down).
+        if (!MarkShuttingDown()) {
+            return;  // Already shut down.
+        }
+
+        // 2. Unregister client FIRST so the master stops routing NEW requests
+        // to us (also stops the heartbeat and enters LOCAL_ONLY). The in-flight
+        // tracker is already closed by step 1, so the public UnregisterClient()
+        // would be rejected; call InnerUnregisterClient() directly.
+        if (registered_.load(std::memory_order_acquire)) {
+            try {
+                auto r = InnerUnregisterClient();
+                if (!r) {
+                    LOG(WARNING)
+                        << "Stop(): UnregisterClient failed: " << r.error()
+                        << " — continuing shutdown";
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Stop(): UnregisterClient threw: " << e.what()
+                           << " — continuing shutdown";
+            }
+        }
+    }
+
+    // 3. Reject + drain in-flight INCOMING peer RPCs so their responses are
+    //    delivered before the RPC server is force-closed below. (RouteCaches on
+    //    other clients may still point here even after unregister.)
+    if (client_rpc_service_) {
+        client_rpc_service_->Stop();
+    }
+
+    // 4. Stop HA recovery thread.
     if (ha_manager_) {
         ha_manager_->Stop();
     }
 
-    // Stop RPC server so no new requests arrive.
+    // 5. Stop async notifier before data_manager to drain pending ops.
+    if (async_route_notifier_) {
+        async_route_notifier_->Stop();
+    }
+
+    // 6. Stop tier scheduler of tiered_backend.
+    if (data_manager_.has_value()) {
+        data_manager_->Stop();
+    }
+
+    // 7. force-stop the RPC server (in-flight peer RPCs already drained).
     if (client_rpc_server_) {
         client_rpc_server_->stop();
     }
@@ -68,18 +112,12 @@ void P2PClientService::Stop() {
         client_rpc_server_thread_.join();
     }
 
-    // Stop async notifier before data_manager to drain pending ops
-    if (async_route_notifier_) {
-        async_route_notifier_->Stop();
+    // 8. Stop heartbeat + base teardown.
+    try {
+        ClientService::Stop();
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Stop(): ClientService::Stop threw: " << e.what();
     }
-
-    // Stop tier scheduler of tierd_backend
-    if (data_manager_.has_value()) {
-        data_manager_->Stop();
-    }
-
-    // Stop heartbeat
-    ClientService::Stop();
 
     LOG(INFO) << "P2PClientService::Stop() — complete";
 }
@@ -113,6 +151,9 @@ P2PClientService::~P2PClientService() {
 ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     client_rpc_port_ = config.client_rpc_port;
     transfer_direction_mode_ = config.transfer_direction_mode;
+    // Saved so a later re-registration (after UnregisterClient) can restart
+    // the heartbeat with the same master entry.
+    master_server_entry_ = config.master_server_entry;
 
     // 1. Try to connect to master (allow failure for degraded startup)
     bool master_connected = false;
@@ -229,8 +270,6 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         }
     });
 
-    is_running_ = true;
-
     // Give RPC server a moment to start
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (rpc_start_failed->load()) {
@@ -342,7 +381,7 @@ AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
         // In degraded mode, skip metadata notification to Master.
         // The data is stored locally; the recovery pipeline will re-sync
         // all local metadata to Master when the connection is restored.
-        if (ha_manager_ && ha_manager_->IsDegraded()) {
+        if (ha_manager_ && ha_manager_->IsLocalService()) {
             return {};
         }
         if (async_route_notifier_) {
@@ -359,7 +398,7 @@ RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
         // The recovery pipeline will re-sync all local metadata,
         // and Master will discard routes for keys that no longer
         // exist locally.
-        if (ha_manager_ && ha_manager_->IsDegraded()) {
+        if (ha_manager_ && ha_manager_->IsLocalService()) {
             return {};
         }
         if (async_route_notifier_) {
@@ -424,17 +463,17 @@ SegmentSyncCallback P2PClientService::BuildSegmentSyncCallback() {
         if (mount) {
             // Skip MountSegment in degraded mode (master not connected).
             // Registration during heartbeat recovery will include segment info.
-            if (ha_manager_ && ha_manager_->IsDegraded()) {
+            if (ha_manager_ && ha_manager_->IsLocalService()) {
                 LOG(INFO) << "Skipping MountSegment in DEGRADED mode: id="
                           << segment.id << ", name=" << segment.name;
                 return {};
             }
-            // TODO: There is a race window between the IsDegraded() check above
-            // and the MountSegment() call below. During this window, the system
-            // could transition to degraded mode (e.g., due to master connection
-            // loss), causing the MountSegment RPC to fail. This would result in
-            // segment initialization failure even though the segment could be
-            // registered later during heartbeat recovery.
+            // TODO: There is a race window between the IsLocalService() check
+            // above and the MountSegment() call below. During this window, the
+            // system could transition to degraded mode (e.g., due to master
+            // connection loss), causing the MountSegment RPC to fail. This
+            // would result in segment initialization failure even though the
+            // segment could be registered later during heartbeat recovery.
             //
             // Future improvement: Remove BuildSegmentSyncCallback function to
             // decouple storage layer initialization from master interaction.
@@ -513,7 +552,7 @@ std::vector<Segment> P2PClientService::CollectTierSegments() const {
 }
 
 tl::expected<RegisterClientResponse, ErrorCode>
-P2PClientService::RegisterClient() {
+P2PClientService::InnerRegisterClient() {
     RegisterClientRequest req;
     req.client_id = client_id_;
     req.segments = CollectTierSegments();
@@ -527,8 +566,64 @@ P2PClientService::RegisterClient() {
                    << register_result.error() << ", client_id=" << client_id_;
     } else {
         view_version_ = register_result.value().view_version;
+        registered_.store(true, std::memory_order_release);
+
+        // A successful register means the master did not have us — drive HA
+        // recovery to re-sync metadata. The register entry points refuse to run
+        // once the service is shutting down, so this only fires while alive.
+        if (ha_manager_) {
+            ha_manager_->HandleEvent(HAEvent::MASTER_RECONNECTED);
+            if (!heartbeat_running_) {
+                LOG(INFO) << "Re-registration: restarting heartbeat"
+                          << ", client_id=" << client_id_;
+                StartHeartbeat(master_server_entry_);
+            }
+        }
     }
     return register_result;
+}
+
+tl::expected<void, ErrorCode> P2PClientService::UnregisterClient() {
+    MutexLocker lk(&registration_mutex_);
+    InflightTracker::Guard guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(WARNING) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    return InnerUnregisterClient();
+}
+
+tl::expected<void, ErrorCode> P2PClientService::InnerUnregisterClient() {
+    bool was_registered =
+        registered_.exchange(false, std::memory_order_acq_rel);
+
+    // 1. Tell the master to drop us — but only if we were registered AND still
+    //    believe the master is reachable
+    tl::expected<void, ErrorCode> ret;  // OK unless an attempted RPC fails
+    bool is_local_service = ha_manager_ && ha_manager_->IsLocalService();
+    if (was_registered && !is_local_service) {
+        UnregisterClientRequest req;
+        req.client_id = client_id_;
+        req.deployment_mode = DeploymentMode::P2P;
+        auto result = master_client_.UnregisterClient(req);
+        if (!result) {
+            LOG(ERROR) << "UnregisterClient RPC failed: " << result.error()
+                       << ", client_id=" << client_id_
+                       << " -- proceeding to local-only anyway";
+            ret = tl::make_unexpected(result.error());
+        }
+    }
+
+    // 2. Always become a local-only service: stop the heartbeat (so it no
+    // longer auto-rejoins) and force LOCAL_ONLY. Both are idempotent
+    InnerStopHeartbeat();
+    if (ha_manager_) {
+        ha_manager_->EnterLocalOnly();
+    }
+
+    LOG(INFO) << "UnregisterClient done, now local-only, client_id="
+              << client_id_;
+    return ret;
 }
 
 // ============================================================================
@@ -537,6 +632,15 @@ P2PClientService::RegisterClient() {
 
 void P2PClientService::OnHAEvent(HAEvent event) {
     if (ha_manager_) ha_manager_->HandleEvent(event);
+}
+
+void P2PClientService::RecordLocalInflight(bool entering) {
+    if (!metrics_) return;
+    if (entering) {
+        metrics_->local_request.inflight.inc();
+    } else {
+        metrics_->local_request.inflight.dec();
+    }
 }
 
 std::string P2PClientService::GetHealthStatus() const {
@@ -632,7 +736,7 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteRouteRequestConfig& route_config) {
-    if (ha_manager_ && ha_manager_->IsDegraded()) {
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
         return InnerBatchPutDegraded(keys, batched_slices);
     }
     return InnerBatchPutNormal(keys, batched_slices, route_config);
@@ -1277,7 +1381,8 @@ P2PClientService::BatchCreateGetHandlesImpl(
         }
     }
 
-    if (miss_indices.empty() || (ha_manager_ && ha_manager_->IsDegraded())) {
+    if (miss_indices.empty() ||
+        (ha_manager_ && ha_manager_->IsLocalService())) {
         // case 1: All keys are found locally
         // case 2: DEGRADED: master is unreachable
         return handles;
@@ -1786,7 +1891,7 @@ tl::expected<bool, ErrorCode> P2PClientService::IsExist(
     }
 
     // DEGRADED: skip Master fallback, return local-only result
-    if (ha_manager_ && ha_manager_->IsDegraded()) {
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
         return false;
     }
 
@@ -1817,6 +1922,15 @@ std::vector<tl::expected<bool, ErrorCode>> P2PClientService::BatchIsExist(
             miss_indices.push_back(i);
             miss_keys.emplace_back(keys[i]);
         }
+    }
+
+    // Local-only service (LOCAL_ONLY/DEGRADED): skip the master fallback and
+    // report misses as not-found, matching the singular IsExist().
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        for (size_t idx : miss_indices) {
+            results[idx] = false;
+        }
+        return results;
     }
 
     // Batch query master for misses
@@ -1869,7 +1983,7 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     }
 
     // 2) Local miss + DEGRADED: master unreachable, treat as not found.
-    if (ha_manager_ && ha_manager_->IsDegraded()) {
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
         LOG(WARNING) << "fail to access master"
                      << ", key=" << object_key;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1900,6 +2014,19 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
         }
         return results;
     }
+    // Local-only service (LOCAL_ONLY/DEGRADED): master is unreachable / no
+    // longer routing for us, so treat every key as not-found, matching the
+    // singular Query().
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
+            results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+        }
+        return results;
+    }
+
     std::vector<std::string_view> key_views(object_keys.begin(),
                                             object_keys.end());
     auto responses = master_client_.BatchGetReplicaList(key_views, config);
@@ -2290,6 +2417,35 @@ void P2PClientService::RegisterHttpMethods() {
             }
             resp.set_status_and_content(status_type::ok,
                                         std::to_string(result.value()));
+        });
+
+    // Re-register with the master (e.g. after a prior /unregister), restoring
+    // global routing. curl -X POST "localhost:9003/register"
+    http_server_->set_http_handler<POST>(
+        "/register", [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = RegisterClient();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // Unregister from the master and switch to local-only service.
+    // curl -X POST "localhost:9003/unregister"
+    http_server_->set_http_handler<POST>(
+        "/unregister",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = UnregisterClient();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
         });
 }
 

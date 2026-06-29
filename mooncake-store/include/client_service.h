@@ -16,6 +16,7 @@
 
 #include "client_metric.h"
 #include "ha_helper.h"
+#include "inflight_tracker.h"
 #include "transfer_engine.h"
 #include "types.h"
 #include "p2p_rpc_types.h"
@@ -65,9 +66,9 @@ class ClientService {
     virtual void Stop();
 
     /**
-     * @brief stops heartbeat thread
+     * @brief Stops the heartbeat thread
      */
-    virtual void StopHeartbeat();
+    virtual void StopHeartbeat() EXCLUDES(registration_mutex_);
 
     /**
      * @brief Release internal resources. Should be called after Stop()
@@ -523,9 +524,8 @@ class ClientService {
      * @brief Handles a successful heartbeat response.
      * Triggers async RegisterClient if master reports UNDEFINED status.
      * Fires MASTER_RECONNECTED if connection_interrupted_ was set.
-     * @return true if heartbeat was successfully processed.
      */
-    bool HandleHeartbeatResponse(const HeartbeatResponse& response,
+    void HandleHeartbeatResponse(const HeartbeatResponse& response,
                                  const std::string& current_master_address,
                                  const std::function<void()>& register_client,
                                  std::future<void>& register_client_future);
@@ -554,6 +554,13 @@ class ClientService {
      */
     void WaitForNextHeartbeat(int interval_ms);
     virtual HeartbeatRequest build_heartbeat_request() = 0;
+
+    void HeartbeatTryRegister();
+
+    /**
+     * @brief Stops the heartbeat with registration_mutex_ held.
+     */
+    void InnerStopHeartbeat() REQUIRES(registration_mutex_);
 
     /**
      * @brief Registers HTTP handlers on the http_server_ instance.
@@ -584,11 +591,20 @@ class ClientService {
                                   bool use_hugepage = false);
 
     /**
-     * @brief Registers the client into the master server.
-     * @return An ErrorCode indicating success or failure.
+     * @brief Register (or re-register) this client with the master
      */
+    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient()
+        EXCLUDES(registration_mutex_);
+
     virtual tl::expected<RegisterClientResponse, ErrorCode>
-    RegisterClient() = 0;
+    InnerRegisterClient() REQUIRES(registration_mutex_) = 0;
+
+    /**
+     * @brief Hook invoked when a local (client-initiated) request enters
+     * (entering=true) or leaves (entering=false) the in-flight set. Subclasses
+     * override to update an in-flight gauge. Base default is a no-op.
+     */
+    virtual void RecordLocalInflight(bool entering) { (void)entering; }
 
     /**
      * @brief Single hook for all HA-related events from the heartbeat loop.
@@ -598,53 +614,25 @@ class ClientService {
 
    protected:
     /**
-     * @brief RAII guard for managing in-flight requests during service
-     * shutdown.
+     * @brief Acquires an in-flight request guard. If the service has not been
+     * started yet or is shutting down, the returned guard's is_valid() is false
+     * and the caller must reject the request.
      */
-    class InflightRequestGuard {
-       public:
-        explicit InflightRequestGuard(ClientService* client)
-            : client_(client),
-              valid_(false),
-              lock_(&client_->running_rw_mtx_, shared_lock) {
-            valid_ = client_->is_running_;
-        }
-        ~InflightRequestGuard() = default;
-
-        InflightRequestGuard(const InflightRequestGuard&) = delete;
-        InflightRequestGuard& operator=(const InflightRequestGuard&) = delete;
-        InflightRequestGuard(InflightRequestGuard&& other) = delete;
-        InflightRequestGuard& operator=(InflightRequestGuard&& other) = delete;
-
-        bool is_valid() const { return valid_; }
-
-       private:
-        ClientService* client_;
-        bool valid_;
-        SharedMutexLocker lock_;
-    };
-
-    /**
-     * @brief Acquires an inflight request guard.
-     * @return An InflightRequestGuard. If shutting down, is_valid() will be
-     * false.
-     */
-    InflightRequestGuard AcquireInflightGuard() {
-        return InflightRequestGuard(this);
+    InflightTracker::Guard AcquireInflightGuard() {
+        return local_inflight_tracker_.Enter();
     }
 
     /**
-     * @brief Marks the service as shutting down.
+     * @brief Marks the service as shutting down: rejects new local requests and
+     * waits (unbounded) for all in-flight ones to finish before the DataManager
+     * is torn down.
      * @return true if successfully marked, false if already shutting down.
      */
     bool MarkShuttingDown() {
-        SharedMutexLocker lock(&running_rw_mtx_);
-        if (!is_running_) return false;
-        is_running_ = false;
-        return true;
+        bool initiated = local_inflight_tracker_.Close();
+        local_inflight_tracker_.Wait();
+        return initiated;
     }
-
-    friend class InflightRequestGuard;
 
    protected:
     // Client identification
@@ -679,9 +667,22 @@ class ClientService {
     /// fires. Only accessed from the heartbeat thread — no locking required.
     bool connection_interrupted_ = false;
 
-    // Shutdown protection
-    SharedMutex running_rw_mtx_;
-    bool is_running_ GUARDED_BY(running_rw_mtx_) = false;
+    /// Master server entry saved at Init() (e.g. "etcd://..." or a direct
+    /// address), so a re-registration can restart the heartbeat.
+    std::string master_server_entry_;
+    /// Set inside RegisterClient(); cleared by UnregisterClient().
+    /// Read by Stop() to decide whether to unregister before shutting down.
+    std::atomic<bool> registered_{false};
+
+    // Serializes register / unregister / stop-heartbeat.
+    // Lock order: registration_mutex_ -> local_inflight_tracker_.rwlock_, and
+    // registration_mutex_ -> heartbeat_mtx_. Stop() holds registration_mutex_
+    // before draining the in-flight tracker so this order is never inverted.
+    Mutex registration_mutex_;
+
+    InflightTracker local_inflight_tracker_{
+        "local requests", [this] { RecordLocalInflight(true); },
+        [this] { RecordLocalInflight(false); }};
 
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     uint16_t http_port_ = 0;  // 0 means disabled

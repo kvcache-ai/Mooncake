@@ -224,6 +224,68 @@ TEST_F(HARecoveryManagerTest, NotifierRestartedOnReachableFromDegraded) {
 }
 
 // ============================================================================
+// LOCAL_ONLY (proactive unregister) state
+// ============================================================================
+
+TEST_F(HARecoveryManagerTest, EnterLocalOnlyForcesStateAndStopsNotifier) {
+    notifier_ =
+        std::make_unique<AsyncMetadataNotifier>(*master_client_, client_id_,
+                                                /*sender_thread_count=*/1,
+                                                /*max_batch_size=*/2000,
+                                                /*queue_capacity=*/4000);
+    notifier_->Start();
+    auto mgr = CreateManager();
+    mgr->SetReadyForRecovery();
+
+    EXPECT_EQ(mgr->GetState(), HAClientState::FULL);
+    EXPECT_FALSE(mgr->IsLocalService());
+    EXPECT_TRUE(notifier_->running_.load());
+
+    mgr->EnterLocalOnly();
+
+    EXPECT_EQ(mgr->GetState(), HAClientState::LOCAL_ONLY);
+    EXPECT_TRUE(mgr->IsLocalService());
+    // LOCAL_ONLY is distinct from DEGRADED.
+    EXPECT_FALSE(mgr->IsDegraded());
+    // Notifier stopped: no more metadata pushed to master.
+    EXPECT_FALSE(notifier_->running_.load());
+}
+
+TEST_F(HARecoveryManagerTest, IsLocalServiceTrueForDegradedAndLocalOnly) {
+    auto mgr = CreateManager();
+    EXPECT_FALSE(mgr->IsLocalService());  // FULL
+
+    mgr->HandleEvent(HAEvent::MASTER_UNREACHABLE);
+    EXPECT_TRUE(mgr->IsLocalService());  // DEGRADED
+
+    mgr->EnterLocalOnly();
+    EXPECT_TRUE(mgr->IsLocalService());  // LOCAL_ONLY
+}
+
+TEST_F(HARecoveryManagerTest,
+       ReconnectFromLocalOnlyRestartsNotifierAndRecovers) {
+    notifier_ =
+        std::make_unique<AsyncMetadataNotifier>(*master_client_, client_id_,
+                                                /*sender_thread_count=*/1,
+                                                /*max_batch_size=*/2000,
+                                                /*queue_capacity=*/4000);
+    notifier_->Start();
+    auto mgr = CreateManager();
+    mgr->SetReadyForRecovery();
+
+    mgr->EnterLocalOnly();
+    EXPECT_EQ(mgr->GetState(), HAClientState::LOCAL_ONLY);
+    EXPECT_FALSE(notifier_->running_.load());
+
+    // Re-registration path: MASTER_RECONNECTED from LOCAL_ONLY restarts the
+    // notifier and drives SYNCING -> FULL (empty data_manager: completes fast).
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
+    EXPECT_TRUE(notifier_->running_.load());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(mgr->GetState(), HAClientState::FULL);
+}
+
+// ============================================================================
 // Concurrent event handling
 // ============================================================================
 

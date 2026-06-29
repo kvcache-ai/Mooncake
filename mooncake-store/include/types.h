@@ -376,13 +376,17 @@ inline std::ostream& operator<<(std::ostream& os,
  * @enum HAClientState
  * @brief Client-side HA state for Master crash recovery.
  *        FULL: normal operation
- *        DEGRADED: Master unreachable, local-only mode
+ *        DEGRADED: Master unreachable, local-only mode (still heartbeat probing
+ *                  and probing for recovery)
  *        SYNCING: re-syncing metadata to restarted Master
+ *        LOCAL_ONLY: intentionally unregistered, stable local-only service
+ *                    (NO heartbeat probing, NO auto re-registration)
  */
 enum class HAClientState : int32_t {
     FULL = 0,
     DEGRADED = 1,
     SYNCING = 2,
+    LOCAL_ONLY = 3,
 };
 
 inline std::ostream& operator<<(std::ostream& os,
@@ -396,6 +400,9 @@ inline std::ostream& operator<<(std::ostream& os,
             break;
         case HAClientState::SYNCING:
             os << "SYNCING";
+            break;
+        case HAClientState::LOCAL_ONLY:
+            os << "LOCAL_ONLY";
             break;
         default:
             os << "UNKNOWN";
@@ -412,6 +419,8 @@ inline const char* toString(HAClientState state) noexcept {
             return "DEGRADED";
         case HAClientState::SYNCING:
             return "SYNCING";
+        case HAClientState::LOCAL_ONLY:
+            return "LOCAL_ONLY";
         default:
             return "UNKNOWN";
     }

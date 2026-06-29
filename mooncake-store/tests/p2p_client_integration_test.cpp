@@ -12,10 +12,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "p2p_client_service.h"
@@ -901,6 +903,41 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
                       payloads[i]);
         }
     }
+}
+
+// ============================================================================
+// UnregisterClient / re-register / graceful Stop
+// ============================================================================
+
+TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
+    auto c = CreateP2PClient("localhost:18821");
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(c->GetHealthStatus(), "FULL");
+
+    // Unregister -> stable LOCAL_ONLY (heartbeat stopped, no auto re-register).
+    auto un = c->UnregisterClient();
+    ASSERT_TRUE(un.has_value()) << static_cast<int>(un.error());
+    EXPECT_EQ(c->GetHealthStatus(), "LOCAL_ONLY");
+
+    // Local read/write still works in local-only mode.
+    const std::string key = "p2p_local_only_rw";
+    const std::string data = "local-only-data";
+    std::vector<Slice> put_slices;
+    put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    ASSERT_TRUE(c->Put(key, put_slices, WriteRouteRequestConfig{}).has_value());
+
+    std::vector<char> buf(data.size(), 0);
+    auto get_res = c->Get(key, {(void*)buf.data()}, {buf.size()});
+    ASSERT_TRUE(get_res.has_value())
+        << "local Get failed: " << static_cast<int>(get_res.error());
+    EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    // (Re-registration back to FULL is driven via the public HTTP /register
+    // endpoint and is covered by
+    // P2PClientHttpEndpointsTest.HttpUnregisterThenRegister.)
+
+    c->Stop();
+    c->Destroy();
 }
 
 }  // namespace testing

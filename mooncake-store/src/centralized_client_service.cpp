@@ -42,8 +42,16 @@ CentralizedClientService::~CentralizedClientService() {
 }
 
 void CentralizedClientService::Stop() {
-    if (!MarkShuttingDown()) {
-        return;  // Already shut down.
+    {
+        // Hold registration_mutex_ across MarkShuttingDown() so the lock order
+        // is always registration_mutex_ -> local_inflight_tracker_.rwlock_,
+        // matching RegisterClient(). This blocks new registrations and lets
+        // active ones finish before the in-flight tracker is drained, avoiding
+        // a lock-inversion deadlock with the registration path.
+        MutexLocker lk(&registration_mutex_);
+        if (!MarkShuttingDown()) {
+            return;  // Already shut down.
+        }
     }
 
     ClientService::Stop();
@@ -169,8 +177,6 @@ ErrorCode CentralizedClientService::Init(
     InitTransferSubmitter();
 
     InitLocalBufferAllocator(config.local_buffer_size, config.protocol);
-
-    is_running_ = true;
 
     auto reg = RegisterClient();
     if (!reg) {
@@ -2038,7 +2044,8 @@ HeartbeatRequest CentralizedClientService::build_heartbeat_request() {
 }
 
 tl::expected<RegisterClientResponse, ErrorCode>
-CentralizedClientService::RegisterClient() {
+CentralizedClientService::InnerRegisterClient() {
+    // Runs under registration_mutex_; mounted_segments_mutex_ nests inside it.
     // This lock must be held until the register rpc is finished,
     // otherwise there will be corner cases, e.g., a segment is
     // unmounted successfully first, and then registered again in

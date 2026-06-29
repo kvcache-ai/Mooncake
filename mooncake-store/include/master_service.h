@@ -51,6 +51,12 @@ class MasterService {
         -> tl::expected<RegisterClientResponse, ErrorCode>;
 
     /**
+     * @brief Unregister a client, removing all its routing metadata
+     */
+    auto UnregisterClient(const UnregisterClientRequest& req)
+        -> tl::expected<UnregisterClientResponse, ErrorCode>;
+
+    /**
      * @brief heartbeat interface for client to sync its status
      * @param req HeartbeatRequest containing client_id and tasks
      * @return HeartbeatResponse containing client status, view_version,
