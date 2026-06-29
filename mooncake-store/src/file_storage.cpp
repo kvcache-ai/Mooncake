@@ -445,7 +445,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             std::vector<std::string> user_keys;
             user_keys.reserve(storage_keys.size());
             for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key[storage_key].key);
+                user_keys.push_back(task_by_storage_key.at(storage_key).key);
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
@@ -457,12 +457,12 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             // present in user_batch_object go to batch_object; the rest
             // are reported as failed.
             for (const auto& storage_key : storage_keys) {
-                const auto& user_key = task_by_storage_key[storage_key].key;
-                auto it = user_batch_object.find(user_key);
+                const auto& task = task_by_storage_key.at(storage_key);
+                auto it = user_batch_object.find(task.key);
                 if (it != user_batch_object.end()) {
                     batch_object.emplace(storage_key, std::move(it->second));
                 } else {
-                    failed_tasks.push_back(task_by_storage_key[storage_key]);
+                    failed_tasks.push_back(task);
                 }
             }
         }
@@ -513,7 +513,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
                         pinned_buffer_pool_->Release(buf);
                         obj_success = false;
-                        failed_tasks.push_back(task_by_storage_key[obj_key]);
+                        failed_tasks.push_back(task_by_storage_key.at(obj_key));
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
@@ -570,7 +570,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             if (offload_res.error() == ErrorCode::INVALID_READ) {
                 for (const auto& [key, _] : host_batch_object) {
-                    failed_tasks.push_back(task_by_storage_key[key]);
+                    failed_tasks.push_back(task_by_storage_key.at(key));
                 }
             } else {
                 return tl::make_unexpected(offload_res.error());
