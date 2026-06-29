@@ -786,7 +786,7 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
 }
 
 // Verify that the SSD Offload path (LOCAL_DISK replicas) is tracked
-// consistently by both hit counters and cache-total accounting.
+// consistently by both cache-total accounting and hit counters.
 TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     auto& metrics = MasterMetricManager::instance();
     using CacheHitStat = MasterMetricManager::CacheHitStat;
@@ -837,7 +837,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     auto put_end_result = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
-    // After PutEnd: MEMORY cache total should increment by 1.
+    // After PutEnd: MEMORY_TOTAL should increment by 1.
     auto stats = metrics.calculate_cache_stats();
     ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_TOTAL)),
               base_mem_total + 1);
@@ -865,8 +865,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
         service_.NotifyOffloadSuccess(client_id, {task}, {obj_meta});
     ASSERT_TRUE(offload_result.has_value());
 
-    // After offload: SSD cache total should increment by 1 (LOCAL_DISK is
-    // now tracked), memory cache total unchanged.
+    // After offload: SSD_TOTAL should increment by 1, MEMORY_TOTAL unchanged.
     stats = metrics.calculate_cache_stats();
     ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_TOTAL)),
               base_mem_total + 1);
@@ -875,26 +874,47 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums + 1);
     ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums + 1);
 
-    // Step 3: Remove the memory replica so only LOCAL_DISK remains.
+    // Step 3: Remove the object (removes both MEMORY and LOCAL_DISK replicas).
+    // Wait for lease expiry so Remove succeeds.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     auto evict_result = service_.Remove(key, "default");
     ASSERT_TRUE(evict_result.has_value());
 
-    // After removing memory: MEMORY cache total should decrement, SSD
-    // cache total unchanged.
+    // After Remove: both totals should return to baseline.
     stats = metrics.calculate_cache_stats();
     ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_TOTAL)),
               base_mem_total);
     ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::SSD_TOTAL)),
-              base_ssd_total + 1);
+              base_ssd_total);
     ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums);
-    ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums + 1);
+    ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums);
 
-    // Step 4: GetReplicaList should hit LOCAL_DISK, incrementing SSD
-    // hit counters and bytes.
-    auto get_result = service_.GetReplicaList(key, "default");
+    // Step 4: Test SSD hit path by creating an object with only a LOCAL_DISK
+    // replica. Use NotifyOffloadSuccess with a key that has no existing
+    // metadata — AddReplica will create the metadata and add LOCAL_DISK.
+    std::string ssd_only_key = "ssd_only_key";
+    OffloadTaskItem task2{.tenant_id = "default",
+                          .key = ssd_only_key,
+                          .size = static_cast<int64_t>(value_length)};
+    StorageObjectMetadata obj_meta2{
+        .bucket_id = 0,
+        .offset = 0,
+        .key_size = 0,
+        .data_size = static_cast<int64_t>(value_length),
+        .transport_endpoint = "tcp://127.0.0.1:9998"};
+    auto offload_result2 =
+        service_.NotifyOffloadSuccess(client_id, {task2}, {obj_meta2});
+    ASSERT_TRUE(offload_result2.has_value());
+
+    // Verify SSD_TOTAL incremented for the new key.
+    stats = metrics.calculate_cache_stats();
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::SSD_TOTAL)),
+              base_ssd_total + 1);
+
+    // GetReplicaList should hit LOCAL_DISK, incrementing SSD hit counters.
+    auto get_result = service_.GetReplicaList(ssd_only_key, "default");
     ASSERT_TRUE(get_result.has_value());
 
-    // Verify SSD hit nums and bytes incremented, memory side unchanged.
     stats = metrics.calculate_cache_stats();
     ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_HITS)),
               base_mem_hit_nums);
@@ -903,6 +923,10 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     ASSERT_EQ(metrics.get_mem_cache_hit_bytes(), base_mem_hit_bytes);
     ASSERT_EQ(metrics.get_file_cache_hit_bytes(),
               base_file_hit_bytes + value_length);
+
+    // Clean up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    service_.Remove(ssd_only_key, "default");
 }
 
 }  // namespace mooncake::test
