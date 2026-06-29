@@ -18,7 +18,7 @@ pip install mooncake-transfer-engine
 
 ## Quick Start
 
-See the [Transfer Engine Quick Start](../getting_started/quick-start.md#transfer-engine-quick-start) guide for a complete example of setting up and using the Transfer Engine.
+See the [Transfer Engine Developer Quick Start](transfer-engine-quick-start.md) guide for a complete example of setting up and using the Transfer Engine API directly.
 
 ## API Reference
 

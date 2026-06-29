@@ -363,7 +363,7 @@ If a protocol fails to initialize:
 
 ## See Also
 
-- [Quick Start Guide](quick-start.md) - Getting started with Mooncake
+- [Mooncake Store Quick Start](quick-start.md) - Start Mooncake Store for serving framework integrations
 - [Transfer Engine Design](../design/transfer-engine/index.md) - Detailed architecture
 - [Transfer Engine Benchmark](../design/transfer-engine/transfer-engine-bench-tuning.md) - Performance tuning
 - [Python API Reference](../python-api-reference/transfer-engine.md) - API documentation

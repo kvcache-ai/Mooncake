@@ -1,20 +1,27 @@
-# Quick Start
+# Mooncake Store Quick Start
 
-This document describes how to quickly start using Mooncake Transfer Engine and Mooncake Store.
+Mooncake Store is the user-facing distributed KV cache backend for vLLM and
+SGLang HiCache. Most users only need to install Mooncake, start
+`mooncake_master`, and configure their serving framework to use Mooncake Store.
+
+Transfer Engine is the lower-level transport layer used by these integrations.
+If you are developing directly against the Transfer Engine API, see the
+[Transfer Engine Developer Quick Start](../python-api-reference/transfer-engine-quick-start.md).
 
 ## Installation
 
-Install the Mooncake Transfer Engine package from PyPI, which includes both Mooncake Transfer Engine and Mooncake Store Python bindings:
+Install the Mooncake package from PyPI. It includes the Mooncake Store Python
+bindings and the Transfer Engine runtime used underneath.
 
 **For CUDA-enabled systems:**
 ```bash
-pip install mooncake-transfer-engine numpy pyzmq
+pip install mooncake-transfer-engine
 ```
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
 
 **For non-CUDA systems:**
 ```bash
-pip install mooncake-transfer-engine-non-cuda numpy pyzmq
+pip install mooncake-transfer-engine-non-cuda
 ```
 
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
@@ -24,246 +31,81 @@ pip install mooncake-transfer-engine-non-cuda numpy pyzmq
 > sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
 > ```
 
-## Transfer Engine Quick Start
+## Start Mooncake Store
 
-> **Note**: When using RDMA protocol, you may need to run with `sudo` for proper permissions.
+For vLLM and SGLang HiCache, start the Mooncake master service first. Many
+serving-framework integrations use Mooncake's HTTP metadata endpoint, so the
+safest starter command is:
 
-### Start Transfer Engine Receiver (Server)
-
-```python
-
-import numpy as np
-import zmq
-from mooncake.engine import TransferEngine
-
-def main():
-    # Initialize ZMQ context and socket
-    context = zmq.Context()
-    socket = context.socket(zmq.PUSH)
-    socket.bind("tcp://*:5555")  # Bind to port 5555 for buffer info
-
-    HOSTNAME = "localhost" # localhost for simple demo
-    METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "tcp" # use "rdma" on machines with RDMA devices configured
-    DEVICE_NAME = "" # auto discovery if empty
-
-    # Initialize server engine
-    server_engine = TransferEngine()
-    server_engine.initialize(
-        HOSTNAME,
-        METADATA_SERVER,
-        PROTOCOL,
-        DEVICE_NAME
-    )
-    session_id = f"{HOSTNAME}:{server_engine.get_rpc_port()}"
-
-    # Allocate memory on server side (1MB buffer)
-    server_buffer = np.zeros(1024 * 1024, dtype=np.uint8)
-    server_ptr = server_buffer.ctypes.data
-    server_len = server_buffer.nbytes
-
-    # Register memory with Mooncake so the target address is advertised
-    ret_value = server_engine.register_memory(server_ptr, server_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
-
-    print(f"Server initialized with session ID: {session_id}")
-    print(f"Server buffer address: {server_ptr}, length: {server_len}")
-
-    # Send buffer info to client
-    buffer_info = {
-        "session_id": session_id,
-        "ptr": server_ptr,
-        "len": server_len
-    }
-    socket.send_json(buffer_info)
-    print("Buffer information sent to client")
-
-    # Keep server running
-    try:
-        while True:
-            input("Press Ctrl+C to exit...")
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-    finally:
-        # Cleanup
-        ret_value = server_engine.unregister_memory(server_ptr)
-        if ret_value != 0:
-            print("Mooncake memory deregistration failed.")
-            raise RuntimeError("Mooncake memory deregistration failed.")
-
-        socket.close()
-        context.term()
-
-if __name__ == "__main__":
-    main()
-
+```shell
+mooncake_master --enable_http_metadata_server=true
 ```
 
-### Start Transfer Engine Sender (Client)
+The master's default RPC port is `50051`.
 
-```python
+If your deployment uses `P2PHANDSHAKE` or an external etcd/Redis metadata
+service instead of the embedded HTTP metadata server, the minimal master command
+is:
 
-
-import numpy as np
-import zmq
-from mooncake.engine import TransferEngine
-
-def main():
-    # Initialize ZMQ context and socket
-    context = zmq.Context()
-    socket = context.socket(zmq.PULL)
-    socket.connect(f"tcp://localhost:5555")
-
-    # Wait for buffer info from server
-    print("Waiting for server buffer information...")
-    buffer_info = socket.recv_json()
-    server_session_id = buffer_info["session_id"]
-    server_ptr = buffer_info["ptr"]
-    server_len = buffer_info["len"]
-    print(f"Received server info - Session ID: {server_session_id}")
-    print(f"Server buffer address: {server_ptr}, length: {server_len}")
-
-    # Initialize client engine
-    HOSTNAME = "localhost" # localhost for simple demo
-    METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "tcp" # use "rdma" on machines with RDMA devices configured
-    DEVICE_NAME = "" # auto discovery if empty
-
-    client_engine = TransferEngine()
-    client_engine.initialize(
-        HOSTNAME,
-        METADATA_SERVER,
-        PROTOCOL,
-        DEVICE_NAME
-    )
-    session_id = f"{HOSTNAME}:{client_engine.get_rpc_port()}"
-
-    # Allocate and initialize client buffer (1MB)
-    client_buffer = np.ones(1024 * 1024, dtype=np.uint8)  # Fill with ones
-    client_ptr = client_buffer.ctypes.data
-    client_len = client_buffer.nbytes
-
-    # Register memory with Mooncake so the source address is advertised
-    ret_value = client_engine.register_memory(client_ptr, client_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
-
-    print(f"Client initialized with session ID: {session_id}")
-
-    # Transfer data from client to server
-    print("Transferring data to server...")
-    for _ in range(10):
-        ret = client_engine.transfer_sync_write(
-            server_session_id,
-            client_ptr,
-            server_ptr,
-            min(client_len, server_len)  # Transfer minimum of both lengths
-        )
-
-        if ret >= 0:
-            print("Transfer successful!")
-        else:
-            print("Transfer failed!")
-
-    # Cleanup
-    ret_value = client_engine.unregister_memory(client_ptr)
-    if ret_value != 0:
-        print("Mooncake memory deregistration failed.")
-        raise RuntimeError("Mooncake memory deregistration failed.")
-
-    socket.close()
-    context.term()
-
-if __name__ == "__main__":
-    main()
-
+```shell
+mooncake_master
 ```
 
-### More Examples and Documentation
+If the master runs in a container and its IP is dynamic, set
+`--rpc_interface=<ifname>` such as `--rpc_interface=eth0`. Mooncake Master will
+resolve the current IPv4 address from that interface at startup instead of
+relying on a fixed `--rpc_address`.
 
-Please refer to the [Transfer Engine Python API](../python-api-reference/transfer-engine.md) and [Transfer Engine](../design/transfer-engine/index.md) for more examples and documentation.
+## Connect vLLM or SGLang
 
-## Mooncake Store Quick Start
+Choose the serving framework path that matches your deployment:
 
-### Start Master (with HTTP enabled)
+| Framework | Mooncake path | Start here |
+|-----------|---------------|------------|
+| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](examples/sglang-integration/hicache-quick-start.md) |
+| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](examples/vllm-integration/kv-cache-storage.md) |
 
-Enable the built-in HTTP metadata server when starting the master:
+SGLang and vLLM also support PD disaggregation paths that use Mooncake Transfer
+Engine for direct KV transfer between prefill and decode workers. Those paths
+are configured through the serving framework guides, not by calling Transfer
+Engine APIs directly:
 
-```bash
-mooncake_master \
-  --enable_http_metadata_server=true \
-  --http_metadata_server_host=0.0.0.0 \
-  --http_metadata_server_port=8080
-```
-This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
+- [SGLang Integration Overview](examples/sglang-integration/index.md)
+- [vLLM Integration Overview](examples/vllm-integration/index.md)
 
-If the master runs in a container and its IP is dynamic, set `--rpc_interface=<ifname>` such as `--rpc_interface=eth0`. Mooncake Master will resolve the current IPv4 address from that interface at startup instead of relying on a fixed `--rpc_address`.
+## Optional Python Smoke Test
 
-Optional: Use the free-ratio-first allocation strategy for better load balancing across segments with different sizes or utilization:
-
-```bash
-mooncake_master \
-  --allocation_strategy=free_ratio_first \
-  --enable_http_metadata_server=true \
-  --http_metadata_server_port=8080
-```
-
-The free-ratio-first strategy balances memory utilization ratio across segments by sampling multiple candidates and preferentially allocating to those with higher free space ratios, leading to more even utilization.
-
-### Hello World Example
+If you want to verify the Store Python API without a serving framework, run this
+single-node `put`/`get` example after starting `mooncake_master`. It uses
+`P2PHANDSHAKE`, so no separate Transfer Engine metadata service is required.
 
 ```python
 from mooncake.store import MooncakeDistributedStore
 
-# 1. Create store instance
 store = MooncakeDistributedStore()
-
-# 2. Setup with all required parameters
 store.setup(
-    "localhost",           # Your node's address
-    "http://localhost:8080/metadata",    # HTTP metadata server
-    512*1024*1024,          # 512MB segment size
-    128*1024*1024,          # 128MB local buffer
-    "tcp",                  # Use TCP (RDMA for high performance)
-    "",                      # Leave empty; Mooncake auto-picks RDMA devices when needed
-    "localhost:50051"        # Master service
+    local_hostname="localhost",
+    metadata_server="P2PHANDSHAKE",
+    global_segment_size=512 * 1024 * 1024,
+    local_buffer_size=128 * 1024 * 1024,
+    protocol="tcp",
+    rdma_devices="",
+    master_server_addr="127.0.0.1:50051",
 )
 
-# 3. Store data
 store.put("hello_key", b"Hello, Mooncake Store!")
 
-# 4. Retrieve data
 data = store.get("hello_key")
 print(data.decode())  # Output: Hello, Mooncake Store!
 
-# 5. Clean up
 store.close()
 ```
 
-### More Examples and Documentation
+## Next Steps
 
-Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md) and [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
+For production deployment, standalone store services, high availability,
+allocation strategies, SSD offload, and runtime tuning, continue to the
+[Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md).
 
-## Skills for AI Coding Assistants
-
-Mooncake ships a set of **built-in skills** under [`.claude/skills`](https://github.com/kvcache-ai/Mooncake/tree/main/.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command:
-
-| Skill | Description |
-|-------|-------------|
-| `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
-| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
-| `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
-
-Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
-
-```text
-/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
-/plugin install mooncake-troubleshoot@mooncake
-/plugin install mooncake-ci-local@mooncake
-/plugin install mooncake-api@mooncake
-```
-
-The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.
+For API details, see the [Mooncake Store Python API](../python-api-reference/mooncake-store.md)
+and [Mooncake Store design](../design/mooncake-store.md).

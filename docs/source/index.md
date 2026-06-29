@@ -169,6 +169,7 @@ troubleshooting/pg-ep-troubleshooting
 :maxdepth: 1
 
 community/governance
+community/ai-coding-assistant-skills
 :::
 
 % Archived content
