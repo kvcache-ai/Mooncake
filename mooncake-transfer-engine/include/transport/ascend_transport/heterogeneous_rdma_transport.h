@@ -118,14 +118,16 @@ class HeterogeneousRdmaTransport : public Transport {
         for (size_t i = 1; true; ++i) {
             std::unique_lock<std::mutex> lock(transfer_queue_mutex_);
             if (transfer_queue_cv_.wait_for(lock, 10000ms, [&] {
-                    return !this->transfer_queue_.empty();
+                    return !this->transfer_queue_.empty() || !running_;
                 })) {
+                if (!running_ && transfer_queue_.empty()) {
+                    return TransferInfo{};
+                }
                 auto info = transfer_queue_.front();
                 transfer_queue_.pop();
                 return info;
             } else {
-                // LOG(INFO) << "HeterogeneousRdmaTransport: getTransfer time
-                // out, idx:" << i;
+                if (!running_) return TransferInfo{};
             }
         }
     }
@@ -142,7 +144,7 @@ class HeterogeneousRdmaTransport : public Transport {
         transfer_queue_cv_.notify_one();
     }
 
-    bool running_{};
+    std::atomic<bool> running_{};
     int logic_device_id_{};
 
     std::unique_ptr<RdmaTransport> transport_{};
