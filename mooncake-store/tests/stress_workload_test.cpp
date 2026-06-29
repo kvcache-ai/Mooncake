@@ -51,7 +51,7 @@ DEFINE_uint64(local_memcpy_async_worker_num, 32,
               "local memcpy executor (P2P)");
 DEFINE_uint64(route_cache_max_memory_mb, 300,
               "Max memory for RouteCache in MB (P2P mode)");
-DEFINE_uint64(route_cache_ttl_ms, 300000,
+DEFINE_uint64(route_cache_ttl_ms, 60000,
               "TTL for RouteCache entries in ms (P2P mode)");
 namespace mooncake {
 namespace benchmark {

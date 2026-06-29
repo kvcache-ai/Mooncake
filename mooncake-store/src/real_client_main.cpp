@@ -30,7 +30,7 @@ DEFINE_uint64(lock_shard_count, 1024,
               "Number of metadata shards in TieredBackend (and matching "
               "pending-write/pinned-key lease shards in DataManager)");
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
-DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
+DEFINE_uint64(route_cache_ttl_ms, 60 * 1000,
               "TTL for RouteCache entries in ms");
 DEFINE_uint64(async_sender_thread_count, 4,
               "Async route notifier sender thread count. "

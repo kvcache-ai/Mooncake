@@ -65,7 +65,7 @@ class P2PRegisterConcurrencyTest : public ::testing::Test {
             /*local_buffer_size=*/0, nullptr, "", rpc_port,
             /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
             /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/5 * 60 * 1000,
+            /*route_cache_ttl_ms=*/60 * 1000,
             /*local_transfer_mode=*/"te",
             /*local_memcpy_async_worker_num=*/32, http_port,
             /*enable_http_server=*/true);

@@ -169,7 +169,7 @@ struct P2PClientConfig : RealClientConfigBase {
     // Aligned Node(64B) + hash_bucket(8B) + Key(assume 64B)
     // + P2PRouteData(each item is 96B and count is 8B)
     size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
-    uint64_t route_cache_ttl_ms = 5 * 60 * 1000;              // 5min
+    uint64_t route_cache_ttl_ms = 60 * 1000;                  // 1min
 
     // Async route notification.
     // async_sender_thread_count > 0 enables async notifier.
@@ -308,7 +308,7 @@ class ClientConfigBuilder {
         uint16_t client_rpc_port = 12345, uint32_t rpc_thread_num = 2,
         size_t lock_shard_count = 1024,
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
-        uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
+        uint64_t route_cache_ttl_ms = 60 * 1000,
         const std::string& local_transfer_mode = "te",
         size_t local_memcpy_async_worker_num = 32, uint16_t http_port = 9003,
         bool enable_http_server = true,
