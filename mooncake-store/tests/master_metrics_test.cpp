@@ -792,6 +792,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     using CacheHitStat = MasterMetricManager::CacheHitStat;
 
     WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
     service_config.enable_offload = true;
     service_config.enable_metric_reporting = true;
     WrappedMasterService service_(service_config);
