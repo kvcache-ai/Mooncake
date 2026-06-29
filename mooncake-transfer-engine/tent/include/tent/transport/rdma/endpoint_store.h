@@ -37,6 +37,10 @@ class EndpointStore {
 
     virtual int remove(RdmaEndPoint *ep) = 0;
 
+    // Terminal context-shutdown operation. Unlike remove()/reclaim(), clear()
+    // synchronously releases every endpoint's verbs resources because workers
+    // have stopped and can no longer drain CQ flush completions. Callers must
+    // not use the store again after clear() returns.
     virtual void clear() = 0;
 
     virtual size_t size() = 0;
@@ -111,7 +115,6 @@ class SIEVEEndpointStore : public EndpointStore {
     std::atomic<int> waiting_list_len_;
 
     size_t max_size_;
-    std::atomic<int> endpoints_count_{0};
 };
 }  // namespace tent
 }  // namespace mooncake
