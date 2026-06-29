@@ -213,6 +213,17 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         service.tenant_quota_policy_store_ = std::move(store);
     }
 
+    int64_t LocalDiskUsedBytes(MasterService& service, const UUID& client_id) {
+        auto access = service.segment_manager_.getLocalDiskSegmentAccess();
+        auto& segments = access.getClientLocalDiskSegment();
+        auto it = segments.find(client_id);
+        EXPECT_TRUE(it != segments.end());
+        if (it == segments.end()) {
+            return -1;
+        }
+        return it->second->ssd_used_bytes.load(std::memory_order_relaxed);
+    }
+
 #ifdef USE_NOF
     void ReplaceAllocationStrategy(
         MasterService& service, std::shared_ptr<AllocationStrategy> strategy) {
@@ -464,6 +475,35 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::TENANT_NOT_REGISTERED);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       NotifyOffloadSuccessDoesNotCountAddReplicaUpdateAsNewDiskUsage) {
+    MasterService service(MakeConfig({{"tenant-a", 1000}}));
+    UUID client_a = MountSegment(service, 4096, "quota_segment_a");
+    UUID client_b = MountSegment(service, 4096, "quota_segment_b");
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_a, true).has_value());
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_b, true).has_value());
+
+    StorageObjectMetadata first_metadata;
+    first_metadata.data_size = 128;
+    first_metadata.transport_endpoint = "disk-endpoint-a";
+    std::vector<OffloadTaskItem> tasks{
+        OffloadTaskItem{.tenant_id = "tenant-a", .key = "cold", .size = 128}};
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_a, tasks, {first_metadata})
+                    .has_value());
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
+
+    StorageObjectMetadata second_metadata;
+    second_metadata.data_size = 128;
+    second_metadata.transport_endpoint = "disk-endpoint-b";
+    auto result =
+        service.NotifyOffloadSuccess(client_b, tasks, {second_metadata});
+
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,

@@ -357,7 +357,7 @@ class MasterService {
      */
     auto AddReplica(const UUID& client_id, const std::string& key,
                     const std::string& tenant_id, Replica& replica)
-        -> tl::expected<void, ErrorCode>;
+        -> tl::expected<bool, ErrorCode>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of

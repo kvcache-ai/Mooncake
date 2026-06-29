@@ -3053,7 +3053,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const std::string& tenant_id, Replica& replica)
-    -> tl::expected<void, ErrorCode> {
+    -> tl::expected<bool, ErrorCode> {
     std::string normalized_tenant = "default";
     std::unique_lock<std::mutex> policy_lock(tenant_quota_policy_mutex_,
                                              std::defer_lock);
@@ -3088,7 +3088,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         metadata.AddReplicas(std::move(replicas));
         auto& shard = accessor.GetShard();
         shard.OnDiskReplicaAdded(metadata);
-        return {};
+        return true;
     }
 
     metadata.VisitReplicas(
@@ -3108,7 +3108,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                     .get_local_disk_descriptor()
                     .object_size;
         });
-    return {};
+    return false;
 }
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
@@ -4863,7 +4863,7 @@ auto MasterService::NotifyOffloadSuccess(
                            << ", key=" << object_id.user_key;
                 return tl::make_unexpected(res.error());
             }
-            added_new_local_disk_replica = true;
+            added_new_local_disk_replica = res.value();
         }
         if (local_disk_segment && metadata.data_size > 0 &&
             added_new_local_disk_replica) {
