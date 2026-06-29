@@ -303,9 +303,9 @@ tl::expected<void, ErrorCode> DataManager::ReservePendingWriteSlot(
             shard.ordered_list.erase(pending_it->second.list_it);
             shard.existed_operation_key_map.erase(pending_it);
         } else {
-            LOG(ERROR) << "PreWrite: replica is processing an in-flight write"
-                       << ", key=" << key << ", error="
-                       << toString(ErrorCode::REPLICA_IS_PROCESSING);
+            LOG(WARNING) << "PreWrite: replica is processing an in-flight write"
+                         << ", key=" << key << ", error="
+                         << toString(ErrorCode::REPLICA_IS_PROCESSING);
             return tl::make_unexpected(ErrorCode::REPLICA_IS_PROCESSING);
         }
     }
@@ -817,9 +817,13 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     // flow.
     auto handle_result = tiered_backend_->Get(key);
     if (!handle_result) {
-        LOG(ERROR) << "ReadRemoteData: Get failed"
-                   << ", key=" << key
-                   << ", error=" << toString(handle_result.error());
+        if (handle_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "ReadRemoteData: Get failed"
+                       << ", key=" << key
+                       << ", error=" << toString(handle_result.error());
+        } else {
+            VLOG(1) << "ReadRemoteData: key not found locally, key=" << key;
+        }
         timer.LogResponse("error_code=", handle_result.error());
         return tl::make_unexpected(handle_result.error());
     }
@@ -953,9 +957,9 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     // the record itself has no separate lock while the write lease excludes
     // concurrent writers.
     if (tiered_backend_->Exist(ctx.key)) {
-        LOG(ERROR) << "PreWrite: key already exists"
-                   << ", key=" << ctx.key
-                   << ", error=" << toString(ErrorCode::OBJECT_ALREADY_EXISTS);
+        VLOG(1) << "PreWrite: key already exists"
+                << ", key=" << ctx.key
+                << ", error=" << toString(ErrorCode::OBJECT_ALREADY_EXISTS);
         (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
                                       write_operation_id);
         timer.LogResponse("error_code=", ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -1164,9 +1168,13 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     // Slow path: Get committed object (no pin_shard_lock).
     auto handle_result = tiered_backend_->Get(ctx.key, tier_id);
     if (!handle_result) {
-        LOG(ERROR) << "PinKey: Get failed"
-                   << ", key=" << ctx.key
-                   << ", error=" << toString(handle_result.error());
+        if (handle_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "PinKey: Get failed"
+                       << ", key=" << ctx.key
+                       << ", error=" << toString(handle_result.error());
+        } else {
+            VLOG(1) << "PinKey: key not found locally, key=" << ctx.key;
+        }
         timer.LogResponse("error_code=", handle_result.error());
         return tl::make_unexpected(handle_result.error());
     }

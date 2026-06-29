@@ -25,9 +25,11 @@ namespace mooncake {
 CentralizedClientService::CentralizedClientService(
     const std::string& metadata_connstring, const std::string& protocol,
     uint16_t http_port, bool enable_http_server,
-    const std::map<std::string, std::string>& labels)
+    const std::map<std::string, std::string>& labels,
+    bool enable_metric_collection)
     : ClientService(metadata_connstring, http_port, enable_http_server, labels),
-      metrics_(ClientMetric::Create(labels)),
+      metrics_(enable_metric_collection ? ClientMetric::Create(labels)
+                                        : nullptr),
       protocol_(protocol),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
@@ -282,6 +284,10 @@ ErrorCode CentralizedClientService::Init(
     StartHttpServer();
 
     runtime_config_store_->loadFromJson(config.runtime_config_json);
+
+    if (metrics_) {
+        metrics_->StartMetricReporting(config.metric_report_interval_seconds);
+    }
 
     return ErrorCode::OK;
 }

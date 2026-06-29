@@ -39,9 +39,11 @@ inline bool IsAlreadyExistsError(ErrorCode err) {
 
 P2PClientService::P2PClientService(
     const std::string& metadata_connstring, uint16_t http_port,
-    bool enable_http_server, const std::map<std::string, std::string>& labels)
+    bool enable_http_server, const std::map<std::string, std::string>& labels,
+    bool enable_metric_collection)
     : ClientService(metadata_connstring, http_port, enable_http_server, labels),
-      metrics_(P2PClientMetric::Create(labels)),
+      metrics_(enable_metric_collection ? P2PClientMetric::Create(labels)
+                                        : nullptr),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr) {
     runtime_config_store_ =
@@ -293,6 +295,11 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     ha_manager_->SetReadyForRecovery();
 
     runtime_config_store_->loadFromJson(config.runtime_config_json);
+
+    // 12. Apply periodic metric-reporting config
+    if (metrics_) {
+        metrics_->StartMetricReporting(config.metric_report_interval_seconds);
+    }
 
     return ErrorCode::OK;
 }
@@ -1263,8 +1270,13 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
                 } else {
                     auto wait_result = handles[i]->task_handle->Wait();
                     if (!wait_result) {
-                        LOG(ERROR) << "Failed to get key: " << keys[i]
-                                   << ", error: " << wait_result.error();
+                        if (wait_result.error() !=
+                            ErrorCode::OBJECT_NOT_FOUND) {
+                            LOG(ERROR) << "Failed to get key: " << keys[i]
+                                       << ", error: " << wait_result.error();
+                        } else {
+                            VLOG(1) << "key not found: " << keys[i];
+                        }
                         results[i] = tl::unexpected(wait_result.error());
                     } else {
                         results[i] = extract(handles[i].value());
@@ -1381,10 +1393,19 @@ P2PClientService::BatchCreateGetHandlesImpl(
         }
     }
 
-    if (miss_indices.empty() ||
-        (ha_manager_ && ha_manager_->IsLocalService())) {
-        // case 1: All keys are found locally
-        // case 2: DEGRADED: master is unreachable
+    if (miss_indices.empty()) {
+        // All keys are found locally.
+        return handles;
+    }
+
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        // DEGRADED: master is unreachable, so a local miss is the terminal
+        // answer. The underlying TieredBackend keeps its miss at VLOG; surface
+        // the end-to-end miss here as a warning.
+        for (size_t i : miss_indices) {
+            LOG(WARNING) << "degraded service: key not found locally"
+                         << ", key=" << keys[i];
+        }
         return handles;
     }
 
@@ -1400,6 +1421,13 @@ P2PClientService::BatchCreateGetHandlesImpl(
     for (size_t j = 0; j < miss_indices.size(); ++j) {
         const size_t i = miss_indices[j];
         if (!routes[j]) {
+            if (routes[j].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                // Local miss + master has no route => the key does not exist
+                // anywhere in the cluster. This is the authoritative end-to-end
+                // read miss for a non-degraded service.
+                LOG(WARNING) << "remote read miss: key not found in cluster"
+                             << ", key=" << keys[i];
+            }
             handles[i] = tl::unexpected(routes[j].error());
         } else {
             handles[i] = remote_get(keys[i], i, std::move(routes[j].value()));

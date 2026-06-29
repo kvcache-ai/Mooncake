@@ -62,6 +62,12 @@ DEFINE_string(runtime_config, "",
               "file. Can also be set via env MC_RUNTIME_CONFIG. For example,"
               "Centralization mode: conf/centralized_runtime_config.json, "
               "P2P mode: conf/p2p_runtime_config.json. Ï");
+DEFINE_bool(enable_client_metric_collection, true,
+            "Enable client metric collection. When false, no metrics are "
+            "collected and the /metrics endpoint is unavailable.");
+DEFINE_uint64(client_metric_report_interval_seconds, 10,
+              "Interval (seconds) for periodic client metric reporting. "
+              "0 disables periodic reporting (metrics are still collected).");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -136,7 +142,9 @@ int main(int argc, char* argv[]) {
                 FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
                 FLAGS_async_route_queue_size, FLAGS_p2p_key_lease_duration_ms,
                 FLAGS_p2p_key_lease_scan_interval_ms,
-                FLAGS_p2p_transfer_direction_mode, FLAGS_runtime_config);
+                FLAGS_p2p_transfer_direction_mode, FLAGS_runtime_config,
+                FLAGS_enable_client_metric_collection,
+                FLAGS_client_metric_report_interval_seconds);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)
@@ -153,7 +161,8 @@ int main(int argc, char* argv[]) {
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
                 FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_http_port),
                 FLAGS_enable_http_server, {}, static_cast<uint16_t>(FLAGS_port),
-                FLAGS_runtime_config);
+                FLAGS_runtime_config, FLAGS_enable_client_metric_collection,
+                FLAGS_client_metric_report_interval_seconds);
         }
     }();
 

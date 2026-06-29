@@ -294,34 +294,9 @@ struct ClientMetric {
     MasterClientMetric master_client_metric;
 
     /**
-     * @brief Check if metrics are enabled via environment variable
-     * @return true if enabled, false if disabled
+     * @brief Creates a ClientMetric instance (metric collection objects).
+     * @return std::unique_ptr<ClientMetric>
      *
-     * Environment variable:
-     * - MC_STORE_CLIENT_METRIC: Enable/disable metrics (enabled by default,
-     *   set to 0/false to disable)
-     */
-    static bool IsEnabled();
-
-    /**
-     * @brief Get the default reporting interval from environment variable
-     * @return Reporting interval in seconds (default: 0)
-     *
-     * Environment variable:
-     * - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds
-     */
-    static uint64_t GetDefaultInterval();
-
-    /**
-     * @brief Creates a ClientMetric instance based on environment variables
-     * @return std::unique_ptr<ClientMetric> containing the instance if enabled,
-     *         nullptr if disabled
-     *
-     * Environment variables:
-     * - MC_STORE_CLIENT_METRIC: Enable/disable metrics (enabled by default,
-     *   set to 0/false to disable)
-     * - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds
-     *   (default: 0, 0 = collect but don't report)
      */
     static std::unique_ptr<ClientMetric> Create(
         const std::map<std::string, std::string>& labels = {}) {
@@ -332,6 +307,11 @@ struct ClientMetric {
     virtual std::string summary_metrics();
 
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
+
+    /**
+     * @brief Starting the periodic reporting interval after construction.
+     */
+    void StartMetricReporting(uint64_t interval_seconds);
 
     explicit ClientMetric(
         uint64_t interval_seconds = 0,
@@ -346,20 +326,7 @@ struct ClientMetric {
     template <typename T>
     static std::unique_ptr<T> CreatePtr(
         const std::map<std::string, std::string>& labels) {
-        if (!IsEnabled()) {
-            LOG(INFO) << "Client metrics disabled (set "
-                         "MC_STORE_CLIENT_METRIC=1 to enable)";
-            return nullptr;
-        }
-        uint64_t interval = GetDefaultInterval();
-        if (interval > 0) {
-            LOG(INFO) << "Client metrics enabled with reporting interval: "
-                      << interval << "s";
-        } else {
-            LOG(INFO)
-                << "Client metrics enabled but reporting disabled (interval=0)";
-        }
-        return std::make_unique<T>(interval, merge_labels(labels));
+        return std::make_unique<T>(0, merge_labels(labels));
     }
 
    private:
