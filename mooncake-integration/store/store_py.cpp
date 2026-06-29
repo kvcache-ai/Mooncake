@@ -1195,7 +1195,7 @@ PYBIND11_MODULE(store, m) {
                const py::object& engine = py::none(),
                const std::string& runtime_config = "",
                bool enable_metric_collection = true,
-               uint64_t metric_report_interval_seconds = 10) {
+               uint64_t metric_report_interval_seconds = 60) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1243,7 +1243,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("p2p_transfer_direction_mode") = "reverse",
             py::arg("engine") = py::none(), py::arg("runtime_config") = "",
             py::arg("enable_metric_collection") = true,
-            py::arg("metric_report_interval_seconds") = 10,
+            py::arg("metric_report_interval_seconds") = 60,
             "Setup the store in P2P architecture.")
         .def(
             "setup",
@@ -1259,7 +1259,7 @@ PYBIND11_MODULE(store, m) {
                bool enable_http_server = true,
                const std::string& runtime_config = "",
                bool enable_metric_collection = true,
-               uint64_t metric_report_interval_seconds = 10) {
+               uint64_t metric_report_interval_seconds = 60) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1290,7 +1290,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_http_server") = true,
             py::arg("runtime_config") = "",
             py::arg("enable_metric_collection") = true,
-            py::arg("metric_report_interval_seconds") = 10)
+            py::arg("metric_report_interval_seconds") = 60)
         .def(
             "setup",
             [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {

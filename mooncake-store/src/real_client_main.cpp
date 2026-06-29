@@ -65,7 +65,7 @@ DEFINE_string(runtime_config, "",
 DEFINE_bool(enable_client_metric_collection, true,
             "Enable client metric collection. When false, no metrics are "
             "collected and the /metrics endpoint is unavailable.");
-DEFINE_uint64(client_metric_report_interval_seconds, 10,
+DEFINE_uint64(metric_report_interval_seconds, 60,
               "Interval (seconds) for periodic client metric reporting. "
               "0 disables periodic reporting (metrics are still collected).");
 
@@ -144,7 +144,7 @@ int main(int argc, char* argv[]) {
                 FLAGS_p2p_key_lease_scan_interval_ms,
                 FLAGS_p2p_transfer_direction_mode, FLAGS_runtime_config,
                 FLAGS_enable_client_metric_collection,
-                FLAGS_client_metric_report_interval_seconds);
+                FLAGS_metric_report_interval_seconds);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)
@@ -162,7 +162,7 @@ int main(int argc, char* argv[]) {
                 FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_http_port),
                 FLAGS_enable_http_server, {}, static_cast<uint16_t>(FLAGS_port),
                 FLAGS_runtime_config, FLAGS_enable_client_metric_collection,
-                FLAGS_client_metric_report_interval_seconds);
+                FLAGS_metric_report_interval_seconds);
         }
     }();
 

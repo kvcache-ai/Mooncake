@@ -121,7 +121,7 @@ struct RealClientConfigBase {
 
     // Periodic client-metric reporting interval, in seconds.
     // When it is 0, metric reporting is disabled.
-    uint64_t metric_report_interval_seconds = 10;
+    uint64_t metric_report_interval_seconds = 60;
 };
 
 /**
@@ -239,7 +239,7 @@ class ClientConfigBuilder {
         const std::map<std::string, std::string>& labels = {},
         uint16_t local_rpc_port = 50052, const std::string& runtime_config = "",
         bool enable_metric_collection = true,
-        uint64_t metric_report_interval_seconds = 10) {
+        uint64_t metric_report_interval_seconds = 60) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -320,7 +320,7 @@ class ClientConfigBuilder {
         const std::string& p2p_transfer_direction_mode = "reverse",
         const std::string& runtime_config = "",
         bool enable_metric_collection = true,
-        uint64_t metric_report_interval_seconds = 10) {
+        uint64_t metric_report_interval_seconds = 60) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -459,7 +459,7 @@ class ClientConfigBuilder {
         static constexpr const char* kDefaultProtocol = "tcp";
         static constexpr const char* kDefaultMasterServerAddr =
             "127.0.0.1:50051";
-        static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 10;
+        static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 60;
         static constexpr bool kDefaultEnableMetricCollection = true;
         // Limits
         static constexpr size_t kMinSegmentSize = 1024;
@@ -620,7 +620,7 @@ class ClientConfigBuilder {
         const std::map<std::string, std::string>& labels = {},
         const std::string& runtime_config = "",
         bool enable_metric_collection = true,
-        uint64_t metric_report_interval_seconds = 10) {
+        uint64_t metric_report_interval_seconds = 60) {
         // Parse local_hostname into IP and optional port.
         // Only set te_port when the user explicitly provides a port;
         // otherwise keep the default value (0 = randomly assigned).
