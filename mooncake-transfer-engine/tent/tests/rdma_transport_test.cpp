@@ -90,7 +90,8 @@ bool waitBatchDone(TransferEngine& engine, BatchID batch) {
     TransferStatus status;
     for (int i = 0; i < 10000; ++i) {
         auto result = engine.getTransferStatus(batch, status);
-        if (!result.ok() || status.s == TransferStatusEnum::FAILED) return false;
+        if (!result.ok() || status.s == TransferStatusEnum::FAILED)
+            return false;
         if (status.s == TransferStatusEnum::COMPLETED) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -209,12 +210,13 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
     ASSERT_TRUE(client.submitTransfer(batch, {request}).ok());
     ASSERT_TRUE(waitBatchDone(client, batch));
     ASSERT_TRUE(client.freeBatch(batch).ok());
-    EXPECT_EQ(std::memcmp(buffer.data(), buffer.data() + kDataLength,
-                          kDataLength),
-              0);
+    EXPECT_EQ(
+        std::memcmp(buffer.data(), buffer.data() + kDataLength, kDataLength),
+        0);
 
     EXPECT_TRUE(client.closeSegment(segment).ok());
-    EXPECT_TRUE(client.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_TRUE(
+        client.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 
     const int status = child_guard.finish();
     ASSERT_TRUE(WIFEXITED(status));
