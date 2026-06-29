@@ -13,6 +13,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -40,6 +41,32 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol) {
+    if (protocol == "rdma" || protocol == "efa") {
+        return globalConfig().max_mr_size;
+    }
+    if (protocol == "ub") {
+        return globalConfig().max_seg_size;
+    }
+    return std::nullopt;
+}
+
+SegmentSplitMode GetSegmentSplitMode(const std::string& protocol) {
+    if (protocol == "rdma" || protocol == "efa") {
+        return SegmentSplitMode::kGiBAlignedBalanced;
+    }
+    if (protocol == "ub") {
+        return SegmentSplitMode::kBalanced;
+    }
+    return SegmentSplitMode::kSingleSegment;
+}
+
+size_t ceilDiv(size_t value, size_t divisor) {
+    DCHECK_NE(divisor, 0u);
+    return value == 0 ? 0 : 1 + (value - 1) / divisor;
+}
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -313,13 +340,15 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
-// Compute GiB-aligned segment sizes that sum exactly to total_bytes.
+// Compute segment sizes that sum exactly to total_bytes.
 //
-// For non-RDMA protocols there is no hardware MR size limit, so a single
-// segment of total_bytes is returned.
+// SegmentSplitMode::kSingleSegment returns {total_bytes}.
 //
-// For RDMA/EFA, segments are split to respect the ibv_reg_mr() hardware
-// limit (max_mr_size).  The algorithm uses two parallel trackers:
+// SegmentSplitMode::kBalanced splits the range into near-equal byte-sized
+// chunks, each <= max_segment_size. This is used for protocols like UB that
+// have a transport registration cap but do not require GiB alignment.
+//
+// SegmentSplitMode::kGiBAlignedBalanced uses two parallel trackers:
 //   remaining_gib_ceil  — ceil-rounded GiB quota, drives even splitting
 //   remaining_bytes     — actual bytes remaining, determines real sizes
 //
@@ -329,36 +358,59 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
 //   (b) adjacent segments differ by at most 1 GiB
 //   (c) sum of all segments == total_bytes  (no memory wasted)
 //
-// Precondition (RDMA/EFA only): max_mr_size >= 1 GiB. GiB-aligned splitting
-// cannot honor a sub-GiB cap; callers configuring a smaller cap get an empty
-// result and an error log. In practice RDMA hardware always reports
-// max_mr_size well above 1 GiB.
+// Precondition for SegmentSplitMode::kGiBAlignedBalanced: max_segment_size
+// >= 1 GiB. GiB-aligned splitting cannot honor a sub-GiB cap; callers
+// configuring a smaller cap get an empty result and an error log.
 std::vector<size_t> computeSegmentSizes(size_t total_bytes,
-                                        size_t max_mr_size,
-                                        bool is_rdma) {
+                                        size_t max_segment_size,
+                                        SegmentSplitMode split_mode) {
     static constexpr size_t kGiB = 1ULL << 30;
 
-    // Non-RDMA: single segment, no splitting needed.
-    if (!is_rdma) return {total_bytes};
+    if (split_mode == SegmentSplitMode::kSingleSegment) {
+        return {total_bytes};
+    }
+
+    if (max_segment_size == 0) {
+        LOG(ERROR) << "computeSegmentSizes: max_segment_size must be > 0";
+        return {};
+    }
+
+    if (total_bytes == 0) {
+        return {0};
+    }
+
+    if (split_mode == SegmentSplitMode::kBalanced) {
+        const size_t num_segments =
+            1 + (total_bytes - 1) / max_segment_size;
+        const size_t base_size = total_bytes / num_segments;
+        const size_t remainder = total_bytes % num_segments;
+
+        std::vector<size_t> sizes;
+        sizes.reserve(num_segments);
+        for (size_t i = 0; i < num_segments; ++i) {
+            sizes.push_back(base_size + (i < remainder ? 1 : 0));
+        }
+        return sizes;
+    }
 
     // RDMA/EFA precondition: GiB-aligned splitting requires at least 1 GiB
     // of headroom. Sub-GiB caps would force segments that exceed the cap.
-    if (max_mr_size < kGiB) {
-        LOG(ERROR) << "computeSegmentSizes: max_mr_size (" << max_mr_size
-                   << " B) < 1 GiB is not supported for RDMA/EFA";
+    if (max_segment_size < kGiB) {
+        LOG(ERROR) << "computeSegmentSizes: max_segment_size ("
+                   << max_segment_size
+                   << " B) < 1 GiB is not supported for GiB-aligned splitting";
         return {};
     }
 
     // Round total UP so the sub-GiB tail occupies a full GiB quota slot,
     // preventing the last segment from exceeding max_mr_size.
-    const size_t total_gib_ceil = (total_bytes + kGiB - 1) / kGiB;
+    const size_t total_gib_ceil = ceilDiv(total_bytes, kGiB);
 
-    // Floor division keeps each GiB-aligned segment within max_mr_size
+    // Floor division keeps each GiB-aligned segment within max_segment_size
     // even when max_mr_size itself is not GiB-aligned.
-    const size_t max_seg_gib = max_mr_size / kGiB;
+    const size_t max_seg_gib = max_segment_size / kGiB;
 
-    const size_t num_segments = std::max<size_t>(
-        1, (total_gib_ceil + max_seg_gib - 1) / max_seg_gib);
+    const size_t num_segments = std::max<size_t>(1, ceilDiv(total_gib_ceil, max_seg_gib));
 
     std::vector<size_t> sizes;
     sizes.reserve(num_segments);
@@ -367,7 +419,11 @@ std::vector<size_t> computeSegmentSizes(size_t total_bytes,
     for (size_t i = 0; i < num_segments; i++) {
         size_t seg_gib = remaining_gib_ceil / (num_segments - i);
         remaining_gib_ceil -= seg_gib;
-        size_t seg_bytes = std::min(seg_gib * kGiB, remaining_bytes);
+        size_t seg_bytes_cap =
+            seg_gib > std::numeric_limits<size_t>::max() / kGiB
+                ? std::numeric_limits<size_t>::max()
+                : seg_gib * kGiB;
+        size_t seg_bytes = std::min(seg_bytes_cap, remaining_bytes);
         remaining_bytes -= seg_bytes;
         sizes.push_back(seg_bytes);
     }
@@ -520,9 +576,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     } else if (global_segment_size == 0) {
         LOG(INFO) << "Global segment size is 0, skip mounting segment";
     } else {
-        const bool is_rdma = (protocol == "rdma" || protocol == "efa");
+        const SegmentSplitMode split_mode = GetSegmentSplitMode(protocol);
+        const size_t max_segment_size =
+            GetTransportRegistrationLimit(protocol).value_or(0);
         const std::vector<size_t> seg_sizes = computeSegmentSizes(
-            global_segment_size, globalConfig().max_mr_size, is_rdma);
+            global_segment_size, max_segment_size, split_mode);
         if (seg_sizes.empty()) {
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -601,7 +659,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, segment_size, protocol, seg_location);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());

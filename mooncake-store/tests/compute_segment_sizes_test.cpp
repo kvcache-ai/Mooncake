@@ -32,11 +32,12 @@ static void checkInvariants(const std::vector<size_t>& sizes,
     }
 }
 
-// Non-RDMA: always a single segment regardless of size.
-TEST(ComputeSegmentSizesTest, NonRdmaAlwaysSingleSegment) {
+// Single-segment mode: always returns one segment regardless of size.
+TEST(ComputeSegmentSizesTest, SingleSegmentModeAlwaysSingleSegment) {
     const size_t total = 1401 * kGiB;
     const size_t max_mr = 1024 * kGiB;  // would split under RDMA
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/false);
+    auto sizes =
+        computeSegmentSizes(total, max_mr, SegmentSplitMode::kSingleSegment);
     ASSERT_EQ(sizes.size(), 1u);
     EXPECT_EQ(sizes[0], total);
 }
@@ -46,7 +47,8 @@ TEST(ComputeSegmentSizesTest, NonRdmaAlwaysSingleSegment) {
 TEST(ComputeSegmentSizesTest, RdmaGiBAlignedBalancedSplit) {
     const size_t total = 1401 * kGiB;
     const size_t max_mr = 1024 * kGiB;  // 1 TiB
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    auto sizes = computeSegmentSizes(total, max_mr,
+                                     SegmentSplitMode::kGiBAlignedBalanced);
     checkInvariants(sizes, total, max_mr);
     ASSERT_EQ(sizes.size(), 2u);
     EXPECT_EQ(sizes[0], 700 * kGiB);
@@ -60,7 +62,8 @@ TEST(ComputeSegmentSizesTest, RdmaSubGiBTailAbsorbedInLastSegment) {
     const size_t tail = 500 * 1024 * 1024;  // 500 MiB
     const size_t total = 7 * kGiB + tail;
     const size_t max_mr = 3 * kGiB;
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    auto sizes = computeSegmentSizes(total, max_mr,
+                                     SegmentSplitMode::kGiBAlignedBalanced);
     checkInvariants(sizes, total, max_mr);
     ASSERT_EQ(sizes.size(), 3u);
     EXPECT_EQ(sizes[0], 2 * kGiB);
@@ -74,7 +77,8 @@ TEST(ComputeSegmentSizesTest, RdmaSubGiBTailAbsorbedInLastSegment) {
 TEST(ComputeSegmentSizesTest, RdmaTotalJustOverMaxMrSizeRequiresTwoSegments) {
     const size_t max_mr = 2 * kGiB;
     const size_t total = max_mr + 1;  // 2 GiB + 1 byte
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    auto sizes = computeSegmentSizes(total, max_mr,
+                                     SegmentSplitMode::kGiBAlignedBalanced);
     checkInvariants(sizes, total, max_mr);
     ASSERT_EQ(sizes.size(), 2u);
 }
@@ -83,7 +87,8 @@ TEST(ComputeSegmentSizesTest, RdmaTotalJustOverMaxMrSizeRequiresTwoSegments) {
 TEST(ComputeSegmentSizesTest, RdmaTotalEqualsMaxMrSizeSingleSegment) {
     const size_t max_mr = 4 * kGiB;
     const size_t total = max_mr;
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    auto sizes = computeSegmentSizes(total, max_mr,
+                                     SegmentSplitMode::kGiBAlignedBalanced);
     checkInvariants(sizes, total, max_mr);
     ASSERT_EQ(sizes.size(), 1u);
     EXPECT_EQ(sizes[0], total);
@@ -94,10 +99,36 @@ TEST(ComputeSegmentSizesTest, RdmaTotalBelowMaxMrSizeWithTailSingleSegment) {
     const size_t tail = 123 * 1024 * 1024;  // 123 MiB
     const size_t total = 3 * kGiB + tail;
     const size_t max_mr = 8 * kGiB;
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    auto sizes = computeSegmentSizes(total, max_mr,
+                                     SegmentSplitMode::kGiBAlignedBalanced);
     checkInvariants(sizes, total, max_mr);
     ASSERT_EQ(sizes.size(), 1u);
     EXPECT_EQ(sizes[0], total);
+}
+
+// UB: split on byte granularity to respect URMA's max_seg_size cap exactly.
+TEST(ComputeSegmentSizesTest, UbBalancedSplitHonorsMaxSegSize) {
+    const size_t total = 7 * kGiB + 1;  // forces a non-even byte tail
+    const size_t max_seg = 3 * kGiB;
+    auto sizes =
+        computeSegmentSizes(total, max_seg, SegmentSplitMode::kBalanced);
+    checkInvariants(sizes, total, max_seg);
+    ASSERT_EQ(sizes.size(), 3u);
+    EXPECT_LE(*std::max_element(sizes.begin(), sizes.end()) -
+                  *std::min_element(sizes.begin(), sizes.end()),
+              size_t{1});
+}
+
+// UB: sub-GiB caps are supported because splitting is byte-balanced rather
+// than GiB-aligned.
+TEST(ComputeSegmentSizesTest, UbSubGiBCapIsSupported) {
+    const size_t max_seg = 512 * 1024 * 1024;  // 512 MiB
+    const size_t total = 3 * kGiB;
+    auto sizes =
+        computeSegmentSizes(total, max_seg, SegmentSplitMode::kBalanced);
+    checkInvariants(sizes, total, max_seg);
+    ASSERT_EQ(sizes.size(), 6u);
+    for (size_t s : sizes) EXPECT_EQ(s, max_seg);
 }
 
 // RDMA, max_mr_size exactly 1 GiB: the boundary of the supported range.
@@ -105,7 +136,8 @@ TEST(ComputeSegmentSizesTest, RdmaTotalBelowMaxMrSizeWithTailSingleSegment) {
 TEST(ComputeSegmentSizesTest, RdmaMaxMrSizeExactlyOneGiBHonorsCap) {
     const size_t max_mr = kGiB;
     const size_t total = 3 * kGiB;
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    auto sizes = computeSegmentSizes(total, max_mr,
+                                     SegmentSplitMode::kGiBAlignedBalanced);
     checkInvariants(sizes, total, max_mr);
     ASSERT_EQ(sizes.size(), 3u);
     for (size_t s : sizes) EXPECT_EQ(s, kGiB);
@@ -117,7 +149,8 @@ TEST(ComputeSegmentSizesTest, RdmaMaxMrSizeExactlyOneGiBHonorsCap) {
 TEST(ComputeSegmentSizesTest, RdmaMaxMrSizeBelowOneGiBReturnsEmpty) {
     const size_t max_mr = 512 * 1024 * 1024;  // 512 MiB, < 1 GiB
     const size_t total = 3 * kGiB;
-    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    auto sizes = computeSegmentSizes(total, max_mr,
+                                     SegmentSplitMode::kGiBAlignedBalanced);
     EXPECT_TRUE(sizes.empty());
 }
 

@@ -29,6 +29,20 @@
 #include "local_hot_cache.h"
 
 namespace mooncake {
+namespace {
+
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol) {
+    if (protocol == "rdma" || protocol == "efa") {
+        return globalConfig().max_mr_size;
+    }
+    if (protocol == "ub") {
+        return globalConfig().max_seg_size;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
@@ -213,13 +227,13 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
         LOG(ERROR) << "length is 0";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Only RDMA/EFA is limited by max_mr_size due to ibv_reg_mr() hardware
-    // limits.
-    if (protocol == "rdma" || protocol == "efa") {
-        auto max_mr_size = globalConfig().max_mr_size;
-        if (length > max_mr_size) {
+    if (auto max_registration_size = GetTransportRegistrationLimit(protocol);
+        max_registration_size.has_value()) {
+        if (length > *max_registration_size) {
             LOG(ERROR) << "length " << length
-                       << " is larger than max_mr_size: " << max_mr_size;
+                       << " is larger than the transport registration limit "
+                       << *max_registration_size << " for protocol "
+                       << protocol;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
