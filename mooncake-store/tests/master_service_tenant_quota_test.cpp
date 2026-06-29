@@ -396,11 +396,13 @@ TEST_F(MasterServiceTenantQuotaTest,
         WritePolicyFile({{"tenant-a", 1000}, {"tenant-b", 1000}});
     auto config = MasterServiceConfig::builder()
                       .set_enable_multi_tenants(true)
+                      .set_enable_offload(true)
                       .set_tenant_quota_connector_type("file")
                       .set_tenant_quota_connector_uri(initial_policy)
                       .build();
     MasterService service(config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
     PutComplete(service, client_id, "warming", "tenant-b", 128);
 
     {
@@ -428,6 +430,40 @@ TEST_F(MasterServiceTenantQuotaTest,
                             [](const Replica::Descriptor& replica) {
                                 return replica.is_local_disk_replica();
                             }));
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       NotifyOffloadSuccessRejectsOrphanObjectWithoutOffloadTask) {
+    const std::string initial_policy =
+        WritePolicyFile({{"tenant-a", 1000}, {"tenant-b", 1000}});
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(initial_policy)
+                      .build();
+    MasterService service(config);
+    UUID client_id = MountSegment(service);
+    PutComplete(service, client_id, "warming", "tenant-b", 128);
+
+    {
+        std::ofstream out(initial_policy);
+        TenantQuotaPolicySnapshot replacement;
+        replacement.tenant_quotas = {{"tenant-a", 1000}};
+        out << FormatTenantQuotaPolicyYaml(replacement);
+    }
+    ReloadTenantQuotaPolicyFromStore(service);
+    EXPECT_FALSE(Snapshot(service, "tenant-b").has_explicit_policy);
+
+    StorageObjectMetadata metadata;
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "disk-endpoint";
+    std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
+        .tenant_id = "tenant-b", .key = "warming", .size = 128}};
+
+    auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::TENANT_NOT_REGISTERED);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,

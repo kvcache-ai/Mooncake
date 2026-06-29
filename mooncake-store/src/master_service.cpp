@@ -4785,15 +4785,18 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& tenant_state = accessor.GetTenantState();
-
-                if (replica.type() != ReplicaType::LOCAL_DISK) {
+                auto task_it = tenant_state.offloading_tasks.find(
+                    request_object_id.user_key);
+                if (task_it != tenant_state.offloading_tasks.end() &&
+                    replica.type() != ReplicaType::LOCAL_DISK) {
                     LOG(ERROR) << "Invalid replica type: " << replica.type()
                                << ". Expected ReplicaType::LOCAL_DISK.";
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
 
-                auto task_it = tenant_state.offloading_tasks.find(
-                    request_object_id.user_key);
+                // Existing orphan objects can only bypass tenant registration
+                // for a master-admitted offload completion. Without this task
+                // marker, fall through to the regular registration check.
                 if (task_it != tenant_state.offloading_tasks.end()) {
                     auto source =
                         obj_metadata.GetReplicaByID(task_it->second.source_id);
@@ -4801,38 +4804,39 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
-                }
 
-                if (!obj_metadata.HasReplica(
-                        &Replica::fn_is_local_disk_replica)) {
-                    std::vector<Replica> replicas;
-                    replicas.emplace_back(std::move(replica));
-                    obj_metadata.AddReplicas(std::move(replicas));
-                    auto& shard = accessor.GetShard();
-                    shard.OnDiskReplicaAdded(obj_metadata);
-                } else {
-                    obj_metadata.VisitReplicas(
-                        [client_id](const Replica& rep) {
-                            return rep.type() == ReplicaType::LOCAL_DISK &&
-                                   rep.get_descriptor()
-                                           .get_local_disk_descriptor()
-                                           .client_id == client_id;
-                        },
-                        [&replica](Replica& rep) {
-                            rep.get_descriptor()
-                                .get_local_disk_descriptor()
-                                .transport_endpoint =
-                                replica.get_descriptor()
+                    if (!obj_metadata.HasReplica(
+                            &Replica::fn_is_local_disk_replica)) {
+                        std::vector<Replica> replicas;
+                        replicas.emplace_back(std::move(replica));
+                        obj_metadata.AddReplicas(std::move(replicas));
+                        auto& shard = accessor.GetShard();
+                        shard.OnDiskReplicaAdded(obj_metadata);
+                    } else {
+                        obj_metadata.VisitReplicas(
+                            [client_id](const Replica& rep) {
+                                return rep.type() == ReplicaType::LOCAL_DISK &&
+                                       rep.get_descriptor()
+                                               .get_local_disk_descriptor()
+                                               .client_id == client_id;
+                            },
+                            [&replica](Replica& rep) {
+                                rep.get_descriptor()
                                     .get_local_disk_descriptor()
-                                    .transport_endpoint;
-                            rep.get_descriptor()
-                                .get_local_disk_descriptor()
-                                .object_size = replica.get_descriptor()
-                                                   .get_local_disk_descriptor()
-                                                   .object_size;
-                        });
+                                    .transport_endpoint =
+                                    replica.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .transport_endpoint;
+                                rep.get_descriptor()
+                                    .get_local_disk_descriptor()
+                                    .object_size =
+                                    replica.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .object_size;
+                            });
+                    }
+                    handled_existing_object = true;
                 }
-                handled_existing_object = true;
             }
         }
 
