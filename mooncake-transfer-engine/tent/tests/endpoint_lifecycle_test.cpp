@@ -17,6 +17,7 @@
 #include <memory>
 
 #include "tent/transport/rdma/endpoint.h"
+#include "tent/transport/rdma/slice.h"
 
 namespace mooncake {
 namespace tent {
@@ -97,6 +98,58 @@ TEST(EndpointLifecycleTest, SharedFromThisUsesRealEndpointOwnership) {
     locked.reset();
     endpoint.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+TEST(EndpointLifecycleTest, SliceAccessWhileEndpointAlive) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    RdmaSlice slice;
+    slice.ep_weak_ptr = endpoint;
+
+    auto locked = slice.ep_weak_ptr.lock();
+    ASSERT_NE(locked, nullptr);
+    EXPECT_EQ(locked.get(), endpoint.get());
+}
+
+TEST(EndpointLifecycleTest, SliceAccessAfterEndpointEvicted) {
+    RdmaSlice slice;
+    {
+        auto endpoint = std::make_shared<RdmaEndPoint>();
+        slice.ep_weak_ptr = endpoint;
+        ASSERT_FALSE(slice.ep_weak_ptr.expired());
+    }
+
+    EXPECT_TRUE(slice.ep_weak_ptr.expired());
+    EXPECT_EQ(slice.ep_weak_ptr.lock(), nullptr);
+}
+
+TEST(EndpointLifecycleTest, MultipleSlicesShareEndpointLifetime) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    RdmaSlice slices[3];
+    for (auto& slice : slices) slice.ep_weak_ptr = endpoint;
+
+    for (auto& slice : slices) {
+        auto locked = slice.ep_weak_ptr.lock();
+        ASSERT_NE(locked, nullptr);
+        EXPECT_EQ(locked.get(), endpoint.get());
+    }
+
+    endpoint.reset();
+    for (auto& slice : slices) {
+        EXPECT_TRUE(slice.ep_weak_ptr.expired());
+        EXPECT_EQ(slice.ep_weak_ptr.lock(), nullptr);
+    }
+}
+
+TEST(EndpointLifecycleTest, SliceWeakPtrResetClearsReference) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    RdmaSlice slice;
+    slice.ep_weak_ptr = endpoint;
+
+    slice.ep_weak_ptr.reset();
+
+    EXPECT_TRUE(slice.ep_weak_ptr.expired());
+    EXPECT_EQ(slice.ep_weak_ptr.lock(), nullptr);
+    EXPECT_NE(endpoint, nullptr);
 }
 
 TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {
