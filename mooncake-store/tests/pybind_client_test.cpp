@@ -999,15 +999,16 @@ TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
     master_address_ = master_.master_address();
 
     struct InvalidSizeCase {
-        const char* local_hostname;
-        const char* global_segment_size;
-        const char* local_buffer_size;
+        std::string local_hostname;
+        std::string global_segment_size;
+        std::string local_buffer_size;
     };
 
     const InvalidSizeCase invalid_size_cases[] = {
         {"localhost:17816", "50%", "16MB"},
         {"localhost:17817", "16MB", "16XB"},
         {"localhost:17818", "-5", "16MB"},
+        {"localhost:17819", "0", std::to_string(MAX_SEGMENT_SIZE + 1)},
     };
 
     for (const auto& test_case : invalid_size_cases) {
