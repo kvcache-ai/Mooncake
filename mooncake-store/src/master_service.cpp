@@ -1402,6 +1402,10 @@ MasterService::EraseMetadata(
     return EraseMetadata(tenant_state, it, tenant_id, quota_mode, nullptr);
 }
 
+// EraseMetadata deletes the object metadata and also cleans up all
+// associated per-key state: offloading_tasks (with dec_refcnt),
+// processing_keys, replication_tasks, and promotion tasks.
+// Callers no longer need to clean these up manually before calling.
 std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,

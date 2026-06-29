@@ -449,13 +449,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
-            std::vector<std::string> missing_user_keys;
-            auto query_result = BatchQuerySegmentSlices(
-                user_keys, tenant_id, user_batch_object, missing_user_keys);
+            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
+                                                        user_batch_object);
             // BatchQuerySegmentSlices is now best-effort: it always returns
-            // OK, with missing keys reported via missing_user_keys. Keys
-            // present in user_batch_object go to batch_object; the rest
-            // are reported as failed.
+            // OK. Keys present in user_batch_object go to batch_object; the
+            // rest are reported as failed.
             for (const auto& storage_key : storage_keys) {
                 const auto& task = task_by_storage_key.at(storage_key);
                 auto it = user_batch_object.find(task.key);
@@ -712,9 +710,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return offload_result;
     }
 
-    LOG(INFO)
-        << "Successfully completed heartbeat with offloaded objects count: "
-        << offloading_objects.size();
+    VLOG(1) << "Completed heartbeat with offloaded objects count: "
+            << offloading_objects.size();
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
@@ -906,11 +903,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
-    std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
-    std::vector<std::string>& missing_keys) {
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     auto batched_query_results = client_->BatchQuery(keys, tenant_id);
     if (batched_query_results.empty()) {
-        missing_keys = keys;
         return {};
     }
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
@@ -929,11 +924,6 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
                     break;
                 }
             }
-            if (batched_slices.find(keys[i]) == batched_slices.end()) {
-                missing_keys.push_back(keys[i]);
-            }
-        } else {
-            missing_keys.push_back(keys[i]);
         }
     }
     return {};
