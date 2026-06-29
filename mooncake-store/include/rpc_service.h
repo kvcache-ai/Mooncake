@@ -296,9 +296,6 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
 
-    tl::expected<bool, ErrorCode> PollRemoveAll(
-        const UUID& client_id);
-
    private:
     MasterService master_service_;
 };
