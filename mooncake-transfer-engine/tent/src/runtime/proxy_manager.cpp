@@ -190,7 +190,8 @@ Status ProxyManager::submit(TaskInfo* task, BatchID batch,
     staging_task.batch = batch;
     staging_task.params = params;
     static std::atomic<size_t> next_queue_index(0);
-    thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
+    const size_t id =
+        next_queue_index.fetch_add(1, std::memory_order_relaxed) % kShards;
     {
         std::lock_guard<std::mutex> lk(shards_[id].mu);
         if (max_queued_tasks_per_shard_ > 0 &&

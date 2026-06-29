@@ -62,7 +62,7 @@ void ProgressWorker::notifyRuntimeQueueReady() {
     if (!running_.load(std::memory_order_acquire)) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (queue_ready_ || !order_.empty()) return;
+        if (queue_ready_) return;
         queue_ready_ = true;
     }
     cv_.notify_one();
