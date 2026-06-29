@@ -13,10 +13,6 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
                           int32_t device_id)
         : vendor_(vendor), device_ptr_(device_ptr), device_id_(device_id) {}
 
-    void set_secondary_device_ptr(const void* ptr) {
-        secondary_device_ptr_ = ptr;
-    }
-
     AcceleratorVendor Vendor() const override { return vendor_; }
 
     bool Available(bool ensure = false) const override {
@@ -26,7 +22,7 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
 
     PointerInfo QueryPointer(const void* ptr) const override {
         ++query_count_;
-        if (ptr != device_ptr_ && ptr != secondary_device_ptr_) {
+        if (ptr != device_ptr_) {
             return PointerInfo{.kind = MemoryKind::kHost, .device_id = -1};
         }
         return PointerInfo{.kind = MemoryKind::kDevice,
@@ -59,7 +55,6 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
    private:
     AcceleratorVendor vendor_;
     const void* device_ptr_;
-    const void* secondary_device_ptr_ = nullptr;
     int32_t device_id_;
     mutable int32_t current_device_id_ = -1;
     mutable CopyDirection last_direction_ = CopyDirection::kAuto;
@@ -113,71 +108,6 @@ TEST(RuntimeAcceleratorTest, CopyFromHostUsesHostToDeviceCopy) {
     EXPECT_STREQ(dst, src);
     EXPECT_EQ(device.current_device_id(), 4);
     EXPECT_EQ(device.last_direction(), CopyDirection::kHostToDevice);
-}
-
-TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorUsesMemcpyForHostPointers) {
-    char src[] = "abc";
-    char dst[sizeof(src)] = {};
-    RuntimeAccelerator runtime_accelerator;
-
-    EXPECT_TRUE(
-        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
-    EXPECT_STREQ(dst, src);
-}
-
-TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorRejectsDifferentDevices) {
-    char src[] = "abc";
-    char dst[sizeof(src)] = {};
-    FakeAcceleratorDevice src_device(AcceleratorVendor::kNvidia, src, 0);
-    FakeAcceleratorDevice dst_device(AcceleratorVendor::kMusa, dst, 1);
-    RuntimeAccelerator runtime_accelerator({&src_device, &dst_device});
-
-    EXPECT_FALSE(
-        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
-}
-
-TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorUsesDeviceToHostForDeviceSrc) {
-    char src[] = "abc";
-    char dst[sizeof(src)] = {};
-    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, src, 5);
-    RuntimeAccelerator runtime_accelerator({&device});
-
-    EXPECT_TRUE(
-        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
-
-    EXPECT_STREQ(dst, src);
-    EXPECT_EQ(device.current_device_id(), 5);
-    EXPECT_EQ(device.last_direction(), CopyDirection::kDeviceToHost);
-}
-
-TEST(RuntimeAcceleratorTest, CopyMaybeAcceleratorUsesHostToDeviceForDeviceDst) {
-    char src[] = "abc";
-    char dst[sizeof(src)] = {};
-    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, dst, 6);
-    RuntimeAccelerator runtime_accelerator({&device});
-
-    EXPECT_TRUE(
-        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
-
-    EXPECT_STREQ(dst, src);
-    EXPECT_EQ(device.current_device_id(), 6);
-    EXPECT_EQ(device.last_direction(), CopyDirection::kHostToDevice);
-}
-
-TEST(RuntimeAcceleratorTest,
-     CopyMaybeAcceleratorUsesDeviceToDeviceForDevicePtrs) {
-    char src[] = "abc";
-    char dst[sizeof(src)] = {};
-    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, src, 7);
-    device.set_secondary_device_ptr(dst);
-    RuntimeAccelerator runtime_accelerator({&device});
-
-    EXPECT_TRUE(
-        runtime_accelerator.CopyMaybeAccelerator(dst, src, sizeof(src)));
-
-    EXPECT_STREQ(dst, src);
-    EXPECT_EQ(device.current_device_id(), 7);
-    EXPECT_EQ(device.last_direction(), CopyDirection::kDeviceToDevice);
 }
 
 }  // namespace

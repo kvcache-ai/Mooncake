@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cerrno>
+#include <cstring>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -660,7 +661,9 @@ void MemcpyWorkerPool::workerThread() {
                     auto* dst_device = runtime_accelerator.FindDeviceForPointer(
                         op.dest, &dst_info);
 
-                    if (src_device || dst_device) {
+                    if (!src_device && !dst_device) {
+                        std::memcpy(op.dest, op.src, op.size);
+                    } else {
                         if (src_device && dst_device &&
                             src_device != dst_device) {
                             LOG(ERROR)
@@ -672,15 +675,33 @@ void MemcpyWorkerPool::workerThread() {
                             ok = false;
                             break;
                         }
-                    }
-                    if (!runtime_accelerator.CopyMaybeAccelerator(
-                            op.dest, op.src, op.size)) {
-                        LOG(ERROR) << "GPU memcpy failed: src_dev="
-                                   << src_info.device_id
-                                   << " dst_dev=" << dst_info.device_id
-                                   << " size=" << op.size;
-                        ok = false;
-                        break;
+                        const device::AcceleratorDevice* accelerator = nullptr;
+                        int32_t device_id = -1;
+                        device::CopyDirection direction;
+                        if (src_device) {
+                            accelerator = src_device;
+                            device_id = src_info.device_id;
+                            direction = device::CopyDirection::kDeviceToHost;
+                            if (dst_device) {
+                                direction =
+                                    device::CopyDirection::kDeviceToDevice;
+                            }
+                        } else {
+                            accelerator = dst_device;
+                            device_id = dst_info.device_id;
+                            direction = device::CopyDirection::kHostToDevice;
+                        }
+                        accelerator->SetContext(device_id);
+                        if (!accelerator->Copy(op.dest, op.src, op.size,
+                                               direction)) {
+                            LOG(ERROR)
+                                << "GPU memcpy failed: src_dev="
+                                << src_info.device_id
+                                << " dst_dev=" << dst_info.device_id
+                                << " size=" << op.size;
+                            ok = false;
+                            break;
+                        }
                     }
                 }
 

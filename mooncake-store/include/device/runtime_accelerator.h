@@ -23,8 +23,6 @@ class RuntimeAccelerator {
 
     bool CopyFromHost(void* dst, const void* src, size_t size) const;
 
-    bool CopyMaybeAccelerator(void* dst, const void* src, size_t size) const;
-
    private:
     std::vector<const AcceleratorDevice*> devices_;
 };
