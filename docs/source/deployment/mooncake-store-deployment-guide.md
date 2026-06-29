@@ -256,6 +256,7 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_used_bytes{tenant_id}`
 - `mooncake_tenant_quota_reserved_bytes{tenant_id}`
 - `mooncake_tenant_quota_committed_count{tenant_id}`
+- `mooncake_tenant_quota_metadata_object_count{tenant_id}`
 - `mooncake_tenant_quota_over_quota{tenant_id}`
 - `mooncake_tenant_quota_explicit_policy{tenant_id}`
 - `mooncake_tenant_quota_reject_total{tenant_id,reason}`
@@ -322,6 +323,7 @@ Each tenant quota snapshot returns:
     "used_bytes": 0,
     "reserved_bytes": 0,
     "committed_count": 0,
+    "metadata_object_count": 0,
     "over_quota": false,
     "has_explicit_policy": true
   }

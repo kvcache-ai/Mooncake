@@ -127,7 +127,7 @@ Admin policy changes are persisted before the final in-memory policy is applied.
 | `PUT` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Create or update a tenant quota policy |
 | `DELETE` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Delete an empty tenant quota policy |
 
-Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `over_quota`, and `has_explicit_policy`.
+Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `metadata_object_count`, `over_quota`, and `has_explicit_policy`.
 
 Snapshots restore object runtime state only. Tenant quota policy is always loaded from the connector after metadata restore, then usage and effective quota are rebuilt from restored metadata and current registered capacity. If the connector cannot be loaded in strict multi-tenant mode, startup fails.
 
