@@ -145,7 +145,11 @@ Status ControlClient::pinStageBuffer(const std::string& server_addr,
         return Status::RpcServiceError(
             "pin stage buffer returned empty response" LOC_MARK);
     }
-    json response = json::parse(response_raw);
+    json response = json::parse(response_raw, nullptr, false);
+    if (response.is_discarded()) {
+        return Status::RpcServiceError(
+            "failed to parse pin stage buffer response" LOC_MARK);
+    }
     if (response.is_object() && response.contains("error")) {
         return Status::RpcServiceError(response["error"].get<std::string>() +
                                        LOC_MARK);
