@@ -881,12 +881,6 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                                "state: not a msgpack array"));
     }
 
-    if (obj.via.array.size < 8) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize MountedSegment invalid array size"));
-    }
-
     // Snapshot format is versioned by array size:
     //   size == 8: legacy snapshot, no protocol field (see issue #2636)
     //   size == 9: current snapshot, with protocol as the last field
