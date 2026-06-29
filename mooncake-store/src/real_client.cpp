@@ -657,8 +657,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #endif
 
     std::optional<std::string> device_name =
-        (rdma_devices.empty() ? std::nullopt
-                              : std::make_optional(rdma_devices));
+        ((rdma_devices.empty() || rdma_devices == "auto-discovery")
+             ? std::nullopt
+             : std::make_optional(rdma_devices));
 
     // Validate required parameters
     if (local_hostname.empty()) {
@@ -4152,15 +4153,6 @@ RealClient::batch_get_into_dummy_helper(
     const std::vector<uint64_t> &dummy_buffers,
     const std::vector<size_t> &sizes, int32_t device_id,
     const UUID &client_id) {
-#ifdef USE_ASCEND_DIRECT
-    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
-            device_id)) {
-        LOG(ERROR) << "Failed to set context for physical device " << device_id;
-        co_return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-#endif
-
     // Hold shared_lock for the entire operation to prevent SHM from being
     // unmapped while batch_get_into_internal is using the translated buffers.
     auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(
@@ -4193,15 +4185,25 @@ RealClient::batch_get_into_dummy_helper(
         std::vector<size_t> sizes;
         std::vector<void *> buffers;
         std::shared_ptr<std::shared_lock<std::shared_mutex>> lock;
+        int32_t device_id;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
     state->buffers = std::move(buffers_result.value());
     state->lock = std::move(lock);
+    state->device_id = device_id;
 
     auto *s = state.get();
     auto try_result = co_await coro_io::post([this, s]() {
+#ifdef USE_ASCEND_DIRECT
+        auto context_result =
+            set_context_if_needed(protocol, s->device_id, "batch_get worker");
+        if (!context_result) {
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                s->keys.size(), tl::unexpected(context_result.error()));
+        }
+#endif
         return batch_get_into_internal(s->keys, s->buffers, s->sizes);
     });
     co_return try_result.value();

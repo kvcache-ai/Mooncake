@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <shared_mutex>
@@ -16,9 +17,13 @@
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
+#include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "common.h"
 #include "segment.h"
+#ifdef USE_HTTP
+#include "transfer_metadata_plugin.h"
+#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -61,9 +66,9 @@ constexpr int kMaxTenantQuotaEvictionRetries = 2;
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
 // this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
-// falls back according to `offload_force_evict_`. A future change may expose
-// this as a configurable parameter if workloads demand tuning.
-constexpr double kOffloadCapRatio = 0.5;
+// falls back according to `offload_force_evict_`.
+// NOTE: Both offloading_queue_limit_ and offload_cap_ratio_ are now
+// configurable via --offloading_queue_limit and --offload_cap_ratio flags.
 
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
@@ -196,8 +201,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(
-          CreateAllocationStrategy(config.allocation_strategy_type)),
+      allocation_strategy_type_(config.enable_cxl
+                                    ? AllocationStrategyType::CXL
+                                    : config.allocation_strategy_type),
+      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -212,7 +219,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      offloading_queue_limit_(config.offloading_queue_limit),
+      offload_cap_ratio_(config.offload_cap_ratio) {
+    // Initialize HTTP metadata key prefix (read env var once at startup)
+    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
+    if (custom_prefix && std::strlen(custom_prefix) > 0) {
+        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
+        if (http_metadata_prefix_.back() != '/') {
+            http_metadata_prefix_ += '/';
+        }
+    } else {
+        http_metadata_prefix_ = "mooncake/";
+    }
+
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -248,6 +268,25 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << "Eviction high watermark ratio must be between 0.0 and 1.0, "
             << "current value: " << eviction_high_watermark_ratio_;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
+
+    // Validate offload tuning knobs here (not only via gflags validator),
+    // because values loaded from a configuration file bypass the gflags
+    // validator chain.
+    if (offload_cap_ratio_ < 0.0 || offload_cap_ratio_ > 1.0) {
+        LOG(ERROR) << "offload_cap_ratio must be between 0.0 and 1.0, "
+                   << "current value: " << offload_cap_ratio_;
+        throw std::invalid_argument("Invalid offload_cap_ratio");
+    }
+    if (offloading_queue_limit_ == 0) {
+        LOG(ERROR) << "offloading_queue_limit must be greater than 0";
+        throw std::invalid_argument("Invalid offloading_queue_limit");
+    }
+    if (offloading_queue_limit_ > 100'000'000ULL) {
+        LOG(ERROR) << "offloading_queue_limit must be <= 100000000 to avoid "
+                   << "overflow when computing offload_cap, current value: "
+                   << offloading_queue_limit_;
+        throw std::invalid_argument("Invalid offloading_queue_limit");
     }
 
     if (put_start_release_timeout_sec_ <= put_start_discard_timeout_sec_) {
@@ -358,6 +397,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
 
+    // NOTE: The async HTTP metadata cleanup worker is started lazily in
+    // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
+    // since that happens after this constructor returns (in
+    // WrappedMasterService).
+
     job_dispatch_running_ = true;
     job_dispatch_thread_ =
         std::thread(&MasterService::JobDispatchThreadFunc, this);
@@ -428,16 +472,22 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
-    snapshot_running_ = false;
+    {
+        std::lock_guard<std::mutex> lk(snapshot_thread_mutex_);
+        snapshot_running_ = false;
+    }
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
+    http_metadata_cleanup_running_ = false;
     graceful_unmount_scheduler_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
+    snapshot_thread_cv_.notify_all();
     task_cleanup_cv_.notify_all();
+    http_metadata_cleanup_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
@@ -455,6 +505,9 @@ MasterService::~MasterService() {
     }
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
+    }
+    if (http_metadata_cleanup_thread_.joinable()) {
+        http_metadata_cleanup_thread_.join();
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
@@ -1327,6 +1380,9 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     const std::function<bool(const Replica&)>& pred_fn) {
     auto erased_replicas =
         PopReplicasWithCacheTotalAccounting(metadata, pred_fn);
+    // Release SSD/local-disk usage for any local-disk replicas being removed.
+    // No-op for memory/noF replicas, so it is safe to call unconditionally.
+    ReleaseLocalDiskUsage(erased_replicas);
     return erased_replicas.size();
 }
 
@@ -1375,6 +1431,7 @@ MasterService::EraseMetadata(
     tenant_state.replication_tasks.erase(key);
     ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
 
+    ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
@@ -1397,6 +1454,35 @@ MasterService::EraseMetadata(
     }
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
     return next;
+}
+
+void MasterService::ReleaseLocalDiskUsage(
+    const std::vector<Replica>& replicas) {
+    std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
+    for (const auto& replica : replicas) {
+        if (!replica.is_local_disk_replica()) {
+            continue;
+        }
+        const auto descriptor =
+            replica.get_descriptor().get_local_disk_descriptor();
+        if (descriptor.object_size > 0) {
+            bytes_by_client[descriptor.client_id] += descriptor.object_size;
+        }
+    }
+    if (bytes_by_client.empty()) {
+        return;
+    }
+
+    ScopedLocalDiskSegmentAccess ssd_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_segments = ssd_access.getClientLocalDiskSegment();
+    for (const auto& [client_id, bytes] : bytes_by_client) {
+        auto disk_it = client_segments.find(client_id);
+        if (disk_it != client_segments.end()) {
+            disk_it->second->ssd_used_bytes.fetch_sub(
+                bytes, std::memory_order_relaxed);
+        }
+    }
 }
 
 void MasterService::RebuildGroupRoutingIndex() {
@@ -2316,9 +2402,18 @@ auto MasterService::AllocateAndInsertMetadata(
             preferred_segments = config.preferred_segments;
         }
 
+        const SsdMetricsProvider* ssd_provider = nullptr;
+        std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
+        if (allocation_strategy_type_ ==
+            AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
+            ssd_access.emplace(segment_manager_.getLocalDiskSegmentAccess());
+            ssd_provider = &*ssd_access;
+        }
+
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
-            preferred_segments);
+            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
+            ssd_provider);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
@@ -2796,6 +2891,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         metadata.reserved_quota_charge_bytes = 0;
     }
 
+    EraseReplicasWithCacheTotalAccounting(
+        metadata, [replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return replica.is_memory_replica() || replica.is_nof_replica();
+            }
+            return replica.type() == replica_type;
+        });
+
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
@@ -3235,12 +3338,16 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
             return r.is_local_disk_replica() && r.is_completed();
         });
-        metadata.EraseReplicas([&client_id](const Replica& replica) {
-            return replica.is_local_disk_replica() &&
-                   replica.get_descriptor()
-                           .get_local_disk_descriptor()
-                           .client_id == client_id;
-        });
+        // PopReplicas (vs EraseReplicas) so we can release the SSD usage of
+        // the removed local-disk replicas; both remove the same matching set.
+        auto erased_replicas =
+            metadata.PopReplicas([&client_id](const Replica& replica) {
+                return replica.is_local_disk_replica() &&
+                       replica.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id;
+            });
+        ReleaseLocalDiskUsage(erased_replicas);
         if (had_completed_disk) {
             auto& shard = accessor.GetShard();
             shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
@@ -3405,6 +3512,12 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", copy source becomes invalid during data transfer";
+        // Release the refcnt taken in CopyStart. The success path below does
+        // this once the copy completes; this error path must do it too, or the
+        // source replica stays pinned and can never be evicted.
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
         // Discard target replicas and clear the replication task.
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&task](const Replica& replica) {
@@ -3632,6 +3745,12 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", move source becomes invalid during data transfer";
+        // Release the refcnt taken in MoveStart. The success path below does
+        // this once the move completes; this error path must do it too, or the
+        // source replica stays pinned and can never be evicted.
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
         // Discard target replica and clear the replication task.
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&task](const Replica& replica) {
@@ -4267,6 +4386,17 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    std::shared_ptr<LocalDiskSegment> local_disk_segment;
+    {
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_segments = ssd_access.getClientLocalDiskSegment();
+        auto disk_it = client_segments.find(client_id);
+        if (disk_it != client_segments.end()) {
+            local_disk_segment = disk_it->second;
+        }
+    }
+
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -4300,14 +4430,22 @@ auto MasterService::NotifyOffloadSuccess(
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, object_id.user_key,
                               object_id.tenant_id, replica);
-        if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
+        if (!res) {
+            if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                continue;
+            }
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id
                        << ", tenant_id=" << object_id.tenant_id
                        << ", key=" << object_id.user_key;
             return tl::make_unexpected(res.error());
         }
+        if (local_disk_segment && metadata.data_size > 0) {
+            local_disk_segment->ssd_used_bytes.fetch_add(
+                metadata.data_size, std::memory_order_relaxed);
+        }
     }
+
     return {};
 }
 
@@ -5051,8 +5189,18 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
 void MasterService::SnapshotThreadFunc() {
     LOG(INFO) << "[Snapshot] snapshot_thread started";
     while (snapshot_running_) {
-        std::this_thread::sleep_for(
-            std::chrono::seconds(snapshot_interval_seconds_));
+        // Wait for the next snapshot cycle, but allow fast shutdown.
+        {
+            std::unique_lock<std::mutex> lk(snapshot_thread_mutex_);
+            snapshot_thread_cv_.wait_for(
+                lk, std::chrono::seconds(snapshot_interval_seconds_),
+                [&] { return !snapshot_running_.load(); });
+        }
+
+        if (!snapshot_running_) {
+            break;
+        }
+
         if (!enable_snapshot_) {
             // Snapshot is disabled
             LOG(INFO)
@@ -6256,7 +6404,7 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
     long offload_push_failed_forced = 0;
     const long offload_cap =
         offload_on_evict_
-            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
     auto try_evict_or_offload =
@@ -6486,7 +6634,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
     const long offload_cap =
         offload_on_evict_
-            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
@@ -7184,6 +7332,8 @@ void MasterService::ClientMonitorFunc() {
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_mem_segment";
+                    // Clean up HTTP metadata if enabled
+                    cleanupHttpMetadata(segment_names[i]);
                 }
                 for (auto& client_id : expired_clients) {
                     segment_access.UnmountLocalDiskSegment(client_id);
@@ -8908,6 +9058,134 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
+    http_metadata_server_ = server;
+    if (server) {
+        LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
+                     "(co-located metadata server)";
+    }
+}
+
+void MasterService::setHttpMetadataRemoteUrl(
+    const std::string& metadata_connstring) {
+#ifdef USE_HTTP
+    // Only http(s) is supported; guard the scheme to avoid
+    // MetadataStoragePlugin::Create()'s LOG(FATAL) on other backends.
+    if (metadata_connstring.rfind("http://", 0) == 0 ||
+        metadata_connstring.rfind("https://", 0) == 0) {
+        try {
+            http_metadata_remote_ =
+                MetadataStoragePlugin::Create(metadata_connstring);
+            LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
+                         "(remote metadata server "
+                      << metadata_connstring << ")";
+            // Start async cleanup worker now that http_metadata_remote_ is
+            // ready
+            http_metadata_cleanup_running_ = true;
+            http_metadata_cleanup_thread_ = std::thread(
+                &MasterService::HttpMetadataCleanupThreadFunc, this);
+            LOG(INFO) << "HTTP metadata cleanup worker thread started";
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to initialize remote HTTP metadata client "
+                            "for "
+                         << metadata_connstring << ": " << e.what()
+                         << ". Metadata cleanup on timeout disabled.";
+            http_metadata_remote_.reset();
+        }
+        return;
+    }
+    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but the "
+                    "configured metadata server '"
+                 << metadata_connstring
+                 << "' is not an HTTP endpoint; remote cleanup currently "
+                    "supports only http(s). Metadata cleanup on timeout "
+                    "disabled.";
+#else
+    (void)metadata_connstring;
+    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but this build "
+                    "has no HTTP metadata support (USE_HTTP=OFF); metadata "
+                    "cleanup on timeout disabled.";
+#endif
+}
+
+void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
+    // Co-located: remove in-process, safe to run inline (no network I/O).
+    if (http_metadata_server_) {
+        const std::string ram_key =
+            http_metadata_prefix_ + "ram/" + segment_name;
+        const std::string rpc_key =
+            http_metadata_prefix_ + "rpc_meta/" + segment_name;
+        bool ram_removed = http_metadata_server_->removeKey(ram_key);
+        bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
+        LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
+                  << ", ram_key_removed=" << ram_removed
+                  << ", rpc_key_removed=" << rpc_removed;
+        return;
+    }
+
+    // Separately-deployed: enqueue for async cleanup so a slow/unreachable
+    // server never blocks the client monitor thread.
+    if (http_metadata_remote_) {
+        {
+            std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);
+            http_metadata_cleanup_queue_.push_back(segment_name);
+        }
+        http_metadata_cleanup_cv_.notify_one();
+        return;
+    }
+
+    // Neither configured: cleanup is disabled, nothing to do.
+}
+
+void MasterService::HttpMetadataCleanupThreadFunc() {
+    LOG(INFO) << "HTTP metadata cleanup worker started";
+    while (http_metadata_cleanup_running_) {
+        std::vector<std::string> batch;
+        {
+            std::unique_lock<std::mutex> lk(http_metadata_cleanup_mutex_);
+            http_metadata_cleanup_cv_.wait(lk, [&] {
+                return !http_metadata_cleanup_queue_.empty() ||
+                       !http_metadata_cleanup_running_.load();
+            });
+            if (!http_metadata_cleanup_running_ &&
+                http_metadata_cleanup_queue_.empty()) {
+                break;
+            }
+            batch.swap(http_metadata_cleanup_queue_);
+        }
+
+        for (const auto& segment_name : batch) {
+            const std::string ram_key =
+                http_metadata_prefix_ + "ram/" + segment_name;
+            const std::string rpc_key =
+                http_metadata_prefix_ + "rpc_meta/" + segment_name;
+
+            // Each key attempted independently so one failure does not
+            // prevent cleanup of the other.
+            bool ram_removed = false;
+            bool rpc_removed = false;
+            try {
+                ram_removed = http_metadata_remote_->remove(ram_key);
+            } catch (const std::exception& e) {
+                LOG(WARNING)
+                    << "Remote HTTP metadata cleanup failed for ram_key: "
+                    << ram_key << ": " << e.what();
+            }
+            try {
+                rpc_removed = http_metadata_remote_->remove(rpc_key);
+            } catch (const std::exception& e) {
+                LOG(WARNING)
+                    << "Remote HTTP metadata cleanup failed for rpc_key: "
+                    << rpc_key << ": " << e.what();
+            }
+            LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
+                      << segment_name << ", ram_key_removed=" << ram_removed
+                      << ", rpc_key_removed=" << rpc_removed;
+        }
+    }
+    LOG(INFO) << "HTTP metadata cleanup worker stopped";
 }
 
 }  // namespace mooncake

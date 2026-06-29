@@ -162,6 +162,123 @@ def _extension_worker(
         })
 
 
+def _extension_p2p_worker(
+    ctx: MooncakePGWorkerContext,
+    extend_event: mp.Event,
+    direction: str,
+) -> None:
+    """Worker for testing P2P after max_world_size/recover_ranks scale-up."""
+    initial_world_size = ctx.world_size - 1
+    extension_rank = ctx.world_size - 1
+    primary_peer = initial_world_size - 1
+    join_ranks = [extension_rank]
+
+    if initial_world_size < 1:
+        raise AssertionError("elastic P2P test expects at least one primary rank")
+
+    if ctx.proc_rank < initial_world_size:
+        device = ctx.init_group(
+            world_size=initial_world_size,
+            max_world_size=ctx.world_size,
+        )
+        backend = ctx.get_backend()
+
+        if ctx.proc_rank == 0:
+            extend_event.set()
+
+        wait_until(
+            lambda: all(pg.get_peer_state(backend, join_ranks)),
+            timeout_s=30.0,
+            poll_interval_s=0.05,
+            description=f"rank {ctx.proc_rank} waiting for joiner ready",
+        )
+        pg.recover_ranks(backend, join_ranks)
+    else:
+        if not extend_event.wait(timeout=30.0):
+            raise TimeoutError("timed out waiting for extend_event")
+
+        device = ctx.init_group(
+            rank=extension_rank,
+            world_size=ctx.world_size,
+            is_extension=True,
+            max_world_size=ctx.world_size,
+        )
+        backend = ctx.get_backend()
+        pg.join_group(backend)
+
+    actual_ws_after = dist.get_world_size()
+    assert actual_ws_after == ctx.world_size, (
+        f"rank {ctx.proc_rank}: world_size after recovery={actual_ws_after}, "
+        f"expected {ctx.world_size}"
+    )
+
+    # Prove elastic collectives are functional before isolating P2P.
+    collective = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+    dist.all_reduce(collective, op=dist.ReduceOp.SUM)
+    expected_sum = ctx.world_size * (ctx.world_size + 1) // 2
+    if int(collective.cpu().item()) != expected_sum:
+        raise AssertionError(
+            f"rank {ctx.proc_rank}: post-recovery all_reduce expected "
+            f"{expected_sum}, got {int(collective.cpu().item())}"
+        )
+
+    dist.barrier()
+
+    if direction == "joiner_to_primary":
+        src_rank = extension_rank
+        dst_rank = primary_peer
+    elif direction == "primary_to_joiner":
+        src_rank = primary_peer
+        dst_rank = extension_rank
+    else:
+        raise AssertionError(f"unknown P2P direction: {direction}")
+
+    numel = 1024
+    if ctx.proc_rank == src_rank:
+        send_tensor = torch.full(
+            (numel,), src_rank, dtype=torch.int32, device=device
+        )
+        works = dist.batch_isend_irecv(
+            [dist.P2POp(op=dist.isend, tensor=send_tensor, peer=dst_rank)]
+        )
+        for work in works:
+            work.wait()
+        ctx.synchronize()
+        value = "sent"
+    elif ctx.proc_rank == dst_rank:
+        recv_tensor = torch.empty((numel,), dtype=torch.int32, device=device)
+        works = dist.batch_isend_irecv(
+            [dist.P2POp(op=dist.irecv, tensor=recv_tensor, peer=src_rank)]
+        )
+        for work in works:
+            work.wait()
+        ctx.synchronize()
+        expected = torch.full_like(recv_tensor, src_rank)
+        if not torch.equal(recv_tensor.cpu(), expected.cpu()):
+            raise AssertionError(
+                f"rank {ctx.proc_rank}: received unexpected P2P payload "
+                f"from rank {src_rank}"
+            )
+        value = "received"
+    else:
+        value = "idle"
+
+    dist.barrier()
+    ctx.record_result(
+        {
+            "direction": direction,
+            "role": (
+                "src"
+                if ctx.proc_rank == src_rank
+                else "dst"
+                if ctx.proc_rank == dst_rank
+                else "idle"
+            ),
+            "value": value,
+        }
+    )
+
+
 def _extension_worker_with_subgroups(
     ctx: MooncakePGWorkerContext,
     extend_event: mp.Event,
@@ -763,6 +880,40 @@ class _ElasticMixin:
         expected_baseline = (self.world_size - 1) * self.world_size // 2
         for row in original_rows:
             self.assertEqual(row.get("baseline"), expected_baseline)
+
+    def test_extension_p2p_joiner_to_primary(self) -> None:
+        """Test P2P from an extension rank to an original rank after recovery."""
+        spawn_ctx = mp.get_context("spawn")
+        extend_event = spawn_ctx.Event()
+
+        rows = self.spawn_backend_and_collect(
+            _extension_p2p_worker,
+            extend_event,
+            "joiner_to_primary",
+            nprocs=self.world_size,
+            timeout_s=60.0,
+        )
+
+        self.assert_all_ok(rows)
+        self.assertEqual(len([r for r in rows if r.get("role") == "src"]), 1)
+        self.assertEqual(len([r for r in rows if r.get("role") == "dst"]), 1)
+
+    def test_extension_p2p_primary_to_joiner(self) -> None:
+        """Test P2P from an original rank to an extension rank after recovery."""
+        spawn_ctx = mp.get_context("spawn")
+        extend_event = spawn_ctx.Event()
+
+        rows = self.spawn_backend_and_collect(
+            _extension_p2p_worker,
+            extend_event,
+            "primary_to_joiner",
+            nprocs=self.world_size,
+            timeout_s=60.0,
+        )
+
+        self.assert_all_ok(rows)
+        self.assertEqual(len([r for r in rows if r.get("role") == "src"]), 1)
+        self.assertEqual(len([r for r in rows if r.get("role") == "dst"]), 1)
 
     def test_extension_with_subgroups(self) -> None:
         """Test extension with multiple disjoint subgroups using split-ranks pattern."""

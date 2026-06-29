@@ -59,8 +59,12 @@ static size_t detectBufferPageSize(void* addr) {
     bool in_range = false;
 
     while (std::getline(smaps, line)) {
-        // VMA header: "start-end perms offset dev inode [pathname]"
-        if (!line.empty() && std::isxdigit(line[0])) {
+        // VMA header: "start-end perms offset dev inode [pathname]".
+        // Cast to unsigned char before std::isxdigit: passing a (possibly
+        // signed) char whose value is > 0x7F is UB, since the argument must be
+        // representable as unsigned char or equal EOF.
+        if (!line.empty() &&
+            std::isxdigit(static_cast<unsigned char>(line[0]))) {
             unsigned long start = 0, end = 0;
             if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
                 in_range = (target >= start && target < end);
@@ -775,7 +779,17 @@ Status EfaTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask*> task_list;
-    for (auto& task : batch_desc.task_list) task_list.push_back(&task);
+    for (auto& request : entries) {
+        auto& task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest*>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 

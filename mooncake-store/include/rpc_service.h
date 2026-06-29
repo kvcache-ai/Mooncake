@@ -16,9 +16,20 @@
 
 namespace mooncake {
 
+// Forward declaration
+class HttpMetadataServer;
 class WrappedMasterService {
    public:
-    WrappedMasterService(const WrappedMasterServiceConfig& config);
+    // Constructor with optional metadata-cleanup-on-timeout configuration.
+    // - http_metadata_server: in-process pointer used when the HTTP metadata
+    //   server is co-located in the master process (nullptr = not co-located).
+    // - http_metadata_remote_url: http(s) connection string used when the
+    //   metadata server is deployed separately (empty = none). Only consulted
+    //   when http_metadata_server is nullptr. If both are unset, cleanup is
+    //   disabled.
+    WrappedMasterService(const WrappedMasterServiceConfig& config,
+                         HttpMetadataServer* http_metadata_server = nullptr,
+                         const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
 

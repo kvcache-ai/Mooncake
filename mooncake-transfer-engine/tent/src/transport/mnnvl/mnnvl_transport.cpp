@@ -145,8 +145,8 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
-    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream));
-    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream));
+    // Streams are created lazily in submitTransferTasks where the correct
+    // GPU device can be inferred from request source pointers.
     return Status::OK();
 }
 
@@ -162,11 +162,35 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     return Status::OK();
 }
 
+static int detectDeviceFromPointer(void *ptr) {
+    if (!ptr) return -1;
+    cudaPointerAttributes attrs = {};
+    auto err = cudaPointerGetAttributes(&attrs, ptr);
+    if (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice)
+        return attrs.device;
+    cudaGetLastError();
+    return -1;
+}
+
 Status MnnvlTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
+
+    if (!mnnvl_batch->async_stream.get()) {
+        int device_id = -1;
+        for (auto &req : request_list) {
+            device_id = detectDeviceFromPointer(req.source);
+            if (device_id >= 0) break;
+        }
+        if (device_id < 0) cudaGetDevice(&device_id);
+        CHECK_STATUS(
+            platform_->getStreamFromPool(mnnvl_batch->sync_stream, device_id));
+        CHECK_STATUS(
+            platform_->getStreamFromPool(mnnvl_batch->async_stream, device_id));
+    }
+
     if (request_list.size() + mnnvl_batch->task_list.size() >
         mnnvl_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
