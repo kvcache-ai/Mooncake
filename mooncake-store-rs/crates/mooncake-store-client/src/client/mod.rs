@@ -122,6 +122,10 @@ include!("helpers.rs");
 mod cold_tier_storage_backend;
 use cold_tier_storage_backend::*;
 
+#[allow(dead_code)]
+mod extent_store_engine;
+use extent_store_engine::ExtentStoreStorageBackend;
+
 /// Cold tier device management, admission control, offload pipeline, and cleanup.
 #[allow(dead_code)]
 mod cold_tier;

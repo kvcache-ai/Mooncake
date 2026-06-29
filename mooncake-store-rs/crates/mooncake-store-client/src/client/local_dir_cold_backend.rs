@@ -463,13 +463,13 @@ fn route_from_recovered_cold_object(
     }
 }
 
-enum RecoveredObjectOutcome {
+pub(super) enum RecoveredObjectOutcome {
     Registered,
     AlreadyConsistent,
     Superseded,
 }
 
-fn try_register_recovered_cold_object(
+pub(super) fn try_register_recovered_cold_object(
     metadata: &dyn MetadataBackend,
     route_directory: &dyn RouteDirectory,
     observer: &ClientLease,
@@ -965,7 +965,7 @@ fn collect_local_dir_file_stats(
     Ok(())
 }
 
-fn read_file_optional(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_file_optional(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(data) => Ok(Some(data)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -976,7 +976,7 @@ fn read_file_optional(path: &std::path::Path, label: &str) -> Result<Option<Vec<
     }
 }
 
-fn remove_file_optional(path: &std::path::Path, label: &str) -> Result<bool> {
+pub(crate) fn remove_file_optional(path: &std::path::Path, label: &str) -> Result<bool> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1137,6 +1137,15 @@ mod tests {
     impl Drop for TestTempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+            if let Some(parent) = self.0.parent() {
+                if parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("mooncake-store-client-cold-backend-"))
+                {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
         }
     }
 
