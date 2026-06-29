@@ -663,10 +663,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
+    // === STEP 2: Poll whether master requested a full SSD clear ===
+    auto remove_all_result = client_->PollRemoveAll();
+    if (remove_all_result && remove_all_result.value()) {
+        RemoveAll();
+    }
+
     if (offloading_objects.empty()) {
         return {};
     }
-    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
         LOG(ERROR) << "Failed to persist objects with error: "

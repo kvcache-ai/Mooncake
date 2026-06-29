@@ -2636,9 +2636,6 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
         if (storage_backend_) {
             storage_backend_->RemoveAll();
         }
-        if (on_remove_all_cleanup_) {
-            on_remove_all_cleanup_();
-        }
     }
     if (result && result.value() > 0 && hot_cache_) {
         hot_cache_->RemoveAllHotKeys();
@@ -3025,6 +3022,10 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     }
     offloading_objects = std::move(response.value());
     return {};
+}
+
+tl::expected<bool, ErrorCode> Client::PollRemoveAll() {
+    return master_client_.PollRemoveAll();
 }
 
 tl::expected<void, ErrorCode> Client::ReportSsdCapacity(

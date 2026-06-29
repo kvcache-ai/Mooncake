@@ -95,6 +95,11 @@ struct LocalDiskSegment {
     // offloading_objects (offloading_mutex_).
     std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
         offloading_mutex_) promotion_objects;
+    // Set by master's RemoveAll. When the client sees this flag via
+    // PollRemoveAll, it calls FileStorage::RemoveAll() to physically
+    // delete all SSD files. Same locking as offloading_objects
+    // (offloading_mutex_).
+    bool GUARDED_BY(offloading_mutex_) pending_remove_all = false;
     explicit LocalDiskSegment(bool enable_offloading)
         : enable_offloading(enable_offloading) {}
 

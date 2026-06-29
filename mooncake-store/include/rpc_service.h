@@ -206,6 +206,9 @@ class WrappedMasterService {
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    tl::expected<bool, ErrorCode> PollRemoveAll(
+        const UUID& client_id);
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
@@ -292,6 +295,9 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
+
+    tl::expected<std::vector<std::string>, ErrorCode> PollRemoveAll(
+        const UUID& client_id);
 
    private:
     MasterService master_service_;

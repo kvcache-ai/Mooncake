@@ -425,6 +425,8 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
+    tl::expected<bool, ErrorCode> PollRemoveAll();
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
 
@@ -647,12 +649,6 @@ class Client {
         return admission_sketch_->increment(key) >= admission_threshold_;
     }
 
-    // Register a cleanup callback invoked by RemoveAll after master metadata
-    // and local storage files have been cleaned (e.g. SSD offload files).
-    void SetRemoveAllCleanup(std::function<void()> callback) {
-        on_remove_all_cleanup_ = std::move(callback);
-    }
-
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
    protected:
@@ -832,10 +828,6 @@ class Client {
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
-
-    // Callback for additional cleanup during RemoveAll (e.g. SSD offload
-    // files). Set by RealClient during setup when SSD offload is enabled.
-    std::function<void()> on_remove_all_cleanup_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;

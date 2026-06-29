@@ -431,6 +431,12 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    /**
+     * @brief Poll whether master has requested a full SSD clear.
+     * @return true if client should clear all SSD files
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAll();
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
