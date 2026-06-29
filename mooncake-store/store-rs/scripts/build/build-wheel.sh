@@ -447,6 +447,33 @@ else
   export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
   _timer_elapsed $_WHEEL_GLOBAL_START "setup (venv + deps + pybind11 + yalantinglibs)"
 
+  _CMAKE_SHARED_CONF_START=$(_timer_start)
+  PATH="${VENV_BIN}:${PATH}" cmake \
+    -S "${UPSTREAM_DIR}" \
+    -B "${UPSTREAM_BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="${YALANTINGLIBS_PREFIX}" \
+    -Dyalantinglibs_DIR="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs" \
+    -DPython3_EXECUTABLE="${VENV_PYTHON}" \
+    -DWITH_TE=ON \
+    -DWITH_STORE=OFF \
+    -DWITH_STORE_RUST=OFF \
+    -DBUILD_EXAMPLES=OFF \
+    -DBUILD_UNIT_TESTS=OFF \
+    -DUSE_TENT=ON \
+    -DUSE_REDIS=ON \
+    -DUSE_HTTP=ON \
+    -DUSE_ETCD=OFF \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  _timer_elapsed $_CMAKE_SHARED_CONF_START "cmake configure (shared transfer_engine)"
+
+  _CMAKE_SHARED_BUILD_START=$(_timer_start)
+  PATH="${VENV_BIN}:${PATH}" cmake --build "${UPSTREAM_BUILD_DIR}" \
+    --target transfer_engine \
+    -j"${BUILD_JOBS}"
+  _timer_elapsed $_CMAKE_SHARED_BUILD_START "cmake build (shared transfer_engine)"
+
   _CMAKE_CONF_START=$(_timer_start)
   PATH="${VENV_BIN}:${PATH}" cmake \
     -S "${UPSTREAM_DIR}" \
@@ -467,13 +494,13 @@ else
     -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 
-  _timer_elapsed $_CMAKE_CONF_START "cmake configure"
+  _timer_elapsed $_CMAKE_CONF_START "cmake configure (static engine)"
 
   _CMAKE_BUILD_START=$(_timer_start)
   PATH="${VENV_BIN}:${PATH}" cmake --build "${UPSTREAM_BUILD_DIR}" \
     --target engine transfer_engine_bench tent_shared \
     -j"${BUILD_JOBS}"
-  _timer_elapsed $_CMAKE_BUILD_START "cmake build (C++ libs)"
+  _timer_elapsed $_CMAKE_BUILD_START "cmake build (static engine + C++ libs)"
 fi
 
 export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
