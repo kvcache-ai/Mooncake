@@ -4,7 +4,8 @@
 
 The Transfer Engine Python API provides a high-level interface for efficient data transfer between distributed systems using RDMA (Remote Direct Memory Access) and other transport protocols. It enables fast, low-latency data movement between nodes in a cluster.
 
-For interfaces beyond the Python API (C/C++, Golang, Rust), see [Transfer Engine](../design/transfer-engine/index.md#using-transfer-engine-to-your-projects).
+For examples and interfaces beyond the Python API (C/C++, Golang, Rust), see
+[Using Transfer Engine in Your Projects](../design/transfer-engine/index.md#using-transfer-engine-in-your-projects).
 
 ## Installation
 
@@ -18,7 +19,8 @@ pip install mooncake-transfer-engine
 
 ## Quick Start
 
-See the [Transfer Engine Developer Quick Start](transfer-engine-quick-start.md) guide for a complete example of setting up and using the Transfer Engine API directly.
+See the [Transfer Engine Python quick start](../design/transfer-engine/index.md#using-transfer-engine-in-your-projects)
+for a complete example of setting up and using the Transfer Engine API directly.
 
 ## API Reference
 

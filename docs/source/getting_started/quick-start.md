@@ -6,12 +6,15 @@ SGLang HiCache. Most users only need to install Mooncake, start
 
 Transfer Engine is the lower-level transport layer used by these integrations.
 If you are developing directly against the Transfer Engine API, see the
-[Transfer Engine Developer Quick Start](../python-api-reference/transfer-engine-quick-start.md).
+[Transfer Engine Python quick start](../design/transfer-engine/index.md#using-transfer-engine-in-your-projects).
 
 ## Installation
 
-Install the Mooncake package from PyPI. It includes the Mooncake Store Python
-bindings and the Transfer Engine runtime used underneath.
+Install the Mooncake package from PyPI. The same package provides:
+
+- Mooncake Store Python bindings for vLLM and SGLang HiCache integrations.
+- Transfer Engine Python bindings and runtime components for direct
+  `mooncake.engine.TransferEngine` usage.
 
 **For CUDA-enabled systems:**
 ```bash

@@ -256,7 +256,184 @@ The HTTP server should implement three following RESTful APIs, while the metadat
 
 For specific implementation, refer to the demo service implemented in Golang at [mooncake-transfer-engine/example/http-metadata-server](gh-dir:mooncake-transfer-engine/example/http-metadata-server).
 
-## Using Transfer Engine to Your Projects
+## Using Transfer Engine in Your Projects
+
+(using-python-interface)=
+### Using Python Interface
+
+For Python applications, use `mooncake.engine.TransferEngine` directly. Most
+serving-framework users should configure Mooncake through vLLM or SGLang
+instead; this example is for developers who need to call the low-level Transfer
+Engine API.
+
+Install Mooncake from PyPI before running this example. The package selected in
+the [Mooncake Store Quick Start installation step](../../getting_started/quick-start.md#installation)
+also provides the Transfer Engine Python bindings and runtime components.
+
+#### Runtime prerequisites
+
+The Python scripts below only import the Python standard library and
+`mooncake.engine`, but the Mooncake package still depends on the system runtime
+libraries used by the transfer stack. On Ubuntu, install them with:
+
+```bash
+sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
+```
+
+The local TCP example uses `P2PHANDSHAKE`, so it does not require a separate
+metadata service. When using RDMA, make sure RDMA drivers, devices, and device
+permissions are configured; you may need to run with `sudo` or adjust device
+permissions.
+
+The following two-process TCP example keeps the Python-side dependencies minimal
+by using only the Python standard library plus the Mooncake package.
+
+::::{dropdown} Receiver (`receiver.py`)
+
+Save the following as `receiver.py`, then run it in the first terminal:
+
+```python
+import ctypes
+import json
+import socket
+
+from mooncake.engine import TransferEngine
+
+
+HOSTNAME = "localhost"
+METADATA_SERVER = "P2PHANDSHAKE"
+PROTOCOL = "tcp"
+DEVICE_NAME = ""
+BUFFER_SIZE = 1024 * 1024
+
+
+def main():
+    engine = TransferEngine()
+    engine.initialize(HOSTNAME, METADATA_SERVER, PROTOCOL, DEVICE_NAME)
+    session_id = f"{HOSTNAME}:{engine.get_rpc_port()}"
+
+    server_buffer = (ctypes.c_uint8 * BUFFER_SIZE)()
+    server_ptr = ctypes.addressof(server_buffer)
+    server_len = ctypes.sizeof(server_buffer)
+
+    ret = engine.register_memory(server_ptr, server_len)
+    if ret != 0:
+        raise RuntimeError("Mooncake memory registration failed.")
+
+    print(f"Receiver session ID: {session_id}")
+    print(f"Receiver buffer address: {server_ptr}, length: {server_len}")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", 5555))
+    listener.listen(1)
+
+    try:
+        print("Waiting for sender to connect on port 5555...")
+        conn, _ = listener.accept()
+        with conn:
+            payload = {
+                "session_id": session_id,
+                "ptr": server_ptr,
+                "len": server_len,
+            }
+            conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+            print("Buffer information sent to sender.")
+
+        input("Press Enter after the sender finishes...")
+        print(f"First byte in receiver buffer: {server_buffer[0]}")
+    finally:
+        ret = engine.unregister_memory(server_ptr)
+        if ret != 0:
+            raise RuntimeError("Mooncake memory deregistration failed.")
+        listener.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+::::
+
+::::{dropdown} Sender (`sender.py`)
+
+Save the following as `sender.py`, then run it in a second terminal:
+
+```python
+import ctypes
+import json
+import socket
+
+from mooncake.engine import TransferEngine
+
+
+HOSTNAME = "localhost"
+METADATA_SERVER = "P2PHANDSHAKE"
+PROTOCOL = "tcp"
+DEVICE_NAME = ""
+BUFFER_SIZE = 1024 * 1024
+
+
+def recv_json_line(sock):
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+    return json.loads(b"".join(chunks).split(b"\n", 1)[0].decode("utf-8"))
+
+
+def main():
+    with socket.create_connection(("localhost", 5555)) as sock:
+        buffer_info = recv_json_line(sock)
+
+    server_session_id = buffer_info["session_id"]
+    server_ptr = buffer_info["ptr"]
+    server_len = buffer_info["len"]
+    print(f"Receiver session ID: {server_session_id}")
+    print(f"Receiver buffer address: {server_ptr}, length: {server_len}")
+
+    engine = TransferEngine()
+    engine.initialize(HOSTNAME, METADATA_SERVER, PROTOCOL, DEVICE_NAME)
+    session_id = f"{HOSTNAME}:{engine.get_rpc_port()}"
+
+    client_buffer = (ctypes.c_uint8 * BUFFER_SIZE)()
+    client_ptr = ctypes.addressof(client_buffer)
+    client_len = ctypes.sizeof(client_buffer)
+    ctypes.memset(client_ptr, 1, client_len)
+
+    ret = engine.register_memory(client_ptr, client_len)
+    if ret != 0:
+        raise RuntimeError("Mooncake memory registration failed.")
+
+    try:
+        print(f"Sender session ID: {session_id}")
+        print("Transferring data to receiver...")
+        ret = engine.transfer_sync_write(
+            server_session_id,
+            client_ptr,
+            server_ptr,
+            min(client_len, server_len),
+        )
+        if ret < 0:
+            raise RuntimeError("Transfer failed.")
+        print("Transfer successful.")
+    finally:
+        ret = engine.unregister_memory(client_ptr)
+        if ret != 0:
+            raise RuntimeError("Mooncake memory deregistration failed.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+::::
+
+For more Python APIs, see [Transfer Engine Python API](../../python-api-reference/transfer-engine.md).
 
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
