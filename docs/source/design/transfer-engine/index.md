@@ -323,12 +323,13 @@ def main():
     print(f"Receiver session ID: {session_id}")
     print(f"Receiver buffer address: {server_ptr}, length: {server_len}")
 
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("0.0.0.0", 5555))
-    listener.listen(1)
-
+    listener = None
     try:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", 5555))
+        listener.listen(1)
+
         print("Waiting for sender to connect on port 5555...")
         conn, _ = listener.accept()
         with conn:
@@ -346,7 +347,8 @@ def main():
         ret = engine.unregister_memory(server_ptr)
         if ret != 0:
             raise RuntimeError("Mooncake memory deregistration failed.")
-        listener.close()
+        if listener is not None:
+            listener.close()
 
 
 if __name__ == "__main__":
