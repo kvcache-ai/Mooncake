@@ -224,6 +224,12 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
         return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
     }
 
+    if (auto valid = ValidateRegisterRequest(req); !valid) {
+        LOG(WARNING) << "RegisterClient: register request failed"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(valid.error());
+    }
+
     auto meta = CreateClientMeta(req);
     if (segment_removal_cb_) {
         meta->SetSegmentRemovalCallback(segment_removal_cb_);

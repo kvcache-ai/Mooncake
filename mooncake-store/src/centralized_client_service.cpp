@@ -161,10 +161,10 @@ ErrorCode CentralizedClientService::Init(
     }
 
     // Initialize transfer engine
+    local_ip_ = config.local_ip;
     if (config.transfer_engine == nullptr) {
-        err = InitTransferEngine(config.local_ip, config.te_port,
-                                 metadata_connstring_, config.protocol,
-                                 config.rdma_devices);
+        err = InitTransferEngine(config.te_port, metadata_connstring_,
+                                 config.protocol, config.rdma_devices);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return err;
