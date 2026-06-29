@@ -202,8 +202,7 @@ class BatchEvictBench {
         return stats;
     }
 
-    static bool MountBenchSegment(MasterService& service,
-                                  const UUID& client_id,
+    static bool MountBenchSegment(MasterService& service, const UUID& client_id,
                                   size_t num_objects) {
         auto segment = MakeSegment(num_objects);
         auto mount_result = service.MountSegment(segment, client_id);
@@ -267,10 +266,9 @@ class BatchEvictBench {
         {
             std::unique_lock<std::shared_mutex> lock(service.snapshot_mutex_);
             const auto wait_end = std::chrono::steady_clock::now();
-            wait_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    wait_end - wait_start)
-                    .count();
+            wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          wait_end - wait_start)
+                          .count();
         }
         return wait_us;
     }
@@ -285,19 +283,15 @@ class BatchEvictBench {
         }
         if (stats.object_count != num_objects ||
             stats.completed_memory_replicas != num_objects ||
-            stats.busy_memory_replicas != 0 ||
-            stats.non_memory_replicas != 0 ||
-            stats.incomplete_replicas != 0 ||
-            stats.unexpired_leases != 0) {
+            stats.busy_memory_replicas != 0 || stats.non_memory_replicas != 0 ||
+            stats.incomplete_replicas != 0 || stats.unexpired_leases != 0) {
             LOG(ERROR) << "metadata validation failed: objects="
-                       << stats.object_count
-                       << ", completed_memory_replicas="
+                       << stats.object_count << ", completed_memory_replicas="
                        << stats.completed_memory_replicas
                        << ", busy_memory_replicas="
                        << stats.busy_memory_replicas
                        << ", non_memory_replicas=" << stats.non_memory_replicas
-                       << ", incomplete_replicas="
-                       << stats.incomplete_replicas
+                       << ", incomplete_replicas=" << stats.incomplete_replicas
                        << ", unexpired_leases=" << stats.unexpired_leases;
             return false;
         }
@@ -307,9 +301,8 @@ class BatchEvictBench {
     static bool ValidateEvictionResult(size_t objects_before,
                                        size_t evicted_count,
                                        uint64_t freed_bytes) {
-        const size_t lowerbound =
-            static_cast<size_t>(std::ceil(objects_before *
-                                          kEvictRatioLowerbound));
+        const size_t lowerbound = static_cast<size_t>(
+            std::ceil(objects_before * kEvictRatioLowerbound));
         if (evicted_count < lowerbound) {
             LOG(ERROR) << "evicted_count below lowerbound: evicted="
                        << evicted_count << ", lowerbound=" << lowerbound;
