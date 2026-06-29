@@ -4,10 +4,10 @@ This document describes how to quickly start using Mooncake Transfer Engine and 
 
 ## Before using Mooncake
 
-The following need to be installed before running any component of Mooncake:
-- RDMA Driver & SDK, such as Mellanox OFED.
-- Python 3.10, virtual environment is recommended.
-- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
+Install the following prerequisites before running any Mooncake component:
+- Python 3.10 or later; a virtual environment is recommended.
+- RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer.
+- CUDA 12.1 or later, if the package is built with `-DUSE_CUDA` (disabled by default). For most CUDA-enabled use cases, such as RDMA-based KV cache transfer between GPUs or between GPU and DRAM, NVIDIA GPUDirect support is also required. *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 - Cambricon Neuware, if the package is built with `-DUSE_MLU`. By default Mooncake looks for Neuware under `NEUWARE_HOME` or `/usr/local/neuware`.
 - Hygon DTK SDK, if the package is built with `-DUSE_HYGON`. By default Mooncake looks for DTK under `DTK_HOME` or `/opt/dtk`.
 - Iluvatar CoreX SDK, if the package is built with `-DUSE_COREX`. By default Mooncake looks for CoreX under `COREX_HOME` or `/usr/local/corex`.
