@@ -1,8 +1,8 @@
 #include "master_service.h"
 
-#include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -49,6 +49,12 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         return config;
     }
 
+    ReplicateConfig HardPinnedMemoryConfig() {
+        ReplicateConfig config = MemoryConfig();
+        config.with_hard_pin = true;
+        return config;
+    }
+
     MasterServiceConfig MakeOffloadConfig(uint64_t default_quota,
                                           uint64_t pool_capacity) {
         auto config = MakeConfig(default_quota, pool_capacity);
@@ -63,8 +69,13 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void PutComplete(MasterService& service, const UUID& client_id,
                      const std::string& key, const std::string& tenant_id,
                      uint64_t size) {
-        auto start =
-            service.PutStart(client_id, key, tenant_id, size, MemoryConfig());
+        PutComplete(service, client_id, key, tenant_id, size, MemoryConfig());
+    }
+
+    void PutComplete(MasterService& service, const UUID& client_id,
+                     const std::string& key, const std::string& tenant_id,
+                     uint64_t size, const ReplicateConfig& config) {
+        auto start = service.PutStart(client_id, key, tenant_id, size, config);
         ASSERT_TRUE(start.has_value()) << toString(start.error());
         auto end =
             service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY);
@@ -74,6 +85,20 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void MountLocalDiskSegment(MasterService& service, const UUID& client_id) {
         auto mount = service.MountLocalDiskSegment(client_id, true);
         ASSERT_TRUE(mount.has_value()) << toString(mount.error());
+    }
+
+    std::unordered_map<std::string, int64_t> DrainOffloadQueue(
+        MasterService& service, const UUID& client_id) {
+        auto result = service.OffloadObjectHeartbeat(client_id, true);
+        EXPECT_TRUE(result.has_value());
+        std::unordered_map<std::string, int64_t> queued;
+        if (!result.has_value()) {
+            return queued;
+        }
+        for (const auto& task : result.value()) {
+            queued[task.key] = task.size;
+        }
+        return queued;
     }
 
     void InjectLocalDiskReplica(MasterService& service, const UUID& client_id,
@@ -124,6 +149,11 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void ReleaseQuotaPartial(MasterService& service,
                              const std::string& tenant_id, uint64_t bytes) {
         service.ReleaseTenantQuotaPartial(tenant_id, bytes);
+    }
+
+    uint64_t ComputeQuotaDeficit(MasterService& service,
+                                 const std::string& tenant_id, uint64_t bytes) {
+        return service.ComputeTenantQuotaDeficit(tenant_id, bytes);
     }
 
     void RecomputeTenantQuotas(MasterService& service) {
@@ -208,7 +238,8 @@ TEST_F(MasterServiceTenantQuotaTest, SameTenantSharesQuotaAcrossKeys) {
                                      /*pool_capacity=*/1000));
     UUID client_id = MountSegment(service);
 
-    PutComplete(service, client_id, "key-a", "tenant-a", 600);
+    PutComplete(service, client_id, "key-a", "tenant-a", 600,
+                HardPinnedMemoryConfig());
     auto over_quota =
         service.PutStart(client_id, "key-b", "tenant-a", 500, MemoryConfig());
 
@@ -244,17 +275,17 @@ TEST_F(MasterServiceTenantQuotaTest, FirstTenantPutStartUsesPoolCapacity) {
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       ZeroDefaultQuotaInitializesNewTenantAsUnlimited) {
+       ZeroDefaultQuotaUsesRegisteredCapacityForDefaultTenant) {
     MasterService service(MakeConfig(/*default_quota=*/0,
-                                     /*pool_capacity=*/1));
+                                     /*pool_capacity=*/0));
+    MountSegment(service, /*size=*/4096);
 
     auto reserve = ReserveQuota(service, "tenant-a", 4096);
 
     ASSERT_TRUE(reserve.has_value()) << toString(reserve.error());
     auto snapshot = Snapshot(service, "tenant-a");
     EXPECT_EQ(snapshot.requested_quota_bytes, 0);
-    EXPECT_EQ(snapshot.effective_quota_bytes,
-              std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(snapshot.effective_quota_bytes, 4096);
     EXPECT_EQ(snapshot.reserved_bytes, 4096);
 }
 
@@ -262,6 +293,7 @@ TEST_F(MasterServiceTenantQuotaTest,
        OverQuotaReserveDoesNotChangeReservedBytes) {
     MasterService service(MakeConfig(/*default_quota=*/100,
                                      /*pool_capacity=*/100));
+    MountSegment(service, /*size=*/100);
     ASSERT_TRUE(ReserveQuota(service, "tenant-a", 80).has_value());
     auto before = Snapshot(service, "tenant-a");
 
@@ -270,6 +302,18 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_FALSE(reserve.has_value());
     EXPECT_EQ(reserve.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     ExpectSameAccounting(before, Snapshot(service, "tenant-a"));
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       QuotaDeficitReturnsZeroWhenCurrentDemandFits) {
+    MasterService service(MakeConfig(/*default_quota=*/1000,
+                                     /*pool_capacity=*/1000));
+    MountSegment(service, /*size=*/1000);
+    ASSERT_TRUE(ReserveQuota(service, "tenant-a", 400).has_value());
+    CommitQuota(service, "tenant-a", 400);
+
+    EXPECT_EQ(ComputeQuotaDeficit(service, "tenant-a", 100), 0);
+    EXPECT_EQ(ComputeQuotaDeficit(service, "tenant-a", 700), 100);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -306,6 +350,7 @@ TEST_F(MasterServiceTenantQuotaTest,
        AbortPrunesInactiveInheritedTenantAndRecomputesQuotas) {
     MasterService service(MakeConfig(/*default_quota=*/1000,
                                      /*pool_capacity=*/100));
+    MountSegment(service, /*size=*/100);
 
     ASSERT_TRUE(ReserveQuota(service, "tenant-a", 50).has_value());
     ASSERT_TRUE(ReserveQuota(service, "tenant-b", 40).has_value());
@@ -346,6 +391,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest, CommitMismatchDoesNotMutateAccounting) {
     MasterService service(MakeConfig(/*default_quota=*/100,
                                      /*pool_capacity=*/100));
+    MountSegment(service, /*size=*/100);
     ASSERT_TRUE(ReserveQuota(service, "tenant-a", 40).has_value());
     auto before = Snapshot(service, "tenant-a");
 
@@ -357,6 +403,7 @@ TEST_F(MasterServiceTenantQuotaTest, CommitMismatchDoesNotMutateAccounting) {
 TEST_F(MasterServiceTenantQuotaTest, AbortMismatchDoesNotMutateAccounting) {
     MasterService service(MakeConfig(/*default_quota=*/100,
                                      /*pool_capacity=*/100));
+    MountSegment(service, /*size=*/100);
     ASSERT_TRUE(ReserveQuota(service, "tenant-a", 40).has_value());
     auto before = Snapshot(service, "tenant-a");
 
@@ -368,6 +415,7 @@ TEST_F(MasterServiceTenantQuotaTest, AbortMismatchDoesNotMutateAccounting) {
 TEST_F(MasterServiceTenantQuotaTest, ReleaseMismatchDoesNotMutateAccounting) {
     MasterService service(MakeConfig(/*default_quota=*/100,
                                      /*pool_capacity=*/100));
+    MountSegment(service, /*size=*/100);
     ASSERT_TRUE(ReserveQuota(service, "tenant-a", 40).has_value());
     CommitQuota(service, "tenant-a", 40);
     auto before = Snapshot(service, "tenant-a");
@@ -381,6 +429,7 @@ TEST_F(MasterServiceTenantQuotaTest,
        ReleasePartialMismatchDoesNotMutateAccounting) {
     MasterService service(MakeConfig(/*default_quota=*/100,
                                      /*pool_capacity=*/100));
+    MountSegment(service, /*size=*/100);
     ASSERT_TRUE(ReserveQuota(service, "tenant-a", 40).has_value());
     CommitQuota(service, "tenant-a", 40);
     auto before = Snapshot(service, "tenant-a");
@@ -391,7 +440,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       PhysicalAllocationFailureKeepsAllocatorError) {
+       RegisteredCapacityQuotaFailurePrecedesAllocatorFailure) {
     MasterService service(MakeConfig(/*default_quota=*/4096,
                                      /*pool_capacity=*/4096));
     UUID client_id = MountSegment(service, /*size=*/512);
@@ -400,7 +449,7 @@ TEST_F(MasterServiceTenantQuotaTest,
                                    MemoryConfig());
 
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(result.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_FALSE(
         service.GetTenantQuotaSnapshotForTesting("tenant-a").has_value());
 }
@@ -444,9 +493,45 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
 }
 
-TEST_F(MasterServiceTenantQuotaTest, PromotionSuccessCommitsTenantQuota) {
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantQuotaEvictionQueuesOffloadOnEvictBeforeDeletingMemory) {
     MasterService service(MakeOffloadConfig(/*default_quota=*/1000,
                                             /*pool_capacity=*/1000));
+    UUID client_id =
+        MountSegment(service, /*size=*/4096, "quota_offload_segment");
+    MountLocalDiskSegment(service, client_id);
+
+    PutComplete(service, client_id, "old", "tenant-a", 600);
+    EXPECT_TRUE(DrainOffloadQueue(service, client_id).empty())
+        << "offload_on_evict should not queue objects at PutEnd";
+
+    auto start =
+        service.PutStart(client_id, "new", "tenant-a", 600, MemoryConfig());
+    ASSERT_FALSE(start.has_value());
+    EXPECT_EQ(start.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+
+    auto queued = DrainOffloadQueue(service, client_id);
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_EQ(queued["old"], 600);
+    EXPECT_TRUE(service.GetReplicaList("old", "tenant-a").has_value());
+    EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 600);
+
+    InjectLocalDiskReplica(service, client_id, "old", "tenant-a", 600,
+                           "quota_offload_segment");
+    auto retry =
+        service.PutStart(client_id, "new", "tenant-a", 600, MemoryConfig());
+    ASSERT_TRUE(retry.has_value()) << toString(retry.error());
+    EXPECT_TRUE(service.GetReplicaList("old", "tenant-a").has_value());
+    auto revoke =
+        service.PutRevoke(client_id, "new", "tenant-a", ReplicaType::MEMORY);
+    ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
+}
+
+TEST_F(MasterServiceTenantQuotaTest, PromotionSuccessCommitsTenantQuota) {
+    auto config = MakeOffloadConfig(/*default_quota=*/1000,
+                                    /*pool_capacity=*/1000);
+    config.default_kv_lease_ttl = 5000;
+    MasterService service(config);
     UUID client_id =
         MountSegment(service, /*size=*/4096, "quota_promotion_segment");
     MountLocalDiskSegment(service, client_id);
@@ -466,6 +551,7 @@ TEST_F(MasterServiceTenantQuotaTest, PromotionSuccessCommitsTenantQuota) {
 
     EXPECT_EQ(Snapshot(service, "tenant-a").used_bytes, 400);
     EXPECT_EQ(Snapshot(service, "tenant-a").reserved_bytes, 0);
+    ASSERT_TRUE(service.GetReplicaList("cold", "tenant-a").has_value());
     auto over_quota = service.PutStart(client_id, "too-much", "tenant-a", 700,
                                        MemoryConfig());
     ASSERT_FALSE(over_quota.has_value());

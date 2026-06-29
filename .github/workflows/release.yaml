@@ -12,6 +12,7 @@ jobs:
     # Skip semver pre-release tags (e.g. v1.0.0-rc1); those are handled by pre-release.yaml.
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
+    container: pytorch/manylinux2_28-builder:cuda12.8
     permissions:
       contents: write
     strategy:
@@ -24,27 +25,15 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - name: Mark workspace safe for git (container runs as root)
+        run: git config --global --add safe.directory '*'
 
-      - name: Free up disk space
+      - name: Select Python ${{ matrix.python-version }} from manylinux image
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/lib/android
-          df -h
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
-        with:
-          cuda: '12.8.1'
-          linux-local-args: '["--toolkit"]'
-          method: 'network'
-          sub-packages: '["nvcc", "nvrtc-dev"]'
-          non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
+          PYV_NODOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
+          PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -58,11 +47,11 @@ jobs:
 
       - name: Configure project
         run: |
-          sudo apt update -y
-          sudo bash -x dependencies.sh -y
+          bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           mkdir build
           cd build
-          cmake .. -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0;2.12.1" -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0;2.12.1" -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="$(which python3)"
         shell: bash
 
       - name: Build project
@@ -70,7 +59,7 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           cd build
           make -j
-          sudo -E make install
+          make install
         shell: bash
 
       - name: Build nvlink_allocator.so

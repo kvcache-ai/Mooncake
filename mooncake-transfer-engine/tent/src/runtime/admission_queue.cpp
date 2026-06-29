@@ -25,6 +25,9 @@ using PublicTaskKey = std::pair<uint64_t, size_t>;
 
 bool isSupportedTerminalStatus(TransferStatusEnum status) {
     return status == TransferStatusEnum::COMPLETED ||
+           status == TransferStatusEnum::INVALID ||
+           status == TransferStatusEnum::CANCELED ||
+           status == TransferStatusEnum::TIMEOUT ||
            status == TransferStatusEnum::FAILED;
 }
 
@@ -232,9 +235,8 @@ Status LocalTransferAdmissionQueue::complete(
         return Status::InvalidEntry("queue owner is not dispatching" LOC_MARK);
     }
 
-    owner.state = terminal_status == TransferStatusEnum::COMPLETED
-                      ? QueueState::Completed
-                      : QueueState::Failed;
+    owner.state = QueueState::Terminal;
+    owner.terminal_status = terminal_status;
     --outstanding_owners_;
     outstanding_bytes_ -= owner.request.length;
     if (owner.kind == QueueOwnerKind::User) {
@@ -271,9 +273,7 @@ Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
             return Status::InternalError(
                 "queue owner batch token mismatch" LOC_MARK);
         }
-        const bool terminal = owner.state == QueueState::Completed ||
-                              owner.state == QueueState::Failed;
-        if (!terminal) {
+        if (owner.state != QueueState::Terminal) {
             return Status::InvalidEntry(
                 "batch has non-terminal queue owners" LOC_MARK);
         }
@@ -314,11 +314,8 @@ Status LocalTransferAdmissionQueue::getPublicStatus(
         case QueueState::Dispatching:
             status = TransferStatusEnum::PENDING;
             break;
-        case QueueState::Completed:
-            status = TransferStatusEnum::COMPLETED;
-            break;
-        case QueueState::Failed:
-            status = TransferStatusEnum::FAILED;
+        case QueueState::Terminal:
+            status = owner_it->second.terminal_status;
             break;
     }
     return Status::OK();

@@ -38,7 +38,9 @@ UrmaContext::~UrmaContext() {
     auto thisString = toString();
     worker_pool_.reset();
     LOG(INFO) << "destroy worker pool done.";
-    endpoint_store_->destroy();
+    if (endpoint_store_) {
+        endpoint_store_->destroy();
+    }
     LOG(INFO) << "destroy endpoint store done.";
     if (urma_context_) deconstruct();
     LOG(WARNING) << "finished destroy context : " << thisString;
