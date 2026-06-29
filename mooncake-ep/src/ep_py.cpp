@@ -26,6 +26,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             if (num_ranks <= 0) {
                 throw py::value_error("num_ranks must be greater than 0");
             }
+            if (num_ranks > MAX_QP_COUNT) {
+                throw py::value_error(
+                    "num_ranks must be less than or equal to MAX_QP_COUNT");
+            }
             if (rank < 0 || rank >= num_ranks) {
                 throw py::value_error("rank must be in [0, num_ranks)");
             }

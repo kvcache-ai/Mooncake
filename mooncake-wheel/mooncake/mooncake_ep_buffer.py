@@ -63,16 +63,20 @@ class EventOverlap:
 
 
 class Buffer:
-    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int):
         from mooncake import ep
 
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         if self.group_size <= 0:
-            raise ValueError("num_ranks must be greater than 0")
+            raise ValueError("group_size must be greater than 0")
+        if self.group_size > ep.MAX_QP_COUNT:
+            raise ValueError(
+                f"group_size must be less than or equal to MAX_QP_COUNT ({ep.MAX_QP_COUNT})"
+            )
         if self.rank < 0 or self.rank >= self.group_size:
-            raise ValueError("rank must be in [0, num_ranks)")
+            raise ValueError("rank must be in [0, group_size)")
         if num_ep_buffer_bytes <= 0:
             raise ValueError("num_ep_buffer_bytes must be greater than 0")
         self.group = group

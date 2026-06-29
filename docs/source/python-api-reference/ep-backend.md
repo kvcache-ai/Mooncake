@@ -308,7 +308,7 @@ Returns the workspace size in bytes for the EP buffer. Use the maximum number of
 tokens a rank may dispatch in one step. Underestimating this value can cause
 buffer overflow or incorrect dispatch results.
 
-### `Buffer(group, num_ep_buffer_bytes=0)`
+### `Buffer(group, num_ep_buffer_bytes)`
 
 Creates the EP runtime for a Mooncake process group. The constructor exchanges
 RDMA and IPC metadata through the group, initializes fast-path transports when
