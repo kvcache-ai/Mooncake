@@ -51,12 +51,17 @@ Status ProxyManager::deconstruct() {
         shards_[i].cv.notify_all();
         if (shards_[i].thread.joinable()) shards_[i].thread.join();
     }
-    for (auto entry : stage_buffers_) {
+
+    std::unordered_map<std::string, StageBuffers> stage_buffers;
+    {
+        std::lock_guard<std::mutex> lk(stage_buffers_mu_);
+        stage_buffers = std::move(stage_buffers_);
+    }
+    for (auto& entry : stage_buffers) {
         impl_->unregisterLocalMemory(entry.second.chunks);
         impl_->freeLocalMemory(entry.second.chunks);
         delete[] entry.second.bitmap;
     }
-    stage_buffers_.clear();
     return Status::OK();
 }
 
@@ -609,7 +614,7 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
     return Status::OK();
 }
 
-Status ProxyManager::allocateStageBuffers(const std::string& location) {
+Status ProxyManager::allocateStageBuffersLocked(const std::string& location) {
     if (stage_buffers_.count(location)) return Status::OK();
     StageBuffers buf;
     auto total_size = kChunkSize * kChunkCount;
@@ -624,6 +629,7 @@ Status ProxyManager::allocateStageBuffers(const std::string& location) {
 }
 
 Status ProxyManager::freeStageBuffers(const std::string& location) {
+    std::lock_guard<std::mutex> lk(stage_buffers_mu_);
     auto it = stage_buffers_.find(location);
     if (it == stage_buffers_.end())
         return Status::InvalidArgument("Stage buffer not allocated" LOC_MARK);
@@ -636,9 +642,10 @@ Status ProxyManager::freeStageBuffers(const std::string& location) {
 
 Status ProxyManager::pinStageBuffer(const std::string& location,
                                     uint64_t& addr) {
+    std::lock_guard<std::mutex> lk(stage_buffers_mu_);
     auto it = stage_buffers_.find(location);
     if (it == stage_buffers_.end()) {
-        CHECK_STATUS(allocateStageBuffers(location));
+        CHECK_STATUS(allocateStageBuffersLocked(location));
         it = stage_buffers_.find(location);
     }
 
@@ -654,6 +661,7 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
 }
 
 Status ProxyManager::unpinStageBuffer(uint64_t addr) {
+    std::lock_guard<std::mutex> lk(stage_buffers_mu_);
     for (auto& [location, buf] : stage_buffers_) {
         auto base = reinterpret_cast<uint64_t>(buf.chunks);
         auto end = base + kChunkSize * kChunkCount;

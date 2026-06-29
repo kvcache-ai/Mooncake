@@ -16,6 +16,7 @@
 #define PROXY_MANAGER_H_
 
 #include <memory>
+#include <mutex>
 
 #include "tent/common/types.h"
 #include "tent/common/status.h"
@@ -96,7 +97,7 @@ class ProxyManager {
 
     Status transferSync(StagingTask& task, StageBufferCache* cache);
 
-    Status allocateStageBuffers(const std::string& location);
+    Status allocateStageBuffersLocked(const std::string& location);
 
     Status freeStageBuffers(const std::string& location);
 
@@ -129,6 +130,7 @@ class ProxyManager {
     static constexpr size_t kChunkCount = 64;
     const size_t max_queued_tasks_per_shard_;
     TransferEngineImpl* impl_;
+    std::mutex stage_buffers_mu_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
     std::atomic<bool> running_;
     struct WorkerShard {
