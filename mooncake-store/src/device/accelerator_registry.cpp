@@ -13,6 +13,7 @@ void RegisterStaticAcceleratorDevice(const AcceleratorDevice& device);
 
 class AcceleratorRegistryImpl final : public AcceleratorRegistry {
     using DeviceList = std::vector<const AcceleratorDevice*>;
+    using DeviceListPtr = std::shared_ptr<const DeviceList>;
 
    public:
     std::span<const AcceleratorDevice* const> RegisteredDevices()
@@ -23,10 +24,10 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
 
     RuntimeAccelerator RuntimeAccelerators(bool ensure = false) const override {
         auto available_devices = std::atomic_load(&available_devices_);
-        if (ensure || !available_devices) {
+        if (ShouldRefresh(ensure, available_devices)) {
             std::lock_guard<std::mutex> lock(refresh_mutex_);
             available_devices = std::atomic_load(&available_devices_);
-            if (ensure || !available_devices) {
+            if (ShouldRefresh(ensure, available_devices)) {
                 available_devices = BuildAvailableDevices();
                 std::atomic_store(&available_devices_, available_devices);
             }
@@ -51,9 +52,15 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
             }
         }
         registered_devices_.push_back(&device);
+        std::atomic_store(&available_devices_, DeviceListPtr());
     }
 
-    std::shared_ptr<const DeviceList> BuildAvailableDevices() const {
+    static bool ShouldRefresh(bool ensure,
+                              const DeviceListPtr& available_devices) {
+        return ensure || !available_devices || available_devices->empty();
+    }
+
+    DeviceListPtr BuildAvailableDevices() const {
         auto available_devices = std::make_shared<DeviceList>();
         for (auto* device : registered_devices_) {
             if (device->Available(true)) {
