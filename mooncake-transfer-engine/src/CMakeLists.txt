@@ -70,7 +70,7 @@ if(USE_CUDA)
     target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
   endif()
   if(USE_NVMEOF)
-    target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
+    target_link_libraries(transfer_engine PUBLIC nvmeof_transport gds_transport cufile)
   endif()
 endif()
 
