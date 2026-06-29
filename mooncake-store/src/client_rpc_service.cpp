@@ -67,9 +67,9 @@ void ClientRpcService::Stop() {
 void ClientRpcService::RecordPeerInflight(bool entering) {
     if (!metrics_) return;
     if (entering) {
-        metrics_->peer_request.inflight.inc();
+        metrics_->peer_request_metrics.inflight.inc();
     } else {
-        metrics_->peer_request.inflight.dec();
+        metrics_->peer_request_metrics.inflight.dec();
     }
 }
 

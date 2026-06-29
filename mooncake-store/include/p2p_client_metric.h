@@ -83,6 +83,9 @@ struct PeerRequestMetrics {
     ReadRpcHandlerMetric pin_key;
     RpcHandlerMetric unpin_key;
 
+    // Number of currently in-flight requests of this direction (gauge).
+    ylt::metric::gauge_t inflight;
+
     explicit PeerRequestMetrics(
         const std::string& prefix = "mooncake_p2p_peer",
         const std::map<std::string, std::string>& labels = {});

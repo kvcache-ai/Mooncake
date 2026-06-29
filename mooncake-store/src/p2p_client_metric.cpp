@@ -162,7 +162,9 @@ PeerRequestMetrics::PeerRequestMetrics(
       write_commit(prefix, "write_commit", labels),
       write_revoke(prefix, "write_revoke", labels),
       pin_key(prefix, "pin_key", labels),
-      unpin_key(prefix, "unpin_key", labels) {}
+      unpin_key(prefix, "unpin_key", labels),
+      inflight(prefix + "_inflight", "Number of currently in-flight requests",
+               labels) {}
 
 void PeerRequestMetrics::serialize(std::string& str) {
     read_remote_data.serialize(str);
@@ -172,6 +174,7 @@ void PeerRequestMetrics::serialize(std::string& str) {
     write_revoke.serialize(str);
     pin_key.serialize(str);
     unpin_key.serialize(str);
+    inflight.serialize(str);
 }
 
 std::string PeerRequestMetrics::summary_metrics() {
@@ -183,6 +186,7 @@ std::string PeerRequestMetrics::summary_metrics() {
     ss << write_revoke.summary_line("WriteRevoke");
     ss << pin_key.summary_line("PinKey");
     ss << unpin_key.summary_line("UnPinKey");
+    ss << "In-flight: " << inflight.value() << " requests\n";
     return ss.str();
 }
 
