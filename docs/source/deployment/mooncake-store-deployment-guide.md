@@ -441,7 +441,7 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--allocation_strategy` | `random` | `random` (pure random, fastest), `free_ratio_first` (best load balance), or `cxl` (prefer CXL memory) |
+| `--allocation_strategy` | `random` | Allocation strategy: `random` (pure random, fastest), `free_ratio_first` (best memory load balance), `ssd_free_ratio_first` (SSD-aware free-ratio-first), `cxl` (prefer CXL memory), or `host_aware_local_first` (prefer writer-host memory segments before ordered remote fallback) |
 
 ### PutStart Timeouts
 
