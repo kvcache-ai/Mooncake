@@ -210,8 +210,7 @@ int RdmaEndPoint::deconstructUnlocked() {
         for (auto& mr : notify_recv_mrs_) {
             if (mr) {
                 if (context_->verbs_.ibv_dereg_mr(mr))
-                    PLOG(ERROR)
-                        << "Failed to deregister notification recv MR";
+                    PLOG(ERROR) << "Failed to deregister notification recv MR";
                 mr = nullptr;
             }
         }
@@ -437,9 +436,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             // establishment failed. Reuse only the exact endpoint generation
             // that issued this RPC; EP_READY alone is not sufficient.
             RWSpinlock::WriteGuard guard(lock_);
-            const bool same_peer =
-                peer_server_name_ == peer_server_name &&
-                peer_nic_name_ == peer_nic_name;
+            const bool same_peer = peer_server_name_ == peer_server_name &&
+                                   peer_nic_name_ == peer_nic_name;
             const bool same_local_qps = qpNum() == local_desc.qp_num;
             if (status_.load(std::memory_order_relaxed) == EP_READY &&
                 same_peer && same_local_qps) {

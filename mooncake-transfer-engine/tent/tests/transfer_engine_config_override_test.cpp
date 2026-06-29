@@ -290,8 +290,7 @@ TEST(TransferEngineConfigOverrideTest,
     Config config;
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
-    EXPECT_TRUE(
-        config.get("transports/rdma/log_slice_affinity", false));
+    EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
 }
 
 TEST(TransferEngineConfigOverrideTest,

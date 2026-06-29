@@ -872,10 +872,8 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
                                            target.segment->machine_id);
     if (transport_->params_->log_slice_affinity) {
-        const auto* local_nic =
-            source.topo->getNicEntry(slice->source_dev_id);
-        const auto* remote_nic =
-            target.topo->getNicEntry(slice->target_dev_id);
+        const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);
+        const auto* remote_nic = target.topo->getNicEntry(slice->target_dev_id);
         VLOG(1) << "RDMA slice affinity: source_location=" << source.location
                 << ", target_location=" << target.location
                 << ", local_device_name="
@@ -883,10 +881,8 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
                 << ", peer_device_name="
                 << (remote_nic ? remote_nic->name : "<unknown>")
                 << ", target_id=" << slice->task->request.target_id
-                << ", source_addr="
-                << static_cast<void*>(slice->source_addr)
-                << ", dest_addr="
-                << reinterpret_cast<void*>(slice->target_addr)
+                << ", source_addr=" << static_cast<void*>(slice->source_addr)
+                << ", dest_addr=" << reinterpret_cast<void*>(slice->target_addr)
                 << ", length=" << slice->length
                 << ", retry_count=" << slice->retry_count;
     }

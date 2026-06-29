@@ -222,7 +222,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::mutex notify_send_mutex_;
     std::condition_variable notify_send_cv_;
     size_t notify_pending_count_ = 0;  // Number of pending sends
-    uint64_t notify_send_wr_id_ = 0;  // Circular counter for wr_id
+    uint64_t notify_send_wr_id_ = 0;   // Circular counter for wr_id
     std::atomic<bool> notify_connected_{false};
 
     // Two-phase destruction constants (matching TE)

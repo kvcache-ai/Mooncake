@@ -58,8 +58,8 @@ static std::shared_ptr<Topology> makeSingleNicTopology(const std::string& nic,
     return topo;
 }
 
-static std::shared_ptr<Topology> makeTwoNicTopology(
-    const std::string& first, const std::string& second) {
+static std::shared_ptr<Topology> makeTwoNicTopology(const std::string& first,
+                                                    const std::string& second) {
     auto json_str = R"({
         "nics": [
             {"name": ")" +
@@ -97,8 +97,7 @@ TEST(RailMonitorConfigTest, CustomJsonOverridesAutomaticPeerMapping) {
     })";
 
     RailMonitor rail;
-    ASSERT_TRUE(
-        rail.load(local.get(), remote.get(), rail_json, nullptr).ok());
+    ASSERT_TRUE(rail.load(local.get(), remote.get(), rail_json, nullptr).ok());
     EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/0), 1);
     EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/1, /*remote_numa=*/0), 0);
     EXPECT_TRUE(rail.available(/*local_nic=*/0, /*remote_nic=*/1));
