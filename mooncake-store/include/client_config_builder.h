@@ -175,7 +175,7 @@ struct P2PClientConfig : RealClientConfigBase {
     // async_sender_thread_count > 0 enables async notifier.
     // async_route_queue_size controls queue capacity
     // (minimum async_max_batch_size * async_sender_thread_count).
-    size_t async_sender_thread_count = 0;
+    size_t async_sender_thread_count = 4;
     size_t async_max_batch_size = 2000;
     size_t async_route_queue_size = 0;
 
@@ -313,7 +313,7 @@ class ClientConfigBuilder {
         size_t local_memcpy_async_worker_num = 32, uint16_t http_port = 9003,
         bool enable_http_server = true,
         const std::map<std::string, std::string>& labels = {},
-        size_t async_sender_thread_count = 0,
+        size_t async_sender_thread_count = 4,
         size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0,
         uint32_t p2p_key_lease_duration_ms = 0,
         uint32_t p2p_key_lease_scan_interval_ms = 0,

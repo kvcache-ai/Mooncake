@@ -32,7 +32,7 @@ DEFINE_uint64(lock_shard_count, 1024,
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
 DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
               "TTL for RouteCache entries in ms");
-DEFINE_uint64(async_sender_thread_count, 0,
+DEFINE_uint64(async_sender_thread_count, 4,
               "Async route notifier sender thread count. "
               "0=disabled (sync RPCs), >0=enable async notifier");
 DEFINE_uint64(async_max_batch_size, 2000,
