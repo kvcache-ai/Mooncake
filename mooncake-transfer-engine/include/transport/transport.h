@@ -113,6 +113,7 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
+        std::string source_location;
         SliceStatus status;
         TransferTask *task;
         // EFA's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
