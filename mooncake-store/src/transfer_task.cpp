@@ -694,11 +694,10 @@ void MemcpyWorkerPool::workerThread() {
                         accelerator->SetContext(device_id);
                         if (!accelerator->Copy(op.dest, op.src, op.size,
                                                direction)) {
-                            LOG(ERROR)
-                                << "GPU memcpy failed: src_dev="
-                                << src_info.device_id
-                                << " dst_dev=" << dst_info.device_id
-                                << " size=" << op.size;
+                            LOG(ERROR) << "GPU memcpy failed: src_dev="
+                                       << src_info.device_id
+                                       << " dst_dev=" << dst_info.device_id
+                                       << " size=" << op.size;
                             ok = false;
                             break;
                         }
