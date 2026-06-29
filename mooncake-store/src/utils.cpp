@@ -561,12 +561,9 @@ std::string ResolveMooncakeHostId(const std::string &local_hostname) {
         return value.substr(begin, end - begin + 1);
     };
 
-    std::string host_id = trim(GetEnvStringOr("MOONCAKE_HOST_ID", ""));
-    if (host_id.empty()) {
-        const std::string hostname = trim(local_hostname);
-        host_id = (hostname == "::1") ? hostname
-                                      : trim(getHostNameWithoutPort(hostname));
-    }
+    const std::string hostname = trim(local_hostname);
+    const std::string host_id =
+        (hostname == "::1") ? hostname : trim(getHostNameWithoutPort(hostname));
     if (host_id.empty()) {
         return "";
     }

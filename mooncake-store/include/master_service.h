@@ -1972,8 +1972,6 @@ class MasterService {
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
-    const bool local_first_alloc_enabled_;
-    const std::string host_fallback_policy_;
 
     bool enable_snapshot_restore_ = false;
 

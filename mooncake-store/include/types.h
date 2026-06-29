@@ -463,10 +463,11 @@ YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
  * @brief Allocation strategy type for segment allocation
  */
 enum class AllocationStrategyType {
-    RANDOM = 0,            // Pure random allocation
-    FREE_RATIO_FIRST,      // Free-ratio-first allocation
-    CXL,                   // CXL-specific allocation
-    SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    RANDOM = 0,             // Pure random allocation
+    FREE_RATIO_FIRST,       // Free-ratio-first allocation
+    CXL,                    // CXL-specific allocation
+    SSD_FREE_RATIO_FIRST,   // SSD free-ratio-first allocation
+    HOST_AWARE_LOCAL_FIRST  // Host-aware local-first allocation
 };
 
 /**

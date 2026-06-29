@@ -1867,18 +1867,12 @@ TEST_F(MasterServiceTest, PutWithPreferredSegments) {
     EXPECT_TRUE(put_end_result.has_value());
 }
 
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersEnvAndRejectsLoopback) {
+TEST_F(MasterServiceTest,
+       ResolveMooncakeHostIdUsesLocalHostnameAndRejectsLoopback) {
     {
-        ScopedEnvVar env("MOONCAKE_HOST_ID", " hostA ");
-        EXPECT_EQ(ResolveMooncakeHostId("127.0.0.1:5000"), "hostA");
-    }
-    {
-        ScopedEnvVar env("MOONCAKE_HOST_ID", "[::1]");
-        EXPECT_TRUE(ResolveMooncakeHostId("hostB:5000").empty());
-    }
-    {
-        ScopedEnvVar env("MOONCAKE_HOST_ID");
         EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+        EXPECT_EQ(ResolveMooncakeHostId("hostB:5001"), "hostB");
+        EXPECT_EQ(ResolveMooncakeHostId("[2001:db8::1]:5000"), "2001:db8::1");
         EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());
         EXPECT_TRUE(ResolveMooncakeHostId("127.0.0.1:5000").empty());
         EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
@@ -1887,10 +1881,23 @@ TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersEnvAndRejectsLoopback) {
     }
 }
 
+TEST_F(MasterServiceTest, MasterConfigParsesHostAwareLocalFirstStrategy) {
+    MasterConfig config{};
+    config.allocation_strategy = "host_aware_local_first";
+
+    WrappedMasterServiceConfig wrapped_config(config, 0);
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(service_config.allocation_strategy_type,
+              AllocationStrategyType::HOST_AWARE_LOCAL_FIRST);
+}
+
 TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
-    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
-    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
-    MasterService service;
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(
+                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
 
     [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
@@ -1913,9 +1920,12 @@ TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
 }
 
 TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
-    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
-    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
-    MasterService service;
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(
+                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
 
     [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
@@ -1938,9 +1948,12 @@ TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
 }
 
 TEST_F(MasterServiceTest, LocalFirstPutFallsBackWhenLocalSegmentIsFull) {
-    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
-    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
-    MasterService service;
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(
+                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
 
     [[maybe_unused]] const auto local = PrepareSimpleSegment(
@@ -1976,9 +1989,12 @@ TEST_F(MasterServiceTest, LocalFirstPutFallsBackWhenLocalSegmentIsFull) {
 }
 
 TEST_F(MasterServiceTest, ExplicitPreferredSegmentOverridesLocalFirst) {
-    ScopedEnvVar local_first("MOONCAKE_LOCAL_FIRST_ALLOC", "1");
-    ScopedEnvVar fallback_policy("MOONCAKE_HOST_FALLBACK_POLICY", "ordered");
-    MasterService service;
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(
+                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
 
     [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
@@ -1999,6 +2015,49 @@ TEST_F(MasterServiceTest, ExplicitPreferredSegmentOverridesLocalFirst) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               "segment_host0");
+}
+
+TEST_F(MasterServiceTest, ExplicitPreferredSegmentFallsBackToLocalFirst) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(
+                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto preferred = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, 1024, "host0");
+    [[maybe_unused]] const auto local = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+    config.preferred_segment = "segment_host0";
+
+    auto fill_start = service.PutStart(writer_client_id, "fill_preferred",
+                                       "default", 1024, config);
+    ASSERT_TRUE(fill_start.has_value());
+    ASSERT_EQ(fill_start->size(), 1u);
+    EXPECT_EQ((*fill_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host0");
+    ASSERT_TRUE(service
+                    .PutEnd(writer_client_id, "fill_preferred", "default",
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    auto fallback_start =
+        service.PutStart(writer_client_id, "fallback_after_preferred_full",
+                         "default", 1, config);
+    ASSERT_TRUE(fallback_start.has_value());
+    ASSERT_EQ(fallback_start->size(), 1u);
+    EXPECT_EQ((*fallback_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
 }
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {

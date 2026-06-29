@@ -73,28 +73,6 @@ constexpr int kMaxTenantQuotaEvictionRetries = 2;
 // NOTE: Both offloading_queue_limit_ and offload_cap_ratio_ are now
 // configurable via --offloading_queue_limit and --offload_cap_ratio flags.
 
-std::string ToLowerAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return value;
-}
-
-bool ResolveLocalFirstAllocEnabled() {
-    const std::string value =
-        ToLowerAscii(GetEnvStringOr("MOONCAKE_LOCAL_FIRST_ALLOC", ""));
-    return value == "1" || value == "true" || value == "yes" || value == "on";
-}
-
-std::string ResolveHostFallbackPolicy() {
-    const std::string policy = ToLowerAscii(
-        GetEnvStringOr("MOONCAKE_HOST_FALLBACK_POLICY", "ordered"));
-    if (!policy.empty() && policy != "ordered") {
-        LOG(WARNING) << "Unsupported MOONCAKE_HOST_FALLBACK_POLICY=" << policy
-                     << ", falling back to ordered";
-    }
-    return "ordered";
-}
-
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
     kRedis,
@@ -230,8 +208,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                     ? AllocationStrategyType::CXL
                                     : config.allocation_strategy_type),
       allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
-      local_first_alloc_enabled_(ResolveLocalFirstAllocEnabled()),
-      host_fallback_policy_(ResolveHostFallbackPolicy()),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -259,9 +235,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
     } else {
         http_metadata_prefix_ = "mooncake/";
     }
-    LOG(INFO) << "Host-aware local-first allocation "
-              << (local_first_alloc_enabled_ ? "enabled" : "disabled")
-              << ", fallback_policy=" << host_fallback_policy_;
+    if (allocation_strategy_type_ ==
+        AllocationStrategyType::HOST_AWARE_LOCAL_FIRST) {
+        LOG(INFO) << "Host-aware local-first allocation strategy enabled";
+    }
 
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
@@ -2442,11 +2419,12 @@ auto MasterService::AllocateAndInsertMetadata(
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     if (config.replica_num > 0) {
-        const bool has_explicit_preferred = !config.preferred_segment.empty() ||
-                                            !config.preferred_segments.empty();
+        const bool use_host_aware_local_first =
+            allocation_strategy_type_ ==
+                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST &&
+            config.replica_num == 1;
         std::string writer_host_id;
-        if (local_first_alloc_enabled_ && config.replica_num == 1 &&
-            !has_explicit_preferred) {
+        if (use_host_aware_local_first) {
             writer_host_id = GetClientHostId(client_id);
         }
 
@@ -2455,18 +2433,32 @@ auto MasterService::AllocateAndInsertMetadata(
         const auto& allocator_manager = allocator_access.getAllocatorManager();
 
         std::vector<std::string> preferred_segments;
+        auto append_preferred_segment = [&preferred_segments](
+                                            const std::string& segment_name) {
+            if (!segment_name.empty() &&
+                std::find(preferred_segments.begin(), preferred_segments.end(),
+                          segment_name) == preferred_segments.end()) {
+                preferred_segments.push_back(segment_name);
+            }
+        };
         if (!config.preferred_segment.empty()) {
-            preferred_segments.push_back(config.preferred_segment);
-        } else if (!config.preferred_segments.empty()) {
-            preferred_segments = config.preferred_segments;
-        } else if (!writer_host_id.empty()) {
-            preferred_segments =
+            append_preferred_segment(config.preferred_segment);
+        } else {
+            for (const auto& preferred_segment : config.preferred_segments) {
+                append_preferred_segment(preferred_segment);
+            }
+        }
+        if (!writer_host_id.empty()) {
+            auto host_ordered_segments =
                 allocator_access.GetHostOrderedSegments(writer_host_id, key);
-            if (!preferred_segments.empty()) {
+            for (const auto& segment_name : host_ordered_segments) {
+                append_preferred_segment(segment_name);
+            }
+            if (!host_ordered_segments.empty()) {
                 VLOG(1) << "key=" << key
                         << ", writer_host_id=" << writer_host_id
                         << ", local_first_preferred_segments="
-                        << preferred_segments.size();
+                        << host_ordered_segments.size();
             }
         }
 
