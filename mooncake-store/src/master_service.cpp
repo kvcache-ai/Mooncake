@@ -4773,22 +4773,27 @@ auto MasterService::NotifyOffloadSuccess(
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
-        auto normalized_tenant_result =
-            NormalizeTenantIdForWrite(task.tenant_id);
-        if (!normalized_tenant_result) {
-            return tl::make_unexpected(normalized_tenant_result.error());
-        }
-        const ObjectIdentity object_id{normalized_tenant_result.value(),
-                                       task.key};
+        const auto request_object_id =
+            MakeObjectIdentityForRequest(task.key, task.tenant_id);
 
-        // Release refcnt and clear offloading task.
+        Replica replica(client_id, metadata.data_size,
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+        bool handled_existing_object = false;
         {
-            MetadataAccessorRW accessor(this, object_id);
+            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+            MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& tenant_state = accessor.GetTenantState();
-                auto task_it =
-                    tenant_state.offloading_tasks.find(object_id.user_key);
+
+                if (replica.type() != ReplicaType::LOCAL_DISK) {
+                    LOG(ERROR) << "Invalid replica type: " << replica.type()
+                               << ". Expected ReplicaType::LOCAL_DISK.";
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+
+                auto task_it = tenant_state.offloading_tasks.find(
+                    request_object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end()) {
                     auto source =
                         obj_metadata.GetReplicaByID(task_it->second.source_id);
@@ -4797,23 +4802,61 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     tenant_state.offloading_tasks.erase(task_it);
                 }
+
+                if (!obj_metadata.HasReplica(
+                        &Replica::fn_is_local_disk_replica)) {
+                    std::vector<Replica> replicas;
+                    replicas.emplace_back(std::move(replica));
+                    obj_metadata.AddReplicas(std::move(replicas));
+                    auto& shard = accessor.GetShard();
+                    shard.OnDiskReplicaAdded(obj_metadata);
+                } else {
+                    obj_metadata.VisitReplicas(
+                        [client_id](const Replica& rep) {
+                            return rep.type() == ReplicaType::LOCAL_DISK &&
+                                   rep.get_descriptor()
+                                           .get_local_disk_descriptor()
+                                           .client_id == client_id;
+                        },
+                        [&replica](Replica& rep) {
+                            rep.get_descriptor()
+                                .get_local_disk_descriptor()
+                                .transport_endpoint =
+                                replica.get_descriptor()
+                                    .get_local_disk_descriptor()
+                                    .transport_endpoint;
+                            rep.get_descriptor()
+                                .get_local_disk_descriptor()
+                                .object_size = replica.get_descriptor()
+                                                   .get_local_disk_descriptor()
+                                                   .object_size;
+                        });
+                }
+                handled_existing_object = true;
             }
         }
 
-        // Add LOCAL_DISK replica.
-        Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
-        auto res = AddReplica(client_id, object_id.user_key,
-                              object_id.tenant_id, replica);
-        if (!res) {
-            if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                continue;
+        if (!handled_existing_object) {
+            auto normalized_tenant_result =
+                NormalizeTenantIdForWrite(task.tenant_id);
+            if (!normalized_tenant_result) {
+                return tl::make_unexpected(normalized_tenant_result.error());
             }
-            LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                       << ", client_id=" << client_id
-                       << ", tenant_id=" << object_id.tenant_id
-                       << ", key=" << object_id.user_key;
-            return tl::make_unexpected(res.error());
+            const ObjectIdentity object_id{normalized_tenant_result.value(),
+                                           task.key};
+
+            auto res = AddReplica(client_id, object_id.user_key,
+                                  object_id.tenant_id, replica);
+            if (!res) {
+                if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    continue;
+                }
+                LOG(ERROR) << "Failed to add replica: error=" << res.error()
+                           << ", client_id=" << client_id
+                           << ", tenant_id=" << object_id.tenant_id
+                           << ", key=" << object_id.user_key;
+                return tl::make_unexpected(res.error());
+            }
         }
         if (local_disk_segment && metadata.data_size > 0) {
             local_disk_segment->ssd_used_bytes.fetch_add(

@@ -391,6 +391,46 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
+       NotifyOffloadSuccessCompletesExistingOrphanObject) {
+    const std::string initial_policy =
+        WritePolicyFile({{"tenant-a", 1000}, {"tenant-b", 1000}});
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(initial_policy)
+                      .build();
+    MasterService service(config);
+    UUID client_id = MountSegment(service);
+    PutComplete(service, client_id, "warming", "tenant-b", 128);
+
+    {
+        std::ofstream out(initial_policy);
+        TenantQuotaPolicySnapshot replacement;
+        replacement.tenant_quotas = {{"tenant-a", 1000}};
+        out << FormatTenantQuotaPolicyYaml(replacement);
+    }
+    ReloadTenantQuotaPolicyFromStore(service);
+    EXPECT_FALSE(Snapshot(service, "tenant-b").has_explicit_policy);
+
+    StorageObjectMetadata metadata;
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "disk-endpoint";
+    std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
+        .tenant_id = "tenant-b", .key = "warming", .size = 128}};
+
+    auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
+
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    auto replicas = service.GetReplicaList("warming", "tenant-b");
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    EXPECT_TRUE(std::any_of(replicas->replicas.begin(),
+                            replicas->replicas.end(),
+                            [](const Replica::Descriptor& replica) {
+                                return replica.is_local_disk_replica();
+                            }));
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
        RegisteredTenantQuotaAdmissionDoesNotCreateImplicitTenants) {
     MasterService service(MakeConfig({{"tenant-a", 100}}));
     UUID client_id = MountSegment(service);
