@@ -148,7 +148,7 @@ jobs:
         export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
         export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
         # This job builds Mooncake with -DENABLE_ASAN=ON, so the C++ libraries
-        # the Rust crate links against carry undefined __asan_* references. Opt
+        # the Rust package links against carry undefined __asan_* references. Opt
         # in to linking the ASan runtime; build.rs emits -lasan first, which
         # keeps libasan first in the initial library list as ASan requires.
         # Non-sanitized builds leave this unset and link without ASan.
@@ -794,7 +794,7 @@ jobs:
         filters: |
           docs:
             - 'docs/**'
-            - 'requirements_docs.txt'
+            - 'docs/requirements-docs.txt'
 
     - name: Set up Python
       if: steps.filter.outputs.docs == 'true'
@@ -806,7 +806,7 @@ jobs:
       if: steps.filter.outputs.docs == 'true'
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements_docs.txt
+        pip install -r docs/requirements-docs.txt
 
     - name: Build docs with strict mode
       if: steps.filter.outputs.docs == 'true'
