@@ -716,13 +716,9 @@ int RdmaTransport::processNotifyCompletions() {
 
         // Process each completion
         for (int i = 0; i < completed; ++i) {
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                LOG(ERROR) << "Notification completion failed: " << wc[i].status
-                           << ", qp_num=" << wc[i].qp_num;
-                continue;
-            }
-
-            // Find endpoint by QP number
+            // Find endpoint by QP number before interpreting errors. A flush
+            // completion after endpoint unpublication is expected during
+            // retirement and should not flood logs.
             std::shared_ptr<RdmaEndPoint> endpoint;
             {
                 RWSpinlock::ReadGuard guard(notify_endpoint_map_lock_);
@@ -730,6 +726,17 @@ int RdmaTransport::processNotifyCompletions() {
                 if (it != notify_qp_to_endpoint_.end()) {
                     endpoint = it->second.lock();
                 }
+            }
+
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR &&
+                    (!endpoint ||
+                     endpoint->status() != RdmaEndPoint::EP_READY)) {
+                    continue;
+                }
+                LOG(ERROR) << "Notification completion failed: " << wc[i].status
+                           << ", qp_num=" << wc[i].qp_num;
+                continue;
             }
 
             if (!endpoint) {

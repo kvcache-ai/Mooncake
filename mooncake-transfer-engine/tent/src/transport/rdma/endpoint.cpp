@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <sstream>
@@ -70,6 +71,14 @@ RdmaEndPoint::~RdmaEndPoint() { deconstruct(); }
 
 int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
                             const std::string& endpoint_name) {
+    EndPointStatus expected = EP_UNINIT;
+    if (!status_.compare_exchange_strong(expected, EP_HANDSHAKING,
+                                         std::memory_order_acq_rel)) {
+        LOG(ERROR) << "Endpoint can only be constructed from EP_UNINIT, got "
+                   << statusToString(expected);
+        return -1;
+    }
+
     context_ = context;
     params_ = params;
     endpoint_name_ = endpoint_name;
@@ -168,7 +177,6 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         }
     }
 
-    status_.store(EP_HANDSHAKING, std::memory_order_relaxed);
     return 0;
 }
 
@@ -186,14 +194,18 @@ int RdmaEndPoint::deconstructUnlocked() {
     auto current_status = status_.load(std::memory_order_relaxed);
     // Idempotent, including delayed destruction through an external shared_ptr.
     if (current_status == EP_DESTROYED) return 0;
-    status_.store(EP_DESTROYED, std::memory_order_relaxed);
     resetInflightSlices();
     peer_qp_num_list_.clear();
 
     // A default-constructed endpoint owns no verbs resources. A partially
     // constructed endpoint has context_ set and must be cleaned below even
     // though it never reached EP_HANDSHAKING.
-    if (!context_) return 0;
+    if (!context_) {
+        status_.store(EP_DESTROYED, std::memory_order_release);
+        return 0;
+    }
+
+    int result = 0;
 
     {
         std::lock_guard<std::mutex> notify_guard(notify_resource_mutex_);
@@ -201,44 +213,76 @@ int RdmaEndPoint::deconstructUnlocked() {
         if (notify_qp_) {
             // Unregister from transport before destroying
             context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
-            if (context_->verbs_.ibv_destroy_qp(notify_qp_))
+            if (context_->verbs_.ibv_destroy_qp(notify_qp_)) {
                 PLOG(ERROR) << "Failed to destroy notification QP";
-            notify_qp_ = nullptr;
-        }
-
-        // Deregister and free notification memory
-        for (auto& mr : notify_recv_mrs_) {
-            if (mr) {
-                if (context_->verbs_.ibv_dereg_mr(mr))
-                    PLOG(ERROR) << "Failed to deregister notification recv MR";
-                mr = nullptr;
+                result = -1;
+            } else {
+                notify_qp_ = nullptr;
             }
         }
-        notify_recv_mrs_.clear();
-        if (notify_send_mr_) {
-            if (context_->verbs_.ibv_dereg_mr(notify_send_mr_))
-                PLOG(ERROR) << "Failed to deregister notification send MR";
-            notify_send_mr_ = nullptr;
+
+        // A live QP may still reference the notification MRs. Keep both MRs
+        // and backing buffers intact until QP destruction succeeds.
+        if (!notify_qp_) {
+            for (auto& mr : notify_recv_mrs_) {
+                if (!mr) continue;
+                if (context_->verbs_.ibv_dereg_mr(mr)) {
+                    PLOG(ERROR) << "Failed to deregister notification recv MR";
+                    result = -1;
+                } else {
+                    mr = nullptr;
+                }
+            }
+            if (std::all_of(notify_recv_mrs_.begin(), notify_recv_mrs_.end(),
+                            [](ibv_mr* mr) { return mr == nullptr; })) {
+                notify_recv_mrs_.clear();
+                notify_recv_buffers_.clear();
+            }
+
+            if (notify_send_mr_) {
+                if (context_->verbs_.ibv_dereg_mr(notify_send_mr_)) {
+                    PLOG(ERROR) << "Failed to deregister notification send MR";
+                    result = -1;
+                } else {
+                    notify_send_mr_ = nullptr;
+                }
+            }
+            if (!notify_send_mr_) notify_send_buffer_.clear();
+        } else {
+            result = -1;
         }
-
-        notify_recv_buffers_.clear();
-        notify_send_buffer_.clear();
     }
 
+    bool all_qps_destroyed = true;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (qp_list_[i] && context_->verbs_.ibv_destroy_qp(qp_list_[i]))
-            PLOG(ERROR) << "ibv_destroy_qp";
-        if (wr_depth_list_ && wr_depth_list_[i].value != 0)
-            cancelQuota(i, wr_depth_list_[i].value);
+        if (wr_depth_list_ && wr_depth_list_[i].value != 0) {
+            const int outstanding = wr_depth_list_[i].value;
+            cancelQuota(i, outstanding);
+        }
+        if (!qp_list_[i]) continue;
+        if (context_->verbs_.ibv_destroy_qp(qp_list_[i])) {
+            PLOG(ERROR) << "Failed to destroy data QP[" << i << "]";
+            result = -1;
+            all_qps_destroyed = false;
+        } else {
+            qp_list_[i] = nullptr;
+        }
     }
-    qp_list_.clear();
-    slice_queue_.clear();
-    delete[] wr_depth_list_;
-    wr_depth_list_ = nullptr;
-    peer_server_name_.clear();
-    peer_nic_name_.clear();
-    // Status remains EP_DESTROYED (unidirectional lifecycle)
-    return 0;
+    if (all_qps_destroyed) {
+        qp_list_.clear();
+        slice_queue_.clear();
+        delete[] wr_depth_list_;
+        wr_depth_list_ = nullptr;
+    }
+
+    if (result == 0 && !notify_qp_ && notify_recv_mrs_.empty() &&
+        !notify_send_mr_ && qp_list_.empty()) {
+        peer_server_name_.clear();
+        peer_nic_name_.clear();
+        status_.store(EP_DESTROYED, std::memory_order_release);
+        return 0;
+    }
+    return -1;
 }
 
 void RdmaEndPoint::beginDestroy() {
@@ -254,12 +298,6 @@ void RdmaEndPoint::beginDestroyNoLock() {
     destroy_start_time_ = getCurrentTimeInNano();
     status_.store(EP_DESTROYING, std::memory_order_release);
 
-    // EP_UNINIT also covers construction failure. Such QPs were never
-    // published and may still be in RESET/INIT, so forcing an ERR transition
-    // is unnecessary (and invalid on some providers); deconstructUnlocked()
-    // will destroy whichever resources were created successfully.
-    if (current_status == EP_UNINIT || !context_) return;
-
     // Stop publishing the endpoint before QPs start flushing. A notification
     // completion that already locked the weak_ptr may finish safely, while no
     // later completion can acquire a retiring endpoint.
@@ -271,6 +309,10 @@ void RdmaEndPoint::beginDestroyNoLock() {
         notify_connected_ = false;
         notify_send_cv_.notify_all();
     }
+
+    // Only EP_READY can own submitted WRs. QPs in EP_UNINIT/EP_HANDSHAKING may
+    // still be RESET/INIT, where a transition to ERR is invalid on providers.
+    if (current_status != EP_READY) return;
 
     // Transition QPs to ERR state so hardware flushes inflight WRs to CQ
     ibv_qp_attr attr;
@@ -299,57 +341,39 @@ bool RdmaEndPoint::finishDestroy() {
     // Gate 1: already done
     if (current_status == EP_DESTROYED) return true;
 
-    // Gate 2: non-two-phase path. Endpoint reached waiting_list_ without
-    // going through beginDestroy(). This handles edge cases and serves as
-    // a safety net. Endpoints that never reached construct() own no RDMA
-    // resources; drop them directly.
     if (current_status != EP_DESTROYING) {
-        if (qp_list_.empty()) {
-            status_.store(EP_DESTROYED, std::memory_order_relaxed);
-            return true;
-        }
-        LOG(WARNING) << "finishDestroy called in unexpected state: "
-                     << statusToString(current_status)
-                     << ", forcing destruction to avoid waiting_list_ leak";
-        // Fall through to the unified destroy path
-    } else {
-        // Gate 3: two-phase path. Wait for inflight WRs to drain via CQ
-        // polling. If ibv_modify_qp-to-ERR failed in beginDestroy, WRs may
-        // never be flushed; enforce a timeout to avoid leaking forever.
-        bool has_outstanding = false;
-        for (size_t i = 0; wr_depth_list_ && i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i].value != 0) {
-                has_outstanding = true;
-                break;
-            }
-        }
-        if (has_outstanding) {
-            double elapsed =
-                (getCurrentTimeInNano() - destroy_start_time_) / 1e9;
-            if (elapsed < kFinishDestroyTimeoutSec) {
-                return false;  // Still waiting for WRs to drain
-            }
-            LOG(WARNING) << "finishDestroy timed out after " << elapsed
-                         << "s with outstanding WRs, forcing destruction";
-        }
+        LOG(ERROR) << "finishDestroy requires EP_DESTROYING, got "
+                   << statusToString(current_status);
+        return false;
     }
 
-    // Unified destroy: tear down QPs and bound retries to avoid
-    // log flooding when ibv_destroy_qp fails permanently.
+    // Wait for inflight WRs to drain via CQ polling. If the transition to ERR
+    // failed, enforce a timeout so cleanup can still make progress.
+    bool has_outstanding = false;
+    for (size_t i = 0; wr_depth_list_ && i < qp_list_.size(); ++i) {
+        if (wr_depth_list_[i].value != 0) {
+            has_outstanding = true;
+            break;
+        }
+    }
+    if (has_outstanding) {
+        double elapsed = (getCurrentTimeInNano() - destroy_start_time_) / 1e9;
+        if (elapsed < kFinishDestroyTimeoutSec) {
+            return false;
+        }
+        LOG(WARNING) << "finishDestroy timed out after " << elapsed
+                     << "s with outstanding WRs, forcing destruction";
+    }
+
     int ret = deconstructUnlocked();
     if (ret) {
-        finish_destroy_retries_++;
-        LOG(ERROR) << "Failed to finish destroying endpoint (attempt "
-                   << finish_destroy_retries_ << "/" << kFinishDestroyMaxRetries
-                   << "): " << ret;
-        if (finish_destroy_retries_ < kFinishDestroyMaxRetries) {
-            return false;  // Retry later
+        destroy_error_count_++;
+        if (destroy_error_count_ <= kMaxDestroyErrorLogs) {
+            LOG(ERROR) << "Failed to finish destroying endpoint (attempt "
+                       << destroy_error_count_ << "): " << ret;
         }
-        LOG(ERROR) << "Giving up after " << finish_destroy_retries_
-                   << " retries (possible resource leak)";
+        return false;
     }
-
-    status_.store(EP_DESTROYED, std::memory_order_relaxed);
     return true;
 }
 

@@ -128,20 +128,9 @@ void FIFOEndpointStore::reclaim() {
     for (auto& endpoint : to_delete) waiting_list_.erase(endpoint);
 }
 
-void FIFOEndpointStore::testOnlyInsertWaiting(
-    std::shared_ptr<RdmaEndPoint> endpoint) {
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    waiting_list_.insert(std::move(endpoint));
-}
-
-size_t FIFOEndpointStore::testOnlyWaitingListSize() {
-    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
-    return waiting_list_.size();
-}
-
 size_t FIFOEndpointStore::size() { return endpoint_map_.size(); }
 
-void FIFOEndpointStore::clear() {
+int FIFOEndpointStore::clear() {
     // clear() is used by RdmaContext::disable() immediately before CQs, PD and
     // the verbs context are destroyed. Merely erasing endpoint_map_ is unsafe:
     // an endpoint retained by an external shared_ptr could otherwise run its
@@ -169,9 +158,15 @@ void FIFOEndpointStore::clear() {
     // deconstruction here, before RdmaContext destroys its CQs and PD.
     // deconstruct() is idempotent, so external shared_ptr owners may release
     // the already-deconstructed endpoint later without touching verbs again.
+    std::vector<std::shared_ptr<RdmaEndPoint>> failed;
     for (auto& endpoint : endpoints) {
-        endpoint->deconstruct();
+        if (endpoint->deconstruct()) failed.push_back(endpoint);
     }
+    if (failed.empty()) return 0;
+
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(failed.begin(), failed.end());
+    return -1;
 }
 
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::get(const std::string& key) {
@@ -304,22 +299,9 @@ void SIEVEEndpointStore::reclaim() {
     waiting_list_len_ -= to_delete.size();
 }
 
-void SIEVEEndpointStore::testOnlyInsertWaiting(
-    std::shared_ptr<RdmaEndPoint> endpoint) {
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    if (waiting_list_.insert(std::move(endpoint)).second) {
-        waiting_list_len_.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-size_t SIEVEEndpointStore::testOnlyWaitingListSize() {
-    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
-    return waiting_list_.size();
-}
-
 size_t SIEVEEndpointStore::size() { return endpoint_map_.size(); }
 
-void SIEVEEndpointStore::clear() {
+int SIEVEEndpointStore::clear() {
     // Terminal shutdown semantics are intentionally different from normal
     // SIEVE eviction: remove()/evictOne() retire endpoints asynchronously,
     // while clear() must release all verbs objects before their parent
@@ -346,9 +328,16 @@ void SIEVEEndpointStore::clear() {
     // synchronously deconstruct each endpoint instead. The operation is
     // idempotent, allowing outstanding external shared_ptr references to die
     // safely after the Store and Context have gone away.
+    std::vector<std::shared_ptr<RdmaEndPoint>> failed;
     for (auto& endpoint : endpoints) {
-        endpoint->deconstruct();
+        if (endpoint->deconstruct()) failed.push_back(endpoint);
     }
+    if (failed.empty()) return 0;
+
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(failed.begin(), failed.end());
+    waiting_list_len_.store(waiting_list_.size(), std::memory_order_relaxed);
+    return -1;
 }
 }  // namespace tent
 }  // namespace mooncake

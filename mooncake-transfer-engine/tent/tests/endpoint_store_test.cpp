@@ -23,6 +23,36 @@
 
 namespace mooncake {
 namespace tent {
+
+class EndpointStoreTestAccess {
+   public:
+    static void insertWaiting(FIFOEndpointStore& store,
+                              std::shared_ptr<RdmaEndPoint> endpoint) {
+        endpoint->beginDestroy();
+        RWSpinlock::WriteGuard guard(store.endpoint_map_lock_);
+        store.waiting_list_.insert(std::move(endpoint));
+    }
+
+    static void insertWaiting(SIEVEEndpointStore& store,
+                              std::shared_ptr<RdmaEndPoint> endpoint) {
+        endpoint->beginDestroy();
+        RWSpinlock::WriteGuard guard(store.endpoint_map_lock_);
+        if (store.waiting_list_.insert(std::move(endpoint)).second) {
+            store.waiting_list_len_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    static size_t waitingListSize(FIFOEndpointStore& store) {
+        RWSpinlock::ReadGuard guard(store.endpoint_map_lock_);
+        return store.waiting_list_.size();
+    }
+
+    static size_t waitingListSize(SIEVEEndpointStore& store) {
+        RWSpinlock::ReadGuard guard(store.endpoint_map_lock_);
+        return store.waiting_list_.size();
+    }
+};
+
 namespace {
 
 enum class StoreType { FIFO, SIEVE };
@@ -41,21 +71,21 @@ class EndpointStoreTest : public testing::TestWithParam<StoreType> {
     void insertWaiting(EndpointStore& store,
                        std::shared_ptr<RdmaEndPoint> endpoint) {
         if (GetParam() == StoreType::FIFO) {
-            static_cast<FIFOEndpointStore&>(store).testOnlyInsertWaiting(
-                std::move(endpoint));
+            EndpointStoreTestAccess::insertWaiting(
+                static_cast<FIFOEndpointStore&>(store), std::move(endpoint));
         } else {
-            static_cast<SIEVEEndpointStore&>(store).testOnlyInsertWaiting(
-                std::move(endpoint));
+            EndpointStoreTestAccess::insertWaiting(
+                static_cast<SIEVEEndpointStore&>(store), std::move(endpoint));
         }
     }
 
     size_t waitingListSize(EndpointStore& store) {
         if (GetParam() == StoreType::FIFO) {
-            return static_cast<FIFOEndpointStore&>(store)
-                .testOnlyWaitingListSize();
+            return EndpointStoreTestAccess::waitingListSize(
+                static_cast<FIFOEndpointStore&>(store));
         }
-        return static_cast<SIEVEEndpointStore&>(store)
-            .testOnlyWaitingListSize();
+        return EndpointStoreTestAccess::waitingListSize(
+            static_cast<SIEVEEndpointStore&>(store));
     }
 
     RdmaTransport transport_;
@@ -109,7 +139,7 @@ TEST_P(EndpointStoreTest, ClearDeconstructsExternallyOwnedWaitingEndpoint) {
     std::weak_ptr<RdmaEndPoint> weak = endpoint;
     insertWaiting(*store, endpoint);
 
-    store->clear();
+    ASSERT_EQ(store->clear(), 0);
 
     EXPECT_EQ(waitingListSize(*store), 0);
     EXPECT_EQ(endpoint->status(), RdmaEndPoint::EP_DESTROYED);

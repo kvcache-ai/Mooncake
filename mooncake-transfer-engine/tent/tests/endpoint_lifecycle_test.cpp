@@ -47,6 +47,14 @@ TEST(EndpointLifecycleTest, DeconstructIsIdempotent) {
     EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
 }
 
+TEST(EndpointLifecycleTest, DestroyedEndpointCannotBeConstructedAgain) {
+    RdmaEndPoint endpoint;
+
+    ASSERT_EQ(endpoint.deconstruct(), 0);
+    EXPECT_NE(endpoint.construct(nullptr, nullptr, "reused"), 0);
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
 TEST(EndpointLifecycleTest, TwoPhaseDestroyHandlesUninitializedEndpoint) {
     RdmaEndPoint endpoint;
 
@@ -54,6 +62,13 @@ TEST(EndpointLifecycleTest, TwoPhaseDestroyHandlesUninitializedEndpoint) {
     EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
     EXPECT_TRUE(endpoint.finishDestroy());
     EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+TEST(EndpointLifecycleTest, FinishDestroyRejectsNonRetiringEndpoint) {
+    RdmaEndPoint endpoint;
+
+    EXPECT_FALSE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_UNINIT);
 }
 
 TEST(EndpointLifecycleTest, FinishDestroyIsIdempotent) {

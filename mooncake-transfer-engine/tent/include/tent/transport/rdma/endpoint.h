@@ -106,7 +106,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // WRs have been drained, actually destroys QPs and frees resources.
     // Returns true if destruction is complete, false if outstanding WRs remain.
     void beginDestroy();
-    void beginDestroyNoLock();  // Internal version without locking
     bool finishDestroy();
 
     Status connect(const std::string& peer_server_name,
@@ -179,6 +178,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
    private:
     // Caller must hold lock_ in write mode.
+    void beginDestroyNoLock();
     int deconstructUnlocked();
 
     void resetInflightSlices();
@@ -227,8 +227,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     // Two-phase destruction constants (matching TE)
     static constexpr double kFinishDestroyTimeoutSec = 30.0;
-    static constexpr int kFinishDestroyMaxRetries = 3;
-    int finish_destroy_retries_ = 0;  // Retry counter for finishDestroy
+    static constexpr int kMaxDestroyErrorLogs = 3;
+    int destroy_error_count_ = 0;
 };
 }  // namespace tent
 }  // namespace mooncake
