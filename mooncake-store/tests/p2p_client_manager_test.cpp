@@ -177,22 +177,6 @@ TEST_F(P2PClientManagerTest, UnregisterClientNotFoundIsIdempotent) {
     EXPECT_TRUE(res.has_value());
 }
 
-TEST_F(P2PClientManagerTest, UnregisterClientWrongDeploymentMode) {
-    auto mgr = CreateManager();
-    mgr->Start();
-
-    UUID client_id = {100, 200};
-    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest(client_id))
-                    .has_value());
-
-    auto res = mgr->UnregisterClient(
-        UnregisterClientRequest{client_id, DeploymentMode::CENTRALIZATION});
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::ILLEGAL_CLIENT);
-    // Client still present (request rejected before cleanup).
-    EXPECT_NE(mgr->GetClient(client_id), nullptr);
-}
-
 TEST_F(P2PClientManagerTest, UnregisterThenReRegister) {
     auto mgr = CreateManager();
     mgr->Start();

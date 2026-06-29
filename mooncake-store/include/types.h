@@ -376,8 +376,8 @@ inline std::ostream& operator<<(std::ostream& os,
  * @enum HAClientState
  * @brief Client-side HA state for Master crash recovery.
  *        FULL: normal operation
- *        DEGRADED: Master unreachable, local-only mode (still heartbeating &
- *                  probing for recovery)
+ *        DEGRADED: Master unreachable, local-only mode (still heartbeat probing
+ *                  and probing for recovery)
  *        SYNCING: re-syncing metadata to restarted Master
  *        LOCAL_ONLY: intentionally unregistered, stable local-only service
  *                    (NO heartbeat probing, NO auto re-registration)

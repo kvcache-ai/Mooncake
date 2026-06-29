@@ -116,6 +116,7 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
 TEST_F(MasterMetricsTest, RegisterUnregisterRpcMetrics) {
     auto& metrics = MasterMetricManager::instance();
     WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
     service_config.enable_metric_reporting = true;
     WrappedCentralizedMasterService service_(service_config);
 

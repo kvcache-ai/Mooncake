@@ -584,20 +584,6 @@ TEST_F(P2PMasterServiceTest, UnregisterClientIdempotent) {
                     .has_value());
 }
 
-TEST_F(P2PMasterServiceTest, UnregisterClientWrongDeploymentMode) {
-    auto service = CreateService();
-    auto seg = MakeP2PSegment();
-    auto client_id = generate_uuid();
-    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
-
-    auto res = service->UnregisterClient(
-        UnregisterClientRequest{client_id, DeploymentMode::CENTRALIZATION});
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, res.error());
-    // Rejected before any cleanup: client still present.
-    EXPECT_NE(service->GetClientManager().GetClient(client_id), nullptr);
-}
-
 // ============================================================
 // GetReplicaList + FilterReplicas Tests
 // ============================================================

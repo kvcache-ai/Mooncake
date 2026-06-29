@@ -151,8 +151,7 @@ YLT_REFL(RegisterClientResponse, view_version);
 /**
  * @brief Request structure for UnregisterClient operation.
  * Client calls this to proactively deregister itself and all its routing
- * metadata (segments/replicas) from the master before going local-only or
- * shutting down.
+ * metadata (segments/replicas) from the master
  */
 struct UnregisterClientRequest {
     UUID client_id;

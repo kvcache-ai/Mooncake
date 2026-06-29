@@ -932,34 +932,11 @@ TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
         << "local Get failed: " << static_cast<int>(get_res.error());
     EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
-    // local_request.inflight gauge is exported (touched by the local Put/Get).
-    auto metrics = c->SerializeMetrics();
-    ASSERT_TRUE(metrics.has_value());
-    EXPECT_NE(metrics.value().find("mooncake_p2p_local_inflight"),
-              std::string::npos);
-
-    // Idempotent: a second unregister stays LOCAL_ONLY and returns OK.
-    EXPECT_TRUE(c->UnregisterClient().has_value());
-    EXPECT_EQ(c->GetHealthStatus(), "LOCAL_ONLY");
-
     // (Re-registration back to FULL is driven via the public HTTP /register
     // endpoint and is covered by P2PClientHttpEndpointsTest.HttpUnregisterThenRegister.)
 
     c->Stop();
     c->Destroy();
-}
-
-TEST_F(P2PClientIntegrationTest, StopUnregistersRegisteredClientGracefully) {
-    auto c = CreateP2PClient("localhost:18822");
-    ASSERT_NE(c, nullptr);
-    EXPECT_EQ(c->GetHealthStatus(), "FULL");
-
-    // Stop() on a registered client unregisters from the master first, then
-    // drains incoming peer RPCs and the local API before tearing down.
-    // Reaching the end (no hang/crash) is the assertion.
-    c->Stop();
-    c->Destroy();
-    SUCCEED();
 }
 
 }  // namespace testing

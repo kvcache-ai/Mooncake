@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <memory>
 #include <string>

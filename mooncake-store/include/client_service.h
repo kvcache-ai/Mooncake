@@ -555,15 +555,6 @@ class ClientService {
     void WaitForNextHeartbeat(int interval_ms);
     virtual HeartbeatRequest build_heartbeat_request() = 0;
 
-    /**
-     * @brief Register (or re-register) this client with the master
-     */
-    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient()
-        EXCLUDES(registration_mutex_);
-
-    virtual tl::expected<RegisterClientResponse, ErrorCode> InnerRegisterClient()
-        REQUIRES(registration_mutex_) = 0;
-
     void HeartbeatTryRegister();
 
     /**
@@ -600,10 +591,13 @@ class ClientService {
                                   bool use_hugepage = false);
 
     /**
-     * @brief Single hook for all HA-related events from the heartbeat loop.
-     * Subclasses override to handle state transitions.
+     * @brief Register (or re-register) this client with the master
      */
-    virtual void OnHAEvent(HAEvent event) { (void)event; }
+    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient()
+        EXCLUDES(registration_mutex_);
+
+    virtual tl::expected<RegisterClientResponse, ErrorCode>
+    InnerRegisterClient() REQUIRES(registration_mutex_) = 0;
 
     /**
      * @brief Hook invoked when a local (client-initiated) request enters
@@ -611,6 +605,12 @@ class ClientService {
      * override to update an in-flight gauge. Base default is a no-op.
      */
     virtual void RecordLocalInflight(bool entering) { (void)entering; }
+
+    /**
+     * @brief Single hook for all HA-related events from the heartbeat loop.
+     * Subclasses override to handle state transitions.
+     */
+    virtual void OnHAEvent(HAEvent event) { (void)event; }
 
    protected:
     /**
@@ -626,8 +626,7 @@ class ClientService {
      * @brief Marks the service as shutting down: rejects new local requests and
      * waits (unbounded) for all in-flight ones to finish before the DataManager
      * is torn down.
-     * @return true if this call initiated shutdown, false if already shutting
-     * down.
+     * @return true if successfully marked, false if already shutting down.
      */
     bool MarkShuttingDown() {
         bool initiated = local_inflight_tracker_.Close();

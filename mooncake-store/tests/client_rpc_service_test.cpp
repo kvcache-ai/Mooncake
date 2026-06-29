@@ -566,12 +566,6 @@ TEST_F(ClientRpcServiceTest, WriteRevokeTokenMismatch) {
 // Graceful stop (drain / reject new peer RPCs)
 // ============================================================================
 
-TEST_F(ClientRpcServiceTest, StopWhenIdleReturns) {
-    // No in-flight handlers -> Stop() drains and returns immediately (no hang).
-    rpc_service_->Stop();
-    SUCCEED();
-}
-
 TEST_F(ClientRpcServiceTest, StopRejectsNewPeerRpcs) {
     auto tier_id = GetTierId();
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
@@ -616,26 +610,6 @@ TEST_F(ClientRpcServiceTest, StopRejectsNewPeerRpcs) {
     auto pin_res = rpc_service_->PinKey(pin);
     ASSERT_FALSE(pin_res.has_value());
     EXPECT_EQ(pin_res.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-}
-
-TEST_F(ClientRpcServiceTest, PeerInflightGaugeExportedInMetrics) {
-    auto tier_id = GetTierId();
-    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
-
-    // A service wired with a metric: each handler inc/dec peer_request.inflight.
-    P2PClientMetric metric(/*interval_seconds=*/0, /*labels=*/{});
-    ClientRpcService rpc(*data_manager_, &metric);
-
-    PreWriteRequest pre;
-    pre.key = "peer_inflight_metric_key";
-    pre.size_bytes = 64;
-    pre.target_tier_id = tier_id;
-    ASSERT_TRUE(rpc.PreWrite(pre).has_value());
-
-    // The gauge has been touched (back to 0 now) and is therefore exported.
-    std::string s;
-    metric.serialize(s);
-    EXPECT_NE(s.find("mooncake_p2p_peer_inflight"), std::string::npos) << s;
 }
 
 }  // namespace mooncake

@@ -580,7 +580,7 @@ tl::expected<void, ErrorCode> P2PClientService::UnregisterClient() {
     MutexLocker lk(&registration_mutex_);
     InflightTracker::Guard guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
-        LOG(WARN) << "client is shutting down";
+        LOG(WARNING) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
     return InnerUnregisterClient();
