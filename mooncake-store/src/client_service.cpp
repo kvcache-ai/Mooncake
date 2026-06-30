@@ -2714,6 +2714,10 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         hot_cache_->BumpKeyGeneration(key);
     }
 
+    // Flush any deferred PutEnds so keys recently written are in COMPLETED
+    // state before the remove RPC (master rejects PROCESSING keys).
+    FlushPendingPutEnds();
+
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
@@ -2769,6 +2773,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }
+
+    // Flush deferred PutEnds so recently-written keys are COMPLETED
+    // (master rejects PROCESSING keys in BatchRemove).
+    FlushPendingPutEnds();
 
     auto results = master_client_.BatchRemove(keys, force);
 

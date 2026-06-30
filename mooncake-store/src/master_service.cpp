@@ -2933,7 +2933,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
         // Group by shard index
         std::unordered_map<size_t, std::vector<size_t>> shard_groups;
         for (size_t i = 0; i < keys.size(); ++i) {
-            size_t shard_idx = getMetadataShardIndex(keys[i], tenant_id);
+            size_t shard_idx = getMetadataShardIndex(tenant_id, keys[i]);
             shard_groups[shard_idx].push_back(i);
         }
 
@@ -2966,7 +2966,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     if (keys.size() >= kMinBatchParallelKeys) {
         std::unordered_map<size_t, std::vector<size_t>> shard_groups;
         for (size_t i = 0; i < keys.size(); ++i) {
-            size_t shard_idx = getMetadataShardIndex(keys[i], tenant_id);
+            size_t shard_idx = getMetadataShardIndex(tenant_id, keys[i]);
             shard_groups[shard_idx].push_back(i);
         }
 
@@ -6587,6 +6587,14 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                         !metadata.IsLeaseExpired(now) ||
                         (!allow_soft_pinned && metadata.IsSoftPinned(now)) ||
                         !can_evict_replicas(metadata)) {
+                        ++it;
+                        continue;
+                    }
+                    // CMS frequency-aware: hot objects get a virtual lease
+                    // extension, biasing quota-driven eviction toward cold keys.
+                    if (AdjustLeaseTimeoutWithFrequency(
+                            normalized_tenant, it->first,
+                            metadata.lease_timeout) > now) {
                         ++it;
                         continue;
                     }
