@@ -80,6 +80,7 @@ impl StorageOwnerState {
             pending_offloads: super::super::ColdTierOffloadManager::new(offload_priority),
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
             initial_cold_backing_repair_at_ms: AtomicU64::new(0),
+            stale_reclaim_scan_completed_at_ms: AtomicU64::new(0),
             offload_mode,
             offload_priority,
             owner_cold_restore_flights: super::super::OwnerColdRestoreFlightMap::new(

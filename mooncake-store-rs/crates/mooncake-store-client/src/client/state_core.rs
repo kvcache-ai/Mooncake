@@ -337,6 +337,7 @@ struct StorageOwnerState {
     pending_offloads: ColdTierOffloadManager,
     cold_tier_cleanup: ColdTierCleanupManager,
     initial_cold_backing_repair_at_ms: AtomicU64,
+    stale_reclaim_scan_completed_at_ms: AtomicU64,
     offload_mode: ColdTierOffloadMode,
     offload_priority: ColdTierOffloadPriorityConfig,
     owner_cold_restore_flights: OwnerColdRestoreFlightMap,
@@ -357,6 +358,7 @@ struct StorageClockState {
     by_key: BTreeMap<ObjectKey, Vec<usize>>,
     pending_hot_keys: BTreeSet<ObjectKey>,
     hand: usize,
+    stale_reclaim_hand: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -595,6 +597,31 @@ impl LocalAllocatorState {
             .filter(|allocation| !pending.contains(allocation))
             .collect()
     }
+
+    fn releasable_stale_candidates(
+        &mut self,
+        candidates: &BTreeSet<AllocationSpan>,
+        live_allocations: &BTreeSet<AllocationSpan>,
+        now_ms: u64,
+    ) -> Vec<AllocationSpan> {
+        let pending = self.pending_allocations(now_ms);
+        candidates
+            .iter()
+            .filter(|allocation| !live_allocations.contains(*allocation))
+            .filter(|allocation| !pending.contains(*allocation))
+            .filter(|allocation| {
+                self.segments
+                    .get(&allocation.segment_name)
+                    .is_some_and(|segment| {
+                        segment.contains_allocation(
+                            allocation.offset_bytes,
+                            allocation.length_bytes,
+                        )
+                    })
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 struct SegmentAllocator {
@@ -626,6 +653,12 @@ impl SegmentAllocator {
         self.announcement.alignment_bytes = next.alignment_bytes.max(1);
         self.announcement.used_bytes = self.announcement.used_bytes.max(next.used_bytes);
         self.cursor_bytes = self.cursor_bytes.max(next.used_bytes);
+    }
+
+    fn contains_allocation(&self, offset_bytes: u64, length_bytes: u64) -> bool {
+        self.allocations
+            .get(&offset_bytes)
+            .is_some_and(|stored| *stored == length_bytes)
     }
 
     fn remaining_capacity(&self) -> u64 {

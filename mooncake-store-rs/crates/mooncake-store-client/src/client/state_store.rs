@@ -1,5 +1,7 @@
 include!("cold_tier_restore_state.rs");
 
+const STALE_RECLAIM_SCAN_INTERVAL_MS: u64 = 100;
+
 impl RouteWriteGate {
     fn lock(&self) -> RouteWritePermit<'_> {
         RouteWritePermit {
@@ -716,6 +718,34 @@ mod state_store_tests {
     }
 
     #[test]
+    fn stale_reclaim_candidate_cursor_advances_with_scan_limit() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        for index in 0..3 {
+            let route = test_route(&format!("k-{index}"), &runtime);
+            clock.track_route(&route, &runtime);
+        }
+
+        assert_eq!(
+            clock.reclaim_candidate_keys(None, 1),
+            vec![ObjectKey("k-0".to_string())]
+        );
+        assert_eq!(
+            clock.reclaim_candidate_keys(None, 1),
+            vec![ObjectKey("k-1".to_string())]
+        );
+        assert_eq!(
+            clock.reclaim_candidate_keys(None, 1),
+            vec![ObjectKey("k-2".to_string())]
+        );
+        assert_eq!(
+            clock.reclaim_candidate_keys(None, 1),
+            vec![ObjectKey("k-0".to_string())],
+            "bounded reclaim pre-pass should make cursor progress instead of rescanning one key"
+        );
+    }
+
+    #[test]
     fn sync_route_after_fresh_rebuild_does_not_resurrect_stale_hotness() {
         let runtime = test_runtime();
 
@@ -910,6 +940,13 @@ impl StorageOwnerState {
         length_bytes: u64,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        if self.reclaim_stale_local_allocations_before_clock_eviction(preferred_segment)? > 0 {
+            if let Some(reservation) =
+                self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment)?
+            {
+                return Ok(Some(reservation));
+            }
+        }
         let budget = self.hot_replicas.eviction_budget().max(1);
         for _ in 0..budget {
             let victim = self.hot_replicas.pick_victim(
@@ -920,7 +957,8 @@ impl StorageOwnerState {
             let Some(victim) = victim else {
                 break;
             };
-            if let Some(reservation) = self.evict_candidate_clean_and_reserve(&victim, length_bytes)?
+            if let Some(reservation) =
+                self.evict_candidate_clean_and_reserve(&victim, length_bytes, preferred_segment)?
             {
                 return Ok(Some(reservation));
             }
@@ -928,20 +966,46 @@ impl StorageOwnerState {
         Ok(None)
     }
 
+    fn reserve_local_after_stale_reclaim(
+        &self,
+        length_bytes: u64,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        let reservation = {
+            let mut allocator = self.allocator.lock();
+            match preferred_segment {
+                Some(segment) => allocator.reserve_specific(&self.runtime, segment, length_bytes),
+                None => allocator.reserve_any(&self.runtime, length_bytes),
+            }
+        };
+        match reservation {
+            Ok(reservation) => Ok(Some(reservation)),
+            Err(StoreError::Allocator(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn evict_candidate_clean_and_reserve(
         &self,
         victim: &ClockEntryId,
         length_bytes: u64,
+        preferred_segment: Option<&SegmentName>,
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
-        let Some(route) = self.route_ops.load_routes_bounded(std::slice::from_ref(&victim.route_key))?.into_iter().next().flatten() else {
+        let Some(route) = self.load_victim_route_bounded(&victim.route_key)? else {
             self.hot_replicas.remove_id(victim);
             return Ok(None);
         };
         if route.state != RouteState::Active {
-            self.hot_replicas.remove_id(victim);
+            self.hot_replicas
+                .clock
+                .lock()
+                .mark_hot_keys(std::slice::from_ref(&victim.route_key));
             return Ok(None);
         }
         if self.replica_index_for_victim(&route, victim).is_none() {
+            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
+                return self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment);
+            }
             self.sync_route(&route);
             return Ok(None);
         }
@@ -950,6 +1014,9 @@ impl StorageOwnerState {
             _ => return Ok(None),
         }
         let Some(replica_index) = self.replica_index_for_victim(&route, victim) else {
+            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
+                return self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment);
+            }
             self.sync_route(&route);
             return Ok(None);
         };
@@ -1021,6 +1088,9 @@ impl StorageOwnerState {
     fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {
         let tracker = OperationTracker::new("storage_owner_evict_one");
         let result = (|| {
+            if self.reclaim_stale_local_allocations_before_clock_eviction(preferred_segment)? > 0 {
+                return Ok(true);
+            }
             for rebuild in 0..=1usize {
                 let budget = {
                     let clock = self.hot_replicas.clock.lock();
@@ -1048,22 +1118,154 @@ impl StorageOwnerState {
         result
     }
 
+    fn reclaim_stale_local_allocations_before_clock_eviction(
+        &self,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<usize> {
+        let now_ms = now_ms();
+        let last_completed = self
+            .stale_reclaim_scan_completed_at_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last_completed != 0
+            && now_ms.saturating_sub(last_completed) < STALE_RECLAIM_SCAN_INTERVAL_MS
+        {
+            return Ok(0);
+        }
+
+        if self
+            .stale_reclaim_scan_completed_at_ms
+            .compare_exchange(
+                last_completed,
+                now_ms,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Ok(0);
+        }
+
+        let candidate_keys = {
+            let mut clock = self.hot_replicas.clock.lock();
+            clock.reclaim_candidate_keys(
+                preferred_segment,
+                self.offload_priority.eviction_scan_limit,
+            )
+        };
+        if candidate_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let current_routes = match self.route_ops.load_routes_bounded(&candidate_keys) {
+            Ok(routes) => routes,
+            Err(error) => {
+                warn!(
+                    runtime = %self.runtime,
+                    keys = candidate_keys.len(),
+                    error = %error,
+                    "stale/orphan reclaim pre-pass skipped after route lookup failure"
+                );
+                return Ok(0);
+            }
+        };
+        let mut released = 0usize;
+        for (key, current) in candidate_keys.iter().zip(current_routes.into_iter()) {
+            released = released.saturating_add(
+                self.reclaim_stale_local_allocations_for_key(key, current.as_ref())?,
+            );
+        }
+        Ok(released)
+    }
+
+    fn reclaim_stale_local_allocations_for_key(
+        &self,
+        key: &ObjectKey,
+        current: Option<&ObjectRoute>,
+    ) -> Result<usize> {
+        let Some(current) = current else {
+            return Ok(0);
+        };
+        if current.state != RouteState::Active {
+            return Ok(0);
+        }
+
+        let live_allocations = self.local_allocation_spans_for_route(current);
+        let candidate_allocations = {
+            let clock = self.hot_replicas.clock.lock();
+            clock.allocation_spans_for_key(key)
+        };
+        if candidate_allocations.is_empty() {
+            return Ok(0);
+        }
+        let releasable = {
+            let mut allocator = self.allocator.lock();
+            let releasable =
+                allocator.releasable_stale_candidates(&candidate_allocations, &live_allocations, now_ms());
+            for allocation in &releasable {
+                allocator.release(
+                    &self.runtime,
+                    &allocation.segment_name,
+                    allocation.offset_bytes,
+                    allocation.length_bytes,
+                )?;
+            }
+            releasable
+        };
+        if releasable.is_empty() {
+            return Ok(0);
+        }
+        self.reconcile_after_stale_release(key, current, &releasable);
+        Ok(releasable.len())
+    }
+
+    fn reconcile_after_stale_release(
+        &self,
+        key: &ObjectKey,
+        current: &ObjectRoute,
+        released: &[AllocationSpan],
+    ) {
+        self.allocator
+            .lock()
+            .clear_pending_route(current, &self.runtime);
+        let mut clock = self.hot_replicas.clock.lock();
+        for allocation in released {
+            clock.remove_allocation_for_key(key, allocation);
+        }
+        clock.track_route(current, &self.runtime);
+    }
+
+    fn local_allocation_spans_for_route(&self, route: &ObjectRoute) -> BTreeSet<AllocationSpan> {
+        route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner == self.runtime)
+            .map(|replica| AllocationSpan {
+                segment_name: replica.segment_name.clone(),
+                offset_bytes: replica.segment_offset,
+                length_bytes: replica.length,
+            })
+            .collect()
+    }
+
     fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
-        let Some(route) = self
-            .route_ops
-            .load_routes_bounded(std::slice::from_ref(&victim.route_key))?
-            .into_iter()
-            .next()
-            .flatten()
-        else {
+        let Some(route) = self.load_victim_route_bounded(&victim.route_key)? else {
             self.hot_replicas.clock.lock().remove_id(victim);
             return Ok(false);
         };
         if route.state != RouteState::Active {
-            self.hot_replicas.clock.lock().remove_id(victim);
+            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
+                return Ok(true);
+            }
+            self.hot_replicas
+                .clock
+                .lock()
+                .mark_hot_keys(std::slice::from_ref(&victim.route_key));
             return Ok(false);
         }
         if self.replica_index_for_victim(&route, victim).is_none() {
+            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
+                return Ok(true);
+            }
             self.sync_route(&route);
             return Ok(false);
         }
@@ -1082,6 +1284,9 @@ impl StorageOwnerState {
             route
         };
         let Some(replica_index) = self.replica_index_for_victim(&route, victim) else {
+            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
+                return Ok(true);
+            }
             self.sync_route(&route);
             return Ok(false);
         };
@@ -1090,6 +1295,15 @@ impl StorageOwnerState {
 
     pub(in super) fn has_local_cold_tier_work(&self) -> bool {
         cold_tier::cold_tier_enabled() && self.cold_tier_devices.has_any_local_backend()
+    }
+
+    fn load_victim_route_bounded(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
+        Ok(self
+            .route_ops
+            .load_routes_bounded(std::slice::from_ref(key))?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     fn has_usable_cold_tier_device(&self) -> Result<bool> {
@@ -1224,6 +1438,47 @@ impl StorageClockState {
 
     fn eviction_budget(&self) -> usize {
         self.entries.len().saturating_mul(3)
+    }
+
+    fn reclaim_candidate_keys(
+        &mut self,
+        preferred_segment: Option<&SegmentName>,
+        limit: usize,
+    ) -> Vec<ObjectKey> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        let mut keys = Vec::new();
+        let mut seen = BTreeSet::new();
+        let limit = limit.max(1);
+        for _ in 0..limit {
+            let index = self.stale_reclaim_hand % self.entries.len();
+            self.stale_reclaim_hand = (self.stale_reclaim_hand + 1) % self.entries.len();
+            let Some(entry) = self.entries[index].as_ref() else {
+                continue;
+            };
+            if preferred_segment.is_some_and(|segment| entry.id.segment_name != *segment) {
+                continue;
+            }
+            if seen.insert(entry.id.route_key.clone()) {
+                keys.push(entry.id.route_key.clone());
+            }
+        }
+        keys
+    }
+
+    fn allocation_spans_for_key(&self, key: &ObjectKey) -> BTreeSet<AllocationSpan> {
+        self.by_key
+            .get(key)
+            .into_iter()
+            .flat_map(|indices| indices.iter())
+            .filter_map(|index| self.entries.get(*index).and_then(Option::as_ref))
+            .map(|entry| AllocationSpan {
+                segment_name: entry.id.segment_name.clone(),
+                offset_bytes: entry.id.segment_offset,
+                length_bytes: entry.length_bytes,
+            })
+            .collect()
     }
 
     fn track_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
@@ -1401,6 +1656,14 @@ impl StorageClockState {
                 self.by_key.remove(&id.route_key);
             }
         }
+    }
+
+    fn remove_allocation_for_key(&mut self, key: &ObjectKey, allocation: &AllocationSpan) {
+        self.remove_id(&ClockEntryId {
+            route_key: key.clone(),
+            segment_name: allocation.segment_name.clone(),
+            segment_offset: allocation.offset_bytes,
+        });
     }
 
     fn pick_victim_coldest_largest_first(
