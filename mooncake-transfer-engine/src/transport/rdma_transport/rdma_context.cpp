@@ -347,9 +347,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                                               int access,
                                               MemoryRegionMeta &mrMeta) {
     if (length > (size_t)globalConfig().max_mr_size) {
-        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
-                      << "shrink it to " << globalConfig().max_mr_size;
-        length = (size_t)globalConfig().max_mr_size;
+        // After registerLocalMemory auto-chunks buffers to <= max_mr_size
+        // (#2017), no larger buffer should reach here. Fail loudly instead of
+        // silently registering a shorter MR — a truncated MR advertises bytes
+        // past the registered region and causes IBV_WC_REM_ACCESS_ERR on RDMA
+        // ops whose target lands past the boundary.
+        LOG(ERROR) << "Buffer length " << length
+                   << " exceeds device max_mr_size "
+                   << globalConfig().max_mr_size
+                   << " (should have been chunked before registration, #2017)";
+        return ERR_INVALID_ARGUMENT;
     }
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
