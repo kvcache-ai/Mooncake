@@ -146,18 +146,18 @@ The following options can be passed to `cmake ..`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-DUSE_CUDA=[ON|OFF]` | `OFF` | Enable GPU memory support, including GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport. Required when transferring GPU memory, even when using TCP. |
-| `-DUSE_MNNVL=[ON|OFF]` | `OFF` | Enable Multi-Node NVLink transport. Requires `-DUSE_CUDA=ON`; not used with MUSA, HIP, or MACA builds. |
-| `-DUSE_MUSA=[ON|OFF]` | `OFF` | Enable Moore Threads GPU support via MUSA. |
-| `-DUSE_MACA=[ON|OFF]` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |
-| `-DUSE_HIP=[ON|OFF]` | `OFF` | Enable AMD GPU support via HIP/ROCm. |
-| `-DUSE_HYGON=[ON|OFF]` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
-| `-DUSE_COREX=[ON|OFF]` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
-| `-DUSE_MLU=[ON|OFF]` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
-| `-DUSE_ASCEND_DIRECT=[ON|OFF]` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
-| `-DUSE_UBSHMEM=[ON|OFF]` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
-| `-DUSE_INTRA_NVLINK=[ON|OFF]` | `OFF` | Enable intranode NVLink transport. |
-| `-DUSE_CXL=[ON|OFF]` | `OFF` | Enable CXL support. |
+| `-DUSE_CUDA=ON/OFF` | `OFF` | Enable GPU memory support, including GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport. Required when transferring GPU memory, even when using TCP. |
+| `-DUSE_MNNVL=ON/OFF` | `OFF` | Enable Multi-Node NVLink transport. Requires `-DUSE_CUDA=ON`; not used with MUSA, HIP, or MACA builds. |
+| `-DUSE_MUSA=ON/OFF` | `OFF` | Enable Moore Threads GPU support via MUSA. |
+| `-DUSE_MACA=ON/OFF` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |
+| `-DUSE_HIP=ON/OFF` | `OFF` | Enable AMD GPU support via HIP/ROCm. |
+| `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
+| `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
+| `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
+| `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
+| `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
+| `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
+| `-DUSE_CXL=ON/OFF` | `OFF` | Enable CXL support. |
 
 ### Vendor SDK Path Overrides
 
@@ -181,28 +181,28 @@ The following options can be passed to `cmake ..`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-DUSE_EFA=[ON|OFF]` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/efa_transport.md). |
-| `-DUSE_NOF=[ON|OFF]` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
-| `-DUSE_REDIS=[ON|OFF]` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
-| `-DUSE_HTTP=[ON|OFF]` | `ON` | Enable HTTP-based metadata service. |
-| `-DUSE_ETCD=[ON|OFF]` | `OFF` | Enable etcd-based metadata service. Requires Go 1.23+. |
-| `-DSTORE_USE_ETCD=[ON|OFF]` | `OFF` | Enable etcd-based failover for Mooncake Store. Independent from `-DUSE_ETCD`. Requires Go 1.23+. |
-| `-DSTORE_USE_REDIS=[ON|OFF]` | `OFF` | Enable Redis-based failover for Mooncake Store. Independent from `-DUSE_REDIS`. Requires hiredis. |
+| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/efa_transport.md). |
+| `-DUSE_NOF=ON/OFF` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
+| `-DUSE_REDIS=ON/OFF` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
+| `-DUSE_HTTP=ON/OFF` | `ON` | Enable HTTP-based metadata service. |
+| `-DUSE_ETCD=ON/OFF` | `OFF` | Enable etcd-based metadata service. Requires Go 1.23+. |
+| `-DSTORE_USE_ETCD=ON/OFF` | `OFF` | Enable etcd-based failover for Mooncake Store. Independent from `-DUSE_ETCD`. Requires Go 1.23+. |
+| `-DSTORE_USE_REDIS=ON/OFF` | `OFF` | Enable Redis-based failover for Mooncake Store. Independent from `-DUSE_REDIS`. Requires hiredis. |
 
 ### Component Options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-DWITH_STORE=[ON|OFF]` | `ON` | Build the Mooncake Store component. |
-| `-DWITH_P2P_STORE=[ON|OFF]` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
-| `-DWITH_RUST_EXAMPLE=[ON|OFF]` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
-| `-DWITH_STORE_RUST=[ON|OFF]` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
-| `-DWITH_EP=[ON|OFF]` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.9.1"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. |
+| `-DWITH_STORE=ON/OFF` | `ON` | Build the Mooncake Store component. |
+| `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
+| `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
+| `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
+| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.9.1"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. |
 
 ### Build Behavior Options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-DBUILD_SHARED_LIBS=[ON|OFF]` | `OFF` | Build Transfer Engine as a shared library. |
-| `-DBUILD_UNIT_TESTS=[ON|OFF]` | `ON` | Build unit tests. |
-| `-DBUILD_EXAMPLES=[ON|OFF]` | `ON` | Build examples. |
+| `-DBUILD_SHARED_LIBS=ON/OFF` | `OFF` | Build Transfer Engine as a shared library. |
+| `-DBUILD_UNIT_TESTS=ON/OFF` | `ON` | Build unit tests. |
+| `-DBUILD_EXAMPLES=ON/OFF` | `ON` | Build examples. |
