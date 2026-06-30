@@ -479,7 +479,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 TEST_F(MasterServiceTenantQuotaTest,
        NotifyOffloadSuccessDoesNotCountAddReplicaUpdateAsNewDiskUsage) {
-    MasterService service(MakeConfig({{"tenant-a", 1000}}));
+    const std::string policy = WritePolicyFile({{"tenant-a", 1000}});
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_enable_offload(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(policy)
+                      .build();
+    MasterService service(config);
     UUID client_a = MountSegment(service, 4096, "quota_segment_a");
     UUID client_b = MountSegment(service, 4096, "quota_segment_b");
     ASSERT_TRUE(service.MountLocalDiskSegment(client_a, true).has_value());
