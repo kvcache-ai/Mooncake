@@ -607,6 +607,8 @@ fn debug_evict_all_removes_all_dram_replicas() {
         );
     }
     assert_eq!(client.get("debug-evict-a").expect("cold get A"), payload_a);
+    // The promotion worker may finish between cold reads; it must not drop shared local memory.
+    client.wait_for_restore_promotions();
     assert_eq!(client.get("debug-evict-b").expect("cold get B"), payload_b);
 
     let _ = std::fs::remove_dir_all(root);
