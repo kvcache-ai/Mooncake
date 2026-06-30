@@ -17,12 +17,9 @@
 
 #include <cstring>
 #include <memory>
+#include <pthread.h>
 #include <random>
 #include <string>
-
-#if defined(__linux__)
-#include <pthread.h>
-#endif
 
 #include <glog/logging.h>
 #if __has_include(<jsoncpp/json/json.h>)
@@ -78,13 +75,6 @@ const Json::Value* FindProtocolDescValue(const Json::Value& root) {
         return &root["comm_resource_config"]["protocol_desc"];
     }
     return nullptr;
-}
-
-void SetAscendThreadName(const char* name) {
-#if defined(__linux__)
-    pthread_setname_np(pthread_self(), name);
-#endif
-    (void)name;
 }
 }  // namespace
 
@@ -176,7 +166,8 @@ bool IsRoceModeEnabled() {
 AscendThreadPool::AscendThreadPool(size_t num_threads) : running_(true) {
     for (size_t i = 0; i < num_threads; ++i) {
         workers_.emplace_back([this, i] {
-            SetAscendThreadName(("ascend-wk-" + std::to_string(i)).c_str());
+            auto thread_name = "ascend-wk-" + std::to_string(i);
+            pthread_setname_np(pthread_self(), thread_name.c_str());
             while (true) {
                 std::function<void()> task;
                 {
