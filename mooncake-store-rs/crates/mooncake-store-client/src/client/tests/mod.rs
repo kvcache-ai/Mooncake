@@ -15341,6 +15341,20 @@ fn draining_route_authority_does_not_special_mirror_local_routes_before_restart(
 
     let namespace = metadata.route_namespace();
     let scoped_key = ObjectKey::new(format!("default::{key}"));
+    let mirror_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if authority_get(&namespace, &store.runtime_id().stable_id, &scoped_key)
+            .expect("store authority mirror should be readable")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < mirror_deadline,
+            "store authority mirror was not published before test rewired authorities"
+        );
+        sleep(Duration::from_millis(10));
+    }
     authority_replace(&namespace, &store.runtime_id().stable_id, &scoped_key, None)
         .expect("test should remove store mirror");
     authority_replace(
