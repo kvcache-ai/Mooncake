@@ -27,7 +27,7 @@ description = "Mooncake is the serving platform for Kimi, a leading LLM service 
 authors = [
     { name = "Mooncake Authors" }
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 readme = "README.md"   # local copy of ../README.md, materialized at build time by scripts/build_wheel.sh
 dependencies = ["aiohttp", "requests", "msgpack"]
 # Single-line arrays: sed-substituted by scripts/build_wheel.sh for each variant.
