@@ -3335,16 +3335,14 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
             return r.is_local_disk_replica() && r.is_completed();
         });
-        // PopReplicas (vs EraseReplicas) so we can release the SSD usage of
-        // the removed local-disk replicas; both remove the same matching set.
-        auto erased_replicas =
-            metadata.PopReplicas([&client_id](const Replica& replica) {
+        EraseReplicasWithCacheTotalAccounting(
+            metadata,
+            [&client_id](const Replica& replica) {
                 return replica.is_local_disk_replica() &&
                        replica.get_descriptor()
                                .get_local_disk_descriptor()
                                .client_id == client_id;
             });
-        ReleaseLocalDiskUsage(erased_replicas);
         if (had_completed_disk) {
             auto& shard = accessor.GetShard();
             shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
