@@ -765,9 +765,9 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
     EXPECT_EQ(metrics.get_file_cache_nums(), baseline + 1);
     EXPECT_EQ(metrics.get_mem_cache_nums(), baseline_mem + 1);
 
-    auto evict_result = service->EvictDiskReplica(
-        client_id, "ssd_evict_cache_total_key", "default",
-        ReplicaType::LOCAL_DISK);
+    auto evict_result =
+        service->EvictDiskReplica(client_id, "ssd_evict_cache_total_key",
+                                  "default", ReplicaType::LOCAL_DISK);
     ASSERT_TRUE(evict_result.has_value());
 
     // After evicting LOCAL_DISK: file_cache_nums_ returns to baseline,

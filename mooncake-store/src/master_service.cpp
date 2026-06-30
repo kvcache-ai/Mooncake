@@ -3336,8 +3336,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
             return r.is_local_disk_replica() && r.is_completed();
         });
         EraseReplicasWithCacheTotalAccounting(
-            metadata,
-            [&client_id](const Replica& replica) {
+            metadata, [&client_id](const Replica& replica) {
                 return replica.is_local_disk_replica() &&
                        replica.get_descriptor()
                                .get_local_disk_descriptor()
