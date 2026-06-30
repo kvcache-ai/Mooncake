@@ -237,7 +237,12 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const std::string& tenant_id) {
     return execute_rpc(
         "PutStart",
-        [&] {
+        [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+            if (auto validation =
+                    MasterService::ValidateKvEventMetadataConfig(config);
+                !validation) {
+                return tl::make_unexpected(validation.error());
+            }
             return master_service_.PutStart(client_id, key, tenant_id,
                                             slice_length, config);
         },
@@ -310,6 +315,12 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                    << " != keys.size()=" << keys.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (auto kv_validation =
+                   MasterService::ValidateKvEventMetadataConfig(config);
+               !kv_validation) {
+        LOG(ERROR) << "BatchPutStart: invalid kv_event_metadata";
+        results.assign(keys.size(),
+                       tl::make_unexpected(kv_validation.error()));
     } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -465,7 +476,12 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const std::string& tenant_id) {
     return execute_rpc(
         "UpsertStart",
-        [&] {
+        [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+            if (auto validation =
+                    MasterService::ValidateKvEventMetadataConfig(config);
+                !validation) {
+                return tl::make_unexpected(validation.error());
+            }
             return master_service_.UpsertStart(client_id, key, tenant_id,
                                                slice_length, config);
         },
@@ -520,6 +536,18 @@ WrappedMasterService::BatchUpsertStart(
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
+
+    if (auto kv_validation =
+            MasterService::ValidateKvEventMetadataConfig(config);
+        !kv_validation) {
+        LOG(ERROR) << "BatchUpsertStart: invalid kv_event_metadata";
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            results(keys.size(),
+                    tl::make_unexpected(kv_validation.error()));
+        MasterMetricManager::instance().inc_batch_put_start_failures(
+            keys.size());
+        return results;
+    }
 
     auto results = master_service_.BatchUpsertStart(client_id, keys, tenant_id,
                                                     slice_lengths, config);

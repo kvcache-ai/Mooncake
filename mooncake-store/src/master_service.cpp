@@ -1,5 +1,6 @@
 #include "master_service.h"
 
+#include <algorithm>
 #include <thread>
 #include <cassert>
 #include <cmath>
@@ -721,6 +722,12 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
             return tl::make_unexpected(err);
         }
     }
+    // Record this segment's physical worker identity for KV events. The
+    // transport endpoint (ip:port) identifies the node holding the data; fall
+    // back to the segment name when it is unset.
+    AutoRegisterSegmentWorkerId(segment.name, segment.te_endpoint.empty()
+                                                  ? segment.name
+                                                  : segment.te_endpoint);
     RecomputeTenantEffectiveQuotas();
     return {};
 }
@@ -1289,6 +1296,15 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
             group_empty = true;
         }
     }
+    // Keep the KV event manifest in sync with group membership.
+    auto manifest_it = tenant_state.kv_group_manifests.find(group_id);
+    if (manifest_it != tenant_state.kv_group_manifests.end()) {
+        manifest_it->second.current_object_keys.erase(key);
+        manifest_it->second.object_worker_ids.erase(key);
+        if (group_empty) {
+            tenant_state.kv_group_manifests.erase(manifest_it);
+        }
+    }
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
     auto route_it =
         object_group_ids_.find(MakeTenantScopedKey(normalized_tenant, key));
@@ -1299,6 +1315,408 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
         groups_needing_lease_refresh_.erase(
             MakeTenantScopedKey(normalized_tenant, group_id));
     }
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateKvEventMetadataConfig(
+    const ReplicateConfig& config) {
+    if (!config.kv_event_metadata.has_value()) {
+        return {};
+    }
+
+    std::unordered_set<std::string> declared_group_ids;
+    if (config.group_ids.has_value()) {
+        for (const auto& gid : config.group_ids.value()) {
+            if (!gid.empty()) {
+                declared_group_ids.insert(gid);
+            }
+        }
+    }
+
+    std::unordered_set<std::string> seen_metadata_groups;
+    for (const auto& meta : config.kv_event_metadata.value()) {
+        if (meta.group_id.empty()) {
+            LOG(ERROR) << "error=kv_event_metadata_empty_group_id";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!seen_metadata_groups.insert(meta.group_id).second) {
+            LOG(ERROR) << "group_id=" << meta.group_id
+                       << ", error=kv_event_metadata_duplicate_group";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (meta.expected_components.empty() &&
+            meta.expected_object_count == 0) {
+            LOG(ERROR) << "group_id=" << meta.group_id
+                       << ", error=kv_event_metadata_missing_expectation";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        for (const auto& component : meta.expected_components) {
+            if (component.object_key.empty()) {
+                LOG(ERROR) << "group_id=" << meta.group_id
+                           << ", error=kv_event_metadata_empty_component_key";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        if (config.group_ids.has_value() &&
+            declared_group_ids.find(meta.group_id) ==
+                declared_group_ids.end()) {
+            LOG(ERROR) << "group_id=" << meta.group_id
+                       << ", error=kv_event_metadata_group_not_in_group_ids";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    return {};
+}
+
+const KvBlockEventMetadata* MasterService::FindKvEventMetadataForGroup(
+    const ReplicateConfig& config, const std::string& group_id) {
+    if (!config.kv_event_metadata.has_value() || group_id.empty()) {
+        return nullptr;
+    }
+    for (const auto& meta : config.kv_event_metadata.value()) {
+        if (meta.group_id == group_id) {
+            return &meta;
+        }
+    }
+    return nullptr;
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateKvManifestForKey(
+    const TenantState& tenant_state, const std::string& tenant_id,
+    const std::string& group_id, const std::string& key,
+    const ReplicateConfig& config) const {
+    (void)tenant_id;
+    (void)key;
+    const KvBlockEventMetadata* meta =
+        FindKvEventMetadataForGroup(config, group_id);
+    if (meta == nullptr) {
+        // No KV event metadata applies to this key's group: unchanged behavior.
+        return {};
+    }
+
+    // Structural validation: we must be able to decide completeness, which
+    // requires either an explicit expected component list or a positive
+    // expected object count.
+    if (meta->expected_components.empty() && meta->expected_object_count == 0) {
+        LOG(ERROR) << "group_id=" << group_id
+                   << ", error=kv_event_metadata_missing_expectation";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (const auto& component : meta->expected_components) {
+        if (component.object_key.empty()) {
+            LOG(ERROR) << "group_id=" << group_id
+                       << ", error=kv_event_metadata_empty_component_key";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    // Conflict detection against an already-recorded manifest: identical
+    // metadata is treated as an idempotent retry, divergent metadata is
+    // rejected.
+    auto manifest_it = tenant_state.kv_group_manifests.find(group_id);
+    if (manifest_it != tenant_state.kv_group_manifests.end()) {
+        if (!manifest_it->second.metadata.SameSemanticsAs(*meta)) {
+            LOG(ERROR) << "group_id=" << group_id
+                       << ", error=kv_event_metadata_conflict";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    return {};
+}
+
+void MasterService::UpsertKvManifestForKey(TenantState& tenant_state,
+                                           const std::string& tenant_id,
+                                           const std::string& group_id,
+                                           const std::string& key,
+                                           const ReplicateConfig& config) {
+    (void)key;
+    const KvBlockEventMetadata* meta =
+        FindKvEventMetadataForGroup(config, group_id);
+    if (meta == nullptr) {
+        return;
+    }
+    auto& manifest = tenant_state.kv_group_manifests[group_id];
+    if (manifest.group_id.empty()) {
+        // Newly created manifest.
+        manifest.tenant_id = NormalizeTenantId(tenant_id);
+        manifest.group_id = group_id;
+        manifest.metadata = *meta;
+        for (const auto& component : meta->expected_components) {
+            manifest.expected_object_keys.insert(component.object_key);
+        }
+    }
+    // Idempotent for repeated identical metadata; conflicting metadata is
+    // rejected earlier by ValidateKvManifestForKey.
+}
+
+void MasterService::SetKvEventPublisher(
+    std::shared_ptr<KvEventPublisher> publisher) {
+    kv_event_publisher_ = std::move(publisher);
+}
+
+std::string MasterService::DeriveSegmentNameFromMetadata(
+    const ObjectMetadata& metadata) {
+    // Prefer a completed memory/nof replica's segment as the owning worker.
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        if (!replica.is_completed()) {
+            continue;
+        }
+        for (const auto& name : replica.get_segment_names()) {
+            if (name.has_value() && !name->empty()) {
+                return name.value();
+            }
+        }
+    }
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        for (const auto& name : replica.get_segment_names()) {
+            if (name.has_value() && !name->empty()) {
+                return name.value();
+            }
+        }
+    }
+    return std::string();
+}
+
+std::string MasterService::ResolveWorkerId(
+    const std::string& segment_name) const {
+    if (segment_name.empty()) {
+        return segment_name;
+    }
+    std::shared_lock<std::shared_mutex> lock(segment_worker_registry_mutex_);
+    auto explicit_it = segment_worker_explicit_.find(segment_name);
+    if (explicit_it != segment_worker_explicit_.end()) {
+        return explicit_it->second;
+    }
+    auto auto_it = segment_worker_auto_.find(segment_name);
+    if (auto_it != segment_worker_auto_.end()) {
+        return auto_it->second;
+    }
+    // Unregistered segment: fall back to the segment name so the event still
+    // carries a stable, if coarse, worker identity.
+    return segment_name;
+}
+
+void MasterService::AutoRegisterSegmentWorkerId(
+    const std::string& segment_name, const std::string& worker_id) {
+    if (segment_name.empty() || worker_id.empty()) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(segment_worker_registry_mutex_);
+    segment_worker_auto_[segment_name] = worker_id;
+}
+
+void MasterService::RegisterSegmentWorkerId(const std::string& segment_name,
+                                            const std::string& worker_id) {
+    if (segment_name.empty()) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(segment_worker_registry_mutex_);
+    if (worker_id.empty()) {
+        segment_worker_explicit_.erase(segment_name);
+    } else {
+        segment_worker_explicit_[segment_name] = worker_id;
+    }
+}
+
+std::optional<std::string> MasterService::GetSegmentWorkerId(
+    const std::string& segment_name) const {
+    std::shared_lock<std::shared_mutex> lock(segment_worker_registry_mutex_);
+    auto explicit_it = segment_worker_explicit_.find(segment_name);
+    if (explicit_it != segment_worker_explicit_.end()) {
+        return explicit_it->second;
+    }
+    auto auto_it = segment_worker_auto_.find(segment_name);
+    if (auto_it != segment_worker_auto_.end()) {
+        return auto_it->second;
+    }
+    return std::nullopt;
+}
+
+std::string MasterService::MakeKvEventId(const std::string& tenant_id,
+                                         const std::string& group_id,
+                                         const char* kind) {
+    const uint64_t seq = kv_event_seq_.fetch_add(1) + 1;
+    return "mooncake:" + tenant_id + ":" + group_id + ":" + kind + ":" +
+           std::to_string(seq);
+}
+
+bool MasterService::IsKvManifestComplete(const KvGroupManifest& manifest) {
+    if (!manifest.expected_object_keys.empty()) {
+        for (const auto& expected : manifest.expected_object_keys) {
+            if (manifest.current_object_keys.find(expected) ==
+                manifest.current_object_keys.end()) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // Weaker count-only completeness when no explicit component list was given.
+    return manifest.metadata.expected_object_count > 0 &&
+           manifest.current_object_keys.size() >=
+               manifest.metadata.expected_object_count;
+}
+
+void MasterService::MaybePublishKvBlockStored(KvGroupManifest& manifest,
+                                              const std::string& worker_id) {
+    if (!kv_event_publisher_) {
+        return;
+    }
+    if (!manifest.metadata.emit_stored_event) {
+        return;
+    }
+    if (!IsKvManifestComplete(manifest)) {
+        return;
+    }
+    // v1: a single representative worker per logical block. The worker set is
+    // reserved for full multi-worker semantics; a non-empty set means the
+    // current placement has already been announced as stored.
+    if (!manifest.stored_event_published_workers.empty()) {
+        return;
+    }
+
+    std::string representative = worker_id;
+    if (representative.empty()) {
+        for (const auto& [object_key, wid] : manifest.object_worker_ids) {
+            (void)object_key;
+            if (!wid.empty()) {
+                representative = wid;
+                break;
+            }
+        }
+    }
+
+    const auto& metadata = manifest.metadata;
+    KvEvent event;
+    event.type = KvEventType::kBlockStored;
+    event.event_id =
+        MakeKvEventId(manifest.tenant_id, manifest.group_id, "stored");
+    event.tenant_id = manifest.tenant_id;
+    event.group_id = manifest.group_id;
+    event.worker_id = representative;
+    event.medium = "EXTERNAL";
+    event.block_hashes = {metadata.block_hash};
+    event.parent_block_hash = metadata.parent_block_hash;
+    event.token_ids = metadata.token_ids;
+    event.block_size = metadata.block_size;
+    event.lora_name = metadata.lora_name;
+    event.model_name = metadata.model_name;
+    event.dp_rank = metadata.dp_rank;
+
+    kv_event_publisher_->Publish(event);
+
+    manifest.stored_event_published_workers.insert(representative);
+    manifest.removed_event_published_workers.clear();
+}
+
+void MasterService::MaybePublishKvBlockRemoved(KvGroupManifest& manifest) {
+    if (!kv_event_publisher_) {
+        return;
+    }
+    if (!manifest.metadata.emit_removed_event) {
+        return;
+    }
+    // Only meaningful if the block was previously announced as stored and not
+    // yet announced as removed for the current placement.
+    if (manifest.stored_event_published_workers.empty()) {
+        return;
+    }
+
+    const std::string representative =
+        *manifest.stored_event_published_workers.begin();
+
+    KvEvent event;
+    event.type = KvEventType::kBlockRemoved;
+    event.event_id =
+        MakeKvEventId(manifest.tenant_id, manifest.group_id, "removed");
+    event.tenant_id = manifest.tenant_id;
+    event.group_id = manifest.group_id;
+    event.worker_id = representative;
+    event.medium = "EXTERNAL";
+    event.block_hashes = {manifest.metadata.block_hash};
+
+    kv_event_publisher_->Publish(event);
+
+    manifest.removed_event_published_workers.insert(representative);
+    manifest.stored_event_published_workers.clear();
+}
+
+void MasterService::MarkKvManifestObjectComplete(TenantState& tenant_state,
+                                                 const std::string& group_id,
+                                                 const std::string& key,
+                                                 const std::string& worker_id) {
+    if (group_id.empty()) {
+        return;
+    }
+    auto manifest_it = tenant_state.kv_group_manifests.find(group_id);
+    if (manifest_it == tenant_state.kv_group_manifests.end()) {
+        return;
+    }
+    auto& manifest = manifest_it->second;
+    manifest.current_object_keys.insert(key);
+    if (!worker_id.empty()) {
+        manifest.object_worker_ids[key] = worker_id;
+    }
+    MaybePublishKvBlockStored(manifest, worker_id);
+}
+
+void MasterService::OnKvManifestObjectRemoved(TenantState& tenant_state,
+                                              const std::string& group_id,
+                                              const std::string& key) {
+    if (group_id.empty()) {
+        return;
+    }
+    auto manifest_it = tenant_state.kv_group_manifests.find(group_id);
+    if (manifest_it == tenant_state.kv_group_manifests.end()) {
+        return;
+    }
+    auto& manifest = manifest_it->second;
+    // Removal of an expected object (or any member when only a count is known)
+    // makes the logical block incomplete.
+    const bool affects_block =
+        manifest.expected_object_keys.empty() ||
+        manifest.expected_object_keys.find(key) !=
+            manifest.expected_object_keys.end();
+    if (!affects_block) {
+        return;
+    }
+    MaybePublishKvBlockRemoved(manifest);
+}
+
+std::optional<KvGroupManifestView> MasterService::GetKvGroupManifest(
+    const std::string& tenant_id, const std::string& group_id) const {
+    if (group_id.empty()) {
+        return std::nullopt;
+    }
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    // Grouped keys (and therefore the manifest) live in the shard selected by
+    // the group_id.
+    const size_t shard_idx = getShardIndex(group_id);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataShardAccessorRO shard(this, shard_idx);
+    auto tenant_it = shard->tenants.find(normalized_tenant);
+    if (tenant_it == shard->tenants.end()) {
+        return std::nullopt;
+    }
+    const auto& manifests = tenant_it->second.kv_group_manifests;
+    auto manifest_it = manifests.find(group_id);
+    if (manifest_it == manifests.end()) {
+        return std::nullopt;
+    }
+    const auto& manifest = manifest_it->second;
+
+    KvGroupManifestView view;
+    view.tenant_id = manifest.tenant_id;
+    view.group_id = manifest.group_id;
+    view.metadata = manifest.metadata;
+    view.generation = manifest.generation;
+    view.expected_object_keys.assign(manifest.expected_object_keys.begin(),
+                                     manifest.expected_object_keys.end());
+    view.current_object_keys.assign(manifest.current_object_keys.begin(),
+                                    manifest.current_object_keys.end());
+    std::sort(view.expected_object_keys.begin(),
+              view.expected_object_keys.end());
+    std::sort(view.current_object_keys.begin(),
+              view.current_object_keys.end());
+    return view;
 }
 
 bool MasterService::HasCompletedMemoryCacheReplica(
@@ -1435,6 +1853,9 @@ MasterService::EraseMetadata(
     if (had_completed_disk && shard) {
         shard->OnDiskReplicaRemoved(had_completed_disk);
     }
+    // Publish BlockRemoved before the group manifest is torn down by
+    // UnregisterGroupMember (which erases the manifest once the group empties).
+    OnKvManifestObjectRemoved(tenant_state, group_id, key);
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
     return next;
 }
@@ -2361,6 +2782,14 @@ auto MasterService::AllocateAndInsertMetadata(
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
+    // Reject structurally invalid or conflicting KV event metadata before
+    // doing any allocation, so callers fail fast and no partial state leaks.
+    if (auto validation = ValidateKvManifestForKey(tenant_state, tenant_id,
+                                                   group_id, key, config);
+        !validation) {
+        return tl::make_unexpected(validation.error());
+    }
+
     const uint64_t reserved_quota_charge =
         RequestedMemoryQuotaCharge(value_length, config);
     auto quota_result = ReserveTenantQuota(tenant_id, reserved_quota_charge);
@@ -2523,6 +2952,7 @@ auto MasterService::AllocateAndInsertMetadata(
     }
     it->second.reserved_quota_charge_bytes = reserved_quota_charge;
     RegisterGroupMember(tenant_state, tenant_id, key, group_id);
+    UpsertKvManifestForKey(tenant_state, tenant_id, group_id, key, config);
     tenant_state.processing_keys.insert(key);
 
     return replica_list;
@@ -2768,6 +3198,17 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
         accessor.EraseFromProcessing();
+    }
+
+    // Track completion in the KV event group manifest and publish BlockStored
+    // once the logical block is complete.
+    if (metadata.IsGrouped() &&
+        metadata.AllReplicas(&Replica::fn_is_completed)) {
+        const std::string segment_name =
+            DeriveSegmentNameFromMetadata(metadata);
+        const std::string worker_id = ResolveWorkerId(segment_name);
+        MarkKvManifestObjectComplete(accessor.GetTenantState(),
+                                     metadata.group_id, key, worker_id);
     }
 
     SyncCacheTotalAccounting(metadata);

@@ -1786,6 +1786,36 @@ PYBIND11_MODULE(store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    // KV event metadata types attached to writes via ReplicateConfig.
+    py::class_<KvBlockComponentSpec>(m, "KvBlockComponentSpec")
+        .def(py::init<>())
+        .def_readwrite("object_key", &KvBlockComponentSpec::object_key)
+        .def_readwrite("component_role", &KvBlockComponentSpec::component_role)
+        .def_readwrite("component_index", &KvBlockComponentSpec::component_index);
+
+    py::class_<KvBlockEventMetadata>(m, "KvBlockEventMetadata")
+        .def(py::init<>())
+        .def_readwrite("schema_version", &KvBlockEventMetadata::schema_version)
+        .def_readwrite("group_id", &KvBlockEventMetadata::group_id)
+        .def_readwrite("block_hash", &KvBlockEventMetadata::block_hash)
+        .def_readwrite("parent_block_hash",
+                       &KvBlockEventMetadata::parent_block_hash)
+        .def_readwrite("token_ids", &KvBlockEventMetadata::token_ids)
+        .def_readwrite("block_size", &KvBlockEventMetadata::block_size)
+        .def_readwrite("dp_rank", &KvBlockEventMetadata::dp_rank)
+        .def_readwrite("model_name", &KvBlockEventMetadata::model_name)
+        .def_readwrite("lora_name", &KvBlockEventMetadata::lora_name)
+        .def_readwrite("additional_salt",
+                       &KvBlockEventMetadata::additional_salt)
+        .def_readwrite("expected_object_count",
+                       &KvBlockEventMetadata::expected_object_count)
+        .def_readwrite("expected_components",
+                       &KvBlockEventMetadata::expected_components)
+        .def_readwrite("emit_stored_event",
+                       &KvBlockEventMetadata::emit_stored_event)
+        .def_readwrite("emit_removed_event",
+                       &KvBlockEventMetadata::emit_removed_event);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -1802,6 +1832,8 @@ PYBIND11_MODULE(store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_readwrite("kv_event_metadata",
+                       &ReplicateConfig::kv_event_metadata)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

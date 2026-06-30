@@ -76,6 +76,98 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 /**
+ * @brief Describes one physical Mooncake object that belongs to a logical
+ * Dynamo KV block group.
+ *
+ * A single logical KV block (e.g. one SGLang prefix page) may be stored as
+ * multiple physical objects, such as the K and V objects of an MHA page, or
+ * several per-head component objects. Each such object is described by one
+ * KvBlockComponentSpec.
+ */
+struct KvBlockComponentSpec {
+    std::string object_key;      // Physical Mooncake object key.
+    std::string component_role;  // e.g. "k", "v", "mla_k", "head_3_k".
+    uint32_t component_index{0};
+
+    bool operator==(const KvBlockComponentSpec& other) const {
+        return object_key == other.object_key &&
+               component_role == other.component_role &&
+               component_index == other.component_index;
+    }
+    bool operator!=(const KvBlockComponentSpec& other) const {
+        return !(*this == other);
+    }
+};
+
+/**
+ * @brief Group-level KV event metadata for a single logical Dynamo KV block.
+ *
+ * This is attached to a write (Put/BatchPut/Upsert) via ReplicateConfig and
+ * carries the semantic information that only the inference engine (SGLang)
+ * knows but Mooncake needs in order to publish Dynamo-compatible KV events.
+ *
+ * One KvBlockEventMetadata item corresponds to exactly one group_id. That
+ * group_id may appear for multiple physical object keys (see
+ * ReplicateConfig::group_ids).
+ */
+struct KvBlockEventMetadata {
+    uint32_t schema_version{1};
+
+    // Logical group identity. Must match an entry in ReplicateConfig::group_ids.
+    std::string group_id;
+
+    // Dynamo logical block identity.
+    uint64_t block_hash{0};
+    std::optional<uint64_t> parent_block_hash;
+
+    // Token semantic information required by Dynamo.
+    std::vector<uint32_t> token_ids;
+    uint32_t block_size{0};
+
+    // Optional routing namespace fields.
+    std::optional<uint32_t> dp_rank;
+    std::string model_name;
+    std::string lora_name;
+    std::string additional_salt;
+
+    // Physical layout expectation: how many / which objects must be present
+    // before this logical block is considered fully stored.
+    uint32_t expected_object_count{0};
+    std::vector<KvBlockComponentSpec> expected_components;
+
+    // Event behavior.
+    bool emit_stored_event{true};
+    bool emit_removed_event{true};
+
+    // Returns the set of expected physical object keys. When
+    // expected_components is non-empty it is derived from there; otherwise it
+    // is empty and completeness has to rely on expected_object_count.
+    std::vector<std::string> ExpectedObjectKeys() const {
+        std::vector<std::string> keys;
+        keys.reserve(expected_components.size());
+        for (const auto& component : expected_components) {
+            keys.push_back(component.object_key);
+        }
+        return keys;
+    }
+
+    // Semantic equality used to decide whether a repeated write for the same
+    // group_id is an idempotent retry or a conflicting redefinition. Event
+    // behavior flags are intentionally ignored here.
+    bool SameSemanticsAs(const KvBlockEventMetadata& other) const {
+        return schema_version == other.schema_version &&
+               group_id == other.group_id && block_hash == other.block_hash &&
+               parent_block_hash == other.parent_block_hash &&
+               token_ids == other.token_ids && block_size == other.block_size &&
+               dp_rank == other.dp_rank && model_name == other.model_name &&
+               lora_name == other.lora_name &&
+               additional_salt == other.additional_salt &&
+               expected_object_count == other.expected_object_count &&
+               expected_components == other.expected_components;
+    }
+};
+
+/**
  * @brief Configuration for replica management
  */
 struct ReplicateConfig {
@@ -96,12 +188,21 @@ struct ReplicateConfig {
     // and memory eviction behavior.
     std::optional<std::vector<std::string>> group_ids{};
 
+    // Optional group-level KV event metadata. This is NOT per-key: each item
+    // describes one logical Dynamo KV block keyed by its group_id, and that
+    // group_id may be shared by multiple physical object keys in group_ids.
+    // When absent, Mooncake behavior is completely unchanged.
+    std::optional<std::vector<KvBlockEventMetadata>> kv_event_metadata{};
+
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
         if (group_ids.has_value()) {
             key_config.group_ids =
                 std::vector<std::string>{group_ids->at(key_index)};
         }
+        // kv_event_metadata is group-level, not per-key, so it is intentionally
+        // carried through unchanged; the per-key PutStart looks up the entry
+        // whose group_id matches the key's group.
         return key_config;
     }
 
@@ -135,6 +236,20 @@ struct ReplicateConfig {
             for (size_t i = 0; i < config.group_ids->size(); ++i) {
                 os << config.group_ids->at(i);
                 if (i + 1 < config.group_ids->size()) os << ", ";
+            }
+            os << "]";
+        }
+        if (config.kv_event_metadata.has_value()) {
+            os << ", kv_event_metadata: [";
+            for (size_t i = 0; i < config.kv_event_metadata->size(); ++i) {
+                const auto& meta = config.kv_event_metadata->at(i);
+                os << "{group_id: " << meta.group_id
+                   << ", block_hash: " << meta.block_hash
+                   << ", block_size: " << meta.block_size
+                   << ", expected_object_count: " << meta.expected_object_count
+                   << ", expected_components: " << meta.expected_components.size()
+                   << "}";
+                if (i + 1 < config.kv_event_metadata->size()) os << ", ";
             }
             os << "]";
         }
