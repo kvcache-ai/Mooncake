@@ -143,6 +143,7 @@ class SharedUringRing {
     tl::expected<size_t, ErrorCode> batch_read(int fd, const ReadDesc* descs,
                                                int cnt) {
         ensure_buf_registered();
+        uint64_t op = ++op_id_;  // unique ID for this batch operation
         size_t total = 0;
         int remaining = cnt;
         int idx = 0;
@@ -161,9 +162,10 @@ class SharedUringRing {
                     io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off, 0);
                 else
                     io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
+                sqe->user_data = op;
             }
 
-            auto res = collect(batch);
+            auto res = collect(batch, op);
             if (!res) return res;
             total += res.value();
             idx += batch;
@@ -182,9 +184,11 @@ class SharedUringRing {
             LOG(ERROR) << "[SharedUringRing] SQ full (fsync)";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+        uint64_t op = ++op_id_;
         io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
+        sqe->user_data = op;
 
-        auto res = collect(1);
+        auto res = collect(1, op);
         if (!res) return tl::make_unexpected(res.error());
         return {};
     }
@@ -241,9 +245,10 @@ class SharedUringRing {
         s = next_pow2(s);
         return std::max(s, MIN_CHUNK);
     }
-
-    // Drain exactly @expected CQEs and accumulate bytes.
-    tl::expected<size_t, ErrorCode> collect(int expected) {
+    // Drain exactly @expected CQEs (matching current op_id_) and accumulate
+    // bytes. Uses sqe->user_data to distinguish current completions from
+    // stale CQEs left by previous failed operations.
+    tl::expected<size_t, ErrorCode> collect(int expected, uint64_t op_id) {
         int ret = io_uring_submit_and_wait(&ring_, expected);
         if (ret < 0) {
             LOG(ERROR) << "[SharedUringRing] io_uring_submit_and_wait: "
@@ -252,9 +257,23 @@ class SharedUringRing {
         }
         size_t total = 0;
         bool err = false;
-        unsigned head, cnt = 0;
-        struct io_uring_cqe* cqe;
-        io_uring_for_each_cqe(&ring_, head, cqe) {
+        int processed = 0;
+
+        // Process CQEs until we have 'expected' completions for this op_id.
+        // Stale CQEs (from previous failed ops) are silently consumed.
+        while (processed < expected) {
+            struct io_uring_cqe* cqe;
+            int wait_ret = io_uring_wait_cqe(&ring_, &cqe);
+            if (wait_ret < 0) {
+                LOG(ERROR) << "[SharedUringRing] io_uring_wait_cqe: "
+                           << strerror(-wait_ret);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (cqe->user_data != op_id) {
+                // Stale CQE from a previous operation; discard it.
+                io_uring_cq_advance(&ring_, 1);
+                continue;
+            }
             if (cqe->res < 0) {
                 LOG(ERROR) << "[SharedUringRing] CQE error: "
                            << strerror(-cqe->res);
@@ -262,9 +281,9 @@ class SharedUringRing {
             } else {
                 total += static_cast<size_t>(cqe->res);
             }
-            ++cnt;
+            io_uring_cq_advance(&ring_, 1);
+            ++processed;
         }
-        io_uring_cq_advance(&ring_, cnt);
         if (err) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         return total;
     }
@@ -277,6 +296,7 @@ class SharedUringRing {
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const bool fix_buf = (use_fixed_buf && buf_registered_);
 
+        uint64_t op = ++op_id_;
         char* ptr = static_cast<char*>(buf);
         size_t total = 0;
         size_t remaining = len;
@@ -307,6 +327,7 @@ class SharedUringRing {
                     else
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
+                sqe->user_data = op;
 
                 ptr += chunk;
                 cur += static_cast<off_t>(chunk);
@@ -314,7 +335,7 @@ class SharedUringRing {
                 if (remaining == 0) break;
             }
 
-            auto res = collect(static_cast<int>(n));
+            auto res = collect(static_cast<int>(n), op);
             if (!res) return res;
             total += res.value();
             if (!is_write && res.value() == 0) break;  // read EOF
@@ -333,6 +354,7 @@ class SharedUringRing {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
 
+        uint64_t op = ++op_id_;
         size_t total = 0;
         off_t cur = off;
         int remaining = cnt;
@@ -354,12 +376,13 @@ class SharedUringRing {
                 else
                     io_uring_prep_read(sqe, fd, iovs[idx].iov_base,
                                        iovs[idx].iov_len, cur);
+                sqe->user_data = op;
 
                 cur += static_cast<off_t>(iovs[idx].iov_len);
                 ++idx;
             }
 
-            auto res = collect(batch);
+            auto res = collect(batch, op);
             if (!res) return res;
             total += res.value();
             remaining -= batch;
@@ -377,6 +400,7 @@ class SharedUringRing {
     bool buf_register_failed_ = false;  // set on first failure; skip retries
     void* buf_base_ = nullptr;
     size_t buf_size_ = 0;
+    uint64_t op_id_ = 0;  // monotonic operation ID for stale CQE filtering
 };
 
 // ============================================================================
