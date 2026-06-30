@@ -1846,7 +1846,7 @@ void MasterService::ClearInvalidHandles(
                     // dec_refcnt), and promotion task cleanup.
                     auto next = std::next(it);
                     EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
+                                  QuotaEraseMode::kFull, &shard);
                     it = next;
                 } else {
                     ++it;
@@ -4807,10 +4807,29 @@ auto MasterService::NotifyOffloadSuccess(
         const auto request_object_id =
             MakeObjectIdentityForRequest(task.key, task.tenant_id);
 
+        // NACK sentinel: offload failed on worker. Clean up the
+        // offloading_task + dec_refcnt but skip AddReplica.
+        if (metadata.data_size < 0) {
+            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+            MetadataAccessorRW accessor(this, request_object_id);
+            if (accessor.Exists()) {
+                auto& tenant_state = accessor.GetTenantState();
+                auto task_it = tenant_state.offloading_tasks.find(
+                    request_object_id.user_key);
+                if (task_it != tenant_state.offloading_tasks.end()) {
+                    auto source = accessor.Get().GetReplicaByID(
+                        task_it->second.source_id);
+                    if (source != nullptr) {
+                        source->dec_refcnt();
+                    }
+                    tenant_state.offloading_tasks.erase(task_it);
+                }
+            }
+            continue;
+        }
+
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
-        bool handled_existing_object = false;
-        bool added_new_local_disk_replica = false;
         {
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
@@ -4840,19 +4859,16 @@ auto MasterService::NotifyOffloadSuccess(
             }
         }
 
-        // Add LOCAL_DISK replica.
-        Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
-        auto res = AddReplica(client_id, object_id.user_key,
-                              object_id.tenant_id, replica);
+        auto res = AddReplica(client_id, request_object_id.user_key,
+                              request_object_id.tenant_id, replica);
         if (!res) {
             if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                 continue;
             }
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id
-                       << ", tenant_id=" << object_id.tenant_id
-                       << ", key=" << object_id.user_key;
+                       << ", tenant_id=" << request_object_id.tenant_id
+                       << ", key=" << request_object_id.user_key;
             return tl::make_unexpected(res.error());
         }
         if (local_disk_segment && metadata.data_size > 0) {
