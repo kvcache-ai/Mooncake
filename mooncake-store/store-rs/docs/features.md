@@ -328,6 +328,12 @@ pure probes and do not report hits.
 
 When capacity pressure forces eviction:
 
+- the storage owner first checks a bounded cursor slice of currently tracked local replicas for stale/orphan allocations whose authoritative route no longer references the local bytes
+- stale/orphan local allocations found in that bounded slice are reclaimed before the storage owner considers a live CLOCK victim
+- repeated reserve retries are rate-limited so pressure spikes do not repeatedly rescan the full tracked key set before every live eviction attempt
+- pending local reservations remain protected until their publish/timeout window expires, so fresh writes are not reclaimed early
+- `reclaim_grace_ms` applies to scheduled cleanup; eviction pressure may reclaim stale/orphan local bytes earlier after an authoritative active route has already moved away
+- route-missing/current-absent lookups are treated as inconclusive and do not release allocator bytes in this path; confirmed-deleted ghost reclaim is handled by a separate proof path
 - the storage owner picks a CLOCK victim
 - the matching route owner removes that replica with CAS
 - only after CAS succeeds does the storage owner release the local allocation
@@ -363,7 +369,7 @@ For tenant-scoped quota policy, delete now also finalizes a negative quota delta
 
 ### Graceful reclaim
 
-A reclaim grace window can delay release to smooth transitions or handoff behavior.
+A reclaim grace window can delay scheduled release to smooth transitions or handoff behavior. Under storage-owner eviction pressure, stale/orphan local allocations can be reclaimed earlier once an authoritative active route no longer references those bytes. Route-missing ghosts are retained until a confirmed cleanup or confirmed-absent reclaim path owns the release decision.
 Queued reclaim cleanup now treats duplicate local or remote release as idempotent
 cleanup noise, while direct non-cleanup release paths still return allocator
 errors.

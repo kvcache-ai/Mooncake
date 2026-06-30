@@ -305,7 +305,7 @@ Reclaim is explicit and route-aware.
 
 - overwrites schedule release for the old replicas
 - deletes schedule reclaim after route removal
-- `reclaim_grace_ms` controls delayed release behavior
+- `reclaim_grace_ms` controls scheduled delayed release behavior
 - remote release uses batched allocator RPC
 - queued reclaim cleanup is idempotent for duplicate local or remote release, but direct non-cleanup release still surfaces allocator errors
 
@@ -323,6 +323,7 @@ sequenceDiagram
     Client->>Alloc: reserve local space
     Alloc-->>Client: Allocator error
     Client->>Evict: evict_one(preferred_segment?)
+    Evict->>Evict: stale/orphan pre-pass over tracked local replicas
     Evict->>Evict: pick CLOCK victim
     Evict->>Route: CAS route without victim replica
     Route-->>Evict: applied / current route
@@ -333,7 +334,13 @@ sequenceDiagram
 
 The important invariants are:
 
-- a replica is never released before its route entry is removed
+- a stale/orphan pre-pass runs before live CLOCK eviction and can reclaim tracked local allocations whose authoritative route already moved away from this runtime
+- each stale/orphan pre-pass checks only a bounded cursor slice of tracked keys; eligible stale/orphan allocations found in that slice are reclaimed before live CLOCK victims, while later cursor slices are left for subsequent attempts
+- tight eviction retry loops are rate-limited so one allocator miss cannot turn into repeated full route sweeps
+- pending local reservations are still protected until publish or timeout, even during eviction pressure
+- `reclaim_grace_ms` delays scheduled cleanup, but storage-owner eviction pressure can reclaim stale/orphan local allocations earlier once the authoritative route no longer references them
+- a local replica is never released before the authoritative active route no longer references that local allocation
+- a route-missing lookup is treated as inconclusive for allocator release; reclaiming confirmed-deleted ghost allocations requires a separate confirmed-absent proof path
 - a failed CAS refreshes local eviction state instead of guessing
 - a storage owner can rebuild its CLOCK from route state if best-effort tracking falls behind
 - local CLOCK eviction is enabled only on clients labeled `storage=true`
