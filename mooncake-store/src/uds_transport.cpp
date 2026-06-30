@@ -91,6 +91,16 @@ void UdsConnection::close() {
     }
 }
 
+tl::expected<void, std::string> UdsConnection::setRecvTimeout(
+    std::chrono::seconds timeout) {
+    timeval tv = {.tv_sec = timeout.count(), .tv_usec = 0};
+    if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        return tl::make_unexpected(
+            errnoMessage("Failed to set UDS recv timeout"));
+    }
+    return {};
+}
+
 int UdsConnection::sendRaw(const void *data, size_t len) {
     const char *pos = static_cast<const char *>(data);
     size_t remaining = len;
@@ -259,9 +269,6 @@ void UdsAcceptor::acceptLoop() {
 
         UdsConnection connection(client_sock);
         if (!running_.load()) break;
-
-        timeval tv = {.tv_sec = 5, .tv_usec = 0};
-        setsockopt(connection.fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         if (handler_) handler_(connection);
     }

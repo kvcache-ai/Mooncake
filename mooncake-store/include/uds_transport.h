@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
@@ -32,6 +33,8 @@ class UdsConnection {
     int fd() const;
     int release();
     void close();
+    tl::expected<void, std::string> setRecvTimeout(
+        std::chrono::seconds timeout);
 
     int sendRaw(const void *data, size_t len);
     int recvRaw(void *data, size_t len);

@@ -47,6 +47,8 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -5276,6 +5278,12 @@ void RealClient::stop_dummy_client_monitor() {
 int RealClient::start_ipc_server() {
     uds_acceptor_ = std::make_unique<UdsAcceptor>(ipc_socket_path_);
     uds_acceptor_->registerHandler([this](UdsConnection &connection) {
+        auto timeout_result = connection.setRecvTimeout(kIpcRequestRecvTimeout);
+        if (!timeout_result) {
+            LOG(ERROR) << timeout_result.error();
+            return;
+        }
+
         IpcRequestType req_type;
         if (connection.recvRaw(&req_type, sizeof(req_type)) != 0) {
             LOG(ERROR) << "Failed to read IPC request type";
