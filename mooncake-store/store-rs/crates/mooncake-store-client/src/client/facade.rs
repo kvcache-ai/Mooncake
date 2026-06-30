@@ -1981,16 +1981,24 @@ impl Drop for StoreClient {
         self._async_eviction.shutdown();
         self.async_replica_tracking.shutdown();
         self.async_route_hit_reporting.shutdown();
-        if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart {
+        if self.owns_local_state_lifecycle
+            && self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart
+        {
             self.flush_pending_offloads_before_drain();
         }
         self.cold_tier.shutdown();
-        if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart {
+        if self.owns_local_state_lifecycle
+            && self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart
+        {
             self.flush_pending_offloads_before_drain();
         }
         if self.owns_cold_tier_lifecycle {
             self.cleanup_owned_routes_on_shutdown();
             self.storage_owner.unregister_cold_tier_devices_on_shutdown();
+        }
+        if !self.owns_local_state_lifecycle {
+            self._control_plane.shutdown();
+            return;
         }
         let _ = self.flush_all_reclaims();
         self.control_client.clear_channels();

@@ -173,6 +173,9 @@ pub struct StoreClient {
     bandwidth_shaping: Option<BandwidthShaping>,
     placement_policy: Option<TenantPlacementPolicy>,
     state: Arc<Mutex<StoreState>>,
+    /// True if this client owns shared local runtime state cleanup.
+    /// False for worker clones that borrow the same `StoreState`.
+    owns_local_state_lifecycle: bool,
     /// True if this client owns the cold tier device lifecycle (bootstrap,
     /// heartbeat, shutdown cleanup).  False for cloned/shared clients.
     #[allow(dead_code)] // used in Drop impl for shutdown cleanup

@@ -763,6 +763,7 @@ impl StoreClientBuilder {
                 .or(self.bandwidth_shaping),
             placement_policy: resolved_placement_policy(&effective_tenant_policy),
             state,
+            owns_local_state_lifecycle: true,
             owns_cold_tier_lifecycle: true,
             cold_tier_shutdown_mode: self.cold_tier_shutdown_mode,
             restore_promotions,

@@ -674,6 +674,7 @@ fn clone_restore_promotion_client(client: &StoreClient) -> StoreClient {
         bandwidth_shaping: client.bandwidth_shaping.clone(),
         placement_policy: client.placement_policy.clone(),
         state: client.state.clone(),
+        owns_local_state_lifecycle: false,
         deferred_cold_tier_reconciles: parking_lot::Mutex::new(Vec::new()),
         owns_cold_tier_lifecycle: false,
         cold_tier_shutdown_mode: super::super::ColdTierShutdownMode::Restart,
