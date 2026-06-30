@@ -256,6 +256,7 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_used_bytes{tenant_id}`
 - `mooncake_tenant_quota_reserved_bytes{tenant_id}`
 - `mooncake_tenant_quota_committed_count{tenant_id}`
+- `mooncake_tenant_quota_metadata_object_count{tenant_id}`
 - `mooncake_tenant_quota_over_quota{tenant_id}`
 - `mooncake_tenant_quota_explicit_policy{tenant_id}`
 - `mooncake_tenant_quota_reject_total{tenant_id,reason}`
@@ -268,16 +269,29 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 
 ## Tenant Quota Management
 
-Tenant quota admission is disabled by default. Enable it on the master when you want memory writes admitted against per-tenant quota:
+Tenant quota admission is disabled by default. Enable strict multi-tenant mode on the master when you want memory writes admitted against connector-managed per-tenant quota:
 
 ```bash
 mooncake_master \
-  --enable_tenant_quota=true \
-  --default_tenant_quota_bytes=1073741824 \
-  --tenant_quota_pool_capacity_bytes=0
+  --enable_multi_tenants=true \
+  --tenant_quota_connector_type=file \
+  --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
 ```
 
-`tenant_quota_pool_capacity_bytes=0` uses the full registered memory capacity as the quota allocation pool. A nonzero value caps the capacity used to compute effective tenant quotas.
+The v1 connector is a writable YAML file. The file must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
+
+```yaml
+version: 1
+
+tenants:
+  - name: tenant-a
+    quota: 200GB
+
+  - name: tenant-b
+    quota: 500GB
+```
+
+When strict multi-tenant mode is enabled, write requests must include a registered tenant. The `default` tenant is not special unless it is explicitly registered in the connector policy.
 
 The same HTTP port used for metrics exposes the tenant quota admin API:
 
@@ -293,14 +307,8 @@ curl -s -X PUT "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-
   -H 'Content-Type: application/json' \
   -d '{"requested_quota_bytes":2147483648}'
 
-# Delete an explicit policy so the tenant inherits the default policy again.
+# Delete an explicit policy. The tenant must not own objects or quota usage.
 curl -s -X DELETE "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
-
-# Query or update the default requested quota. The default may be 0.
-curl -s http://<master_host>:9003/api/v1/tenant_quotas/default
-curl -s -X PUT http://<master_host>:9003/api/v1/tenant_quotas/default \
-  -H 'Content-Type: application/json' \
-  -d '{"requested_quota_bytes":1073741824}'
 ```
 
 Each tenant quota snapshot returns:
@@ -315,13 +323,14 @@ Each tenant quota snapshot returns:
     "used_bytes": 0,
     "reserved_bytes": 0,
     "committed_count": 0,
+    "metadata_object_count": 0,
     "over_quota": false,
     "has_explicit_policy": true
   }
 }
 ```
 
-In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If tenant quota is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`.
+In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If strict multi-tenant mode is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`. Deleting a non-empty tenant returns HTTP 409 with `TENANT_NOT_EMPTY`.
 
 ---
 
@@ -465,9 +474,9 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable_tenant_quota` | `false` | Enable per-tenant memory quota admission |
-| `--default_tenant_quota_bytes` | `0` | Default requested quota for tenants without explicit policy; `0` is allowed and inherited-default tenants still share capacity left by explicit tenants |
-| `--tenant_quota_pool_capacity_bytes` | `0` | Capacity used to compute effective tenant quotas; `0` means total registered memory capacity |
+| `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
+| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type |
+| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path |
 
 ### High Availability
 
