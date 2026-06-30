@@ -916,12 +916,30 @@ void MasterAdminServer::HandleSegmentStatus(
     });
 }
 
+struct HttpDiskReplicaInfo {
+    std::string file_path;
+    uint64_t object_size = 0;
+    YLT_REFL(HttpDiskReplicaInfo, file_path, object_size);
+};
+
+struct HttpLocalDiskReplicaInfo {
+    std::string client_id;
+    uint64_t object_size = 0;
+    std::string transport_endpoint;
+    YLT_REFL(HttpLocalDiskReplicaInfo, client_id, object_size,
+             transport_endpoint);
+};
+
 struct HttpBatchQueryKeyResult {
     bool ok{false};
     std::optional<std::string> error;
     std::optional<std::vector<AllocatedBuffer::Descriptor>> values;
+    std::optional<std::vector<HttpDiskReplicaInfo>> disk_values;
+    std::optional<std::vector<HttpLocalDiskReplicaInfo>> local_disk_values;
+    std::optional<std::vector<AllocatedBuffer::Descriptor>> nof_values;
 };
-YLT_REFL(HttpBatchQueryKeyResult, ok, error, values);
+YLT_REFL(HttpBatchQueryKeyResult, ok, error, values, disk_values,
+         local_disk_values, nof_values);
 
 struct HttpBatchQueryKeysResponse {
     bool success{false};
@@ -931,63 +949,81 @@ YLT_REFL(HttpBatchQueryKeysResponse, success, data);
 
 void MasterAdminServer::HandleBatchQueryKeys(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
-    auto service = GetActiveService();
-    if (!service) {
-        WriteSimpleErrorResponse(resp,
-                                 coro_http::status_type::service_unavailable,
-                                 "service plane is not active");
-        return;
-    }
-
-    auto keys_str = req.get_query_value("keys");
-    std::vector<std::string> keys;
-    if (!keys_str.empty()) {
-        std::string_view sv(keys_str);
-        size_t pos = 0;
-        while ((pos = sv.find(',')) != std::string_view::npos) {
-            keys.emplace_back(sv.substr(0, pos));
-            sv.remove_prefix(pos + 1);
-        }
-        keys.emplace_back(sv);
-    }
-
-    if (keys.empty()) {
-        WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
-                                 "No keys provided. Use ?keys=key1,key2,...");
-        return;
-    }
-
-    auto results = service->BatchGetReplicaList(keys, "default");
-    const size_t n = std::min(keys.size(), results.size());
-    HttpBatchQueryKeysResponse payload;
-    payload.success = true;
-
-    for (size_t i = 0; i < n; ++i) {
-        const auto& result = results[i];
-        HttpBatchQueryKeyResult item;
-        if (!result.has_value()) {
-            item.error = toString(result.error());
-            payload.data.emplace(keys[i], std::move(item));
-            continue;
+    WithActiveService(resp, [&](auto service) {
+        auto keys_str = req.get_decode_query_value("keys");
+        std::vector<std::string> keys;
+        if (!keys_str.empty()) {
+            std::string_view sv(keys_str);
+            size_t pos = 0;
+            while ((pos = sv.find(',')) != std::string_view::npos) {
+                keys.emplace_back(sv.substr(0, pos));
+                sv.remove_prefix(pos + 1);
+            }
+            keys.emplace_back(sv);
         }
 
-        item.ok = true;
-        item.values = std::vector<AllocatedBuffer::Descriptor>{};
-        for (const auto& replica : result.value().replicas) {
-            if (!replica.is_memory_replica()) {
+        if (keys.empty()) {
+            WriteSimpleErrorResponse(
+                resp, coro_http::status_type::bad_request,
+                "No keys provided. Use ?keys=key1,key2,...");
+            return;
+        }
+
+        auto results = service->BatchGetReplicaListForAdmin(keys, "default");
+        const size_t n = std::min(keys.size(), results.size());
+        HttpBatchQueryKeysResponse payload;
+        payload.success = true;
+
+        for (size_t i = 0; i < n; ++i) {
+            const auto& result = results[i];
+            HttpBatchQueryKeyResult item;
+            if (!result.has_value()) {
+                item.error = toString(result.error());
+                payload.data.emplace(keys[i], std::move(item));
                 continue;
             }
-            item.values->emplace_back(
-                replica.get_memory_descriptor().buffer_descriptor);
-        }
-        payload.data.emplace(keys[i], std::move(item));
-    }
 
-    if (results.size() != keys.size()) {
-        LOG(WARNING) << "BatchGetReplicaList size mismatch: keys="
-                     << keys.size() << " results=" << results.size();
-    }
-    WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+            item.ok = true;
+            item.values = std::vector<AllocatedBuffer::Descriptor>{};
+            for (const auto& replica : result.value().replicas) {
+                if (replica.is_memory_replica()) {
+                    item.values->emplace_back(
+                        replica.get_memory_descriptor().buffer_descriptor);
+                } else if (replica.is_disk_replica()) {
+                    if (!item.disk_values.has_value()) {
+                        item.disk_values = std::vector<HttpDiskReplicaInfo>{};
+                    }
+                    auto& d = replica.get_disk_descriptor();
+                    item.disk_values->emplace_back(
+                        HttpDiskReplicaInfo{d.file_path, d.object_size});
+                } else if (replica.is_local_disk_replica()) {
+                    if (!item.local_disk_values.has_value()) {
+                        item.local_disk_values =
+                            std::vector<HttpLocalDiskReplicaInfo>{};
+                    }
+                    auto& d = replica.get_local_disk_descriptor();
+                    item.local_disk_values->emplace_back(
+                        HttpLocalDiskReplicaInfo{UuidToString(d.client_id),
+                                                 d.object_size,
+                                                 d.transport_endpoint});
+                } else if (replica.is_nof_replica()) {
+                    if (!item.nof_values.has_value()) {
+                        item.nof_values =
+                            std::vector<AllocatedBuffer::Descriptor>{};
+                    }
+                    item.nof_values->emplace_back(
+                        replica.get_nof_descriptor().buffer_descriptor);
+                }
+            }
+            payload.data.emplace(keys[i], std::move(item));
+        }
+
+        if (results.size() != keys.size()) {
+            LOG(WARNING) << "BatchGetReplicaListForAdmin size mismatch: keys="
+                         << keys.size() << " results=" << results.size();
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
 }
 
 void MasterAdminServer::HandleGetTenantQuotas(
