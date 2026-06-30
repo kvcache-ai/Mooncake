@@ -131,6 +131,7 @@ std::optional<ContiguousSliceRange> GetContiguousSliceRange(
 struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
+    size_t allocated_dfs_replicas = 0;
     size_t successful_memory_transfers = 0;
     size_t successful_nof_transfers = 0;
     size_t failed_memory_transfers = 0;
@@ -142,6 +143,8 @@ struct ReplicaTransferSummary {
             ++allocated_memory_replicas;
         } else if (replica.is_nof_replica()) {
             ++allocated_nof_replicas;
+        } else if (replica.is_dfs_replica()) {
+            ++allocated_dfs_replicas;
         }
     }
 
@@ -167,7 +170,7 @@ struct ReplicaTransferSummary {
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
-    if (config.nof_replica_num == 0) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
         return summary.allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -177,7 +180,8 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                0;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
-           summary.allocated_nof_replicas == config.nof_replica_num;
+           summary.allocated_nof_replicas == config.nof_replica_num &&
+           summary.allocated_dfs_replicas == config.dfs_replica_num;
 }
 
 // success describes whether the overall put should succeed. Reliable modes
@@ -1040,6 +1044,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
+    CacheDfsDescriptors(object_key, result.value().replicas);
     return QueryResult(
         std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
@@ -1072,6 +1077,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
+            CacheDfsDescriptors(object_keys[i], response[i].value().replicas);
             results.emplace_back(QueryResult(
                 std::move(response[i].value().replicas),
                 start_time + std::chrono::milliseconds(
@@ -1111,7 +1117,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    if (replica.is_dfs_replica()) {
+        err = ReadDfsReplica(object_key, replica, slices);
+    } else {
+        err = TransferRead(replica, slices);
+    }
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
@@ -1393,7 +1403,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
-        if (replica.is_nof_replica()) {
+        if (replica.is_dfs_replica()) {
+            auto dfs_result = ReadDfsReplica(key, replica, slices_it->second);
+            if (dfs_result != ErrorCode::OK) {
+                results[i] = tl::unexpected(dfs_result);
+                continue;
+            }
+            results[i] = {};
+            continue;
+        } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
@@ -1545,6 +1563,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     ReplicaTransferSummary transfer_summary;
+    CacheDfsDescriptors(key, start_result.value());
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
     }
@@ -1650,6 +1669,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
         return tl::unexpected(err);
     }
+
+    CacheDfsDescriptors(key, start_result.value());
 
     // Record transfer latency
     auto t0 = std::chrono::steady_clock::now();
@@ -1913,6 +1934,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                     "Master failed to start put operation");
         } else {
             ops[i].replicas = start_responses[i].value();
+            CacheDfsDescriptors(ops[i].key, ops[i].replicas);
             ops[i].RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config,
                                               ops[i].transfer_summary)) {
@@ -1977,6 +1999,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                             "Master failed to start upsert operation");
         } else {
             ops[i].replicas = start_responses[i].value();
+            CacheDfsDescriptors(ops[i].key, ops[i].replicas);
             VLOG(1) << "Successfully started upsert for key " << ops[i].key
                     << " with " << ops[i].replicas.size() << " replicas";
         }
@@ -2598,11 +2621,11 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (!result) {
         return tl::unexpected(result.error());
     }
-
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
 
+    if (dfs_desc_cache_) dfs_desc_cache_->Remove(key);
     return {};
 }
 
@@ -2662,6 +2685,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         }
     }
 
+    if (dfs_desc_cache_) {
+        for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
+            if (results[i]) dfs_desc_cache_->Remove(keys[i]);
+        }
+    }
     return results;
 }
 
@@ -3022,6 +3050,18 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::PullDfsOffloadTasks(
+    std::vector<OffloadTaskItem>& offloading_objects) {
+    auto response = master_client_.PullDfsOffloadTasks(client_id_);
+    if (!response) {
+        LOG(ERROR) << "PullDfsOffloadTasks failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    offloading_objects = std::move(response.value());
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
     int64_t ssd_total_capacity_bytes) {
     auto response =
@@ -3066,6 +3106,32 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
+}
+
+tl::expected<void, ErrorCode> Client::BatchPutEnd(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    auto responses = master_client_.BatchPutEnd(keys, replica_type);
+    if (responses.size() != keys.size()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    for (size_t i = 0; i < responses.size(); ++i) {
+        if (!responses[i]) {
+            LOG(ERROR) << "BatchPutEnd failed for key " << keys[i]
+                       << ": " << responses[i].error();
+            return tl::make_unexpected(responses[i].error());
+        }
+    }
+    return {};
+}
+
+void Client::SetDfsDescriptorCache(
+    std::shared_ptr<DfsDescriptorCache> cache) {
+    dfs_desc_cache_ = std::move(cache);
+}
+
+void Client::SetDfsStorageBackend(
+    std::shared_ptr<StorageBackendInterface> backend) {
+    dfs_storage_backend_ = std::move(backend);
 }
 
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
@@ -3492,6 +3558,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     } else if (replica_descriptor.is_local_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_local_disk_descriptor();
         total_size = disk_desc.object_size;
+    } else if (replica_descriptor.is_dfs_replica()) {
+        total_size = replica_descriptor.get_dfs_descriptor().object_size;
     }
 
     size_t slices_size = CalculateSliceSize(slices);
@@ -3501,7 +3569,57 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    if (replica_descriptor.is_dfs_replica()) {
+        LOG(ERROR) << "DFS reads require object key context";
+        return ErrorCode::INVALID_REPLICA;
+    }
+
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
+}
+
+ErrorCode Client::ReadDfsReplica(
+    const std::string& key, const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices) {
+    if (!replica_descriptor.is_dfs_replica()) {
+        return ErrorCode::INVALID_REPLICA;
+    }
+    if (!dfs_storage_backend_ || !dfs_desc_cache_) {
+        LOG(ERROR) << "DFS backend/cache is not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    const auto& desc = replica_descriptor.get_dfs_descriptor();
+    dfs_desc_cache_->Put(key, desc);
+
+    auto contiguous_range = GetContiguousSliceRange(slices);
+    if (!contiguous_range.has_value()) {
+        LOG(ERROR) << "DFS read requires contiguous destination slices";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (contiguous_range->size < desc.object_size) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    std::unordered_map<std::string, Slice> batch;
+    batch.emplace(key, Slice{contiguous_range->ptr, contiguous_range->size});
+    auto result = dfs_storage_backend_->BatchLoad(batch);
+    if (!result) {
+        LOG(ERROR) << "DFS read failed for key " << key << ": "
+                   << result.error();
+        return result.error();
+    }
+    return ErrorCode::OK;
+}
+
+void Client::CacheDfsDescriptors(
+    const std::string& key,
+    const std::vector<Replica::Descriptor>& replica_descriptors) {
+    if (!dfs_desc_cache_) return;
+    for (const auto& replica : replica_descriptors) {
+        if (replica.is_dfs_replica()) {
+            dfs_desc_cache_->Put(key, replica.get_dfs_descriptor());
+        }
+    }
 }
 
 ErrorCode Client::TransferReadRange(

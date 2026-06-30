@@ -30,7 +30,9 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
+    storage/distributed/dfs_global_allocator.cpp
     storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/posix_fs_adapter.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp

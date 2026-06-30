@@ -18,6 +18,7 @@
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
+#include "storage/distributed/dfs_descriptor_cache.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -425,6 +426,9 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
+    tl::expected<void, ErrorCode> PullDfsOffloadTasks(
+        std::vector<OffloadTaskItem>& offloading_objects);
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
 
@@ -511,6 +515,12 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+    tl::expected<void, ErrorCode> BatchPutEnd(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
+
+    void SetDfsDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache);
+    void SetDfsStorageBackend(
+        std::shared_ptr<StorageBackendInterface> backend);
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -682,6 +692,12 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
+    ErrorCode ReadDfsReplica(const std::string& key,
+                             const Replica::Descriptor& replica_descriptor,
+                             std::vector<Slice>& slices);
+    void CacheDfsDescriptors(
+        const std::string& key,
+        const std::vector<Replica::Descriptor>& replica_descriptors);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -826,6 +842,8 @@ class Client {
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+    std::shared_ptr<StorageBackendInterface> dfs_storage_backend_;
+    std::shared_ptr<DfsDescriptorCache> dfs_desc_cache_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
