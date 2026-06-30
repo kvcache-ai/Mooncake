@@ -455,6 +455,39 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target
+    // buffers owned by different transports (the device KV pool via hip, the
+    // host aux/metadata buffers via rdma). Route each request to the transport
+    // that owns the buffer covering the target address. When a buffer is
+    // registered under more than one protocol (the device KV pool is registered
+    // by both rdma and hip), prefer hip for intra-node XGMI throughput.
+    if (proto.find(',') != std::string::npos) {
+        std::string chosen;
+        for (const auto &buffer : target_segment_desc->buffers) {
+            if (entry.target_offset >= buffer.addr &&
+                entry.target_offset < buffer.addr + buffer.length) {
+                if (buffer.protocol == "hip") {
+                    chosen = "hip";
+                    break;
+                }
+                if (chosen.empty()) chosen = buffer.protocol;
+            }
+        }
+        if (chosen.empty()) {
+            return Status::InvalidArgument(
+                "No matching buffer for target offset in multi-protocol "
+                "segment " +
+                std::to_string(entry.target_id));
+        }
+        if (!transport_map_.count(chosen)) {
+            return Status::NotSupportedTransport("Transport " + chosen +
+                                                 " not installed");
+        }
+        transport = transport_map_[chosen].get();
+        return Status::OK();
+    }
+#endif
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport

@@ -427,11 +427,21 @@ int HipTransport::install(std::string& local_server_name,
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
-    auto desc = std::make_shared<SegmentDesc>();
+    // Compose with any local segment another transport (e.g. RDMA) already
+    // installed instead of overwriting it, so a single-node segment can
+    // advertise both protocols (e.g. "rdma,hip"). Mirrors
+    // RdmaTransport::allocateLocalSegmentID.
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
 
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!desc->protocol.empty()) desc->protocol += ",";
+    desc->protocol += "hip";
+#else
     desc->protocol = "hip";
+#endif
 
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -649,17 +659,23 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 
     // IPC-based memory registration
     if (!use_fabric_mem_) {
-        // Validate memory type
+        // Only device memory can be exported via HIP IPC. Callers that register
+        // a batch across all transports (e.g. SGLang's PD metadata/aux buffers,
+        // which live in host memory) also hand those host buffers to this
+        // transport. Skip non-device memory gracefully and let RDMA/TCP register
+        // it; returning an error would roll back the entire multi-protocol batch
+        // and tear down every session.
         hipPointerAttribute_t attr;
-        if (!checkHip(hipPointerGetAttributes(&attr, addr),
-                      "HipTransport: hipPointerGetAttributes failed")) {
-            return -1;
-        }
-
-        if (attr.type != hipMemoryTypeDevice) {
-            LOG(ERROR) << "Unsupported memory type, " << addr << " "
-                       << attr.type;
-            return -1;
+        hipError_t attr_err = hipPointerGetAttributes(&attr, addr);
+        if (attr_err != hipSuccess || attr.type != hipMemoryTypeDevice) {
+            // Clear any sticky error the failed query latched so it does not
+            // poison subsequent HIP calls made by the caller.
+            (void)hipGetLastError();
+            if (globalConfig().trace) {
+                LOG(INFO) << "HipTransport: skipping non-device memory " << addr
+                          << ", leaving it to other transports";
+            }
+            return 0;
         }
 
         // Get IPC handle
@@ -676,6 +692,9 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.length = length;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 
