@@ -4915,9 +4915,10 @@ auto MasterService::NotifyOffloadSuccess(
                            << ", key=" << object_id.user_key;
                 return tl::make_unexpected(res.error());
             }
+            added_new_local_disk_replica = res.value();
         }
-        if ((local_disk_segment || added_new_local_disk_replica) &&
-            metadata.data_size > 0) {
+        if (local_disk_segment && metadata.data_size > 0 &&
+            added_new_local_disk_replica) {
             local_disk_segment->ssd_used_bytes.fetch_add(
                 metadata.data_size, std::memory_order_relaxed);
         }
