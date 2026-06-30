@@ -5515,8 +5515,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 auto next_task_it = std::next(task_it);
                 EraseMetadata(tenant_state, metadata_it, tenant_it->first,
                               QuotaEraseMode::kFull, &shard);
+                task_it = next_task_it;
+            } else {
+                task_it = tenant_state.replication_tasks.erase(task_it);
             }
-            task_it = tenant_state.replication_tasks.erase(task_it);
         }
 
         for (auto task_it = tenant_state.offloading_tasks.begin();
