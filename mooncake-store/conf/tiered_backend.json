@@ -8,9 +8,9 @@
         }
     ],
     "scheduler": {
-        "policy": "LRU",
-        "low_watermark": 0.6,
-        "high_watermark": 0.8,
-        "eviction_mode": "sync"
+        "type": "event_driven",
+        "evict_watermark_low": 0.70,
+        "evict_watermark_high": 0.90,
+        "limit_watermark": 0.95
     }
 }

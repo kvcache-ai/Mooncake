@@ -1,0 +1,42 @@
+{
+    "tiers": [
+        {
+            "type": "DRAM",
+            "capacity": "16GB",
+            "priority": 100,
+            "allocator_type": "OFFSET"
+        },
+        {
+            "type": "STORAGE",
+            "capacity": "1TB",
+            "priority": 10,
+            "storage_backend_type": "bucket_storage_backend",
+            "storage_filepath": "/data/mooncake",
+            "staging_buffer_capacity": "2GB",
+            "total_size_limit": "1TB",
+            "bucket_size_limit": "256MB",
+            "bucket_keys_limit": 500
+        }
+    ],
+    "scheduler": {
+        "type": "event_driven",
+        "policy": "multi_lru",
+        "loop_interval_ms": 1000,
+        "evict_watermark_low": 0.70,
+        "evict_watermark_high": 0.90,
+        "limit_watermark": 0.95,
+        "evict_rate_k": 1.0,
+        "evict_load_window_s": 2.0,
+        "offload_freq_threshold": 2,
+        "onboard_freq_threshold": 4,
+        "onboard_fast_threshold": 0.50,
+        "sketch_capacity": 65536,
+        "candidate_scan_limit": 4096,
+        "band_warm_threshold": 3,
+        "band_hot_threshold": 8,
+        "band_veryhot_threshold": 15,
+        "thread_count": 2,
+        "queue_capacity": 1024,
+        "hot_key_num": 2000
+    }
+}
