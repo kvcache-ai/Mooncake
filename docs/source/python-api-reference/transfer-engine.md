@@ -168,6 +168,43 @@ Gets the address of the first buffer in a specified segment.
 The optional `transport_hint` argument pins the request onto a named transport (`"rdma"`, `"tcp"`, ...), overriding policy-driven selection for that one call. **TENT backend only** (`MC_USE_TENT=1`); silently ignored on the classic backend. See [TENT transport selector](../design/tent/transport-selector.md) for more details.
 ```
 
+#### Declarative transfer()
+
+```python
+from mooncake.engine import TransferEngine
+from mooncake.transfer import local_buffer, remote_buffer, transfer
+
+engine = TransferEngine()
+engine.initialize("prefill-0:12345", "127.0.0.1:2379", "tcp", "")
+
+src = local_buffer(0x1000, length=4096)
+dst = remote_buffer("decode-0:12345", 0x2000)
+ret = transfer(src, dst, engine=engine)
+```
+
+The declarative helper describes the source and destination first, then maps
+the request onto the existing synchronous TransferEngine API:
+
+- `local_buffer(...) -> remote_buffer(...)` calls `transfer_sync_write()`
+- `remote_buffer(...) -> local_buffer(...)` calls `transfer_sync_read()`
+
+The length can be supplied on either endpoint or through `transfer(...,
+length=...)`. If multiple lengths are supplied, they must match. The helper
+currently supports one local endpoint and one remote endpoint per request.
+
+For reusable requests:
+
+```python
+from mooncake.transfer import TransferRequest, local_buffer, remote_buffer
+
+request = TransferRequest(
+    src=remote_buffer("prefill-0:12345", 0x2000, length=4096),
+    dst=local_buffer(0x1000),
+    transport_hint="tcp",
+)
+ret = request.execute(engine)
+```
+
 #### transfer_sync_write()
 
 ```python
