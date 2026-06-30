@@ -222,6 +222,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void resetDeviceCollectiveRuntime();
     bool allActivePeersOnSameHost() const;
     void maybeInitDirectP2pAllgather();
+    void maybeInitHierarchicalAllReduceWorkspace();
     void setLocalOnlyActiveRanks();
     void syncActiveRanksTensor();
 
@@ -237,6 +238,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     static TransferEngine* externalEngine_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
+    int cudaDeviceIndex_{-1};
     static std::string hostIp_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
@@ -249,7 +251,21 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     uint32_t* directP2pDeviceSequenceSlots_{nullptr};
     uint32_t directP2pDeviceSequenceSlotCursor_{0};
     std::unique_ptr<device::P2pTransport> directP2pTransport_;
+    std::unique_ptr<device::RdmaTransport> directRdmaTransport_;
+    bool directRdmaReady_{false};
+    int directRdmaQpsPerRank_{1};
     std::vector<void*> directP2pPeerPtrsHost_;
+    void* hierarchicalAllReduceBuffer_{nullptr};
+    size_t hierarchicalAllReduceBufferBytes_{0};
+    std::unique_ptr<device::P2pTransport> hierarchicalAllReduceP2pTransport_;
+    std::unique_ptr<device::RdmaTransport> hierarchicalAllReduceRdmaTransport_;
+    bool hierarchicalAllReduceWorkspaceReady_{false};
+    bool hierarchicalAllReduceRdmaReady_{false};
+    int hierarchicalAllReduceRdmaQpsPerRank_{1};
+    uint32_t hierarchicalAllReduceSequence_{1};
+    uint32_t* hierarchicalAllReduceDeviceSequenceCounter_{nullptr};
+    uint32_t* hierarchicalAllReduceDeviceSequenceSlots_{nullptr};
+    uint32_t hierarchicalAllReduceDeviceSequenceSlotCursor_{0};
     struct DirectP2pOutputPeerCache {
         void** peer_ptrs_dev{nullptr};
         std::vector<void*> peer_ptrs_host;

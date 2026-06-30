@@ -400,6 +400,93 @@ void launchP2pReduceScatterSlottedGraphKernel(
     }
 }
 
+void launchDeviceApiReduceScatterSlottedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* p2p_available, bool* active_mask, void* raddrs,
+    void* rkeys, void* qp_devctxs, int qps_per_rank, size_t tensorSize,
+    size_t slotStride, size_t rdmaSendBaseOffset, int slots, int rank,
+    int numRanks, const uint32_t* baseSequenceSlot, uint32_t* sequenceCounter,
+    uint32_t reserveIncrement, cudaStream_t stream) {
+    size_t num = tensorSize / output.element_size();
+    switch (output.scalar_type()) {
+        case c10::kByte:
+            launchDeviceApiReduceScatterSlottedGraphKernel_uint8(
+                (uint8_t*)output.data_ptr(), (const uint8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kChar:
+            launchDeviceApiReduceScatterSlottedGraphKernel_int8(
+                (int8_t*)output.data_ptr(), (const int8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kShort:
+            launchDeviceApiReduceScatterSlottedGraphKernel_int16(
+                (int16_t*)output.data_ptr(), (const int16_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kInt:
+            launchDeviceApiReduceScatterSlottedGraphKernel_int32(
+                (int*)output.data_ptr(), (const int*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kLong:
+            launchDeviceApiReduceScatterSlottedGraphKernel_int64(
+                (int64_t*)output.data_ptr(), (const int64_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kFloat:
+            launchDeviceApiReduceScatterSlottedGraphKernel_float(
+                (float*)output.data_ptr(), (const float*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kDouble:
+            launchDeviceApiReduceScatterSlottedGraphKernel_double(
+                (double*)output.data_ptr(), (const double*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kBool:
+            launchDeviceApiReduceScatterSlottedGraphKernel_bool(
+                (bool*)output.data_ptr(), (const bool*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, num, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kBFloat16:
+            launchDeviceApiReduceScatterSlottedGraphKernel_bf16(
+                output.data_ptr(), input.data_ptr(), local_recv_base, peer_ptrs,
+                p2p_available, active_mask, raddrs, rkeys, qp_devctxs,
+                qps_per_rank, num, slotStride, rdmaSendBaseOffset, slots, rank,
+                numRanks, baseSequenceSlot, sequenceCounter, reserveIncrement,
+                stream);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce_scatter dtype: ",
+                                        output.scalar_type()));
+    }
+}
+
 void launchP2pReduceScatterSlottedChunkedKernel(
     at::Tensor& output, at::Tensor& input, void* local_recv_base,
     void** peer_ptrs, int32_t* available, size_t tensorSize,
@@ -544,69 +631,286 @@ void launchP2pReduceScatterSlottedChunkedGraphKernel(
     }
 }
 
+void launchDeviceApiReduceScatterSlottedChunkedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* p2p_available, bool* active_mask, void* raddrs,
+    void* rkeys, void* qp_devctxs, int qps_per_rank, size_t tensorSize,
+    size_t chunkBytes, size_t slotStride, size_t rdmaSendBaseOffset, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream) {
+    TORCH_CHECK(tensorSize % output.element_size() == 0,
+                "reduce_scatter tensorSize must align to element size");
+    TORCH_CHECK(chunkBytes % output.element_size() == 0,
+                "reduce_scatter chunkBytes must align to element size");
+    size_t fullNum = tensorSize / output.element_size();
+    size_t chunkNum = chunkBytes / output.element_size();
+    switch (output.scalar_type()) {
+        case c10::kByte:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_uint8(
+                (uint8_t*)output.data_ptr(), (const uint8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kChar:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_int8(
+                (int8_t*)output.data_ptr(), (const int8_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kShort:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_int16(
+                (int16_t*)output.data_ptr(), (const int16_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kInt:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_int32(
+                (int*)output.data_ptr(), (const int*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kLong:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_int64(
+                (int64_t*)output.data_ptr(), (const int64_t*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kFloat:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_float(
+                (float*)output.data_ptr(), (const float*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kDouble:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_double(
+                (double*)output.data_ptr(), (const double*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kBool:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_bool(
+                (bool*)output.data_ptr(), (const bool*)input.data_ptr(),
+                local_recv_base, peer_ptrs, p2p_available, active_mask, raddrs,
+                rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum, slotStride,
+                rdmaSendBaseOffset, slots, rank, numRanks, baseSequenceSlot,
+                sequenceCounter, reserveIncrement, stream);
+            break;
+        case c10::kBFloat16:
+            launchDeviceApiReduceScatterSlottedChunkedGraphKernel_bf16(
+                output.data_ptr(), input.data_ptr(), local_recv_base, peer_ptrs,
+                p2p_available, active_mask, raddrs, rkeys, qp_devctxs,
+                qps_per_rank, fullNum, chunkNum, slotStride, rdmaSendBaseOffset,
+                slots, rank, numRanks, baseSequenceSlot, sequenceCounter,
+                reserveIncrement, stream);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce_scatter dtype: ",
+                                        output.scalar_type()));
+    }
+}
+
 void launchP2pAllReduceSlottedKernel(
     at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
     int32_t* available, size_t tensorSize, size_t slotStride, int slots,
-    int rank, int numRanks, uint32_t sequence, cudaStream_t stream) {
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream,
+    bool useDeviceApi) {
     size_t num = tensorSize / tensor.element_size();
     switch (tensor.scalar_type()) {
         case c10::kByte:
             launchP2pAllReduceSlottedKernel_uint8(
                 (uint8_t*)tensor.data_ptr(), (const uint8_t*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kChar:
             launchP2pAllReduceSlottedKernel_int8(
                 (int8_t*)tensor.data_ptr(), (const int8_t*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kShort:
             launchP2pAllReduceSlottedKernel_int16(
                 (int16_t*)tensor.data_ptr(), (const int16_t*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kInt:
             launchP2pAllReduceSlottedKernel_int32(
                 (int*)tensor.data_ptr(), (const int*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kLong:
             launchP2pAllReduceSlottedKernel_int64(
                 (int64_t*)tensor.data_ptr(), (const int64_t*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kFloat:
             launchP2pAllReduceSlottedKernel_float(
                 (float*)tensor.data_ptr(), (const float*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kDouble:
             launchP2pAllReduceSlottedKernel_double(
                 (double*)tensor.data_ptr(), (const double*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kBool:
             launchP2pAllReduceSlottedKernel_bool(
                 (bool*)tensor.data_ptr(), (const bool*)tensor.data_ptr(),
                 local_recv_base, peer_ptrs, available, num, slotStride, slots,
-                rank, numRanks, sequence, stream);
+                rank, numRanks, sequence, stream, useDeviceApi);
             break;
         case c10::kBFloat16:
             launchP2pAllReduceSlottedKernel_bf16(
                 tensor.data_ptr(), tensor.data_ptr(), local_recv_base, peer_ptrs,
                 available, num, slotStride, slots, rank, numRanks, sequence,
-                stream);
+                stream, useDeviceApi);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported all_reduce dtype: ",
                                         tensor.scalar_type()));
+    }
+}
+
+void launchDeviceApiAllReducePairExchangeSlottedChunkedGraphKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* p2p_available, void* raddrs, void* rkeys, void* qp_devctxs,
+    int qps_per_rank, size_t tensorSize, size_t chunkBytes,
+    size_t slotStride, size_t dataBaseOffset, size_t controlBaseOffset,
+    int slots, int rank, int numRanks, int pairLocalRank,
+    int peerPairLocalRank, int peerRank, const uint32_t* baseSequenceSlot,
+    uint32_t* sequenceCounter, uint32_t reserveIncrement,
+    cudaStream_t stream) {
+    TORCH_CHECK(tensorSize % tensor.element_size() == 0,
+                "hierarchical all_reduce tensorSize must align to element size");
+    TORCH_CHECK(chunkBytes % tensor.element_size() == 0,
+                "hierarchical all_reduce chunkBytes must align to element size");
+    size_t fullNum = tensorSize / tensor.element_size();
+    size_t chunkNum = chunkBytes / tensor.element_size();
+    switch (tensor.scalar_type()) {
+        case c10::kFloat:
+            launchDeviceApiAllReducePairExchangeSlottedChunkedGraphKernel_float(
+                (float*)tensor.data_ptr(), local_recv_base, peer_ptrs,
+                p2p_available, raddrs, rkeys, qp_devctxs, qps_per_rank,
+                fullNum, chunkNum, slotStride, dataBaseOffset,
+                controlBaseOffset, slots, rank, numRanks, pairLocalRank,
+                peerPairLocalRank, peerRank, baseSequenceSlot, sequenceCounter,
+                reserveIncrement, stream);
+            break;
+        case c10::kBFloat16:
+            launchDeviceApiAllReducePairExchangeSlottedChunkedGraphKernel_bf16(
+                tensor.data_ptr(), local_recv_base, peer_ptrs, p2p_available,
+                raddrs, rkeys, qp_devctxs, qps_per_rank, fullNum, chunkNum,
+                slotStride, dataBaseOffset, controlBaseOffset, slots, rank,
+                numRanks, pairLocalRank, peerPairLocalRank, peerRank,
+                baseSequenceSlot, sequenceCounter, reserveIncrement, stream);
+            break;
+        default:
+            TORCH_CHECK(false,
+                        c10::str("Hierarchical all_reduce prototype only "
+                                  "supports float/bfloat16, got ",
+                                  tensor.scalar_type()));
+    }
+}
+
+void launchP2pNodeLocalAllReduceSlottedKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    size_t controlBaseOffset, int globalRank, int nodeBaseRank,
+    int localRank, int nodeSize, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream) {
+    TORCH_CHECK(tensorSize % tensor.element_size() == 0,
+                "node-local all_reduce tensorSize must align to element size");
+    size_t num = tensorSize / tensor.element_size();
+    switch (tensor.scalar_type()) {
+        case c10::kFloat:
+            launchP2pNodeLocalAllReduceSlottedKernel_float(
+                (float*)tensor.data_ptr(), (const float*)tensor.data_ptr(),
+                local_recv_base, peer_ptrs, available, num, slotStride, slots,
+                controlBaseOffset, globalRank, nodeBaseRank, localRank,
+                nodeSize, baseSequenceSlot, stream);
+            break;
+        case c10::kBFloat16:
+            launchP2pNodeLocalAllReduceSlottedKernel_bf16(
+                tensor.data_ptr(), tensor.data_ptr(), local_recv_base,
+                peer_ptrs, available, num, slotStride, slots,
+                controlBaseOffset, globalRank, nodeBaseRank, localRank,
+                nodeSize, baseSequenceSlot, stream);
+            break;
+        default:
+            TORCH_CHECK(false,
+                        c10::str("Node-local hierarchical all_reduce prototype "
+                                  "only supports float/bfloat16, got ",
+                                  tensor.scalar_type()));
+    }
+}
+
+void launchP2pAllReduceRingKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, int rank, int numRanks,
+    uint32_t sequence, int signalMode, int numChannels, cudaStream_t stream) {
+    TORCH_CHECK(tensor.scalar_type() == c10::kFloat,
+                "Direct P2P ring all_reduce PoC only supports float tensors.");
+    size_t num = tensorSize / tensor.element_size();
+    launchP2pAllReduceRingKernel_float(
+        (float*)tensor.data_ptr(), local_recv_base, peer_ptrs, available, num,
+        rank, numRanks, sequence, signalMode, numChannels, stream);
+}
+
+void launchP2pAllReduceRingGraphKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, int rank, int numRanks,
+    const uint32_t* sequenceSlot, int signalMode, int numChannels,
+    cudaStream_t stream) {
+    TORCH_CHECK(tensor.scalar_type() == c10::kFloat,
+                "Direct P2P ring all_reduce PoC only supports float tensors.");
+    size_t num = tensorSize / tensor.element_size();
+    launchP2pAllReduceRingGraphKernel_float(
+        (float*)tensor.data_ptr(), local_recv_base, peer_ptrs, available, num,
+        rank, numRanks, sequenceSlot, signalMode, numChannels, stream);
+}
+
+void launchP2pAllReduceFusedRsAgSlottedGraphKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, const uint32_t* rsSequenceSlot,
+    const uint32_t* agSequenceSlot, cudaStream_t stream) {
+    size_t num = tensorSize / tensor.element_size();
+    switch (tensor.scalar_type()) {
+        case c10::kFloat:
+            launchP2pAllReduceFusedRsAgSlottedGraphKernel_float(
+                (float*)tensor.data_ptr(), local_recv_base, peer_ptrs,
+                available, num, slotStride, slots, rank, numRanks,
+                rsSequenceSlot, agSequenceSlot, stream);
+            break;
+        case c10::kBFloat16:
+            launchP2pAllReduceFusedRsAgSlottedGraphKernel_bf16(
+                tensor.data_ptr(), local_recv_base, peer_ptrs, available, num,
+                slotStride, slots, rank, numRanks, rsSequenceSlot,
+                agSequenceSlot, stream);
+            break;
+        default:
+            TORCH_CHECK(false,
+                        "Direct P2P fused RS+AG all_reduce PoC only supports "
+                        "float and bfloat16 tensors.");
     }
 }
 

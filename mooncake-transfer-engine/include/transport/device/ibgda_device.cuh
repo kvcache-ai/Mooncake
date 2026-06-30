@@ -201,13 +201,38 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
                                              int src_rank, int qps_per_rank,
                                              const void* send_ptr,
                                              uint64_t recv_raddr,
-                                             uint32_t nbytes) {
+                                             uint32_t nbytes,
+                                             bool debug = false,
+                                             bool poll_completion = false) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
+    const uint16_t expect = qp->wq_head;
+    if (debug) {
+        printf("MOONCAKE_PG_IBGDA_PUT_POST src=%d dst=%d channel=%d "
+               "send=%p raddr=0x%llx bytes=%u lkey=0x%x rkey=0x%x "
+               "qpn=%u wq_head=%u wq_tail=%u\n",
+               src_rank, dst_rank, channel, send_ptr,
+               static_cast<unsigned long long>(recv_raddr), nbytes,
+               ctx.rkeys[src_rank], ctx.rkeys[dst_rank], qp->qpn,
+               qp->wq_head, qp->wq_tail);
+    }
     mc_ibgda_write_rdma_write_wqe(qp, reinterpret_cast<uint64_t>(send_ptr),
                                   mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
                                   mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
     mc_ibgda_post_send_db(qp);
+    if (debug || poll_completion) {
+        if (debug) {
+        printf("MOONCAKE_PG_IBGDA_PUT_POLL src=%d dst=%d expect=%u "
+               "wq_head=%u wq_tail=%u\n",
+               src_rank, dst_rank, expect, qp->wq_head, qp->wq_tail);
+        }
+        mc_ibgda_poll_cq(qp, expect);
+        if (debug) {
+        printf("MOONCAKE_PG_IBGDA_PUT_DONE src=%d dst=%d expect=%u "
+               "wq_head=%u wq_tail=%u\n",
+               src_rank, dst_rank, expect, qp->wq_head, qp->wq_tail);
+        }
+    }
     mc_ibgda_unlock(qp);
 }
 
@@ -218,13 +243,37 @@ __device__ __forceinline__ void mc_ibgda_red_add(
     int qps_per_rank,
     uint64_t laddr,       // local scratch VA for the atomic result
     uint64_t recv_raddr,  // remote VA of the signal word
-    int32_t value) {
+    int32_t value, bool debug = false, bool poll_completion = false) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
+    const uint16_t expect = qp->wq_head;
+    if (debug) {
+        printf("MOONCAKE_PG_IBGDA_ATOMIC_POST src=%d dst=%d channel=%d "
+               "laddr=0x%llx raddr=0x%llx value=%d lkey=0x%x rkey=0x%x "
+               "qpn=%u wq_head=%u wq_tail=%u\n",
+               src_rank, dst_rank, channel,
+               static_cast<unsigned long long>(laddr),
+               static_cast<unsigned long long>(recv_raddr), value,
+               ctx.rkeys[src_rank], ctx.rkeys[dst_rank], qp->qpn,
+               qp->wq_head, qp->wq_tail);
+    }
     mc_ibgda_write_rdma_atomic_add_wqe(
         qp, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
         mc_bswap32(ctx.rkeys[dst_rank]));
     mc_ibgda_post_send_db(qp);
+    if (debug || poll_completion) {
+        if (debug) {
+        printf("MOONCAKE_PG_IBGDA_ATOMIC_POLL src=%d dst=%d expect=%u "
+               "wq_head=%u wq_tail=%u\n",
+               src_rank, dst_rank, expect, qp->wq_head, qp->wq_tail);
+        }
+        mc_ibgda_poll_cq(qp, expect);
+        if (debug) {
+        printf("MOONCAKE_PG_IBGDA_ATOMIC_DONE src=%d dst=%d expect=%u "
+               "wq_head=%u wq_tail=%u\n",
+               src_rank, dst_rank, expect, qp->wq_head, qp->wq_tail);
+        }
+    }
     mc_ibgda_unlock(qp);
 }
 

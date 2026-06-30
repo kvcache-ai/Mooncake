@@ -87,14 +87,26 @@ __device__ __forceinline__ void mc_rdma_put(
     const CommCtx& ctx, int channel, int dst_rank, int qps_per_rank,
     const void* send_ptr,
     void* recv_ptr,  // local VA of the recv slot (for raddr computation)
-    uint32_t nbytes, int lane_id) {
+    uint32_t nbytes, int lane_id, bool debug = false,
+    bool poll_completion = false) {
     if (lane_id == 0) {
+        uint64_t offset = reinterpret_cast<const char*>(recv_ptr) -
+                          reinterpret_cast<const char*>(ctx.p2p.local_base);
         uint64_t recv_raddr =
-            ctx.ibgda.raddrs[dst_rank] +
-            (reinterpret_cast<const char*>(recv_ptr) -
-             reinterpret_cast<const char*>(ctx.p2p.local_base));
+            ctx.ibgda.raddrs[dst_rank] + offset;
+        if (debug) {
+            printf("MOONCAKE_PG_DEVICE_API_RDMA_PUT_ADDR rank=%d peer=%d "
+                   "local_base=%p recv_ptr=%p offset=0x%llx "
+                   "peer_raddr_base=0x%llx recv_raddr=0x%llx send_ptr=%p "
+                   "bytes=%u\n",
+                   ctx.rank, dst_rank, ctx.p2p.local_base, recv_ptr,
+                   static_cast<unsigned long long>(offset),
+                   static_cast<unsigned long long>(ctx.ibgda.raddrs[dst_rank]),
+                   static_cast<unsigned long long>(recv_raddr), send_ptr,
+                   nbytes);
+        }
         mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
-                     send_ptr, recv_raddr, nbytes);
+                     send_ptr, recv_raddr, nbytes, debug, poll_completion);
     }
 }
 
@@ -107,7 +119,9 @@ __device__ __forceinline__ void mc_rdma_put(
 
 __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
                                           int channel, int qps_per_rank,
-                                          int* sig_ptr, int32_t val) {
+                                          int* sig_ptr, int32_t val,
+                                          bool debug = false,
+                                          bool poll_completion = false) {
     if (dst_rank == ctx.rank) {
         mc_st_release(sig_ptr, val);
         return;
@@ -115,18 +129,53 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
     if (mc_comm_p2p_available(ctx, dst_rank)) {
         mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
     } else {
-        uint64_t recv_raddr =
-            ctx.ibgda.raddrs[dst_rank] +
-            (reinterpret_cast<const char*>(sig_ptr) -
-             reinterpret_cast<const char*>(ctx.p2p.local_base));
-        uint64_t laddr =
-            ctx.ibgda.raddrs[ctx.rank] +
+        uint64_t signal_offset =
+            reinterpret_cast<const char*>(sig_ptr) -
+            reinterpret_cast<const char*>(ctx.p2p.local_base);
+        uint64_t atomic_result_offset =
             (reinterpret_cast<const char*>(sig_ptr) -
              reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)) +
             (reinterpret_cast<const char*>(ctx.ibgda.local_atomic_base) -
              reinterpret_cast<const char*>(ctx.p2p.local_base));
+        uint64_t recv_raddr =
+            ctx.ibgda.raddrs[dst_rank] + signal_offset;
+        uint64_t laddr =
+            ctx.ibgda.raddrs[ctx.rank] + atomic_result_offset;
+        if (debug) {
+            printf("MOONCAKE_PG_DEVICE_API_SIGNAL_ADDR rank=%d peer=%d "
+                   "sig_ptr=%p local_base=%p remote_sig_base=%p "
+                   "local_atomic_base=%p signal_offset=0x%llx "
+                   "atomic_result_offset=0x%llx self_raddr_base=0x%llx "
+                   "peer_raddr_base=0x%llx laddr=0x%llx recv_raddr=0x%llx "
+                   "val=%d\n",
+                   ctx.rank, dst_rank, sig_ptr, ctx.p2p.local_base,
+                   ctx.ibgda.remote_atomic_base, ctx.ibgda.local_atomic_base,
+                   static_cast<unsigned long long>(signal_offset),
+                   static_cast<unsigned long long>(atomic_result_offset),
+                   static_cast<unsigned long long>(ctx.ibgda.raddrs[ctx.rank]),
+                   static_cast<unsigned long long>(ctx.ibgda.raddrs[dst_rank]),
+                   static_cast<unsigned long long>(laddr),
+                   static_cast<unsigned long long>(recv_raddr), val);
+        }
         mc_ibgda_red_add(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
-                         laddr, recv_raddr, val);
+                         laddr, recv_raddr, val, debug, poll_completion);
+    }
+}
+
+// Store-style signal for protocols where the signal word is an epoch/sequence,
+// not an accumulated counter.  P2P uses a release store, and IBGDA uses a
+// 4-byte RDMA WRITE from the local signal word to the peer's same offset.
+__device__ __forceinline__ void mc_signal_write(
+    const CommCtx& ctx, int dst_rank, int channel, int qps_per_rank,
+    int* sig_ptr, int32_t val, bool debug = false,
+    bool poll_completion = false) {
+    mc_st_release(sig_ptr, val);
+    if (dst_rank == ctx.rank) return;
+    if (mc_comm_p2p_available(ctx, dst_rank)) {
+        mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
+    } else {
+        mc_rdma_put(ctx, channel, dst_rank, qps_per_rank, sig_ptr, sig_ptr,
+                    sizeof(int32_t), 0, debug, poll_completion);
     }
 }
 

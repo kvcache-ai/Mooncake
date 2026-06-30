@@ -165,7 +165,10 @@ bool macaP2pPairAllowed(int src_physical, int dst_physical) {
 
 }  // namespace
 #endif
-
+static bool forceDisablePgP2pPeers() {
+    const char* value = std::getenv("MOONCAKE_PG_FORCE_DISABLE_P2P");
+    return value && value[0] != '\0' && value[0] != '0';
+}
 class P2pDeviceTransportImpl : public P2pTransport {
    public:
     explicit P2pDeviceTransportImpl(int num_ranks) : num_ranks_(num_ranks) {
@@ -298,6 +301,12 @@ class P2pDeviceTransportImpl : public P2pTransport {
         for (int dst = group_start; dst < group_end; ++dst) {
             if (active_ranks_mask[dst] == 0) continue;
             if (dst == rank) continue;
+            if (forceDisablePgP2pPeers()) {
+                LOG(INFO) << "[EP P2P] rank " << rank
+                          << " skipping IPC import for rank " << dst
+                          << " due to MOONCAKE_PG_FORCE_DISABLE_P2P=1";
+                continue;
+            }
 
             int dst_device = dst % device_count;
             int can_access = 0;

@@ -99,6 +99,31 @@ void launchP2pReduceScatterSlottedGraphKernel(
     const uint32_t* baseSequenceSlot, uint32_t* sequenceCounter,
     uint32_t reserveIncrement, cudaStream_t stream);
 
+void launchDeviceApiReduceScatterSlottedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* p2p_available, bool* active_mask, void* raddrs,
+    void* rkeys, void* qp_devctxs, int qps_per_rank, size_t tensorSize,
+    size_t slotStride, size_t rdmaSendBaseOffset, int slots, int rank,
+    int numRanks, const uint32_t* baseSequenceSlot, uint32_t* sequenceCounter,
+    uint32_t reserveIncrement, cudaStream_t stream);
+
+void launchDeviceApiReduceScatterSlottedChunkedGraphKernel(
+    at::Tensor& output, at::Tensor& input, void* local_recv_base,
+    void** peer_ptrs, int32_t* p2p_available, bool* active_mask, void* raddrs,
+    void* rkeys, void* qp_devctxs, int qps_per_rank, size_t tensorSize,
+    size_t chunkBytes, size_t slotStride, size_t rdmaSendBaseOffset, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream);
+
+void launchDeviceApiAllReducePairExchangeSlottedChunkedGraphKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* p2p_available, void* raddrs, void* rkeys, void* qp_devctxs,
+    int qps_per_rank, size_t tensorSize, size_t chunkBytes,
+    size_t slotStride, size_t dataBaseOffset, size_t controlBaseOffset,
+    int slots, int rank, int numRanks, int pairLocalRank,
+    int peerPairLocalRank, int peerRank, const uint32_t* baseSequenceSlot,
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream);
+
 void launchP2pReduceScatterSlottedChunkedKernel(
     at::Tensor& output, at::Tensor& input, void* local_recv_base,
     void** peer_ptrs, int32_t* available, size_t tensorSize,
@@ -114,7 +139,32 @@ void launchP2pReduceScatterSlottedChunkedGraphKernel(
 void launchP2pAllReduceSlottedKernel(
     at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
     int32_t* available, size_t tensorSize, size_t slotStride, int slots,
-    int rank, int numRanks, uint32_t sequence, cudaStream_t stream);
+    int rank, int numRanks, uint32_t sequence, cudaStream_t stream,
+    bool useDeviceApi = false);
+
+void launchP2pNodeLocalAllReduceSlottedKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    size_t controlBaseOffset, int globalRank, int nodeBaseRank,
+    int localRank, int nodeSize, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream);
+
+void launchP2pAllReduceRingKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, int rank, int numRanks,
+    uint32_t sequence, int signalMode, int numChannels, cudaStream_t stream);
+
+void launchP2pAllReduceRingGraphKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, int rank, int numRanks,
+    const uint32_t* sequenceSlot, int signalMode, int numChannels,
+    cudaStream_t stream);
+
+void launchP2pAllReduceFusedRsAgSlottedGraphKernel(
+    at::Tensor& tensor, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, const uint32_t* rsSequenceSlot,
+    const uint32_t* agSequenceSlot, cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
@@ -167,6 +217,27 @@ void launchP2pAllgatherStoreSignalSlottedGraphKernel(
     int32_t* available, size_t tensorSize, size_t slotStride, int slots,
     int rank, int numRanks, const uint32_t* baseSequenceSlot,
     uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream);
+
+void launchDeviceApiAllgatherStoreSignalSlottedGraphKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* p2p_available, bool* active_mask, void* raddrs, void* rkeys,
+    void* qp_devctxs, int qps_per_rank, size_t tensorSize, size_t slotStride,
+    int slots, int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    uint32_t* sequenceCounter, uint32_t reserveIncrement, cudaStream_t stream);
+
+void launchDeviceApiAllgatherStoreSignalSlottedChunkedGraphKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* p2p_available, bool* active_mask, void* raddrs, void* rkeys,
+    void* qp_devctxs, int qps_per_rank, size_t tensorSize, size_t chunkBytes,
+    size_t slotStride, int slots, int rank, int numRanks,
+    const uint32_t* baseSequenceSlot, uint32_t* sequenceCounter,
+    uint32_t reserveIncrement, cudaStream_t stream);
+
+void launchP2pAllgatherStoreSignalSlottedGraphSkipSelfKernel(
+    void* input, void* output, void* local_recv_base, void** peer_ptrs,
+    int32_t* available, size_t tensorSize, size_t slotStride, int slots,
+    int rank, int numRanks, const uint32_t* baseSequenceSlot,
+    cudaStream_t stream);
 
 void launchP2pAllgatherStoreSignalSlottedChunkedKernel(
     void* input, void* output, void* local_recv_base, void** peer_ptrs,
