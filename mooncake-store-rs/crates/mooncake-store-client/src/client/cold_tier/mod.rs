@@ -48,10 +48,10 @@ pub(super) use helpers::{
     backend_load_cold_payload_batch_into, backend_load_cold_payload_batch_pinned,
     backend_remove_cold_payload, backend_remove_cold_payload_batch, backend_remove_pending_source,
     backend_store_cold_payload_batch, backend_store_pending_source, cold_backing_placeholder,
-    cold_only_read_placeholder, cold_restore_flight_key, is_cold_backing_placeholder,
-    materialized_cold_backing, payload_checksum, read_local_hot_replica_payload, same_cold_payload,
-    validate_cold_restore_payload, validate_resolved_payload_checksum,
-    with_disjoint_restore_caller_buffers,
+    cold_only_read_placeholder, cold_restore_flight_key, has_materialized_cold_backing,
+    is_cold_backing_placeholder, materialized_cold_backing, payload_checksum,
+    read_local_hot_replica_payload, same_cold_payload, validate_cold_restore_payload,
+    validate_resolved_payload_checksum, with_disjoint_restore_caller_buffers,
 };
 #[allow(unused_imports)]
 pub(super) use metrics::{

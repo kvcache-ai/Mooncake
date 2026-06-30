@@ -19,6 +19,7 @@ impl MembershipSyncHandle {
         interval: Duration,
         namespace: String,
         suspect_runtime_cache: SharedSuspectRuntimeCache,
+        refresh_cold_tier_devices: bool,
     ) -> Result<Self> {
         if interval.is_zero() {
             return Ok(Self::disabled());
@@ -77,21 +78,20 @@ impl MembershipSyncHandle {
                                     "background tenant policy cache refresh failed"
                                 );
                             }
-                            // Cold tier refresh failures are logged but do NOT
-                            // contribute to the main backoff counter.  If cold
-                            // tier metadata is temporarily unavailable (e.g.
-                            // during an upgrade), we must not delay live-client
-                            // and tenant-policy refreshes that are critical for
-                            // correct routing.
-                            if let Err(error) = refresh_cold_tier_device_cache(
-                                metadata.as_ref(),
-                                &cold_tier_device_cache,
-                                "cold_tier_device_snapshot_refresh",
-                            ) {
-                                tracing::warn!(
-                                    error = %error,
-                                    "background cold tier device cache refresh failed"
-                                );
+                            // Cold-tier device refresh is best-effort and excluded
+                            // from the main membership backoff. Skip it entirely
+                            // when this runtime has no local backend.
+                            if refresh_cold_tier_devices {
+                                if let Err(error) = refresh_cold_tier_device_cache(
+                                    metadata.as_ref(),
+                                    &cold_tier_device_cache,
+                                    "cold_tier_device_snapshot_refresh",
+                                ) {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "background cold tier device cache refresh failed"
+                                    );
+                                }
                             }
                             if any_failed {
                                 consecutive_failures = consecutive_failures

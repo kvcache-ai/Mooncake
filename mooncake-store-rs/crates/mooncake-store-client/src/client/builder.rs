@@ -565,20 +565,6 @@ impl StoreClientBuilder {
                 cold_tier_handles.entry(old_id.clone()).or_insert(backend);
             }
         }
-        if cold_tier_enabled {
-            cold_tier_handles
-                .entry(default_cold_tier_id.clone())
-                .or_insert_with(|| {
-                    let fallback_root = default_cold_tier_root();
-                    warn!(
-                        path = %fallback_root.display(),
-                        "no cold tier target configured for default device, using ephemeral PID-based path"
-                    );
-                    Arc::new(LocalDirPersistentStorageBackend::new_with_root(
-                        fallback_root,
-                    ))
-                });
-        }
         let cold_tier_resolver =
             ColdTierBackendResolver::from_handles(default_cold_tier_id, cold_tier_handles);
         let storage_owner = Arc::new(StorageOwnerState::new(
@@ -692,7 +678,8 @@ impl StoreClientBuilder {
                 .unwrap_or_default()
                 .as_millis() as u64,
         );
-        if cold_tier_enabled {
+        let refresh_cold_tier_devices = storage_owner.has_local_cold_tier_work();
+        if refresh_cold_tier_devices {
             refresh_cold_tier_device_cache(
                 runtime_metadata.as_ref(),
                 &cold_tier_device_cache,
@@ -707,6 +694,7 @@ impl StoreClientBuilder {
             self.live_client_sync_interval,
             route_namespace.clone(),
             suspect_runtime_cache.clone(),
+            refresh_cold_tier_devices,
         )?;
         let async_eviction = AsyncEvictionHandle::spawn(
             &runtime,

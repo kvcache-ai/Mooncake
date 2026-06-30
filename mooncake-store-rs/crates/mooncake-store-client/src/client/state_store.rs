@@ -1088,8 +1088,12 @@ impl StorageOwnerState {
         self.evict_route_replica(victim, &route, replica_index, delete_empty_route)
     }
 
+    pub(in super) fn has_local_cold_tier_work(&self) -> bool {
+        cold_tier::cold_tier_enabled() && self.cold_tier_devices.has_any_local_backend()
+    }
+
     fn has_usable_cold_tier_device(&self) -> Result<bool> {
-        if cold_tier::cold_tier_disabled() {
+        if !self.has_local_cold_tier_work() {
             return Ok(false);
         }
         self.cold_tier_devices

@@ -681,6 +681,11 @@ impl ColdTierDeviceManager {
         self.resolver.lock().has_backend(cold_tier_id)
     }
 
+    /// Returns true if this runtime has at least one local cold-tier backend.
+    pub(in super::super) fn has_any_local_backend(&self) -> bool {
+        self.resolver.lock().has_any_backend()
+    }
+
     /// Returns the set of cold_tier_ids that have local backends registered.
     pub(in super::super) fn local_device_ids(&self) -> Vec<String> {
         self.resolver.lock().backend_ids()

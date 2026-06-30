@@ -59,6 +59,184 @@ fn embedded_client_restores_cold_only_route_without_configured_cold_tier_target(
 }
 
 #[test]
+fn env_only_cold_tier_does_not_register_fallback_backend_for_eviction() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let cold_root = cold_tier_test_root("env-only-no-fallback");
+    let client = StoreClientBuilder::new(metadata.clone(), "env-only-no-fallback")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(Arc::new(TestTransport::new("env-only-no-fallback-segment")))
+        .local_memory(storage_config_with_bytes(128))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed without cold tier target");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let scoped = metadata
+        .for_tenant("default")
+        .expect("for_tenant should return Some");
+    let device = mooncake_store_core::ColdTierDeviceRecord {
+        device_id: client.runtime_id().stable_id.0.clone(),
+        stable_id: client.runtime_id().stable_id.0.clone(),
+        epoch: Some(client.runtime_id().epoch.0),
+        cold_tier_id: client.runtime_id().stable_id.0.clone(),
+        kind: "ssd".to_string(),
+        target: mooncake_store_core::ColdTierTargetSpec::Directory {
+            path: cold_root.display().to_string(),
+        },
+        root_dir: Some(cold_root.display().to_string()),
+        state: mooncake_store_core::ColdTierDeviceState::Healthy,
+        capacity_bytes: Some(1024 * 1024),
+        used_bytes: 0,
+        reserved_bytes: 0,
+        failure_count: 0,
+        last_error: None,
+        tags: Vec::new(),
+        updated_at_ms: now_ms(),
+    };
+    assert!(matches!(
+        scoped
+            .put_cold_tier_device_if_absent(&device)
+            .expect("device publish should succeed"),
+        mooncake_store_core::ColdTierPutDeviceResult::Created(_)
+    ));
+    refresh_cold_tier_device_cache(
+        scoped.as_ref(),
+        client.storage_owner.cold_tier_devices.cache(),
+        "test_env_only_no_fallback",
+    )
+    .expect("cache refresh should succeed");
+
+    assert!(
+        client
+            .storage_owner
+            .cold_tier_devices
+            .local_device_ids()
+            .is_empty(),
+        "env-only cold tier startup must not register a fallback backend"
+    );
+    assert!(
+        !client
+            .storage_owner
+            .cold_tier_devices
+            .has_usable_device(scoped.as_ref())
+            .expect("usable-device check should succeed"),
+        "metadata-only device must not make eviction use cold offload without a local backend"
+    );
+
+    client
+        .put("env-only-evict", b"env-only-payload")
+        .expect("put should succeed");
+    let route_before_evict = client
+        .query_route("env-only-evict")
+        .expect("route query should succeed")
+        .expect("hot route should exist before eviction");
+    assert_eq!(route_before_evict.replicas.len(), 1);
+    assert!(
+        route_before_evict.cold_backing.is_none(),
+        "env-only/no-backend put must publish a hot-only route before eviction"
+    );
+
+    assert!(
+        client
+            .storage_owner
+            .evict_one_blocking(None)
+            .expect("manual eviction should succeed"),
+        "manual eviction should find the hot victim"
+    );
+    assert!(
+        client
+            .query_route("env-only-evict")
+            .expect("route query should succeed")
+            .is_none(),
+        "without a local cold backend, evicting the last replica should delete the route"
+    );
+
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"storage_owner_evict_one\",status=\"ok\""));
+    assert!(
+        !metrics.contains("operation=\"storage_owner_eviction_forced_offload\""),
+        "env-only/no-backend eviction must not force cold offload"
+    );
+    assert!(
+        !metrics.contains("operation=\"storage_owner_background_offload\""),
+        "env-only/no-backend eviction must not enqueue background offload"
+    );
+
+    let _ = std::fs::remove_dir_all(cold_root);
+}
+
+#[test]
+fn configured_cold_tier_eviction_materializes_cold_backing() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let cold_root = cold_tier_test_root("configured-eviction-materializes");
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let client = StoreClientBuilder::new(metadata, "configured-eviction-materializes")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "configured-eviction-materializes-segment",
+        )))
+        .local_memory(storage_config_with_bytes(128))
+        .cold_tier_target(cold_tier_test_config_with_root(
+            "configured-eviction-materializes",
+            cold_root.clone(),
+        ))
+        .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed with cold tier target");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    client
+        .put("configured-evict", b"configured-payload")
+        .expect("put should succeed");
+    let route_before_evict = client
+        .query_route("configured-evict")
+        .expect("route query should succeed")
+        .expect("hot route should exist before eviction");
+    assert_eq!(route_before_evict.replicas.len(), 1);
+    assert!(
+        route_before_evict.cold_backing.is_none(),
+        "evict-triggered mode starts as hot-only; eviction is what creates cold_backing"
+    );
+
+    assert!(
+        client
+            .storage_owner
+            .evict_one_blocking(None)
+            .expect("manual eviction should succeed"),
+        "manual eviction should find the hot victim"
+    );
+
+    let route = client
+        .query_route("configured-evict")
+        .expect("route query should succeed")
+        .expect("cold-backed route should remain after evicting last DRAM replica");
+    assert!(route.replicas.is_empty());
+    assert!(route.cold_backing.as_ref().is_some_and(|backing| {
+        backing.state == mooncake_store_core::ColdBackingState::Materialized
+    }));
+
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"storage_owner_evict_one\",status=\"ok\""));
+    assert!(
+        metrics.contains("operation=\"storage_owner_eviction_forced_offload\",status=\"ok\""),
+        "configured cold-tier eviction should force materialization before deleting the last replica"
+    );
+
+    let _ = std::fs::remove_dir_all(cold_root);
+}
+
+#[test]
 fn embedded_client_remote_cold_only_read_promotes_on_owner() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());

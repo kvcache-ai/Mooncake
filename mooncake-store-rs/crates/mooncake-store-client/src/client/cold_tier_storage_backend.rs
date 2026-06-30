@@ -707,6 +707,10 @@ impl ColdTierBackendResolver {
         self.backends.contains_key(cold_tier_id)
     }
 
+    pub(super) fn has_any_backend(&self) -> bool {
+        !self.backends.is_empty()
+    }
+
     pub(super) fn backend_ids(&self) -> Vec<String> {
         self.backends.keys().cloned().collect()
     }

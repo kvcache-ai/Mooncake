@@ -2943,47 +2943,52 @@ impl StoreClient {
                 "executing hot remote RDMA before cold promotes"
             );
 
-            // Pin hot entries on their owners before RDMA to prevent eviction by
-            // concurrent cold restores from other TPs (Cold-vs-Hot race).
-            // Group by owner → one PinForRead gRPC per distinct owner.
             let mut hot_pins_by_owner: std::collections::BTreeMap<
                 ClientRuntimeId,
                 (ClientLease, Vec<String>, Vec<u64>),
             > = std::collections::BTreeMap::new();
-            for &index in &hot_remote_indices {
-                let owner = &resolved[index].replica.owner;
-                // Skip local entries (same runtime) — no gRPC needed
-                if *owner == self.lease.runtime {
-                    continue;
-                }
-                if !hot_pins_by_owner.contains_key(owner) {
-                    let lease_opt = self.metadata.get_client_lease(owner).ok().flatten();
-                    if let Some(lease) = lease_opt {
-                        hot_pins_by_owner.insert(owner.clone(), (lease, Vec::new(), Vec::new()));
-                    } else {
-                        // Can't resolve lease — skip pin for this owner
+            if cold_tier::cold_tier_enabled() {
+                // Pin only applies to restored staging-pool slots. Ordinary hot
+                // segment replicas have no staging slot to pin, so avoid adding
+                // metadata lookups and synchronous RPCs to the pure hot path.
+                for &index in &hot_remote_indices {
+                    if !cold_tier::has_materialized_cold_backing(&resolved[index].route) {
                         continue;
                     }
+                    let owner = &resolved[index].replica.owner;
+                    // Skip local entries (same runtime) — no gRPC needed
+                    if *owner == self.lease.runtime {
+                        continue;
+                    }
+                    if !hot_pins_by_owner.contains_key(owner) {
+                        let lease_opt = self.metadata.get_client_lease(owner).ok().flatten();
+                        if let Some(lease) = lease_opt {
+                            hot_pins_by_owner.insert(owner.clone(), (lease, Vec::new(), Vec::new()));
+                        } else {
+                            // Can't resolve lease — skip pin for this owner
+                            continue;
+                        }
+                    }
+                    if let Some(entry) = hot_pins_by_owner.get_mut(owner) {
+                        entry.1.push(resolved[index].replica.segment_name.0.clone());
+                        entry.2.push(resolved[index].replica.segment_offset);
+                    }
                 }
-                if let Some(entry) = hot_pins_by_owner.get_mut(owner) {
-                    entry.1.push(resolved[index].replica.segment_name.0.clone());
-                    entry.2.push(resolved[index].replica.segment_offset);
-                }
-            }
 
-            // Issue PinForRead RPCs (synchronous, must confirm before RDMA)
-            for (owner, (lease, ref names, ref offsets)) in &hot_pins_by_owner {
-                if let Err(e) =
-                    self.control_client
-                        .pin_for_read(lease, names.clone(), offsets.clone())
-                {
-                    debug!(
-                        runtime = %self.lease.runtime,
-                        owner = %owner,
-                        slots = names.len(),
-                        error = %e,
-                        "pin_for_read failed (proceeding without pin protection)"
-                    );
+                // Issue PinForRead RPCs (synchronous, must confirm before RDMA)
+                for (owner, (lease, ref names, ref offsets)) in &hot_pins_by_owner {
+                    if let Err(e) =
+                        self.control_client
+                            .pin_for_read(lease, names.clone(), offsets.clone())
+                    {
+                        debug!(
+                            runtime = %self.lease.runtime,
+                            owner = %owner,
+                            slots = names.len(),
+                            error = %e,
+                            "pin_for_read failed (proceeding without pin protection)"
+                        );
+                    }
                 }
             }
 
@@ -3710,7 +3715,6 @@ impl StoreClient {
 
         // Early return if there was nothing to do remotely at all.
         if hot_remote_indices.is_empty() && cold_success_count == 0 {
-            self.report_get_hits_best_effort(resolved);
             debug!(
                 runtime = %self.lease.runtime,
                 total_items = resolved.len(),
@@ -3738,7 +3742,6 @@ impl StoreClient {
             e
         })?;
         let checksum_ms = checksum_start.elapsed().as_millis() as u64;
-        self.report_get_hits_best_effort(resolved);
 
         let retry_ms = if backpressured_cold_indices_count > 0 {
             retry_start.elapsed().as_millis() as u64
@@ -4135,6 +4138,7 @@ impl StoreClient {
             if route.state != RouteState::Active {
                 continue;
             }
+            let mut reported_readable_replica = false;
             for replica in &route.replicas {
                 if !Self::replica_is_readable(
                     replica,
@@ -4144,6 +4148,7 @@ impl StoreClient {
                 ) {
                     continue;
                 }
+                reported_readable_replica = true;
                 if replica.owner == self.lease.runtime {
                     local_hits.insert(route.key.clone());
                 } else {
@@ -4152,6 +4157,20 @@ impl StoreClient {
                         .or_default()
                         .insert(route.key.clone());
                 }
+            }
+            if reported_readable_replica {
+                continue;
+            }
+            let Some(cold_backing) = cold_tier::materialized_cold_backing(route) else {
+                continue;
+            };
+            if cold_backing.owner == self.lease.runtime {
+                local_hits.insert(route.key.clone());
+            } else if readable_runtimes.contains(&cold_backing.owner) {
+                remote_hits
+                    .entry(cold_backing.owner)
+                    .or_default()
+                    .insert(route.key.clone());
             }
         }
         self.report_grouped_route_hits_best_effort(
