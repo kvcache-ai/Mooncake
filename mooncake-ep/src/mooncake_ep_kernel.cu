@@ -662,6 +662,10 @@ combine(void* combined_x, int32_t* active_ranks,
             float combined_values[kNumElemsPerInt4] = {0.0f};
             #pragma unroll
             for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
+                // Skip experts on inactive ranks (timed out during combine recv)
+                int expert_src_rank = reg_topk_idx[i] / num_local_experts;
+                if (!active_ranks[expert_src_rank])
+                    continue;
                 // Read from sources
                 auto rdma_buffer_type = reinterpret_cast<const int*>(reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
                 auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
