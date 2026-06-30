@@ -777,7 +777,7 @@ impl StoreClient {
                     }
                     Err(error) => return Err(error),
                 }
-                if cold_tier::cold_tier_enabled() {
+                if self.storage_owner.has_local_cold_tier_work() {
                     cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
                         self.storage_owner.as_ref(),
                     );
