@@ -1,0 +1,89 @@
+name: Publish Master Image
+
+# Manual trigger only: this installs an already-published PyPI wheel, so it must be
+# run after that version's wheel is published — avoids racing release.yaml, which builds
+# and publishes the wheel in the same v* tag event.
+on:
+  workflow_dispatch:
+    inputs:
+      mooncake_version:
+        description: "Published mooncake-transfer-engine version (also the image tag), e.g. 0.3.11.post1"
+        required: true
+        type: string
+      pip_index_url:
+        description: "pip index URL"
+        required: false
+        default: "https://pypi.org/simple"
+        type: string
+      tag_latest:
+        description: "Also tag :latest"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  publish-master:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android
+          df -h
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          # For an org access token (OAT), the login username is the org name
+          # (Docker: docker login --username <ORG_NAME>) — not a secret.
+          username: kvcacheai
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          REPO="docker.io/kvcacheai/mooncake"
+          TAGS="${REPO}:${{ inputs.mooncake_version }}"
+          if [ "${{ inputs.tag_latest }}" = "true" ]; then
+            TAGS="${TAGS}"$'\n'"${REPO}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/master.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            MOONCAKE_VERSION=${{ inputs.mooncake_version }}
+            PIP_INDEX_URL=${{ inputs.pip_index_url }}
+          tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Smoke test (amd64 import)
+        run: |
+          docker run --rm --platform linux/amd64 \
+            "docker.io/kvcacheai/mooncake:${{ inputs.mooncake_version }}" \
+            python3 -c "import mooncake.engine, mooncake.store; print('ok')"
