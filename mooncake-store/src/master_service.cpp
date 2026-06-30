@@ -190,6 +190,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      enable_hidden_type_aware_eviction_(
+          config.enable_hidden_type_aware_eviction),
+      hidden_memory_budget_ratio_(config.hidden_memory_budget_ratio),
+      hidden_memory_high_watermark_ratio_(
+          config.hidden_memory_high_watermark_ratio),
+      allow_hidden_in_global_eviction_(config.allow_hidden_in_global_eviction),
+      default_hidden_lease_ttl_(config.default_hidden_lease_ttl),
+      soft_pinned_hidden_lease_ttl_(config.soft_pinned_hidden_lease_ttl),
       nof_eviction_ratio_(config.nof_eviction_ratio),
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
@@ -296,6 +304,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << "Eviction high watermark ratio must be between 0.0 and 1.0, "
             << "current value: " << eviction_high_watermark_ratio_;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
+    if (hidden_memory_budget_ratio_ < 0.0 ||
+        hidden_memory_budget_ratio_ > 1.0) {
+        LOG(ERROR) << "Hidden memory budget ratio must be between 0.0 and 1.0, "
+                   << "current value: " << hidden_memory_budget_ratio_;
+        throw std::invalid_argument("Invalid hidden memory budget ratio");
+    }
+    if (hidden_memory_high_watermark_ratio_ < 0.0 ||
+        hidden_memory_high_watermark_ratio_ > 1.0) {
+        LOG(ERROR) << "Hidden memory high watermark ratio must be between "
+                      "0.0 and 1.0, current value: "
+                   << hidden_memory_high_watermark_ratio_;
+        throw std::invalid_argument(
+            "Invalid hidden memory high watermark ratio");
     }
 
     // Validate offload tuning knobs here (not only via gflags validator),
@@ -1064,6 +1086,38 @@ uint64_t MasterService::CompletedMemoryQuotaCharge(
            });
 }
 
+uint64_t MasterService::SelectLeaseTtl(
+    const ObjectMetadata& metadata,
+    const std::chrono::system_clock::time_point& now) const {
+    if (!enable_hidden_type_aware_eviction_ ||
+        metadata.data_type != ObjectDataType::HIDDEN_STATE) {
+        return default_kv_lease_ttl_;
+    }
+    auto now_copy = now;
+    if (metadata.IsSoftPinned(now_copy)) {
+        return soft_pinned_hidden_lease_ttl_;
+    }
+    return default_hidden_lease_ttl_;
+}
+
+long MasterService::CountHiddenObjects() {
+    long object_count = 0;
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            (void)tenant_id;
+            for (const auto& [key, metadata] : tenant_state.metadata) {
+                (void)key;
+                if (metadata.data_type != ObjectDataType::HIDDEN_STATE) {
+                    continue;
+                }
+                object_count++;
+            }
+        }
+    }
+    return object_count;
+}
+
 uint64_t MasterService::RequestedMemoryQuotaCharge(
     uint64_t value_length, const ReplicateConfig& config) const {
     const unsigned __int128 charge =
@@ -1587,6 +1641,14 @@ void MasterService::SyncCacheTotalAccounting(ObjectMetadata& metadata) {
     const bool has_memory_cache_replica =
         HasCompletedMemoryCacheReplica(metadata);
     const bool has_disk_cache_replica = HasCompletedDiskCacheReplica(metadata);
+    uint64_t hidden_allocated_bytes = 0;
+    if (metadata.data_type == ObjectDataType::HIDDEN_STATE) {
+        hidden_allocated_bytes =
+            static_cast<uint64_t>(metadata.size) *
+            metadata.CountReplicas([](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed();
+            });
+    }
 
     if (!metadata.memory_cache_total_accounted && has_memory_cache_replica) {
         MasterMetricManager::instance().inc_mem_cache_nums();
@@ -1604,6 +1666,18 @@ void MasterService::SyncCacheTotalAccounting(ObjectMetadata& metadata) {
         MasterMetricManager::instance().dec_file_cache_nums();
         metadata.disk_cache_total_accounted = false;
     }
+
+    if (hidden_allocated_bytes > metadata.hidden_allocated_accounted_bytes) {
+        MasterMetricManager::instance().inc_hidden_allocated_mem_size(
+            static_cast<int64_t>(hidden_allocated_bytes -
+                                 metadata.hidden_allocated_accounted_bytes));
+    } else if (metadata.hidden_allocated_accounted_bytes >
+               hidden_allocated_bytes) {
+        MasterMetricManager::instance().dec_hidden_allocated_mem_size(
+            static_cast<int64_t>(metadata.hidden_allocated_accounted_bytes -
+                                 hidden_allocated_bytes));
+    }
+    metadata.hidden_allocated_accounted_bytes = hidden_allocated_bytes;
 }
 
 void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
@@ -1615,13 +1689,20 @@ void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
         MasterMetricManager::instance().dec_file_cache_nums();
         metadata.disk_cache_total_accounted = false;
     }
+    if (metadata.hidden_allocated_accounted_bytes > 0) {
+        MasterMetricManager::instance().dec_hidden_allocated_mem_size(
+            static_cast<int64_t>(metadata.hidden_allocated_accounted_bytes));
+        metadata.hidden_allocated_accounted_bytes = 0;
+    }
 }
 
 void MasterService::RebuildCacheTotalAccounting() {
     MasterMetricManager::instance().reset_cache_total_nums();
+    MasterMetricManager::instance().reset_hidden_allocated_mem_size();
     for (auto& shard : metadata_shards_) {
         for (auto& tenant_entry : shard.tenants) {
             for (auto& metadata_entry : tenant_entry.second.metadata) {
+                metadata_entry.second.hidden_allocated_accounted_bytes = 0;
                 SyncCacheTotalAccounting(metadata_entry.second);
             }
         }
@@ -1766,13 +1847,15 @@ void MasterService::RebuildGroupRoutingIndex() {
 void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
                                        const std::string& key,
                                        const ObjectMetadata& metadata) const {
+    auto now = std::chrono::system_clock::now();
     if (!metadata.IsGrouped()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantLease(SelectLeaseTtl(metadata, now),
+                            default_kv_soft_pin_ttl_);
         return;
     }
 
-    bool needs_refresh = metadata.NeedsLeaseRefresh(default_kv_lease_ttl_,
-                                                    default_kv_soft_pin_ttl_);
+    bool needs_refresh = metadata.NeedsLeaseRefresh(
+        SelectLeaseTtl(metadata, now), default_kv_soft_pin_ttl_);
     if (!needs_refresh) {
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
         needs_refresh = groups_needing_lease_refresh_.find(MakeTenantScopedKey(
@@ -1785,19 +1868,21 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
 
     auto group_it = tenant_state.group_members.find(metadata.group_id);
     if (group_it == tenant_state.group_members.end()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantLease(SelectLeaseTtl(metadata, now),
+                            default_kv_soft_pin_ttl_);
         return;
     }
 
     for (const auto& member_key : group_it->second) {
         auto mit = tenant_state.metadata.find(member_key);
         if (mit != tenant_state.metadata.end()) {
-            mit->second.GrantLease(default_kv_lease_ttl_,
+            mit->second.GrantLease(SelectLeaseTtl(mit->second, now),
                                    default_kv_soft_pin_ttl_);
         }
     }
     if (group_it->second.find(key) == group_it->second.end()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantLease(SelectLeaseTtl(metadata, now),
+                            default_kv_soft_pin_ttl_);
     }
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
@@ -2010,7 +2095,8 @@ auto MasterService::ExistKey(const std::string& key,
         if (ts) {
             GrantLeaseForGroup(*ts, key, metadata);
         } else {
-            metadata.GrantLease(default_kv_lease_ttl_,
+            auto now = std::chrono::system_clock::now();
+            metadata.GrantLease(SelectLeaseTtl(metadata, now),
                                 default_kv_soft_pin_ttl_);
         }
         return true;
@@ -2478,7 +2564,8 @@ auto MasterService::GetReplicaList(const std::string& key,
         if (ts) {
             GrantLeaseForGroup(*ts, key, metadata);
         } else {
-            metadata.GrantLease(default_kv_lease_ttl_,
+            auto now = std::chrono::system_clock::now();
+            metadata.GrantLease(SelectLeaseTtl(metadata, now),
                                 default_kv_soft_pin_ttl_);
         }
 
@@ -2494,8 +2581,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             promotion_eligible = !any_memory && any_local_disk;
         }
 
+        auto now = std::chrono::system_clock::now();
         resp = GetReplicaListResponse(std::move(replica_list),
-                                      default_kv_lease_ttl_);
+                                      SelectLeaseTtl(metadata, now));
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -2607,8 +2695,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     }
                 }
 
+                auto now = std::chrono::system_clock::now();
                 results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), default_kv_lease_ttl_);
+                    std::move(replica_list), SelectLeaseTtl(metadata, now));
             }
         }
 
@@ -6714,6 +6803,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
     MasterMetricManager::instance().reset_cache_total_nums();
+    MasterMetricManager::instance().reset_hidden_allocated_mem_size();
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
@@ -7145,6 +7235,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // shards.
     size_t start_idx = RandomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const bool hidden_budget_eviction_enabled =
+        enable_hidden_type_aware_eviction_ && hidden_memory_budget_ratio_ < 1.0;
+    const bool exclude_hidden_from_global_eviction =
+        hidden_budget_eviction_enabled && !allow_hidden_in_global_eviction_;
+    auto is_global_memory_evictable = [&](const ObjectMetadata& metadata) {
+        return !(exclude_hidden_from_global_eviction &&
+                 metadata.data_type == ObjectDataType::HIDDEN_STATE);
+    };
 
     // ===== Phase 1: Parallel candidate collection =====
     // N threads each scan a batch of shards, collecting Candidates with
@@ -7174,6 +7272,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
                         if (it->second.IsHardPinned()) continue;
+                        if (!is_global_memory_evictable(it->second)) continue;
                         bool has_evictable = can_evict_replicas(it->second);
                         if (has_evictable) shard_evictable_count++;
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
@@ -7238,6 +7337,108 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
 
+    if (hidden_budget_eviction_enabled) {
+        const long hidden_object_count = CountHiddenObjects();
+        const int64_t global_capacity =
+            MasterMetricManager::instance().get_total_mem_capacity();
+        const int64_t hidden_used_bytes =
+            MasterMetricManager::instance().get_hidden_allocated_mem_size();
+        if (global_capacity > 0 && hidden_object_count > 0 &&
+            hidden_used_bytes > 0) {
+            const double hidden_used_ratio =
+                static_cast<double>(hidden_used_bytes) /
+                static_cast<double>(global_capacity);
+            const double hidden_high_watermark_ratio =
+                hidden_memory_budget_ratio_ *
+                hidden_memory_high_watermark_ratio_;
+            if (hidden_used_ratio > hidden_high_watermark_ratio) {
+                const double hidden_over_budget_ratio =
+                    hidden_used_ratio - hidden_high_watermark_ratio;
+                const double hidden_evict_ratio_target = std::min(
+                    1.0, std::max(eviction_ratio_,
+                                  hidden_over_budget_ratio + eviction_ratio_));
+                long hidden_target_evict_num = static_cast<long>(
+                    std::ceil(hidden_object_count * hidden_evict_ratio_target));
+
+                std::vector<Candidate> hidden_candidates;
+                for (size_t i = 0; i < kNumShards; i++) {
+                    const size_t shard_idx = (start_idx + i) % kNumShards;
+                    MetadataShardAccessorRW shard(this, shard_idx);
+                    for (const auto& [tenant_id, tenant_state] :
+                         shard->tenants) {
+                        for (const auto& [key, metadata] :
+                             tenant_state.metadata) {
+                            if (metadata.data_type !=
+                                    ObjectDataType::HIDDEN_STATE ||
+                                metadata.IsHardPinned() ||
+                                !metadata.IsLeaseExpired(now) ||
+                                !can_evict_replicas(metadata)) {
+                                continue;
+                            }
+                            hidden_candidates.push_back(
+                                {shard_idx, tenant_id, key,
+                                 metadata.lease_timeout});
+                        }
+                    }
+                }
+
+                hidden_target_evict_num =
+                    std::min(hidden_target_evict_num,
+                             static_cast<long>(hidden_candidates.size()));
+                if (hidden_target_evict_num > 0) {
+                    std::nth_element(
+                        hidden_candidates.begin(),
+                        hidden_candidates.begin() +
+                            (hidden_target_evict_num - 1),
+                        hidden_candidates.end(),
+                        [](const Candidate& a, const Candidate& b) {
+                            return a.lease_timeout < b.lease_timeout;
+                        });
+                    const auto hidden_target_timeout =
+                        hidden_candidates[hidden_target_evict_num - 1]
+                            .lease_timeout;
+
+                    for (const auto& c : hidden_candidates) {
+                        if (hidden_target_evict_num <= 0) {
+                            break;
+                        }
+                        if (c.lease_timeout > hidden_target_timeout) {
+                            continue;
+                        }
+                        MetadataShardAccessorRW shard(this, c.shard_idx);
+                        auto tenant_it = shard->tenants.find(c.tenant_id);
+                        if (tenant_it == shard->tenants.end()) continue;
+                        auto& tenant_state = tenant_it->second;
+                        auto it = tenant_state.metadata.find(c.key);
+                        if (it == tenant_state.metadata.end()) continue;
+                        if (it->second.data_type !=
+                                ObjectDataType::HIDDEN_STATE ||
+                            it->second.IsHardPinned() ||
+                            !it->second.IsLeaseExpired(now) ||
+                            !can_evict_replicas(it->second)) {
+                            continue;
+                        }
+                        auto evict_result = try_evict_group_or_object(
+                            c.tenant_id, c.key, it->second, shard, tenant_state,
+                            deferred_replicas,
+                            /*allow_soft_pinned=*/true);
+                        total_freed_size += evict_result.freed_bytes;
+                        evicted_count += evict_result.evicted_objects;
+                        hidden_target_evict_num -= evict_result.evicted_objects;
+                        if (!it->second.IsValid()) {
+                            EraseMetadata(tenant_state, it, c.tenant_id,
+                                          QuotaEraseMode::kFull, &shard);
+                        }
+                        if (tenant_state.Empty()) {
+                            shard->tenants.erase(tenant_it);
+                        }
+                        deferred_replicas.clear();
+                    }
+                }
+            }
+        }
+    }
+
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
         long ideal_evict_num =
@@ -7269,7 +7470,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto it = tenant_state.metadata.find(c.key);
                 if (it == tenant_state.metadata.end()) continue;
                 // Re-validate: state may have changed since Phase 1
-                if (!it->second.IsLeaseExpired(now) ||
+                if (!is_global_memory_evictable(it->second) ||
+                    !it->second.IsLeaseExpired(now) ||
                     it->second.IsSoftPinned(now) ||
                     !can_evict_replicas(it->second)) {
                     no_pin_objects.push_back(c.lease_timeout);
@@ -7331,6 +7533,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
                             if (!it->second.IsHardPinned() &&
+                                is_global_memory_evictable(it->second) &&
                                 it->second.IsLeaseExpired(now) &&
                                 it->second.lease_timeout <= target_timeout &&
                                 !it->second.IsSoftPinned(now) &&
@@ -7387,6 +7590,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
                             if (it->second.IsHardPinned() ||
+                                !is_global_memory_evictable(it->second) ||
                                 !it->second.IsLeaseExpired(now) ||
                                 !can_evict_replicas(it->second)) {
                                 ++it;

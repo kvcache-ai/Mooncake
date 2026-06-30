@@ -26,6 +26,9 @@ MasterMetricManager::MasterMetricManager()
           "Total memory bytes currently allocated across all segments"),
       mem_total_capacity_("master_total_capacity_bytes",
                           "Total memory capacity across all mounted segments"),
+      hidden_allocated_mem_size_(
+          "master_hidden_allocated_bytes",
+          "Total completed hidden memory replica bytes currently accounted"),
       mem_allocated_size_per_segment_(
           "segment_allocated_bytes",
           "Total memory bytes currently allocated of the segment", {"segment"}),
@@ -569,6 +572,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_put_revoke_failed_items_.inc(0);
 
     // Update Store-observed cache reuse metrics
+    hidden_allocated_mem_size_.inc(0);
     mem_cache_hit_nums_.inc(0);
     file_cache_hit_nums_.inc(0);
     valid_get_nums_.inc(0);
@@ -625,6 +629,22 @@ void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
 
 void MasterMetricManager::reset_total_mem_capacity() {
     mem_total_capacity_.reset();
+}
+
+void MasterMetricManager::inc_hidden_allocated_mem_size(int64_t val) {
+    hidden_allocated_mem_size_.inc(val);
+}
+
+void MasterMetricManager::dec_hidden_allocated_mem_size(int64_t val) {
+    hidden_allocated_mem_size_.dec(val);
+}
+
+void MasterMetricManager::reset_hidden_allocated_mem_size() {
+    hidden_allocated_mem_size_.reset();
+}
+
+int64_t MasterMetricManager::get_hidden_allocated_mem_size() {
+    return hidden_allocated_mem_size_.value();
 }
 
 int64_t MasterMetricManager::get_allocated_mem_size() {
