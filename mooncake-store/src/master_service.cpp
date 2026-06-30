@@ -4830,6 +4830,8 @@ auto MasterService::NotifyOffloadSuccess(
 
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+        bool handled_existing_object = false;
+        bool added_new_local_disk_replica = false;
         {
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
@@ -4855,23 +4857,67 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
+
+                    if (!obj_metadata.HasReplica(
+                            &Replica::fn_is_local_disk_replica)) {
+                        std::vector<Replica> replicas;
+                        replicas.emplace_back(std::move(replica));
+                        obj_metadata.AddReplicas(std::move(replicas));
+                        auto& shard = accessor.GetShard();
+                        shard.OnDiskReplicaAdded(obj_metadata);
+                        added_new_local_disk_replica = true;
+                    } else {
+                        obj_metadata.VisitReplicas(
+                            [client_id](const Replica& rep) {
+                                return rep.type() == ReplicaType::LOCAL_DISK &&
+                                       rep.get_descriptor()
+                                               .get_local_disk_descriptor()
+                                               .client_id == client_id;
+                            },
+                            [&replica](Replica& rep) {
+                                rep.get_descriptor()
+                                    .get_local_disk_descriptor()
+                                    .transport_endpoint =
+                                    replica.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .transport_endpoint;
+                                rep.get_descriptor()
+                                    .get_local_disk_descriptor()
+                                    .object_size =
+                                    replica.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .object_size;
+                            });
+                    }
+                    handled_existing_object = true;
                 }
             }
         }
 
-        auto res = AddReplica(client_id, request_object_id.user_key,
-                              request_object_id.tenant_id, replica);
-        if (!res) {
-            if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                continue;
+        if (!handled_existing_object) {
+            auto normalized_tenant_result =
+                NormalizeTenantIdForWrite(request_object_id.tenant_id);
+            if (!normalized_tenant_result) {
+                return tl::make_unexpected(normalized_tenant_result.error());
             }
-            LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                       << ", client_id=" << client_id
-                       << ", tenant_id=" << request_object_id.tenant_id
-                       << ", key=" << request_object_id.user_key;
-            return tl::make_unexpected(res.error());
+            const ObjectIdentity object_id{normalized_tenant_result.value(),
+                                           request_object_id.user_key};
+
+            auto res = AddReplica(client_id, object_id.user_key,
+                                  object_id.tenant_id, replica);
+            if (!res) {
+                if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    continue;
+                }
+                LOG(ERROR) << "Failed to add replica: error=" << res.error()
+                           << ", client_id=" << client_id
+                           << ", tenant_id=" << object_id.tenant_id
+                           << ", key=" << object_id.user_key;
+                return tl::make_unexpected(res.error());
+            }
         }
-        if (local_disk_segment && metadata.data_size > 0) {
+        if ((local_disk_segment || added_new_local_disk_replica) &&
+            metadata.data_size > 0) {
             local_disk_segment->ssd_used_bytes.fetch_add(
                 metadata.data_size, std::memory_order_relaxed);
         }
