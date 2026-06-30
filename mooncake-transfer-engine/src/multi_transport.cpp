@@ -461,17 +461,31 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     // host aux/metadata buffers via rdma). Route each request to the transport
     // that owns the buffer covering the target address. When a buffer is
     // registered under more than one protocol (the device KV pool is registered
-    // by both rdma and hip), prefer hip for intra-node XGMI throughput.
+    // by both rdma and hip), pick the highest-performance transport by a fixed
+    // priority instead of relying on buffer registration order.
     if (proto.find(',') != std::string::npos) {
+        auto protocol_priority = [](const std::string &p) {
+            if (p == "hip") return 4;
+            if (p == "cxl") return 3;
+            if (p == "rdma") return 2;
+            if (p == "tcp") return 1;
+            return 0;
+        };
         std::string chosen;
+        int chosen_priority = -1;
         for (const auto &buffer : target_segment_desc->buffers) {
-            if (entry.target_offset >= buffer.addr &&
-                entry.target_offset < buffer.addr + buffer.length) {
-                if (buffer.protocol == "hip") {
-                    chosen = "hip";
-                    break;
+            // CXL buffers locate via offset + cxl_base_addr; all other
+            // protocols use the absolute virtual address in buffer.addr.
+            uint64_t start = (buffer.protocol == "cxl")
+                                 ? buffer.offset + target_segment_desc->cxl_base_addr
+                                 : buffer.addr;
+            if (entry.target_offset >= start &&
+                entry.target_offset < start + buffer.length) {
+                int priority = protocol_priority(buffer.protocol);
+                if (priority > chosen_priority) {
+                    chosen = buffer.protocol;
+                    chosen_priority = priority;
                 }
-                if (chosen.empty()) chosen = buffer.protocol;
             }
         }
         if (chosen.empty()) {

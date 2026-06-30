@@ -429,16 +429,21 @@ int HipTransport::install(std::string& local_server_name,
 
     // Compose with any local segment another transport (e.g. RDMA) already
     // installed instead of overwriting it, so a single-node segment can
-    // advertise both protocols (e.g. "rdma,hip"). Mirrors
-    // RdmaTransport::allocateLocalSegmentID.
-    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    if (!desc) desc = std::make_shared<SegmentDesc>();
+    // advertise both protocols (e.g. "rdma,hip"). Work on a copy (the map may
+    // hand back a descriptor other threads are reading) and publish the new
+    // one atomically via addLocalSegment.
+    auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
+    if (old_desc) *desc = *old_desc;
 
     desc->name = local_server_name_;
 #ifdef ENABLE_MULTI_PROTOCOL
-    if (!desc->protocol.empty()) desc->protocol += ",";
-    desc->protocol += "hip";
+    if (desc->protocol.empty()) {
+        desc->protocol = "hip";
+    } else if (desc->protocol.find("hip") == std::string::npos) {
+        desc->protocol += ",hip";
+    }
 #else
     desc->protocol = "hip";
 #endif
