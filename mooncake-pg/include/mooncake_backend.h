@@ -158,6 +158,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
     static void setDeviceFilter(std::vector<std::string> filters) {
+        deviceFilters_ = filters;
         engine_->setWhitelistFilters(std::move(filters));
     }
 
@@ -213,13 +214,16 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void joinGroup();
 
    private:
+    void ensureCudaDevice() const;
     void waitForExtensionState();
     void publishLocalPeerMetadata();
     void maybeInitDirectP2pAllgather();
+    void maybeInitHierarchicalAllReduceWorkspace();
     void setLocalOnlyActiveRanks();
     void syncActiveRanksTensor();
 
     static TransferEngine* engine_;
+    static std::vector<std::string> deviceFilters_;
     std::shared_ptr<MooncakeWorker> worker_;
     static bool engineInitialized_;
     static int backendIndex_;
@@ -230,6 +234,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     static TransferEngine* externalEngine_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
+    int cudaDeviceIndex_{-1};
     static std::string hostIp_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
@@ -242,7 +247,21 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     uint32_t* directP2pDeviceSequenceSlots_{nullptr};
     uint32_t directP2pDeviceSequenceSlotCursor_{0};
     std::unique_ptr<device::P2pTransport> directP2pTransport_;
+    std::unique_ptr<device::RdmaTransport> directRdmaTransport_;
+    bool directRdmaReady_{false};
+    int directRdmaQpsPerRank_{1};
     std::vector<void*> directP2pPeerPtrsHost_;
+    void* hierarchicalAllReduceBuffer_{nullptr};
+    size_t hierarchicalAllReduceBufferBytes_{0};
+    std::unique_ptr<device::P2pTransport> hierarchicalAllReduceP2pTransport_;
+    std::unique_ptr<device::RdmaTransport> hierarchicalAllReduceRdmaTransport_;
+    bool hierarchicalAllReduceWorkspaceReady_{false};
+    bool hierarchicalAllReduceRdmaReady_{false};
+    int hierarchicalAllReduceRdmaQpsPerRank_{1};
+    uint32_t hierarchicalAllReduceSequence_{1};
+    uint32_t* hierarchicalAllReduceDeviceSequenceCounter_{nullptr};
+    uint32_t* hierarchicalAllReduceDeviceSequenceSlots_{nullptr};
+    uint32_t hierarchicalAllReduceDeviceSequenceSlotCursor_{0};
     struct DirectP2pOutputPeerCache {
         void** peer_ptrs_dev{nullptr};
         std::vector<void*> peer_ptrs_host;

@@ -99,6 +99,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         num_ranks_ = num_ranks;
         num_qps_ = num_qps;
 
+        int cuda_device = -1;
+        cudaGetDevice(&cuda_device);
         std::string nic =
             device_name.empty() ? autoDetectNic(device_filter_) : device_name;
         if (nic.empty()) {
@@ -180,6 +182,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         LOG(INFO) << "[EP IBGDA] Initialized on " << nic
+                  << " for cuda_device=" << cuda_device
                   << " (gid_index=" << gid_index_ << ", roce=" << is_roce_
                   << ")";
         return 0;
