@@ -759,6 +759,30 @@ Note that the HTTP metadata server is designed for single-node deployments and d
 
 For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../getting_started/observability.md).
 
+## Chunked Read Infrastructure
+
+Mooncake Store supports chunked (streaming) reads where a large transfer is split into independently trackable chunks. This enables callers to overlap transfer with compute by consuming completed chunks before the entire read finishes.
+
+### Core Components
+
+- **`ChunkedReadSession`** (internal, `transfer_task.cpp`): Manages a batch of transfer requests split into chunk groups. Uses futex-based waiting for low-latency per-chunk completion notification and windowed submission to control concurrency.
+
+- **`ChunkedReadHandle`** (public, `transfer_task.h`): Thin handle wrapping a shared `ChunkedReadSession`. Exposes:
+  - `num_chunks()` — total chunk count
+  - `is_chunk_ready(i)` — non-blocking poll
+  - `completed_count()` — count of finished chunks
+  - `wait_chunk(i)` — block until chunk *i* completes
+  - `wait_all()` — block until all chunks complete
+  - `make_precompleted(n, error_code)` — factory for already-done sessions (used in fast paths and tests)
+
+### Design Notes
+
+- **Futex-based notification**: `ChunkedReadSession` uses Linux futex (`FUTEX_WAIT_PRIVATE` / `FUTEX_WAKE_PRIVATE`) on `BatchDesc::finished_task_count` for efficient per-chunk wake-up without condition variable overhead.
+
+- **Windowed submission**: Chunks are submitted to the transfer engine in windows (controlled by `window_size_`) rather than all at once, preventing resource exhaustion for large transfers.
+
+- **Precompleted fast path**: When all data is already available (e.g., local memcpy completed synchronously), a precompleted session avoids batch allocation and futex setup entirely.
+
 ## Mooncake Store Python API
 
 **Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)

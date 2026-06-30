@@ -1,12 +1,19 @@
 #include "transfer_task.h"
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <cerrno>
+#include <climits>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -805,7 +812,7 @@ void TransferEngineOperationState::wait_for_completion() {
         // avoid missed notifications. The predicate is re-checked under the
         // lock. Under the mutex, relaxed is sufficient; the mutex acquire
         // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        std::unique_lock<std::mutex> lock(batch_desc.lifecycle_mutex);
         const int64_t elapsed_milliseconds =
             getCurrentTimeInMilli() - start_ts_;
         if (elapsed_milliseconds < timeout_milliseconds) {
@@ -818,7 +825,7 @@ void TransferEngineOperationState::wait_for_completion() {
                         std::memory_order_relaxed);
                 });
         }
-    }  // Explicitly release completion_mutex before acquiring mutex_
+    }  // Explicitly release lifecycle_mutex before acquiring mutex_
 
     // Once completion is observed, read failure flag.
     if (completed) {
@@ -1425,6 +1432,373 @@ void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,
     } else if (op_code == TransferRequest::WRITE) {
         transfer_metric_->total_write_bytes.inc(total_bytes);
     }
+}
+
+// ---------------------------------------------------------------------------
+// ChunkedReadSession — per-chunk completion tracking for streaming reads
+// ---------------------------------------------------------------------------
+
+constexpr int64_t kChunkedReadTimeoutSeconds = 60;
+
+class ChunkedReadSession {
+   public:
+    ChunkedReadSession(size_t num_chunks, ErrorCode result)
+        : num_chunks_(num_chunks),
+          chunk_done_(num_chunks, 1),
+          chunk_results_(num_chunks, result),
+          completed_count_(num_chunks),
+          submitted_chunks_(num_chunks),
+          sealed_(true),
+          precompleted_(true) {}
+
+    ChunkedReadSession(TransferEngine& engine, BatchID batch_id,
+                       std::vector<std::vector<TransferRequest>> chunk_groups,
+                       size_t initial_window, std::string submit_context)
+        : engine_(&engine),
+          batch_id_(batch_id),
+          num_chunks_(chunk_groups.size()),
+          chunk_groups_(std::move(chunk_groups)),
+          chunk_done_(num_chunks_, 0),
+          chunk_results_(num_chunks_, ErrorCode::OK),
+          chunk_task_offsets_(num_chunks_ + 1, 0),
+          completed_count_(0),
+          window_size_(std::max<size_t>(1, initial_window)),
+          submit_context_(std::move(submit_context)) {
+        for (size_t i = 0; i < num_chunks_; ++i) {
+            chunk_task_offsets_[i + 1] =
+                chunk_task_offsets_[i] + chunk_groups_[i].size();
+        }
+    }
+
+    ~ChunkedReadSession() { cleanup(); }
+    ChunkedReadSession(const ChunkedReadSession&) = delete;
+    ChunkedReadSession& operator=(const ChunkedReadSession&) = delete;
+
+    bool submit_initial_window() {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        if (precompleted_) return true;
+        maybe_submit_more(window_size_);
+        return !submit_failed_;
+    }
+
+    size_t num_chunks() const { return num_chunks_; }
+
+    bool is_chunk_ready(size_t chunk_index) {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        if (chunk_index >= num_chunks_) return false;
+        return poll_chunk(chunk_index);
+    }
+
+    size_t completed_count() {
+        return completed_count_.load(std::memory_order_relaxed);
+    }
+
+    ErrorCode wait_chunk(size_t chunk_index) {
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
+        if (chunk_index >= num_chunks_) return ErrorCode::INVALID_PARAMS;
+        if (precompleted_) return chunk_results_[chunk_index];
+        maybe_submit_more(chunk_index + 1);
+        if (poll_chunk(chunk_index)) return chunk_results_[chunk_index];
+        if (!futex_wait_until_chunk(chunk_index, state_lock)) {
+            if (!poll_chunk(chunk_index)) {
+                mark_chunk_done(chunk_index, ErrorCode::TRANSFER_FAIL);
+                seal_batch();
+            }
+        }
+        return chunk_results_[chunk_index];
+    }
+
+    ErrorCode wait_all() {
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
+        return wait_all_locked(state_lock);
+    }
+
+   private:
+    ErrorCode wait_all_locked(std::unique_lock<std::mutex>& state_lock) {
+        if (precompleted_) return aggregate_result();
+        maybe_submit_more(window_size_);
+
+        auto* futex_word = get_futex_word();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(kChunkedReadTimeoutSeconds);
+        size_t current = completed_count_.load(std::memory_order_relaxed);
+        while (current < num_chunks_) {
+            maybe_submit_more(current + 1);
+            drain_completed_chunks(chunk_task_offsets_[submitted_chunks_.load(
+                                       std::memory_order_acquire)],
+                                   true);
+            current = completed_count_.load(std::memory_order_relaxed);
+            if (current >= num_chunks_) break;
+            uint32_t snapshot = finished_task_count_snapshot();
+            size_t observed = observed_batch_finished_count(snapshot);
+            if (observed > chunk_task_offsets_[current]) {
+                size_t next = drain_completed_chunks(observed);
+                if (next > current) {
+                    current = next;
+                    continue;
+                }
+            }
+            state_lock.unlock();
+            bool waited = futex_wait_once(futex_word, snapshot, deadline);
+            state_lock.lock();
+            if (!waited) break;
+            current = completed_count_.load(std::memory_order_relaxed);
+        }
+        drain_completed_chunks(observed_batch_finished_count(), true);
+        if (completed_count_.load(std::memory_order_relaxed) != num_chunks_) {
+            mark_remaining_chunks_failed();
+        }
+        seal_batch();
+        return aggregate_result();
+    }
+
+   private:
+    uint32_t* get_futex_word() const {
+        return Transport::toBatchDesc(batch_id_)
+            .finished_task_count_futex_word();
+    }
+
+    bool futex_wait_once(
+        uint32_t* futex_word, uint32_t snapshot,
+        const std::chrono::steady_clock::time_point& deadline) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline - now);
+        struct timespec ts;
+        ts.tv_sec = ns.count() / 1000000000LL;
+        ts.tv_nsec = ns.count() % 1000000000LL;
+        ::syscall(SYS_futex, futex_word, FUTEX_WAIT_PRIVATE, snapshot, &ts,
+                  nullptr, 0);
+        return true;
+    }
+
+    bool futex_wait_until_chunk(size_t chunk_index,
+                                std::unique_lock<std::mutex>& state_lock) {
+        auto* futex_word = get_futex_word();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(kChunkedReadTimeoutSeconds);
+        while (true) {
+            maybe_submit_more(chunk_index + 1);
+            uint32_t snapshot = finished_task_count_snapshot();
+            size_t observed = observed_batch_finished_count(snapshot);
+            if (observed > completed_count_.load(std::memory_order_relaxed)) {
+                drain_completed_chunks(observed);
+                if (chunk_done_[chunk_index]) return true;
+            }
+            if (materialize_chunk_result(chunk_index)) return true;
+            state_lock.unlock();
+            bool waited = futex_wait_once(futex_word, snapshot, deadline);
+            state_lock.lock();
+            if (!waited) {
+                if (poll_chunk(chunk_index)) return true;
+                return false;
+            }
+        }
+    }
+
+    void cleanup() {
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
+        if (precompleted_ || !engine_ || batch_id_ == INVALID_BATCH_ID) return;
+        wait_all_locked(state_lock);
+        Status s = engine_->freeBatchID(batch_id_);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to free chunked read batch " << batch_id_
+                       << ": " << s.message();
+            return;
+        }
+        chunk_groups_.clear();
+        engine_ = nullptr;
+        batch_id_ = INVALID_BATCH_ID;
+    }
+
+    void maybe_submit_more(size_t required_chunks) {
+        if (precompleted_) return;
+        if (sealed_) return;
+        size_t submitted = submitted_chunks_.load(std::memory_order_acquire);
+        size_t target = std::min(
+            num_chunks_, std::max(required_chunks, submitted + window_size_));
+        if (target <= submitted) return;
+
+        std::vector<TransferRequest> window;
+        size_t count = 0;
+        for (size_t i = submitted; i < target; ++i)
+            count += chunk_groups_[i].size();
+        window.reserve(count);
+        for (size_t i = submitted; i < target; ++i)
+            window.insert(window.end(), chunk_groups_[i].begin(),
+                          chunk_groups_[i].end());
+
+        Status s = engine_->submitTransfer(batch_id_, window);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to submit " << submit_context_
+                       << " window for batch " << batch_id_ << ": "
+                       << s.message();
+            submit_failed_ = true;
+            for (size_t i = submitted; i < num_chunks_; ++i)
+                mark_chunk_done(i, ErrorCode::TRANSFER_FAIL);
+            submitted_chunks_.store(num_chunks_, std::memory_order_release);
+            seal_batch_locked();
+            return;
+        }
+        submitted_chunks_.store(target, std::memory_order_release);
+        if (target == num_chunks_) seal_batch_locked();
+    }
+
+    void seal_batch() {
+        if (precompleted_) return;
+        seal_batch_locked();
+    }
+
+    void seal_batch_locked() {
+        if (sealed_) return;
+        auto& bd = Transport::toBatchDesc(batch_id_);
+        {
+            std::lock_guard<std::mutex> lk(bd.lifecycle_mutex);
+            bd.publish_completion_if_ready_locked();
+        }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        bd.completion_cv.notify_all();
+#endif
+        sealed_ = true;
+    }
+
+    uint32_t finished_task_count_snapshot() const {
+        return Transport::toBatchDesc(batch_id_)
+            .finished_task_count_load_acquire();
+    }
+
+    size_t observed_batch_finished_count() const {
+        return observed_batch_finished_count(finished_task_count_snapshot());
+    }
+
+    size_t observed_batch_finished_count(uint32_t snapshot) const {
+        size_t submitted = submitted_chunks_.load(std::memory_order_acquire);
+        return std::min(static_cast<size_t>(snapshot),
+                        chunk_task_offsets_[submitted]);
+    }
+
+    void mark_chunk_done(size_t i, ErrorCode result) {
+        if (chunk_done_[i]) return;
+        chunk_done_[i] = 1;
+        chunk_results_[i] = result;
+        completed_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool materialize_chunk_result(size_t i) {
+        if (chunk_done_[i]) return true;
+        if (i >= submitted_chunks_.load(std::memory_order_acquire))
+            return false;
+        bool all_done = true;
+        for (size_t task_id = chunk_task_offsets_[i];
+             task_id < chunk_task_offsets_[i + 1]; ++task_id) {
+            TransferStatus status;
+            Status s = engine_->getTransferStatus(batch_id_, task_id, status);
+            if (!s.ok()) {
+                mark_chunk_done(i, ErrorCode::TRANSFER_FAIL);
+                return true;
+            }
+            switch (status.s) {
+                case TransferStatusEnum::COMPLETED:
+                    break;
+                case TransferStatusEnum::FAILED:
+                case TransferStatusEnum::CANCELED:
+                case TransferStatusEnum::INVALID:
+                case TransferStatusEnum::TIMEOUT:
+                    mark_chunk_done(i, ErrorCode::TRANSFER_FAIL);
+                    return true;
+                default:
+                    all_done = false;
+            }
+        }
+        if (!all_done) return false;
+        mark_chunk_done(i, ErrorCode::OK);
+        return true;
+    }
+
+    size_t drain_completed_chunks(size_t observed, bool force = false) {
+        size_t completed = completed_count_.load(std::memory_order_relaxed);
+        if (completed >= num_chunks_) return completed;
+        if (observed <= completed && !force) return completed;
+        size_t submitted = submitted_chunks_.load(std::memory_order_acquire);
+        for (size_t idx = next_drain_idx_; idx < submitted; ++idx) {
+            if (!chunk_done_[idx]) materialize_chunk_result(idx);
+        }
+        while (next_drain_idx_ < submitted && chunk_done_[next_drain_idx_]) {
+            ++next_drain_idx_;
+        }
+        return completed_count_.load(std::memory_order_relaxed);
+    }
+
+    void mark_remaining_chunks_failed() {
+        for (size_t i = 0; i < num_chunks_; ++i)
+            if (!chunk_done_[i]) mark_chunk_done(i, ErrorCode::TRANSFER_FAIL);
+    }
+
+    ErrorCode aggregate_result() const {
+        for (size_t i = 0; i < num_chunks_; ++i)
+            if (chunk_results_[i] != ErrorCode::OK) return chunk_results_[i];
+        return ErrorCode::OK;
+    }
+
+    bool poll_chunk(size_t chunk_index) {
+        if (chunk_done_[chunk_index]) return true;
+        maybe_submit_more(chunk_index + 1);
+        size_t observed = observed_batch_finished_count();
+        if (observed > completed_count_.load(std::memory_order_relaxed))
+            drain_completed_chunks(observed);
+        if (chunk_done_[chunk_index]) return true;
+        return materialize_chunk_result(chunk_index);
+    }
+
+    TransferEngine* engine_ = nullptr;
+    BatchID batch_id_ = INVALID_BATCH_ID;
+    size_t num_chunks_ = 0;
+    std::vector<std::vector<TransferRequest>> chunk_groups_;
+    std::vector<uint8_t> chunk_done_;
+    std::vector<ErrorCode> chunk_results_;
+    std::vector<size_t> chunk_task_offsets_;
+    std::atomic<size_t> completed_count_{0};
+    std::atomic<size_t> submitted_chunks_{0};
+    size_t window_size_ = 1;
+    size_t next_drain_idx_ = 0;
+    bool sealed_ = false;
+    bool precompleted_ = false;
+    bool submit_failed_ = false;
+    std::string submit_context_;
+    // Protects session state; wait helpers release it while sleeping on futex.
+    std::mutex state_mutex_;
+};
+
+// ChunkedReadHandle — thin wrapper over ChunkedReadSession
+
+ChunkedReadHandle::ChunkedReadHandle(
+    std::shared_ptr<ChunkedReadSession> session)
+    : session_(std::move(session)) {}
+ChunkedReadHandle::~ChunkedReadHandle() = default;
+ChunkedReadHandle::ChunkedReadHandle(ChunkedReadHandle&&) noexcept = default;
+ChunkedReadHandle& ChunkedReadHandle::operator=(ChunkedReadHandle&&) noexcept =
+    default;
+size_t ChunkedReadHandle::num_chunks() const {
+    return session_ ? session_->num_chunks() : 0;
+}
+bool ChunkedReadHandle::is_chunk_ready(size_t i) {
+    return session_ ? session_->is_chunk_ready(i) : false;
+}
+size_t ChunkedReadHandle::completed_count() {
+    return session_ ? session_->completed_count() : 0;
+}
+ErrorCode ChunkedReadHandle::wait_chunk(size_t i) {
+    return session_ ? session_->wait_chunk(i) : ErrorCode::INVALID_PARAMS;
+}
+ErrorCode ChunkedReadHandle::wait_all() {
+    return session_ ? session_->wait_all() : ErrorCode::INVALID_PARAMS;
+}
+
+ChunkedReadHandle ChunkedReadHandle::make_precompleted(size_t num_chunks,
+                                                       ErrorCode result) {
+    return ChunkedReadHandle(
+        std::make_shared<ChunkedReadSession>(num_chunks, result));
 }
 
 }  // namespace mooncake
