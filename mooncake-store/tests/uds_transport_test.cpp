@@ -5,10 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <fcntl.h>
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace mooncake {
@@ -169,21 +169,24 @@ TEST(UdsTransportTest, ConnectFailureReturnsPromptlyWithShortTimeout) {
     EXPECT_NE(connection_result.error().find(socket_name), std::string::npos);
 }
 
-TEST(UdsTransportTest, ConnectRestoresBlockingMode) {
-    UdsAcceptor acceptor(testSocketPath("blocking"));
+TEST(UdsTransportTest, ConnectClearsSendTimeout) {
+    UdsAcceptor acceptor(testSocketPath("send_timeout"));
     acceptor.registerHandler([](UdsConnection &) {});
     auto start_result = acceptor.start();
     ASSERT_TRUE(start_result) << start_result.error();
 
-    UdsConnector connector(testSocketPath("blocking"),
+    UdsConnector connector(testSocketPath("send_timeout"),
                            std::chrono::milliseconds(10));
     auto connection_result = connector.connect();
     ASSERT_TRUE(connection_result) << connection_result.error();
     auto connection = std::move(connection_result.value());
 
-    int flags = fcntl(connection->fd(), F_GETFL, 0);
-    ASSERT_GE(flags, 0);
-    EXPECT_EQ(flags & O_NONBLOCK, 0);
+    timeval tv;
+    socklen_t tv_len = sizeof(tv);
+    ASSERT_EQ(
+        getsockopt(connection->fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, &tv_len), 0);
+    EXPECT_EQ(tv.tv_sec, 0);
+    EXPECT_EQ(tv.tv_usec, 0);
 
     acceptor.stop();
 }

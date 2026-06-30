@@ -5,12 +5,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <limits>
 #include <string>
 #include <utility>
 
-#include <fcntl.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -36,51 +33,18 @@ tl::expected<void, std::string> makeAbstractAddress(
     return {};
 }
 
-tl::expected<void, std::string> setSocketBlocking(int fd, bool blocking) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) {
+tl::expected<void, std::string> setSendTimeout(
+    int fd, std::chrono::milliseconds timeout) {
+    timeval tv = {
+        .tv_sec =
+            std::chrono::duration_cast<std::chrono::seconds>(timeout).count(),
+        .tv_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+                       timeout % std::chrono::seconds(1))
+                       .count(),
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
         return tl::make_unexpected(
-            errnoMessage("Failed to get UDS socket flags"));
-    }
-
-    int new_flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
-    if (fcntl(fd, F_SETFL, new_flags) < 0) {
-        return tl::make_unexpected(
-            errnoMessage("Failed to set UDS socket flags"));
-    }
-    return {};
-}
-
-tl::expected<void, std::string> waitForConnect(
-    int sock_fd, const std::string &socket_name,
-    std::chrono::milliseconds connect_timeout) {
-    pollfd pfd = {.fd = sock_fd, .events = POLLOUT, .revents = 0};
-    int timeout_ms = static_cast<int>(connect_timeout.count());
-    int poll_result = 0;
-    do {
-        poll_result = poll(&pfd, 1, timeout_ms);
-    } while (poll_result < 0 && errno == EINTR);
-
-    if (poll_result == 0) {
-        return tl::make_unexpected("Timed out connecting UDS socket '" +
-                                   socket_name + "'");
-    }
-    if (poll_result < 0) {
-        return tl::make_unexpected(
-            errnoMessage("Failed to poll UDS socket '" + socket_name + "'"));
-    }
-
-    int socket_error = 0;
-    socklen_t socket_error_len = sizeof(socket_error);
-    if (getsockopt(sock_fd, SOL_SOCKET, SO_ERROR, &socket_error,
-                   &socket_error_len) < 0) {
-        return tl::make_unexpected(
-            errnoMessage("Failed to get UDS socket connect result"));
-    }
-    if (socket_error != 0) {
-        return tl::make_unexpected("Failed to connect UDS socket '" +
-                                   socket_name +
-                                   "': " + strerror(socket_error));
+            errnoMessage("Failed to set UDS send timeout"));
     }
     return {};
 }
@@ -89,9 +53,6 @@ tl::expected<int, std::string> createConnectedSocket(
     const std::string &socket_name, std::chrono::milliseconds connect_timeout) {
     if (connect_timeout.count() <= 0) {
         return tl::make_unexpected("UDS connect timeout must be positive");
-    }
-    if (connect_timeout.count() > std::numeric_limits<int>::max()) {
-        return tl::make_unexpected("UDS connect timeout is too large");
     }
 
     int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -107,32 +68,27 @@ tl::expected<int, std::string> createConnectedSocket(
         return tl::make_unexpected(addr_result.error());
     }
 
-    auto nonblocking_result = setSocketBlocking(sock_fd, false);
-    if (!nonblocking_result) {
+    auto timeout_result = setSendTimeout(sock_fd, connect_timeout);
+    if (!timeout_result) {
         close(sock_fd);
-        return tl::make_unexpected(nonblocking_result.error());
+        return tl::make_unexpected(timeout_result.error());
     }
 
     if (::connect(sock_fd, reinterpret_cast<sockaddr *>(&addr), addr_len) < 0) {
-        if (errno != EINPROGRESS && errno != EAGAIN) {
-            auto error = errnoMessage("Failed to connect UDS socket '" +
-                                      socket_name + "'");
-            close(sock_fd);
-            return tl::make_unexpected(error);
-        }
-
-        auto connect_result =
-            waitForConnect(sock_fd, socket_name, connect_timeout);
-        if (!connect_result) {
-            close(sock_fd);
-            return tl::make_unexpected(connect_result.error());
-        }
+        auto error =
+            errno == EAGAIN || errno == EINPROGRESS
+                ? "Timed out connecting UDS socket '" + socket_name + "'"
+                : errnoMessage("Failed to connect UDS socket '" + socket_name +
+                               "'");
+        close(sock_fd);
+        return tl::make_unexpected(error);
     }
 
-    auto blocking_result = setSocketBlocking(sock_fd, true);
-    if (!blocking_result) {
+    auto clear_timeout_result =
+        setSendTimeout(sock_fd, std::chrono::milliseconds(0));
+    if (!clear_timeout_result) {
         close(sock_fd);
-        return tl::make_unexpected(blocking_result.error());
+        return tl::make_unexpected(clear_timeout_result.error());
     }
 
     return sock_fd;
