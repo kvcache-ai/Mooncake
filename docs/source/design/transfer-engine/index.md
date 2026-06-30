@@ -122,6 +122,13 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
       go run . --addr=:8080
       ```
 
+    :::{toctree}
+    :maxdepth: 1
+
+    metadata
+    :::
+
+
 2. **Start the target node.**
     ```bash
     ./transfer_engine_bench --mode=target \
