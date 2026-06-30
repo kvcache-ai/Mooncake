@@ -1341,9 +1341,9 @@ void RegisterRpcService(
     server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
         &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::PullDfsOffloadTasks>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::PullDfsOffloadTasks>(
+            &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
         &wrapped_master_service);
     server.register_handler<

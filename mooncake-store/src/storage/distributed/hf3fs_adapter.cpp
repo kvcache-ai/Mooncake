@@ -380,8 +380,7 @@ tl::expected<std::vector<std::string>, ErrorCode> Hf3fsAdapter::ListFiles(
     return result;
 }
 
-tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFile(
-    const std::string& path) {
+tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFile(const std::string& path) {
     int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
@@ -422,8 +421,9 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::PreallocateFile(
     return {};
 }
 
-tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(
-    int fd, const iovec* iov, int iovcnt, int64_t offset) {
+tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(int fd, const iovec* iov,
+                                                      int iovcnt,
+                                                      int64_t offset) {
     if (fd < 0 || offset < 0 || iovcnt < 0 || (iovcnt > 0 && iov == nullptr)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -460,8 +460,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(
                 iov_off = 0;
                 continue;
             }
-            size_t n = std::min(chunk - copied,
-                                iov[iov_idx].iov_len - iov_off);
+            size_t n = std::min(chunk - copied, iov[iov_idx].iov_len - iov_off);
             memcpy(dest + copied,
                    static_cast<char*>(iov[iov_idx].iov_base) + iov_off, n);
             copied += n;
@@ -493,8 +492,9 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(
     return total_written;
 }
 
-tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(
-    int fd, iovec* iov, int iovcnt, int64_t offset) {
+tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(int fd, iovec* iov,
+                                                     int iovcnt,
+                                                     int64_t offset) {
     if (fd < 0 || offset < 0 || iovcnt < 0 || (iovcnt > 0 && iov == nullptr)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -544,8 +544,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(
                 continue;
             }
             size_t n = std::min(to_copy, iov[iov_idx].iov_len - iov_off);
-            memcpy(static_cast<char*>(iov[iov_idx].iov_base) + iov_off, src,
-                   n);
+            memcpy(static_cast<char*>(iov[iov_idx].iov_base) + iov_off, src, n);
             src += n;
             to_copy -= n;
             total_read += n;

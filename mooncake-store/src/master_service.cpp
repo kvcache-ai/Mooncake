@@ -464,8 +464,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 }
 
 void MasterService::InitDfsAllocatorFromEnvironment() {
-    enable_dfs_ = GetEnvOr<bool>(
-        "MOONCAKE_ENABLE_DFS", GetEnvOr<bool>("MOONCAKE_DFS_ENABLED", false));
+    enable_dfs_ = GetEnvOr<bool>("MOONCAKE_ENABLE_DFS",
+                                 GetEnvOr<bool>("MOONCAKE_DFS_ENABLED", false));
     if (!enable_dfs_) return;
 
     const bool single_tenant =
@@ -479,8 +479,7 @@ void MasterService::InitDfsAllocatorFromEnvironment() {
 
     const std::string root_dir = GetEnvStringOr(
         "MOONCAKE_DFS_ROOT_DIR",
-        GetEnvStringOr("MOONCAKE_DISTRIBUTED_ROOT_DIR",
-                       "/mnt/3fs/mooncake"));
+        GetEnvStringOr("MOONCAKE_DISTRIBUTED_ROOT_DIR", "/mnt/3fs/mooncake"));
     const int shard_count = GetEnvOr<int>("MOONCAKE_DFS_SHARD_COUNT", 64);
     const uint64_t shard_capacity = GetEnvOr<uint64_t>(
         "MOONCAKE_DFS_SHARD_CAPACITY", 4ULL * 1024 * 1024 * 1024);
@@ -2853,8 +2852,8 @@ auto MasterService::AllocateAndInsertMetadata(
                     << nof_desc.buffer_descriptor.transport_endpoint_;
         } else if (replica.is_dfs_replica()) {
             const auto& dfs_desc = desc.get_dfs_descriptor();
-            VLOG(1) << "Replica #" << ++i << ": dfs_file="
-                    << dfs_desc.file_path << ", offset=" << dfs_desc.offset
+            VLOG(1) << "Replica #" << ++i << ": dfs_file=" << dfs_desc.file_path
+                    << ", offset=" << dfs_desc.offset
                     << ", shard_idx=" << dfs_desc.shard_idx;
         }
     }
@@ -2900,8 +2899,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
     if (config.dfs_replica_num > 1 ||
         (config.dfs_replica_num > 0 && config.replica_num == 0)) {
-        LOG(ERROR) << "key=" << key
-                   << ", replica_num=" << config.replica_num
+        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", error=invalid_dfs_replica_config";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -2912,10 +2910,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 &&
-        (!enable_dfs_ || !dfs_allocator_ ||
-         !dfs_allocator_->IsInitialized())) {
-        LOG(ERROR) << "key=" << key
-                   << ", error=dfs_allocator_not_initialized";
+        (!enable_dfs_ || !dfs_allocator_ || !dfs_allocator_->IsInitialized())) {
+        LOG(ERROR) << "key=" << key << ", error=dfs_allocator_not_initialized";
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
@@ -3117,8 +3113,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             replica.mark_complete();
             if (replica.is_dfs_replica() && dfs_allocator_) {
                 const auto& desc = replica.get_dfs_descriptor();
-                dfs_allocator_->UpdateAccess(key, desc.shard_idx,
-                                             desc.offset);
+                dfs_allocator_->UpdateAccess(key, desc.shard_idx, desc.offset);
             }
         });
 
@@ -3180,16 +3175,16 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                         OffloadingTask{source->id(),
                                        std::chrono::system_clock::now()});
                 } else if (result.error() != ErrorCode::OBJECT_ALREADY_EXISTS) {
-                    LOG(ERROR) << "Failed to push DFS offload queue for key="
-                               << key << ", error=" << result.error();
+                    LOG(ERROR)
+                        << "Failed to push DFS offload queue for key=" << key
+                        << ", error=" << result.error();
                 }
             }
         }
     }
 
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
-        !offload_on_evict_ &&
-        !metadata.HasReplica([](const Replica& replica) {
+        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
         auto& tenant_state = accessor.GetTenantState();
@@ -3303,15 +3298,15 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep = metadata.GetFirstReplica([replica_type](
-                                                       const Replica& replica) {
-        if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica() ||
-                    replica.is_dfs_replica()) &&
-                   !replica.is_processing();
-        }
-        return replica.type() == replica_type && !replica.is_processing();
-    });
+    auto processing_rep =
+        metadata.GetFirstReplica([replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return (replica.is_memory_replica() ||
+                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
+                       !replica.is_processing();
+            }
+            return replica.type() == replica_type && !replica.is_processing();
+        });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
                    << ", error=invalid_replica_status";
@@ -3432,8 +3427,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (config.dfs_replica_num > 0 &&
         (!enable_dfs_ || dfs_allocator_ == nullptr ||
          !dfs_allocator_->IsInitialized())) {
-        LOG(ERROR) << "key=" << key << ", dfs_replica_num="
-                   << config.dfs_replica_num
+        LOG(ERROR) << "key=" << key
+                   << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", error=dfs_service_unavailable";
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
@@ -4790,8 +4785,7 @@ void MasterService::FreeDfsReplicas(const std::vector<Replica>& replicas) {
 }
 
 void MasterService::RemoveDfsReplicaByOffset(const std::string& key,
-                                             int shard_idx,
-                                             uint64_t offset) {
+                                             int shard_idx, uint64_t offset) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentity(key, "default");
     MetadataAccessorRW accessor(this, object_id);

@@ -519,8 +519,7 @@ class Client {
         const std::vector<std::string>& keys, ReplicaType replica_type);
 
     void SetDfsDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache);
-    void SetDfsStorageBackend(
-        std::shared_ptr<StorageBackendInterface> backend);
+    void SetDfsStorageBackend(std::shared_ptr<StorageBackendInterface> backend);
 
     /**
      * @brief Fetch tasks assigned to a client

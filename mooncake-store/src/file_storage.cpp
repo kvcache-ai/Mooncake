@@ -425,7 +425,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             std::vector<std::string> user_keys;
             user_keys.reserve(keys.size());
             for (const auto& storage_key : keys) {
-                auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_key);
+                auto [tenant_id, key] =
+                    ParseTenantScopedStorageKey(storage_key);
                 (void)tenant_id;
                 user_keys.push_back(std::move(key));
             }

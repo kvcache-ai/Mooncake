@@ -99,8 +99,7 @@ class FileSystemAdapter {
 
     // === fd-based I/O for shard-offset DFS mode ===
 
-    virtual tl::expected<int, ErrorCode> OpenFile(
-        const std::string& /*path*/) {
+    virtual tl::expected<int, ErrorCode> OpenFile(const std::string& /*path*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
@@ -113,14 +112,16 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
-    virtual tl::expected<size_t, ErrorCode> WriteAt(
-        int /*fd*/, const iovec* /*iov*/, int /*iovcnt*/,
-        int64_t /*offset*/) {
+    virtual tl::expected<size_t, ErrorCode> WriteAt(int /*fd*/,
+                                                    const iovec* /*iov*/,
+                                                    int /*iovcnt*/,
+                                                    int64_t /*offset*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
-    virtual tl::expected<size_t, ErrorCode> ReadAt(
-        int /*fd*/, iovec* /*iov*/, int /*iovcnt*/, int64_t /*offset*/) {
+    virtual tl::expected<size_t, ErrorCode> ReadAt(int /*fd*/, iovec* /*iov*/,
+                                                   int /*iovcnt*/,
+                                                   int64_t /*offset*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 

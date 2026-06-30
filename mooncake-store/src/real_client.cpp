@@ -4598,9 +4598,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 const char *replica_type =
                     op.replica.is_dfs_replica() ? "DFS" : "DISK";
                 if (!disk_results[di]) {
-                    LOG(ERROR) << replica_type << " BatchGet failed for key '"
-                               << key
-                               << "': " << toString(disk_results[di].error());
+                    LOG(ERROR)
+                        << replica_type << " BatchGet failed for key '" << key
+                        << "': " << toString(disk_results[di].error());
                     results[op.original_index] =
                         tl::unexpected(disk_results[di].error());
                     continue;
@@ -5036,8 +5036,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                 if (!op.is_local_disk) continue;
                 const auto &replica = op.replica;
                 if (!replica.is_local_disk_replica()) {
-                    LOG(ERROR) << "No LOCAL_DISK replica found for key: "
-                               << key;
+                    LOG(ERROR)
+                        << "No LOCAL_DISK replica found for key: " << key;
                     results[op.original_index] =
                         tl::make_unexpected(ErrorCode::INVALID_REPLICA);
                     continue;
@@ -5128,9 +5128,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                     client_buffer_allocator_->allocate(op.total_size);
                 if (!alloc_result) {
                     LOG(ERROR)
-                        << "Failed to allocate temp buffer for "
-                        << replica_type << " read, key: " << key
-                        << ", size: " << op.total_size;
+                        << "Failed to allocate temp buffer for " << replica_type
+                        << " read, key: " << key << ", size: " << op.total_size;
                     results[op.original_index] =
                         tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
                     continue;

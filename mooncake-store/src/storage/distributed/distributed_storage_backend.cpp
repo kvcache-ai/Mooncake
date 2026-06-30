@@ -63,8 +63,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         GetEnvOr<bool>("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
     config.shard_count =
         GetEnvOr<int>("MOONCAKE_DFS_SHARD_COUNT", config.shard_count);
-    config.shard_capacity = GetEnvOr<uint64_t>(
-        "MOONCAKE_DFS_SHARD_CAPACITY", config.shard_capacity);
+    config.shard_capacity = GetEnvOr<uint64_t>("MOONCAKE_DFS_SHARD_CAPACITY",
+                                               config.shard_capacity);
     config.alignment =
         GetEnvOr<uint64_t>("MOONCAKE_DFS_ALIGNMENT", config.alignment);
     config.single_tenant =
@@ -121,8 +121,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
                            ".data";
         auto fd_result = fs_adapter_->OpenFile(path);
         if (!fd_result) {
-            LOG(ERROR) << "Failed to open DFS shard " << path
-                       << ": " << fd_result.error();
+            LOG(ERROR) << "Failed to open DFS shard " << path << ": "
+                       << fd_result.error();
             return tl::make_unexpected(fd_result.error());
         }
         auto shard = std::make_unique<ShardFile>();
@@ -158,8 +158,7 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     for (const auto& [storage_key, slices] : batch_object) {
         auto desc = LookupDescriptor(storage_key);
         if (!desc) {
-            LOG(WARNING) << "DFS descriptor cache miss for key "
-                         << storage_key;
+            LOG(WARNING) << "DFS descriptor cache miss for key " << storage_key;
             continue;
         }
         if (desc->shard_idx < 0 ||
@@ -197,9 +196,8 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 
         auto& shard = *shard_files_[desc->shard_idx];
         std::lock_guard lock(shard.mutex);
-        auto result =
-            fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
-                                 static_cast<int64_t>(desc->offset));
+        auto result = fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
+                                           static_cast<int64_t>(desc->offset));
         if (!result || *result != total_size) {
             LOG(WARNING) << "DFS write failed for key " << storage_key
                          << ", expected=" << total_size
@@ -208,10 +206,10 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         }
 
         success_keys.push_back(storage_key);
-        success_metas.push_back(StorageObjectMetadata{
-            -1, static_cast<int64_t>(desc->offset),
-            static_cast<int64_t>(storage_key.size()),
-            static_cast<int64_t>(desc->object_size), ""});
+        success_metas.push_back(
+            StorageObjectMetadata{-1, static_cast<int64_t>(desc->offset),
+                                  static_cast<int64_t>(storage_key.size()),
+                                  static_cast<int64_t>(desc->object_size), ""});
     }
 
     if (!success_keys.empty() && complete_handler) {
@@ -268,9 +266,9 @@ tl::expected<bool, ErrorCode> DistributedStorageBackend::IsEnableOffloading() {
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
-    const std::function<
-        ErrorCode(const std::vector<std::string>& keys,
-                  std::vector<StorageObjectMetadata>& metadatas)>& /*handler*/) {
+    const std::function<ErrorCode(
+        const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas)>& /*handler*/) {
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 }
 

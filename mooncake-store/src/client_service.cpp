@@ -3116,16 +3116,15 @@ tl::expected<void, ErrorCode> Client::BatchPutEnd(
     }
     for (size_t i = 0; i < responses.size(); ++i) {
         if (!responses[i]) {
-            LOG(ERROR) << "BatchPutEnd failed for key " << keys[i]
-                       << ": " << responses[i].error();
+            LOG(ERROR) << "BatchPutEnd failed for key " << keys[i] << ": "
+                       << responses[i].error();
             return tl::make_unexpected(responses[i].error());
         }
     }
     return {};
 }
 
-void Client::SetDfsDescriptorCache(
-    std::shared_ptr<DfsDescriptorCache> cache) {
+void Client::SetDfsDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache) {
     dfs_desc_cache_ = std::move(cache);
 }
 
@@ -3577,9 +3576,9 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
-ErrorCode Client::ReadDfsReplica(
-    const std::string& key, const Replica::Descriptor& replica_descriptor,
-    std::vector<Slice>& slices) {
+ErrorCode Client::ReadDfsReplica(const std::string& key,
+                                 const Replica::Descriptor& replica_descriptor,
+                                 std::vector<Slice>& slices) {
     if (!replica_descriptor.is_dfs_replica()) {
         return ErrorCode::INVALID_REPLICA;
     }

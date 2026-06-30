@@ -42,8 +42,8 @@ class Hf3fsAdapter : public FileSystemAdapter {
 
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 
-    tl::expected<void, ErrorCode> PreallocateFile(
-        const std::string& path, uint64_t size) override;
+    tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
+                                                  uint64_t size) override;
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,

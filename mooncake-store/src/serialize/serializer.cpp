@@ -847,8 +847,7 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             descriptor.aligned_size = payload_items[3].as<uint64_t>();
             descriptor.shard_idx = payload_items[4].as<int32_t>();
 
-            replica =
-                std::make_shared<Replica>(std::move(descriptor), status);
+            replica = std::make_shared<Replica>(std::move(descriptor), status);
             break;
         }
         default:

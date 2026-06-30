@@ -36,8 +36,7 @@ bool DfsGlobalAllocator::Init(const std::string& mount_path, int shard_count,
     shards_.clear();
     shards_.resize(shard_count_);
 
-    eviction_enabled_ =
-        GetEnvOr<bool>("MOONCAKE_DFS_EVICTION_ENABLED", true);
+    eviction_enabled_ = GetEnvOr<bool>("MOONCAKE_DFS_EVICTION_ENABLED", true);
     eviction_high_watermark_ =
         GetEnvOr<double>("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", 0.9);
     eviction_low_watermark_ =
@@ -50,14 +49,14 @@ bool DfsGlobalAllocator::Init(const std::string& mount_path, int shard_count,
     std::error_code ec;
     std::filesystem::create_directories(mount_path_, ec);
     if (ec) {
-        LOG(ERROR) << "Failed to create DFS mount path " << mount_path_
-                   << ": " << ec.message();
+        LOG(ERROR) << "Failed to create DFS mount path " << mount_path_ << ": "
+                   << ec.message();
         return false;
     }
 
-    const auto adapter_type = GetEnvStringOr(
-        "MOONCAKE_DFS_FS_ADAPTER",
-        GetEnvStringOr("MOONCAKE_DISTRIBUTED_FS_TYPE", "hf3fs"));
+    const auto adapter_type =
+        GetEnvStringOr("MOONCAKE_DFS_FS_ADAPTER",
+                       GetEnvStringOr("MOONCAKE_DISTRIBUTED_FS_TYPE", "hf3fs"));
     if (adapter_type == "posix") {
         fs_adapter_ = std::make_unique<PosixFsAdapter>();
     } else if (adapter_type == "hf3fs") {
@@ -79,19 +78,18 @@ bool DfsGlobalAllocator::Init(const std::string& mount_path, int shard_count,
                            FormatShardIdx(i, shard_count_) + ".data";
         auto prealloc = fs_adapter_->PreallocateFile(path, shard_capacity);
         if (!prealloc) {
-            LOG(ERROR) << "Failed to preallocate DFS shard " << path
-                       << ": " << prealloc.error();
+            LOG(ERROR) << "Failed to preallocate DFS shard " << path << ": "
+                       << prealloc.error();
             return false;
         }
 
         auto shard = std::make_unique<ShardState>();
         shard->capacity = shard_capacity;
-        uint32_t init_cap = static_cast<uint32_t>(
-            std::max<uint64_t>(1, std::min<uint64_t>(shard_capacity / 4096,
-                                                     64ULL * 1024)));
+        uint32_t init_cap = static_cast<uint32_t>(std::max<uint64_t>(
+            1, std::min<uint64_t>(shard_capacity / 4096, 64ULL * 1024)));
         uint32_t max_cap = static_cast<uint32_t>(std::max<uint64_t>(
-            init_cap, std::min<uint64_t>(shard_capacity / 1024,
-                                         64ULL * 1024 * 1024)));
+            init_cap,
+            std::min<uint64_t>(shard_capacity / 1024, 64ULL * 1024 * 1024)));
         shard->allocator =
             OffsetAllocator::create(0, shard_capacity, init_cap, max_cap);
         if (!shard->allocator) return false;
@@ -198,8 +196,8 @@ void DfsGlobalAllocator::SetEvictCallback(
 }
 
 std::string DfsGlobalAllocator::FormatShardIdx(int idx, int shard_count) {
-    int width = static_cast<int>(
-        std::max<size_t>(2, std::to_string(std::max(0, shard_count - 1)).size()));
+    int width = static_cast<int>(std::max<size_t>(
+        2, std::to_string(std::max(0, shard_count - 1)).size()));
     std::ostringstream oss;
     oss << std::setw(width) << std::setfill('0') << idx;
     return oss.str();
@@ -215,17 +213,16 @@ void DfsGlobalAllocator::ProcessPendingFrees(int shard_idx) {
     }
 }
 
-std::vector<DfsGlobalAllocator::EvictedKey>
-DfsGlobalAllocator::EvictFromShard(int shard_idx) {
+std::vector<DfsGlobalAllocator::EvictedKey> DfsGlobalAllocator::EvictFromShard(
+    int shard_idx) {
     std::vector<EvictedKey> evicted;
     auto& shard = *shards_[shard_idx];
 
     {
         std::shared_lock lock(shard.handle_mutex);
         auto report = shard.allocator->storageReport();
-        double usage = 1.0 -
-                       static_cast<double>(report.totalFreeSpace) /
-                           static_cast<double>(shard.capacity);
+        double usage = 1.0 - static_cast<double>(report.totalFreeSpace) /
+                                 static_cast<double>(shard.capacity);
         if (usage < eviction_high_watermark_) return evicted;
     }
 
@@ -251,9 +248,8 @@ DfsGlobalAllocator::EvictFromShard(int shard_idx) {
             {
                 std::lock_guard pending_lock(shard.pending_mutex);
                 shard.pending_free.push_back(
-                    {it->second,
-                     std::chrono::steady_clock::now() +
-                         deferred_free_duration_});
+                    {it->second, std::chrono::steady_clock::now() +
+                                     deferred_free_duration_});
             }
             shard.offset_to_handle.erase(it);
         }
@@ -263,9 +259,8 @@ DfsGlobalAllocator::EvictFromShard(int shard_idx) {
         {
             std::shared_lock lock(shard.handle_mutex);
             auto report = shard.allocator->storageReport();
-            double usage = 1.0 -
-                           static_cast<double>(report.totalFreeSpace) /
-                               static_cast<double>(shard.capacity);
+            double usage = 1.0 - static_cast<double>(report.totalFreeSpace) /
+                                     static_cast<double>(shard.capacity);
             if (usage < eviction_low_watermark_) break;
         }
     }

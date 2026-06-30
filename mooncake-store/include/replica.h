@@ -593,8 +593,8 @@ class Replica {
         }
 
         DistributedFSDescriptor& get_dfs_descriptor() {
-            if (auto* desc = std::get_if<DistributedFSDescriptor>(
-                    &descriptor_variant)) {
+            if (auto* desc =
+                    std::get_if<DistributedFSDescriptor>(&descriptor_variant)) {
                 return *desc;
             }
             throw std::runtime_error("Expected DistributedFSDescriptor");
@@ -631,8 +631,8 @@ class Replica {
         }
 
         const DistributedFSDescriptor& get_dfs_descriptor() const {
-            if (auto* desc = std::get_if<DistributedFSDescriptor>(
-                    &descriptor_variant)) {
+            if (auto* desc =
+                    std::get_if<DistributedFSDescriptor>(&descriptor_variant)) {
                 return *desc;
             }
             throw std::runtime_error("Expected DistributedFSDescriptor");
@@ -749,8 +749,7 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
     } else if (replica.is_local_disk_replica()) {
-        const auto& disk_data =
-            std::get<LocalDiskReplicaData>(replica.data_);
+        const auto& disk_data = std::get<LocalDiskReplicaData>(replica.data_);
         os << "type: LOCAL_DISK, client_id: " << disk_data.client_id
            << ", object_size: " << disk_data.object_size
            << ", transport_endpoint: " << disk_data.transport_endpoint;

@@ -17,8 +17,7 @@ class DfsDescriptorCache {
         cache_[key] = desc;
     }
 
-    std::optional<DistributedFSDescriptor> Get(
-        const std::string& key) const {
+    std::optional<DistributedFSDescriptor> Get(const std::string& key) const {
         std::shared_lock lock(mutex_);
         auto it = cache_.find(key);
         if (it == cache_.end()) return std::nullopt;

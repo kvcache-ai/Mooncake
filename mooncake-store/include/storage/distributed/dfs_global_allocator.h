@@ -65,9 +65,7 @@ class DfsGlobalAllocator {
 
         std::mutex lru_mutex;
         std::list<std::pair<std::string, uint64_t>> lru_list;
-        std::unordered_map<std::string,
-                           decltype(lru_list)::iterator>
-            lru_index;
+        std::unordered_map<std::string, decltype(lru_list)::iterator> lru_index;
 
         struct PendingFree {
             std::shared_ptr<OffsetAllocationHandle> handle;
