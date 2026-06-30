@@ -278,7 +278,17 @@ mooncake_master \
   --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
 ```
 
-The v1 connector is a writable YAML file. The file must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
+You can also store the same YAML policy in etcd when Mooncake Store is built with `STORE_USE_ETCD=ON`:
+
+```bash
+mooncake_master \
+  --enable_multi_tenants=true \
+  --cluster_id=mooncake_cluster \
+  --tenant_quota_connector_type=etcd \
+  --tenant_quota_connector_uri=127.0.0.1:2379
+```
+
+The etcd connector stores the policy at `mooncake-store/<cluster_id>/tenant_quota_policy`. The policy must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
 
 ```yaml
 version: 1
@@ -475,8 +485,8 @@ mooncake_master \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
-| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type |
-| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path |
+| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type: `file` or `etcd` when built with `STORE_USE_ETCD=ON` |
+| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path; for `etcd`, the endpoints string |
 
 ### High Availability
 

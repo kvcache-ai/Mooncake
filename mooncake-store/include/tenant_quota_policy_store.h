@@ -45,7 +45,23 @@ class YamlTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
     std::mutex mutex_;
 };
 
+#ifdef STORE_USE_ETCD
+class EtcdTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
+   public:
+    EtcdTenantQuotaPolicyStore(std::string endpoints, std::string cluster_id);
+
+    tl::expected<TenantQuotaPolicySnapshot, std::string> Load() override;
+    tl::expected<void, std::string> Save(
+        const TenantQuotaPolicySnapshot& snapshot) override;
+
+   private:
+    std::string key_;
+    std::mutex mutex_;
+};
+#endif
+
 tl::expected<std::unique_ptr<TenantQuotaPolicyStore>, std::string>
-CreateTenantQuotaPolicyStore(const std::string& type, const std::string& uri);
+CreateTenantQuotaPolicyStore(const std::string& type, const std::string& uri,
+                             const std::string& cluster_id);
 
 }  // namespace mooncake
