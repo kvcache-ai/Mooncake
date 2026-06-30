@@ -188,12 +188,15 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_ETCD=ON/OFF` | `OFF` | Enable etcd-based metadata service. Requires Go 1.23+. |
 | `-DSTORE_USE_ETCD=ON/OFF` | `OFF` | Enable etcd-based failover for Mooncake Store. Independent from `-DUSE_ETCD`. Requires Go 1.23+. |
 | `-DSTORE_USE_REDIS=ON/OFF` | `OFF` | Enable Redis-based failover for Mooncake Store. Independent from `-DUSE_REDIS`. Requires hiredis. |
+| `-DSTORE_USE_K8S_LEASE=ON/OFF` | `OFF` | Enable Kubernetes Lease-based failover for Mooncake Store. Cannot be enabled with `-DSTORE_USE_ETCD=ON` or non-legacy `-DUSE_ETCD=ON`. |
 
 ### Component Options
 
 | Option | Default | Description |
 | --- | --- | --- |
+| `-DWITH_TE=ON/OFF` | `ON` | Build the Mooncake Transfer Engine component and sample code. |
 | `-DWITH_STORE=ON/OFF` | `ON` | Build the Mooncake Store component. |
+| `-DWITH_STORE_GO=ON/OFF` | `OFF` | Build Go bindings for Mooncake Store when `-DWITH_STORE=ON`. |
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
@@ -206,3 +209,4 @@ The following options can be passed to `cmake ..`.
 | `-DBUILD_SHARED_LIBS=ON/OFF` | `OFF` | Build Transfer Engine as a shared library. |
 | `-DBUILD_UNIT_TESTS=ON/OFF` | `ON` | Build unit tests. |
 | `-DBUILD_EXAMPLES=ON/OFF` | `ON` | Build examples. |
+| `-DSTORE_USE_JEMALLOC=ON/OFF` | `OFF` | Use jemalloc in the Mooncake Store master. |
