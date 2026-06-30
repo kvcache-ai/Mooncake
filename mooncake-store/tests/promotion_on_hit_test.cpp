@@ -2227,6 +2227,198 @@ TEST_F(PromotionOnHitTest, MetricsRemoveMidPromotionCountsAsCancelled) {
     service->RemoveAll();
 }
 
+// --- Promotion retry candidate tests ---
+
+// A transient watermark rejection records a candidate; the retry scheduler
+// can later see and process it.
+TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;  // all promotions rejected
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "retry_seg", kDefaultSegmentBase,
+                              seg_size);
+    // LOCAL_DISK-only key: inject without a prior PutStart.
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_wm", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
+
+    // Get triggers frequency gate (threshold=1 → passes) then hits watermark=0.
+    {
+        auto r = service->GetReplicaList("k_wm", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, 1)
+        << "Expected one candidate recorded on watermark rejection";
+    EXPECT_EQ(service->CountCandidatesForTesting("default"), 1u);
+
+    // A second Get on the same key should update last_seen but not add a
+    // duplicate candidate.
+    {
+        auto r = service->GetReplicaList("k_wm", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(service->CountCandidatesForTesting("default"), 1u)
+        << "Duplicate candidate must not be created";
+
+    service->RemoveAll();
+}
+
+// Candidate is cleaned up after kPromotionCandidateMaxRetries scans.
+TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "exhaust_seg", kDefaultSegmentBase,
+                              seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_exhaust",
+                                       1024, seg.segment_name));
+
+    // Record a candidate via a Get (watermark=0 rejects).
+    {
+        auto r = service->GetReplicaList("k_exhaust", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(service->CountCandidatesForTesting("default"), 1u);
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t expired_pre = mm.get_promotion_candidate_expired_evaluated();
+
+    // Drive retries; each scan increments retry_count until exhausted.
+    // Run more scans than kPromotionCandidateMaxRetries (8) to be sure.
+    for (int i = 0; i <= 10; ++i) {
+        service->RunPromotionCandidateRetryForTesting();
+    }
+
+    EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u)
+        << "Candidate must be erased after max retries";
+    EXPECT_GT(mm.get_promotion_candidate_expired_evaluated() - expired_pre, 0);
+
+    service->RemoveAll();
+}
+
+// When an object is removed while a candidate is pending, the retry scan
+// cleans up the candidate without promoting.
+TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "rm_seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_rm", 1024,
+                                       seg.segment_name));
+
+    // Record candidate.
+    {
+        auto r = service->GetReplicaList("k_rm", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(service->CountCandidatesForTesting("default"), 1u);
+
+    // Remove the object while candidate is pending.
+    auto rm = service->Remove("k_rm", "default", /*force=*/true);
+    ASSERT_TRUE(rm.has_value());
+
+    // Retry scan should find object gone and erase candidate.
+    service->RunPromotionCandidateRetryForTesting();
+    EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u);
+
+    auto& mm = MasterMetricManager::instance();
+    EXPECT_EQ(mm.get_promotion_candidate_admitted(), 0);
+
+    service->RemoveAll();
+}
+
+// Records multiple candidates and verifies per-key tracking is correct.
+TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 64;
+    auto seg = PrepareSegment(*service, "multi_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
+    const int64_t unevaluated_pre =
+        mm.get_promotion_candidate_expired_unevaluated();
+
+    constexpr int kKeys = 5;
+    for (int i = 0; i < kKeys; i++) {
+        std::string key = "k_multi_" + std::to_string(i);
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 512,
+                                           seg.segment_name));
+        auto r = service->GetReplicaList(key, "default");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, kKeys);
+    EXPECT_EQ(mm.get_promotion_candidate_expired_unevaluated() - unevaluated_pre,
+              0);
+    EXPECT_EQ(service->CountCandidatesForTesting("default"),
+              static_cast<size_t>(kKeys));
+
+    service->RemoveAll();
+}
+
+// ClearCandidatesForReload resets all candidate state and the global count.
+TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "reload_seg", kDefaultSegmentBase,
+                              seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_reload",
+                                       1024, seg.segment_name));
+
+    // Record a candidate.
+    {
+        auto r = service->GetReplicaList("k_reload", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(service->CountCandidatesForTesting("default"), 1u);
+
+    // Simulate metadata reload.
+    service->ClearCandidatesForReload();
+
+    EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u);
+    EXPECT_EQ(
+        service->promotion_candidate_count_.load(std::memory_order_relaxed),
+        0u);
+
+    service->RemoveAll();
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

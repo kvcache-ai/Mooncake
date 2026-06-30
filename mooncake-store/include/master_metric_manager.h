@@ -314,6 +314,14 @@ class MasterMetricManager {
                                  const std::string& reason, int64_t val = 1);
     void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
 
+    // Promotion retry candidate metrics
+    void inc_promotion_candidate_recorded(int64_t val = 1);
+    void inc_promotion_candidate_admitted(int64_t val = 1);
+    void inc_promotion_candidate_admission_rejected(int64_t val = 1);
+    void inc_promotion_candidate_expired_evaluated(int64_t val = 1);
+    void inc_promotion_candidate_expired_unevaluated(int64_t val = 1);
+    void inc_promotion_candidate_dropped_limit(int64_t val = 1);
+
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
     int64_t get_promotion_admitted();
@@ -325,6 +333,12 @@ class MasterMetricManager {
     int64_t get_promotion_rejected_frequency();
     int64_t get_promotion_rejected_watermark();
     int64_t get_promotion_rejected_cap();
+    int64_t get_promotion_candidate_recorded();
+    int64_t get_promotion_candidate_admitted();
+    int64_t get_promotion_candidate_admission_rejected();
+    int64_t get_promotion_candidate_expired_evaluated();
+    int64_t get_promotion_candidate_expired_unevaluated();
+    int64_t get_promotion_candidate_dropped_limit();
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     void inc_copy_start_requests(int64_t val = 1);
@@ -674,6 +688,13 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_rejected_frequency_;
     ylt::metric::counter_t promotion_rejected_watermark_;
     ylt::metric::counter_t promotion_rejected_cap_;
+    // Promotion retry candidate metrics
+    ylt::metric::counter_t promotion_candidate_recorded_;
+    ylt::metric::counter_t promotion_candidate_admitted_;
+    ylt::metric::counter_t promotion_candidate_admission_rejected_;
+    ylt::metric::counter_t promotion_candidate_expired_evaluated_;
+    ylt::metric::counter_t promotion_candidate_expired_unevaluated_;
+    ylt::metric::counter_t promotion_candidate_dropped_limit_;
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
