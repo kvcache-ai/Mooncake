@@ -64,8 +64,6 @@ class RDMALargeMrTest : public ::testing::Test {
 
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("RDMALargeMrTest");
-        FLAGS_logtostderr = 1;
         // Force a small device max_mr_size cap (config caps to min(env,
         // device)).
         setenv("MC_MAX_MR_SIZE", std::to_string(kMaxMrSize).c_str(), 1);
@@ -82,7 +80,6 @@ class RDMALargeMrTest : public ::testing::Test {
     void TearDown() override {
         if (engine && addr) engine->unregisterLocalMemory(addr);
         if (addr) numa_free(addr, kBufferSize);
-        google::ShutdownGoogleLogging();
     }
 };
 
@@ -133,6 +130,12 @@ TEST_F(RDMALargeMrTest, WritePastMaxMrSizeBoundary) {
 
 int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
+    // Initialize logging once for the whole binary — calling
+    // InitGoogleLogging() per-test in SetUp() aborts on the 2nd TEST_F.
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = 1;
     ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    int rc = RUN_ALL_TESTS();
+    google::ShutdownGoogleLogging();
+    return rc;
 }
