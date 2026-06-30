@@ -95,8 +95,6 @@ class LocalTransferAdmissionQueue {
     std::vector<QueueOwnerId> pickForDispatch(size_t max_owners,
                                               size_t max_bytes, TimePoint now);
 
-    Status requeueForDispatch(QueueOwnerId owner_id);
-
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
     Status retireBatch(uint64_t batch_token);
@@ -122,7 +120,7 @@ class LocalTransferAdmissionQueue {
         uint64_t batch_token{0};
         Request request{};
         QueueOwnerKind kind{QueueOwnerKind::User};
-        TimePoint enqueue_time{};
+        TimePoint queue_enter_time{};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };

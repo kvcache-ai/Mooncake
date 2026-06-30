@@ -1642,26 +1642,6 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
-    if (task.type == TCP) {
-        std::vector<std::string> staging_params;
-        findStagingPolicy(task.request, staging_params);
-        if (!staging_params.empty() && staging_proxy_) {
-            task.staging = true;
-            auto status =
-                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
-            if (!status.ok()) {
-                task.staging = false;
-                task.type = UNSPEC;
-                if (status.IsTooManyRequests()) {
-                    CHECK_STATUS(runtime_queue_->requeueForDispatch(owner_id));
-                    return Status::OK();
-                }
-                return finishQueuedOwner(owner_id, FAILED);
-            }
-            return markQueuedOwnerSubmitted(owner_id);
-        }
-    }
-
     if (!batch->sub_batch[task.type]) {
         auto& transport = transport_list_[task.type];
         if (!transport) return finishQueuedOwner(owner_id, FAILED);

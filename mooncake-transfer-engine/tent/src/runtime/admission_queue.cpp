@@ -246,7 +246,7 @@ void LocalTransferAdmissionQueue::DispatchScheduler::promoteAgedPriority(
                 continue;
             }
 
-            if (now - owner_it->second.enqueue_time < threshold) break;
+            if (now - owner_it->second.queue_enter_time < threshold) break;
 
             auto insert_it = promoted_queue.end();
             for (auto it = promoted_queue.begin(); it != promoted_queue.end();
@@ -256,8 +256,8 @@ void LocalTransferAdmissionQueue::DispatchScheduler::promoteAgedPriority(
                     promoted_it->second.state != QueueState::Queued) {
                     continue;
                 }
-                if (owner_it->second.enqueue_time <
-                    promoted_it->second.enqueue_time) {
+                if (owner_it->second.queue_enter_time <
+                    promoted_it->second.queue_enter_time) {
                     insert_it = it;
                     break;
                 }
@@ -468,7 +468,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.batch_token = submit.batch_token;
         owner.request = owner_input.request;
         owner.kind = owner_input.kind;
-        owner.enqueue_time = now;
+        owner.queue_enter_time = now;
         owners_.emplace(owner_id, owner);
         batch_index.owner_ids.push_back(owner_id);
         owner_ids.push_back(owner_id);
@@ -507,25 +507,6 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         owners_.find(owner_id)->second.state = QueueState::Dispatching;
     }
     return picked;
-}
-
-Status LocalTransferAdmissionQueue::requeueForDispatch(QueueOwnerId owner_id) {
-    if (owner_id == 0) {
-        return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
-    }
-    auto owner_it = owners_.find(owner_id);
-    if (owner_it == owners_.end()) {
-        return Status::InvalidEntry("queue owner not found" LOC_MARK);
-    }
-    auto& owner = owner_it->second;
-    if (owner.state != QueueState::Dispatching) {
-        return Status::InvalidEntry("queue owner is not dispatching" LOC_MARK);
-    }
-
-    owner.state = QueueState::Queued;
-    owner.enqueue_time = Clock::now();
-    scheduler_.enqueue(owner_id, owner.request.priority, owner.kind);
-    return Status::OK();
 }
 
 Status LocalTransferAdmissionQueue::complete(
