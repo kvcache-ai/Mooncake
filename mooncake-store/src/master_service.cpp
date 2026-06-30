@@ -6895,12 +6895,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
+                            // CMS frequency-aware: hot objects use
+                            // virtual lease extension, biasing
+                            // eviction toward cold objects.
                             local_candidates[t].push_back(
                                 {s, tenant_id, it->first,
-                                 it->second.lease_timeout});
+                                 AdjustLeaseTimeoutWithFrequency(
+                                     tenant_id, it->first,
+                                     it->second.lease_timeout)});
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(
-                                it->second.lease_timeout);
+                                AdjustLeaseTimeoutWithFrequency(
+                                    tenant_id, it->first,
+                                    it->second.lease_timeout));
                         }
                     }
                 }
@@ -6984,11 +6991,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto& tenant_state = tenant_it->second;
                 auto it = tenant_state.metadata.find(c.key);
                 if (it == tenant_state.metadata.end()) continue;
-                // Re-validate: state may have changed since Phase 1
+                // Re-validate: state may have changed since Phase 1.
+                // Recompute effective timeout in case CMS frequency
+                // changed since candidate collection.
+                auto effective_timeout = AdjustLeaseTimeoutWithFrequency(
+                    c.tenant_id, c.key, it->second.lease_timeout);
                 if (!it->second.IsLeaseExpired(now) ||
                     it->second.IsSoftPinned(now) ||
+                    effective_timeout > target_timeout ||
                     !can_evict_replicas(it->second)) {
-                    no_pin_objects.push_back(c.lease_timeout);
+                    no_pin_objects.push_back(effective_timeout);
                     continue;
                 }
                 auto evict_result = try_evict_group_or_object(
@@ -7048,7 +7060,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                target_evict_num > 0) {
                             if (!it->second.IsHardPinned() &&
                                 it->second.IsLeaseExpired(now) &&
-                                it->second.lease_timeout <= target_timeout &&
+                                AdjustLeaseTimeoutWithFrequency(
+                                    tenant_it->first, it->first,
+                                    it->second.lease_timeout) <=
+                                    target_timeout &&
                                 !it->second.IsSoftPinned(now) &&
                                 can_evict_replicas(it->second)) {
                                 auto evict_result = try_evict_group_or_object(
@@ -7109,7 +7124,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 continue;
                             }
                             if (!it->second.IsSoftPinned(now) ||
-                                it->second.lease_timeout <=
+                                AdjustLeaseTimeoutWithFrequency(
+                                    tenant_it->first, it->first,
+                                    it->second.lease_timeout) <=
                                     soft_target_timeout) {
                                 auto evict_result = try_evict_group_or_object(
                                     tenant_it->first, it->first, it->second,
