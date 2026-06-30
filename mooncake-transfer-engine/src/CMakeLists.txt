@@ -56,7 +56,10 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
-         yalantinglibs::yalantinglibs)
+         yalantinglibs::yalantinglibs
+         nl-3
+         nl-genl-3
+         nl-route-3)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

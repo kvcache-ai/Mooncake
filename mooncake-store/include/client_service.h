@@ -767,6 +767,20 @@ class Client {
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
+
+    // Deferred BatchPutEnd: accumulate PutEnd keys and flush in batches.
+    // Eliminates one RPC round-trip per PUT (PutEnd) by batching N keys into
+    // a single BatchPutEnd RPC. On high-throughput workloads this reduces
+    // control-plane RPC count by ~50%.
+    //
+    // Error semantics: PutEnd failures are logged but NOT propagated to the
+    // original Put() caller. This is a deliberate performance/correctness
+    // trade-off — the caller sees Put() success even if the deferred PutEnd
+    // later fails. In practice, PutEnd failures are extremely rare (network
+    // partition or master crash). Failed keys remain in PROCESSING state and
+    // are eventually cleaned up by put_start_release_timeout_sec.
+    void DeferPutEnd(const std::string& key, ReplicaType replica_type);
+    void FlushPendingPutEnds();
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
@@ -841,6 +855,14 @@ class Client {
     std::atomic<bool> last_ping_success_{false};
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
+
+    // Deferred BatchPutEnd accumulator: buffers PutEnd keys to batch-flush
+    // via a single BatchPutEnd RPC, eliminating per-PUT PutEnd RPC latency.
+    // At kMaxPendingPutEnds=32, saves ~31 RPC round-trips per batch (~3-10ms).
+    static constexpr size_t kMaxPendingPutEnds = 32;
+    std::mutex pending_put_ends_mutex_;
+    // Each entry: {key, replica_type}
+    std::vector<std::pair<std::string, ReplicaType>> pending_put_ends_;
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();

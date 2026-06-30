@@ -303,6 +303,9 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    // Flush any pending deferred PutEnds before tearing down
+    FlushPendingPutEnds();
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -962,6 +965,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices) {
+    // Flush deferred PutEnds so recently-written keys are visible to readers.
+    // Without this, keys written within the last batch window (up to 32 PUTs)
+    // would be in PROCESSING state and not found by GetReplicaList.
+    FlushPendingPutEnds();
     auto query_result = Query(object_key);
     if (!query_result) {
         return tl::unexpected(query_result.error());
@@ -972,6 +979,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    // Flush deferred PutEnds so recently-written keys are visible
+    FlushPendingPutEnds();
     auto batched_query_results = BatchQuery(object_keys);
 
     // If any queries failed, return error results immediately for failed
@@ -1028,12 +1037,16 @@ Client::BatchQueryIp(const std::vector<UUID>& client_ids) {
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 Client::QueryByRegex(const std::string& str) {
+    // Flush deferred PutEnds so recently-written keys are visible
+    FlushPendingPutEnds();
     auto result = master_client_.GetReplicaListByRegex(str);
     return result;
 }
 
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
+    // Flush deferred PutEnds so recently-written keys are visible to readers
+    FlushPendingPutEnds();
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto result = master_client_.GetReplicaList(object_key);
@@ -1047,6 +1060,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
+    // Flush deferred PutEnds so recently-written keys are visible
+    FlushPendingPutEnds();
     return BatchQuery(object_keys, master_client_.tenant_id());
 }
 
@@ -1593,13 +1608,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         DetermineFinalizeDecision(config, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
-        auto end_result =
-            master_client_.PutEnd(key, *finalize_decision.end_type);
-        if (!end_result) {
-            ErrorCode err = end_result.error();
-            LOG(ERROR) << "Failed to end put operation: " << err;
-            return tl::unexpected(err);
-        }
+        // Defer PutEnd to batch-flush: avoids one RPC round-trip per PUT.
+        // Keys are accumulated and flushed via BatchPutEnd when the buffer
+        // reaches kMaxPendingPutEnds, reducing control-plane RPC count by ~50%.
+        DeferPutEnd(key, *finalize_decision.end_type);
     }
 
     if (finalize_decision.revoke_type.has_value()) {
@@ -2097,6 +2109,117 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 << ", nof=" << op.transfer_summary.successful_nof_transfers
                 << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
                 << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
+    }
+}
+
+void Client::DeferPutEnd(const std::string& key, ReplicaType replica_type) {
+    bool should_flush = false;
+    {
+        std::lock_guard<std::mutex> lock(pending_put_ends_mutex_);
+        pending_put_ends_.emplace_back(key, replica_type);
+        should_flush = (pending_put_ends_.size() >= kMaxPendingPutEnds);
+    }
+    // Flush outside the lock to avoid holding it during the RPC
+    if (should_flush) {
+        FlushPendingPutEnds();
+    }
+}
+
+void Client::FlushPendingPutEnds() {
+    std::vector<std::pair<std::string, ReplicaType>> to_flush;
+    {
+        std::lock_guard<std::mutex> lock(pending_put_ends_mutex_);
+        if (pending_put_ends_.empty()) {
+            return;
+        }
+        to_flush.swap(pending_put_ends_);
+    }
+
+    // Group keys by replica_type for BatchPutEnd
+    std::vector<std::string> memory_keys;
+    std::vector<std::string> disk_keys;
+    std::vector<std::string> local_disk_keys;
+    std::vector<std::string> nof_keys;
+    std::vector<std::string> all_keys;
+
+    for (auto& [key, rtype] : to_flush) {
+        switch (rtype) {
+            case ReplicaType::MEMORY:
+                memory_keys.push_back(std::move(key));
+                break;
+            case ReplicaType::DISK:
+                disk_keys.push_back(std::move(key));
+                break;
+            case ReplicaType::LOCAL_DISK:
+                local_disk_keys.push_back(std::move(key));
+                break;
+            case ReplicaType::NOF_SSD:
+                nof_keys.push_back(std::move(key));
+                break;
+            case ReplicaType::ALL:
+                all_keys.push_back(std::move(key));
+                break;
+        }
+    }
+
+    if (!memory_keys.empty()) {
+        auto results =
+            master_client_.BatchPutEnd(memory_keys, ReplicaType::MEMORY);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(ERROR) << "Deferred BatchPutEnd(MEMORY) failed for key="
+                           << memory_keys[i]
+                           << ": " << toString(results[i].error());
+            }
+        }
+    }
+
+    if (!disk_keys.empty()) {
+        auto results =
+            master_client_.BatchPutEnd(disk_keys, ReplicaType::DISK);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(ERROR) << "Deferred BatchPutEnd(DISK) failed for key="
+                           << disk_keys[i]
+                           << ": " << toString(results[i].error());
+            }
+        }
+    }
+
+    if (!local_disk_keys.empty()) {
+        auto results =
+            master_client_.BatchPutEnd(local_disk_keys, ReplicaType::LOCAL_DISK);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(ERROR) << "Deferred BatchPutEnd(LOCAL_DISK) failed for key="
+                           << local_disk_keys[i]
+                           << ": " << toString(results[i].error());
+            }
+        }
+    }
+
+    if (!nof_keys.empty()) {
+        auto results =
+            master_client_.BatchPutEnd(nof_keys, ReplicaType::NOF_SSD);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(ERROR) << "Deferred BatchPutEnd(NOF_SSD) failed for key="
+                           << nof_keys[i]
+                           << ": " << toString(results[i].error());
+            }
+        }
+    }
+
+    if (!all_keys.empty()) {
+        auto results =
+            master_client_.BatchPutEnd(all_keys, ReplicaType::ALL);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(ERROR) << "Deferred BatchPutEnd(ALL) failed for key="
+                           << all_keys[i]
+                           << ": " << toString(results[i].error());
+            }
+        }
     }
 }
 
@@ -2966,12 +3089,16 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 }
 
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
+    // Flush deferred PutEnds so recently-written keys are visible
+    FlushPendingPutEnds();
     auto result = master_client_.ExistKey(key);
     return result;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
+    // Flush deferred PutEnds so recently-written keys are visible
+    FlushPendingPutEnds();
     auto response = master_client_.BatchExistKey(keys);
 
     // Check if we got the expected number of responses

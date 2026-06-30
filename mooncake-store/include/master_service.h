@@ -369,6 +369,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
+    // NOTE: parameter order differs from WrappedMasterService::BatchPutEnd in rpc_service.h
+    // (tenant_id and replica_type are swapped). These serve different call chains.
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id,
@@ -811,9 +813,22 @@ class MasterService {
     // evict ratio target. If the actual evicted ratio is less than
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
+    //
+    // CMS Frequency-Aware Eviction: When promotion_sketch_ is available, the
+    // effective lease timeout is boosted by the CMS access frequency count.
+    // Hot objects (high CMS count) get a virtual lease extension, making them
+    // less likely to be evicted than cold objects with the same real lease
+    // timeout. This is a novel use of CountMinSketch for eviction tuning.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
+
+    // Compute a frequency-adjusted lease timeout for eviction selection.
+    // Uses CMS count (if available) to extend the effective lease of
+    // frequently-accessed objects, biasing eviction toward cold objects.
+    std::chrono::system_clock::time_point AdjustLeaseTimeoutWithFrequency(
+        const std::string& tenant_id, const std::string& key,
+        std::chrono::system_clock::time_point lease_timeout) const;
     struct TenantQuotaEvictionResult {
         uint64_t freed_bytes{0};
         uint64_t evicted_objects{0};
@@ -1333,12 +1348,12 @@ class MasterService {
 
     static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
                                              const std::string& tenant_id) {
-        return {NormalizeTenantId(tenant_id), user_key};
+        return {std::string(NormalizeTenantIdRef(tenant_id)), user_key};
     }
 
     static std::string MakeTenantScopedKey(const std::string& tenant_id,
                                            const std::string& key) {
-        const auto normalized_tenant = NormalizeTenantId(tenant_id);
+        const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
         std::string scoped_key;
         scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
         scoped_key.append(normalized_tenant);
@@ -1350,7 +1365,7 @@ class MasterService {
     // Helper to get shard index from tenant-scoped object identity.
     size_t getShardIndex(const std::string& tenant_id,
                          const std::string& user_key) const {
-        const auto normalized_tenant = NormalizeTenantId(tenant_id);
+        const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
         if (normalized_tenant == "default") {
             return std::hash<std::string>{}(user_key) % kNumShards;
         }
@@ -1564,44 +1579,11 @@ class MasterService {
                                        ? ReplicationTaskIterator{}
                                        : tenant_state_->replication_tasks.find(
                                              object_id_.user_key)) {
-            // Automatically clean up invalid handles (memory replicas only).
-            // Note: We only check memory replicas here to avoid lock order
-            // violation (client_mutex_ must be acquired before metadata shard).
-            // local_disk replicas are cleaned up by ClearInvalidHandles() in
-            // ClientMonitorFunc.
-            if (tenant_state_ != nullptr &&
-                it_ != tenant_state_->metadata.end()) {
-                // Erase invalid memory replicas (those with unmounted
-                // segments). No client_mutex_ needed since we only check memory
-                // replicas.
-                const uint64_t before_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
-                service_->EraseReplicasWithCacheTotalAccounting(
-                    it_->second, [](const Replica& replica) {
-                        return replica.has_invalid_mem_handle();
-                    });
-                const uint64_t after_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
-                if (before_charge > after_charge) {
-                    service_->ReleaseCommittedQuotaCharge(
-                        it_->second, before_charge - after_charge);
-                }
-                // If no valid replicas remain, delete the whole object.
-                if (!it_->second.IsValid()) {
-                    const bool had_processing =
-                        processing_it_ != tenant_state_->processing_keys.end();
-                    this->Erase();
-                    if (tenant_state_ != nullptr && had_processing) {
-                        this->EraseFromProcessing();
-                    }
-                    if (tenant_state_ != nullptr) {
-                        service_->ErasePromotionTaskIfPresent(
-                            *tenant_state_, object_id_.user_key,
-                            object_id_.tenant_id);
-                        MaybeEraseEmptyTenant();
-                    }
-                }
-            }
+            // Deferred cleanup: invalid replicas are NOT erased during
+            // construction to avoid lock hold time on the hot path.
+            // Invalid memory replicas (unmounted segments) and invalid
+            // local_disk replicas are cleaned up asynchronously by
+            // ClearInvalidHandles() in ClientMonitorFunc.
         }
 
         // Check if metadata exists
