@@ -222,6 +222,7 @@ elif [ "$NPU_BUILD" = "1" ]; then
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-npu"/' pyproject.toml
     sed -i 's/^description = "\(.*\)"$/description = "\1 (Ascend NPU version)"/' pyproject.toml
     sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "ascend", "npu"]/' pyproject.toml
+    sed -i 's/^requires-python = ">=3.10"$/requires-python = ">=3.9"/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-npu"
@@ -252,6 +253,7 @@ elif [ "$MUSA_BUILD" = "1" ]; then
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-musa"/' pyproject.toml
     sed -i 's/^description = "\(.*\)"$/description = "\1 (MUSA version)"/' pyproject.toml
     sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "musa", "moore-threads"]/' pyproject.toml
+    sed -i 's/^requires-python = ">=3.10"$/requires-python = ">=3.9"/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-musa"

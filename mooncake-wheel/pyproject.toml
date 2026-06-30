@@ -23,7 +23,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mooncake-transfer-engine"
 version = "0.3.11.post1"
-description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI."
+description = "A KVCache-centric Disaggregated Architecture for large-scale LLM inference and training."
 authors = [
     { name = "Mooncake Authors" }
 ]
@@ -31,7 +31,7 @@ requires-python = ">=3.10"
 readme = "README.md"   # local copy of ../README.md, materialized at build time by scripts/build_wheel.sh
 dependencies = ["aiohttp", "requests", "msgpack"]
 # Single-line arrays: sed-substituted by scripts/build_wheel.sh for each variant.
-keywords = ["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma"]
+keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
 classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]
 
 [project.urls]
@@ -39,7 +39,7 @@ Homepage = "https://github.com/kvcache-ai/Mooncake"
 Documentation = "https://kvcache-ai.github.io/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 Issues = "https://github.com/kvcache-ai/Mooncake/issues"
-Blog = "https://kvcache.ai/"
+Blog = "https://kvcache.ai/blog"
 Changelog = "https://github.com/kvcache-ai/Mooncake/releases"
 Slack = "https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA"
 
