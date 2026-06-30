@@ -608,8 +608,7 @@ class MasterService {
      * @param client_id The client polling for the remove-all signal
      * @return true if client should clear all SSD files, false otherwise
      */
-    auto PollRemoveAll(const UUID& client_id)
-        -> tl::expected<bool, ErrorCode>;
+    auto PollRemoveAll(const UUID& client_id) -> tl::expected<bool, ErrorCode>;
 
     auto ReportSsdCapacity(const UUID& client_id,
                            int64_t ssd_total_capacity_bytes)

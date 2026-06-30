@@ -1177,12 +1177,13 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
-tl::expected<bool, ErrorCode>
-WrappedMasterService::PollRemoveAll(const UUID& client_id) {
+tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
+    const UUID& client_id) {
     ScopedVLogTimer timer(1, "PollRemoveAll");
     timer.LogRequest("client_id=", client_id);
     auto result = master_service_.PollRemoveAll(client_id);
-    timer.LogResponse("should_remove_all=", result.has_value() ? result.value() : false);
+    timer.LogResponse("should_remove_all=",
+                      result.has_value() ? result.value() : false);
     return result;
 }
 

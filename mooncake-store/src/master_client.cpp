@@ -999,7 +999,8 @@ tl::expected<bool, ErrorCode> MasterClient::PollRemoveAll() {
 
     auto result =
         invoke_rpc<&WrappedMasterService::PollRemoveAll, bool>(client_id_);
-    timer.LogResponse("should_remove_all=", result.has_value() ? result.value() : false);
+    timer.LogResponse("should_remove_all=",
+                      result.has_value() ? result.value() : false);
     return result;
 }
 
