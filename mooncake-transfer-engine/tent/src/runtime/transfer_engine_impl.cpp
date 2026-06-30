@@ -2216,26 +2216,6 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
-    if (task.type == TCP || task.type == HP_TCP) {
-        std::vector<std::string> staging_params;
-        findStagingPolicy(task.request, staging_params);
-        if (!staging_params.empty() && staging_proxy_) {
-            task.staging = true;
-            // Orchestration only; the real transport submissions issued by
-            // ProxyManager are counted where they recurse through the
-            // non-staging path below.
-            auto status =
-                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
-            if (!status.ok()) {
-                task.staging = false;
-                task.type = UNSPEC;
-                return finishQueuedOwner(owner_id, FAILED);
-            }
-            task.post_time = std::chrono::steady_clock::now();
-            return markQueuedOwnerSubmitted(owner_id);
-        }
-    }
-
     if (!batch->sub_batch[task.type]) {
         auto& transport = transport_list_[task.type];
         if (!transport) return finishQueuedOwner(owner_id, FAILED);
