@@ -227,7 +227,7 @@ System-managed behavior:
 | `location` | `"cpu:0"` | placement string passed into transport registration |
 | `tags` | `["dram"]` | tags published with the segment |
 | `alignment` | `64` | allocation alignment |
-| `reclaim_grace_ms` | `1000` | delayed reclaim window |
+| `reclaim_grace_ms` | `1000` | delayed reclaim window for scheduled cleanup; storage-owner eviction pressure may reclaim stale/orphan local bytes earlier after an authoritative active route no longer references them; route-missing ghosts are not released without a separate confirmed-absent proof |
 | `eviction_high_watermark_percent` | `90` | start background eviction when local usage reaches this percentage |
 | `eviction_low_watermark_percent` | `80` | stop background eviction after usage falls to this percentage |
 | `eviction_poll_interval` | `100ms` | background storage-owner eviction polling interval; `0` disables the worker |
