@@ -163,7 +163,7 @@ cd mooncake-wheel
 # Materialize a local copy of the root README.md so that
 # `readme = "README.md"` resolves inside this directory. Modern
 # setuptools rejects `../`-traversal in the readme path. The file is
-# removed at the end of the script (the explicit `rm` after `cd ..`).
+# removed by the EXIT trap below.
 cp ../README.md README.md
 
 WHEEL_DIR="$(pwd)"
@@ -201,8 +201,8 @@ if [ "$NON_CUDA_BUILD" = "1" ]; then
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-non-cuda"/' pyproject.toml
-    sed -i 's/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI."/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. (Non-CUDA version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma"\]/keywords = ["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma", "non-cuda"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Non-CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "non-cuda"]/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-non-cuda"
 elif [ "$CU13_BUILD" = "1" ]; then
@@ -211,8 +211,8 @@ elif [ "$CU13_BUILD" = "1" ]; then
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cuda13"/' pyproject.toml
-    sed -i 's/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI."/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. (CUDA 13 version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma"\]/keywords = ["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma", "cuda13"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (CUDA 13 version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "cuda13"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-cuda13"
 elif [ "$NPU_BUILD" = "1" ]; then
     echo "Modifying package name for Ascend NPU build"
@@ -220,8 +220,8 @@ elif [ "$NPU_BUILD" = "1" ]; then
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-npu"/' pyproject.toml
-    sed -i 's/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI."/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. (Ascend NPU version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma"\]/keywords = ["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma", "ascend", "npu"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Ascend NPU version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "ascend", "npu"]/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-npu"
@@ -231,8 +231,8 @@ elif [ "$EFA_BUILD" = "1" ]; then
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa"/' pyproject.toml
-    sed -i 's/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI."/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. (AWS EFA, CUDA version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma"\]/keywords = ["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma", "aws", "efa", "libfabric", "cuda"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-efa"
 elif [ "$EFA_NON_CUDA_BUILD" = "1" ]; then
     echo "Modifying package name for AWS EFA build (non-CUDA)"
@@ -240,8 +240,8 @@ elif [ "$EFA_NON_CUDA_BUILD" = "1" ]; then
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-non-cuda"/' pyproject.toml
-    sed -i 's/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI."/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. (AWS EFA, Non-CUDA version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma"\]/keywords = ["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma", "aws", "efa", "libfabric", "non-cuda"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, Non-CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "non-cuda"]/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-efa-non-cuda"
 elif [ "$MUSA_BUILD" = "1" ]; then
@@ -250,8 +250,8 @@ elif [ "$MUSA_BUILD" = "1" ]; then
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-musa"/' pyproject.toml
-    sed -i 's/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI."/description = "Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. (MUSA version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma"\]/keywords = ["mooncake", "transfer-engine", "mooncake-store", "kv-cache", "llm-inference", "disaggregated-inference", "prefill-decode-disaggregation", "kimi", "moonshot-ai", "p2p-transfer", "rdma", "musa", "moore-threads"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (MUSA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "musa", "moore-threads"]/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-musa"
@@ -522,10 +522,5 @@ rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
 
 cd ..
-
-[[ -f mooncake-wheel/pyproject.toml.backup ]] && mv mooncake-wheel/pyproject.toml.backup mooncake-wheel/pyproject.toml
-
-# Remove the staged README.md copy materialized earlier so the working tree stays clean.
-rm -f mooncake-wheel/README.md
 
 echo "Wheel package built and repaired successfully!"
