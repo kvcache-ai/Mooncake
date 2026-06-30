@@ -35,7 +35,7 @@ tl::expected<void, std::string> makeAbstractAddress(
 
 tl::expected<int, std::string> createConnectedSocket(
     const std::string &socket_name) {
-    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock_fd < 0) {
         return tl::make_unexpected(errnoMessage("Failed to create UDS socket"));
     }
@@ -98,7 +98,7 @@ int UdsConnection::sendRaw(const void *data, size_t len) {
     size_t remaining = len;
     while (remaining > 0) {
         ssize_t sent = ::send(fd_, pos, remaining, 0);
-        if (sent < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (sent < 0 && errno == EINTR) continue;
         if (sent <= 0) return -1;
         pos += sent;
         remaining -= static_cast<size_t>(sent);
@@ -111,7 +111,7 @@ int UdsConnection::recvRaw(void *data, size_t len) {
     size_t remaining = len;
     while (remaining > 0) {
         ssize_t received = ::recv(fd_, pos, remaining, 0);
-        if (received < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (received < 0 && errno == EINTR) continue;
         if (received <= 0) return -1;
         pos += received;
         remaining -= static_cast<size_t>(received);
@@ -142,7 +142,7 @@ int UdsConnection::sendFd(int fd, void *data, size_t data_len) {
 
     while (true) {
         ssize_t sent = sendmsg(fd_, &msg, 0);
-        if (sent < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (sent < 0 && errno == EINTR) continue;
         return sent < 0 ? -1 : 0;
     }
 }
@@ -164,8 +164,8 @@ int UdsConnection::recvFd(void *data, size_t data_len) {
 
     while (true) {
         ssize_t received = recvmsg(fd_, &msg, 0);
-        if (received < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (received < 0) return -1;
+        if (received < 0 && errno == EINTR) continue;
+        if (received <= 0) return -1;
         break;
     }
 
@@ -204,7 +204,7 @@ tl::expected<void, std::string> UdsAcceptor::start() {
         return tl::make_unexpected("UDS acceptor handler is not registered");
     }
 
-    listen_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    listen_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listen_fd_ < 0) {
         return tl::make_unexpected(errnoMessage("Failed to create UDS socket"));
     }
@@ -275,11 +275,11 @@ void UdsAcceptor::acceptLoop() {
 }
 
 void UdsAcceptor::wakeAccept() {
-    // accept() is a blocking syscall on the listener thread. Connecting to the
-    // same abstract UDS name creates one local connection, wakes accept(), and
-    // lets the loop observe running_ == false without relying on signals.
-    auto fd = createConnectedSocket(socket_name_);
-    if (fd) ::close(*fd);
+    // accept() is a blocking syscall on the listener thread. Shutting down the
+    // listener wakes accept() so the loop can observe running_ == false.
+    if (listen_fd_ >= 0) {
+        ::shutdown(listen_fd_, SHUT_RDWR);
+    }
 }
 
 }  // namespace mooncake
