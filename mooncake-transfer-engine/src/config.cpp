@@ -651,8 +651,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
-    LOG(INFO) << "metadata_cache_ttl_ms = "
-              << config.metadata_cache_ttl_ms;
+    LOG(INFO) << "metadata_cache_ttl_ms = " << config.metadata_cache_ttl_ms;
     LOG(INFO) << "metadata_deregister_grace_ms = "
               << config.metadata_deregister_grace_ms;
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;

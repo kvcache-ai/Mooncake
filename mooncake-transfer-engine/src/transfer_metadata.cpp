@@ -49,7 +49,8 @@ static inline std::string extractProtocolFromConnString(
     return "etcd";
 }
 
-static void normalizeSegmentDescForPublish(TransferMetadata::SegmentDesc &desc) {
+static void normalizeSegmentDescForPublish(
+    TransferMetadata::SegmentDesc &desc) {
     if (desc.metadata_version == 0) desc.metadata_version = 1;
     for (auto &buffer : desc.buffers) {
         if (buffer.state.empty())
@@ -59,8 +60,7 @@ static void normalizeSegmentDescForPublish(TransferMetadata::SegmentDesc &desc) 
 
 static void bumpSegmentMetadataVersion(TransferMetadata::SegmentDesc &desc) {
     uint64_t now_ns = getCurrentTimeInNano();
-    desc.metadata_version =
-        std::max(now_ns, desc.metadata_version + 1);
+    desc.metadata_version = std::max(now_ns, desc.metadata_version + 1);
 }
 
 static void decodeBufferState(const Json::Value &bufferJSON,
@@ -525,7 +525,8 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
     if (!storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
         LOG(ERROR) << "Failed to register segment descriptor, name "
-                   << publish_desc.name << " protocol " << publish_desc.protocol;
+                   << publish_desc.name << " protocol "
+                   << publish_desc.protocol;
         return ERR_METADATA;
     }
 
@@ -1266,9 +1267,8 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                      iter != segment_desc->buffers.end(); ++iter) {
                     if (iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                        ||
-                        (iter->offset + segment_desc->cxl_base_addr) ==
-                            (uint64_t)addr
+                        || (iter->offset + segment_desc->cxl_base_addr) ==
+                               (uint64_t)addr
 #endif
                     ) {
                         segment_desc->buffers.erase(iter);

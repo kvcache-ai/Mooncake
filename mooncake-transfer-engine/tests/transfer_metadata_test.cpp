@@ -166,9 +166,9 @@ TEST(RdmaTransportMetadataTest, SelectDeviceSkipsDrainingBuffers) {
 
     int buffer_id = -1;
     int device_id = -1;
-    EXPECT_EQ(RdmaTransport::selectDevice(&desc, 4096, 128, buffer_id,
-                                          device_id),
-              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(
+        RdmaTransport::selectDevice(&desc, 4096, 128, buffer_id, device_id),
+        ERR_ADDRESS_NOT_REGISTERED);
 }
 
 // add, get and remove RPCMetaEntryMeta

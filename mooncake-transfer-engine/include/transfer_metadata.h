@@ -50,8 +50,8 @@ class TransferMetadata {
     };
 
     struct BufferDesc {
-        static constexpr const char* STATE_READY = "READY";
-        static constexpr const char* STATE_DRAINING = "DRAINING";
+        static constexpr const char *STATE_READY = "READY";
+        static constexpr const char *STATE_DRAINING = "DRAINING";
 
         std::string name;
         uint64_t addr;
