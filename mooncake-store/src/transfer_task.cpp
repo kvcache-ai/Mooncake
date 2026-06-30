@@ -1143,8 +1143,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 
         // Return a pre-completed future (no async work needed)
         auto state = std::make_shared<EmptyOperationState>();
-        VLOG(2) << "Inline memcpy completed: " << slices.size()
-                << " slices, " << total_size << " bytes";
+        VLOG(2) << "Inline memcpy completed: " << slices.size() << " slices, "
+                << total_size << " bytes";
         return TransferFuture(state);
     }
 

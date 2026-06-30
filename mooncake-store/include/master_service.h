@@ -369,8 +369,9 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    // NOTE: parameter order differs from WrappedMasterService::BatchPutEnd in rpc_service.h
-    // (tenant_id and replica_type are swapped). These serve different call chains.
+    // NOTE: parameter order differs from WrappedMasterService::BatchPutEnd in
+    // rpc_service.h (tenant_id and replica_type are swapped). These serve
+    // different call chains.
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id,

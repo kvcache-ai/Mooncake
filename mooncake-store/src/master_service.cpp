@@ -2941,16 +2941,20 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
         std::vector<std::future<void>> futures;
         results.resize(keys.size());
         for (auto& [shard_idx, indices] : shard_groups) {
-            futures.emplace_back(std::async(std::launch::async, [&, shard_idx, indices = std::move(indices)]() {
-                for (size_t idx : indices) {
-                    results[idx] = PutEnd(client_id, keys[idx], tenant_id, replica_type);
-                }
-            }));
+            futures.emplace_back(std::async(
+                std::launch::async,
+                [&, shard_idx, indices = std::move(indices)]() {
+                    for (size_t idx : indices) {
+                        results[idx] = PutEnd(client_id, keys[idx], tenant_id,
+                                              replica_type);
+                    }
+                }));
         }
         for (auto& f : futures) f.wait();
     } else {
         for (const auto& key : keys) {
-            results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
+            results.emplace_back(
+                PutEnd(client_id, key, tenant_id, replica_type));
         }
     }
     return results;
@@ -2973,16 +2977,20 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
         std::vector<std::future<void>> futures;
         results.resize(keys.size());
         for (auto& [shard_idx, indices] : shard_groups) {
-            futures.emplace_back(std::async(std::launch::async, [&, shard_idx, indices = std::move(indices)]() {
-                for (size_t idx : indices) {
-                    results[idx] = PutRevoke(client_id, keys[idx], tenant_id, replica_type);
-                }
-            }));
+            futures.emplace_back(std::async(
+                std::launch::async,
+                [&, shard_idx, indices = std::move(indices)]() {
+                    for (size_t idx : indices) {
+                        results[idx] = PutRevoke(client_id, keys[idx],
+                                                 tenant_id, replica_type);
+                    }
+                }));
         }
         for (auto& f : futures) f.wait();
     } else {
         for (const auto& key : keys) {
-            results.emplace_back(PutRevoke(client_id, key, tenant_id, replica_type));
+            results.emplace_back(
+                PutRevoke(client_id, key, tenant_id, replica_type));
         }
     }
     return results;
@@ -6591,7 +6599,8 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                         continue;
                     }
                     // CMS frequency-aware: hot objects get a virtual lease
-                    // extension, biasing quota-driven eviction toward cold keys.
+                    // extension, biasing quota-driven eviction toward cold
+                    // keys.
                     if (AdjustLeaseTimeoutWithFrequency(
                             normalized_tenant, it->first,
                             metadata.lease_timeout) > now) {
@@ -6659,8 +6668,7 @@ MasterService::AdjustLeaseTimeoutWithFrequency(
 
     // Query CMS frequency WITHOUT incrementing (read-only). This is the
     // access count accumulated via TryPushPromotionQueue on each GET hit.
-    const auto admission_key =
-        MakeTenantScopedStorageKey(tenant_id, key);
+    const auto admission_key = MakeTenantScopedStorageKey(tenant_id, key);
     const uint8_t freq = promotion_sketch_->count(admission_key);
     if (freq == 0) return lease_timeout;
 
@@ -6669,9 +6677,9 @@ MasterService::AdjustLeaseTimeoutWithFrequency(
     static constexpr int64_t kLeaseExtensionSecondsPerAccess = 30;
     static constexpr int64_t kMaxLeaseExtensionSeconds = 7200;  // 2 hours
 
-    int64_t extension_sec = std::min(
-        static_cast<int64_t>(freq) * kLeaseExtensionSecondsPerAccess,
-        kMaxLeaseExtensionSeconds);
+    int64_t extension_sec =
+        std::min(static_cast<int64_t>(freq) * kLeaseExtensionSecondsPerAccess,
+                 kMaxLeaseExtensionSeconds);
 
     return lease_timeout + std::chrono::seconds(extension_sec);
 }

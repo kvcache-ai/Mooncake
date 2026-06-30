@@ -32,12 +32,12 @@ class CountMinSketch {
     }
 
     // Lock-free increment. Uses atomic fetch_add with saturation at UINT8_MAX.
-    uint8_t increment(const std::string &key) {
+    uint8_t increment(const std::string& key) {
         uint8_t min_val = UINT8_MAX;
         size_t base = std::hash<std::string>{}(key);
         for (size_t i = 0; i < depth_; ++i) {
             size_t idx = hashFromBase(base, i) % width_;
-            auto &cell = table_[row_strides_[i] + idx];
+            auto& cell = table_[row_strides_[i] + idx];
             uint8_t old_val = cell.load(std::memory_order_relaxed);
             // Saturating increment: only CAS if below max
             while (old_val < UINT8_MAX) {
@@ -61,13 +61,13 @@ class CountMinSketch {
 
     // Lock-free read. Uses atomic loads with relaxed ordering (Count-Min Sketch
     // is inherently approximate, so strict ordering is unnecessary).
-    uint8_t count(const std::string &key) const {
+    uint8_t count(const std::string& key) const {
         uint8_t min_val = UINT8_MAX;
         size_t base = std::hash<std::string>{}(key);
         for (size_t i = 0; i < depth_; ++i) {
             size_t idx = hashFromBase(base, i) % width_;
-            uint8_t val = table_[row_strides_[i] + idx].load(
-                std::memory_order_relaxed);
+            uint8_t val =
+                table_[row_strides_[i] + idx].load(std::memory_order_relaxed);
             if (val < min_val) min_val = val;
         }
         return min_val;
@@ -90,14 +90,15 @@ class CountMinSketch {
             width_ * depth_) {
             return;
         }
-        for (auto &cell : table_) {
+        for (auto& cell : table_) {
             cell.store(cell.load(std::memory_order_relaxed) >> 1,
                        std::memory_order_relaxed);
         }
-        // Use fetch_sub to preserve concurrent increments that arrived during decay.
-        // store(0) would silently erase them, causing counter drift and delayed
-        // subsequent decay cycles. fetch_sub(threshold) subtracts only the increments
-        // accounted for by this decay pass; any extras remain counted.
+        // Use fetch_sub to preserve concurrent increments that arrived during
+        // decay. store(0) would silently erase them, causing counter drift and
+        // delayed subsequent decay cycles. fetch_sub(threshold) subtracts only
+        // the increments accounted for by this decay pass; any extras remain
+        // counted.
         total_increments_.fetch_sub(width_ * depth_, std::memory_order_relaxed);
     }
 
@@ -118,8 +119,8 @@ class CountMinSketch {
     const size_t depth_;
     std::vector<std::atomic<uint8_t>> table_;  // lock-free flat table
     std::vector<size_t> row_strides_;          // precomputed offsets
-    std::atomic<size_t> total_increments_;      // atomic for lock-free check
-    std::mutex decay_mu_;                       // protects decay() only
+    std::atomic<size_t> total_increments_;     // atomic for lock-free check
+    std::mutex decay_mu_;                      // protects decay() only
 };
 
 }  // namespace mooncake

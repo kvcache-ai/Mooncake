@@ -2168,32 +2168,31 @@ void Client::FlushPendingPutEnds() {
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
                 LOG(ERROR) << "Deferred BatchPutEnd(MEMORY) failed for key="
-                           << memory_keys[i]
-                           << ": " << toString(results[i].error());
+                           << memory_keys[i] << ": "
+                           << toString(results[i].error());
             }
         }
     }
 
     if (!disk_keys.empty()) {
-        auto results =
-            master_client_.BatchPutEnd(disk_keys, ReplicaType::DISK);
+        auto results = master_client_.BatchPutEnd(disk_keys, ReplicaType::DISK);
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
                 LOG(ERROR) << "Deferred BatchPutEnd(DISK) failed for key="
-                           << disk_keys[i]
-                           << ": " << toString(results[i].error());
+                           << disk_keys[i] << ": "
+                           << toString(results[i].error());
             }
         }
     }
 
     if (!local_disk_keys.empty()) {
-        auto results =
-            master_client_.BatchPutEnd(local_disk_keys, ReplicaType::LOCAL_DISK);
+        auto results = master_client_.BatchPutEnd(local_disk_keys,
+                                                  ReplicaType::LOCAL_DISK);
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
                 LOG(ERROR) << "Deferred BatchPutEnd(LOCAL_DISK) failed for key="
-                           << local_disk_keys[i]
-                           << ": " << toString(results[i].error());
+                           << local_disk_keys[i] << ": "
+                           << toString(results[i].error());
             }
         }
     }
@@ -2204,20 +2203,19 @@ void Client::FlushPendingPutEnds() {
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
                 LOG(ERROR) << "Deferred BatchPutEnd(NOF_SSD) failed for key="
-                           << nof_keys[i]
-                           << ": " << toString(results[i].error());
+                           << nof_keys[i] << ": "
+                           << toString(results[i].error());
             }
         }
     }
 
     if (!all_keys.empty()) {
-        auto results =
-            master_client_.BatchPutEnd(all_keys, ReplicaType::ALL);
+        auto results = master_client_.BatchPutEnd(all_keys, ReplicaType::ALL);
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
                 LOG(ERROR) << "Deferred BatchPutEnd(ALL) failed for key="
-                           << all_keys[i]
-                           << ": " << toString(results[i].error());
+                           << all_keys[i] << ": "
+                           << toString(results[i].error());
             }
         }
     }

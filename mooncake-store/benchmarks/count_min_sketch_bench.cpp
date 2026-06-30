@@ -65,9 +65,7 @@ class MutexCountMinSketch {
     mutable std::mutex mutex_;
 };
 
-static std::string make_key(int id) {
-    return "key_" + std::to_string(id);
-}
+static std::string make_key(int id) { return "key_" + std::to_string(id); }
 
 struct BenchResult {
     int num_threads;
@@ -171,8 +169,8 @@ int main() {
     std::vector<int> thread_counts = {1, 2, 4, 8, 16};
 
     std::cout << "=== CountMinSketch Benchmark: CAS vs Mutex ===" << std::endl;
-    std::cout << "Keys: " << NUM_KEYS
-              << ", Ops/thread: " << OPS_PER_THREAD << std::endl;
+    std::cout << "Keys: " << NUM_KEYS << ", Ops/thread: " << OPS_PER_THREAD
+              << std::endl;
     std::cout << std::string(80, '=') << std::endl;
 
     // --- MUTEX BASELINE ---
@@ -226,12 +224,9 @@ int main() {
     std::cout << "  COMPARISON: CAS vs Mutex (throughput in M ops/s)"
               << std::endl;
     std::cout << std::string(80, '=') << std::endl;
-    std::cout << std::setw(10) << "Threads"
-              << std::setw(16) << "Mutex-Inc"
-              << std::setw(16) << "CAS-Inc"
-              << std::setw(12) << "Speedup"
-              << std::setw(16) << "Mutex-Mix"
-              << std::setw(16) << "CAS-Mix"
+    std::cout << std::setw(10) << "Threads" << std::setw(16) << "Mutex-Inc"
+              << std::setw(16) << "CAS-Inc" << std::setw(12) << "Speedup"
+              << std::setw(16) << "Mutex-Mix" << std::setw(16) << "CAS-Mix"
               << std::setw(12) << "Speedup" << std::endl;
     std::cout << std::string(80, '-') << std::endl;
 
@@ -250,10 +245,9 @@ int main() {
             double inc_speedup = c_inc.throughput_mops / m_inc.throughput_mops;
             double mix_speedup = c_mix.throughput_mops / m_mix.throughput_mops;
 
-            std::cout << std::setw(10) << t << std::setw(16)
-                      << std::fixed << std::setprecision(2)
-                      << m_inc.throughput_mops << std::setw(16)
-                      << c_inc.throughput_mops << std::setw(11)
+            std::cout << std::setw(10) << t << std::setw(16) << std::fixed
+                      << std::setprecision(2) << m_inc.throughput_mops
+                      << std::setw(16) << c_inc.throughput_mops << std::setw(11)
                       << std::setprecision(1) << inc_speedup << "x"
                       << std::setw(16) << std::setprecision(2)
                       << m_mix.throughput_mops << std::setw(16)

@@ -86,8 +86,9 @@ class WrappedMasterService {
                   const ReplicateConfig& config,
                   const std::string& tenant_id = "default");
 
-    // NOTE: parameter order differs from MasterService::BatchPutEnd in master_service.h
-    // (tenant_id and replica_type are swapped). These serve different call chains.
+    // NOTE: parameter order differs from MasterService::BatchPutEnd in
+    // master_service.h (tenant_id and replica_type are swapped). These serve
+    // different call chains.
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
