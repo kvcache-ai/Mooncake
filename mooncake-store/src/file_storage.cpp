@@ -702,11 +702,19 @@ void FileStorage::RemoveAll() {
     // 2. Unconditionally wipe all files under the storage directory.
     //    This guarantees physical cleanup even if the in-memory map was
     //    empty (e.g. after a crash or partial ScanMeta).
+    //    Use manual increment with error_code to avoid throwing
+    //    filesystem_error from operator++ in range-for.
     const auto& storage_dir = config_.storage_filepath;
     std::error_code ec;
     if (fs::exists(storage_dir, ec) && !ec) {
-        for (const auto& entry : fs::directory_iterator(storage_dir, ec)) {
-            if (ec) break;
+        for (auto it = fs::directory_iterator(storage_dir, ec);
+             it != fs::directory_iterator(); it.increment(ec)) {
+            if (ec) {
+                LOG(WARNING) << "RemoveAll: directory iteration failed: "
+                             << ec.message();
+                break;
+            }
+            const auto& entry = *it;
             std::error_code remove_ec;
             fs::remove_all(entry.path(), remove_ec);
             if (remove_ec &&

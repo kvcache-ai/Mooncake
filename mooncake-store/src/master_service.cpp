@@ -3976,11 +3976,6 @@ long MasterService::RemoveAll(bool force) {
     // them to physically clear their SSD via pending_remove_all.
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
 
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         for (auto tenant_it = shard->tenants.begin();
@@ -4027,11 +4022,17 @@ long MasterService::RemoveAll(bool force) {
     }
 
     // Signal each client that owns disk replicas to clear their SSD.
-    for (const auto& client_id : clients_with_disk_replicas) {
-        auto seg_it = client_local_disk_segment.find(client_id);
-        if (seg_it != client_local_disk_segment.end()) {
-            MutexLocker locker(&seg_it->second->offloading_mutex_);
-            seg_it->second->pending_remove_all = true;
+    if (!clients_with_disk_replicas.empty()) {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        for (const auto& client_id : clients_with_disk_replicas) {
+            auto seg_it = client_local_disk_segment.find(client_id);
+            if (seg_it != client_local_disk_segment.end()) {
+                MutexLocker locker(&seg_it->second->offloading_mutex_);
+                seg_it->second->pending_remove_all = true;
+            }
         }
     }
 
@@ -4048,11 +4049,6 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
 
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
-
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
 
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
@@ -4098,11 +4094,17 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
         }
     }
 
-    for (const auto& client_id : clients_with_disk_replicas) {
-        auto seg_it = client_local_disk_segment.find(client_id);
-        if (seg_it != client_local_disk_segment.end()) {
-            MutexLocker locker(&seg_it->second->offloading_mutex_);
-            seg_it->second->pending_remove_all = true;
+    if (!clients_with_disk_replicas.empty()) {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        for (const auto& client_id : clients_with_disk_replicas) {
+            auto seg_it = client_local_disk_segment.find(client_id);
+            if (seg_it != client_local_disk_segment.end()) {
+                MutexLocker locker(&seg_it->second->offloading_mutex_);
+                seg_it->second->pending_remove_all = true;
+            }
         }
     }
 

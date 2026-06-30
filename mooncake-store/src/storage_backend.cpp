@@ -3287,18 +3287,21 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
 }
 
 void OffsetAllocatorStorageBackend::RemoveAll() {
-    // Clear all shard maps and reset counters under exclusive locks.
-    {
-        std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
-        shard_locks.reserve(kNumShards);
-        for (size_t i = 0; i < kNumShards; ++i) {
-            shard_locks.emplace_back(
-                std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
-            shards_[i].map.clear();
-        }
-        total_size_.store(0, std::memory_order_relaxed);
-        total_keys_.store(0, std::memory_order_relaxed);
+    // Acquire exclusive locks on all shards and keep them held across the
+    // whole function. The single-arg SharedMutexLocker constructor takes
+    // the exclusive mode (see mutex.h), so map.clear() is safe. Holding
+    // the locks through the data_file_/allocator_ rebuild prevents
+    // concurrent RemoveAll invocations (initiator sync + heartbeat backstop)
+    // from racing on data_file_.reset() / rebuild.
+    std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+    shard_locks.reserve(kNumShards);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shard_locks.emplace_back(
+            std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+        shards_[i].map.clear();
     }
+    total_size_.store(0, std::memory_order_relaxed);
+    total_keys_.store(0, std::memory_order_relaxed);
 
     // Truncate the data file and rebuild the allocator so the backend
     // is ready for new writes (same logic as Init's fresh-start path).
