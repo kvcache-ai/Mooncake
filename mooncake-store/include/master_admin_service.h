@@ -103,6 +103,8 @@ class MasterAdminServer {
                                      coro_http::coro_http_response& resp);
     void HandleSetDefaultTenantQuota(coro_http::coro_http_request& req,
                                      coro_http::coro_http_response& resp);
+    void HandleRemoveAll(coro_http::coro_http_request& req,
+                         coro_http::coro_http_response& resp);
 
     void RegisterHandler();
 

@@ -3994,16 +3994,6 @@ long MasterService::RemoveAll(bool force) {
                                 clients_with_disk_replicas.insert(*cid);
                             }
                         });
-                    it->second.VisitReplicas(
-                        &Replica::fn_is_completed, [](Replica& replica) {
-                            if (replica.is_memory_replica()) {
-                                MasterMetricManager::instance()
-                                    .dec_mem_cache_nums();
-                            } else if (replica.is_disk_replica()) {
-                                MasterMetricManager::instance()
-                                    .dec_file_cache_nums();
-                            }
-                        });
                     ErasePromotionTaskIfPresent(tenant_state, it->first,
                                                 tenant_it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
@@ -4068,16 +4058,6 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                         auto cid = replica.get_local_disk_client_id();
                         if (cid) {
                             clients_with_disk_replicas.insert(*cid);
-                        }
-                    });
-                it->second.VisitReplicas(
-                    &Replica::fn_is_completed, [](Replica& replica) {
-                        if (replica.is_memory_replica()) {
-                            MasterMetricManager::instance()
-                                .dec_mem_cache_nums();
-                        } else if (replica.is_disk_replica()) {
-                            MasterMetricManager::instance()
-                                .dec_file_cache_nums();
                         }
                     });
                 ErasePromotionTaskIfPresent(tenant_state, it->first,

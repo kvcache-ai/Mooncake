@@ -1131,6 +1131,34 @@ void MasterAdminServer::HandleSetDefaultTenantQuota(
     });
 }
 
+void MasterAdminServer::HandleRemoveAll(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    bool force = false;
+    if (auto it = req.get_query_value("force"); !it.empty()) {
+        force = (it == "true" || it == "1");
+    }
+    std::string tenant_id;
+    if (auto it = req.get_query_value("tenant_id"); !it.empty()) {
+        tenant_id = std::string(it);
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        long count;
+        if (tenant_id.empty()) {
+            count = service->RemoveAll(force);
+        } else {
+            count = service->RemoveAll(force, tenant_id);
+        }
+        struct HttpRemoveAllResponse {
+            bool success{true};
+            long removed_count{0};
+        };
+        YLT_REFL(HttpRemoveAllResponse, success, removed_count);
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpRemoveAllResponse{.removed_count = count});
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1233,6 +1261,11 @@ void MasterAdminServer::RegisterHandler() {
         "/batch_query_keys",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleBatchQueryKeys(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/remove_all",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleRemoveAll(req, resp);
         });
 }
 }  // namespace mooncake
