@@ -43,6 +43,22 @@ std::vector<std::string> splitConfigString(const std::string& value,
     return result;
 }
 
+void loadUint64Env(const char* name, uint64_t& target, uint64_t max_value) {
+    const char* env = std::getenv(name);
+    if (!env) return;
+    try {
+        uint64_t value = std::stoull(env);
+        if (value <= max_value) {
+            target = value;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable " << name;
+        }
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "Invalid " << name << " environment value: " << env
+                     << ". Error: " << e.what();
+    }
+}
+
 bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
     if (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0) {
         output = true;
@@ -315,6 +331,13 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* disable_metacache = std::getenv("MC_DISABLE_METACACHE");
     if (disable_metacache) {
         config.metacache = false;
+    }
+    loadUint64Env("MC_METADATA_CACHE_TTL_MS", config.metadata_cache_ttl_ms,
+                  3600ULL * 1000ULL);
+    loadUint64Env("MC_METADATA_DEREG_GRACE_MS",
+                  config.metadata_deregister_grace_ms, 3600ULL * 1000ULL);
+    if (config.metadata_deregister_grace_ms < config.metadata_cache_ttl_ms) {
+        config.metadata_deregister_grace_ms = config.metadata_cache_ttl_ms;
     }
 
     const char* handshake_listen_backlog =
@@ -628,6 +651,10 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
+    LOG(INFO) << "metadata_cache_ttl_ms = "
+              << config.metadata_cache_ttl_ms;
+    LOG(INFO) << "metadata_deregister_grace_ms = "
+              << config.metadata_deregister_grace_ms;
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;

@@ -54,6 +54,11 @@ class WorkerPool {
 
     void markRailFailed(const std::string &peer_nic_path);
     bool isRailAvailable(const std::string &peer_nic_path);
+    void clearRailState(const std::vector<std::string> &peer_nic_paths);
+    std::vector<std::string> buildPeerNicPaths(
+        const Transport::SegmentDesc &desc) const;
+    void recordPeerMetadataVersion(SegmentID segment_id,
+                                   const Transport::SegmentDesc &desc);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);
@@ -110,6 +115,14 @@ class WorkerPool {
     // Rail state management: peer_nic_path -> RailState
     std::unordered_map<std::string, RailState> rail_states_;
     std::mutex rail_state_lock_;
+
+    struct TargetMetadataState {
+        bool initialized = false;
+        uint64_t metadata_version = 0;
+        std::vector<std::string> peer_nic_paths;
+    };
+    std::unordered_map<SegmentID, TargetMetadataState> target_metadata_;
+    std::mutex target_metadata_lock_;
 
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;            // Errors before pause

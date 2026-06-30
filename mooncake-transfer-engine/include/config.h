@@ -60,6 +60,8 @@ struct GlobalConfig {
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
     bool metacache = true;
+    uint64_t metadata_cache_ttl_ms = 1000;
+    uint64_t metadata_deregister_grace_ms = 1000;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
