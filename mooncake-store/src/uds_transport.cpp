@@ -21,8 +21,7 @@ std::string errnoMessage(const std::string &operation) {
 tl::expected<void, std::string> makeAbstractAddress(
     const std::string &socket_name, sockaddr_un &addr, socklen_t &addr_len) {
     if (socket_name.size() > sizeof(addr.sun_path) - 2) {
-        return tl::make_unexpected("UDS socket name too long: " +
-                                   socket_name);
+        return tl::make_unexpected("UDS socket name too long: " + socket_name);
     }
 
     memset(&addr, 0, sizeof(addr));
@@ -48,10 +47,9 @@ tl::expected<int, std::string> createConnectedSocket(
         return tl::make_unexpected(addr_result.error());
     }
 
-    if (::connect(sock_fd, reinterpret_cast<sockaddr *>(&addr), addr_len) <
-        0) {
-        auto error = errnoMessage("Failed to connect UDS socket '" +
-                                  socket_name + "'");
+    if (::connect(sock_fd, reinterpret_cast<sockaddr *>(&addr), addr_len) < 0) {
+        auto error =
+            errnoMessage("Failed to connect UDS socket '" + socket_name + "'");
         close(sock_fd);
         return tl::make_unexpected(error);
     }
