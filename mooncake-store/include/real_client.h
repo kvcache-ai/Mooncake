@@ -286,6 +286,35 @@ class PrefetchThrottle {
     std::unordered_map<std::string, Entry> entries_;
 };
 
+// Replica tier selected for get() after optional prefetch wait ([GET-SRC] source=).
+enum class PrefetchReplicaSource : uint8_t {
+    kDram,
+    kSsd,
+    kDisk,
+    kUnknown,
+};
+
+// Get-side prefetch observation outcome ([PREFETCH-OUTCOME] outcome=).
+enum class PrefetchOutcome : uint8_t {
+    kDramResident,
+    kPrefetchEvictedAfterExist,
+    kPrefetchFailed,
+    kPrefetchHit,
+    kPrefetchDramWasResident,
+    kPrefetchPromotedUntracked,
+    kPrefetchMissRace,
+};
+
+PrefetchReplicaSource PrefetchReplicaSourceFromDescriptor(
+    const Replica::Descriptor& replica);
+const char* PrefetchReplicaSourceToString(PrefetchReplicaSource source);
+
+PrefetchOutcome ClassifyPrefetchOutcome(
+    int64_t prefetch_trigger_ms, int64_t prefetch_done_ms, int64_t get_ms,
+    PrefetchReplicaSource source, PrefetchThrottle::State prefetch_state,
+    bool prefetch_wait_attempted, bool promote_attempted);
+const char* PrefetchOutcomeToString(PrefetchOutcome outcome);
+
 class RealClient : public PyClient {
    public:
     RealClient();

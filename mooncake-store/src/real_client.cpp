@@ -2185,19 +2185,6 @@ void RunLocalPrefetchRegisterAndPromote(
     }
 }
 
-const char *ReplicaSourceLabel(const Replica::Descriptor &replica) {
-    if (replica.is_memory_replica()) {
-        return "DRAM";
-    }
-    if (replica.is_local_disk_replica()) {
-        return "SSD";
-    }
-    if (replica.is_disk_replica()) {
-        return "DISK";
-    }
-    return "UNKNOWN";
-}
-
 // Returns refreshed QueryResult when master sees a COMPLETE MEMORY replica.
 std::optional<QueryResult> TryRefreshBestMemoryReplica(
     Client *client, const std::string &key,
@@ -2214,45 +2201,93 @@ std::optional<QueryResult> TryRefreshBestMemoryReplica(
     return std::move(requery.value());
 }
 
-const char *ClassifyPrefetchOutcome(int64_t prefetch_trigger_ms,
-                                    int64_t prefetch_done_ms,
-                                    int64_t get_ms, const char *source,
-                                    PrefetchThrottle::State prefetch_state,
-                                    bool prefetch_wait_attempted,
-                                    bool promote_attempted) {
-    const bool from_dram =
-        (source != nullptr && std::strcmp(source, "DRAM") == 0);
+}  // namespace
+
+PrefetchReplicaSource PrefetchReplicaSourceFromDescriptor(
+    const Replica::Descriptor &replica) {
+    if (replica.is_memory_replica()) {
+        return PrefetchReplicaSource::kDram;
+    }
+    if (replica.is_local_disk_replica()) {
+        return PrefetchReplicaSource::kSsd;
+    }
+    if (replica.is_disk_replica()) {
+        return PrefetchReplicaSource::kDisk;
+    }
+    return PrefetchReplicaSource::kUnknown;
+}
+
+const char *PrefetchReplicaSourceToString(PrefetchReplicaSource source) {
+    switch (source) {
+        case PrefetchReplicaSource::kDram:
+            return "DRAM";
+        case PrefetchReplicaSource::kSsd:
+            return "SSD";
+        case PrefetchReplicaSource::kDisk:
+            return "DISK";
+        case PrefetchReplicaSource::kUnknown:
+            return "UNKNOWN";
+    }
+    return "UNKNOWN";
+}
+
+PrefetchOutcome ClassifyPrefetchOutcome(
+    int64_t prefetch_trigger_ms, int64_t prefetch_done_ms, int64_t get_ms,
+    PrefetchReplicaSource source, PrefetchThrottle::State prefetch_state,
+    bool prefetch_wait_attempted, bool promote_attempted) {
+    const bool from_dram = source == PrefetchReplicaSource::kDram;
     const bool prefetch_involved =
         prefetch_trigger_ms >= 0 || prefetch_wait_attempted;
     if (!prefetch_involved) {
         if (from_dram) {
-            return "dram_resident";
+            return PrefetchOutcome::kDramResident;
         }
-        // exist 时 BatchQuery 见 DRAM 未 promote（或无 trigger），get 时落 SSD。
-        return "prefetch_evicted_after_exist";
+        // Key was DRAM-resident at exist-time (or never triggered); evicted
+        // before get(), so get falls back to SSD.
+        return PrefetchOutcome::kPrefetchEvictedAfterExist;
     }
     if (prefetch_trigger_ms >= 0 &&
         prefetch_state == PrefetchThrottle::State::kFailed) {
-        return "prefetch_failed";
+        return PrefetchOutcome::kPrefetchFailed;
     }
     if (from_dram) {
         if (prefetch_done_ms >= 0 && prefetch_done_ms <= get_ms) {
-            return "prefetch_hit";
+            return PrefetchOutcome::kPrefetchHit;
         }
         if (!promote_attempted) {
-            return "prefetch_dram_was_resident";
+            return PrefetchOutcome::kPrefetchDramWasResident;
         }
-        return "prefetch_promoted_untracked";
+        return PrefetchOutcome::kPrefetchPromotedUntracked;
     }
-    // 本 rank 曾 trigger 或已走 promote，但 get 仍读 SSD。
+    // This rank triggered prefetch or attempted promote, but get still reads
+    // SSD (promotion lost the race or timed out).
     if (prefetch_trigger_ms >= 0 || promote_attempted) {
-        return "prefetch_miss_race";
+        return PrefetchOutcome::kPrefetchMissRace;
     }
-    // 本 rank 无 trigger、未 promote，get 时 SSD（exist 阶段可能在 DRAM）。
-    return "prefetch_evicted_after_exist";
+    // No trigger/promote on this rank; get reads SSD (may have been DRAM at
+    // exist-time on another rank, or master wait timed out on TP1~7).
+    return PrefetchOutcome::kPrefetchEvictedAfterExist;
 }
 
-}  // namespace
+const char *PrefetchOutcomeToString(PrefetchOutcome outcome) {
+    switch (outcome) {
+        case PrefetchOutcome::kDramResident:
+            return "dram_resident";
+        case PrefetchOutcome::kPrefetchEvictedAfterExist:
+            return "prefetch_evicted_after_exist";
+        case PrefetchOutcome::kPrefetchFailed:
+            return "prefetch_failed";
+        case PrefetchOutcome::kPrefetchHit:
+            return "prefetch_hit";
+        case PrefetchOutcome::kPrefetchDramWasResident:
+            return "prefetch_dram_was_resident";
+        case PrefetchOutcome::kPrefetchPromotedUntracked:
+            return "prefetch_promoted_untracked";
+        case PrefetchOutcome::kPrefetchMissRace:
+            return "prefetch_miss_race";
+    }
+    return "prefetch_evicted_after_exist";
+}
 
 void RealClient::initPrefetchRuntime() {
     // Bounded worker pool for SSD prefetch promotion jobs. Fixed size,
@@ -5423,14 +5458,16 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         const int64_t get_ms = PrefetchThrottle::NowMs();
-        const char *source = ReplicaSourceLabel(replica);
+        const PrefetchReplicaSource source =
+            PrefetchReplicaSourceFromDescriptor(replica);
         const bool promote_attempted =
             prefetch_throttle_ ? prefetch_throttle_->promoteAttempted(key)
                                : false;
-        const char *outcome = ClassifyPrefetchOutcome(
+        const PrefetchOutcome outcome = ClassifyPrefetchOutcome(
             prefetch_trigger_ms, prefetch_done_ms, get_ms, source,
             prefetch_state, prefetch_wait_attempted, promote_attempted);
-        VLOG(1) << "[GET-SRC] key=" << key << " source=" << source
+        VLOG(1) << "[GET-SRC] key=" << key
+                << " source=" << PrefetchReplicaSourceToString(source)
                 << " size=" << total_size
                 << " prefetch_trigger_ms=" << prefetch_trigger_ms
                 << " prefetch_done_ms=" << prefetch_done_ms
@@ -5439,7 +5476,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                 << " prefetch_promote_attempted="
                 << (promote_attempted ? "1" : "0")
                 << " path=multi_buffers"
-                << " [PREFETCH-OUTCOME] outcome=" << outcome;
+                << " [PREFETCH-OUTCOME] outcome="
+                << PrefetchOutcomeToString(outcome);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
         for (auto &size : sizes) {
