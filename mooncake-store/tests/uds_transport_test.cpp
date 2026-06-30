@@ -148,6 +148,46 @@ TEST(UdsTransportTest, StopWakesAcceptLoop) {
     EXPECT_FALSE(connector.connect());
 }
 
+TEST(UdsTransportTest, ConnectRejectsNonPositiveTimeout) {
+    UdsConnector connector(testSocketPath("invalid_timeout"),
+                           std::chrono::milliseconds(0));
+    auto connection_result = connector.connect();
+    ASSERT_FALSE(connection_result);
+    EXPECT_NE(connection_result.error().find("timeout"), std::string::npos);
+}
+
+TEST(UdsTransportTest, ConnectFailureReturnsPromptlyWithShortTimeout) {
+    std::string socket_name = testSocketPath("missing");
+    UdsConnector connector(socket_name, std::chrono::milliseconds(10));
+
+    auto start = std::chrono::steady_clock::now();
+    auto connection_result = connector.connect();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_FALSE(connection_result);
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+    EXPECT_NE(connection_result.error().find(socket_name), std::string::npos);
+}
+
+TEST(UdsTransportTest, ConnectRestoresBlockingMode) {
+    UdsAcceptor acceptor(testSocketPath("blocking"));
+    acceptor.registerHandler([](UdsConnection &) {});
+    auto start_result = acceptor.start();
+    ASSERT_TRUE(start_result) << start_result.error();
+
+    UdsConnector connector(testSocketPath("blocking"),
+                           std::chrono::milliseconds(10));
+    auto connection_result = connector.connect();
+    ASSERT_TRUE(connection_result) << connection_result.error();
+    auto connection = std::move(connection_result.value());
+
+    int flags = fcntl(connection->fd(), F_GETFL, 0);
+    ASSERT_GE(flags, 0);
+    EXPECT_EQ(flags & O_NONBLOCK, 0);
+
+    acceptor.stop();
+}
+
 TEST(UdsTransportTest, StartRequiresRegisteredHandler) {
     UdsAcceptor acceptor(testSocketPath("no_handler"));
     auto start_result = acceptor.start();

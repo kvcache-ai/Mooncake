@@ -47,11 +47,14 @@ class UdsConnection {
 
 class UdsConnector {
    public:
-    explicit UdsConnector(std::string socket_name);
+    explicit UdsConnector(
+        std::string socket_name,
+        std::chrono::milliseconds connect_timeout = std::chrono::seconds(5));
     tl::expected<std::unique_ptr<UdsConnection>, std::string> connect();
 
    private:
     std::string socket_name_;
+    std::chrono::milliseconds connect_timeout_;
 };
 
 class UdsAcceptor {

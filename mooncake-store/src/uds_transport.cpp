@@ -3,10 +3,14 @@
 #include <glog/logging.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -32,8 +36,64 @@ tl::expected<void, std::string> makeAbstractAddress(
     return {};
 }
 
+tl::expected<void, std::string> setSocketBlocking(int fd, bool blocking) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return tl::make_unexpected(
+            errnoMessage("Failed to get UDS socket flags"));
+    }
+
+    int new_flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+    if (fcntl(fd, F_SETFL, new_flags) < 0) {
+        return tl::make_unexpected(
+            errnoMessage("Failed to set UDS socket flags"));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> waitForConnect(
+    int sock_fd, const std::string &socket_name,
+    std::chrono::milliseconds connect_timeout) {
+    pollfd pfd = {.fd = sock_fd, .events = POLLOUT, .revents = 0};
+    int timeout_ms = static_cast<int>(connect_timeout.count());
+    int poll_result = 0;
+    do {
+        poll_result = poll(&pfd, 1, timeout_ms);
+    } while (poll_result < 0 && errno == EINTR);
+
+    if (poll_result == 0) {
+        return tl::make_unexpected("Timed out connecting UDS socket '" +
+                                   socket_name + "'");
+    }
+    if (poll_result < 0) {
+        return tl::make_unexpected(
+            errnoMessage("Failed to poll UDS socket '" + socket_name + "'"));
+    }
+
+    int socket_error = 0;
+    socklen_t socket_error_len = sizeof(socket_error);
+    if (getsockopt(sock_fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                   &socket_error_len) < 0) {
+        return tl::make_unexpected(
+            errnoMessage("Failed to get UDS socket connect result"));
+    }
+    if (socket_error != 0) {
+        return tl::make_unexpected("Failed to connect UDS socket '" +
+                                   socket_name +
+                                   "': " + strerror(socket_error));
+    }
+    return {};
+}
+
 tl::expected<int, std::string> createConnectedSocket(
-    const std::string &socket_name) {
+    const std::string &socket_name, std::chrono::milliseconds connect_timeout) {
+    if (connect_timeout.count() <= 0) {
+        return tl::make_unexpected("UDS connect timeout must be positive");
+    }
+    if (connect_timeout.count() > std::numeric_limits<int>::max()) {
+        return tl::make_unexpected("UDS connect timeout is too large");
+    }
+
     int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock_fd < 0) {
         return tl::make_unexpected(errnoMessage("Failed to create UDS socket"));
@@ -47,11 +107,32 @@ tl::expected<int, std::string> createConnectedSocket(
         return tl::make_unexpected(addr_result.error());
     }
 
-    if (::connect(sock_fd, reinterpret_cast<sockaddr *>(&addr), addr_len) < 0) {
-        auto error =
-            errnoMessage("Failed to connect UDS socket '" + socket_name + "'");
+    auto nonblocking_result = setSocketBlocking(sock_fd, false);
+    if (!nonblocking_result) {
         close(sock_fd);
-        return tl::make_unexpected(error);
+        return tl::make_unexpected(nonblocking_result.error());
+    }
+
+    if (::connect(sock_fd, reinterpret_cast<sockaddr *>(&addr), addr_len) < 0) {
+        if (errno != EINPROGRESS && errno != EAGAIN) {
+            auto error = errnoMessage("Failed to connect UDS socket '" +
+                                      socket_name + "'");
+            close(sock_fd);
+            return tl::make_unexpected(error);
+        }
+
+        auto connect_result =
+            waitForConnect(sock_fd, socket_name, connect_timeout);
+        if (!connect_result) {
+            close(sock_fd);
+            return tl::make_unexpected(connect_result.error());
+        }
+    }
+
+    auto blocking_result = setSocketBlocking(sock_fd, true);
+    if (!blocking_result) {
+        close(sock_fd);
+        return tl::make_unexpected(blocking_result.error());
     }
 
     return sock_fd;
@@ -187,12 +268,13 @@ int UdsConnection::recvFd(void *data, size_t data_len) {
     return -1;
 }
 
-UdsConnector::UdsConnector(std::string socket_name)
-    : socket_name_(std::move(socket_name)) {}
+UdsConnector::UdsConnector(std::string socket_name,
+                           std::chrono::milliseconds connect_timeout)
+    : socket_name_(std::move(socket_name)), connect_timeout_(connect_timeout) {}
 
 tl::expected<std::unique_ptr<UdsConnection>, std::string>
 UdsConnector::connect() {
-    auto fd = createConnectedSocket(socket_name_);
+    auto fd = createConnectedSocket(socket_name_, connect_timeout_);
     if (!fd) return tl::make_unexpected(fd.error());
     return std::make_unique<UdsConnection>(*fd);
 }
