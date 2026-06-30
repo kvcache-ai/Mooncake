@@ -3187,14 +3187,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         metadata.reserved_quota_charge_bytes = 0;
     }
 
-    EraseReplicasWithCacheTotalAccounting(
-        metadata, [replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() || replica.is_nof_replica();
-            }
-            return replica.type() == replica_type;
-        });
-
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
