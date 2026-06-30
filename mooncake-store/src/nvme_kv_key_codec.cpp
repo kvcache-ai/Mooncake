@@ -59,7 +59,12 @@ bool ParseNvmeKvPhysicalKeyHex(std::string_view physical_key_hex,
         }
         physical_key[i] = static_cast<uint8_t>((high << 4) | low);
     }
+    NormalizeNvmeKvPhysicalKey(physical_key);
     return true;
+}
+
+void NormalizeNvmeKvPhysicalKey(NvmeKvPhysicalKey& physical_key) {
+    physical_key[kNvmeKvPhysicalKeyCsiOverlappedByteIndex] = 0;
 }
 
 NvmeKvPhysicalKey EncodeNvmeKvPhysicalKey(const std::string& key) {
@@ -70,6 +75,7 @@ NvmeKvPhysicalKey EncodeNvmeKvPhysicalKey(const std::string& key) {
     const uint64_t h1 = XXH64(seed1.data(), seed1.size(), 0);
     std::memcpy(physical_key.data(), &h0, sizeof(h0));
     std::memcpy(physical_key.data() + 8, &h1, sizeof(h1));
+    NormalizeNvmeKvPhysicalKey(physical_key);
     return physical_key;
 }
 
@@ -83,6 +89,7 @@ NvmeKvPhysicalKey EncodeNvmeKvChunkPhysicalKey(const std::string& key,
     const uint64_t h1 = XXH64(seed1.data(), seed1.size(), 0);
     std::memcpy(physical_key.data(), &h0, sizeof(h0));
     std::memcpy(physical_key.data() + 8, &h1, sizeof(h1));
+    NormalizeNvmeKvPhysicalKey(physical_key);
     return physical_key;
 }
 

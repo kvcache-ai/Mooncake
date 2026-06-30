@@ -16,11 +16,17 @@ namespace mooncake {
 // entries.
 using NvmeKvPhysicalKey = std::array<uint8_t, 16>;
 
+// KV CSI occupies cdw14[31:24], overlapping physical key byte 11 in the
+// passthrough command encoding. Keep that byte deterministic so catalog keys
+// and collision checks match the actual device-visible key space.
+constexpr size_t kNvmeKvPhysicalKeyCsiOverlappedByteIndex = 11;
+
 uint32_t ComputeNvmeKvChecksum(std::span<const uint8_t> data);
 std::array<uint8_t, 32> ComputeNvmeKvVerifyHash(const std::string& key);
 std::string NvmeKvPhysicalKeyToHex(const NvmeKvPhysicalKey& physical_key);
 bool ParseNvmeKvPhysicalKeyHex(std::string_view physical_key_hex,
                                NvmeKvPhysicalKey& physical_key);
+void NormalizeNvmeKvPhysicalKey(NvmeKvPhysicalKey& physical_key);
 
 // Root objects use a hash of the logical key. Large-object chunks derive
 // independent physical keys from the logical key plus chunk index so chunks do

@@ -326,8 +326,10 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
 
     tl::expected<std::string, ErrorCode> Retrieve(
         const PhysicalKey& key) const override {
-        auto dma_buffer =
-            AllocateAlignedBuffer(capabilities_.effective_max_value_size);
+        const uint32_t max_value_size = capabilities_.effective_max_value_size;
+        const uint32_t transfer_bytes =
+            RoundUpToKvTransferBytes(max_value_size);
+        auto dma_buffer = AllocateAlignedBuffer(transfer_bytes);
         if (dma_buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
@@ -335,11 +337,10 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         cmd.opcode = kNvmeKvRetrieveOpcode;
         cmd.nsid = nsid_;
         cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
-        cmd.data_len = capabilities_.effective_max_value_size;
-        cmd.cdw10 = capabilities_.effective_max_value_size;
+        cmd.data_len = transfer_bytes;
+        cmd.cdw10 = max_value_size;
         cmd.cdw11 = BuildKeyLengthField(key.size());
-        auto block_count =
-            ComputeKvBlockCountMinusOne(capabilities_.effective_max_value_size);
+        auto block_count = ComputeKvBlockCountMinusOne(max_value_size);
         if (!block_count) {
             return tl::make_unexpected(block_count.error());
         }
@@ -354,10 +355,8 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         }
 
         const uint32_t actual_size = ResolveNvmeKvObjectValueSize(
-            dma_buffer.get(), result.value(),
-            capabilities_.effective_max_value_size);
-        if (actual_size == 0 ||
-            actual_size > capabilities_.effective_max_value_size) {
+            dma_buffer.get(), result.value(), max_value_size);
+        if (actual_size == 0 || actual_size > max_value_size) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
         return std::string(dma_buffer.get(), dma_buffer.get() + actual_size);
@@ -366,8 +365,10 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
     tl::expected<uint32_t, ErrorCode> RetrieveInto(
         const PhysicalKey& key, void* buffer,
         uint32_t buffer_size) const override {
-        auto dma_buffer =
-            AllocateAlignedBuffer(capabilities_.effective_max_value_size);
+        const uint32_t max_value_size = capabilities_.effective_max_value_size;
+        const uint32_t transfer_bytes =
+            RoundUpToKvTransferBytes(max_value_size);
+        auto dma_buffer = AllocateAlignedBuffer(transfer_bytes);
         if (dma_buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
@@ -375,11 +376,10 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         cmd.opcode = kNvmeKvRetrieveOpcode;
         cmd.nsid = nsid_;
         cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
-        cmd.data_len = capabilities_.effective_max_value_size;
-        cmd.cdw10 = capabilities_.effective_max_value_size;
+        cmd.data_len = transfer_bytes;
+        cmd.cdw10 = max_value_size;
         cmd.cdw11 = BuildKeyLengthField(key.size());
-        auto block_count =
-            ComputeKvBlockCountMinusOne(capabilities_.effective_max_value_size);
+        auto block_count = ComputeKvBlockCountMinusOne(max_value_size);
         if (!block_count) {
             return tl::make_unexpected(block_count.error());
         }
@@ -394,10 +394,8 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         }
 
         const uint32_t actual_size = ResolveNvmeKvObjectValueSize(
-            dma_buffer.get(), result.value(),
-            capabilities_.effective_max_value_size);
-        if (actual_size == 0 ||
-            actual_size > capabilities_.effective_max_value_size) {
+            dma_buffer.get(), result.value(), max_value_size);
+        if (actual_size == 0 || actual_size > max_value_size) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
         if (actual_size > buffer_size) {
