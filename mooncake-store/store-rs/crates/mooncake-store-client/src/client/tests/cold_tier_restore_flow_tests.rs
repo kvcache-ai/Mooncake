@@ -439,6 +439,8 @@ fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
     );
 
     force_cold_only_route(&client, "batch-readable-evict-target");
+    bounded_reads.store(0, Ordering::Relaxed);
+    full_reads.store(0, Ordering::Relaxed);
 
     assert_eq!(
         client

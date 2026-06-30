@@ -13,7 +13,7 @@ use mooncake_store_core::{
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest,
     RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentTargetChunk, StoreError,
+    SegmentLifecycleState, SegmentName, SegmentReservation, SegmentTargetChunk, StoreError,
     TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccounting,
     TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
     TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy, TenantQuotaReservation,
@@ -252,6 +252,7 @@ struct RecoverableMetadataState {
     hidden_clients: BTreeSet<String>,
     hidden_segments: BTreeSet<String>,
     hide_route_policy: bool,
+    failed_route_reads: BTreeSet<ObjectKey>,
 }
 
 struct CountingStorageBackend {
@@ -417,6 +418,14 @@ impl CountingRouteDirectory {
     fn get_object_routes_calls(&self) -> usize {
         self.get_object_routes_calls.load(Ordering::Relaxed)
     }
+
+    fn bounded_reads(&self) -> usize {
+        self.bounded_reads.load(Ordering::Relaxed)
+    }
+
+    fn full_reads(&self) -> usize {
+        self.full_reads.load(Ordering::Relaxed)
+    }
 }
 
 impl EmptyConflictRouteDirectory {
@@ -462,6 +471,22 @@ impl RecoverableMetadataBackend {
             .lock()
             .expect("recoverable metadata state lock should succeed")
             .hide_route_policy = true;
+    }
+
+    fn fail_route_reads_for(&self, key: ObjectKey) {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .failed_route_reads
+            .insert(key);
+    }
+
+    fn allow_route_reads_for(&self, key: &ObjectKey) {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .failed_route_reads
+            .remove(key);
     }
 
     fn segment_key(owner: &ClientRuntimeId, segment: &SegmentName) -> String {
@@ -763,6 +788,18 @@ impl MetadataBackend for RecoverableMetadataBackend {
         &self,
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
+        if self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .failed_route_reads
+            .contains(key)
+        {
+            return Err(StoreError::Metadata(format!(
+                "simulated route read outage for {}",
+                key.0
+            )));
+        }
         self.inner.get_object_route(key)
     }
 
@@ -1758,6 +1795,7 @@ impl RouteDirectory for CountingRouteDirectory {
         observer: &ClientLease,
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.full_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.get_object_route(observer, key)
     }
 
@@ -2832,6 +2870,29 @@ fn test_storage_owner_state(
             offload_mode: ColdTierOffloadMode::default(),
             offload_priority: ColdTierOffloadPriorityConfig::default(),
             runtime: runtime.clone(),
+        },
+    ))
+}
+
+fn test_storage_owner_state_with_route_directory(
+    client: &StoreClient,
+    route_directory: Arc<dyn RouteDirectory>,
+    offload_priority: ColdTierOffloadPriorityConfig,
+) -> Arc<StorageOwnerState> {
+    Arc::new(StorageOwnerState::new(
+        client.runtime_id().clone(),
+        mooncake_store_route::RouteOperations::new(route_directory, client.lease.clone()),
+        client.metadata.clone(),
+        client.allocator.clone(),
+        client.state.clone(),
+        StorageOwnerColdTierConfig {
+            resolver: ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
+            devices: shared_cold_tier_device_cache("test"),
+            watermarks: ColdTierWatermarkConfig::default(),
+            rate_limits: ColdTierRateLimitConfig::default(),
+            offload_mode: ColdTierOffloadMode::default(),
+            offload_priority,
+            runtime: client.runtime_id().clone(),
         },
     ))
 }
@@ -11181,6 +11242,1011 @@ fn background_watermark_eviction_reclaims_without_front_path_pressure() {
         .find(|snapshot| snapshot.operation == "storage_owner_evict_one" && snapshot.status == "ok")
         .expect("per-eviction metric should be recorded");
     assert!(evict_one.calls_total >= 1);
+}
+
+#[test]
+fn eviction_reclaims_stale_local_allocation_before_live_clock_victim() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-stale-prepass-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-stale-prepass")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let stale_route = client
+        .put("evict-stale-key", b"0123456789abcdef")
+        .expect("stale key put should succeed");
+    let hot_payload = b"fedcba9876543210";
+    let hot_route = client
+        .put("evict-hot-key", hot_payload)
+        .expect("hot key put should succeed");
+    wait_for_storage_clock_route(&client, &stale_route, false);
+    wait_for_storage_clock_route(&client, &hot_route, false);
+    assert_eq!(
+        client
+            .get("evict-hot-key")
+            .expect("hot key get should succeed"),
+        hot_payload
+    );
+    wait_for_storage_clock_hot(&client, &hot_route);
+
+    let mut moved_stale_route = stale_route.clone();
+    moved_stale_route.version = stale_route.version.next();
+    moved_stale_route.replicas[0].owner =
+        ClientRuntimeId::new("evict-stale-successor", ClientEpoch(1));
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &stale_route.key,
+            Some(stale_route.version),
+            Some(&moved_stale_route),
+        )
+        .expect("stale route move should succeed");
+    assert!(cas.applied, "stale route move should apply");
+    assert!(
+        client
+            .query_route("evict-stale-key")
+            .expect("stale key route query should succeed")
+            .is_some(),
+        "authoritative route should stay published on the successor"
+    );
+    assert!(
+        {
+            let clock = client.storage_owner.hot_replicas.clock.lock();
+            clock
+                .entries
+                .iter()
+                .filter_map(Option::as_ref)
+                .any(|entry| {
+                    entry.id.route_key == stale_route.key
+                        && entry.id.segment_name == stale_route.replicas[0].segment_name
+                        && entry.id.segment_offset == stale_route.replicas[0].segment_offset
+                })
+        },
+        "local CLOCK should still carry the stale replica before eviction reconciles it"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        32,
+        "stale replica bytes should still be allocated before the pre-pass runs"
+    );
+
+    let fresh_payload = b"abcdefghijklmnop";
+    let fresh_route = client
+        .put("evict-fresh-key", fresh_payload)
+        .expect("fresh key put should reclaim stale bytes and succeed");
+    assert_eq!(fresh_route.replicas[0].owner, *client.runtime_id());
+    assert!(
+        client
+            .query_route("evict-stale-key")
+            .expect("stale key route query should succeed")
+            .is_some(),
+        "stale key should stay authoritative on its successor after local cleanup"
+    );
+    assert!(
+        client
+            .query_route("evict-hot-key")
+            .expect("hot key route query should succeed")
+            .is_some(),
+        "eviction should reclaim the stale allocation before deleting a live hot key"
+    );
+    assert_eq!(
+        client
+            .get("evict-hot-key")
+            .expect("hot key should remain readable"),
+        hot_payload
+    );
+    assert_eq!(
+        client
+            .get("evict-fresh-key")
+            .expect("fresh key should remain readable"),
+        fresh_payload
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        32,
+        "stale allocation should be released so only the hot and fresh keys remain allocated"
+    );
+}
+
+#[test]
+fn eviction_stale_prepass_respects_pending_window_before_reclaiming_orphans() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-pending-orphan-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-pending-orphan")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(48))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let stale_route = client
+        .put("pending-stale-key", b"0123456789abcdef")
+        .expect("stale key put should succeed");
+    let hot_payload = b"fedcba9876543210";
+    let hot_route = client
+        .put("pending-hot-key", hot_payload)
+        .expect("hot key put should succeed");
+    let cold_payload = b"abcdefghijklmnop";
+    let cold_route = client
+        .put("pending-cold-key", cold_payload)
+        .expect("cold key put should succeed");
+    wait_for_storage_clock_route(&client, &stale_route, false);
+    wait_for_storage_clock_route(&client, &hot_route, false);
+    wait_for_storage_clock_route(&client, &cold_route, false);
+    assert_eq!(
+        client
+            .get("pending-hot-key")
+            .expect("hot key get should succeed"),
+        hot_payload
+    );
+    wait_for_storage_clock_hot(&client, &hot_route);
+
+    let mut moved_stale_route = stale_route.clone();
+    moved_stale_route.version = stale_route.version.next();
+    moved_stale_route.replicas[0].owner =
+        ClientRuntimeId::new("tiny-stale-successor", ClientEpoch(1));
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &stale_route.key,
+            Some(stale_route.version),
+            Some(&moved_stale_route),
+        )
+        .expect("stale route move should succeed");
+    assert!(cas.applied, "stale route move should apply");
+    client.allocator.lock().mark_pending_reservation(
+        &SegmentReservation {
+            owner: client.runtime_id().clone(),
+            segment_name: stale_route.replicas[0].segment_name.clone(),
+            offset_bytes: stale_route.replicas[0].segment_offset,
+            length_bytes: stale_route.replicas[0].length,
+        },
+        now_ms().saturating_add(60_000),
+    );
+
+    let fresh_payload = b"ponmlkjihgfedcba";
+    client
+        .put("pending-fresh-key", fresh_payload)
+        .expect("fresh key put should still succeed");
+
+    assert!(
+        client
+            .query_route("pending-hot-key")
+            .expect("hot key route query should succeed")
+            .is_some(),
+        "protected orphan cleanup must not evict the hot live key"
+    );
+    assert!(
+        client
+            .query_route("pending-cold-key")
+            .expect("cold key route query should succeed")
+            .is_none(),
+        "when the orphan is still protected, CLOCK eviction should fall back to a live cold victim"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        48,
+        "pending orphan must stay allocated until its protection window expires"
+    );
+}
+
+#[test]
+fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-mixed-pending-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-mixed-pending")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let key = ObjectKey::new("default::mixed-pending-key");
+    let (released_reservation, pending_reservation) = {
+        let mut allocator = client.allocator.lock();
+        (
+            allocator
+                .reserve_any(client.runtime_id(), 16)
+                .expect("first same-key local allocation should reserve"),
+            allocator
+                .reserve_any(client.runtime_id(), 16)
+                .expect("second same-key local allocation should reserve"),
+        )
+    };
+    let released_span = AllocationSpan {
+        segment_name: released_reservation.segment_name.clone(),
+        offset_bytes: released_reservation.offset_bytes,
+        length_bytes: released_reservation.length_bytes,
+    };
+    let pending_span = AllocationSpan {
+        segment_name: pending_reservation.segment_name.clone(),
+        offset_bytes: pending_reservation.offset_bytes,
+        length_bytes: pending_reservation.length_bytes,
+    };
+    let local_route = |version: u64, reservation: &SegmentReservation| ObjectRoute {
+        key: key.clone(),
+        namespace: None,
+        logical_key: Some("mixed-pending-key".to_string()),
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: None,
+        version: RouteVersion(version),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: client.runtime_id().clone(),
+            segment_name: reservation.segment_name.clone(),
+            offset: Some(reservation.offset_bytes),
+            segment_offset: reservation.offset_bytes,
+            length: reservation.length_bytes,
+            checksum: None,
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+        cold_backing: None,
+    };
+    let stale_releasable_route = local_route(1, &released_reservation);
+    let stale_pending_route = local_route(2, &pending_reservation);
+    client.storage_owner.track_route(&stale_releasable_route);
+    client.storage_owner.track_route(&stale_pending_route);
+    client
+        .allocator
+        .lock()
+        .mark_pending_reservation(&pending_reservation, now_ms().saturating_add(60_000));
+
+    let successor_route = ObjectRoute {
+        key: key.clone(),
+        namespace: None,
+        logical_key: Some("mixed-pending-key".to_string()),
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: None,
+        version: RouteVersion(3),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: ClientRuntimeId::new("mixed-pending-successor", ClientEpoch(1)),
+            segment_name: SegmentName::new("mixed-pending-successor-segment"),
+            offset: Some(0),
+            segment_offset: 0,
+            length: 16,
+            checksum: None,
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+        cold_backing: None,
+    };
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(&client.lease, &key, None, Some(&successor_route))
+        .expect("successor route publish should succeed");
+    assert!(cas.applied, "successor route publish should apply");
+
+    client
+        .storage_owner
+        .stale_reclaim_scan_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    let reclaimed = client
+        .storage_owner
+        .reclaim_stale_local_allocations_before_clock_eviction(None)
+        .expect("mixed stale pre-pass should succeed");
+    assert_eq!(
+        reclaimed, 1,
+        "only the non-pending same-key stale allocation should be released"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "pending same-key stale allocation should remain allocated"
+    );
+    let tracked_after_first_pass = {
+        let clock = client.storage_owner.hot_replicas.clock.lock();
+        clock.allocation_spans_for_key(&key)
+    };
+    assert!(
+        !tracked_after_first_pass.contains(&released_span),
+        "released same-key stale allocation should be removed from CLOCK tracking"
+    );
+    assert!(
+        tracked_after_first_pass.contains(&pending_span),
+        "pending same-key stale allocation must stay tracked for a later cleanup pass"
+    );
+
+    client
+        .allocator
+        .lock()
+        .mark_pending_reservation(&pending_reservation, 0);
+    client
+        .storage_owner
+        .stale_reclaim_scan_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    let reclaimed_after_deadline = client
+        .storage_owner
+        .reclaim_stale_local_allocations_before_clock_eviction(None)
+        .expect("expired pending stale pre-pass should succeed");
+    assert_eq!(
+        reclaimed_after_deadline, 1,
+        "the previously pending same-key stale allocation should be reclaimed after its deadline"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        0,
+        "both same-key stale allocations should be released after the pending window expires"
+    );
+    assert!(
+        client
+            .storage_owner
+            .hot_replicas
+            .clock
+            .lock()
+            .allocation_spans_for_key(&key)
+            .is_empty(),
+        "same-key stale tracking should be empty after both allocations are released"
+    );
+}
+
+#[test]
+fn eviction_reclaims_stale_local_allocation_even_with_tiny_scan_limit() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let transport = Arc::new(TestTransport::new("evict-stale-tiny-scan-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "evict-stale-tiny-scan")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .cold_tier_offload_priority(ColdTierOffloadPriorityConfig::default().eviction_scan_limit(1))
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let stale_payload = b"stale-00";
+    let live_a_payload = b"live-a-0";
+    let live_b_payload = b"live-b-1";
+    let live_c_payload = b"live-c-2";
+    let hot_payload = b"hot-key-";
+    let live_d_payload = b"live-d-4";
+
+    let stale_route = client
+        .put("tiny-stale", stale_payload)
+        .expect("stale put should succeed");
+    let live_a_route = client
+        .put("tiny-live-a", live_a_payload)
+        .expect("live-a put should succeed");
+    let live_b_route = client
+        .put("tiny-live-b", live_b_payload)
+        .expect("live-b put should succeed");
+    let live_c_route = client
+        .put("tiny-live-c", live_c_payload)
+        .expect("live-c put should succeed");
+    let hot_route = client
+        .put("tiny-hot", hot_payload)
+        .expect("hot put should succeed");
+    let live_d_route = client
+        .put("tiny-live-d", live_d_payload)
+        .expect("live-d put should succeed");
+    wait_for_storage_clock_route(&client, &stale_route, false);
+    assert_eq!(
+        client.get("tiny-hot").expect("hot get should succeed"),
+        hot_payload
+    );
+    wait_for_storage_clock_hot(&client, &hot_route);
+
+    let mut moved_stale_route = stale_route.clone();
+    moved_stale_route.version = stale_route.version.next();
+    moved_stale_route.replicas[0].owner =
+        ClientRuntimeId::new("tiny-stale-successor", ClientEpoch(1));
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &stale_route.key,
+            Some(stale_route.version),
+            Some(&moved_stale_route),
+        )
+        .expect("stale route move should succeed");
+    assert!(cas.applied, "stale route move should apply");
+
+    let counting_directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let counting_owner = test_storage_owner_state_with_route_directory(
+        &client,
+        counting_directory.clone(),
+        ColdTierOffloadPriorityConfig::default().eviction_scan_limit(1),
+    );
+    for route in [
+        &stale_route,
+        &live_a_route,
+        &live_b_route,
+        &live_c_route,
+        &hot_route,
+        &live_d_route,
+    ] {
+        counting_owner.track_route(route);
+    }
+
+    let mut total_reclaimed = 0usize;
+    for attempt in 0..8 {
+        counting_owner
+            .stale_reclaim_scan_completed_at_ms
+            .store(0, Ordering::Relaxed);
+        let route_reads_before = metadata.get_object_route_calls();
+        let bounded_reads_before = counting_directory.bounded_reads();
+        let full_reads_before = counting_directory.full_reads();
+        let reclaimed = counting_owner
+            .reclaim_stale_local_allocations_before_clock_eviction(None)
+            .expect("bounded stale pre-pass should succeed");
+        let route_reads = metadata
+            .get_object_route_calls()
+            .saturating_sub(route_reads_before);
+        let bounded_reads = counting_directory
+            .bounded_reads()
+            .saturating_sub(bounded_reads_before);
+        let full_reads = counting_directory
+            .full_reads()
+            .saturating_sub(full_reads_before);
+        assert!(
+            route_reads <= 1,
+            "eviction_scan_limit=1 must cap attempt {attempt} to at most one authoritative route read; saw {route_reads}"
+        );
+        assert_eq!(
+            bounded_reads, 1,
+            "stale pre-pass must use the bounded route lookup path for attempt {attempt}"
+        );
+        assert_eq!(
+            full_reads, 0,
+            "stale pre-pass must not use the exhaustive route lookup path for attempt {attempt}"
+        );
+        total_reclaimed = total_reclaimed.saturating_add(reclaimed);
+        if total_reclaimed > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        total_reclaimed, 1,
+        "bounded cursor should eventually reach and reclaim the stale key without sweeping all keys in one attempt"
+    );
+
+    client
+        .put("tiny-fresh", b"fresh-05")
+        .expect("fresh put should reclaim stale bytes even when eviction_scan_limit=1");
+
+    assert!(
+        client
+            .query_route("tiny-stale")
+            .expect("stale route query should succeed")
+            .is_some(),
+        "authoritative stale key route should stay published after local reclamation"
+    );
+    assert_eq!(
+        client.get("tiny-live-a").expect("live-a should survive"),
+        live_a_payload
+    );
+    assert_eq!(
+        client.get("tiny-live-b").expect("live-b should survive"),
+        live_b_payload
+    );
+    assert_eq!(
+        client.get("tiny-live-c").expect("live-c should survive"),
+        live_c_payload
+    );
+    assert_eq!(
+        client.get("tiny-hot").expect("hot should survive"),
+        hot_payload
+    );
+    assert_eq!(
+        client.get("tiny-live-d").expect("live-d should survive"),
+        live_d_payload
+    );
+    assert_eq!(
+        client.get("tiny-fresh").expect("fresh should survive"),
+        b"fresh-05"
+    );
+}
+
+#[test]
+fn eviction_stale_prepass_does_not_release_route_missing_ghost() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-missing-ghost-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-missing-ghost")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(16))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("missing-ghost-key", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "test setup should allocate the tracked local replica"
+    );
+
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(&client.lease, &route.key, Some(route.version), None)
+        .expect("route delete CAS should succeed");
+    assert!(cas.applied, "route delete CAS should apply");
+    assert!(
+        client
+            .query_route("missing-ghost-key")
+            .expect("route query should succeed")
+            .is_none(),
+        "test setup should simulate a route-missing local ghost"
+    );
+
+    client
+        .storage_owner
+        .stale_reclaim_scan_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    let reclaimed = client
+        .storage_owner
+        .reclaim_stale_local_allocations_before_clock_eviction(None)
+        .expect("route-missing stale pre-pass should not error");
+    assert_eq!(
+        reclaimed, 0,
+        "route-missing/current-None is not authoritative proof for allocator release"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "route-missing ghost bytes must remain allocated until a confirmed cleanup path owns them"
+    );
+    let tracked_allocations = {
+        let clock = client.storage_owner.hot_replicas.clock.lock();
+        clock.allocation_spans_for_key(&route.key)
+    };
+    assert_eq!(
+        tracked_allocations.len(),
+        1,
+        "pre-pass should not drop tracking when route absence is inconclusive"
+    );
+}
+
+#[test]
+fn eviction_victim_lookup_uses_bounded_route_read() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-bounded-victim-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-bounded-victim")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(16))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("bounded-victim-key", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+
+    let mut moved_route = route.clone();
+    moved_route.version = route.version.next();
+    moved_route.replicas[0].owner =
+        ClientRuntimeId::new("bounded-victim-successor", ClientEpoch(1));
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &route.key,
+            Some(route.version),
+            Some(&moved_route),
+        )
+        .expect("moved route CAS should succeed");
+    assert!(cas.applied, "moved route CAS should apply");
+
+    let counting_directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let counting_owner = test_storage_owner_state_with_route_directory(
+        &client,
+        counting_directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    counting_owner.track_route(&route);
+    let victim = ClockEntryId {
+        route_key: route.key.clone(),
+        segment_name: route.replicas[0].segment_name.clone(),
+        segment_offset: route.replicas[0].segment_offset,
+    };
+
+    assert!(
+        counting_owner
+            .evict_candidate(&victim)
+            .expect("bounded victim eviction should succeed"),
+        "stale CLOCK victim should be reclaimed after a bounded route lookup"
+    );
+    assert_eq!(
+        counting_directory.bounded_reads(),
+        1,
+        "live eviction victim lookup must use bounded route reads"
+    );
+    assert_eq!(
+        counting_directory.full_reads(),
+        0,
+        "live eviction victim lookup must not use exhaustive route reads"
+    );
+}
+
+#[test]
+fn clean_eviction_victim_lookup_uses_bounded_route_read() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("clean-bounded-victim-segment"));
+    let client = StoreClientBuilder::new(metadata, "clean-bounded-victim")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(16))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("clean-bounded-victim-key", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+
+    let mut materialized_route = route.clone();
+    materialized_route.version = route.version.next();
+    materialized_route.cold_backing = Some(mooncake_store_core::ColdBackingRoute {
+        owner: client.runtime_id().clone(),
+        cold_tier_id: "clean-bounded-victim-device".to_string(),
+        object_locator: "clean-bounded-victim-key".to_string(),
+        length: route.replicas[0].length,
+        checksum: None,
+        state: mooncake_store_core::ColdBackingState::Materialized,
+        replicas: Vec::new(),
+    });
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &route.key,
+            Some(route.version),
+            Some(&materialized_route),
+        )
+        .expect("materialized route CAS should succeed");
+    assert!(cas.applied, "materialized route CAS should apply");
+
+    let counting_directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let counting_owner = test_storage_owner_state_with_route_directory(
+        &client,
+        counting_directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    counting_owner.track_route(&materialized_route);
+    counting_owner
+        .stale_reclaim_scan_completed_at_ms
+        .store(now_ms(), Ordering::Relaxed);
+
+    let reservation = counting_owner
+        .evict_one_clean_and_reserve_bounded(16, None)
+        .expect("clean evict-and-reserve should succeed")
+        .expect("materialized victim should provide a reservation");
+    assert_eq!(
+        reservation.offset_bytes, route.replicas[0].segment_offset,
+        "clean reserve should reuse the selected materialized victim"
+    );
+    assert_eq!(
+        counting_directory.bounded_reads(),
+        1,
+        "clean eviction victim lookup must use bounded route reads"
+    );
+    assert_eq!(
+        counting_directory.full_reads(),
+        0,
+        "clean eviction victim lookup must not use exhaustive route reads"
+    );
+}
+
+#[test]
+fn eviction_stale_prepass_error_falls_back_to_live_clock_eviction() {
+    let metadata = Arc::new(RecoverableMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let transport = Arc::new(TestTransport::new("evict-prepass-error-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "evict-prepass-error")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .cold_tier_offload_priority(ColdTierOffloadPriorityConfig::default().eviction_scan_limit(1))
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let hot_route = client
+        .put("prepass-error-hot", b"0123456789abcdef")
+        .expect("hot put should succeed");
+    let cold_route = client
+        .put("prepass-error-cold", b"fedcba9876543210")
+        .expect("cold put should succeed");
+    wait_for_storage_clock_route(&client, &hot_route, false);
+    wait_for_storage_clock_route(&client, &cold_route, false);
+    assert_eq!(
+        client
+            .get("prepass-error-hot")
+            .expect("hot key get should succeed"),
+        b"0123456789abcdef"
+    );
+    wait_for_storage_clock_hot(&client, &hot_route);
+    metadata.fail_route_reads_for(hot_route.key.clone());
+
+    client
+        .put("prepass-error-fresh", b"abcdefghijklmnop")
+        .expect("stale pre-pass route lookup errors should not block live eviction fallback");
+    metadata.allow_route_reads_for(&hot_route.key);
+
+    assert!(
+        client
+            .query_route("prepass-error-hot")
+            .expect("hot route query should succeed")
+            .is_some(),
+        "pre-pass error key is hot and should not be the live eviction victim"
+    );
+    assert!(
+        client
+            .query_route("prepass-error-cold")
+            .expect("cold route query should succeed")
+            .is_none(),
+        "live CLOCK eviction should still reclaim a cold victim after stale pre-pass fails"
+    );
+}
+
+#[test]
+fn eviction_pressure_can_reclaim_stale_allocation_before_reclaim_grace_deadline() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-grace-best-effort-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-grace-best-effort")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(60_000)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let stale_route = client
+        .put("grace-best-effort-stale", b"0123456789abcdef")
+        .expect("stale put should succeed");
+    let live_route = client
+        .put("grace-best-effort-live", b"fedcba9876543210")
+        .expect("live put should succeed");
+    wait_for_storage_clock_route(&client, &stale_route, false);
+    wait_for_storage_clock_route(&client, &live_route, false);
+
+    let mut moved_stale_route = stale_route.clone();
+    moved_stale_route.version = stale_route.version.next();
+    moved_stale_route.replicas[0].owner =
+        ClientRuntimeId::new("grace-best-effort-successor", ClientEpoch(1));
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &stale_route.key,
+            Some(stale_route.version),
+            Some(&moved_stale_route),
+        )
+        .expect("stale route move should succeed");
+    assert!(cas.applied, "stale route move should apply");
+
+    client
+        .put("grace-best-effort-fresh", b"abcdefghijklmnop")
+        .expect(
+            "eviction pressure may reclaim stale orphan bytes before writer-side grace expires",
+        );
+
+    assert!(
+        client
+            .query_route("grace-best-effort-live")
+            .expect("live route query should succeed")
+            .is_some(),
+        "best-effort stale cleanup should preserve live route entries"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        32,
+        "stale bytes should be reused under pressure even though reclaim_grace_ms is non-zero"
+    );
+}
+
+#[test]
+fn clean_evict_and_reserve_reclaims_stale_before_live_materialized_route() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("clean-reserve-stale-segment"));
+    let client = StoreClientBuilder::new(metadata, "clean-reserve-stale")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let stale_route = client
+        .put("clean-stale", b"0123456789abcdef")
+        .expect("stale put should succeed");
+    let live_route = client
+        .put("clean-live", b"fedcba9876543210")
+        .expect("live put should succeed");
+    wait_for_storage_clock_route(&client, &stale_route, false);
+    wait_for_storage_clock_route(&client, &live_route, false);
+
+    let mut moved_stale_route = stale_route.clone();
+    moved_stale_route.version = stale_route.version.next();
+    moved_stale_route.replicas[0].owner =
+        ClientRuntimeId::new("clean-reserve-stale-successor", ClientEpoch(1));
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &stale_route.key,
+            Some(stale_route.version),
+            Some(&moved_stale_route),
+        )
+        .expect("stale route move should succeed");
+    assert!(cas.applied, "stale route move should apply");
+
+    let mut materialized_route = live_route.clone();
+    materialized_route.version = live_route.version.next();
+    materialized_route.cold_backing = Some(mooncake_store_core::ColdBackingRoute {
+        owner: client.runtime_id().clone(),
+        cold_tier_id: "clean-reserve-device".to_string(),
+        object_locator: "clean-live".to_string(),
+        length: live_route.replicas[0].length,
+        checksum: None,
+        state: mooncake_store_core::ColdBackingState::Materialized,
+        replicas: Vec::new(),
+    });
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &live_route.key,
+            Some(live_route.version),
+            Some(&materialized_route),
+        )
+        .expect("materialized live route CAS should succeed");
+    assert!(cas.applied, "materialized live route CAS should apply");
+
+    let reservation = client
+        .storage_owner
+        .evict_one_clean_and_reserve_bounded(16, None)
+        .expect("clean evict-and-reserve should succeed")
+        .expect("stale reclaim should free enough space for the reservation");
+
+    assert_eq!(
+        reservation.offset_bytes, stale_route.replicas[0].segment_offset,
+        "clean reserve should reuse stale bytes before evicting a live materialized route"
+    );
+    assert!(
+        client
+            .query_route("clean-stale")
+            .expect("stale route query should succeed")
+            .is_some(),
+        "stale key should remain authoritative on its successor route"
+    );
+    let live_after = client
+        .query_route("clean-live")
+        .expect("live route query should succeed")
+        .expect("live route should remain authoritative");
+    assert_eq!(
+        live_after.replicas.len(),
+        1,
+        "clean reserve should not remove the live materialized replica while stale bytes are available"
+    );
+}
+
+#[test]
+fn eviction_keeps_non_active_routes_tracked_until_delete_cleanup() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-non-active-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-non-active")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(16))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("non-active-key", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+
+    let mut deleting_route = route.clone();
+    deleting_route.state = mooncake_store_core::RouteState::Deleting;
+    deleting_route.version = route.version.next();
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &route.key,
+            Some(route.version),
+            Some(&deleting_route),
+        )
+        .expect("deleting route CAS should succeed");
+    assert!(cas.applied, "deleting route CAS should apply");
+
+    let victim = ClockEntryId {
+        route_key: deleting_route.key.clone(),
+        segment_name: deleting_route.replicas[0].segment_name.clone(),
+        segment_offset: deleting_route.replicas[0].segment_offset,
+    };
+    assert!(
+        !client
+            .storage_owner
+            .evict_candidate(&victim)
+            .expect("non-active victim eviction should not error"),
+        "non-active routes should defer reclaim instead of claiming immediate progress"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "non-active route bytes must stay allocated until delete cleanup proves release is safe"
+    );
+    let tracked_allocations = {
+        let clock = client.storage_owner.hot_replicas.clock.lock();
+        clock.allocation_spans_for_key(&deleting_route.key)
+    };
+    assert_eq!(
+        tracked_allocations.len(),
+        1,
+        "non-active route must stay tracked so later delete cleanup can still find its local allocation"
+    );
 }
 
 #[test]
