@@ -9,11 +9,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
+#include "tenant_quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -32,7 +38,13 @@ class PromotionOnHitTest : public ::testing::Test {
         FLAGS_logtostderr = true;
     }
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {
+        for (const auto& path : policy_files_) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+        google::ShutdownGoogleLogging();
+    }
 
     // Friend access to MasterService::promotion_admission_threshold_, which
     // is otherwise private. PromotionOnHitTest is friended; TEST_F-generated
@@ -43,6 +55,21 @@ class PromotionOnHitTest : public ::testing::Test {
     }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
+
+    std::string WriteTenantQuotaPolicyFile(
+        const std::map<std::string, uint64_t>& tenant_quotas) {
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas = tenant_quotas;
+        auto path =
+            std::filesystem::temp_directory_path() /
+            ("mooncake_promotion_tenant_policy_" + std::to_string(::getpid()) +
+             "_" + std::to_string(next_policy_file_++) + ".yaml");
+        std::ofstream out(path);
+        out << FormatTenantQuotaPolicyYaml(snapshot);
+        out.close();
+        policy_files_.push_back(path.string());
+        return path.string();
+    }
 
     Segment MakeSegment(std::string name, size_t base, size_t size) const {
         Segment segment;
@@ -116,6 +143,9 @@ class PromotionOnHitTest : public ::testing::Test {
         EXPECT_TRUE(mount_ld.has_value());
         return client_id;
     }
+
+    std::vector<std::string> policy_files_;
+    size_t next_policy_file_ = 0;
 };
 
 // Sanity: with promotion disabled, no path mutates promotion_objects.
@@ -2035,17 +2065,21 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
 TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 2;
     config.default_kv_lease_ttl = 2000;
+    const std::string key = "shared_hot_key";
+    const std::string tenant_a = "tenant_promotion_a";
+    const std::string tenant_b = "tenant_promotion_b";
+    config.tenant_quota_connector_uri = WriteTenantQuotaPolicyFile(
+        {{tenant_a, 64 * 1024 * 1024}, {tenant_b, 64 * 1024 * 1024}});
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg =
         PrepareSegment(*service, "seg_tenant", kDefaultSegmentBase, seg_size);
-    const std::string key = "shared_hot_key";
-    const std::string tenant_a = "tenant_promotion_a";
-    const std::string tenant_b = "tenant_promotion_b";
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
                                        seg.segment_name, tenant_a));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,

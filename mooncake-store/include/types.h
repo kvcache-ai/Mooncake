@@ -227,6 +227,18 @@ inline std::string NormalizeTenantId(const std::string& tenant_id) {
     return tenant_id.empty() ? "default" : tenant_id;
 }
 
+inline bool IsValidTenantId(const std::string& tenant_id) {
+    if (tenant_id.empty() || tenant_id.front() == '_') {
+        return false;
+    }
+    for (unsigned char c : tenant_id) {
+        if (c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
                                               const std::string& key) {
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
@@ -408,6 +420,8 @@ enum class ErrorCode : int32_t {
     DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
     DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
+    TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
+    TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
