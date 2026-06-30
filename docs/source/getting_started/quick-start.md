@@ -1,12 +1,6 @@
 # Quick Start
 
-Mooncake provides two common integration paths for vLLM and SGLang: Transfer
-Engine for direct KV transfer in PD disaggregation, and Mooncake Store as a
-distributed KV cache backend.
-
-Transfer Engine is the lower-level transport layer used by these integrations.
-If you are developing directly against the Transfer Engine API, see the
-[Transfer Engine Python quick start](../design/transfer-engine/index.md#using-transfer-engine-in-your-projects).
+This document describes how to quickly start using Mooncake Transfer Engine and Mooncake Store.
 
 ## Before using Mooncake
 
@@ -35,7 +29,7 @@ pip install mooncake-transfer-engine
 
 - CUDA >= 13.0
 ```bash
-pip install mooncake-transfer-engine-cuda13 numpy pyzmq
+pip install mooncake-transfer-engine-cuda13
 ```
 
 **For non-CUDA systems:**
