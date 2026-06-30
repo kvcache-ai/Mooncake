@@ -234,6 +234,7 @@ fn main() {
     println!("cargo:rustc-link-lib=numa");   // NUMA binding
     println!("cargo:rustc-link-lib=curl");    // HTTP metadata plugin
     println!("cargo:rustc-link-lib=ibverbs"); // RDMA transport
+    println!("cargo:rustc-link-lib=yaml-cpp"); // tenant quota policy connector
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=xxhash");
 
@@ -339,6 +340,7 @@ fn main() {
         "numa",
         "ibverbs",
         "jsoncpp",
+        "yaml-cpp",
         "zstd",
         "m",
     ] {
