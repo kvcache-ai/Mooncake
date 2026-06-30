@@ -1131,8 +1131,14 @@ void MasterAdminServer::HandleSetDefaultTenantQuota(
     });
 }
 
-void MasterAdminServer::HandleRemoveAll(
-    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+struct HttpRemoveAllResponse {
+    bool success{true};
+    long removed_count{0};
+};
+YLT_REFL(HttpRemoveAllResponse, success, removed_count);
+
+void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
+                                        coro_http::coro_http_response& resp) {
     bool force = false;
     if (auto it = req.get_query_value("force"); !it.empty()) {
         force = (it == "true" || it == "1");
@@ -1149,11 +1155,6 @@ void MasterAdminServer::HandleRemoveAll(
         } else {
             count = service->RemoveAll(force, tenant_id);
         }
-        struct HttpRemoveAllResponse {
-            bool success{true};
-            long removed_count{0};
-        };
-        YLT_REFL(HttpRemoveAllResponse, success, removed_count);
         WriteJsonResponse(resp, coro_http::status_type::ok,
                           HttpRemoveAllResponse{.removed_count = count});
     });
