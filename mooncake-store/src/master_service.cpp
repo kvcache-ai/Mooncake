@@ -4859,6 +4859,7 @@ auto MasterService::NotifyOffloadSuccess(
                         obj_metadata.AddReplicas(std::move(replicas));
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
+                        SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
                     } else {
                         obj_metadata.VisitReplicas(
