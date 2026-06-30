@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -40,6 +41,48 @@ class PromotionOnHitTest : public ::testing::Test {
     static uint32_t GetPromotionAdmissionThresholdForTesting(
         MasterService* service) {
         return service->promotion_admission_threshold_;
+    }
+
+    static size_t CountPromotionCandidatesForTesting(
+        MasterService* service, const std::string& tenant = "default") {
+        return service->CountPromotionCandidatesForTesting(tenant);
+    }
+
+    static uint64_t GetPromotionCandidateCountForTesting(
+        MasterService* service) {
+        return service->promotion_candidate_count_.load(
+            std::memory_order_relaxed);
+    }
+
+    static void DecrementPromotionCandidateCountForTesting(
+        MasterService* service) {
+        service->DecrementPromotionCandidateCount();
+    }
+
+    static void BackoffQueueCapCandidateForTesting(
+        MasterService* service, const std::string& key,
+        const std::string& tenant = "default") {
+        service->BackoffPromotionCandidate(
+            MasterService::MakeObjectIdentity(key, tenant),
+            MasterService::PromotionQueueResult::kQueueCapRejected);
+    }
+
+    static uint64_t GetPromotionInFlightForTesting(MasterService* service) {
+        return service->promotion_in_flight_.load(std::memory_order_relaxed);
+    }
+
+    static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
+        return service->RunPromotionCandidateRetryForTesting();
+    }
+
+    static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
+                                                       size_t max_shards) {
+        return service->RunPromotionCandidateRetry(max_shards);
+    }
+
+    static void ResetMetadataForTesting(MasterService* service) {
+        MasterService::MetadataSerializer serializer(service);
+        serializer.Reset();
     }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
@@ -594,7 +637,7 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
-    config.promotion_queue_limit = 1;  // any 1 task saturates a shard
+    config.promotion_queue_limit = 1;  // any 1 task saturates the global cap
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
@@ -604,7 +647,7 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     // Find two keys that hash to the same shard. MasterService::
     // getShardIndex is private but the formula is deterministic
     // (std::hash<std::string>{}(key) % kNumShards), so we can mirror
-    // it here. kNumShards=1024 (master_service.h:889).
+    // it here.
     constexpr size_t kNumShardsLocal = 1024;
     auto shard_of = [](const std::string& k) {
         return std::hash<std::string>{}(k) % kNumShardsLocal;
@@ -653,6 +696,194 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
         << "k2's rejection must increment promotion_rejected_cap";
 
     service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, QueueLimitRejectedCandidateRetriesAfterSlotFreed) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_first", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_retry", 1024,
+                                       seg.segment_name));
+
+    auto first = service->GetReplicaList("k_first", "default");
+    ASSERT_TRUE(first.has_value());
+    auto retry = service->GetReplicaList("k_retry", "default");
+    ASSERT_TRUE(retry.has_value());
+
+    auto initial = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(initial.has_value());
+    EXPECT_EQ(CountPromotionTask(*initial, "k_first"), 1u);
+    EXPECT_EQ(CountPromotionTask(*initial, "k_retry"), 0u);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 1u);
+
+    auto failure =
+        service->NotifyPromotionFailure(seg.client_id, "k_first", "default");
+    ASSERT_TRUE(failure.has_value());
+
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get(), 0), 0u);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 1u)
+        << "zero-shard retry scans are no-ops and must not drop candidates";
+    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 1u);
+
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 1u);
+    auto after_retry = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(after_retry.has_value());
+    EXPECT_EQ(CountPromotionTask(*after_retry, "k_retry"), 1u)
+        << "cap-rejected hot LOCAL_DISK-only key should be re-enqueued "
+        << "after the transient in-flight cap clears, without requiring "
+        << "another foreground Get";
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 0u);
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, RetryDropsCandidateWhenObjectRemoved) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_first", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_drop", 1024,
+                                       seg.segment_name));
+
+    auto first = service->GetReplicaList("k_first", "default");
+    ASSERT_TRUE(first.has_value());
+    auto dropped = service->GetReplicaList("k_drop", "default");
+    ASSERT_TRUE(dropped.has_value());
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 1u);
+
+    auto rm = service->Remove("k_drop", "default", /*force=*/true);
+    ASSERT_TRUE(rm.has_value());
+    auto failure =
+        service->NotifyPromotionFailure(seg.client_id, "k_first", "default");
+    ASSERT_TRUE(failure.has_value());
+
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 0u);
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_EQ(CountPromotionTask(*heartbeat, "k_drop"), 0u)
+        << "removed objects are permanent failures for promotion retry";
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, QueueLimitRejectedCandidateGivesUpAfterMaxBackoff) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_first", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_retry", 1024,
+                                       seg.segment_name));
+
+    auto first = service->GetReplicaList("k_first", "default");
+    ASSERT_TRUE(first.has_value());
+    auto retry = service->GetReplicaList("k_retry", "default");
+    ASSERT_TRUE(retry.has_value());
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get()), 1u);
+    ASSERT_EQ(GetPromotionCandidateCountForTesting(service.get()), 1u);
+
+    for (uint32_t attempt = 1; attempt < 8; ++attempt) {
+        BackoffQueueCapCandidateForTesting(service.get(), "k_retry");
+        EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 1u)
+            << "candidate should remain retryable before max attempt "
+            << attempt;
+        EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 1u);
+    }
+
+    BackoffQueueCapCandidateForTesting(service.get(), "k_retry");
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 0u)
+        << "bounded retry must give up once max attempts is reached";
+    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u);
+
+    auto failure =
+        service->NotifyPromotionFailure(seg.client_id, "k_first", "default");
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_EQ(CountPromotionTask(*heartbeat, "k_retry"), 0u)
+        << "gave-up candidates must not be resurrected after the cap clears";
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, MetadataResetClearsTransientRetryCandidates) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+    auto& mm = MasterMetricManager::instance();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_first", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_retry", 1024,
+                                       seg.segment_name));
+
+    auto first = service->GetReplicaList("k_first", "default");
+    ASSERT_TRUE(first.has_value());
+    auto retry = service->GetReplicaList("k_retry", "default");
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 1u);
+    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 1u);
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 1);
+
+    ResetMetadataForTesting(service.get());
+
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get()), 0u);
+    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u)
+        << "metadata reload/reset clears transient candidate maps directly, "
+        << "so the global candidate counter must be reset too";
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u)
+        << "metadata reload/reset also clears promotion_tasks, so the soft "
+        << "in-flight cap must be reset with the transient metadata";
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest,
+       CandidateCounterSaturatingDecrementDoesNotUnderflow) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    auto service = std::make_unique<MasterService>(config);
+
+    ASSERT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u);
+    DecrementPromotionCandidateCountForTesting(service.get());
+    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u)
+        << "candidate counter cleanup is advisory and must not underflow if "
+        << "a metadata reload/reset already cleared it";
 }
 
 // PromotionObjectHeartbeat caps the per-call response at kMaxPerHeartbeat

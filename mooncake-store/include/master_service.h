@@ -1195,6 +1195,34 @@ class MasterService {
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     };
 
+    enum class PromotionQueueResult {
+        kQueued,
+        kDisabled,
+        kFrequencyRejected,
+        kWatermarkRejected,
+        kNotFound,
+        kAlreadyInFlight,
+        kMemoryReplicaPresent,
+        kQueueCapRejected,
+        kNoLocalDiskSource,
+        kPushFailed,
+    };
+
+    enum class PromotionCandidateReason {
+        kWatermark,
+        kQueueCap,
+        kPushFailed,
+    };
+
+    struct PromotionCandidate {
+        std::chrono::system_clock::time_point first_seen;
+        std::chrono::system_clock::time_point next_retry_time;
+        uint32_t retry_attempts{0};
+        PromotionCandidateReason last_reason{
+            PromotionCandidateReason::kQueueCap};
+        ErrorCode last_error{ErrorCode::OK};
+    };
+
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     struct TenantState {
@@ -1204,6 +1232,8 @@ class MasterService {
             replication_tasks;
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
+        std::unordered_map<std::string, PromotionCandidate>
+            promotion_candidates;
 
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
@@ -1211,7 +1241,8 @@ class MasterService {
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && group_members.empty();
+                   promotion_tasks.empty() && promotion_candidates.empty() &&
+                   group_members.empty();
         }
     };
 
@@ -1485,7 +1516,26 @@ class MasterService {
      * map. Acquires its own RW shard accessor; safe to call after
      * GetReplicaList's RO accessor has been released.
      */
-    void TryPushPromotionQueue(const ObjectIdentity& object_id);
+    PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
+                                               bool record_candidate = true);
+    void RecordPromotionCandidate(TenantState& tenant_state,
+                                  const std::string& key,
+                                  PromotionCandidateReason reason,
+                                  ErrorCode last_error);
+    void DecrementPromotionCandidateCount();
+    void ErasePromotionCandidate(TenantState& tenant_state,
+                                 const std::string& key);
+    void ErasePromotionCandidate(const ObjectIdentity& object_id);
+    void ClearPromotionTransientStateForMetadataReload();
+    bool IsTransientPromotionQueueResult(PromotionQueueResult result) const;
+    std::chrono::milliseconds PromotionCandidateBackoff(
+        uint32_t retry_attempts) const;
+    void BackoffPromotionCandidate(const ObjectIdentity& object_id,
+                                   PromotionQueueResult result);
+    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
+    size_t RunPromotionCandidateRetry();
+    size_t RunPromotionCandidateRetryForTesting();
+    size_t CountPromotionCandidatesForTesting(const std::string& tenant_id);
 
     // Erase any in-flight PromotionTask for `key`, abort any staged promotion
     // quota reservation, and decrement the cluster-wide in-flight counter. Safe
@@ -1907,6 +1957,21 @@ class MasterService {
     // promotion task reaper after the task entry is erased. Relaxed memory
     // order is safe — the value is an advisory soft cap, not a barrier.
     std::atomic<uint64_t> promotion_in_flight_{0};
+    std::atomic<uint64_t> promotion_candidate_count_{0};
+    std::atomic<uint64_t> promotion_candidate_recorded_{0};
+    std::atomic<uint64_t> promotion_candidate_retry_attempted_{0};
+    std::atomic<uint64_t> promotion_candidate_retry_queued_{0};
+    std::atomic<uint64_t> promotion_candidate_gave_up_{0};
+    std::atomic<size_t> promotion_retry_cursor_shard_{0};
+    static constexpr size_t kPromotionCandidateLimit = 50000;
+    static constexpr uint32_t kPromotionCandidateMaxAttempts = 8;
+    static constexpr size_t kPromotionRetryScanBatch = 128;
+    static constexpr size_t kPromotionRetryShardScanBatch = 64;
+    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{60000};
+    static constexpr std::chrono::milliseconds
+        kPromotionCandidateInitialBackoff{10};
+    static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
+        1000};
     // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.
