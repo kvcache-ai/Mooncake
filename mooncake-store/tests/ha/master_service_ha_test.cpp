@@ -4,9 +4,14 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include "ha/oplog/mock_oplog_store.h"
 #include "ha/oplog/mock_metadata_store.h"
@@ -26,7 +31,49 @@ class MasterServiceHATest : public ::testing::Test {
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
+    static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
     static constexpr const char* kDefaultTenant = "default";
+
+    void TearDown() override {
+        for (const auto& path : policy_files_) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+        policy_files_.clear();
+    }
+
+    std::string WriteTenantPolicyFile(
+        const std::map<std::string, uint64_t>& tenant_quotas) {
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas = tenant_quotas;
+        auto path =
+            std::filesystem::temp_directory_path() /
+            ("mooncake_master_service_ha_test_" + std::to_string(::getpid()) +
+             "_" + std::to_string(next_policy_file_++) + ".yaml");
+        std::ofstream out(path);
+        out << FormatTenantQuotaPolicyYaml(snapshot);
+        out.close();
+        policy_files_.push_back(path.string());
+        return path.string();
+    }
+
+    MasterServiceConfig MakeStrictHAConfig(
+        const std::vector<std::string>& tenants = {kDefaultTenant,
+                                                   "tenant_a"}) {
+        std::map<std::string, uint64_t> tenant_quotas;
+        for (const auto& tenant : tenants) {
+            tenant_quotas.emplace(tenant, kStrictTenantQuotaBytes);
+        }
+        return MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id("test_cluster")
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile(tenant_quotas))
+            .build();
+    }
 
     Segment MakeSegment(std::string name = "test_segment",
                         size_t base = kDefaultSegmentBase,
@@ -183,6 +230,9 @@ class MasterServiceHATest : public ::testing::Test {
                      .start_time = std::chrono::system_clock::now(),
                      .holder_id = holder_id});
     }
+
+    std::vector<std::string> policy_files_;
+    int next_policy_file_{0};
 };
 
 TEST_F(MasterServiceHATest, RestoreFromStandbySnapshotClearsInvalidEndpoints) {
@@ -938,11 +988,7 @@ TEST_F(MasterServiceHATest,
 
 // AddReplica publishes OpLog entry with the non-default tenant_id.
 TEST_F(MasterServiceHATest, AddReplicaPublishesTenantId) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -972,11 +1018,7 @@ TEST_F(MasterServiceHATest, AddReplicaPublishesTenantId) {
 // PutRevoke(MEMORY) on a tenant_a object publishes REMOVE OpLog with
 // non-default tenant_id.
 TEST_F(MasterServiceHATest, PutRevokeMemoryPublishesRemoveTenantId) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -1009,11 +1051,7 @@ TEST_F(MasterServiceHATest, PutRevokeMemoryPublishesRemoveTenantId) {
 // PUT_END OpLog with non-default tenant_id (not REMOVE — the object stays
 // alive in memory).
 TEST_F(MasterServiceHATest, EvictDiskReplicaLocalDiskPublishesPutEndTenantId) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -1050,11 +1088,7 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaLocalDiskPublishesPutEndTenantId) {
 // publishes under "default", which would cause the standby to apply it
 // against the wrong tenant).
 TEST_F(MasterServiceHATest, CopyEndPublishesPutEndTenantId) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -1092,11 +1126,7 @@ TEST_F(MasterServiceHATest, CopyEndPublishesPutEndTenantId) {
 // publishes under "default", which would cause the standby to apply it
 // against the wrong tenant). Structurally identical to the CopyEnd case.
 TEST_F(MasterServiceHATest, MoveEndPublishesPutEndTenantId) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -1146,11 +1176,7 @@ TEST_F(MasterServiceHATest, MoveEndPublishesPutEndTenantId) {
 // covers the default-tenant happy path through the public API; here we
 // cover the non-default-tenant OpLog bug at the same code path.
 TEST_F(MasterServiceHATest, NotifyPromotionSuccessPublishesPutEndTenantId) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -1202,11 +1228,7 @@ TEST_F(MasterServiceHATest, NotifyPromotionSuccessPublishesPutEndTenantId) {
 // BatchRemove on a tenant_a object publishes REMOVE OpLog with
 // non-default tenant_id (exercises line 3702 in master_service.cpp).
 TEST_F(MasterServiceHATest, BatchRemoveForcePublishesRemoveTenantId) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -1236,14 +1258,60 @@ TEST_F(MasterServiceHATest, BatchRemoveForcePublishesRemoveTenantId) {
     EXPECT_NE("default", entry.tenant_id);
 }
 
-// BatchReplicaClear (new tenant-aware overload) publishes REMOVE OpLog
-// with the real (non-default) tenant_id.
-TEST_F(MasterServiceHATest, BatchReplicaClearPublishesRemoveTenantId) {
+TEST_F(MasterServiceHATest, RemoveAllTenantPublishesRemoveTenantId) {
+    auto service_config = MakeStrictHAConfig();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string tenant = "tenant_a";
+    const std::string key = "tenant_remove_all_key";
+
+    PutObjectWithTenant(*service, client_id, key, tenant);
+
+    EXPECT_EQ(1, service->RemoveAll(tenant, /*force=*/true));
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::REMOVE, entry.op_type);
+    EXPECT_EQ(tenant, entry.tenant_id);
+    EXPECT_NE("default", entry.tenant_id);
+}
+
+TEST_F(MasterServiceHATest,
+       RemoveUsesNormalizedTenantIdWhenMultiTenantDisabled) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
                               .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "legacy_remove_normalized_tenant_key";
+
+    PutObject(*service, client_id, key);
+
+    auto remove = service->Remove(key, "tenant_a");
+    ASSERT_TRUE(remove.has_value()) << toString(remove.error());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::REMOVE, entry.op_type);
+    EXPECT_EQ(kDefaultTenant, entry.tenant_id);
+}
+
+// BatchReplicaClear (new tenant-aware overload) publishes REMOVE OpLog
+// with the real (non-default) tenant_id.
+TEST_F(MasterServiceHATest, BatchReplicaClearPublishesRemoveTenantId) {
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -1281,11 +1349,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearPublishesRemoveTenantId) {
 // apply the entry to the wrong tenant and the assertions below would
 // fail.
 TEST_F(MasterServiceHATest, NonDefaultTenantStandbyConvergesCorrectly) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
+    auto service_config = MakeStrictHAConfig();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
     auto mock_oplog = std::make_shared<MockOpLogStore>();
