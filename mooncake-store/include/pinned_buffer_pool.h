@@ -1,25 +1,19 @@
 #pragma once
 
+#include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
-#include <cstdlib>
-#include "cuda_alike.h"
 
-// Ascend CANN is not covered by cuda_alike.h
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-#include <acl/acl_rt.h>
-#endif
+#include "device/accelerator_registry.h"
+#include "pinned_host_buffer.h"
 
 namespace mooncake {
 
 /**
  * PinnedBufferPool: Thread-safe pool of reusable pinned host memory buffers.
  *
- * Platform pinned alloc APIs:
- *   CUDA / MUSA / MACA : cudaMallocHost   (mapped via cuda_alike.h)
- *   HIP                : hipHostMalloc     (not mapped in hip.h, native API)
- *   Ascend             : aclrtMallocHost
- *   Other              : new char[]        (pageable fallback)
+ * Platform-specific pinned host allocation is delegated to AcceleratorDevice.
  *
  * Pinned memory provides 10x~100x higher D2H bandwidth than pageable memory.
  * Falls back to new char[] if pinned allocation fails.
@@ -33,9 +27,46 @@ class PinnedBufferPool {
     static constexpr size_t kDefaultMaxPoolSize = 32;
 
     struct Buffer {
+        PinnedHostBuffer pinned_host;
+        std::unique_ptr<char[]> pageable_host;
         char* data = nullptr;
         size_t capacity = 0;
-        bool is_pinned = false;  // Selects correct free API in FreeBuffer
+
+        Buffer() = default;
+        explicit Buffer(PinnedHostBuffer pinned_host)
+            : pinned_host(std::move(pinned_host)),
+              data(static_cast<char*>(this->pinned_host.addr)),
+              capacity(this->pinned_host.size) {}
+
+        static Buffer Pageable(size_t size) {
+            Buffer buf;
+            buf.pageable_host = std::make_unique<char[]>(size);
+            buf.data = buf.pageable_host.get();
+            buf.capacity = size;
+            return buf;
+        }
+
+        Buffer(const Buffer&) = delete;
+        Buffer& operator=(const Buffer&) = delete;
+        Buffer(Buffer&& other) noexcept
+            : pinned_host(std::move(other.pinned_host)),
+              pageable_host(std::move(other.pageable_host)),
+              data(other.data),
+              capacity(other.capacity) {
+            other.data = nullptr;
+            other.capacity = 0;
+        }
+        Buffer& operator=(Buffer&& other) noexcept {
+            if (this != &other) {
+                pinned_host = std::move(other.pinned_host);
+                pageable_host = std::move(other.pageable_host);
+                data = other.data;
+                capacity = other.capacity;
+                other.data = nullptr;
+                other.capacity = 0;
+            }
+            return *this;
+        }
     };
 
     explicit PinnedBufferPool(size_t max_pool_size = kDefaultMaxPoolSize)
@@ -48,9 +79,11 @@ class PinnedBufferPool {
             std::lock_guard<std::mutex> lk(mutex_);
             for (size_t i = 0; i < pool_.size(); ++i) {
                 if (pool_[i].capacity >= size) {
-                    Buffer buf = pool_[i];
+                    Buffer buf = std::move(pool_[i]);
                     // O(1) erase: swap with back then pop
-                    pool_[i] = pool_.back();
+                    if (i != pool_.size() - 1) {
+                        pool_[i] = std::move(pool_.back());
+                    }
                     pool_.pop_back();
                     return buf;
                 }
@@ -62,9 +95,9 @@ class PinnedBufferPool {
     void Release(Buffer buf) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (pool_.size() < max_pool_size_) {
-            pool_.push_back(buf);
+            pool_.push_back(std::move(buf));
         } else {
-            // Pool full — free immediately to bound pinned memory usage
+            // Pool full: free immediately to bound pinned memory usage.
             FreeBuffer(buf);
         }
     }
@@ -79,57 +112,19 @@ class PinnedBufferPool {
 
    private:
     static Buffer AllocNew(size_t size) {
-        Buffer buf;
-        buf.capacity = size;
-        buf.is_pinned = false;
-
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
-    defined(USE_HYGON) || defined(USE_COREX)
-        if (cudaMallocHost(reinterpret_cast<void**>(&buf.data), size) ==
-            cudaSuccess) {
-            buf.is_pinned = true;
-        } else {
-            buf.data = new char[size];
+        const auto& registry = device::GetAcceleratorRegistry();
+        auto runtime_accelerator = registry.RuntimeAccelerators();
+        for (auto* accelerator : runtime_accelerator.Devices()) {
+            auto host = accelerator->AllocatePinnedHost(size);
+            if (host.addr) return Buffer(std::move(host));
         }
-
-#elif defined(USE_HIP)
-        if (hipHostMalloc(reinterpret_cast<void**>(&buf.data), size, 0) ==
-            hipSuccess) {
-            buf.is_pinned = true;
-        } else {
-            buf.data = new char[size];
-        }
-
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-        if (aclrtMallocHost(reinterpret_cast<void**>(&buf.data), size) ==
-            ACL_SUCCESS) {
-            buf.is_pinned = true;
-        } else {
-            buf.data = new char[size];
-        }
-
-#else
-        buf.data = new char[size];
-#endif
-        return buf;
+        return Buffer::Pageable(size);
     }
 
     static void FreeBuffer(Buffer& buf) {
-        if (!buf.data) return;
-        if (!buf.is_pinned) {
-            delete[] buf.data;
-            return;
-        }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
-    defined(USE_HYGON) || defined(USE_COREX)
-        cudaFreeHost(buf.data);
-#elif defined(USE_HIP)
-        hipHostFree(buf.data);
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-        aclrtFreeHost(buf.data);
-#else
-        delete[] buf.data;
-#endif
+        buf.pinned_host.reset();
+        buf.pageable_host.reset();
+        buf = {};
     }
 
     const size_t max_pool_size_;

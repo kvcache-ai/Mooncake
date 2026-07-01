@@ -93,8 +93,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     };
 
     int construct(RdmaContext* context, EndPointParams* params,
-                  const std::string& endpoint_name,
-                  std::atomic<int>* endpoints_count = nullptr);
+                  const std::string& endpoint_name);
 
     int deconstruct();
 
@@ -107,7 +106,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // WRs have been drained, actually destroys QPs and frees resources.
     // Returns true if destruction is complete, false if outstanding WRs remain.
     void beginDestroy();
-    void beginDestroyNoLock();  // Internal version without locking
     bool finishDestroy();
 
     Status connect(const std::string& peer_server_name,
@@ -180,6 +178,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
    private:
     // Caller must hold lock_ in write mode.
+    void beginDestroyNoLock();
     int deconstructUnlocked();
 
     void resetInflightSlices();
@@ -208,8 +207,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
-    std::atomic<int>* endpoints_count_;
-
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
 
@@ -220,16 +217,18 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::vector<ibv_mr*> notify_recv_mrs_;  // Memory regions for recv buffers
     std::vector<char> notify_send_buffer_;  // Single contiguous send buffer
     ibv_mr* notify_send_mr_ = nullptr;      // Single MR for all send slots
+    // Serializes notification buffer/QP access against deconstruction.
+    std::mutex notify_resource_mutex_;
     std::mutex notify_send_mutex_;
     std::condition_variable notify_send_cv_;
-    int notify_pending_count_ = 0;    // Number of pending sends
-    uint64_t notify_send_wr_id_ = 0;  // Circular counter for wr_id
-    bool notify_connected_ = false;
+    size_t notify_pending_count_ = 0;  // Number of pending sends
+    uint64_t notify_send_wr_id_ = 0;   // Circular counter for wr_id
+    std::atomic<bool> notify_connected_{false};
 
     // Two-phase destruction constants (matching TE)
     static constexpr double kFinishDestroyTimeoutSec = 30.0;
-    static constexpr int kFinishDestroyMaxRetries = 3;
-    int finish_destroy_retries_ = 0;  // Retry counter for finishDestroy
+    static constexpr int kMaxDestroyErrorLogs = 3;
+    int destroy_error_count_ = 0;
 };
 }  // namespace tent
 }  // namespace mooncake
