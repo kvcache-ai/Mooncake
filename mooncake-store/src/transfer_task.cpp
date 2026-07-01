@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -661,7 +662,7 @@ void MemcpyWorkerPool::workerThread() {
                         std::memcpy(op.dest, op.src, op.size);
                     } else {
                         int dev = src_on_gpu ? src_dev : dst_dev;
-                        gpu_staging::SetDevice(dev);
+                        gpu_staging::DeviceGuard guard(dev);
                         if (!gpu_staging::CopyAuto(op.dest, op.src, op.size)) {
                             LOG(ERROR)
                                 << "GPU memcpy failed: src_dev=" << src_dev
@@ -900,13 +901,14 @@ TransferStrategy TransferFuture::strategy() const {
 // TransferSubmitter Implementation
 // ============================================================================
 
-TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     std::shared_ptr<StorageBackend>& backend,
-                                     const std::string& local_hostname,
-                                     TransferMetric* transfer_metric,
-                                     int numa_socket_id)
+TransferSubmitter::TransferSubmitter(
+    TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+    const std::string& local_hostname,
+    std::shared_ptr<ClientBufferAllocator> staging_allocator,
+    TransferMetric* transfer_metric, int numa_socket_id)
     : engine_(engine),
       local_endpoint_(engine.getLocalIpAndPort()),
+      staging_allocator_(std::move(staging_allocator)),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
 #ifdef USE_NOF
       spdk_nvmf_pool_(std::make_unique<SpdkNofWorkerPool>(numa_socket_id)),
@@ -947,6 +949,85 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             << memcpy_enabled_;
 }
 
+std::pair<std::vector<Slice>, std::vector<BufferHandle>>
+TransferSubmitter::ensureRegisteredForRDMA(const std::vector<Slice>& slices) {
+    // First pass: identify unregistered slices and compute total staging size.
+    // Batching into one contiguous allocation avoids per-slice allocator
+    // overhead which can be significant (30ms+ for 33 slices at 512MB).
+    size_t total_staging = 0;
+    std::vector<bool> needs_staging(slices.size(), false);
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (!engine_.isLocalMemoryRegistered(slices[i].ptr, slices[i].size)) {
+            if (slices[i].size >
+                std::numeric_limits<size_t>::max() - total_staging) {
+                LOG(ERROR) << "RDMA staging size overflow";
+                return std::make_pair(std::vector<Slice>{},
+                                      std::vector<BufferHandle>{});
+            }
+            needs_staging[i] = true;
+            total_staging += slices[i].size;
+        }
+    }
+
+    // Fast path: all slices already registered — still need kMaxSliceSize
+    // splitting because callers (e.g. multi_buffers) may pass large slices.
+    if (total_staging == 0) {
+        std::vector<Slice> split;
+        split.reserve(slices.size());
+        for (const auto& s : slices) {
+            auto sub = split_into_slices(s.ptr, s.size);
+            split.insert(split.end(), sub.begin(), sub.end());
+        }
+        return std::make_pair(std::move(split), std::vector<BufferHandle>{});
+    }
+
+    if (!staging_allocator_) {
+        LOG(ERROR) << "No staging allocator for unregistered RDMA slices";
+        return std::make_pair(std::vector<Slice>{},
+                              std::vector<BufferHandle>{});
+    }
+
+    // Allocate ONE contiguous staging buffer for all unregistered data.
+    auto staging_alloc = staging_allocator_->allocate(total_staging);
+    if (!staging_alloc) {
+        LOG(ERROR) << "Staging alloc failed, total_size=" << total_staging;
+        return std::make_pair(std::vector<Slice>{},
+                              std::vector<BufferHandle>{});
+    }
+
+    char* staging_base = static_cast<char*>(staging_alloc->ptr());
+    size_t staging_offset = 0;
+
+    std::vector<Slice> prepared;
+    std::vector<BufferHandle> staging_handles;
+    prepared.reserve(slices.size());
+
+    // Sync path (default): copy each unregistered slice into the contiguous
+    // staging buffer. MemcpySafe auto-detects GPU vs CPU pointers.
+    // Staged slices are split by kMaxSliceSize to match RDMA transfer limits.
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (!needs_staging[i]) {
+            // Already registered — split by kMaxSliceSize for RDMA limits.
+            auto sub = split_into_slices(slices[i].ptr, slices[i].size);
+            prepared.insert(prepared.end(), sub.begin(), sub.end());
+        } else {
+            void* staged_ptr = staging_base + staging_offset;
+            staging_offset += slices[i].size;
+            if (!gpu_staging::MemcpySafe(staged_ptr, slices[i].ptr,
+                                         slices[i].size)) {
+                LOG(ERROR) << "MemcpySafe failed during RDMA staging";
+                return std::make_pair(std::vector<Slice>{},
+                                      std::vector<BufferHandle>{});
+            }
+            // Split staged data by kMaxSliceSize for RDMA transfer limits.
+            auto sub = split_into_slices(staged_ptr, slices[i].size);
+            prepared.insert(prepared.end(), sub.begin(), sub.end());
+        }
+    }
+    staging_handles.push_back(std::move(*staging_alloc));
+    return {std::move(prepared), std::move(staging_handles)};
+}
+
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code, void* ptr, size_t size) {
@@ -969,10 +1050,25 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                 case TransferStrategy::LOCAL_MEMCPY:
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
-                case TransferStrategy::TRANSFER_ENGINE:
-                    future =
-                        submitTransferEngineOperation(handle, slices, op_code);
+                case TransferStrategy::TRANSFER_ENGINE: {
+                    if (handle.protocol_ == "rdma") {
+                        auto [prepared, staging] =
+                            ensureRegisteredForRDMA(slices);
+                        if (prepared.empty() && !slices.empty()) {
+                            LOG(ERROR) << "ensureRegisteredForRDMA failed";
+                            return std::nullopt;
+                        }
+                        future = submitTransferEngineOperation(handle, prepared,
+                                                               op_code);
+                        if (future && !staging.empty()) {
+                            future->attachStagingHandles(std::move(staging));
+                        }
+                    } else {
+                        future = submitTransferEngineOperation(handle, slices,
+                                                               op_code);
+                    }
                     break;
+                }
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
                     return std::nullopt;
@@ -1008,16 +1104,38 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code) {
+    // NOTE: submit_batch always goes through TRANSFER_ENGINE (RDMA), never
+    // LOCAL_MEMCPY.  The selectStrategy dispatch is in submit() for single-
+    // replica transfers; BatchPut/BatchUpsert only call submit_batch when
+    // all replicas are remote (memory-backed, non-local).
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    std::vector<BufferHandle> all_staging_handles;
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
         auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
+        auto& handle = mem_desc.buffer_descriptor;
+        if (!validateTransferParams(handle, slices)) {
             return std::nullopt;
         }
-        auto& handle = mem_desc.buffer_descriptor;
+
+        // For RDMA WRITE ops, ensure slices are in registered memory.
+        const std::vector<Slice>* effective_slices = &slices;
+        std::vector<Slice> prepared;
+        if (op_code == TransferRequest::WRITE && handle.protocol_ == "rdma") {
+            auto [p, staging] = ensureRegisteredForRDMA(slices);
+            if (p.empty() && !slices.empty()) {
+                LOG(ERROR) << "ensureRegisteredForRDMA failed in submit_batch";
+                return std::nullopt;
+            }
+            prepared = std::move(p);
+            effective_slices = &prepared;
+            for (auto& h : staging) {
+                all_staging_handles.push_back(std::move(h));
+            }
+        }
+
         uint64_t offset = 0;
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
@@ -1025,7 +1143,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
                        << handle.transport_endpoint_;
             return std::nullopt;
         }
-        for (auto slice : slices) {
+        for (const auto& slice : *effective_slices) {
             TransferRequest request;
             request.opcode = op_code;
             request.source = static_cast<char*>(slice.ptr);
@@ -1039,6 +1157,9 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     future = submitTransfer(requests);
     // Update metrics on successful submission
     if (future.has_value()) {
+        if (!all_staging_handles.empty()) {
+            future->attachStagingHandles(std::move(all_staging_handles));
+        }
         for (auto& slices : all_slices) {
             updateTransferMetrics(slices, op_code);
         }
@@ -1091,39 +1212,63 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
     auto state = std::make_shared<MemcpyOperationState>();
 
-    // Create memcpy operations
-    std::vector<MemcpyOperation> operations;
-    operations.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
     uint64_t offset = src_offset;
 
+    int base_dev = -1;
+    bool base_on_gpu = false;
+    if (base_address != 0) {
+        base_on_gpu = gpu_staging::IsDevicePointer(
+            reinterpret_cast<void*>(base_address), &base_dev);
+    }
+
+    // Execute memcpy inline on the calling thread instead of going through
+    // the worker pool. This eliminates thread synchronization overhead and
+    // keeps data on the same NUMA node. The worker pool (1 thread) added
+    // ~30ms overhead for 512MB on eRDMA hardware.
+    bool ok = true;
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
-
-        if (slice.ptr == nullptr) continue;
+        if (slice.ptr == nullptr || slice.size == 0) continue;
 
         void* dest;
         const void* src;
-
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local buffer)
             dest = slice.ptr;
             src = reinterpret_cast<const void*>(base_address + offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote buffer)
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
         offset += slice.size;
 
-        operations.emplace_back(dest, src, slice.size);
+        int slice_dev = -1;
+        bool slice_on_gpu = gpu_staging::IsDevicePointer(slice.ptr, &slice_dev);
+
+        bool src_on_gpu =
+            (op_code == TransferRequest::READ) ? base_on_gpu : slice_on_gpu;
+        int src_dev = (op_code == TransferRequest::READ) ? base_dev : slice_dev;
+        bool dst_on_gpu =
+            (op_code == TransferRequest::READ) ? slice_on_gpu : base_on_gpu;
+        int dst_dev = (op_code == TransferRequest::READ) ? slice_dev : base_dev;
+
+        if (!src_on_gpu && !dst_on_gpu) {
+            std::memcpy(dest, src, slice.size);
+        } else {
+            int dev = src_on_gpu ? src_dev : dst_dev;
+            gpu_staging::DeviceGuard guard(dev);
+            if (!gpu_staging::CopyAuto(dest, src, slice.size)) {
+                LOG(ERROR) << "GPU memcpy failed: src_dev=" << src_dev
+                           << " dst_dev=" << dst_dev << " size=" << slice.size;
+                ok = false;
+                break;
+            }
+        }
     }
 
-    // Submit memcpy operations to worker pool for async execution
-    MemcpyTask task(std::move(operations), state);
-    memcpy_pool_->submitTask(std::move(task));
+    state->set_completed(ok ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL);
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
+    VLOG(1) << "Memcpy transfer completed inline with " << slices.size()
             << " operations";
 
     return TransferFuture(state);
@@ -1317,18 +1462,10 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
 TransferStrategy TransferSubmitter::selectStrategy(
     const AllocatedBuffer::Descriptor& handle,
     const std::vector<Slice>& slices) const {
-    // Check if memcpy operations are enabled via environment variable
-    if (!memcpy_enabled_) {
-        VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
-                   "variable";
-        return TransferStrategy::TRANSFER_ENGINE;
-    }
-
-    // Check conditions for local memcpy optimization
-    if (isLocalTransfer(handle)) {
+    (void)slices;
+    if (memcpy_enabled_ && isLocalTransfer(handle)) {
         return TransferStrategy::LOCAL_MEMCPY;
     }
-
     return TransferStrategy::TRANSFER_ENGINE;
 }
 

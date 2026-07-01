@@ -59,9 +59,10 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
             std::memcpy(dst, &infos[i].metadata,
                         infos[i].metadata.header.data_offset);
             if (infos[i].tensor_size > 0) {
-                std::memcpy(dst + infos[i].metadata.header.data_offset,
-                            reinterpret_cast<void *>(infos[i].data_ptr),
-                            infos[i].tensor_size);
+                gpu_staging::MemcpySafe(
+                    dst + infos[i].metadata.header.data_offset,
+                    reinterpret_cast<void *>(infos[i].data_ptr),
+                    infos[i].tensor_size);
             }
 
             valid_keys.push_back(keys[i]);
