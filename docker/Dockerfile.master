@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.7
+
+###############################################################################
+# Stage 1: build Mooncake from source (non-CUDA) and produce a Python wheel
+###############################################################################
+ARG UBUNTU_VERSION=22.04
+
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    NON_CUDA_BUILD=1
+
+ARG PYTHON_VERSION=3.10
+ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
+ARG CMAKE_BUILD_TYPE=Release
+
+ENV PYTHON_VERSION=${PYTHON_VERSION} \
+    PATH="/usr/local/go/bin:${PATH}"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        ninja-build \
+        software-properties-common \
+        pkg-config && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv && \
+    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    apt-get purge -y --auto-remove software-properties-common && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . /workspace
+
+RUN bash dependencies.sh -y
+
+RUN mkdir -p build && \
+    cd build && \
+    cmake -G Ninja .. \
+        -DBUILD_UNIT_TESTS=OFF \
+        -DUSE_HTTP=ON \
+        -DUSE_ETCD=ON \
+        -DUSE_CUDA=OFF \
+        -DWITH_EP=OFF \
+        -DSTORE_USE_ETCD=ON \
+        -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
+    cmake --build .
+
+RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
+
+###############################################################################
+# Stage 2: install the freshly built wheel into a minimal runtime image
+###############################################################################
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+ARG PYTHON_VERSION=3.10
+ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        software-properties-common \
+        ibverbs-providers \
+        rdma-core \
+        libibverbs1 \
+        librdmacm1 \
+        libnuma1 \
+        liburing2 \
+        libyaml-0-2 \
+        libcurl4 && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} && \
+    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    apt-get purge -y --auto-remove software-properties-common curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
+RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && \
+    rm -rf /tmp/mooncake-wheel /root/.cache/pip
+
+EXPOSE 50051 9003 8080
+
+ENTRYPOINT ["mooncake_master"]
