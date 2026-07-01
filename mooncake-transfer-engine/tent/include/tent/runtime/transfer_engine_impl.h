@@ -161,6 +161,8 @@ class TransferEngineImpl {
 
     uint64_t lockStageBuffer(const std::string& location);
 
+    Status pinStageBuffer(const std::string& location, uint64_t& addr);
+
     Status unlockStageBuffer(uint64_t addr);
 
     // Test-only hook: replace the transport in a given slot after construct().
@@ -294,6 +296,7 @@ class TransferEngineImpl {
     struct RuntimeQueueConfig {
         bool enabled{false};
         QueueLimits limits{};
+        QueueAgingConfig aging{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
         std::chrono::microseconds progress_fallback_interval{50000};
@@ -334,6 +337,8 @@ class TransferEngineImpl {
     bool enable_auto_failover_on_poll_{true};
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
+    // Zero leaves the legacy unbounded accept behavior enabled.
+    size_t staging_max_queued_tasks_per_shard_{0};
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     size_t dispatch_inflight_owners_{0};
