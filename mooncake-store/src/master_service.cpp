@@ -1579,7 +1579,8 @@ bool MasterService::HasCompletedMemoryCacheReplica(
 bool MasterService::HasCompletedDiskCacheReplica(
     const ObjectMetadata& metadata) {
     return metadata.HasReplica([](const Replica& replica) {
-        return replica.is_disk_replica() && replica.is_completed();
+        return (replica.is_disk_replica() || replica.is_local_disk_replica()) &&
+               replica.is_completed();
     });
 }
 
@@ -2483,8 +2484,13 @@ auto MasterService::GetReplicaList(const std::string& key,
         // TODO: NoF SSD support (ranhaojia)
         if (replica_list[0].is_memory_replica()) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
-        } else if (replica_list[0].is_disk_replica()) {
+            MasterMetricManager::instance().inc_mem_cache_hit_bytes(
+                static_cast<int64_t>(metadata.size));
+        } else if (replica_list[0].is_local_disk_replica() ||
+                   replica_list[0].is_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
+            MasterMetricManager::instance().inc_file_cache_hit_bytes(
+                static_cast<int64_t>(metadata.size));
         }
         MasterMetricManager::instance().inc_valid_get_nums();
         // Grant a lease to the object so it will not be removed
@@ -2605,8 +2611,13 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 if (replica_list[0].is_memory_replica()) {
                     MasterMetricManager::instance().inc_mem_cache_hit_nums();
-                } else if (replica_list[0].is_disk_replica()) {
+                    MasterMetricManager::instance().inc_mem_cache_hit_bytes(
+                        static_cast<int64_t>(metadata.size));
+                } else if (replica_list[0].is_local_disk_replica() ||
+                           replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
+                    MasterMetricManager::instance().inc_file_cache_hit_bytes(
+                        static_cast<int64_t>(metadata.size));
                 }
                 MasterMetricManager::instance().inc_valid_get_nums();
                 GrantLeaseForGroup(tenant_state, key, metadata);
@@ -3124,6 +3135,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         metadata.AddReplicas(std::move(replicas));
         auto& shard = accessor.GetShard();
         shard.OnDiskReplicaAdded(metadata);
+        SyncCacheTotalAccounting(metadata);
         return true;
     }
 
@@ -3652,16 +3664,13 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
             return r.is_local_disk_replica() && r.is_completed();
         });
-        // PopReplicas (vs EraseReplicas) so we can release the SSD usage of
-        // the removed local-disk replicas; both remove the same matching set.
-        auto erased_replicas =
-            metadata.PopReplicas([&client_id](const Replica& replica) {
+        EraseReplicasWithCacheTotalAccounting(
+            metadata, [&client_id](const Replica& replica) {
                 return replica.is_local_disk_replica() &&
                        replica.get_descriptor()
                                .get_local_disk_descriptor()
                                .client_id == client_id;
             });
-        ReleaseLocalDiskUsage(erased_replicas);
         if (had_completed_disk) {
             auto& shard = accessor.GetShard();
             shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
@@ -4857,6 +4866,7 @@ auto MasterService::NotifyOffloadSuccess(
                         obj_metadata.AddReplicas(std::move(replicas));
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
+                        SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
                     } else {
                         obj_metadata.VisitReplicas(
