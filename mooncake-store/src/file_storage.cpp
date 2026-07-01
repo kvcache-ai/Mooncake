@@ -1,22 +1,19 @@
 #include "file_storage.h"
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.hpp"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
 
 namespace mooncake {
-
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
 
 namespace {
 
@@ -491,23 +488,28 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // WriteBucket) always receives host pointers.
         std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
         std::vector<PinnedBufferPool::Buffer> staging_bufs;
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
 
         for (auto& [obj_key, slices] : batch_object) {
             std::vector<Slice> host_slices;
             bool obj_success = true;
             for (const auto& slice : slices) {
-                int device_id = -1;
-                if (IsDevicePointer(slice.ptr, &device_id)) {
-                    SetDevice(device_id);
+                device::PointerInfo info{};
+                auto* device =
+                    runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+                if (device) {
+                    device->SetContext(info.device_id);
                     auto buf = pinned_buffer_pool_->Acquire(slice.size);
-                    if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                    if (!device->Copy(buf.data, slice.ptr, slice.size,
+                                      device::CopyDirection::kDeviceToHost)) {
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
-                        pinned_buffer_pool_->Release(buf);
+                        pinned_buffer_pool_->Release(std::move(buf));
                         obj_success = false;
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
-                    staging_bufs.push_back(buf);
+                    staging_bufs.push_back(std::move(buf));
                 } else {
                     host_slices.push_back(slice);
                 }
@@ -546,9 +548,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto offload_res = storage_backend_->BatchOffload(
             host_batch_object, bucket_complete_handler, eviction_handler);
 
-        // Release staging buffers back to pool (Buffer is POD, no destructor)
+        // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
-            pinned_buffer_pool_->Release(buf);
+            pinned_buffer_pool_->Release(std::move(buf));
         }
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
