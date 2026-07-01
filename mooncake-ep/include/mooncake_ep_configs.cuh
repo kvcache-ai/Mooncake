@@ -43,16 +43,22 @@ constexpr int kEpActiveQpsPerRank = 8;
 #endif
 
 #include <cuda_bf16.h>
+#ifndef MOONCAKE_EP_USE_MACA
 #include <cuda_fp8.h>
-#include <cuda_runtime.h>
 #include <infiniband/mlx5dv.h>
+#endif
+#include <cuda_runtime.h>
+
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#define MOONCAKE_EP_SPLIT_SEND_RECV 1
+#endif
 
 // torchada maps nv_bfloat16 → __mt_bfloat16 which is an incomplete type on
 // MUSA, so sizeof(__mt_bfloat16) fails.  mt_bfloat16 (the complete typedef in
 // musa_bf16.hpp) requires the MUSA device compiler (mcc) and cannot be
 // included from host .cpp files.  Use EP_BF16_SIZE: sizeof(nv_bfloat16) on
 // CUDA, hardcoded 2 on MUSA (both are 2 bytes).
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
 #define EP_BF16_SIZE 2
 #else
 #define EP_BF16_SIZE sizeof(nv_bfloat16)

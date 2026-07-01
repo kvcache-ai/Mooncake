@@ -135,6 +135,7 @@ design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
+design/ssd-free-ratio-first-allocation
 :::
 
 % API Documentation
@@ -146,6 +147,7 @@ design/conductor/conductor-architecture-design
 api-reference/python/index
 api-reference/cpp/index
 api-reference/http/index
+api-reference/rust/index
 :::
 
 % Q&A for Mooncake

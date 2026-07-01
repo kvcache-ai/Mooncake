@@ -21,12 +21,150 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "cuda_alike.h"
 
 namespace mooncake {
 namespace device {
+
+#ifdef USE_MACA
+namespace {
+
+bool parseBoolEnv(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s == "1" || s == "on" || s == "true" || s == "yes";
+}
+
+std::string getLowerEnv(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return "";
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+int macaAllocFlagFromMode(const std::string& mode, const char* env_name) {
+    if (mode.empty() || mode == "default" || mode == "cuda")
+        return mcDeviceMallocDefault;
+    if (mode == "fine" || mode == "finegrained" || mode == "fine-grained")
+        return mcDeviceMallocFinegrained;
+    if (mode == "signal") return mcMallocSignalMemory;
+    if (mode == "wc" || mode == "writecoherence" || mode == "write-coherence")
+        return mcDeviceMallocWriteCoherence;
+    if (mode == "pcie" || mode == "pcie-uncache" || mode == "map-pcie")
+        return mcDeviceMallocMapPcieDefault;
+    if (mode == "pcie-wc" || mode == "map-pcie-wc")
+        return mcDeviceMallocMapPcieCoherence;
+    if (mode == "fixed" || mode == "fixed-uncache")
+        return mcDeviceMallocFixedMemDefault;
+    if (mode == "fixed-wc") return mcDeviceMallocFixedMemCoherence;
+    LOG(WARNING) << "[EP P2P] unknown " << env_name << "=" << mode
+                 << ", using default cudaMalloc";
+    return mcDeviceMallocDefault;
+}
+
+int macaAllocFlagFromEnv() {
+    return macaAllocFlagFromMode(getLowerEnv("MOONCAKE_EP_MACA_ALLOC"),
+                                 "MOONCAKE_EP_MACA_ALLOC");
+}
+
+std::string macaIpcMode() {
+    std::string mode = getLowerEnv("MOONCAKE_EP_MACA_IPC");
+    return mode.empty() ? "normal" : mode;
+}
+
+bool parseNonNegativeInt(const std::string& token, int* value) {
+    if (token.empty()) return false;
+    int result = 0;
+    for (char c : token) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+        result = result * 10 + (c - '0');
+    }
+    *value = result;
+    return true;
+}
+
+int physicalDeviceFromVisibleList(int logical_device) {
+    const char* visible = std::getenv("CUDA_VISIBLE_DEVICES");
+    if (visible == nullptr || visible[0] == '\0') return logical_device;
+
+    std::string list(visible);
+    size_t begin = 0;
+    int logical = 0;
+    while (begin <= list.size()) {
+        size_t end = list.find(',', begin);
+        if (end == std::string::npos) end = list.size();
+        std::string token = list.substr(begin, end - begin);
+        token.erase(std::remove_if(
+                        token.begin(), token.end(),
+                        [](unsigned char c) { return std::isspace(c) != 0; }),
+                    token.end());
+        if (logical == logical_device) {
+            int physical = logical_device;
+            return parseNonNegativeInt(token, &physical) ? physical
+                                                         : logical_device;
+        }
+        if (end == list.size()) break;
+        begin = end + 1;
+        ++logical;
+    }
+    return logical_device;
+}
+
+bool pairListed(const std::string& pairs, int src, int dst) {
+    size_t begin = 0;
+    while (begin <= pairs.size()) {
+        size_t end = pairs.find(',', begin);
+        if (end == std::string::npos) end = pairs.size();
+        std::string item = pairs.substr(begin, end - begin);
+        item.erase(std::remove_if(
+                       item.begin(), item.end(),
+                       [](unsigned char c) { return std::isspace(c) != 0; }),
+                   item.end());
+
+        size_t dash = item.find('-');
+        if (dash != std::string::npos) {
+            int a = -1, b = -1;
+            if (parseNonNegativeInt(item.substr(0, dash), &a) &&
+                parseNonNegativeInt(item.substr(dash + 1), &b)) {
+                if ((a == src && b == dst) || (a == dst && b == src))
+                    return true;
+            }
+        }
+
+        if (end == pairs.size()) break;
+        begin = end + 1;
+    }
+    return false;
+}
+
+bool macaP2pPairAllowed(int src_physical, int dst_physical) {
+    if (parseBoolEnv("MOONCAKE_EP_MACA_ALLOW_NODE_P2P")) return true;
+
+    const char* explicit_pairs = std::getenv("MOONCAKE_EP_MACA_P2P_PAIRS");
+    if (explicit_pairs != nullptr && explicit_pairs[0] != '\0')
+        return pairListed(explicit_pairs, src_physical, dst_physical);
+
+    // C500 exposes two direct MetaXLink islands by default: 0<->1 and 2<->3.
+    // NODE pairs may report canAccessPeer=1, but EP kernel peer stores can hang
+    // waiting for device-side signals on those paths.
+    return src_physical / 2 == dst_physical / 2 &&
+           std::abs(src_physical - dst_physical) == 1;
+}
+
+}  // namespace
+#endif
 
 class P2pDeviceTransportImpl : public P2pTransport {
    public:
@@ -54,22 +192,79 @@ class P2pDeviceTransportImpl : public P2pTransport {
 
     void* allocateBuffer(size_t bytes) override {
         void* ptr = nullptr;
+#ifdef USE_MACA
+        int alloc_flag = macaAllocFlagFromEnv();
+        cudaError_t err = alloc_flag == mcDeviceMallocDefault
+                              ? cudaMalloc(&ptr, bytes)
+                              : mcExtMallocWithFlags(&ptr, bytes, alloc_flag);
+#else
         cudaError_t err = cudaMalloc(&ptr, bytes);
+#endif
         if (err != cudaSuccess) {
-            LOG(ERROR) << "[EP P2P] cudaMalloc(" << bytes
+            LOG(ERROR) << "[EP P2P] device allocation(" << bytes
                        << ") failed: " << cudaGetErrorString(err);
             return nullptr;
         }
+#ifdef USE_MACA
+        if (alloc_flag != mcDeviceMallocDefault) {
+            LOG(INFO) << "[EP P2P] allocated MACA buffer with "
+                         "mcExtMallocWithFlags flag="
+                      << alloc_flag;
+        }
+#endif
         return ptr;
     }
 
     void freeBuffer(void* ptr) override { cudaFree(ptr); }
 
     std::vector<int32_t> exportIpcHandle(void* ptr) override {
+#ifdef USE_MACA
+        if (parseBoolEnv("MOONCAKE_EP_MACA_DISABLE_IPC")) {
+            LOG(INFO) << "[EP P2P] MACA IPC handle export disabled by "
+                         "MOONCAKE_EP_MACA_DISABLE_IPC";
+            return {};
+        }
+
+        cudaPointerAttributes attr{};
+        cudaError_t attr_err = cudaPointerGetAttributes(&attr, ptr);
+        if (attr_err != cudaSuccess || attr.type != cudaMemoryTypeDevice ||
+            attr.devicePointer == nullptr) {
+            LOG(WARNING) << "[EP P2P] skip MACA IPC handle export for "
+                         << "non-device pointer=" << ptr
+                         << ", attr_err=" << cudaGetErrorString(attr_err)
+                         << ", type=" << attr.type
+                         << ", devicePointer=" << attr.devicePointer
+                         << ", allocationFlags=" << attr.allocationFlags;
+            return {};
+        }
+
+        std::string ipc_mode = macaIpcMode();
+        if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
+            mcIpcCrossMemHandle_t handle;
+            cudaError_t err = mcIpcGetMemHandleCross_v2(&handle, ptr);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "[EP P2P] mcIpcGetMemHandleCross_v2 failed: "
+                           << cudaGetErrorString(err);
+                return {};
+            }
+            constexpr size_t kHandleBytes = sizeof(mcIpcCrossMemHandle_t);
+            constexpr size_t kNumInt32s =
+                (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+            std::vector<int32_t> result(kNumInt32s);
+            memcpy(result.data(), &handle, kHandleBytes);
+            return result;
+        }
+#endif
         cudaIpcMemHandle_t handle;
+#ifdef USE_MACA
+        cudaError_t err = macaIpcMode() == "cross"
+                              ? mcIpcGetMemHandleCross(&handle, ptr)
+                              : cudaIpcGetMemHandle(&handle, ptr);
+#else
         cudaError_t err = cudaIpcGetMemHandle(&handle, ptr);
+#endif
         if (err != cudaSuccess) {
-            LOG(ERROR) << "[EP P2P] cudaIpcGetMemHandle failed: "
+            LOG(ERROR) << "[EP P2P] IPC handle export failed: "
                        << cudaGetErrorString(err);
             return {};
         }
@@ -112,6 +307,20 @@ class P2pDeviceTransportImpl : public P2pTransport {
                       << "): canAccessPeer=" << can_access;
             if (!can_access) continue;
 
+#ifdef USE_MACA
+            int src_physical = physicalDeviceFromVisibleList(device_id);
+            int dst_physical = physicalDeviceFromVisibleList(dst_device);
+            if (!macaP2pPairAllowed(src_physical, dst_physical)) {
+                LOG(INFO) << "[EP P2P] rank " << rank << " physical GPU"
+                          << src_physical << " -> rank " << dst
+                          << " physical GPU" << dst_physical
+                          << " disabled for MACA EP fast path; set "
+                             "MOONCAKE_EP_MACA_ALLOW_NODE_P2P=1 or "
+                             "MOONCAKE_EP_MACA_P2P_PAIRS to override";
+                continue;
+            }
+#endif
+
             cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
             if (err != cudaSuccess &&
                 err != cudaErrorPeerAccessAlreadyEnabled) {
@@ -129,14 +338,50 @@ class P2pDeviceTransportImpl : public P2pTransport {
             constexpr size_t kHandleBytes = sizeof(cudaIpcMemHandle_t);
             constexpr size_t kNumInt32s =
                 (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+#ifdef USE_MACA
+            std::string ipc_mode = macaIpcMode();
+            if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
+                constexpr size_t kCrossHandleBytes =
+                    sizeof(mcIpcCrossMemHandle_t);
+                constexpr size_t kCrossNumInt32s =
+                    (kCrossHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+                if (h.size() < kCrossNumInt32s) continue;
+                mcIpcCrossMemHandle_t handle;
+                memcpy(&handle, h.data(), kCrossHandleBytes);
+                void* peer_ptr = nullptr;
+                err = mcIpcOpenMemHandleCross_v2(
+                    &peer_ptr, &handle, cudaIpcMemLazyEnablePeerAccess);
+                if (err != cudaSuccess) {
+                    LOG(WARNING)
+                        << "[EP P2P] rank " << rank
+                        << " failed to open cross_v2 IPC handle for rank "
+                        << dst << ": " << cudaGetErrorString(err);
+                    continue;
+                }
+                LOG(INFO) << "[EP P2P] rank " << rank
+                          << " opened cross_v2 IPC handle for rank " << dst
+                          << ": peer_ptr=" << peer_ptr;
+                available[dst] = 1;
+                peer_ptrs_host_[dst] = peer_ptr;
+                continue;
+            }
+#endif
             if (h.size() < kNumInt32s) continue;
 
             cudaIpcMemHandle_t handle;
             memcpy(&handle, h.data(), kHandleBytes);
 
             void* peer_ptr = nullptr;
+#ifdef USE_MACA
+            err = ipc_mode == "cross"
+                      ? mcIpcOpenMemHandleCross(&peer_ptr, handle,
+                                                cudaIpcMemLazyEnablePeerAccess)
+                      : cudaIpcOpenMemHandle(&peer_ptr, handle,
+                                             cudaIpcMemLazyEnablePeerAccess);
+#else
             err = cudaIpcOpenMemHandle(&peer_ptr, handle,
                                        cudaIpcMemLazyEnablePeerAccess);
+#endif
             if (err != cudaSuccess) {
                 LOG(WARNING) << "[EP P2P] rank " << rank
                              << " failed to open IPC handle for rank " << dst

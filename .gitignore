@@ -206,6 +206,9 @@ _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
+
+# core dumps
+core_*
 # MacOS
 .DS_Store
 .envrc

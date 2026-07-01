@@ -91,6 +91,46 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 >
 > The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
 
+### Tenant Quota
+
+The Master Service can optionally enforce strict multi-tenant memory quota admission. This feature is disabled by default. When `enable_multi_tenants=false`, request tenant IDs are ignored for object placement, all objects use the `default` namespace, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
+
+When strict multi-tenant mode is enabled, the tenant quota policy is loaded from the configured connector. The v1 connector is a writable YAML file configured by `tenant_quota_connector_type=file` and `tenant_quota_connector_uri=<path>`. Tenants must be explicitly present in that connector policy before they can write. Missing tenants, empty tenants, and an unregistered `default` tenant are rejected with `TENANT_NOT_REGISTERED`.
+
+The YAML policy uses schema version `1`:
+
+```yaml
+version: 1
+
+tenants:
+  - name: tenant-a
+    quota: 200GB
+```
+
+Tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters. Quotas must be positive integers and may use `B`, `KB`, `MB`, `GB`, or `TB` units.
+
+Effective quota is recomputed from the current registered memory capacity:
+
+- If explicit tenant requests fit within the registered memory capacity, tenants receive their requested quotas and remaining capacity stays unallocated.
+- If explicit tenant requests exceed registered memory capacity, explicit tenants receive quota scaled proportionally by request size.
+- Remainders are assigned deterministically by tenant ID, so repeated recomputes produce stable results.
+- Tenants present in restored metadata but missing from the connector policy become in-memory orphans with requested quota `0`, effective quota `0`, and `over_quota=true` while they still own metadata. Reads and removals are allowed so operators can clean them up; writes remain blocked until the tenant is re-registered or emptied.
+
+`PutStart` and size-changing `UpsertStart` charge quota before memory is allocated. If the first reservation fails, the master performs tenant-scoped memory eviction for the target tenant and retries the reservation. The retry is bounded to two eviction attempts. Tenant quota eviction scans only the target tenant, skips hard-pinned objects, honors soft-pin eviction configuration, and preserves grouped-object lease safety checks.
+
+Admin policy changes are persisted before the final in-memory policy is applied. `PUT` writes the connector first and then applies the policy in memory. `DELETE` first marks the tenant unregistered in memory to block concurrent writes, verifies the tenant is empty, writes the connector, and rolls back the in-memory mark if the connector write fails. The admin HTTP API exposes:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/tenant_quotas` | List quota snapshots for active or explicit tenants |
+| `GET` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Query one tenant quota snapshot |
+| `PUT` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Create or update a tenant quota policy |
+| `DELETE` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Delete an empty tenant quota policy |
+
+Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `metadata_object_count`, `over_quota`, and `has_explicit_policy`.
+
+Snapshots restore object runtime state only. Tenant quota policy is always loaded from the connector after metadata restore, then usage and effective quota are rebuilt from restored metadata and current registered capacity. If the connector cannot be loaded in strict multi-tenant mode, startup fails.
+
 ### Master Service APIs
 
 The protobuf definition between Master and Client is as follows:

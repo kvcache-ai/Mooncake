@@ -16,9 +16,20 @@
 
 namespace mooncake {
 
+// Forward declaration
+class HttpMetadataServer;
 class WrappedMasterService {
    public:
-    WrappedMasterService(const WrappedMasterServiceConfig& config);
+    // Constructor with optional metadata-cleanup-on-timeout configuration.
+    // - http_metadata_server: in-process pointer used when the HTTP metadata
+    //   server is co-located in the master process (nullptr = not co-located).
+    // - http_metadata_remote_url: http(s) connection string used when the
+    //   metadata server is deployed separately (empty = none). Only consulted
+    //   when http_metadata_server is nullptr. If both are unset, cleanup is
+    //   disabled.
+    WrappedMasterService(const WrappedMasterServiceConfig& config,
+                         HttpMetadataServer* http_metadata_server = nullptr,
+                         const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
 
@@ -165,6 +176,16 @@ class WrappedMasterService {
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
     tl::expected<std::string, ErrorCode> ServiceReady();
+
+    tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
+    ListTenantQuotaSnapshots();
+    tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
+        const std::string& tenant_id);
+    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
+        const std::string& tenant_id, uint64_t requested_quota_bytes);
+    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+    DeleteTenantQuotaPolicy(const std::string& tenant_id);
+    tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
