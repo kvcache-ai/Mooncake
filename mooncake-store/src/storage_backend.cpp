@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <random>
 #include <regex>
 #include <string>
 #include <thread>
@@ -1230,12 +1231,100 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     return {};
 }
 
+// Build a per-process salt used to namespace bucket ids across processes
+// sharing the same on-disk directory. PID alone is insufficient because two
+// processes can share the low bits of their PID; mixing in random_device
+// provides additional entropy. random_device may throw on minimal images
+// lacking an entropy source, in which case we fall back to clock-derived
+// jitter -- collisions remain extremely unlikely (PID still differs).
+static int64_t ComputeProcessSalt(int64_t mask) {
+    uint64_t rnd = 0;
+    try {
+        std::random_device rd;
+        rnd = rd();
+    } catch (const std::exception&) {
+        rnd = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    const uint64_t pid = static_cast<uint64_t>(::getpid());
+    return static_cast<int64_t>((pid ^ rnd) & static_cast<uint64_t>(mask));
+}
+
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
+    // PROCESS-UNIQUE BUCKET ID SPACE
+    //
+    // A BucketStorageBackend instance lives per-process, but multiple
+    // processes (e.g. multiple inference workers, TP ranks, or multi-tenant
+    // clients) may share the SAME on-disk directory. All of them construct
+    // their BucketIdGenerator in close temporal proximity at startup.
+    //
+    // The previous formula was:
+    //   current_id_ = (time_gen() << SEQUENCE_BITS) | 0
+    // time_gen() returns SECONDS, so processes whose constructors fall in
+    // the same second get the EXACT SAME starting current_id_. Each
+    // process then independently fetch_add(1)'s its own sequence and
+    // collisions are inevitable -- multiple processes open the same
+    // <id>.bucket file with O_TRUNC, corrupting each other's data.
+    //
+    // Fix: encode a per-process salt in the high bits of the id.
+    // Layout (63 bits used; sign bit stays 0 so the id remains a safe int64):
+    //   bits [62:44]  19-bit process salt   (pid xor random_device)
+    //   bits [43:12]  32-bit time_gen seconds
+    //   bits [11:0]   12-bit sequence (fetch_add)
+    //
+    // 32-bit seconds covers ~136 years from the epoch; no wrap risk in
+    // practice. The 19-bit (524288-entry) salt combined with random_device
+    // entropy makes intra-host collisions vanishingly improbable.
+    constexpr int kSecondBits = 32;
+    constexpr int kProcSaltBits = 19;
+    constexpr int kProcSaltShift = TIMESTAMP_SHIFT + kSecondBits;
+    constexpr int64_t kProcSaltMask = (1LL << kProcSaltBits) - 1;
+    constexpr int64_t kSecondMask = (1LL << kSecondBits) - 1;
+
+    const int64_t proc_salt = ComputeProcessSalt(kProcSaltMask);
+    const int64_t cur_time_stamp = time_gen() & kSecondMask;
+    const int64_t fresh_base = (proc_salt << kProcSaltShift) |
+                               (cur_time_stamp << TIMESTAMP_SHIFT) |
+                               SEQUENCE_ID_SHIFT;
+
     if (start <= 0) {
-        auto cur_time_stamp = time_gen();
-        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | SEQUENCE_ID_SHIFT;
+        current_id_ = fresh_base;
+        LOG(INFO) << "[BucketIdGenerator] init (fresh): pid=" << ::getpid()
+                  << ", proc_salt=" << proc_salt
+                  << ", time_sec=" << cur_time_stamp
+                  << ", current_id=" << current_id_;
     } else {
-        current_id_ = start;
+        // Restart path: ScanMeta recovered the largest id observed on disk.
+        //
+        // Because every process operates in its own salt namespace
+        // (bits [62:44]), the on-disk max id only constrains us when it
+        // was minted by a process with OUR salt -- i.e. a previous
+        // incarnation of this same logical worker that happened to draw
+        // the same salt. Ids carrying any other salt are in a disjoint
+        // range and cannot collide with anything we will mint.
+        //
+        // Therefore:
+        //   - if the recovered max shares our salt, we must start from
+        //     max(fresh_base, start) so we never reissue an existing
+        //     path;
+        //   - otherwise the recovered max is irrelevant to us and we
+        //     start from fresh_base.
+        //
+        // This replaces an earlier `while (base_id <= start) bump_time()`
+        // loop that could spin forever if `start` carried a salt larger
+        // than ours, because the salt occupies the high bits and time
+        // alone could never push base_id past it.
+        const int64_t start_salt = (start >> kProcSaltShift) & kProcSaltMask;
+        if (start_salt == proc_salt) {
+            current_id_ = std::max(fresh_base, start);
+        } else {
+            current_id_ = fresh_base;
+        }
+        LOG(INFO) << "[BucketIdGenerator] init (restart): pid=" << ::getpid()
+                  << ", proc_salt=" << proc_salt
+                  << ", scanmeta_max_id=" << start
+                  << ", scanmeta_max_salt=" << start_salt
+                  << ", new_current_id=" << current_id_;
     }
 }
 
