@@ -267,7 +267,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (enable_multi_tenants_) {
         auto store = CreateTenantQuotaPolicyStore(tenant_quota_connector_type_,
-                                                  tenant_quota_connector_uri_);
+                                                  tenant_quota_connector_uri_,
+                                                  cluster_id_);
         if (!store) {
             throw std::invalid_argument(store.error());
         }

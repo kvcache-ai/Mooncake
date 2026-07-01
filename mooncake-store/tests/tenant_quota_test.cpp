@@ -228,6 +228,28 @@ TEST(TenantQuotaPolicyStoreTest, RoundTripsYamlFile) {
     std::filesystem::remove(path);
 }
 
+TEST(TenantQuotaPolicyStoreTest, FileFactoryCreatesYamlStore) {
+    const auto path = MakeTempPolicyPath("factory-file");
+    auto store =
+        CreateTenantQuotaPolicyStore("file", path.string(), "test_cluster");
+    ASSERT_TRUE(store.has_value()) << store.error();
+}
+
+TEST(TenantQuotaPolicyStoreTest, FileFactoryRequiresUri) {
+    auto store = CreateTenantQuotaPolicyStore("file", "", "test_cluster");
+    ASSERT_FALSE(store.has_value());
+    EXPECT_NE(store.error().find("non-empty uri"), std::string::npos);
+}
+
+#ifndef STORE_USE_ETCD
+TEST(TenantQuotaPolicyStoreTest, EtcdFactoryRequiresStoreUseEtcd) {
+    auto store =
+        CreateTenantQuotaPolicyStore("etcd", "127.0.0.1:2379", "test_cluster");
+    ASSERT_FALSE(store.has_value());
+    EXPECT_NE(store.error().find("STORE_USE_ETCD"), std::string::npos);
+}
+#endif
+
 TEST(TenantQuotaPolicyStoreTest, RoundTripsYamlSpecialScalarNames) {
     TenantQuotaPolicySnapshot snapshot;
     snapshot.tenant_quotas = {{"foo#bar", 1},
