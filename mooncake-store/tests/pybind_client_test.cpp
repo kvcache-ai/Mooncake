@@ -36,6 +36,29 @@ class GLogMuter {
     int original_log_level_;
 };
 
+class LogCaptureSink : public google::LogSink {
+   public:
+    void send(google::LogSeverity severity, const char* full_filename,
+              const char* base_filename, int line, const struct ::tm* tm_time,
+              const char* message, size_t message_len) override {
+        (void)severity;
+        (void)full_filename;
+        (void)base_filename;
+        (void)line;
+        (void)tm_time;
+
+        logs_.append(message, message_len);
+        logs_.push_back('\n');
+    }
+
+    bool Contains(const std::string& needle) const {
+        return logs_.find(needle) != std::string::npos;
+    }
+
+   private:
+    std::string logs_;
+};
+
 class RealClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -992,6 +1015,26 @@ TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
         << "Setup should preserve zero-size pure client/server semantics";
 }
 
+TEST_F(RealClientTest, ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {
+    LogCaptureSink sink;
+    google::AddLogSink(&sink);
+
+    ConfigDict config = MakeConfigDict(
+        "localhost:17816", std::to_string(MAX_SEGMENT_SIZE + 1), "0");
+    config[CONFIG_KEY_PROTOCOL] = "invalid_protocol";
+
+    auto result = py_client_->setup_internal(config);
+
+    google::RemoveLogSink(&sink);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(sink.Contains("Invalid protocol"))
+        << "Setup should reach validation after size checks";
+    EXPECT_FALSE(sink.Contains("Invalid global_segment_size"))
+        << "global_segment_size above MAX_SEGMENT_SIZE should be accepted as "
+           "total capacity by ConfigDict validation";
+}
+
 TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
     GLogMuter muter;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
@@ -999,15 +1042,16 @@ TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
     master_address_ = master_.master_address();
 
     struct InvalidSizeCase {
-        const char* local_hostname;
-        const char* global_segment_size;
-        const char* local_buffer_size;
+        std::string local_hostname;
+        std::string global_segment_size;
+        std::string local_buffer_size;
     };
 
     const InvalidSizeCase invalid_size_cases[] = {
         {"localhost:17816", "50%", "16MB"},
         {"localhost:17817", "16MB", "16XB"},
         {"localhost:17818", "-5", "16MB"},
+        {"localhost:17819", "0", std::to_string(MAX_SEGMENT_SIZE + 1)},
     };
 
     for (const auto& test_case : invalid_size_cases) {

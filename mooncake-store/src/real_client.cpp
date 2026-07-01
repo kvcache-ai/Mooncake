@@ -1016,7 +1016,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
     // A size of 0 keeps the pure client/server setup semantics.
-    auto validate_size = [](const char *key, size_t value) {
+    // global_segment_size is a total capacity and may exceed max_mr_size; the
+    // setup path splits it into mountable chunks below.
+    auto validate_min_size = [](const char *key, size_t value) {
+        if (value != 0 && value < MIN_SEGMENT_SIZE) {
+            LOG(ERROR) << "Invalid " << key << ": " << value
+                       << ", must be 0 or at least " << MIN_SEGMENT_SIZE;
+            return false;
+        }
+        return true;
+    };
+    auto validate_single_segment_size = [](const char *key, size_t value) {
         if ((value != 0 && value < MIN_SEGMENT_SIZE) ||
             value > MAX_SEGMENT_SIZE) {
             LOG(ERROR) << "Invalid " << key << ": " << value
@@ -1026,8 +1036,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         return true;
     };
-    if (!validate_size(CONFIG_KEY_GLOBAL_SEGMENT_SIZE, global_segment_size) ||
-        !validate_size(CONFIG_KEY_LOCAL_BUFFER_SIZE, local_buffer_size)) {
+    if (!validate_min_size(CONFIG_KEY_GLOBAL_SEGMENT_SIZE,
+                           global_segment_size) ||
+        !validate_single_segment_size(CONFIG_KEY_LOCAL_BUFFER_SIZE,
+                                      local_buffer_size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
