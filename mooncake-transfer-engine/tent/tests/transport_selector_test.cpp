@@ -641,6 +641,77 @@ TEST(TransportSelectorTest, HintNotInMatchingPolicyReturnsUnspec) {
     EXPECT_EQ(r.transport, UNSPEC);
 }
 
+// RFC #2519 / #2568 step 1: a policy's link-layer QoS (service_level /
+// traffic_class / qp_pool) is parsed from JSON and carried out via
+// SelectionResult. (Step 1 only plumbs the values; applying them at QP setup
+// is the per-class QP pool follow-up.)
+TEST(TransportSelectorTest, PolicyLinkLayerQoSIsParsedAndCarried) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "kv-critical";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"rdma"};
+    policy["service_level"] = 3;
+    policy["traffic_class"] = 96;
+    policy["qp_pool"] = "kv";
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.policy_name = "kv-critical";
+
+    auto r = selector.select(ctx, transports, /*index=*/0);
+    ASSERT_TRUE(r.service_level.has_value());
+    EXPECT_EQ(r.service_level.value(), 3);
+    ASSERT_TRUE(r.traffic_class.has_value());
+    EXPECT_EQ(r.traffic_class.value(), 96);
+    ASSERT_TRUE(r.qp_pool.has_value());
+    EXPECT_EQ(r.qp_pool.value(), "kv");
+}
+
+// Out-of-range SL/TC are ignored (left as nullopt) so a bad config never
+// changes selection behavior.
+TEST(TransportSelectorTest, PolicyLinkLayerQoSOutOfRangeIgnored) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "bad-qos";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"rdma"};
+    policy["service_level"] = 99;    // > 15, invalid
+    policy["traffic_class"] = 9999;  // > 255, invalid
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.policy_name = "bad-qos";
+
+    auto r = selector.select(ctx, transports, /*index=*/0);
+    EXPECT_FALSE(r.service_level.has_value());
+    EXPECT_FALSE(r.traffic_class.has_value());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
