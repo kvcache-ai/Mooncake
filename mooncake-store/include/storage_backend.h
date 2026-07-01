@@ -229,6 +229,9 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // DFS page-offset mode. Enabled automatically for kDistributed.
+    bool enable_dfs = false;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -249,6 +252,7 @@ struct FileStorageConfig {
 class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& file_storage_config);
+    virtual ~StorageBackendInterface() = default;
 
     virtual tl::expected<void, ErrorCode> Init() = 0;
 

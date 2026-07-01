@@ -431,6 +431,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
+    PullDfsOffloadTasks(const UUID& client_id);
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 

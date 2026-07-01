@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -377,6 +378,187 @@ tl::expected<std::vector<std::string>, ErrorCode> Hf3fsAdapter::ListFiles(
     }
     closedir(d);
     return result;
+}
+
+tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFile(const std::string& path) {
+    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+
+    if (hf3fs_reg_fd(fd, 0) != 0) {
+        close(fd);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    return fd;
+}
+
+tl::expected<void, ErrorCode> Hf3fsAdapter::CloseFile(int fd) {
+    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
+    hf3fs_dereg_fd(fd);
+    if (close(fd) != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Hf3fsAdapter::PreallocateFile(
+    const std::string& path, uint64_t size) {
+    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+
+    int rc = fallocate(fd, 0, 0, static_cast<off_t>(size));
+    if (rc != 0) {
+        rc = ftruncate(fd, static_cast<off_t>(size));
+    }
+    int saved_errno = errno;
+    close(fd);
+
+    if (rc != 0) {
+        errno = saved_errno;
+        LOG(ERROR) << "Failed to preallocate DFS file " << path
+                   << ", size=" << size << ", error=" << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(int fd, const iovec* iov,
+                                                      int iovcnt,
+                                                      int64_t offset) {
+    if (fd < 0 || offset < 0 || iovcnt < 0 || (iovcnt > 0 && iov == nullptr)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (int i = 0; i < iovcnt; ++i) {
+        if (!iov[i].iov_base && iov[i].iov_len > 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto* resource = resource_manager_->getThreadResource();
+    if (!resource || !resource->initialized) {
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    size_t total_length = 0;
+    for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
+    if (total_length == 0) return size_t{0};
+
+    auto& threefs_iov = resource->iov_;
+    auto& ior_write = resource->ior_write_;
+    size_t total_written = 0;
+    size_t remaining = total_length;
+    int iov_idx = 0;
+    size_t iov_off = 0;
+    off_t current_offset = static_cast<off_t>(offset);
+
+    while (remaining > 0) {
+        size_t chunk = std::min(remaining, resource->config_.iov_size);
+        size_t copied = 0;
+        char* dest = reinterpret_cast<char*>(threefs_iov.base);
+        while (copied < chunk && iov_idx < iovcnt) {
+            if (iov_off >= iov[iov_idx].iov_len) {
+                ++iov_idx;
+                iov_off = 0;
+                continue;
+            }
+            size_t n = std::min(chunk - copied, iov[iov_idx].iov_len - iov_off);
+            memcpy(dest + copied,
+                   static_cast<char*>(iov[iov_idx].iov_base) + iov_off, n);
+            copied += n;
+            iov_off += n;
+        }
+        if (copied == 0) break;
+
+        int ret =
+            hf3fs_prep_io(&ior_write, &threefs_iov, false, threefs_iov.base, fd,
+                          current_offset, copied, nullptr);
+        if (ret < 0) break;
+        ret = hf3fs_submit_ios(&ior_write);
+        if (ret < 0) break;
+        struct hf3fs_cqe cqe;
+        ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
+        if (ret < 0 || cqe.result < 0) break;
+
+        size_t bytes_written = cqe.result;
+        if (bytes_written == 0) break;
+        total_written += bytes_written;
+        current_offset += bytes_written;
+        remaining -= bytes_written;
+        if (bytes_written < copied) break;
+    }
+
+    if (total_written != total_length) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return total_written;
+}
+
+tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(int fd, iovec* iov,
+                                                     int iovcnt,
+                                                     int64_t offset) {
+    if (fd < 0 || offset < 0 || iovcnt < 0 || (iovcnt > 0 && iov == nullptr)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (int i = 0; i < iovcnt; ++i) {
+        if (!iov[i].iov_base && iov[i].iov_len > 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto* resource = resource_manager_->getThreadResource();
+    if (!resource || !resource->initialized) {
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    size_t total_length = 0;
+    for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
+    if (total_length == 0) return size_t{0};
+
+    auto& threefs_iov = resource->iov_;
+    auto& ior_read = resource->ior_read_;
+    size_t total_read = 0;
+    size_t remaining = total_length;
+    int iov_idx = 0;
+    size_t iov_off = 0;
+    off_t current_offset = static_cast<off_t>(offset);
+
+    while (remaining > 0) {
+        size_t chunk = std::min(remaining, resource->config_.iov_size);
+        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base,
+                                fd, current_offset, chunk, nullptr);
+        if (ret < 0) break;
+        ret = hf3fs_submit_ios(&ior_read);
+        if (ret < 0) break;
+        struct hf3fs_cqe cqe;
+        ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
+        if (ret < 0 || cqe.result < 0) break;
+
+        size_t bytes_read = cqe.result;
+        if (bytes_read == 0) break;
+
+        size_t to_copy = bytes_read;
+        char* src = reinterpret_cast<char*>(threefs_iov.base);
+        while (to_copy > 0 && iov_idx < iovcnt) {
+            if (iov_off >= iov[iov_idx].iov_len) {
+                ++iov_idx;
+                iov_off = 0;
+                continue;
+            }
+            size_t n = std::min(to_copy, iov[iov_idx].iov_len - iov_off);
+            memcpy(static_cast<char*>(iov[iov_idx].iov_base) + iov_off, src, n);
+            src += n;
+            to_copy -= n;
+            total_read += n;
+            remaining -= n;
+            current_offset += n;
+            iov_off += n;
+        }
+        if (bytes_read < chunk) break;
+    }
+
+    if (total_read != total_length) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return total_read;
 }
 
 }  // namespace mooncake
