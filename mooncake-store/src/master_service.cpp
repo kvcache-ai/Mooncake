@@ -5154,6 +5154,7 @@ void MasterService::ClearCandidatesForReload() {
     }
     promotion_candidate_count_.store(0, std::memory_order_relaxed);
     promotion_retry_cursor_.store(0, std::memory_order_relaxed);
+    promotion_in_flight_.store(0, std::memory_order_relaxed);
 }
 
 size_t MasterService::RunPromotionCandidateRetry() {
@@ -5177,6 +5178,20 @@ size_t MasterService::CountCandidatesForTesting(
         }
     }
     return count;
+}
+
+void MasterService::ResetCandidateBackoffsForTesting() {
+    const auto epoch = std::chrono::steady_clock::time_point{};
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& [tenant_id, tenant_state] : shard->tenants) {
+            (void)tenant_id;
+            for (auto& [key, candidate] : tenant_state.promotion_candidates) {
+                (void)key;
+                candidate.retry_after = epoch;
+            }
+        }
+    }
 }
 
 size_t MasterService::RunPromotionCandidateRetry(

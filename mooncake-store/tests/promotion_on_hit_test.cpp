@@ -2299,8 +2299,10 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
     const int64_t expired_pre = mm.get_promotion_candidate_expired_evaluated();
 
     // Drive retries; each scan increments retry_count until exhausted.
-    // Run more scans than kPromotionCandidateMaxRetries (8) to be sure.
+    // Reset backoff timestamps before each scan so wall-clock time doesn't
+    // gate retries and the loop completes without sleeping.
     for (int i = 0; i <= 10; ++i) {
+        service->ResetCandidateBackoffsForTesting();
         service->RunPromotionCandidateRetryForTesting();
     }
 
@@ -2327,6 +2329,9 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_rm", 1024,
                                        seg.segment_name));
 
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_candidate_admitted();
+
     // Record candidate.
     {
         auto r = service->GetReplicaList("k_rm", "default");
@@ -2342,8 +2347,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
     service->RunPromotionCandidateRetryForTesting();
     EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u);
 
-    auto& mm = MasterMetricManager::instance();
-    EXPECT_EQ(mm.get_promotion_candidate_admitted(), 0);
+    EXPECT_EQ(mm.get_promotion_candidate_admitted() - admitted_pre, 0);
 
     service->RemoveAll();
 }
@@ -2414,6 +2418,9 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
     EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u);
     EXPECT_EQ(
         service->promotion_candidate_count_.load(std::memory_order_relaxed),
+        0u);
+    EXPECT_EQ(
+        service->promotion_in_flight_.load(std::memory_order_relaxed),
         0u);
 
     service->RemoveAll();

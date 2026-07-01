@@ -1560,6 +1560,7 @@ class MasterService {
     size_t RunPromotionCandidateRetry();
     size_t RunPromotionCandidateRetryForTesting();
     size_t CountCandidatesForTesting(const std::string& tenant_id);
+    void ResetCandidateBackoffsForTesting();
 
     // Erase any in-flight PromotionTask for `key`, abort any staged promotion
     // quota reservation, and decrement the cluster-wide in-flight counter. Safe
