@@ -4807,10 +4807,9 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    auto& tenant_state = accessor.GetTenantState();
     if (enable_ha_ && oplog_store_) {
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::REMOVE, tenant_id, key, {});
+            OpType::REMOVE, object_id.tenant_id, key, {});
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -4975,6 +4974,14 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                 !tenant_state.replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
+                if (enable_ha_ && oplog_store_) {
+                    auto err = PersistRemoveForHA("RemoveAll(tenant)",
+                                                  normalized_tenant, it->first);
+                    if (!err) {
+                        ++it;
+                        continue;
+                    }
+                }
                 total_freed_size += it->second.size * mem_rep_count;
                 it = EraseMetadata(tenant_state, it, normalized_tenant,
                                    QuotaEraseMode::kFull, &shard);
