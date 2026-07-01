@@ -49,7 +49,49 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
         }                                                      \
     }
 
-#else  // !MOONCAKE_EP_USE_MUSA
+#elif defined(MOONCAKE_EP_USE_MACA)
+
+// -- FP8 types ---------------------------------------------------------------
+// MetaX C500 does not support the FP8 EP path.  The dispatch<true> template is
+// still compiled because the host selects the kernel through a runtime bool, so
+// provide storage stubs and reject actual FP8 use in the host/Python wrappers.
+#include <cstdint>
+using ep_fp8_storage_t = uint8_t;
+using ep_fp8x2_storage_t = uint16_t;
+#if defined(__CUDACC__) || defined(__MCC__)
+__device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2) {
+    return 0;
+}
+#endif
+
+// -- Device intrinsics -------------------------------------------------------
+#ifndef __activemask
+#define __activemask() (0xffffffff)
+#endif
+
+#if defined(__CUDACC__) || defined(__MCC__)
+__forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
+#endif
+
+// -- Kernel launch (MACA: no cooperative launch) -----------------------------
+#define EP_LAUNCH_BOUNDS(max_threads, min_blocks)
+
+#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
+    dim3 _grid(num_sms);                                  \
+    dim3 _block(num_threads);                             \
+    cudaStream_t _stream = stream
+
+#define LAUNCH_KERNEL(config, kernel, ...)                     \
+    kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__);        \
+    {                                                          \
+        auto _err = cudaGetLastError();                        \
+        if (_err != cudaSuccess) {                             \
+            fprintf(stderr, "[EP] kernel launch failed: %s\n", \
+                    cudaGetErrorString(_err));                 \
+        }                                                      \
+    }
+
+#else  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
 
 // -- FP8 types (CUDA native names) -------------------------------------------
 #include <cuda_fp8.h>
@@ -86,7 +128,9 @@ __forceinline__ __device__ int get_lane_id() {
 #define LAUNCH_KERNEL(config, kernel, ...) \
     CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
 
-#endif  // MOONCAKE_EP_USE_MUSA
+#endif  // MOONCAKE_EP_USE_MUSA / MOONCAKE_EP_USE_MACA
 
 // Both platforms need IB verbs
+#ifndef MOONCAKE_EP_USE_MACA
 #include <infiniband/mlx5dv.h>
+#endif

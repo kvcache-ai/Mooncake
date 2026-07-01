@@ -14,7 +14,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -182,8 +182,10 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         exported_data = new char[total_length];
         if (!exported_data) return pybind11::none();
 
-        if (!mooncake::gpu_staging::CopyToHost(
-                exported_data, buffer_handle->ptr(), total_length)) {
+        if (!mooncake::device::GetAcceleratorRegistry()
+                 .RuntimeAccelerators()
+                 .CopyToHost(exported_data, buffer_handle->ptr(),
+                             total_length)) {
             LOG(ERROR) << "Failed to copy buffer to host memory";
             delete[] exported_data;
             return pybind11::none();
@@ -484,13 +486,15 @@ class MooncakeStorePyWrapper {
             }
 
             py::gil_scoped_acquire acquire_gil;
-            int device_id = -1;
-            if (mooncake::gpu_staging::IsDevicePointer(buffer_handle->ptr(),
-                                                       &device_id)) {
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+            if (runtime_accelerator.FindDeviceForPointer(
+                    buffer_handle->ptr())) {
                 std::string host_buf(buffer_handle->size(), '\0');
-                if (!mooncake::gpu_staging::CopyToHost(host_buf.data(),
-                                                       buffer_handle->ptr(),
-                                                       buffer_handle->size())) {
+                if (!runtime_accelerator.CopyToHost(host_buf.data(),
+                                                    buffer_handle->ptr(),
+                                                    buffer_handle->size())) {
                     LOG(ERROR) << "Failed to copy buffer to host memory";
                     return pybind11::none();
                 }
@@ -522,17 +526,20 @@ class MooncakeStorePyWrapper {
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
 
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+
             for (const auto &data : batch_data) {
                 if (!data) {
                     results.emplace_back(kNullString);
                     continue;
                 }
-                int device_id = -1;
-                if (mooncake::gpu_staging::IsDevicePointer(data->ptr(),
-                                                           &device_id)) {
+                if (runtime_accelerator.FindDeviceForPointer(data->ptr())) {
                     std::string host_buf(data->size(), '\0');
-                    if (!mooncake::gpu_staging::CopyToHost(
-                            host_buf.data(), data->ptr(), data->size())) {
+                    if (!runtime_accelerator.CopyToHost(host_buf.data(),
+                                                        data->ptr(),
+                                                        data->size())) {
                         LOG(ERROR) << "Failed to copy buffer to host memory";
                         results.emplace_back(kNullString);
                         continue;

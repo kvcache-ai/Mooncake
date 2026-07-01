@@ -84,6 +84,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaMemcpyDefault musaMemcpyDefault
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#define cudaMemcpyKind musaMemcpyKind
 #define cudaMemset musaMemset
 #define cudaMemsetAsync musaMemsetAsync
 #define cudaMemoryTypeDevice musaMemoryTypeDevice

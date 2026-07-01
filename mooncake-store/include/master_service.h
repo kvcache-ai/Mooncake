@@ -28,6 +28,7 @@
 #include "mutex.h"
 #include "segment.h"
 #include "tenant_quota.h"
+#include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
@@ -66,9 +67,15 @@ class MasterServiceTenantQuotaTest;
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
- * 2. metadata_shards_[shard_idx_].mutex
- * 3. tenant_quota_shards_[shard_idx_].mutex
- * 4. segment_mutex_
+ * 2. tenant_quota_policy_mutex_
+ * 3. snapshot_mutex_
+ * 4. metadata_shards_[shard_idx_].mutex
+ * 5. tenant_quota_shards_[shard_idx_].mutex
+ * 6. segment_mutex_
+ *
+ * Strict tenant admission and policy mutation paths that need both
+ * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
+ * policy mutex first, then snapshot_mutex_.
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
@@ -98,10 +105,8 @@ class MasterService {
         const std::string& tenant_id) const;
     tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
         const std::string& tenant_id, uint64_t requested_quota_bytes);
-    std::optional<TenantQuotaSnapshot> DeleteTenantQuotaPolicy(
-        const std::string& tenant_id);
-    uint64_t GetDefaultTenantQuotaPolicy() const;
-    void SetDefaultTenantQuotaPolicy(uint64_t requested_quota_bytes);
+    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+    DeleteTenantQuotaPolicy(const std::string& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
     /**
@@ -352,7 +357,7 @@ class MasterService {
      */
     auto AddReplica(const UUID& client_id, const std::string& key,
                     const std::string& tenant_id, Replica& replica)
-        -> tl::expected<void, ErrorCode>;
+        -> tl::expected<bool, ErrorCode>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -1157,6 +1162,7 @@ class MasterService {
         } type;
         ReplicaID source_id;
         std::vector<ReplicaID> replica_ids;
+        uint64_t reserved_quota_charge_bytes{0};
     };
 
     struct OffloadingTask {
@@ -1335,6 +1341,15 @@ class MasterService {
                                              const std::string& tenant_id) {
         return {NormalizeTenantId(tenant_id), user_key};
     }
+    std::string NormalizeRequestTenantId(const std::string& tenant_id) const;
+    ObjectIdentity MakeObjectIdentityForRequest(
+        const std::string& user_key, const std::string& tenant_id) const;
+    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWrite(
+        const std::string& tenant_id) const;
+    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWriteLocked(
+        const std::string& tenant_id) const;
+    bool IsTenantRegistered(const std::string& tenant_id) const;
+    bool TenantHasObjects(const std::string& tenant_id) const;
 
     static std::string MakeTenantScopedKey(const std::string& tenant_id,
                                            const std::string& key) {
@@ -1394,6 +1409,8 @@ class MasterService {
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
+    bool ShouldProtectZeroChargeMetadataCreate(
+        uint64_t requested_quota_charge) const;
     uint64_t ComputeTenantQuotaDeficit(const std::string& tenant_id,
                                        uint64_t incoming_quota_charge);
     tl::expected<void, ErrorCode> ReserveTenantQuota(
@@ -1403,9 +1420,18 @@ class MasterService {
     void ReleaseTenantQuota(const std::string& tenant_id, uint64_t bytes);
     void ReleaseTenantQuotaPartial(const std::string& tenant_id,
                                    uint64_t bytes);
+    void CommitAdditionalTenantQuota(const std::string& tenant_id,
+                                     uint64_t bytes);
+    void AbortReplicationTaskQuota(const std::string& tenant_id,
+                                   const ReplicationTask& task);
+    void IncrementTenantMetadataObjectCount(const std::string& tenant_id);
+    void DecrementTenantMetadataObjectCount(const std::string& tenant_id);
     void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
+    void LoadTenantQuotaPoliciesFromStoreOrThrow();
+    void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
+    TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
     uint64_t GetTenantQuotaCapacityBytes();
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
@@ -1676,6 +1702,10 @@ class MasterService {
                     enable_soft_pin, enable_hard_pin, data_type, group_id,
                     object_id_.tenant_id, object_id_.user_key));
             it_ = result.first;
+            if (result.second) {
+                service_->IncrementTenantMetadataObjectCount(
+                    object_id_.tenant_id);
+            }
         }
 
        private:
@@ -1756,20 +1786,6 @@ class MasterService {
         // Deserialize discarded replicas
         tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
             const msgpack::object& obj);
-    };
-
-    class TenantQuotaPolicySerializer {
-       public:
-        TenantQuotaPolicySerializer(MasterService* service)
-            : service_(service) {}
-
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
-        tl::expected<void, SerializationError> Deserialize(
-            const std::vector<uint8_t>& data);
-        void Reset();
-
-       private:
-        MasterService* service_;
     };
 
     friend class MetadataAccessor;
@@ -1925,13 +1941,11 @@ class MasterService {
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
-    const bool enable_tenant_quota_;
-    // Startup default used when restoring legacy snapshots without
-    // tenant_quota_policy.
-    const uint64_t configured_default_tenant_quota_bytes_;
-    // Runtime default policy, mutable through the tenant quota admin API.
-    std::atomic<uint64_t> default_tenant_quota_bytes_;
-    const uint64_t tenant_quota_pool_capacity_bytes_;
+    const bool enable_multi_tenants_;
+    const std::string tenant_quota_connector_type_;
+    const std::string tenant_quota_connector_uri_;
+    std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
+    mutable std::mutex tenant_quota_policy_mutex_;
     mutable std::mutex tenant_quota_recompute_mutex_;
 
     // HTTP metadata server pointer for cleanup on client timeout

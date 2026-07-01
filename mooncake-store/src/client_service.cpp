@@ -24,6 +24,8 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <utility>
+#include <vector>
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
@@ -37,13 +39,9 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 
 namespace mooncake {
-
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
 
 namespace {
 
@@ -3364,23 +3362,21 @@ void Client::PutToLocalFile(const std::string& key,
     // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
 
     for (const auto& slice : slices) {
-        int device_id = -1;
-        if (IsDevicePointer(slice.ptr, &device_id)) {
-            SetDevice(device_id);
-#if defined(USE_SUNRISE)
-            std::vector<char> pageable_buf(slice.size);
-            if (!CopyDeviceToHost(pageable_buf.data(), slice.ptr, slice.size)) {
-#else
+        device::PointerInfo info{};
+        auto* device =
+            runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+        if (device) {
+            device->SetContext(info.device_id);
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
-#endif
+            if (!device->Copy(buf.data, slice.ptr, slice.size,
+                              device::CopyDirection::kDeviceToHost)) {
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
-#if !defined(USE_SUNRISE)
-                pinned_buffer_pool_->Release(buf);
-#endif
+                pinned_buffer_pool_->Release(std::move(buf));
                 // Must revoke to avoid phantom replica in master
                 auto revoke_result =
                     master_client_.PutRevoke(key, ReplicaType::DISK);
@@ -3390,12 +3386,8 @@ void Client::PutToLocalFile(const std::string& key,
                 }
                 return;
             }
-#if defined(USE_SUNRISE)
-            value.append(pageable_buf.data(), slice.size);
-#else
             value.append(buf.data, slice.size);
-            pinned_buffer_pool_->Release(buf);
-#endif
+            pinned_buffer_pool_->Release(std::move(buf));
         } else {
             value.append(static_cast<char*>(slice.ptr), slice.size);
         }

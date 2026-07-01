@@ -29,7 +29,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
@@ -268,18 +268,11 @@ void fill_ranged_read_results_with_error(
 // tl::expected<int64_t, ErrorCode>.
 inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     void *dst, const void *src, size_t size, const std::string &context) {
-    int device_id = -1;
-    if (gpu_staging::IsDevicePointer(dst, &device_id)) {
-        gpu_staging::SetDevice(device_id);
-        if (!gpu_staging::CopyHostToDevice(dst, src, size)) {
-            LOG(ERROR) << "H2D copy failed: " << context;
-            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
-        }
-    } else if (gpu_staging::IsHostPointer(dst)) {
-        memcpy(dst, src, size);
-    } else {
-        LOG(ERROR) << "Unknown memory type for dst buffer: " << context;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyFromHost(dst, src, size)) {
+        LOG(ERROR) << "H2D copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
     return {};
 }
@@ -2629,8 +2622,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // MEMORY / DISK: use client_->Get.  FilterQueryResult ensures
     // Client::Get's internal FindFirstCompleteReplica can only see
     // the replica we selected, preventing accidental LOCAL_DISK picks.
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
     if (replica.is_disk_replica() &&
-        gpu_staging::IsDevicePointer(buffer_handle->ptr(), nullptr)) {
+        runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
         LOG(WARNING) << "DISK replica for key '" << key
                      << "' received a device pointer from the allocator; "
                      << "file I/O cannot write to GPU memory — read will fail. "
@@ -2935,8 +2930,10 @@ RealClient::batch_get_buffer_internal(
         // DISK replicas use storage_backend::vector_read (file I/O) which
         // can only write to CPU-addressable memory.  If the allocator ever
         // returns device memory for DISK, the read will silently fail.
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
         if (replica.is_disk_replica() &&
-            gpu_staging::IsDevicePointer(buffer_handle->ptr(), nullptr)) {
+            runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << "DISK replica for key '" << key
                 << "' received a device pointer from the allocator; "
