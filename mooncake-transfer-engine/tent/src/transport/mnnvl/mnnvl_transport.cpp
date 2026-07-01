@@ -172,6 +172,17 @@ static int detectDeviceFromPointer(void *ptr) {
     return -1;
 }
 
+// Helper to look up registered device ID for a pointer
+int MnnvlTransport::getRegisteredDeviceId(void *ptr) const {
+    if (!ptr) return -1;
+    std::lock_guard<std::mutex> lock(registered_memory_mutex_);
+    auto it = registered_memory_gpu_id_.find(ptr);
+    if (it != registered_memory_gpu_id_.end()) {
+        return it->second;
+    }
+    return -1;
+}
+
 Status MnnvlTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
@@ -180,9 +191,18 @@ Status MnnvlTransport::submitTransferTasks(
 
     if (!mnnvl_batch->async_stream.get()) {
         int device_id = -1;
+        // Use registered device ID instead of inferring from pointers
         for (auto &req : request_list) {
-            device_id = detectDeviceFromPointer(req.source);
+            device_id = getRegisteredDeviceId(req.source);
             if (device_id >= 0) break;
+        }
+        // Fallback to pointer detection if not registered (backward
+        // compatibility)
+        if (device_id < 0) {
+            for (auto &req : request_list) {
+                device_id = detectDeviceFromPointer(req.source);
+                if (device_id >= 0) break;
+            }
         }
         if (device_id < 0) cudaGetDevice(&device_id);
         CHECK_STATUS(
@@ -335,6 +355,11 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
             CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
                                         cudaHostRegisterDefault));
         }
+        // Store CPU buffers with device ID -1
+        {
+            std::lock_guard<std::mutex> lock(registered_memory_mutex_);
+            registered_memory_gpu_id_[reinterpret_cast<void *>(desc.addr)] = -1;
+        }
         return Status::OK();
     } else if (location.type() != "cuda")
         return Status::InvalidArgument(
@@ -382,6 +407,12 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     desc.addr = (uint64_t)real_addr;
     desc.length = real_size;
 
+    // Capture GPU device ID from BufferDesc.location at registration time
+    {
+        std::lock_guard<std::mutex> lock(registered_memory_mutex_);
+        registered_memory_gpu_id_[real_addr] = location.index();
+    }
+
     desc.transports.push_back(TransportType::MNNVL);
     return Status::OK();
 }
@@ -391,6 +422,11 @@ Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
     LocationParser location(desc.location);
     if (location.type() == "cpu" && host_register_) {
         CHECK_CUDA(cudaHostUnregister((void *)desc.addr));
+    }
+    // Remove the buffer from the registered memory map
+    {
+        std::lock_guard<std::mutex> lock(registered_memory_mutex_);
+        registered_memory_gpu_id_.erase(reinterpret_cast<void *>(desc.addr));
     }
     return Status::OK();
 }

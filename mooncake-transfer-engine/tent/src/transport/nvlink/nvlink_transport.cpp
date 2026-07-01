@@ -66,6 +66,17 @@ int detectDeviceFromPointer(void* ptr) {
 
 }  // namespace
 
+// Helper to look up registered device ID for a pointer
+int NVLinkTransport::getRegisteredDeviceId(void* ptr) const {
+    if (!ptr) return -1;
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    auto it = registered_memory_gpu_id_.find(ptr);
+    if (it != registered_memory_gpu_id_.end()) {
+        return it->second;
+    }
+    return -1;
+}
+
 NVLinkTransport::NVLinkTransport() : installed_(false) {}
 
 NVLinkTransport::~NVLinkTransport() { uninstall(); }
@@ -141,9 +152,18 @@ Status NVLinkTransport::submitTransferTasks(
 
     if (!shm_batch->async_stream.get()) {
         int device_id = -1;
+        // Use registered device ID instead of inferring from pointers
         for (auto& req : request_list) {
-            device_id = detectDeviceFromPointer(req.source);
+            device_id = getRegisteredDeviceId(req.source);
             if (device_id >= 0) break;
+        }
+        // Fallback to pointer detection if not registered (backward
+        // compatibility)
+        if (device_id < 0) {
+            for (auto& req : request_list) {
+                device_id = detectDeviceFromPointer(req.source);
+                if (device_id >= 0) break;
+            }
         }
         if (device_id < 0) cudaGetDevice(&device_id);
         CHECK_STATUS(
@@ -361,12 +381,20 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
             registered_base_addrs_.insert((uint64_t)base_ptr);
+            // Capture GPU device ID from BufferDesc.location at registration
+            // time
+            registered_memory_gpu_id_[(void*)base_ptr] = location.index();
         }
     } else if (location.type() == "cpu" ||
                location.type() == kWildcardLocation) {
         if (host_register_)
             CHECK_CUDA(cudaHostRegister(((void*)desc.addr), desc.length,
                                         cudaHostRegisterDefault));
+        // Store CPU buffers with device ID -1
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            registered_memory_gpu_id_[reinterpret_cast<void*>(desc.addr)] = -1;
+        }
     } else
         return Status::InvalidArgument(
             "Unrecognized location - neither cpu or cuda: " + location.type());
@@ -401,9 +429,16 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
             registered_base_addrs_.erase(key);
+            // Remove the buffer from the registered memory map
+            registered_memory_gpu_id_.erase((void*)key);
         }
     } else if (location.type() == "cpu" && host_register_) {
         CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
+        // Remove CPU buffer from the registered memory map
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            registered_memory_gpu_id_.erase((void*)desc.addr);
+        }
     }
     desc.shm_path.clear();
     return Status::OK();
