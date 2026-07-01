@@ -4382,6 +4382,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
+    int64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
 
@@ -4444,12 +4445,14 @@ long MasterService::RemoveAll(bool force) {
 
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
+            << ", total_freed_size=" << total_freed_size
             << ", signaled_clients=" << clients_with_disk_replicas.size();
     return removed_count;
 }
 
 long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     long removed_count = 0;
+    int64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
