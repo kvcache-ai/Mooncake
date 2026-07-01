@@ -4382,10 +4382,25 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
-    uint64_t total_freed_size = 0;
+    int64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
 
+    // Since RemoveAll clears everything, signal ALL clients with a
+    // LocalDiskSegment to physically clear their SSD immediately.
+    // This lets client cleanup overlap with master metadata deletion.
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        for (auto& [client_id, segment] : client_local_disk_segment) {
+            MutexLocker locker(&segment->offloading_mutex_);
+            segment->pending_remove_all = true;
+        }
+    }
+
+    // Delete metadata — runs concurrently with client SSD cleanup.
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         for (auto tenant_it = shard->tenants.begin();
@@ -4399,6 +4414,8 @@ long MasterService::RemoveAll(bool force) {
                     auto mem_rep_count = it->second.CountReplicas(
                         &Replica::fn_is_memory_replica);
                     total_freed_size += it->second.size * mem_rep_count;
+                    ErasePromotionTaskIfPresent(tenant_state, it->first,
+                                                tenant_it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
                                        QuotaEraseMode::kFull, &shard);
                     removed_count++;
@@ -4422,12 +4439,22 @@ long MasterService::RemoveAll(bool force) {
 
 long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     long removed_count = 0;
-    uint64_t total_freed_size = 0;
-    // Store the current time to avoid repeatedly
-    // calling std::chrono::steady_clock::now()
+    int64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+
+    // Signal ALL clients to clear their SSD — overlaps with metadata deletion.
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        for (auto& [client_id, segment] : client_local_disk_segment) {
+            MutexLocker locker(&segment->offloading_mutex_);
+            segment->pending_remove_all = true;
+        }
+    }
 
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
@@ -4444,6 +4471,8 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                ErasePromotionTaskIfPresent(tenant_state, it->first,
+                                            normalized_tenant);
                 it = EraseMetadata(tenant_state, it, normalized_tenant,
                                    QuotaEraseMode::kFull, &shard);
                 removed_count++;
@@ -4701,12 +4730,12 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
+    std::vector<OffloadTaskItem> result;
     std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;
     {
         MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
         local_disk_segment_it->second->enable_offloading = enable_offloading;
         if (enable_offloading) {
-            std::vector<OffloadTaskItem> result;
             result.reserve(
                 local_disk_segment_it->second->offloading_objects.size());
             for (const auto& [_, task] :
@@ -4727,6 +4756,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         // MetadataAccessorRW.
         offloading_objects_copy =
             std::move(local_disk_segment_it->second->offloading_objects);
+        // Drain pending_remove_all when offloading is disabled.
+        local_disk_segment_it->second->pending_remove_all = false;
     }
 
     for (auto& [_, task] : offloading_objects_copy) {
@@ -4746,7 +4777,27 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             }
         }
     }
-    return {};
+    return result;
+}
+
+auto MasterService::PollRemoveAll(const UUID& client_id)
+    -> tl::expected<bool, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    bool result;
+    {
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        result = local_disk_segment_it->second->pending_remove_all;
+        local_disk_segment_it->second->pending_remove_all = false;
+    }
+    return result;
 }
 
 auto MasterService::ReportSsdCapacity(const UUID& client_id,

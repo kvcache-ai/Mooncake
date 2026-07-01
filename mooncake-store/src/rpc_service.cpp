@@ -1156,6 +1156,16 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
+    const UUID& client_id) {
+    ScopedVLogTimer timer(1, "PollRemoveAll");
+    timer.LogRequest("client_id=", client_id);
+    auto result = master_service_.PollRemoveAll(client_id);
+    timer.LogResponse("should_remove_all=",
+                      result.has_value() ? result.value() : false);
+    return result;
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
     const UUID& client_id, int64_t ssd_total_capacity_bytes) {
     ScopedVLogTimer timer(1, "ReportSsdCapacity");
@@ -1367,6 +1377,8 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
         &wrapped_master_service);

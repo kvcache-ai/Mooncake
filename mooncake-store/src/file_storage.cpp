@@ -701,10 +701,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
+    // === STEP 2: Poll whether master requested a full SSD clear ===
+    auto remove_all_result = client_->PollRemoveAll();
+    if (remove_all_result && remove_all_result.value()) {
+        RemoveAll();
+    }
+
     if (offloading_objects.empty()) {
         return {};
     }
-    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
         LOG(ERROR) << "Failed to persist objects with error: "
@@ -723,6 +729,43 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
     return {};
+}
+
+void FileStorage::RemoveAll() {
+    namespace fs = std::filesystem;
+
+    // 1. Drain in-memory metadata via storage_backend_ so that
+    //    concurrent readers/writers can no longer reference stale entries.
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+
+    // 2. Unconditionally wipe all files under the storage directory.
+    //    This guarantees physical cleanup even if the in-memory map was
+    //    empty (e.g. after a crash or partial ScanMeta).
+    //    Use manual increment with error_code to avoid throwing
+    //    filesystem_error from operator++ in range-for.
+    const auto& storage_dir = config_.storage_filepath;
+    std::error_code ec;
+    if (fs::exists(storage_dir, ec) && !ec) {
+        for (auto it = fs::directory_iterator(storage_dir, ec);
+             it != fs::directory_iterator(); it.increment(ec)) {
+            if (ec) {
+                LOG(WARNING) << "RemoveAll: directory iteration failed: "
+                             << ec.message();
+                break;
+            }
+            const auto& entry = *it;
+            std::error_code remove_ec;
+            fs::remove_all(entry.path(), remove_ec);
+            if (remove_ec &&
+                remove_ec != std::errc::no_such_file_or_directory) {
+                LOG(WARNING) << "RemoveAll: failed to remove " << entry.path()
+                             << ", error: " << remove_ec.message();
+            }
+        }
+    }
+    LOG(INFO) << "FileStorage::RemoveAll: cleaned directory " << storage_dir;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
