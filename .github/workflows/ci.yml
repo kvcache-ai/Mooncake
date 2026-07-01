@@ -31,6 +31,7 @@ jobs:
         python-version: ['3.10', '3.12']
     env:
       CI: "true"
+      PIP_NO_CACHE_DIR: "1"
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -229,12 +230,15 @@ jobs:
 
         echo "=== Processing coverage data ==="
         lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
-
-        echo "=== Generating HTML report ==="
-        genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
+        rm -f coverage.info
 
         echo "=== Coverage summary ==="
-        lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
+        lcov --summary coverage.filtered.info 2>&1 || echo "lcov summary failed"
+
+        echo "=== Removing coverage intermediates ==="
+        find . -name "*.gcda" -delete
+        find . -name "*.gcno" -delete
+        df -h
 
         echo "=== Coverage report generation completed ==="
       shell: bash
@@ -428,6 +432,10 @@ jobs:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
         python-version: ['3.10', '3.12']
     runs-on: ${{ matrix.ubuntu-version }}
+    env:
+      PIP_NO_CACHE_DIR: "1"
+      MOONCAKE_TEST_TORCH_SPEC: "torch==2.11.0+cu128"
+      MOONCAKE_TEST_TORCH_INDEX_URL: "https://download.pytorch.org/whl/cu128"
     steps:
     - uses: actions/checkout@v4
       with:

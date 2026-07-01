@@ -341,6 +341,18 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
+        if (!endpoint->readyToSend()) {
+            if (endpoint->readyAckTimedOut()) {
+                LOG(ERROR) << "Worker: Timed out waiting for RDMA ready ACK "
+                           << "for endpoint: " << entry.first
+                           << ", deleting endpoint";
+                handlePathFailure(entry.first, endpoint.get());
+                for (auto &slice : entry.second)
+                    failed_slice_list.push_back(slice);
+                entry.second.clear();
+            }
+            continue;
+        }
         // Set endpoint pointer for each slice before submitting
         for (auto &slice : entry.second) {
             slice->rdma.endpoint = endpoint.get();
