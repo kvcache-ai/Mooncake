@@ -6712,6 +6712,25 @@ ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
     return snapshot_catalog_store_.get();
 }
 
+void MasterService::ObserveEvictedAges(
+    std::chrono::system_clock::time_point now,
+    std::chrono::system_clock::time_point lease_timeout,
+    std::chrono::system_clock::time_point put_start_time) const {
+    // Eviction requires the lease to be expired (now >= lease_timeout), so on
+    // the instrumented paths idle age is >= default_kv_lease_ttl_. Clamp at 0
+    // defensively in case a forced/edge path ever observes a fresh key.
+    int64_t idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - lease_timeout)
+                          .count() +
+                      static_cast<int64_t>(default_kv_lease_ttl_);
+    int64_t abs_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         now - put_start_time)
+                         .count();
+    auto& m = MasterMetricManager::instance();
+    m.observe_evicted_idle_age_ms(std::max<int64_t>(0, idle_ms));
+    m.observe_evicted_absolute_age_ms(std::max<int64_t>(0, abs_ms));
+}
+
 MasterService::TenantQuotaEvictionResult
 MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                                          uint64_t target_bytes) {
@@ -6811,12 +6830,16 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
 
     auto try_evict_group_or_object =
         [&, this](const std::string& key, ObjectMetadata& metadata,
-                  TenantState& tenant_state,
+                  MetadataShardAccessorRW& shard, TenantState& tenant_state,
                   std::vector<std::vector<Replica>>& deferred_replicas,
                   bool allow_soft_pinned) -> TenantQuotaEvictionResult {
         if (!metadata.IsGrouped()) {
             uint64_t freed = try_evict_or_offload(key, metadata, tenant_state,
                                                   deferred_replicas);
+            if (freed > 0) {
+                ObserveEvictedAges(now, metadata.lease_timeout,
+                                   metadata.put_start_time);
+            }
             return {.freed_bytes = freed,
                     .evicted_objects = freed > 0 ? 1U : 0U};
         }
@@ -6825,6 +6848,10 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
         if (group_it == tenant_state.group_members.end()) {
             uint64_t freed = try_evict_or_offload(key, metadata, tenant_state,
                                                   deferred_replicas);
+            if (freed > 0) {
+                ObserveEvictedAges(now, metadata.lease_timeout,
+                                   metadata.put_start_time);
+            }
             return {.freed_bytes = freed,
                     .evicted_objects = freed > 0 ? 1U : 0U};
         }
@@ -6858,9 +6885,12 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
             result.freed_bytes += freed;
             if (freed > 0) {
                 ++result.evicted_objects;
+                ObserveEvictedAges(now, member_metadata.lease_timeout,
+                                   member_metadata.put_start_time);
             }
             if (member_key != key && !member_metadata.IsValid()) {
-                EraseMetadata(tenant_state, member_it, normalized_tenant);
+                EraseMetadata(tenant_state, member_it, normalized_tenant,
+                              QuotaEraseMode::kFull, &shard);
             }
         }
         return result;
@@ -6893,12 +6923,13 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                     }
 
                     auto evict_result = try_evict_group_or_object(
-                        it->first, metadata, tenant_state, deferred_replicas,
-                        allow_soft_pinned);
+                        it->first, metadata, shard, tenant_state,
+                        deferred_replicas, allow_soft_pinned);
                     total.freed_bytes += evict_result.freed_bytes;
                     total.evicted_objects += evict_result.evicted_objects;
                     if (!metadata.IsValid()) {
-                        it = EraseMetadata(tenant_state, it, normalized_tenant);
+                        it = EraseMetadata(tenant_state, it, normalized_tenant,
+                                           QuotaEraseMode::kFull, &shard);
                     } else {
                         ++it;
                     }
@@ -7075,6 +7106,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (!metadata.IsGrouped()) {
             uint64_t freed = try_evict_or_offload(
                 tenant_id, key, metadata, tenant_state, deferred_replicas);
+            if (freed > 0) {
+                ObserveEvictedAges(now, metadata.lease_timeout,
+                                   metadata.put_start_time);
+            }
             return {.freed_bytes = freed, .evicted_objects = freed > 0 ? 1 : 0};
         }
 
@@ -7082,6 +7117,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (group_it == tenant_state.group_members.end()) {
             uint64_t freed = try_evict_or_offload(
                 tenant_id, key, metadata, tenant_state, deferred_replicas);
+            if (freed > 0) {
+                ObserveEvictedAges(now, metadata.lease_timeout,
+                                   metadata.put_start_time);
+            }
             return {.freed_bytes = freed, .evicted_objects = freed > 0 ? 1 : 0};
         }
 
@@ -7115,6 +7154,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             result.freed_bytes += freed;
             if (freed > 0) {
                 result.evicted_objects++;
+                ObserveEvictedAges(now, member_metadata.lease_timeout,
+                                   member_metadata.put_start_time);
             }
             if (member_key != key && !member_metadata.IsValid()) {
                 EraseMetadata(tenant_state, member_it, tenant_id,
@@ -7550,6 +7591,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 }
 
                 total_freed_size += metadata.size * erased;
+                ObserveEvictedAges(now, metadata.lease_timeout,
+                                   metadata.put_start_time);
                 shard_evicted_count++;
                 if (!metadata.IsValid()) {
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
