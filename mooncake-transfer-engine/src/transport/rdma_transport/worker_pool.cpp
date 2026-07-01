@@ -116,6 +116,7 @@ int WorkerPool::submitPostSend(
                            << target_id;
                 return ERR_INVALID_ARGUMENT;
             }
+            recordPeerMetadataVersion(target_id, *segment_desc_map[target_id]);
         }
     }
 #else
@@ -123,9 +124,16 @@ int WorkerPool::submitPostSend(
         segment_desc_map;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id))
+        if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id);
+            if (!segment_desc_map[target_id]) {
+                LOG(ERROR) << "Cannot get target segment description #"
+                           << target_id;
+                return ERR_INVALID_ARGUMENT;
+            }
+            recordPeerMetadataVersion(target_id, *segment_desc_map[target_id]);
+        }
     }
 #endif  // CONFIG_CACHE_SEGMENT_DESC
 
@@ -157,6 +165,7 @@ int WorkerPool::submitPostSend(
                 failed_target_ids[slice->target_id] = getCurrentTimeInNano();
                 continue;
             }
+            recordPeerMetadataVersion(slice->target_id, *peer_segment_desc);
 
             if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
                                  slice->length, context_.deviceName(),
@@ -185,7 +194,7 @@ int WorkerPool::submitPostSend(
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
                 if (alt_dev_id == (size_t)device_id) continue;
                 auto alt_path =
-                    MakeNicPath(peer_segment_desc->name,
+                    MakeNicPath(peer_segment_desc->nicPathServerName(),
                                 peer_segment_desc->devices[alt_dev_id].name);
                 if (isRailAvailable(alt_path)) {
                     device_id = alt_dev_id;
@@ -455,6 +464,10 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id, true);
+            if (segment_desc_map[target_id]) {
+                recordPeerMetadataVersion(target_id,
+                                          *segment_desc_map[target_id]);
+            }
         }
     }
 
@@ -673,6 +686,47 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
         return true;
     }
     return false;
+}
+
+void WorkerPool::clearRailState(
+    const std::vector<std::string> &peer_nic_paths) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    for (const auto &path : peer_nic_paths) rail_states_.erase(path);
+}
+
+std::vector<std::string> WorkerPool::buildPeerNicPaths(
+    const Transport::SegmentDesc &desc) const {
+    std::vector<std::string> paths;
+    paths.reserve(desc.devices.size());
+    for (const auto &device : desc.devices) {
+        paths.push_back(MakeNicPath(desc.nicPathServerName(), device.name));
+    }
+    return paths;
+}
+
+void WorkerPool::recordPeerMetadataVersion(SegmentID segment_id,
+                                           const Transport::SegmentDesc &desc) {
+    auto new_paths = buildPeerNicPaths(desc);
+    std::vector<std::string> stale_paths;
+    {
+        std::lock_guard<std::mutex> lock(target_metadata_lock_);
+        auto &state = target_metadata_[segment_id];
+        if (!state.initialized) {
+            state.initialized = true;
+            state.metadata_version = desc.metadata_version;
+            state.peer_nic_paths = std::move(new_paths);
+            return;
+        }
+        if (state.metadata_version == desc.metadata_version) {
+            state.peer_nic_paths = std::move(new_paths);
+            return;
+        }
+        stale_paths = state.peer_nic_paths;
+        state.metadata_version = desc.metadata_version;
+        state.peer_nic_paths = std::move(new_paths);
+    }
+    for (const auto &path : stale_paths) context_.deleteEndpoint(path);
+    clearRailState(stale_paths);
 }
 
 // Unified retry logic: increment retry count and return whether retry is
