@@ -57,6 +57,9 @@ class P2PClientIntegrationTest : public ::testing::Test {
         google::InitGoogleLogging("P2PClientIntegrationTest");
         FLAGS_logtostderr = 1;
 
+        // Fork ordering: all child processes (master/remote peer) must start
+        // before the first CreateP2PClient()/Init(). Init() spawns background
+        // threads; fork() after that can deadlock/hang the test parent.
         ASSERT_TRUE(master_process_.Start()) << "Failed to start P2P master";
         master_address_ = master_process_.master_address();
         LOG(INFO) << "P2P master started at " << master_address_;

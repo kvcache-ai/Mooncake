@@ -96,6 +96,8 @@ inline bool WaitForReadyStateFile(
     return false;
 }
 
+// Spawns a test child via fork()/execv() (POSIX). Call only before any
+// P2PClientService::Init() in the parent test process.
 class P2PClientChildProcess {
    public:
     P2PClientChildProcess() = default;
@@ -379,6 +381,8 @@ class ScopedP2PMasterProcess {
     std::optional<std::string> state_file_path_;
 };
 
+// Remote peer child process. Must be started in SetUpTestSuite() (or
+// otherwise before the first CreateP2PClient()), never mid-test after Init().
 class ScopedP2PRemotePeerProcess {
    public:
     bool Start(const std::string& master_address,
