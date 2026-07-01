@@ -307,6 +307,28 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(100, 1000), "100");
 }
 
+TEST(DfsGlobalAllocatorTest, AllocateReservesAlignmentPadding) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_alloc_padding");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 8 * 1024, 4096));
+
+    auto desc = alloc.Allocate("key1", 100);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_EQ(desc->aligned_size, 4096);
+    EXPECT_EQ(desc->offset % 4096, 0);
+
+    auto exhausted = alloc.Allocate("key2", 100);
+    EXPECT_FALSE(exhausted.has_value());
+    EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx);
+    auto after_free = alloc.Allocate("key3", 100);
+    EXPECT_TRUE(after_free.has_value());
+}
+
 TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     EnvGuard env;
     ConfigurePosixDfs(env);
@@ -315,7 +337,7 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     TempDir tmp("dfs_exhaust");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 16 * 1024, 4096));
+    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 32 * 1024, 4096));
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {

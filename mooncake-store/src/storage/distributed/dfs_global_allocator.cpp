@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 #include "storage/distributed/fs_adapter.h"
@@ -122,7 +123,7 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
     std::unique_lock handle_lock(shard.handle_mutex);
     ProcessPendingFrees(shard_idx);
 
-    auto handle = shard.allocator->allocate(aligned_size);
+    auto handle = shard.allocator->allocate(aligned_size + alignment_ - 1);
     if (!handle) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 
     uint64_t raw_offset = handle->address();
