@@ -198,22 +198,14 @@ Status MnnvlTransport::submitTransferTasks(
         LocationParser location(buf->location);
         int device_id = location.index();
 
-        // Multi-GPU batch validation: all requests must be from the same device
-        // Current SubBatch architecture (single sync_stream/async_stream pair)
-        // does not support per-device stream management. Multi-GPU batches
-        // would require either:
-        //   1. Grouping + dispatching per-device internally (needs SubBatch
-        //   refactor)
-        //   2. Caller responsibility to split batches by device
-        // For now, reject mixed-GPU batches explicitly rather than silently
-        // using wrong stream.
+        // Capture the first GPU device encountered for stream creation.
+        // Mixed-GPU batches use the first GPU's stream and rely on CUDA P2P
+        // for cross-device access (same behavior as pre-#2569 code).
+        // A future refactor could group requests by device and dispatch to
+        // per-device streams, but that requires SubBatch structure changes.
         if (!device_determined && device_id >= 0) {
             batch_device_id = device_id;
             device_determined = true;
-        } else if (device_id >= 0 && device_id != batch_device_id) {
-            return Status::InvalidArgument(
-                "Multi-GPU batch not supported: requests from different GPU "
-                "devices in the same batch" LOC_MARK);
         }
 
         // Create and populate task
@@ -240,7 +232,11 @@ Status MnnvlTransport::submitTransferTasks(
 
     // Get or create streams for this batch's device
     if (!mnnvl_batch->async_stream.get()) {
-        int stream_device = (batch_device_id >= 0) ? batch_device_id : 0;
+        int stream_device = batch_device_id;
+        if (stream_device < 0) {
+            // CPU-only batch: use current CUDA device
+            cudaGetDevice(&stream_device);
+        }
         CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream,
                                                   stream_device));
         CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream,
