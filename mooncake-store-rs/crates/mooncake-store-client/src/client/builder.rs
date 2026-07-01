@@ -690,11 +690,10 @@ impl StoreClientBuilder {
             &runtime,
             runtime_metadata.clone(),
             live_client_cache.clone(),
-            cold_tier_device_cache.clone(),
+            if refresh_cold_tier_devices { Some(cold_tier_device_cache.clone()) } else { None },
             self.live_client_sync_interval,
             route_namespace.clone(),
             suspect_runtime_cache.clone(),
-            refresh_cold_tier_devices,
         )?;
         let async_eviction = AsyncEvictionHandle::spawn(
             &runtime,

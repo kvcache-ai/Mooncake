@@ -15,11 +15,10 @@ impl MembershipSyncHandle {
         runtime: &ClientRuntimeId,
         metadata: Arc<dyn MetadataBackend>,
         live_client_cache: SharedLiveClientCache,
-        cold_tier_device_cache: SharedColdTierDeviceCache,
+        cold_tier_device_cache: Option<SharedColdTierDeviceCache>,
         interval: Duration,
         namespace: String,
         suspect_runtime_cache: SharedSuspectRuntimeCache,
-        refresh_cold_tier_devices: bool,
     ) -> Result<Self> {
         if interval.is_zero() {
             return Ok(Self::disabled());
@@ -81,10 +80,10 @@ impl MembershipSyncHandle {
                             // Cold-tier device refresh is best-effort and excluded
                             // from the main membership backoff. Skip it entirely
                             // when this runtime has no local backend.
-                            if refresh_cold_tier_devices {
+                            if let Some(ref cache) = cold_tier_device_cache {
                                 if let Err(error) = refresh_cold_tier_device_cache(
                                     metadata.as_ref(),
-                                    &cold_tier_device_cache,
+                                    cache,
                                     "cold_tier_device_snapshot_refresh",
                                 ) {
                                     tracing::warn!(
