@@ -75,6 +75,7 @@ class UdsAcceptor {
     std::string socket_name_;
     Handler handler_;
     int listen_fd_ = -1;
+    std::atomic<int> active_client_fd_{-1};
     std::atomic<bool> running_{false};
     std::jthread thread_;
 };

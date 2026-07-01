@@ -188,7 +188,8 @@ int UdsConnection::sendFd(int fd, void *data, size_t data_len) {
     while (true) {
         ssize_t sent = sendmsg(fd_, &msg, 0);
         if (sent < 0 && errno == EINTR) continue;
-        return sent < 0 ? -1 : 0;
+        if (sent < 0) return -1;
+        return sent == static_cast<ssize_t>(data_len) ? 0 : -1;
     }
 }
 
@@ -207,8 +208,9 @@ int UdsConnection::recvFd(void *data, size_t data_len) {
     msg.msg_control = buf;
     msg.msg_controllen = sizeof(buf);
 
+    ssize_t received = 0;
     while (true) {
-        ssize_t received = recvmsg(fd_, &msg, 0);
+        received = recvmsg(fd_, &msg, 0);
         if (received < 0 && errno == EINTR) continue;
         if (received <= 0) return -1;
         break;
@@ -219,6 +221,13 @@ int UdsConnection::recvFd(void *data, size_t data_len) {
         cmsg->cmsg_type == SCM_RIGHTS) {
         int received_fd = -1;
         memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+        // Even for malformed messages, close any delivered fd instead of
+        // leaking it into this process.
+        if (received != static_cast<ssize_t>(data_len) ||
+            (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+            ::close(received_fd);
+            return -1;
+        }
         return received_fd;
     }
     return -1;
@@ -288,6 +297,11 @@ tl::expected<void, std::string> UdsAcceptor::start() {
 void UdsAcceptor::stop() {
     if (!running_.exchange(false)) return;
     wakeAccept();
+    int active_client_fd = active_client_fd_.load();
+    if (active_client_fd >= 0) {
+        // Stop should unblock handlers waiting on either read or write.
+        ::shutdown(active_client_fd, SHUT_RDWR);
+    }
     if (thread_.joinable()) thread_.join();
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
@@ -308,7 +322,9 @@ void UdsAcceptor::acceptLoop() {
         UdsConnection connection(client_sock);
         if (!running_.load()) break;
 
+        active_client_fd_ = connection.fd();
         if (handler_) handler_(connection);
+        active_client_fd_ = -1;
     }
 
     if (listen_fd_ >= 0) {

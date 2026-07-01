@@ -109,6 +109,44 @@ TEST(UdsTransportTest, SendsFdFromClientToServer) {
     EXPECT_TRUE(received.load());
 }
 
+TEST(UdsTransportTest, RejectsFdWithPartialPayload) {
+    int sockets[2] = {-1, -1};
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets), 0);
+
+    UdsConnection receiver(sockets[1]);
+    int fd = createTempFd("partial-payload");
+    ASSERT_GE(fd, 0);
+
+    uint32_t marker = 7;
+    iovec iov;
+    iov.iov_base = &marker;
+    iov.iov_len = sizeof(marker) - 1;
+
+    char control[CMSG_SPACE(sizeof(int))];
+    memset(control, 0, sizeof(control));
+
+    msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    ASSERT_EQ(sendmsg(sockets[0], &msg, 0),
+              static_cast<ssize_t>(sizeof(marker) - 1));
+    close(fd);
+    close(sockets[0]);
+
+    uint32_t received_marker = 0;
+    EXPECT_LT(receiver.recvFd(&received_marker, sizeof(received_marker)), 0);
+}
+
 TEST(UdsTransportTest, SendsFdFromServerToClient) {
     UdsAcceptor acceptor(testSocketPath("server_fd"));
 
@@ -146,6 +184,29 @@ TEST(UdsTransportTest, StopWakesAcceptLoop) {
 
     UdsConnector connector(testSocketPath("stop"));
     EXPECT_FALSE(connector.connect());
+}
+
+TEST(UdsTransportTest, StopWakesActiveClientHandler) {
+    UdsAcceptor acceptor(testSocketPath("active_stop"));
+    std::atomic<bool> entered{false};
+    std::atomic<bool> exited{false};
+
+    acceptor.registerHandler([&](UdsConnection &connection) {
+        entered = true;
+        uint32_t value = 0;
+        EXPECT_EQ(connection.recvRaw(&value, sizeof(value)), -1);
+        exited = true;
+    });
+    auto start_result = acceptor.start();
+    ASSERT_TRUE(start_result) << start_result.error();
+
+    UdsConnector connector(testSocketPath("active_stop"));
+    auto connection_result = connector.connect();
+    ASSERT_TRUE(connection_result) << connection_result.error();
+
+    ASSERT_TRUE(waitForFlag(entered));
+    acceptor.stop();
+    EXPECT_TRUE(exited.load());
 }
 
 TEST(UdsTransportTest, ConnectRejectsNonPositiveTimeout) {
