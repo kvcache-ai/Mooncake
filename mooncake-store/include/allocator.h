@@ -221,6 +221,7 @@ class OffsetBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    ReplicaType getReplicaType() const { return replica_type_; }
 
     /**
      * Returns the actual largest free region from the offset allocator.
