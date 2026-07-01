@@ -265,6 +265,15 @@ DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl | "
     "ssd_free_ratio_first");
+
+// Frequency-aware eviction (CMS-based lease extension)
+DEFINE_bool(disable_frequency_aware_eviction, false,
+            "Disable CMS frequency-aware lease extension during eviction");
+DEFINE_int64(lease_extension_per_access, 30,
+             "Seconds of lease extension per CMS frequency count");
+DEFINE_int64(max_lease_extension_seconds, 7200,
+             "Maximum lease extension in seconds (cap at 2 hours)");
+
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -502,6 +511,18 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
+
+    // Frequency-aware eviction
+    default_config.GetBool("disable_frequency_aware_eviction",
+                           &master_config.disable_frequency_aware_eviction,
+                           FLAGS_disable_frequency_aware_eviction);
+    default_config.GetInt64("lease_extension_per_access",
+                            &master_config.lease_extension_per_access,
+                            FLAGS_lease_extension_per_access);
+    default_config.GetInt64("max_lease_extension_seconds",
+                            &master_config.max_lease_extension_seconds,
+                            FLAGS_max_lease_extension_seconds);
+
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -872,6 +893,26 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
+    }
+    // Frequency-aware eviction
+    if ((google::GetCommandLineFlagInfo("disable_frequency_aware_eviction",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.disable_frequency_aware_eviction =
+            FLAGS_disable_frequency_aware_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo("lease_extension_per_access", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.lease_extension_per_access =
+            FLAGS_lease_extension_per_access;
+    }
+    if ((google::GetCommandLineFlagInfo("max_lease_extension_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_lease_extension_seconds =
+            FLAGS_max_lease_extension_seconds;
     }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
