@@ -8,8 +8,6 @@ namespace mooncake {
 
 namespace {
 
-constexpr int kEpActiveQpsPerRank = 8;
-
 int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce) {
     if (!is_roce) return qps_per_rank;
     return std::min(qps_per_rank, kEpActiveQpsPerRank);
