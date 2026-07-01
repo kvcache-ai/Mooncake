@@ -700,6 +700,15 @@ ErrorCode Client::InitTransferEngine(
             globalConfig().ascend_use_fabric_mem = true;
         }
     }
+    if (protocol == "sunrise_link") {
+        const char* sunrise_use_device_mem_env =
+            std::getenv("SUNRISE_USE_DEVICE_MEM");
+        if (sunrise_use_device_mem_env) {
+            globalConfig().sunrise_use_device_mem = true;
+            LOG(INFO) << "SUNRISE_USE_DEVICE_MEM enabled: segments will be "
+                      << "allocated in device memory via tangMalloc";
+        }
+    }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
@@ -774,7 +783,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem") {
+        } else if (protocol == "ascend" || protocol == "ubshmem" ||
+                   protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";

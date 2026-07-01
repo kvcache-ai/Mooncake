@@ -18,6 +18,9 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/coro_io.hpp>
@@ -787,12 +790,26 @@ class RealClient : public PyClient {
         }
     };
 
+#if defined(USE_SUNRISE)
+    struct SunriseSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                sunrise_free_memory(ptr);
+            }
+        }
+    };
+#endif
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+#if defined(USE_SUNRISE)
+    std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
+        sunrise_segment_ptrs_;
+#endif
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
