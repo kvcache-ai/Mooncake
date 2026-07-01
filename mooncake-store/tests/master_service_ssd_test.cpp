@@ -743,6 +743,39 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsLocalDiskUsageTracking) {
                                   segment1);
 }
 
+// Evicting a LOCAL_DISK replica via EvictDiskReplica must decrement
+// file_cache_nums_ even when the object still has a MEMORY replica (so
+// accessor.Erase() does not run). Without SyncCacheTotalAccounting in the
+// LOCAL_DISK eviction branch, the gauge would stay over-counted.
+TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
+    auto& metrics = MasterMetricManager::instance();
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    const std::string segment = "ssd_evict_cache_total_segment";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0xc00000000);
+
+    const int64_t baseline = metrics.get_file_cache_nums();
+    const int64_t baseline_mem = metrics.get_mem_cache_nums();
+
+    PutAndOffload(*service, client_id, "ssd_evict_cache_total_key", 128,
+                  segment);
+
+    // After offload: file_cache_nums_ increments by 1 (LOCAL_DISK replica),
+    // mem_cache_nums_ also increments by 1 (MEMORY replica from PutEnd).
+    EXPECT_EQ(metrics.get_file_cache_nums(), baseline + 1);
+    EXPECT_EQ(metrics.get_mem_cache_nums(), baseline_mem + 1);
+
+    auto evict_result =
+        service->EvictDiskReplica(client_id, "ssd_evict_cache_total_key",
+                                  "default", ReplicaType::LOCAL_DISK);
+    ASSERT_TRUE(evict_result.has_value());
+
+    // After evicting LOCAL_DISK: file_cache_nums_ returns to baseline,
+    // mem_cache_nums_ unchanged (MEMORY replica still present).
+    EXPECT_EQ(metrics.get_file_cache_nums(), baseline);
+    EXPECT_EQ(metrics.get_mem_cache_nums(), baseline_mem + 1);
+}
+
 // Real-path performance comparison: MasterService PutStart throughput for
 // three configurations:
 //   (A) RANDOM, no offload        — baseline, original behavior

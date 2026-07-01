@@ -17,7 +17,9 @@
 
 #include <cstring>
 #include <memory>
+#include <pthread.h>
 #include <random>
+#include <string>
 
 #include <glog/logging.h>
 #if __has_include(<jsoncpp/json/json.h>)
@@ -163,7 +165,9 @@ bool IsRoceModeEnabled() {
 // AscendThreadPool implementation
 AscendThreadPool::AscendThreadPool(size_t num_threads) : running_(true) {
     for (size_t i = 0; i < num_threads; ++i) {
-        workers_.emplace_back([this] {
+        workers_.emplace_back([this, i] {
+            auto thread_name = "ascend-wk-" + std::to_string(i);
+            pthread_setname_np(pthread_self(), thread_name.c_str());
             while (true) {
                 std::function<void()> task;
                 {

@@ -284,6 +284,16 @@ TEST(TransferEngineConfigOverrideTest,
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaSliceAffinityLogEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_LOG_RDMA_SLICE_AFFINITY", "true");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
+}
+
+TEST(TransferEngineConfigOverrideTest,
      ExplicitMetadataOverridesDriveSuccessfulHttpInitialization) {
 #ifdef _WIN32
     GTEST_SKIP() << "Requires local HTTP metadata server support";
