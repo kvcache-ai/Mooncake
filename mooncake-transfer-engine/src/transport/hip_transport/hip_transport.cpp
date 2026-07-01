@@ -667,9 +667,9 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         // Only device memory can be exported via HIP IPC. Callers that register
         // a batch across all transports (e.g. SGLang's PD metadata/aux buffers,
         // which live in host memory) also hand those host buffers to this
-        // transport. Skip non-device memory gracefully and let RDMA/TCP register
-        // it; returning an error would roll back the entire multi-protocol batch
-        // and tear down every session.
+        // transport. Skip non-device memory gracefully and let RDMA/TCP
+        // register it; returning an error would roll back the entire
+        // multi-protocol batch and tear down every session.
         hipPointerAttribute_t attr;
         hipError_t attr_err = hipPointerGetAttributes(&attr, addr);
         if (attr_err != hipSuccess || attr.type != hipMemoryTypeDevice) {

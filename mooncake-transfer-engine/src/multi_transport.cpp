@@ -464,7 +464,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     // by both rdma and hip), pick the highest-performance transport by a fixed
     // priority instead of relying on buffer registration order.
     if (proto.find(',') != std::string::npos) {
-        auto protocol_priority = [](const std::string &p) {
+        auto protocol_priority = [](const std::string& p) {
             if (p == "hip") return 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
@@ -473,12 +473,13 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         };
         std::string chosen;
         int chosen_priority = -1;
-        for (const auto &buffer : target_segment_desc->buffers) {
+        for (const auto& buffer : target_segment_desc->buffers) {
             // CXL buffers locate via offset + cxl_base_addr; all other
             // protocols use the absolute virtual address in buffer.addr.
-            uint64_t start = (buffer.protocol == "cxl")
-                                 ? buffer.offset + target_segment_desc->cxl_base_addr
-                                 : buffer.addr;
+            uint64_t start =
+                (buffer.protocol == "cxl")
+                    ? buffer.offset + target_segment_desc->cxl_base_addr
+                    : buffer.addr;
             if (entry.target_offset >= start &&
                 entry.target_offset < start + buffer.length) {
                 int priority = protocol_priority(buffer.protocol);
