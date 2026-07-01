@@ -848,6 +848,7 @@ int UrmaEndpoint::setupConnectionsByActive() {
     local_desc.local_nic_path = context_->nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.jetty_num = JettyNum();
+    local_desc.local_eid = context_->getEid();
 
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
@@ -873,6 +874,10 @@ int UrmaEndpoint::setupConnectionsByActive() {
                    << ", peer.local_nic_path: " << peer_desc.local_nic_path
                    << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
+    }
+
+    if (!peer_desc.local_eid.empty()) {
+        return doSetupConnection(peer_desc.local_eid, peer_desc.jetty_num);
     }
 
     auto segment_desc =
@@ -947,6 +952,12 @@ int UrmaEndpoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
     local_desc.local_nic_path = context_->nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.jetty_num = JettyNum();
+    local_desc.local_eid = context_->getEid();
+
+    if (!peer_desc.local_eid.empty()) {
+        return doSetupConnection(peer_desc.local_eid, peer_desc.jetty_num,
+                                 &local_desc.reply_msg);
+    }
 
     auto segment_desc =
         context_->engine().meta()->getSegmentDescByName(peer_server_name);

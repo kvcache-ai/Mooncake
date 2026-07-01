@@ -144,6 +144,7 @@ class TransferMetadata {
         std::string peer_nic_path;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma
+        std::string local_eid;            // for ub/urma
 #endif
 #ifdef USE_BAREX
         uint16_t barex_port;

@@ -431,36 +431,6 @@ int UbTransport::startHandshakeDaemon(std::string& local_server_name) {
         metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
 }
 
-int UbTransport::preConnect(const std::string& peer_nic_path) {
-    if (peer_nic_path.empty()) return ERR_INVALID_ARGUMENT;
-    bool any_connected = false;
-    for (auto& context : context_list_) {
-        if (!context || !context->active()) continue;
-        auto endpoint = context->endpoint(peer_nic_path);
-        if (!endpoint) {
-            LOG(WARNING) << "UbTransport::preConnect cannot create endpoint "
-                            "for "
-                         << peer_nic_path;
-            continue;
-        }
-        if (endpoint->connected()) {
-            any_connected = true;
-            continue;
-        }
-        int ret = endpoint->setupConnectionsByActive();
-        if (ret != 0) {
-            LOG(WARNING) << "UbTransport::preConnect "
-                            "setupConnectionsByActive failed for "
-                         << peer_nic_path << ", ret=" << ret;
-        } else {
-            LOG(INFO) << "UbTransport::preConnect established connection to "
-                      << peer_nic_path;
-            any_connected = true;
-        }
-    }
-    return any_connected ? 0 : ERR_ENDPOINT;
-}
-
 int UbTransport::selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
                               int& buffer_id, int& device_id, int retry_cnt) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,

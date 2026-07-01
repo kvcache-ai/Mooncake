@@ -17,7 +17,6 @@
 #include <glog/logging.h>
 
 #include <cstdlib>
-#include <set>
 #include <sstream>
 #include <vector>
 
@@ -128,6 +127,7 @@ Status UbTentTransport::install(std::string& local_segment_name,
                     peer_hs.peer_nic_path = peer.peer_nic_path;
 #ifdef USE_UB
                     peer_hs.jetty_num = peer.jetty_num;
+                    peer_hs.local_eid = peer.local_eid;
 #endif
                     int ret = cb(peer_hs, local_hs);
                     local.local_nic_path = local_hs.local_nic_path;
@@ -135,6 +135,7 @@ Status UbTentTransport::install(std::string& local_segment_name,
                     local.reply_msg = local_hs.reply_msg;
 #ifdef USE_UB
                     local.jetty_num = local_hs.jetty_num;
+                    local.local_eid = local_hs.local_eid;
 #endif
                     return ret;
                 });
@@ -404,37 +405,6 @@ Status UbTentTransport::submitTransferTasks(
     }
 
     ub_batch->task_count_ += request_list.size();
-
-    // Eagerly establish UB endpoint connections to remote peers so that
-    // when the worker threads process slices, the URMA connection is
-    // already set up.  Without this, the first few batches fail in the
-    // worker because setupConnectionsByActive() may not complete in time,
-    // cascading into endpoint deactivation (1 s dead window) and eventual
-    // TCP failover for the majority of early-work batches.
-    {
-        std::set<mooncake::Transport::SegmentID> preconnected;
-        for (const auto& req : request_list) {
-            if (req.target_id == LOCAL_SEGMENT_ID) continue;
-            auto te_id = getTESegmentID(req.target_id);
-            if (te_id == static_cast<mooncake::Transport::SegmentID>(-1))
-                continue;
-            if (preconnected.count(te_id)) continue;
-            preconnected.insert(te_id);
-
-            auto remote_desc =
-                te_metadata_bridge_->getSegmentDescByID(te_id, true);
-            if (!remote_desc || remote_desc->devices.empty()) {
-                LOG(WARNING)
-                    << "UbTentTransport: pre-connect cannot get remote "
-                       "desc for TE segment "
-                    << te_id;
-                continue;
-            }
-            auto peer_nic_path = MakeNicPath(remote_desc->nicPathServerName(),
-                                             remote_desc->devices[0].name);
-            ub_transport_->preConnect(peer_nic_path);
-        }
-    }
 
     auto old_s = ub_transport_->submitTransferTask(task_ptrs);
     if (!old_s.ok()) {

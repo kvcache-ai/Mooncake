@@ -263,6 +263,7 @@ int UbTentMetadataBridge::sendHandshake(const std::string& peer_server_name,
     request.peer_nic_path = local_desc.peer_nic_path;
 #ifdef USE_UB
     request.jetty_num = local_desc.jetty_num;
+    request.local_eid = local_desc.local_eid;
 #endif
 
     UbBootstrapDesc response;
@@ -278,6 +279,7 @@ int UbTentMetadataBridge::sendHandshake(const std::string& peer_server_name,
     peer_desc.reply_msg = response.reply_msg;
 #ifdef USE_UB
     peer_desc.jetty_num = response.jetty_num;
+    peer_desc.local_eid = response.local_eid;
 #endif
 
     return 0;

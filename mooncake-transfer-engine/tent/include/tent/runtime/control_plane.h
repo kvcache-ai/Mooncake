@@ -59,11 +59,13 @@ struct UbBootstrapDesc {
     std::string local_nic_path;
     std::string peer_nic_path;
     std::vector<uint32_t> jetty_num;
+    std::string local_eid;
     std::string reply_msg;
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(UbBootstrapDesc, local_nic_path,
-                                   peer_nic_path, jetty_num, reply_msg);
+                                   peer_nic_path, jetty_num, local_eid,
+                                   reply_msg);
 };
 
 using OnReceiveUbBootstrap =
