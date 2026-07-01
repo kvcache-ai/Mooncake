@@ -34,6 +34,7 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)

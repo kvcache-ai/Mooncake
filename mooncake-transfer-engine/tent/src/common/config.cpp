@@ -117,6 +117,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/workers/max_retry_count");
     setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
               "transports/rdma/disable_gpu_direct_rdma");
+    setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
+              "transports/rdma/log_slice_affinity");
     return status;
 }
 

@@ -58,6 +58,52 @@ static std::shared_ptr<Topology> makeSingleNicTopology(const std::string& nic,
     return topo;
 }
 
+static std::shared_ptr<Topology> makeTwoNicTopology(const std::string& first,
+                                                    const std::string& second) {
+    auto json_str = R"({
+        "nics": [
+            {"name": ")" +
+                    first + R"(", "type": 0, "numa_node": 0},
+            {"name": ")" +
+                    second + R"(", "type": 0, "numa_node": 0}
+        ],
+        "mems": [{
+            "name": "host0",
+            "type": 0,
+            "numa_node": 0,
+            "device_list": {"rank0": [0, 1]}
+        }]
+    })";
+    auto topo = std::make_shared<Topology>();
+    auto status = topo->parse(json_str);
+    if (!status.ok()) {
+        ADD_FAILURE() << "Topology::parse failed: " << status.ToString();
+    }
+    return topo;
+}
+
+TEST(RailMonitorConfigTest, CustomJsonOverridesAutomaticPeerMapping) {
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeTwoNicTopology("remote0", "remote1");
+    const std::string rail_json = R"({
+        "all": [
+            {"local": "local0", "remote": "remote1"},
+            {"local": "local1", "remote": "remote0"}
+        ],
+        "direct": [
+            {"local": "local0", "remote": "remote1"},
+            {"local": "local1", "remote": "remote0"}
+        ]
+    })";
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local.get(), remote.get(), rail_json, nullptr).ok());
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/0), 1);
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/1, /*remote_numa=*/0), 0);
+    EXPECT_TRUE(rail.available(/*local_nic=*/0, /*remote_nic=*/1));
+    EXPECT_FALSE(rail.available(/*local_nic=*/0, /*remote_nic=*/0));
+}
+
 // ---------------------------------------------------------------------------
 // markRecovered resets error_count so failures start accumulating fresh
 // ---------------------------------------------------------------------------

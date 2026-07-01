@@ -33,6 +33,12 @@ set(MOONCAKE_STORE_SOURCES
     storage/distributed/dfs_global_allocator.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
+    device/accelerator_device.cpp
+    device/accelerator_registry.cpp
+    device/runtime_accelerator.cpp
+    device/cuda_like_accelerator_device.cpp
+    device/hip_accelerator_device.cpp
+    device/ascend_accelerator_device.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -333,7 +339,8 @@ endif()
 # USE_CUDA may be OFF even when GPU pointers are present (e.g.
 # WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart). Each
 # detected toolkit gets both link libraries AND compile definitions, so that
-# gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
+# AcceleratorDevice implementations and pinned_buffer_pool.h pick the correct
+# backend.
 #
 # NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
 # Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
