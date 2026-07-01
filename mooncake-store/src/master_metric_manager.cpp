@@ -374,6 +374,27 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_rejected_cap_total",
           "Promotion attempts rejected because promotion_in_flight was at "
           "promotion_queue_limit"),
+      promotion_candidate_recorded_(
+          "master_promotion_candidate_recorded_total",
+          "New promotion retry candidate entries created"),
+      promotion_candidate_admitted_(
+          "master_promotion_candidate_admitted_total",
+          "Promotion retry candidates successfully queued on background retry"),
+      promotion_candidate_admission_rejected_(
+          "master_promotion_candidate_admission_rejected_total",
+          "Promotion retry candidates that hit a gate again during retry scan"),
+      promotion_candidate_expired_evaluated_(
+          "master_promotion_candidate_expired_evaluated_total",
+          "Promotion retry candidates expired or exhausted during a retry scan"),
+      promotion_candidate_expired_unevaluated_(
+          "master_promotion_candidate_expired_unevaluated_total",
+          "Promotion retry candidates that aged out before the background "
+          "scheduler ever evaluated them (scan budget too small to reach "
+          "their shard within the TTL window)"),
+      promotion_candidate_dropped_limit_(
+          "master_promotion_candidate_dropped_limit_total",
+          "Promotion retry candidates dropped at record time because the "
+          "global candidate count limit was reached"),
       tenant_quota_reject_total_(
           "mooncake_tenant_quota_reject_total",
           "Total number of tenant quota admission rejects",
@@ -482,6 +503,12 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_rejected_frequency_.inc(0);
     promotion_rejected_watermark_.inc(0);
     promotion_rejected_cap_.inc(0);
+    promotion_candidate_recorded_.inc(0);
+    promotion_candidate_admitted_.inc(0);
+    promotion_candidate_admission_rejected_.inc(0);
+    promotion_candidate_expired_evaluated_.inc(0);
+    promotion_candidate_expired_unevaluated_.inc(0);
+    promotion_candidate_dropped_limit_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
@@ -1145,6 +1172,27 @@ void MasterMetricManager::inc_promotion_rejected_watermark(int64_t val) {
 void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
     promotion_rejected_cap_.inc(val);
 }
+void MasterMetricManager::inc_promotion_candidate_recorded(int64_t val) {
+    promotion_candidate_recorded_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_admitted(int64_t val) {
+    promotion_candidate_admitted_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_admission_rejected(
+    int64_t val) {
+    promotion_candidate_admission_rejected_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_expired_evaluated(
+    int64_t val) {
+    promotion_candidate_expired_evaluated_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_expired_unevaluated(
+    int64_t val) {
+    promotion_candidate_expired_unevaluated_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_dropped_limit(int64_t val) {
+    promotion_candidate_dropped_limit_.inc(val);
+}
 
 void MasterMetricManager::inc_tenant_quota_reject(const std::string& tenant_id,
                                                   const std::string& reason,
@@ -1540,6 +1588,24 @@ int64_t MasterMetricManager::get_promotion_rejected_watermark() {
 int64_t MasterMetricManager::get_promotion_rejected_cap() {
     return promotion_rejected_cap_.value();
 }
+int64_t MasterMetricManager::get_promotion_candidate_recorded() {
+    return promotion_candidate_recorded_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_admitted() {
+    return promotion_candidate_admitted_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_admission_rejected() {
+    return promotion_candidate_admission_rejected_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_expired_evaluated() {
+    return promotion_candidate_expired_evaluated_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_expired_unevaluated() {
+    return promotion_candidate_expired_unevaluated_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_dropped_limit() {
+    return promotion_candidate_dropped_limit_.value();
+}
 
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
 void MasterMetricManager::inc_copy_start_requests(int64_t val) {
@@ -1834,6 +1900,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_rejected_frequency_);
     serialize_metric(promotion_rejected_watermark_);
     serialize_metric(promotion_rejected_cap_);
+    serialize_metric(promotion_candidate_recorded_);
+    serialize_metric(promotion_candidate_admitted_);
+    serialize_metric(promotion_candidate_admission_rejected_);
+    serialize_metric(promotion_candidate_expired_evaluated_);
+    serialize_metric(promotion_candidate_expired_unevaluated_);
+    serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
 
