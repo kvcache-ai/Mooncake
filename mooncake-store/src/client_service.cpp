@@ -2720,6 +2720,248 @@ std::vector<int> Client::GetNicNumaNodes() const {
     return {nodes.begin(), nodes.end()};
 }
 
+tl::expected<void, ErrorCode> Client::warmup(
+    const std::shared_ptr<ClientBufferAllocator>& allocator) {
+    if (!transfer_engine_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!allocator) {
+        LOG(WARNING) << "warmup: no buffer allocator provided, skipping";
+        return {};
+    }
+
+    auto read_size_from_env = []() -> size_t {
+        constexpr size_t kDefaultReadSize = 64;
+        const char* env = std::getenv("MC_STORE_WARMUP_READ_SIZE");
+        if (!env || env[0] == '\0') return kDefaultReadSize;
+        try {
+            auto value = static_cast<size_t>(std::stoull(env));
+            return value == 0 ? kDefaultReadSize : value;
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_STORE_WARMUP_READ_SIZE='" << env
+                         << "': " << e.what() << ", using "
+                         << kDefaultReadSize;
+            return kDefaultReadSize;
+        }
+    };
+    auto uint_from_env = [](const char* name, uint64_t default_value) {
+        const char* env = std::getenv(name);
+        if (!env || env[0] == '\0') return default_value;
+        try {
+            return static_cast<uint64_t>(std::stoull(env));
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid " << name << "='" << env << "': "
+                         << e.what() << ", using " << default_value;
+            return default_value;
+        }
+    };
+
+    constexpr uint64_t kDefaultWarmupConcurrency = 16;
+    constexpr uint64_t kMaxWarmupConcurrency = 128;
+    const size_t warmup_read_size = read_size_from_env();
+    const uint64_t warmup_timeout_ms =
+        uint_from_env("MC_STORE_WARMUP_TIMEOUT_MS", 1000);
+    const uint64_t warmup_max_targets =
+        uint_from_env("MC_STORE_WARMUP_MAX_TARGETS", 0);
+    const uint64_t requested_concurrency =
+        uint_from_env("MC_STORE_WARMUP_CONCURRENCY",
+                      kDefaultWarmupConcurrency);
+    const size_t warmup_concurrency = static_cast<size_t>(
+        std::clamp<uint64_t>(requested_concurrency, 1,
+                             kMaxWarmupConcurrency));
+    if (requested_concurrency > kMaxWarmupConcurrency) {
+        LOG(WARNING) << "warmup: MC_STORE_WARMUP_CONCURRENCY="
+                     << requested_concurrency << " exceeds max "
+                     << kMaxWarmupConcurrency << ", clamped";
+    }
+
+    std::vector<std::string> preferred_protocols;
+    if (!protocol_.empty()) {
+        preferred_protocols.push_back(protocol_);
+    }
+    auto targets_result =
+        master_client_.ListWarmupTargets(warmup_max_targets,
+                                         preferred_protocols);
+    if (!targets_result) {
+        LOG(WARNING) << "warmup: ListWarmupTargets failed: "
+                     << toString(targets_result.error())
+                     << ", continuing without warmup";
+        return {};
+    }
+
+    const auto& targets = targets_result.value();
+    LOG(INFO) << "warmup: pre-establishing READ-only connections to "
+              << targets.size() << " target(s), concurrency="
+              << warmup_concurrency << ", timeout_ms=" << warmup_timeout_ms
+              << ", read_size=" << warmup_read_size;
+
+    std::atomic<size_t> next_index{0};
+    std::atomic<size_t> success_count{0};
+    std::atomic<size_t> failed_count{0};
+    std::atomic<size_t> skipped_count{0};
+    std::atomic<size_t> timeout_count{0};
+
+    auto warmup_one = [&](const WarmupTarget& target, void* warmup_buffer) {
+        if (!target.allow_warmup || target.is_local ||
+            target.segment_name.empty()) {
+            skipped_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        auto target_id = transfer_engine_->openSegment(target.segment_name);
+        if (target_id == (SegmentHandle)-1 || target_id == LOCAL_SEGMENT_ID) {
+            LOG(WARNING) << "warmup: cannot open remote segment '"
+                         << target.segment_name << "'";
+            skipped_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        auto metadata = transfer_engine_->getMetadata();
+        if (!metadata) {
+            skipped_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        auto target_segment = metadata->getSegmentDescByID(target_id);
+        if (!target_segment || target_segment->buffers.empty()) {
+            LOG(WARNING) << "warmup: segment '" << target.segment_name
+                         << "' has no readable buffer metadata";
+            skipped_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        const auto& remote_buffer = target_segment->buffers[0];
+        if (remote_buffer.length < warmup_read_size) {
+            LOG(WARNING) << "warmup: segment '" << target.segment_name
+                         << "' buffer too small for warmup, length="
+                         << remote_buffer.length
+                         << ", required=" << warmup_read_size;
+            skipped_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        auto batch_id = transfer_engine_->allocateBatchID(1);
+        if (batch_id == INVALID_BATCH_ID) {
+            LOG(WARNING) << "warmup: allocateBatchID failed for '"
+                         << target.segment_name << "'";
+            failed_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        Transport::TransferRequest request;
+        request.opcode = Transport::TransferRequest::READ;
+        request.source = warmup_buffer;
+        request.target_id = target_id;
+        request.target_offset = remote_buffer.addr;
+        request.length = warmup_read_size;
+
+        auto status = transfer_engine_->submitTransfer(batch_id, {request});
+        if (!status.ok()) {
+            LOG(WARNING) << "warmup: READ submitTransfer failed for '"
+                         << target.segment_name << "': " << status.message();
+            transfer_engine_->freeBatchID(batch_id);
+            failed_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        Transport::TransferStatus ts{};
+        bool timed_out = true;
+        bool terminal = false;
+        bool batch_freed = false;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(warmup_timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto s = transfer_engine_->getTransferStatus(batch_id, 0, ts);
+            if (!s.ok()) {
+                timed_out = false;
+                break;
+            }
+            if (ts.s == Transport::COMPLETED ||
+                ts.s == Transport::FAILED || ts.s == Transport::INVALID) {
+                timed_out = false;
+                terminal = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        if (terminal) {
+            auto free_status = transfer_engine_->freeBatchID(batch_id);
+            if (!free_status.ok()) {
+                LOG(WARNING) << "warmup: freeBatchID failed for '"
+                             << target.segment_name
+                             << "': " << free_status.message();
+            } else {
+                batch_freed = true;
+            }
+        }
+        if (ts.s == Transport::COMPLETED) {
+            success_count.fetch_add(1, std::memory_order_relaxed);
+        } else if (timed_out) {
+            LOG(WARNING) << "warmup: READ timed out for '"
+                         << target.segment_name << "' after "
+                         << warmup_timeout_ms
+                         << " ms; batch left pending";
+            timeout_count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!batch_freed) {
+                auto free_status = transfer_engine_->freeBatchID(batch_id);
+                if (!free_status.ok()) {
+                    LOG(WARNING) << "warmup: freeBatchID failed for '"
+                                 << target.segment_name
+                                 << "': " << free_status.message();
+                }
+            }
+            failed_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    const auto start = std::chrono::steady_clock::now();
+    const size_t worker_count = std::min(warmup_concurrency, targets.size());
+    std::vector<std::shared_ptr<BufferHandle>> worker_buffers;
+    worker_buffers.reserve(worker_count);
+    for (size_t i = 0; i < worker_count; ++i) {
+        auto worker_buf = allocator->allocate(warmup_read_size);
+        if (!worker_buf) {
+            LOG(WARNING) << "warmup: failed to allocate worker buffer";
+            break;
+        }
+        std::memset(worker_buf->ptr(), 0, worker_buf->size());
+        worker_buffers.emplace_back(std::move(worker_buf));
+    }
+    if (worker_buffers.empty() && !targets.empty()) {
+        LOG(WARNING) << "warmup: no worker buffers available, skipping";
+        return {};
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_buffers.size());
+    for (auto& worker_buf : worker_buffers) {
+        workers.emplace_back([&, warmup_buffer = worker_buf->ptr()]() {
+            while (true) {
+                const size_t index =
+                    next_index.fetch_add(1, std::memory_order_relaxed);
+                if (index >= targets.size()) return;
+                warmup_one(targets[index], warmup_buffer);
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        if (worker.joinable()) worker.join();
+    }
+
+    const auto duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    LOG(INFO) << "warmup: completed total=" << targets.size()
+              << ", success=" << success_count.load()
+              << ", failed=" << failed_count.load()
+              << ", skipped=" << skipped_count.load()
+              << ", timeout=" << timeout_count.load()
+              << ", duration_ms=" << duration_ms;
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {

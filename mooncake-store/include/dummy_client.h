@@ -30,7 +30,8 @@ class DummyClient : public PyClient {
                    const std::string &ipc_socket_path,
                    bool enable_ssd_offload = false,
                    const std::string &ssd_offload_path = "",
-                   const std::string &tenant_id = "default") {
+                   const std::string &tenant_id = "default",
+                   bool enable_store_warmup = false) {
         // Dummy client does not support real setup
         return -1;
     };

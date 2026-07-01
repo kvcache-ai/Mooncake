@@ -183,6 +183,11 @@ struct RpcNameTraits<&WrappedMasterService::GetAllNoFSegments> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ListWarmupTargets> {
+    static constexpr const char* value = "ListWarmupTargets";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetNoFSegmentsByName> {
     static constexpr const char* value = "GetNoFSegmentsByName";
 };
@@ -869,6 +874,20 @@ MasterClient::GetAllNoFSegments() {
 
     auto result = invoke_rpc<&WrappedMasterService::GetAllNoFSegments,
                              std::vector<NoFSegment>>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<WarmupTarget>, ErrorCode>
+MasterClient::ListWarmupTargets(
+    uint64_t max_targets, const std::vector<std::string>& preferred_protocols) {
+    ScopedVLogTimer timer(1, "MasterClient::ListWarmupTargets");
+    timer.LogRequest("client_id=", client_id_,
+                     ", max_targets=", max_targets);
+
+    auto result = invoke_rpc<&WrappedMasterService::ListWarmupTargets,
+                             std::vector<WarmupTarget>>(
+        client_id_, max_targets, preferred_protocols);
     timer.LogResponseExpected(result);
     return result;
 }

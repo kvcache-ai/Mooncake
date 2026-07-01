@@ -53,6 +53,9 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Number of worker threads that concurrently handle inbound handshake
+    // requests on the listener. Override via MC_HANDSHAKE_WORKER_THREADS.
+    int handshake_worker_threads = 1;
     // Connect timeout (seconds) for outbound handshake-port RPCs (QP
     // handshake, probe, notify, metadata exchange). A plain blocking
     // connect() has no deadline: to an unroutable address (e.g. a

@@ -2180,6 +2180,55 @@ auto MasterService::GetAllSegments()
     return all_segments;
 }
 
+auto MasterService::ListWarmupTargets(
+    const UUID& client_id, uint64_t max_targets,
+    const std::vector<std::string>& preferred_protocols)
+    -> tl::expected<std::vector<WarmupTarget>, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<std::pair<Segment, UUID>> all_segments;
+    auto err = segment_access.GetAllSegments(all_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    auto protocol_allowed = [&](const std::string& protocol) {
+        if (preferred_protocols.empty()) return true;
+        for (const auto& preferred : preferred_protocols) {
+            if (protocol.find(preferred) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    std::vector<WarmupTarget> targets;
+    targets.reserve(all_segments.size());
+    for (const auto& [segment, owner_client_id] : all_segments) {
+        SegmentStatus status;
+        err = segment_access.GetSegmentStatusByName(segment.name, status);
+        if (err != ErrorCode::OK || status != SegmentStatus::OK) {
+            continue;
+        }
+        if (!protocol_allowed(segment.protocol)) {
+            continue;
+        }
+
+        WarmupTarget target;
+        target.segment_name = segment.te_endpoint.empty() ? segment.name
+                                                          : segment.te_endpoint;
+        target.segment_id = segment.id;
+        target.client_id = owner_client_id;
+        target.protocol = segment.protocol;
+        target.is_local = owner_client_id == client_id;
+        target.allow_warmup = !target.is_local && !target.segment_name.empty();
+        target.priority = targets.size();
+        targets.emplace_back(std::move(target));
+
+        if (max_targets > 0 && targets.size() >= max_targets) {
+            break;
+        }
+    }
+    return targets;
+}
+
 auto MasterService::GetAllNoFSegments()
     -> tl::expected<std::vector<NoFSegment>, ErrorCode> {
     std::vector<MountedNoFSegmentSnapshot> mounted_segments;

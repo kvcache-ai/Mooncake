@@ -1138,6 +1138,14 @@ WrappedMasterService::GetAllSegmentsForAdmin() {
     return master_service_.GetAllSegments();
 }
 
+tl::expected<std::vector<WarmupTarget>, ErrorCode>
+WrappedMasterService::ListWarmupTargets(
+    const UUID& client_id, uint64_t max_targets,
+    const std::vector<std::string>& preferred_protocols) {
+    return master_service_.ListWarmupTargets(client_id, max_targets,
+                                             preferred_protocols);
+}
+
 tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
 WrappedMasterService::GetSegmentsDetailForAdmin() {
     return master_service_.GetSegmentsDetail();
@@ -1331,6 +1339,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::UnmountNoFSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ListWarmupTargets>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
