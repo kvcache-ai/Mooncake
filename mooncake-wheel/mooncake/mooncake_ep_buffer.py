@@ -4,6 +4,18 @@ import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.upper() in {"1", "ON", "TRUE", "YES"}
+
+
+_USE_MACA = _env_enabled("MOONCAKE_EP_USE_MACA") or bool(
+    getattr(torch.version, "maca", None)
+)
+
+
 class EventOverlap:
     """
     A wrapper class to manage CUDA events, also for better overlapping convenience.
@@ -81,10 +93,78 @@ class Buffer:
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
         self._use_fallback = bool(self.runtime.ibgda_disabled())
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
+        self._maca_phase_token: Optional[torch.Tensor] = None
+        self._maca_phase_recv_tokens: Optional[List[torch.Tensor]] = None
         self.connect()
+
+    def _maca_host_only_phase_sync(self) -> bool:
+        return _USE_MACA and _env_enabled(
+            "MOONCAKE_EP_MACA_HOST_ONLY_PHASE_SYNC"
+        )
+
+    def _maca_phase_fence(self, send_event: Optional[Any] = None) -> None:
+        if not self._maca_host_only_phase_sync():
+            return
+
+        backend = dist.get_backend(self.group)
+        fence_device = torch.device("cpu" if backend == "gloo" else "cuda")
+
+        if send_event is not None:
+            send_event.synchronize()
+        else:
+            torch.cuda.synchronize()
+
+        if (
+            self._maca_phase_token is None
+            or self._maca_phase_token.device != fence_device
+        ):
+            self._maca_phase_token = torch.empty(
+                1, dtype=torch.int32, device=fence_device
+            )
+        if (
+            self._maca_phase_recv_tokens is None
+            or self._maca_phase_recv_tokens[0].device != fence_device
+        ):
+            self._maca_phase_recv_tokens = [
+                torch.empty(1, dtype=torch.int32, device=fence_device)
+                for _ in range(self.group_size)
+            ]
+        self._maca_phase_token.fill_(1)
+        ops = []
+        for peer in range(self.group_size):
+            if peer == self.rank:
+                continue
+            ops.append(
+                dist.P2POp(
+                    dist.isend, self._maca_phase_token, peer, self.group
+                )
+            )
+            ops.append(
+                dist.P2POp(
+                    dist.irecv,
+                    self._maca_phase_recv_tokens[peer],
+                    peer,
+                    self.group,
+                )
+            )
+        if not ops:
+            return
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
+
+    def _wrap_maca_recv_hook(
+        self, hook: Optional[Callable], send_event: Optional[Any]
+    ) -> Callable:
+        def wrapped_hook() -> None:
+            self._maca_phase_fence(send_event)
+            if hook is not None:
+                hook()
+
+        return wrapped_hook
     
     def connect(self, is_update: bool = False):
         from mooncake import ep
+        skip_ipc_exchange = _env_enabled("MOONCAKE_EP_SKIP_IPC_EXCHANGE")
 
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
@@ -105,15 +185,15 @@ class Buffer:
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
-
             if is_update:
                 self.runtime.update_local_qpns()
 
-            local_qpns = self.runtime.get_local_qpns()
+            local_qpns_flat = self.runtime.get_local_qpns()
+            assert len(local_qpns_flat) % self.group_size == 0
+            all_to_all_size = len(local_qpns_flat) // self.group_size
             local_qpns = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
+                    torch.tensor(local_qpns_flat, dtype=torch.int32, device="cuda").view(
                         -1, all_to_all_size
                     )
                 )
@@ -124,6 +204,14 @@ class Buffer:
             ]
             dist.all_to_all(remote_qpns, local_qpns, self.group)
             peer_qpns = [remote_qpns[r].tolist() for r in range(self.group_size)]
+            if _env_enabled("MOONCAKE_EP_DEBUG_BOOTSTRAP"):
+                local_qpn_slices = [q.tolist() for q in local_qpns]
+                print(
+                    f"[Rank {self.rank}] EP IBGDA bootstrap raddrs={raddrs} "
+                    f"rkeys={rkeys} local_qpn_slices={local_qpn_slices} "
+                    f"peer_qpns={peer_qpns}",
+                    flush=True,
+                )
 
             local_lids = self.runtime.get_local_lids()
             local_lids = list(
@@ -164,30 +252,31 @@ class Buffer:
                 subnet_prefixes, interface_ids, active_ranks_mask
             )
 
-        try:
-            local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers
-            local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
-            )
-            handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = [h.tolist() for h in handles]
-            from mooncake.ep import get_active_ranks
-            active_ranks_mask = get_active_ranks(self.backend).tolist()
-            self.runtime.sync_nvlink_ipc_handles(remote_handles,
-                                                 active_ranks_mask)
-        except Exception as e:
-            import warnings
+        if not skip_ipc_exchange:
+            try:
+                local_handle_ints = self.runtime.get_ipc_handle()
+                # pybind11 converts std::vector<int32_t> to a list of integers
+                local_handle_tensor = torch.tensor(
+                    local_handle_ints, dtype=torch.int32, device="cuda"
+                )
+                handles = [
+                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                    for _ in range(self.group_size)
+                ]
+                dist.all_gather(handles, local_handle_tensor, self.group)
+                remote_handles = [h.tolist() for h in handles]
+                from mooncake.ep import get_active_ranks
+                active_ranks_mask = get_active_ranks(self.backend).tolist()
+                self.runtime.sync_nvlink_ipc_handles(remote_handles,
+                                                     active_ranks_mask)
+            except Exception as e:
+                import warnings
 
-            warnings.warn(
-                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+                warnings.warn(
+                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         use_fast_path = False
         try:
@@ -313,7 +402,9 @@ class Buffer:
             packed_recv_count,
             handle,
             EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+            self._wrap_maca_recv_hook(hook, event)
+            if self._maca_host_only_phase_sync()
+            else hook,
         )
 
     # noinspection PyTypeChecker
@@ -395,7 +486,9 @@ class Buffer:
         return (
             combined_x,
             EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+            self._wrap_maca_recv_hook(hook, event)
+            if self._maca_host_only_phase_sync()
+            else hook,
         )
 
     def get_next_combine_buffer(self, handle: object):

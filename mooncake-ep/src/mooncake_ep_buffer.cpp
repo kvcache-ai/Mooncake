@@ -1,5 +1,7 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
+#include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <transfer_engine.h>
 
@@ -23,6 +25,37 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
     return ret == 0;
 }
 
+static bool envEnabled(const char* name) {
+    const char* env = std::getenv(name);
+    if (!env) return false;
+    std::string value(env);
+    for (char& c : value) c = static_cast<char>(std::toupper(c));
+    return value == "1" || value == "ON" || value == "TRUE" ||
+           value == "YES";
+}
+
+static bool macaHostOnlyPhaseSyncEnabled() {
+#ifdef MOONCAKE_EP_USE_MACA
+    const char* env = std::getenv("MOONCAKE_EP_MACA_HOST_ONLY_PHASE_SYNC");
+    if (!env) return false;
+    std::string value(env);
+    for (char& c : value) c = static_cast<char>(std::toupper(c));
+    return value == "1" || value == "ON" || value == "TRUE" ||
+           value == "YES";
+#else
+    return false;
+#endif
+}
+
+static int envInt(const char* name, int default_value) {
+    const char* env = std::getenv(name);
+    if (!env || !*env) return default_value;
+    char* end = nullptr;
+    long value = std::strtol(env, &end, 10);
+    if (end == env || value <= 0) return default_value;
+    return static_cast<int>(value);
+}
+
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    TransferEngine* engine)
@@ -31,6 +64,16 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       comm_stream(at::cuda::getStreamFromPool(true)) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
+    if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_PEER")) {
+        int active_qps_per_peer =
+            envInt("MOONCAKE_EP_ACTIVE_QPS_PER_PEER", USE_QP_COUNT / num_ranks);
+        active_qps_per_peer =
+            std::min(active_qps_per_peer, USE_QP_COUNT / num_ranks);
+        USE_QP_COUNT = active_qps_per_peer * num_ranks;
+        LOG(INFO) << "[EP] Limiting IBGDA QPs to " << USE_QP_COUNT
+                  << " total (" << active_qps_per_peer << " per peer) via "
+                  << "MOONCAKE_EP_ACTIVE_QPS_PER_PEER";
+    }
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
@@ -115,6 +158,238 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     p2p_transport_ = nullptr;
 
     if (workspace) cudaFree(workspace);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> MooncakeEpBuffer::debug_signal_buffers(
+    int num_max_dispatch_tokens_per_rank, int hidden, int num_experts,
+    int buffer_slot) {
+    EP_HOST_ASSERT(buffer_slot == 0 || buffer_slot == 1);
+    BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
+                      num_ranks, num_experts);
+    EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
+    auto buffer = layout.buffers[buffer_slot];
+    auto options = torch::dtype(torch::kInt32).device(torch::kCUDA);
+    auto send = torch::empty({num_experts}, options);
+    auto recv = torch::empty({num_experts}, options);
+    CUDA_CHECK(cudaMemcpyAsync(send.data_ptr<int>(),
+                               buffer.rdma_send_signal_buffer,
+                               num_experts * sizeof(int),
+                               cudaMemcpyDeviceToDevice,
+                               at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemcpyAsync(recv.data_ptr<int>(),
+                               buffer.rdma_recv_signal_buffer,
+                               num_experts * sizeof(int),
+                               cudaMemcpyDeviceToDevice,
+                               at::cuda::getCurrentCUDAStream()));
+    return {send, recv};
+}
+
+torch::Tensor MooncakeEpBuffer::debug_dispatch_recv_src_slots(
+    int num_max_dispatch_tokens_per_rank, int hidden, int num_experts,
+    int buffer_slot) {
+    EP_HOST_ASSERT(buffer_slot == 0 || buffer_slot == 1);
+    BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
+                      num_ranks, num_experts);
+    EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
+    auto buffer = layout.buffers[buffer_slot];
+    int num_local_experts = num_experts / num_ranks;
+    size_t hidden_bytes = static_cast<size_t>(hidden) * EP_BF16_SIZE;
+    size_t msg_bytes = sizeof(int4) + hidden_bytes;
+    auto options = torch::dtype(torch::kInt32).device(torch::kCPU);
+    auto out = torch::empty(
+        {num_local_experts, num_ranks, num_max_dispatch_tokens_per_rank},
+        options);
+    auto out_acc = out.accessor<int, 3>();
+    for (int e = 0; e < num_local_experts; ++e) {
+        for (int r = 0; r < num_ranks; ++r) {
+            for (int s = 0; s < num_max_dispatch_tokens_per_rank; ++s) {
+                int value = 0;
+                auto* src = reinterpret_cast<char*>(buffer.rdma_recv_data_buffer) +
+                            (static_cast<size_t>(e) * num_ranks *
+                                 num_max_dispatch_tokens_per_rank +
+                             static_cast<size_t>(r) *
+                                 num_max_dispatch_tokens_per_rank +
+                             s) *
+                                msg_bytes;
+                CUDA_CHECK(cudaMemcpy(&value, src, sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+                out_acc[e][r][s] = value;
+            }
+        }
+    }
+    return out;
+}
+
+torch::Tensor MooncakeEpBuffer::debug_rdma_put_probe(
+    int dst_rank, int64_t dst_byte_offset, uint64_t value) {
+    EP_HOST_ASSERT(rdma_transport_ != nullptr);
+    EP_HOST_ASSERT(dst_rank >= 0 && dst_rank < num_ranks);
+    EP_HOST_ASSERT(dst_byte_offset >= 0);
+    EP_HOST_ASSERT(dst_byte_offset + static_cast<int64_t>(sizeof(uint64_t)) <=
+                   num_ep_buffer_bytes);
+
+    int64_t src_byte_offset =
+        envInt("MACA_EP_PROBE_SRC_OFFSET", 0);
+    EP_HOST_ASSERT(src_byte_offset >= 0);
+    EP_HOST_ASSERT(src_byte_offset + static_cast<int64_t>(sizeof(uint64_t)) <=
+                   num_ep_buffer_bytes);
+
+    auto options = torch::dtype(torch::kUInt64).device(torch::kCUDA);
+    auto* local_source = reinterpret_cast<uint64_t*>(
+        static_cast<char*>(gdr_buffer) + src_byte_offset);
+    CUDA_CHECK(cudaMemsetAsync(
+        static_cast<char*>(gdr_buffer) + dst_byte_offset, 0, sizeof(uint64_t),
+        comm_stream.stream()));
+    CUDA_CHECK(cudaMemsetAsync(local_source, 0, sizeof(uint64_t),
+                               comm_stream.stream()));
+
+    int qps_per_rank = USE_QP_COUNT / num_ranks;
+    int probe_bytes = envInt("MACA_EP_PROBE_BYTES", 8);
+    EP_HOST_ASSERT(probe_bytes > 0);
+    EP_HOST_ASSERT(src_byte_offset + probe_bytes <= num_ep_buffer_bytes);
+    EP_HOST_ASSERT(dst_byte_offset + probe_bytes <= num_ep_buffer_bytes);
+    int poll_completion = envEnabled("MACA_EP_PROBE_POLL") ? 1 : 0;
+    mooncake::debug_rdma_put_probe(
+        gdr_buffer, rdma_transport_->raddrsPtr(), rdma_transport_->rkeysPtr(),
+        rdma_transport_->qpDevCtxsPtr(), rank, num_ranks, qps_per_rank,
+        dst_rank, static_cast<uint64_t>(dst_byte_offset),
+        static_cast<uint64_t>(src_byte_offset), value,
+        static_cast<uint32_t>(probe_bytes), local_source, poll_completion,
+        comm_stream.stream());
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+
+    auto out = torch::empty({2}, options);
+    CUDA_CHECK(cudaMemcpyAsync(
+        out.data_ptr(), static_cast<char*>(gdr_buffer) + dst_byte_offset,
+        sizeof(uint64_t), cudaMemcpyDeviceToDevice,
+        at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemcpyAsync(
+        out.data_ptr<uint64_t>() + 1, local_source, sizeof(uint64_t),
+        cudaMemcpyDeviceToDevice, at::cuda::getCurrentCUDAStream()));
+    return out;
+}
+
+torch::Tensor MooncakeEpBuffer::debug_rdma_multi_put_probe(
+    int dst_rank, int64_t dst_byte_offset, int64_t dst_stride,
+    int64_t src_byte_offset, int64_t src_stride, int nbytes, int nputs) {
+    EP_HOST_ASSERT(rdma_transport_ != nullptr);
+    EP_HOST_ASSERT(dst_rank >= 0 && dst_rank < num_ranks);
+    EP_HOST_ASSERT(dst_byte_offset >= 0);
+    EP_HOST_ASSERT(dst_stride >= nbytes);
+    EP_HOST_ASSERT(src_byte_offset >= 0);
+    EP_HOST_ASSERT(src_stride >= nbytes);
+    EP_HOST_ASSERT(nbytes > 0);
+    EP_HOST_ASSERT(nputs > 0);
+    EP_HOST_ASSERT(src_byte_offset + (nputs - 1) * src_stride + nbytes <=
+                   num_ep_buffer_bytes);
+    EP_HOST_ASSERT(dst_byte_offset + (nputs - 1) * dst_stride + nbytes <=
+                   num_ep_buffer_bytes);
+
+    for (int i = 0; i < nputs; ++i) {
+        CUDA_CHECK(cudaMemsetAsync(
+            static_cast<char*>(gdr_buffer) + dst_byte_offset + i * dst_stride,
+            0, nbytes, comm_stream.stream()));
+        CUDA_CHECK(cudaMemsetAsync(
+            static_cast<char*>(gdr_buffer) + src_byte_offset + i * src_stride,
+            0, nbytes, comm_stream.stream()));
+    }
+
+    int qps_per_rank = USE_QP_COUNT / num_ranks;
+    int poll_completion = envEnabled("MACA_EP_PROBE_POLL") ? 1 : 0;
+    int delay_iters = envInt("MACA_EP_MULTI_PUT_DELAY_ITERS", 0);
+    int pre_post_delay_iters =
+        envInt("MACA_EP_MULTI_PUT_PRE_POST_DELAY_ITERS", 0);
+    int channel_offset = envInt("MACA_EP_MULTI_PUT_CHANNEL_OFFSET", 0);
+    int warmup_puts = envInt("MACA_EP_MULTI_PUT_WARMUP", 0);
+    int prewrite_source = envEnabled("MACA_EP_MULTI_PUT_PREWRITE") ? 1 : 0;
+    int64_t warmup_dst_offset =
+        envInt("MACA_EP_MULTI_PUT_WARMUP_DST_OFFSET", 262144);
+    int64_t warmup_src_offset =
+        envInt("MACA_EP_MULTI_PUT_WARMUP_SRC_OFFSET", 131072);
+    EP_HOST_ASSERT(warmup_puts >= 0);
+    if (warmup_puts > 0) {
+        EP_HOST_ASSERT(warmup_src_offset >= 0);
+        EP_HOST_ASSERT(warmup_dst_offset >= 0);
+        EP_HOST_ASSERT(warmup_src_offset + (warmup_puts - 1) * src_stride +
+                           nbytes <=
+                       num_ep_buffer_bytes);
+        EP_HOST_ASSERT(warmup_dst_offset + (warmup_puts - 1) * dst_stride +
+                           nbytes <=
+                       num_ep_buffer_bytes);
+    }
+    if (prewrite_source) {
+        for (int i = 0; i < nputs; ++i) {
+            uint64_t value = (rank == 0 ? 0xabc0000000000000ULL
+                                        : 0xdef0000000000000ULL) |
+                             static_cast<uint64_t>(i);
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<char*>(gdr_buffer) + src_byte_offset +
+                    i * src_stride,
+                &value, sizeof(value), cudaMemcpyHostToDevice,
+                comm_stream.stream()));
+        }
+        for (int i = 0; i < warmup_puts; ++i) {
+            uint64_t value = (rank == 0 ? 0xabc0000000000000ULL
+                                        : 0xdef0000000000000ULL) |
+                             static_cast<uint64_t>(i);
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<char*>(gdr_buffer) + warmup_src_offset +
+                    i * src_stride,
+                &value, sizeof(value), cudaMemcpyHostToDevice,
+                comm_stream.stream()));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+    }
+    mooncake::debug_rdma_multi_put_probe(
+        gdr_buffer, rdma_transport_->raddrsPtr(), rdma_transport_->rkeysPtr(),
+        rdma_transport_->qpDevCtxsPtr(), rank, num_ranks, qps_per_rank,
+        dst_rank, static_cast<uint64_t>(dst_byte_offset),
+        static_cast<uint64_t>(dst_stride),
+        static_cast<uint64_t>(src_byte_offset),
+        static_cast<uint64_t>(src_stride), static_cast<uint32_t>(nbytes),
+        nputs, poll_completion, delay_iters, channel_offset,
+        warmup_puts, static_cast<uint64_t>(warmup_dst_offset),
+        static_cast<uint64_t>(warmup_src_offset), pre_post_delay_iters,
+        prewrite_source, comm_stream.stream());
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+
+    auto options = torch::dtype(torch::kUInt64).device(torch::kCUDA);
+    auto out = torch::empty({nputs, 2}, options);
+    for (int i = 0; i < nputs; ++i) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            out.data_ptr<uint64_t>() + i * 2,
+            static_cast<char*>(gdr_buffer) + dst_byte_offset + i * dst_stride,
+            sizeof(uint64_t), cudaMemcpyDeviceToDevice,
+            at::cuda::getCurrentCUDAStream()));
+        CUDA_CHECK(cudaMemcpyAsync(
+            out.data_ptr<uint64_t>() + i * 2 + 1,
+            static_cast<char*>(gdr_buffer) + src_byte_offset + i * src_stride,
+            sizeof(uint64_t), cudaMemcpyDeviceToDevice,
+            at::cuda::getCurrentCUDAStream()));
+    }
+    return out;
+}
+
+torch::Tensor MooncakeEpBuffer::debug_read_u64(int64_t byte_offset) {
+    EP_HOST_ASSERT(byte_offset >= 0);
+    EP_HOST_ASSERT(byte_offset + static_cast<int64_t>(sizeof(uint64_t)) <=
+                   num_ep_buffer_bytes);
+    auto options = torch::dtype(torch::kUInt64).device(torch::kCUDA);
+    auto out = torch::empty({1}, options);
+    CUDA_CHECK(cudaMemcpyAsync(
+        out.data_ptr(), static_cast<char*>(gdr_buffer) + byte_offset,
+        sizeof(uint64_t), cudaMemcpyDeviceToDevice,
+        at::cuda::getCurrentCUDAStream()));
+    return out;
+}
+
+void MooncakeEpBuffer::debug_clear_u64(int64_t byte_offset) {
+    EP_HOST_ASSERT(byte_offset >= 0);
+    EP_HOST_ASSERT(byte_offset + static_cast<int64_t>(sizeof(uint64_t)) <=
+                   num_ep_buffer_bytes);
+    CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(gdr_buffer) + byte_offset, 0,
+                               sizeof(uint64_t), comm_stream.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
@@ -203,6 +478,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     auto mark_send_done = [=]() {
 #if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+        if (macaHostOnlyPhaseSyncEnabled()) return;
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -211,6 +487,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     auto wait_peer_send_done = [=]() {
 #if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+        if (macaHostOnlyPhaseSyncEnabled()) return;
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -219,6 +496,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     auto mark_and_wait_peer_send_done = [=]() {
 #if defined(MOONCAKE_EP_USE_MACA)
+        if (macaHostOnlyPhaseSyncEnabled()) return;
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -234,6 +512,16 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 #endif
     };
 
+    const int force_rdma_data =
+        envEnabled("MOONCAKE_EP_FORCE_RDMA_DATA_PATH") ? 1 : 0;
+    const int poll_rdma_put =
+        envEnabled("MOONCAKE_EP_RDMA_POLL_PUT") ? 1 : 0;
+    const int rdma_write_signal =
+        envEnabled("MOONCAKE_EP_RDMA_WRITE_SIGNAL") ? 1 : 0;
+    const int active_qps_per_peer = std::min(
+        USE_QP_COUNT / num_ranks,
+        envInt("MOONCAKE_EP_ACTIVE_QPS_PER_PEER", USE_QP_COUNT / num_ranks));
+
     auto launcher = [=](int phases) {
         mooncake::dispatch(
             packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
@@ -246,8 +534,9 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x.data_ptr(),
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
-            num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases);
+            num_experts, rank, num_ranks, use_fp8, force_rdma_data,
+            poll_rdma_put, rdma_write_signal, active_qps_per_peer, workspace,
+            launch_stream, timeout_ticks, phases);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -368,6 +657,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     auto mark_send_done = [=]() {
 #if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+        if (macaHostOnlyPhaseSyncEnabled()) return;
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -376,6 +666,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     auto wait_peer_send_done = [=]() {
 #if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+        if (macaHostOnlyPhaseSyncEnabled()) return;
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -384,6 +675,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     auto mark_and_wait_peer_send_done = [=]() {
 #if defined(MOONCAKE_EP_USE_MACA)
+        if (macaHostOnlyPhaseSyncEnabled()) return;
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -400,6 +692,16 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     };
 
     // Kernel launch
+    const int force_rdma_data =
+        envEnabled("MOONCAKE_EP_FORCE_RDMA_DATA_PATH") ? 1 : 0;
+    const int poll_rdma_put =
+        envEnabled("MOONCAKE_EP_RDMA_POLL_PUT") ? 1 : 0;
+    const int rdma_write_signal =
+        envEnabled("MOONCAKE_EP_RDMA_WRITE_SIGNAL") ? 1 : 0;
+    const int active_qps_per_peer = std::min(
+        USE_QP_COUNT / num_ranks,
+        envInt("MOONCAKE_EP_ACTIVE_QPS_PER_PEER", USE_QP_COUNT / num_ranks));
+
     auto launcher = [=](int phases) {
         mooncake::combine(
             combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(), gdr_buffer,
@@ -411,8 +713,9 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy);
+            num_ranks, force_rdma_data, poll_rdma_put, rdma_write_signal,
+            active_qps_per_peer, workspace, launch_stream, timeout_ticks,
+            phases, zero_copy);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -501,6 +804,36 @@ void MooncakeEpBuffer::sync_ibgda_peers(
             flat_qpns.push_back(peer_qpns[r][q]);
             flat_lids.push_back(peer_lids[r][q]);
         }
+    }
+    if (envEnabled("MOONCAKE_EP_DEBUG_BOOTSTRAP")) {
+        auto local_meta = rdma_transport_->localMetadata();
+        std::ostringstream oss;
+        oss << "[EP IBGDA connect layout] rank=" << rank
+            << " qps_per_rank=" << qps_per_rank
+            << " local_raddr=0x" << std::hex
+            << static_cast<uint64_t>(local_meta.raddr)
+            << " local_rkey=0x" << static_cast<uint32_t>(local_meta.rkey)
+            << std::dec << " active=";
+        for (int r = 0; r < num_ranks; ++r) {
+            oss << active_ranks_mask[r];
+        }
+        oss << " remote_meta=";
+        for (int r = 0; r < num_ranks; ++r) {
+            oss << "{r=" << r << ",addr=0x" << std::hex
+                << static_cast<uint64_t>(remote_addrs[r])
+                << ",key=0x" << static_cast<uint32_t>(remote_keys[r])
+                << std::dec << "}";
+        }
+        oss << " flat_qpns=";
+        int limit = std::min<int>(static_cast<int>(flat_qpns.size()), 32);
+        for (int i = 0; i < limit; ++i) {
+            int peer_rank = i * num_ranks / USE_QP_COUNT;
+            int channel = i % qps_per_rank;
+            oss << "{i=" << i << ",peer=" << peer_rank
+                << ",ch=" << channel << ",qpn=" << flat_qpns[i] << "}";
+        }
+        if (static_cast<int>(flat_qpns.size()) > limit) oss << "...";
+        LOG(INFO) << oss.str();
     }
 
     int ret = rdma_transport_->connectPeers(

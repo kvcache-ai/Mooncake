@@ -125,6 +125,27 @@ struct MooncakeEpBuffer {
     torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                           int hidden, int num_experts);
 
+    std::tuple<torch::Tensor, torch::Tensor> debug_signal_buffers(
+        int num_max_dispatch_tokens_per_rank, int hidden, int num_experts,
+        int buffer_slot);
+
+    torch::Tensor debug_dispatch_recv_src_slots(
+        int num_max_dispatch_tokens_per_rank, int hidden, int num_experts,
+        int buffer_slot);
+
+    torch::Tensor debug_rdma_put_probe(int dst_rank, int64_t dst_byte_offset,
+                                       uint64_t value);
+    torch::Tensor debug_rdma_multi_put_probe(int dst_rank,
+                                             int64_t dst_byte_offset,
+                                             int64_t dst_stride,
+                                             int64_t src_byte_offset,
+                                             int64_t src_stride, int nbytes,
+                                             int nputs);
+    torch::Tensor debug_read_u64(int64_t byte_offset);
+    void debug_clear_u64(int64_t byte_offset);
+
+    int debug_current_buffer_slot() const { return buffer_idx; }
+
     bool ibgda_disabled() const { return ibgda_disabled_; }
 
     bool is_roce() const {

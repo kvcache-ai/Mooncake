@@ -37,7 +37,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",
-             &MooncakeEpBuffer::get_next_combine_buffer);
+             &MooncakeEpBuffer::get_next_combine_buffer)
+        .def("debug_signal_buffers", &MooncakeEpBuffer::debug_signal_buffers)
+        .def("debug_dispatch_recv_src_slots",
+             &MooncakeEpBuffer::debug_dispatch_recv_src_slots)
+        .def("debug_rdma_put_probe", &MooncakeEpBuffer::debug_rdma_put_probe)
+        .def("debug_rdma_multi_put_probe",
+             &MooncakeEpBuffer::debug_rdma_multi_put_probe)
+        .def("debug_read_u64", &MooncakeEpBuffer::debug_read_u64)
+        .def("debug_clear_u64", &MooncakeEpBuffer::debug_clear_u64)
+        .def("debug_current_buffer_slot",
+             &MooncakeEpBuffer::debug_current_buffer_slot);
 }
 
 }  // namespace mooncake

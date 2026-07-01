@@ -8,7 +8,6 @@
 #include "transport/device/device_ops.cuh"
 #include "transport/device/p2p_device.cuh"
 #include "transport/device/ibgda_device.cuh"
-
 namespace mooncake {
 namespace device {
 
@@ -20,6 +19,9 @@ struct CommCtx {
     P2PContext p2p;
     IbgdaContext ibgda;
     int rank;
+    int force_rdma_data;
+    int poll_rdma_put;
+    int rdma_write_signal;
 };
 
 // Construct CommCtx from the raw kernel arguments.
@@ -28,9 +30,13 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     void* gdr_buffer, const int32_t* nvlink_available,
     void* const* ipc_peer_ptrs, void* raddrs, void* rkeys, void* qp_devctxs,
     const void* rdma_send_signal_buffer, const void* rdma_recv_signal_buffer,
-    int rank, int num_ranks, int num_qps) {
+    int rank, int num_ranks, int num_qps, int force_rdma_data = 0,
+    int poll_rdma_put = 0, int rdma_write_signal = 0) {
     CommCtx ctx;
     ctx.rank = rank;
+    ctx.force_rdma_data = force_rdma_data;
+    ctx.poll_rdma_put = poll_rdma_put;
+    ctx.rdma_write_signal = rdma_write_signal;
 
     ctx.p2p.available = nvlink_available;
     ctx.p2p.peer_ptrs = ipc_peer_ptrs;
@@ -72,6 +78,7 @@ __device__ __forceinline__ void* mc_comm_peer_ptr(const CommCtx& ctx,
 __device__ __forceinline__ void* mc_route_put(const CommCtx& ctx, int dst_rank,
                                               void* recv_ptr) {
     if (dst_rank == ctx.rank) return recv_ptr;
+    if (ctx.force_rdma_data) return nullptr;
     if (mc_comm_p2p_available(ctx, dst_rank))
         return mc_comm_peer_ptr(ctx, dst_rank, recv_ptr);
     return nullptr;  // IBGDA path
@@ -89,8 +96,22 @@ __device__ __forceinline__ void mc_rdma_put(
             ctx.ibgda.raddrs[dst_rank] +
             (reinterpret_cast<const char*>(recv_ptr) -
              reinterpret_cast<const char*>(ctx.p2p.local_base));
+        if (ctx.force_rdma_data) {
+            long long recv_off =
+                reinterpret_cast<const char*>(recv_ptr) -
+                reinterpret_cast<const char*>(ctx.p2p.local_base);
+            long long send_off =
+                reinterpret_cast<const char*>(send_ptr) -
+                reinterpret_cast<const char*>(ctx.p2p.local_base);
+            printf("[EP RDMA put] rank=%d dst=%d ch=%d qpr=%d bytes=%u "
+                   "send_off=%lld recv_off=%lld rbase=0x%llx raddr=0x%llx\n",
+                   ctx.rank, dst_rank, channel, qps_per_rank, nbytes,
+                   send_off, recv_off,
+                   static_cast<unsigned long long>(ctx.ibgda.raddrs[dst_rank]),
+                   static_cast<unsigned long long>(recv_raddr));
+        }
         mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
-                     send_ptr, recv_raddr, nbytes);
+                     send_ptr, recv_raddr, nbytes, ctx.poll_rdma_put != 0);
     }
 }
 
@@ -108,13 +129,36 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
         mc_st_release(sig_ptr, val);
         return;
     }
-    if (mc_comm_p2p_available(ctx, dst_rank)) {
+    if (!ctx.force_rdma_data && mc_comm_p2p_available(ctx, dst_rank)) {
         mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
     } else {
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
             (reinterpret_cast<const char*>(sig_ptr) -
              reinterpret_cast<const char*>(ctx.p2p.local_base));
+        if (ctx.force_rdma_data) {
+            long long sig_off =
+                reinterpret_cast<const char*>(sig_ptr) -
+                reinterpret_cast<const char*>(ctx.p2p.local_base);
+            printf("[EP RDMA signal] rank=%d dst=%d ch=%d qpr=%d val=%d "
+                   "sig_off=%lld rbase=0x%llx raddr=0x%llx write_signal=%d\n",
+                   ctx.rank, dst_rank, channel, qps_per_rank, val, sig_off,
+                   static_cast<unsigned long long>(ctx.ibgda.raddrs[dst_rank]),
+                   static_cast<unsigned long long>(recv_raddr),
+                   ctx.rdma_write_signal);
+        }
+        if (ctx.rdma_write_signal) {
+            auto* local_sig_ptr = reinterpret_cast<int*>(
+                reinterpret_cast<uintptr_t>(ctx.ibgda.local_atomic_base) +
+                (reinterpret_cast<const char*>(sig_ptr) -
+                 reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)));
+            mc_st_release(local_sig_ptr, val);
+            mc_fence();
+            mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
+                         local_sig_ptr, recv_raddr, sizeof(int32_t),
+                         ctx.poll_rdma_put != 0);
+            return;
+        }
         uint64_t laddr =
             ctx.ibgda.raddrs[ctx.rank] +
             (reinterpret_cast<const char*>(sig_ptr) -
@@ -122,7 +166,7 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
             (reinterpret_cast<const char*>(ctx.ibgda.local_atomic_base) -
              reinterpret_cast<const char*>(ctx.p2p.local_base));
         mc_ibgda_red_add(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
-                         laddr, recv_raddr, val);
+                         laddr, recv_raddr, val, ctx.poll_rdma_put != 0);
     }
 }
 

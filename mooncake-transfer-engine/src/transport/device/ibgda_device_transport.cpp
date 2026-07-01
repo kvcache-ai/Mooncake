@@ -48,6 +48,7 @@ static constexpr uint32_t kDefaultProxyRingSize = 64;
 
 static uint16_t bswap16(uint16_t v) { return __builtin_bswap16(v); }
 static uint32_t bswap32(uint32_t v) { return __builtin_bswap32(v); }
+static uint64_t bswap64(uint64_t v) { return __builtin_bswap64(v); }
 
 static size_t roundUpToPage(size_t v) {
     size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
@@ -220,6 +221,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int registerMemory(void* ptr, size_t bytes) override {
         int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                      IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+        uintptr_t log_alloc_base = reinterpret_cast<uintptr_t>(ptr);
+        size_t log_alloc_size = bytes;
+        uintptr_t log_reg_iova = reinterpret_cast<uintptr_t>(ptr);
+        size_t log_reg_size = bytes;
+        bool log_dmabuf = false;
 #if defined(USE_MACA)
         CUmemorytype mem_type;
         CUresult result = cuPointerGetAttribute(
@@ -254,6 +260,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             uintptr_t reg_iova = roundDownToPage(alloc_base_u);
             size_t reg_delta = alloc_base_u - reg_iova;
             size_t reg_size = roundUpToPage(alloc_size + reg_delta);
+            log_alloc_base = alloc_base_u;
+            log_alloc_size = alloc_size;
+            log_reg_iova = reg_iova;
+            log_reg_size = reg_size;
+            log_dmabuf = true;
             mr_ = ibv_reg_dmabuf_mr(pd_, 0, reg_size, reg_iova, dmabuf_fd,
                                     access);
             int saved_errno = errno;
@@ -280,6 +291,16 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             return -1;
         }
         mr_ptr_ = ptr;
+        LOG(INFO) << "[EP IBGDA MR] ptr=0x" << std::hex
+                  << reinterpret_cast<uintptr_t>(ptr)
+                  << " alloc_base=0x" << log_alloc_base
+                  << " reg_iova=0x" << log_reg_iova
+                  << " lkey=0x" << mr_->lkey
+                  << " rkey=0x" << mr_->rkey << std::dec
+                  << " bytes=" << bytes
+                  << " alloc_size=" << log_alloc_size
+                  << " reg_size=" << log_reg_size
+                  << " dmabuf=" << log_dmabuf;
         return 0;
     }
 
@@ -519,6 +540,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         size_t ring_offset = static_cast<size_t>(-1);
         mlx5gda_cq_dbr* cq_dbr = nullptr;
         uint64_t cq_ci = 0;
+        uint32_t debug_posts = 0;
     };
 
     static bool shouldUseProxyDoorbell() {
@@ -581,6 +603,17 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
         uint16_t completed =
             static_cast<uint16_t>(bswap16(cqe->wqe_counter) + 1);
+        if (std::getenv("MC_IBGDA_PROXY_DEBUG") && lane.debug_posts < 8) {
+            LOG(INFO) << "[EP IBGDA proxy CQ debug] qpn=" << lane.qp->qpn
+                      << " cq_ci=" << lane.cq_ci
+                      << " expect=" << expect16
+                      << " completed=" << completed
+                      << " opcode=0x" << std::hex
+                      << static_cast<uint32_t>(opcode) << std::dec
+                      << " owner=" << static_cast<uint32_t>(owner)
+                      << " expected_owner="
+                      << static_cast<uint32_t>(expected_owner);
+        }
         ++lane.cq_ci;
         updateCqConsumerIndex(lane);
         return static_cast<int16_t>(completed - expect16) >= 0;
@@ -605,7 +638,18 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             if (!isSuccessCqeOpcode(opcode)) continue;
             uint16_t completed =
                 static_cast<uint16_t>(bswap16(cqe->wqe_counter) + 1);
-            if (static_cast<int16_t>(completed - expect16) >= 0) return true;
+            if (static_cast<int16_t>(completed - expect16) >= 0) {
+                if (std::getenv("MC_IBGDA_PROXY_DEBUG") &&
+                    lane.debug_posts < 8) {
+                    LOG(INFO) << "[EP IBGDA proxy CQ debug] qpn="
+                              << lane.qp->qpn << " collapsed_idx=" << i
+                              << " expect=" << expect16
+                              << " completed=" << completed
+                              << " opcode=0x" << std::hex
+                              << static_cast<uint32_t>(opcode) << std::dec;
+                }
+                return true;
+            }
         }
         return false;
     }
@@ -647,6 +691,28 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         uint32_t wq_head = first_slot->wq_head;
+        if (std::getenv("MC_IBGDA_PROXY_DEBUG") && lane.debug_posts < 8) {
+            auto* wqe = reinterpret_cast<mlx5gda_rdma_write_wqe*>(
+                &wq[(wq_head - 1) & (lane.qp->num_wqebb - 1)]);
+            uint32_t qpn_ds = bswap32(wqe->ctrl.qpn_ds);
+            uint32_t opcode = bswap32(wqe->ctrl.opmod_idx_opcode);
+            uint32_t bytes = bswap32(wqe->data.byte_count);
+            uint32_t lkey = bswap32(wqe->data.lkey);
+            uint32_t rkey = bswap32(wqe->raddr.rkey);
+            uint64_t laddr = bswap64(wqe->data.addr);
+            uint64_t raddr = bswap64(wqe->raddr.raddr);
+            LOG(INFO) << "[EP IBGDA proxy debug] qpn=" << lane.qp->qpn
+                      << " post=" << lane.debug_posts << " head=" << head
+                      << " slot_wq_head=" << wq_head
+                      << " qpn_ds=0x" << std::hex << qpn_ds
+                      << " opcode=0x" << opcode << " laddr=0x" << laddr
+                      << " raddr=0x" << raddr << std::dec
+                      << " bytes=" << bytes << " lkey=0x" << std::hex
+                      << lkey << " rkey=0x" << rkey << std::dec
+                      << " first_qword=0x" << std::hex << wqe->ctrl.qpn_ds
+                      << std::dec;
+            ++lane.debug_posts;
+        }
         postHostDoorbell(lane.qp, dbr, wq, wq_head);
         if (!pollProxyCompletion(lane, wq_head)) {
             ring->error_head = head;

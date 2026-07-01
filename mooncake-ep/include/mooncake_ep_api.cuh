@@ -15,6 +15,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               const int64_t* topk_idx, int* next_clean_buffer, int num_tokens,
               int hidden, int num_max_dispatch_tokens_per_rank, int num_topk,
               int num_experts, int rank, int num_ranks, bool use_fp8,
+              int force_rdma_data, int poll_rdma_put, int rdma_write_signal,
+              int active_qps_per_peer,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
               int phases);
 
@@ -40,8 +42,31 @@ void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              const int64_t* layout_range, int* next_clean_buffer,
              int num_combined_tokens, int hidden,
              int num_max_dispatch_tokens_per_rank, int num_topk,
-             int num_experts, int rank, int num_ranks, void* workspace,
-             cudaStream_t stream, int64_t timeout_ticks, int phases,
-             bool zero_copy);
+             int num_experts, int rank, int num_ranks, int force_rdma_data,
+             int poll_rdma_put, int rdma_write_signal,
+             int active_qps_per_peer, void* workspace, cudaStream_t stream,
+             int64_t timeout_ticks, int phases, bool zero_copy);
+
+void debug_rdma_put_probe(void* mxa_buffer, void* raddrs, void* rkeys,
+                          void* qp_devctxs, int rank, int num_ranks,
+                          int qps_per_rank, int dst_rank,
+                          uint64_t dst_byte_offset, uint64_t src_byte_offset,
+                          uint64_t value,
+                          uint32_t nbytes, uint64_t* local_source,
+                          int poll_completion, cudaStream_t stream);
+
+void debug_rdma_multi_put_probe(
+    void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs, int rank,
+    int num_ranks, int qps_per_rank, int dst_rank, uint64_t dst_byte_offset,
+    uint64_t dst_stride, uint64_t src_byte_offset, uint64_t src_stride,
+    uint32_t nbytes, int nputs, int poll_completion, int delay_iters,
+    int channel_offset, int warmup_puts, uint64_t warmup_dst_offset,
+    uint64_t warmup_src_offset, int pre_post_delay_iters, int prewrite_source,
+    cudaStream_t stream);
+
+void debug_fill_multi_put_sources(void* mxa_buffer, int rank,
+                                  uint64_t src_byte_offset,
+                                  uint64_t src_stride, int nputs,
+                                  cudaStream_t stream);
 
 }  // namespace mooncake

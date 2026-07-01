@@ -95,7 +95,7 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
     if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
 }
 
-__device__ __forceinline__ bool mc_ibgda_proxy_publish_doorbell(
+__device__ __forceinline__ uint64_t mc_ibgda_proxy_publish_doorbell(
     mlx5gda_qp_devctx* qp, uint32_t first_wq_head, uint32_t wqe_count) {
     mlx5gda_proxy_ring* ring = qp->proxy_ring;
     uint64_t tail = ring->producer_tail;
@@ -106,7 +106,7 @@ __device__ __forceinline__ bool mc_ibgda_proxy_publish_doorbell(
     while (tail - completion >= capacity) {
         if (++spins > 100000000u) {
             ring->error_head = tail;
-            return false;
+            return UINT64_MAX;
         }
         __threadfence_system();
         completion = *const_cast<volatile uint64_t*>(&ring->completion_head);
@@ -120,17 +120,18 @@ __device__ __forceinline__ bool mc_ibgda_proxy_publish_doorbell(
     __threadfence_system();
     mc_st_release_u32(&slot->state, MLX5GDA_PROXY_SLOT_POSTED);
     mc_st_release_u64(&ring->producer_tail, tail + 1);
-    return true;
+    return tail;
 }
 
-__device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
+__device__ __forceinline__ uint64_t mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
     uint32_t num_posted = static_cast<uint32_t>(qp->wq_head);
     if (mc_ibgda_proxy_enabled(qp)) {
-        if (!mc_ibgda_proxy_publish_doorbell(qp, num_posted - 1, 1)) {
+        uint64_t ticket = mc_ibgda_proxy_publish_doorbell(qp, num_posted - 1, 1);
+        if (ticket == UINT64_MAX) {
             printf("[EP IBGDA] proxy doorbell publish failed\n");
             __trap();
         }
-        return;
+        return ticket;
     }
 
     // DBR write — always done (NIC polls doorbell record in GPU memory)
@@ -145,6 +146,20 @@ __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
                           *reinterpret_cast<uint64_t*>(last_wqe));
         qp->bf_offset ^= MLX5GDA_BF_SIZE;
     }
+    return UINT64_MAX;
+}
+
+__device__ __forceinline__ void mc_ibgda_wait_proxy_completion(
+    mlx5gda_qp_devctx* qp, uint64_t ticket) {
+    if (ticket == UINT64_MAX) return;
+    mlx5gda_proxy_ring* ring = qp->proxy_ring;
+    uint64_t completion =
+        *const_cast<volatile uint64_t*>(&ring->completion_head);
+    while (static_cast<int64_t>(completion - (ticket + 1)) < 0) {
+        __threadfence_system();
+        completion = *const_cast<volatile uint64_t*>(&ring->completion_head);
+    }
+    __threadfence_system();
 }
 
 // Issue an RDMA WRITE WQE.  laddr/raddr are device VAs; keys are big-endian.
@@ -217,13 +232,21 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
                                              int src_rank, int qps_per_rank,
                                              const void* send_ptr,
                                              uint64_t recv_raddr,
-                                             uint32_t nbytes) {
+                                             uint32_t nbytes,
+                                             bool poll_completion = false) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
     mc_ibgda_write_rdma_write_wqe(qp, reinterpret_cast<uint64_t>(send_ptr),
                                   mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
                                   mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
-    mc_ibgda_post_send_db(qp);
+    uint16_t expect = qp->wq_head;
+    uint64_t proxy_ticket = mc_ibgda_post_send_db(qp);
+    if (poll_completion) {
+        if (mc_ibgda_proxy_enabled(qp))
+            mc_ibgda_wait_proxy_completion(qp, proxy_ticket);
+        else
+            mc_ibgda_poll_cq(qp, expect);
+    }
     mc_ibgda_unlock(qp);
 }
 
@@ -234,13 +257,20 @@ __device__ __forceinline__ void mc_ibgda_red_add(
     int qps_per_rank,
     uint64_t laddr,       // local scratch VA for the atomic result
     uint64_t recv_raddr,  // remote VA of the signal word
-    int32_t value) {
+    int32_t value, bool poll_completion = false) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
     mc_ibgda_write_rdma_atomic_add_wqe(
         qp, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
         mc_bswap32(ctx.rkeys[dst_rank]));
-    mc_ibgda_post_send_db(qp);
+    uint16_t expect = qp->wq_head;
+    uint64_t proxy_ticket = mc_ibgda_post_send_db(qp);
+    if (poll_completion) {
+        if (mc_ibgda_proxy_enabled(qp))
+            mc_ibgda_wait_proxy_completion(qp, proxy_ticket);
+        else
+            mc_ibgda_poll_cq(qp, expect);
+    }
     mc_ibgda_unlock(qp);
 }
 

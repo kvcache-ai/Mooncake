@@ -35,7 +35,7 @@ __global__ void mark_phase_ack_kernel(void* mxa_buffer,
                                       int num_ranks, int epoch) {
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
-        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
+        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT, 0);
 
     for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
          peer += static_cast<int>(blockDim.x)) {
@@ -71,7 +71,7 @@ __global__ void mark_and_wait_phase_ack_kernel(
         int epoch, int64_t timeout_ticks) {
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
-        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
+        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT, 0);
 
     for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
          peer += static_cast<int>(blockDim.x)) {
@@ -142,6 +142,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* next_clean_buffer,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
+         int force_rdma_data, int poll_rdma_put, int rdma_write_signal,
+         int active_qps_per_peer,
          int64_t timeout_ticks,
          int phases) {
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -173,8 +175,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
         rdma_send_signal_buffer, rdma_recv_signal_buffer,
-        rank, num_ranks, MAX_QP_COUNT);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+        rank, num_ranks, MAX_QP_COUNT, force_rdma_data, poll_rdma_put,
+        rdma_write_signal);
+    const size_t num_qp_per_rank = active_qps_per_peer;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -265,6 +268,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     mc_fence();
                 } else {
                     // IBGDA path — send directly from source buffer
+                    __syncwarp();
+                    mc_fence();
                     mc_rdma_put(comm_ctx, dst_expert_local_idx % num_qp_per_rank, dst_rank, num_qp_per_rank,
                                       src_ptr, dst_ptr, num_bytes_per_msg, lane_id);
                 }
@@ -332,6 +337,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
+            if (force_rdma_data && num_tokens_sent > 0) {
+                printf("[EP dispatch count send] rank=%d expert=%d dst_rank=%d dst_local=%d src_rank=%d count=%d sig_off_words=%lld write_signal=%d\n",
+                       rank, responsible_expert_idx, dst_rank,
+                       dst_expert_local_idx, rank, num_tokens_sent,
+                       static_cast<long long>(signal_ptr - reinterpret_cast<int*>(mxa_buffer)),
+                       rdma_write_signal);
+            }
             mc_red_add(comm_ctx, dst_rank, dst_expert_local_idx % num_qp_per_rank, num_qp_per_rank,
                        signal_ptr, static_cast<int32_t>(-num_tokens_sent - 1));
         } else {
@@ -444,8 +456,10 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               const void* x, const int64_t* topk_idx,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-              int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
+              int num_topk, int num_experts, int rank, int num_ranks,
+              bool use_fp8, int force_rdma_data, int poll_rdma_put,
+              int rdma_write_signal, int active_qps_per_peer, void* workspace,
+              cudaStream_t stream, int64_t timeout_ticks, int phases) {
     constexpr int kNumMaxTopK = 11;
 #if defined(MOONCAKE_EP_USE_MACA)
     // C500 uses 64-thread hardware waves. Use 15 waves per CTA to keep the
@@ -491,7 +505,9 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
+              num_topk, num_experts, rank, num_ranks, force_rdma_data, \
+              poll_rdma_put, rdma_write_signal, active_qps_per_peer, \
+              timeout_ticks, phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * kEpWarpSize, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -513,7 +529,8 @@ combine(void* combined_x, int32_t* active_ranks,
         int* atomic_clean_flag,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
-        int num_experts, int rank, int num_ranks,
+        int num_experts, int rank, int num_ranks, int force_rdma_data,
+        int poll_rdma_put, int rdma_write_signal, int active_qps_per_peer,
         int64_t timeout_ticks,
         int phases, bool zero_copy) {
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -539,8 +556,9 @@ combine(void* combined_x, int32_t* active_ranks,
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
         rdma_send_signal_buffer, rdma_recv_signal_buffer,
-        rank, num_ranks, MAX_QP_COUNT);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+        rank, num_ranks, MAX_QP_COUNT, force_rdma_data, poll_rdma_put,
+        rdma_write_signal);
+    const size_t num_qp_per_rank = active_qps_per_peer;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -599,6 +617,7 @@ combine(void* combined_x, int32_t* active_ranks,
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 __syncwarp();
+                mc_fence();
                 mc_rdma_put(comm_ctx, local_expert_idx % num_qp_per_rank, dst_rank, num_qp_per_rank,
                                   buf_ptr, dst_ptr, num_bytes_per_slot, lane_id);
             }
@@ -706,7 +725,8 @@ void combine(void* combined_x, int32_t* active_ranks,
              int* next_clean_buffer,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
-             void* workspace, cudaStream_t stream,
+             int force_rdma_data, int poll_rdma_put, int rdma_write_signal,
+             int active_qps_per_peer, void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy) {
 #if defined(MOONCAKE_EP_USE_MACA)
     constexpr int kNumWarpsPerGroup = 3;
@@ -740,12 +760,194 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               atomic_clean_flag, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
-              num_experts, rank, num_ranks, \
-              timeout_ticks, phases, zero_copy); } break
+              num_experts, rank, num_ranks, force_rdma_data, poll_rdma_put, \
+              rdma_write_signal, active_qps_per_peer, timeout_ticks, phases, \
+              zero_copy); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * kEpWarpSize, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
+}
+
+__global__ void debug_rdma_put_probe_kernel(void* mxa_buffer, void* raddrs,
+                                            void* rkeys, void* qp_devctxs,
+                                            int rank, int dst_rank,
+                                            int qps_per_rank,
+                                            uint64_t dst_byte_offset,
+                                            uint64_t src_byte_offset,
+                                            uint64_t value,
+                                            uint32_t nbytes,
+                                            uint64_t* local_source,
+                                            int poll_completion) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    *local_source = value;
+    mc_fence();
+
+    CommCtx ctx{};
+    ctx.rank = rank;
+    ctx.force_rdma_data = 1;
+    ctx.poll_rdma_put = poll_completion;
+    ctx.rdma_write_signal = 0;
+    ctx.p2p.local_base = mxa_buffer;
+    ctx.p2p.available = nullptr;
+    ctx.p2p.peer_ptrs = nullptr;
+    ctx.ibgda.qp_devctxs = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    ctx.ibgda.raddrs = reinterpret_cast<const uint64_t*>(raddrs);
+    ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(rkeys);
+    ctx.ibgda.local_atomic_base = mxa_buffer;
+    ctx.ibgda.remote_atomic_base = mxa_buffer;
+
+    uint64_t recv_raddr = ctx.ibgda.raddrs[dst_rank] + dst_byte_offset;
+    int qp_idx = dst_rank * qps_per_rank;
+    mlx5gda_qp_devctx* qp = ctx.ibgda.qp_devctxs + qp_idx;
+    printf("[EP debug rdma probe] rank=%d dst=%d qpr=%d off=%llu "
+           "src_off=%llu rbase=0x%llx raddr=0x%llx value=0x%llx "
+           "source=0x%llx qp_idx=%d qpn=%u laddr=0x%llx lkey=0x%x "
+           "rkey=0x%x self_base=0x%llx bytes=%u\n",
+           rank, dst_rank, qps_per_rank,
+           static_cast<unsigned long long>(dst_byte_offset),
+           static_cast<unsigned long long>(src_byte_offset),
+           static_cast<unsigned long long>(ctx.ibgda.raddrs[dst_rank]),
+           static_cast<unsigned long long>(recv_raddr),
+           static_cast<unsigned long long>(value),
+           static_cast<unsigned long long>(*local_source),
+           qp_idx, qp->qpn,
+           static_cast<unsigned long long>(
+               reinterpret_cast<uint64_t>(local_source)),
+           ctx.ibgda.rkeys[rank], ctx.ibgda.rkeys[dst_rank],
+           static_cast<unsigned long long>(ctx.ibgda.raddrs[rank]), nbytes);
+    mc_ibgda_put(ctx.ibgda, 0, dst_rank, rank, qps_per_rank, local_source,
+                 recv_raddr, nbytes, poll_completion != 0);
+}
+
+__global__ void debug_rdma_multi_put_probe_kernel(
+    void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs, int rank,
+    int dst_rank, int qps_per_rank, uint64_t dst_byte_offset,
+    uint64_t dst_stride, uint64_t src_byte_offset, uint64_t src_stride,
+    uint32_t nbytes, int nputs, int poll_completion, int delay_iters,
+    int channel_offset, int warmup_puts, uint64_t warmup_dst_offset,
+    uint64_t warmup_src_offset, int pre_post_delay_iters,
+    int prewrite_source) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    CommCtx ctx{};
+    ctx.rank = rank;
+    ctx.force_rdma_data = 1;
+    ctx.poll_rdma_put = poll_completion;
+    ctx.rdma_write_signal = 0;
+    ctx.p2p.local_base = mxa_buffer;
+    ctx.p2p.available = nullptr;
+    ctx.p2p.peer_ptrs = nullptr;
+    ctx.ibgda.qp_devctxs = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    ctx.ibgda.raddrs = reinterpret_cast<const uint64_t*>(raddrs);
+    ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(rkeys);
+    ctx.ibgda.local_atomic_base = mxa_buffer;
+    ctx.ibgda.remote_atomic_base = mxa_buffer;
+
+    int total_puts = warmup_puts + nputs;
+    for (int i = 0; i < total_puts; ++i) {
+        bool warmup = i < warmup_puts;
+        int logical_i = warmup ? i : i - warmup_puts;
+        uint64_t cur_src_off =
+            warmup ? warmup_src_offset + static_cast<uint64_t>(logical_i) *
+                                             src_stride
+                   : src_byte_offset + static_cast<uint64_t>(logical_i) *
+                                           src_stride;
+        uint64_t cur_dst_off =
+            warmup ? warmup_dst_offset + static_cast<uint64_t>(logical_i) *
+                                             dst_stride
+                   : dst_byte_offset + static_cast<uint64_t>(logical_i) *
+                                           dst_stride;
+        auto* local_source = reinterpret_cast<uint64_t*>(
+            reinterpret_cast<uintptr_t>(mxa_buffer) + cur_src_off);
+        uint64_t value = (rank == 0 ? 0xabc0000000000000ULL
+                                    : 0xdef0000000000000ULL) |
+                         static_cast<uint64_t>(logical_i);
+        if (!prewrite_source) {
+            *local_source = value;
+            mc_fence();
+        }
+        for (int spin = 0; spin < pre_post_delay_iters; ++spin) {
+            __threadfence_system();
+        }
+
+        int channel = (i + channel_offset) % qps_per_rank;
+        uint64_t recv_raddr = ctx.ibgda.raddrs[dst_rank] + cur_dst_off;
+        if (i < 4 || (warmup_puts > 0 && i < warmup_puts + 4)) {
+            int qp_idx = dst_rank * qps_per_rank + channel;
+            mlx5gda_qp_devctx* qp = ctx.ibgda.qp_devctxs + qp_idx;
+            printf("[EP debug multi put] rank=%d dst=%d i=%d warmup=%d ch=%d qpr=%d "
+                   "src_off=%llu dst_off=%llu bytes=%u qpn=%u source=0x%llx\n",
+                   rank, dst_rank, i, warmup ? 1 : 0, channel, qps_per_rank,
+                   static_cast<unsigned long long>(cur_src_off),
+                   static_cast<unsigned long long>(cur_dst_off),
+                   nbytes, qp->qpn,
+                   static_cast<unsigned long long>(*local_source));
+        }
+        mc_ibgda_put(ctx.ibgda, channel, dst_rank, rank, qps_per_rank,
+                     local_source, recv_raddr, nbytes,
+                     poll_completion != 0);
+        for (int spin = 0; spin < delay_iters; ++spin) {
+            __threadfence_system();
+        }
+    }
+}
+
+__global__ void debug_fill_multi_put_sources_kernel(
+    void* mxa_buffer, int rank, uint64_t src_byte_offset, uint64_t src_stride,
+    int nputs) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    for (int i = 0; i < nputs; ++i) {
+        auto* local_source = reinterpret_cast<uint64_t*>(
+            reinterpret_cast<uintptr_t>(mxa_buffer) + src_byte_offset +
+            static_cast<uint64_t>(i) * src_stride);
+        *local_source = ((rank == 0 ? 0xabc0000000000000ULL
+                                    : 0xdef0000000000000ULL) |
+                         static_cast<uint64_t>(i));
+    }
+    mc_fence();
+}
+
+void debug_rdma_put_probe(void* mxa_buffer, void* raddrs, void* rkeys,
+                          void* qp_devctxs, int rank, int num_ranks,
+                          int qps_per_rank, int dst_rank,
+                          uint64_t dst_byte_offset, uint64_t src_byte_offset,
+                          uint64_t value,
+                          uint32_t nbytes, uint64_t* local_source,
+                          int poll_completion, cudaStream_t stream) {
+    (void)num_ranks;
+    SETUP_LAUNCH_CONFIG(1, 1, stream);
+    LAUNCH_KERNEL(&cfg, debug_rdma_put_probe_kernel, mxa_buffer, raddrs, rkeys,
+                  qp_devctxs, rank, dst_rank, qps_per_rank, dst_byte_offset,
+                  src_byte_offset, value, nbytes, local_source,
+                  poll_completion);
+}
+
+void debug_rdma_multi_put_probe(
+    void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs, int rank,
+    int num_ranks, int qps_per_rank, int dst_rank, uint64_t dst_byte_offset,
+    uint64_t dst_stride, uint64_t src_byte_offset, uint64_t src_stride,
+    uint32_t nbytes, int nputs, int poll_completion, int delay_iters,
+    int channel_offset, int warmup_puts, uint64_t warmup_dst_offset,
+    uint64_t warmup_src_offset, int pre_post_delay_iters, int prewrite_source,
+    cudaStream_t stream) {
+    (void)num_ranks;
+    SETUP_LAUNCH_CONFIG(1, 1, stream);
+    LAUNCH_KERNEL(&cfg, debug_rdma_multi_put_probe_kernel, mxa_buffer, raddrs,
+                  rkeys, qp_devctxs, rank, dst_rank, qps_per_rank,
+                  dst_byte_offset, dst_stride, src_byte_offset, src_stride,
+                  nbytes, nputs, poll_completion, delay_iters, channel_offset,
+                  warmup_puts, warmup_dst_offset, warmup_src_offset,
+                  pre_post_delay_iters, prewrite_source);
+}
+
+void debug_fill_multi_put_sources(void* mxa_buffer, int rank,
+                                  uint64_t src_byte_offset,
+                                  uint64_t src_stride, int nputs,
+                                  cudaStream_t stream) {
+    SETUP_LAUNCH_CONFIG(1, 1, stream);
+    LAUNCH_KERNEL(&cfg, debug_fill_multi_put_sources_kernel, mxa_buffer, rank,
+                  src_byte_offset, src_stride, nputs);
 }
 
 } // namespace mooncake
