@@ -93,6 +93,11 @@ class UbTransport : public Transport {
                                         peer_desc);
     }
 
+    // Eagerly establish a UB endpoint connection to the given peer so that
+    // the lazy-connect in the worker thread doesn't fail on first use and
+    // cascade into a failover-to-TCP for early batches.
+    int preConnect(const std::string& peer_nic_path);
+
    private:
     static int init(UbTransport* transport);
 
