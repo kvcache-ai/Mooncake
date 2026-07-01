@@ -3,6 +3,11 @@ name: Publish Master Image
 # Manual trigger only: this installs an already-published PyPI wheel, so it must be
 # run after that version's wheel is published — avoids racing release.yaml, which builds
 # and publishes the wheel in the same v* tag event.
+#
+# Publish flow: validate input -> confirm amd64+arm64 wheels exist -> build multi-arch
+# and push the :<version> tag (and optionally :latest) -> smoke-test amd64 AND arm64.
+# Since this is manually triggered, a failed smoke just means you delete the pushed tag
+# from Docker Hub by hand — no digest/promote dance needed.
 on:
   workflow_dispatch:
     inputs:
@@ -10,28 +15,68 @@ on:
         description: "Published mooncake-transfer-engine version (also the image tag), e.g. 0.3.11.post1"
         required: true
         type: string
-      pip_index_url:
-        description: "pip index URL"
-        required: false
-        default: "https://pypi.org/simple"
-        type: string
       tag_latest:
-        description: "Also tag :latest"
+        description: "Also move :latest to this build. Only enable when publishing the newest release (a backfill/retry of an older wheel must NOT move :latest)."
         required: false
-        default: true
+        default: false
         type: boolean
 
 permissions:
   contents: read
 
+# Serialize publishes so two concurrent runs can't interleave and move :latest backwards.
+concurrency:
+  group: publish-master-image
+  cancel-in-progress: false
+
 jobs:
   publish-master:
     runs-on: ubuntu-22.04
+    env:
+      REPO: docker.io/kvcacheai/mooncake
+      # inputs.* placed in env (not interpolated into shell source) — injection-safe.
+      MOONCAKE_VERSION: ${{ inputs.mooncake_version }}
+      TAG_LATEST: ${{ inputs.tag_latest }}
+      # Pinned for the official image: provenance must always be the public PyPI index.
+      # Debug builds against another index belong in a separate workflow that does NOT
+      # push official kvcacheai/mooncake tags.
+      PIP_INDEX_URL: https://pypi.org/simple
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Validate mooncake_version
+        run: |
+          if ! printf '%s' "$MOONCAKE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$'; then
+            echo "Invalid mooncake_version '$MOONCAKE_VERSION': expected e.g. 0.3.11 or 0.3.11.post1" >&2
+            exit 1
+          fi
+
+      - name: Confirm cp312 amd64+arm64 wheels are published on PyPI
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          v = os.environ["MOONCAKE_VERSION"]
+          url = f"https://pypi.org/pypi/mooncake-transfer-engine/{v}/json"
+          try:
+              data = json.load(urllib.request.urlopen(url, timeout=30))
+          except Exception as e:
+              sys.exit(f"Cannot fetch PyPI metadata for {v}: {e}")
+          arch_ok = {"x86_64": False, "aarch64": False}
+          for f in data.get("urls", []):
+              fn = f.get("filename", "")
+              if fn.endswith(".whl") and "cp312" in fn:
+                  for arch in arch_ok:
+                      if arch in fn:
+                          arch_ok[arch] = True
+          missing = [a for a, ok in arch_ok.items() if not ok]
+          if missing:
+              sys.exit(f"Missing cp312 wheel(s) for {v}: {missing}. "
+                       "Both amd64 (x86_64) and arm64 (aarch64) must be published first.")
+          print(f"cp312 amd64+arm64 wheels present for {v}")
+          PY
 
       - name: Free up disk space
         run: |
@@ -59,31 +104,46 @@ jobs:
       - name: Compute image tags
         id: tags
         run: |
-          REPO="docker.io/kvcacheai/mooncake"
-          TAGS="${REPO}:${{ inputs.mooncake_version }}"
-          if [ "${{ inputs.tag_latest }}" = "true" ]; then
+          TAGS="${REPO}:${MOONCAKE_VERSION}"
+          if [ "$TAG_LATEST" = "true" ]; then
             TAGS="${TAGS}"$'\n'"${REPO}:latest"
           fi
           {
             echo "tags<<EOF"
-            echo "${TAGS}"
+            echo "$TAGS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # Build multi-arch and push the public tag(s) directly. provenance/sbom disabled to
+      # keep the index free of unknown/unknown attestation entries (they would otherwise
+      # show up in `imagetools inspect`).
       - name: Build and push (multi-arch)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/master.Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
+          provenance: false
+          sbom: false
           build-args: |
             MOONCAKE_VERSION=${{ inputs.mooncake_version }}
-            PIP_INDEX_URL=${{ inputs.pip_index_url }}
+            PIP_INDEX_URL=${{ env.PIP_INDEX_URL }}
           tags: ${{ steps.tags.outputs.tags }}
+          push: true
 
-      - name: Smoke test (amd64 import)
+      # Smoke tests run AFTER push. If either fails, delete the pushed tag(s) from
+      # Docker Hub by hand — this workflow is manual, so no auto-cleanup is wired up.
+      - name: Smoke test amd64 (import)
         run: |
           docker run --rm --platform linux/amd64 \
-            "docker.io/kvcacheai/mooncake:${{ inputs.mooncake_version }}" \
-            python3 -c "import mooncake.engine, mooncake.store; print('ok')"
+            "${REPO}:${MOONCAKE_VERSION}" \
+            python3 -c "import mooncake.engine, mooncake.store; print('amd64 ok')"
+
+      # arm64 is the riskier arch here: the aarch64 wheel is manylinux_2_39 (glibc >= 2.39),
+      # which is the whole reason master.Dockerfile pins a trixie base. Smoke it under QEMU.
+      - name: Smoke test arm64 (import, QEMU)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            "${REPO}:${MOONCAKE_VERSION}" \
+            python3 -c "import mooncake.engine, mooncake.store; print('arm64 ok')"
