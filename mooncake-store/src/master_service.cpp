@@ -5004,7 +5004,6 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    auto& tenant_state [[maybe_unused]] = accessor.GetTenantState();
     if (enable_ha_ && oplog_store_) {
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
             OpType::REMOVE, object_id.tenant_id, key, {});
@@ -5175,8 +5174,8 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 if (enable_ha_ && oplog_store_) {
-                    auto err = PersistRemoveForHA(
-                        "RemoveAll(tenant)", normalized_tenant, it->first);
+                    auto err = PersistRemoveForHA("RemoveAll(tenant)",
+                                                  normalized_tenant, it->first);
                     if (!err) {
                         ++it;
                         continue;
