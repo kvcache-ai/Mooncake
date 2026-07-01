@@ -132,6 +132,11 @@ struct MasterConfig {
     // liveness window. Default 1 is conservative; small-object or RDMA-
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
+
+    // Ablation study controls (for paper experiments)
+    bool disable_frequency_aware_eviction = false;
+    int64_t lease_extension_per_access = 30;
+    int64_t max_lease_extension_seconds = 7200;
 };
 
 class MasterServiceSupervisorConfig {
@@ -212,6 +217,11 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // Ablation study controls (for paper experiments)
+    bool disable_frequency_aware_eviction = false;
+    int64_t lease_extension_per_access = 30;
+    int64_t max_lease_extension_seconds = 7200;
+
     // Pod identity for K8s label-based routing
     std::string pod_name;
     std::string pod_namespace;
@@ -253,6 +263,10 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_frequency_aware_eviction =
+            config.disable_frequency_aware_eviction;
+        lease_extension_per_access = config.lease_extension_per_access;
+        max_lease_extension_seconds = config.max_lease_extension_seconds;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -403,6 +417,10 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    // Ablation study controls (for paper experiments)
+    bool disable_frequency_aware_eviction = false;
+    int64_t lease_extension_per_access = 30;
+    int64_t max_lease_extension_seconds = 7200;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -476,6 +494,10 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_frequency_aware_eviction =
+            config.disable_frequency_aware_eviction;
+        lease_extension_per_access = config.lease_extension_per_access;
+        max_lease_extension_seconds = config.max_lease_extension_seconds;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -570,6 +592,10 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_frequency_aware_eviction =
+            config.disable_frequency_aware_eviction;
+        lease_extension_per_access = config.lease_extension_per_access;
+        max_lease_extension_seconds = config.max_lease_extension_seconds;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -669,6 +695,11 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+
+    // Ablation study controls (for paper experiments)
+    bool disable_frequency_aware_eviction_ = false;
+    int64_t lease_extension_per_access_ = 30;
+    int64_t max_lease_extension_seconds_ = 7200;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -938,6 +969,21 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_disable_frequency_aware_eviction(bool v) {
+        disable_frequency_aware_eviction_ = v;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_lease_extension_per_access(int64_t sec) {
+        lease_extension_per_access_ = sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_lease_extension_seconds(int64_t sec) {
+        max_lease_extension_seconds_ = sec;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -980,6 +1026,10 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    // Ablation study controls (for paper experiments)
+    bool disable_frequency_aware_eviction = false;
+    int64_t lease_extension_per_access = 30;
+    int64_t max_lease_extension_seconds = 7200;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1049,6 +1099,10 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_frequency_aware_eviction =
+            config.disable_frequency_aware_eviction;
+        lease_extension_per_access = config.lease_extension_per_access;
+        max_lease_extension_seconds = config.max_lease_extension_seconds;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
@@ -1152,6 +1206,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.disable_frequency_aware_eviction = disable_frequency_aware_eviction_;
+    config.lease_extension_per_access = lease_extension_per_access_;
+    config.max_lease_extension_seconds = max_lease_extension_seconds_;
     return config;
 }
 

@@ -402,6 +402,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    // Frequency-aware eviction parameters
+    disable_frequency_aware_eviction_ = config.disable_frequency_aware_eviction;
+    lease_extension_per_access_ = config.lease_extension_per_access;
+    max_lease_extension_seconds_ = config.max_lease_extension_seconds;
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -6891,6 +6896,15 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                         ++it;
                         continue;
                     }
+                    // CMS frequency-aware: hot objects get a virtual lease
+                    // extension, biasing quota-driven eviction toward cold
+                    // keys.
+                    if (AdjustLeaseTimeoutWithFrequency(
+                            normalized_tenant, it->first,
+                            metadata.lease_timeout) > now) {
+                        ++it;
+                        continue;
+                    }
 
                     auto evict_result = try_evict_group_or_object(
                         it->first, metadata, tenant_state, deferred_replicas,
@@ -6942,6 +6956,30 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                         "(offload_force_evict=true).";
     }
     return total;
+}
+
+std::chrono::system_clock::time_point
+MasterService::AdjustLeaseTimeoutWithFrequency(
+    const std::string& tenant_id, const std::string& key,
+    std::chrono::system_clock::time_point lease_timeout) const {
+    if (!promotion_sketch_) return lease_timeout;
+    if (disable_frequency_aware_eviction_) return lease_timeout;
+
+    // Query CMS frequency WITHOUT incrementing (read-only). This is the
+    // access count accumulated via TryPushPromotionQueue on each GET hit.
+    const auto admission_key = MakeTenantScopedStorageKey(tenant_id, key);
+    const uint8_t freq = promotion_sketch_->count(admission_key);
+    if (freq == 0) return lease_timeout;
+
+    // Each CMS count ~= one access. Extend the effective lease by
+    // lease_extension_per_access_ seconds per access, up to a cap.
+    // Configurable via --lease_extension_per_access and --max_lease_extension
+    // for parameter sensitivity experiments.
+    int64_t extension_sec =
+        std::min(static_cast<int64_t>(freq) * lease_extension_per_access_,
+                 max_lease_extension_seconds_);
+
+    return lease_timeout + std::chrono::seconds(extension_sec);
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,
@@ -7169,6 +7207,63 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         bool has_evictable = can_evict_replicas(it->second);
                         if (has_evictable) shard_evictable_count++;
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
+            // To achieve evicted_count / object_count = evict_ratio_target,
+            // ideally how many object should be evicted in this shard
+            const long ideal_evict_num =
+                std::ceil(object_count * evict_ratio_target) - evicted_count;
+
+            std::vector<std::chrono::system_clock::time_point>
+                candidates;  // can be removed
+            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                for (auto it = tenant_state.metadata.begin();
+                     it != tenant_state.metadata.end(); it++) {
+                    if (it->second.IsHardPinned()) {
+                        continue;
+                    }
+                    if (!it->second.IsLeaseExpired(now) ||
+                        !can_evict_replicas(it->second)) {
+                        continue;
+                    }
+                    if (!it->second.IsSoftPinned(now)) {
+                        // CMS frequency-aware: hot objects use virtual
+                        // lease extension, biasing eviction toward cold
+                        // objects.
+                        auto effective_timeout =
+                            AdjustLeaseTimeoutWithFrequency(
+                                tenant_id, it->first, it->second.lease_timeout);
+                        if (ideal_evict_num > 0) {
+                            candidates.push_back(effective_timeout);
+                        } else {
+                            no_pin_objects.push_back(effective_timeout);
+                        }
+                    } else if (allow_evict_soft_pinned_objects_) {
+                        soft_pin_objects.push_back(
+                            AdjustLeaseTimeoutWithFrequency(
+                                tenant_id, it->first,
+                                it->second.lease_timeout));
+                    }
+                }
+            }
+
+            if (ideal_evict_num > 0 && !candidates.empty()) {
+                long evict_num =
+                    std::min(ideal_evict_num, (long)candidates.size());
+                long shard_evicted_count =
+                    0;  // number of objects evicted from this shard
+                std::nth_element(candidates.begin(),
+                                 candidates.begin() + (evict_num - 1),
+                                 candidates.end());
+                auto target_timeout = candidates[evict_num - 1];
+                for (auto tenant_it = shard->tenants.begin();
+                     tenant_it != shard->tenants.end();) {
+                    auto& tenant_state = tenant_it->second;
+                    auto it = tenant_state.metadata.begin();
+                    while (it != tenant_state.metadata.end()) {
+                        if (it->second.IsHardPinned() ||
+                            !it->second.IsLeaseExpired(now) ||
+                            it->second.IsSoftPinned(now) ||
+                            !can_evict_replicas(it->second)) {
+                            ++it;
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
                             local_candidates[t].push_back(
@@ -7178,6 +7273,30 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             local_soft_pin[t].push_back(
                                 it->second.lease_timeout);
                         }
+                        if (AdjustLeaseTimeoutWithFrequency(
+                                tenant_it->first, it->first,
+                                it->second.lease_timeout) <= target_timeout) {
+                            auto evict_result = try_evict_group_or_object(
+                                tenant_it->first, it->first, it->second, shard,
+                                tenant_state, deferred_replicas,
+                                /*allow_soft_pinned=*/false);
+                            total_freed_size += evict_result.freed_bytes;
+                            if (it->second.IsValid() == false) {
+                                it = EraseMetadata(tenant_state, it,
+                                                   tenant_it->first);
+                            } else {
+                                ++it;
+                            }
+                            shard_evicted_count += evict_result.evicted_objects;
+                        } else {
+                            no_pin_objects.push_back(it->second.lease_timeout);
+                            ++it;
+                        }
+                    }
+                    if (tenant_state.Empty()) {
+                        tenant_it = shard->tenants.erase(tenant_it);
+                    } else {
+                        ++tenant_it;
                     }
                 }
                 local_object_count[t] += shard_metadata_count;
@@ -7324,7 +7443,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                target_evict_num > 0) {
                             if (!it->second.IsHardPinned() &&
                                 it->second.IsLeaseExpired(now) &&
-                                it->second.lease_timeout <= target_timeout &&
+                                AdjustLeaseTimeoutWithFrequency(
+                                    tenant_it->first, it->first,
+                                    it->second.lease_timeout) <=
+                                    target_timeout &&
                                 !it->second.IsSoftPinned(now) &&
                                 can_evict_replicas(it->second)) {
                                 auto evict_result = try_evict_group_or_object(
@@ -7385,7 +7507,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 continue;
                             }
                             if (!it->second.IsSoftPinned(now) ||
-                                it->second.lease_timeout <=
+                                AdjustLeaseTimeoutWithFrequency(
+                                    tenant_it->first, it->first,
+                                    it->second.lease_timeout) <=
                                     soft_target_timeout) {
                                 auto evict_result = try_evict_group_or_object(
                                     tenant_it->first, it->first, it->second,
@@ -7534,6 +7658,13 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 auto& metadata = it->second;
                 if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                     metadata.IsSoftPinned(now)) {
+                    ++it;
+                    continue;
+                }
+                // CMS frequency-aware: hot objects get a virtual lease
+                // extension, biasing eviction toward cold objects.
+                if (AdjustLeaseTimeoutWithFrequency(
+                        tenant_id, it->first, metadata.lease_timeout) > now) {
                     ++it;
                     continue;
                 }

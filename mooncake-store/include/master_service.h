@@ -816,6 +816,12 @@ class MasterService {
     // evict ratio target. If the actual evicted ratio is less than
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
+    //
+    // CMS Frequency-Aware Eviction: When promotion_sketch_ is available, the
+    // effective lease timeout is boosted by the CMS access frequency count.
+    // Hot objects (high CMS count) get a virtual lease extension, making them
+    // less likely to be evicted than cold objects with the same real lease
+    // timeout. This is a novel use of CountMinSketch for eviction tuning.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
@@ -825,6 +831,13 @@ class MasterService {
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const std::string& tenant_id, uint64_t target_bytes);
+
+    // Compute a frequency-adjusted lease timeout for eviction selection.
+    // Uses CMS count (if available) to extend the effective lease of
+    // frequently-accessed objects, biasing eviction toward cold objects.
+    std::chrono::system_clock::time_point AdjustLeaseTimeoutWithFrequency(
+        const std::string& tenant_id, const std::string& key,
+        std::chrono::system_clock::time_point lease_timeout) const;
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
@@ -1927,6 +1940,14 @@ class MasterService {
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
+
+    // Ablation study controls (for paper experiments)
+    bool disable_frequency_aware_eviction_{false};
+
+    // Frequency-aware eviction parameters (configurable for sensitivity
+    // experiments)
+    int64_t lease_extension_per_access_{30};     // seconds per CMS count
+    int64_t max_lease_extension_seconds_{7200};  // cap at 2 hours
 
     const std::string ha_backend_type_;
 
