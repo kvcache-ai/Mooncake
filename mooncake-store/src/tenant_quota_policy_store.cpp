@@ -30,6 +30,10 @@ bool IsValidTenantQuotaName(const std::string& name) {
     return IsValidTenantId(name);
 }
 
+std::string ErrnoMessage(const std::string& action, const std::string& path) {
+    return action + " '" + path + "' failed: " + std::strerror(errno);
+}
+
 #ifdef STORE_USE_ETCD
 tl::expected<std::string, std::string> NormalizeClusterIdForEtcdKey(
     const std::string& cluster_id) {
@@ -37,6 +41,9 @@ tl::expected<std::string, std::string> NormalizeClusterIdForEtcdKey(
         cluster_id.empty() ? std::string(DEFAULT_CLUSTER_ID) : cluster_id;
     while (!normalized.empty() && normalized.back() == '/') {
         normalized.pop_back();
+    }
+    if (normalized.empty()) {
+        normalized = DEFAULT_CLUSTER_ID;
     }
     if (!IsValidClusterIdComponent(normalized)) {
         return tl::make_unexpected("invalid tenant quota etcd cluster_id '" +
@@ -53,12 +60,6 @@ tl::expected<std::string, std::string> BuildTenantQuotaEtcdKey(
     }
     return "mooncake-store/" + normalized.value() + "/tenant_quota_policy";
 }
-
-std::string ErrnoMessage(const std::string& action, const std::string& path) {
-    return action + " '" + path + "' failed: " + std::strerror(errno);
-}
-
-std::string ToErrorString(ErrorCode error) { return toString(error); }
 #endif
 
 tl::expected<void, std::string> WriteAll(int fd, const std::string& content,
@@ -376,8 +377,8 @@ tl::expected<void, std::string> YamlTenantQuotaPolicyStore::Save(
 }
 
 #ifdef STORE_USE_ETCD
-EtcdTenantQuotaPolicyStore::EtcdTenantQuotaPolicyStore(std::string endpoints,
-                                                       std::string cluster_id) {
+EtcdTenantQuotaPolicyStore::EtcdTenantQuotaPolicyStore(
+    const std::string& endpoints, const std::string& cluster_id) {
     auto key = BuildTenantQuotaEtcdKey(cluster_id);
     if (!key) {
         throw std::invalid_argument(key.error());
@@ -388,8 +389,14 @@ EtcdTenantQuotaPolicyStore::EtcdTenantQuotaPolicyStore(std::string endpoints,
     }
     ErrorCode connect_error = EtcdHelper::ConnectToEtcdStoreClient(endpoints);
     if (connect_error != ErrorCode::OK) {
+        if (connect_error == ErrorCode::INVALID_PARAMS) {
+            throw std::runtime_error(
+                "failed to connect tenant quota etcd store: "
+                "tenant_quota_connector_uri must match the already connected "
+                "store etcd endpoints used by HA/oplog");
+        }
         throw std::runtime_error("failed to connect tenant quota etcd store: " +
-                                 ToErrorString(connect_error));
+                                 toString(connect_error));
     }
     key_ = std::move(key.value());
 }
@@ -405,7 +412,7 @@ EtcdTenantQuotaPolicyStore::Load() {
         return tl::make_unexpected(
             "failed to load tenant quota policy from "
             "etcd key '" +
-            key_ + "': " + ToErrorString(error));
+            key_ + "': " + toString(error));
     }
     return ParseTenantQuotaPolicyYaml(content);
 }
@@ -420,7 +427,7 @@ tl::expected<void, std::string> EtcdTenantQuotaPolicyStore::Save(
         return tl::make_unexpected(
             "failed to save tenant quota policy to "
             "etcd key '" +
-            key_ + "': " + ToErrorString(error));
+            key_ + "': " + toString(error));
     }
     return {};
 }

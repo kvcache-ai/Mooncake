@@ -288,7 +288,7 @@ mooncake_master \
   --tenant_quota_connector_uri=127.0.0.1:2379
 ```
 
-The etcd connector stores the policy at `mooncake-store/<cluster_id>/tenant_quota_policy`. The policy must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
+The etcd connector stores the policy at `mooncake-store/<cluster_id>/tenant_quota_policy`. It shares the process-wide store etcd client used by HA/oplog, so if HA or oplog also uses etcd, `tenant_quota_connector_uri` must match those etcd endpoints. The policy must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
 
 ```yaml
 version: 1

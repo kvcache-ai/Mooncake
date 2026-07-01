@@ -48,7 +48,8 @@ class YamlTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
 #ifdef STORE_USE_ETCD
 class EtcdTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
    public:
-    EtcdTenantQuotaPolicyStore(std::string endpoints, std::string cluster_id);
+    EtcdTenantQuotaPolicyStore(const std::string& endpoints,
+                               const std::string& cluster_id);
 
     tl::expected<TenantQuotaPolicySnapshot, std::string> Load() override;
     tl::expected<void, std::string> Save(
