@@ -4386,10 +4386,21 @@ long MasterService::RemoveAll(bool force) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
 
-    // Collect client_ids that own LOCAL_DISK replicas, so we can signal
-    // them to physically clear their SSD via pending_remove_all.
-    std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
+    // Since RemoveAll clears everything, signal ALL clients with a
+    // LocalDiskSegment to physically clear their SSD immediately.
+    // This lets client cleanup overlap with master metadata deletion.
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        for (auto& [client_id, segment] : client_local_disk_segment) {
+            MutexLocker locker(&segment->offloading_mutex_);
+            segment->pending_remove_all = true;
+        }
+    }
 
+    // Delete metadata — runs concurrently with client SSD cleanup.
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         for (auto tenant_it = shard->tenants.begin();
@@ -4400,14 +4411,6 @@ long MasterService::RemoveAll(bool force) {
                 if ((force || it->second.IsLeaseExpired(now)) &&
                     it->second.AllReplicas(&Replica::fn_is_completed) &&
                     !tenant_state.replication_tasks.contains(it->first)) {
-                    it->second.VisitReplicas(
-                        &Replica::fn_is_local_disk_replica,
-                        [&clients_with_disk_replicas](const Replica& replica) {
-                            auto cid = replica.get_local_disk_client_id();
-                            if (cid) {
-                                clients_with_disk_replicas.insert(*cid);
-                            }
-                        });
                     auto mem_rep_count = it->second.CountReplicas(
                         &Replica::fn_is_memory_replica);
                     total_freed_size += it->second.size * mem_rep_count;
@@ -4428,25 +4431,9 @@ long MasterService::RemoveAll(bool force) {
         }
     }
 
-    // Signal each client that owns disk replicas to clear their SSD.
-    if (!clients_with_disk_replicas.empty()) {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        for (const auto& client_id : clients_with_disk_replicas) {
-            auto seg_it = client_local_disk_segment.find(client_id);
-            if (seg_it != client_local_disk_segment.end()) {
-                MutexLocker locker(&seg_it->second->offloading_mutex_);
-                seg_it->second->pending_remove_all = true;
-            }
-        }
-    }
-
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
-            << ", total_freed_size=" << total_freed_size
-            << ", signaled_clients=" << clients_with_disk_replicas.size();
+            << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
 
@@ -4457,7 +4444,17 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     auto now = std::chrono::system_clock::now();
     const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
 
-    std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
+    // Signal ALL clients to clear their SSD — overlaps with metadata deletion.
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        for (auto& [client_id, segment] : client_local_disk_segment) {
+            MutexLocker locker(&segment->offloading_mutex_);
+            segment->pending_remove_all = true;
+        }
+    }
 
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
@@ -4471,14 +4468,6 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
             if ((force || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
                 !tenant_state.replication_tasks.contains(it->first)) {
-                it->second.VisitReplicas(
-                    &Replica::fn_is_local_disk_replica,
-                    [&clients_with_disk_replicas](const Replica& replica) {
-                        auto cid = replica.get_local_disk_client_id();
-                        if (cid) {
-                            clients_with_disk_replicas.insert(*cid);
-                        }
-                    });
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
@@ -4496,24 +4485,10 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
         }
     }
 
-    if (!clients_with_disk_replicas.empty()) {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        for (const auto& client_id : clients_with_disk_replicas) {
-            auto seg_it = client_local_disk_segment.find(client_id);
-            if (seg_it != client_local_disk_segment.end()) {
-                MutexLocker locker(&seg_it->second->offloading_mutex_);
-                seg_it->second->pending_remove_all = true;
-            }
-        }
-    }
-
     VLOG(1) << "action=remove_all_objects"
             << ", tenant_id=" << normalized_tenant
             << ", removed_count=" << removed_count
-            << ", signaled_clients=" << clients_with_disk_replicas.size();
+            << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
 
