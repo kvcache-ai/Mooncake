@@ -250,9 +250,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     } else {
         http_metadata_prefix_ = "mooncake/";
     }
-    if (allocation_strategy_type_ ==
-        AllocationStrategyType::HOST_AWARE_LOCAL_FIRST) {
-        LOG(INFO) << "Host-aware local-first allocation strategy enabled";
+    if (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST) {
+        LOG(INFO) << "Local-first allocation strategy enabled";
     }
 
     if (enable_snapshot_ || enable_snapshot_restore_) {
@@ -2695,12 +2694,11 @@ auto MasterService::AllocateAndInsertMetadata(
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     if (config.replica_num > 0) {
-        const bool use_host_aware_local_first =
-            allocation_strategy_type_ ==
-                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST &&
+        const bool use_local_first =
+            allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
             config.replica_num == 1;
         std::string writer_host_id;
-        if (use_host_aware_local_first) {
+        if (use_local_first) {
             writer_host_id = GetClientHostId(client_id);
         }
 

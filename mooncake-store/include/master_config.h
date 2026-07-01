@@ -506,15 +506,14 @@ class WrappedMasterServiceConfig {
         } else if (config.allocation_strategy == "ssd_free_ratio_first") {
             allocation_strategy_type =
                 AllocationStrategyType::SSD_FREE_RATIO_FIRST;
-        } else if (config.allocation_strategy == "host_aware_local_first") {
-            allocation_strategy_type =
-                AllocationStrategyType::HOST_AWARE_LOCAL_FIRST;
+        } else if (config.allocation_strategy == "local_first") {
+            allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
                          << "Valid options are: random, free_ratio_first, cxl, "
-                            "ssd_free_ratio_first, host_aware_local_first "
+                            "ssd_free_ratio_first, local_first "
                             "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }

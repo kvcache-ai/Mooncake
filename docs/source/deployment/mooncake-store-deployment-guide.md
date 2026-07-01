@@ -450,7 +450,7 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--allocation_strategy` | `random` | Allocation strategy: `random` (pure random, fastest), `free_ratio_first` (best memory load balance), `ssd_free_ratio_first` (SSD-aware free-ratio-first), `cxl` (prefer CXL memory), or `host_aware_local_first` (prefer writer-host memory segments before ordered remote fallback) |
+| `--allocation_strategy` | `random` | Allocation strategy: `random` (pure random, fastest), `free_ratio_first` (best memory load balance), `ssd_free_ratio_first` (SSD-aware free-ratio-first), `cxl` (prefer CXL memory), or `local_first` (prefer local host memory segments before ordered remote fallback) |
 
 ### PutStart Timeouts
 
@@ -592,14 +592,14 @@ rpc_interface: "eth0"
 rpc_port: 50051
 ```
 
-### Host-aware Local-first Allocation
+### Local-first Allocation
 
 Mooncake can prefer memory segments on the writer's host before falling back to remote hosts. This is useful when colocating inference workers and store segments, because a store node failure only invalidates the KV cache written to that host instead of spreading one request's cache across the whole cluster.
 
-This feature is disabled by default. Enable it on the master by selecting the host-aware allocation strategy:
+This feature is disabled by default. Enable it on the master by selecting the local-first allocation strategy:
 
 ```yaml
-allocation_strategy: "host_aware_local_first"
+allocation_strategy: "local_first"
 ```
 
 When enabled, the master applies local-first allocation only for memory replicas with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` are tried first; if they are unavailable or full, Mooncake falls back to the writer host and then remote hosts in lexicographic host-id order. Within the same host, segment names are sorted and rotated by key hash so multiple segments on one host do not always receive the first allocation attempt.
