@@ -113,6 +113,12 @@ class OperationState {
  */
 class EmptyOperationState : public OperationState {
    public:
+    EmptyOperationState() {
+        // Pre-set result so get_result() does not assert - this state is
+        // always considered successfully completed (no async work needed).
+        result_.emplace(ErrorCode::OK);
+    }
+
     bool is_completed() override { return true; }
 
     void wait_for_completion() override {}

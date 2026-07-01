@@ -1010,6 +1010,12 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    // Pre-allocate to avoid repeated vector growth.
+    size_t total_slices = 0;
+    for (const auto& slices : all_slices) {
+        total_slices += slices.size();
+    }
+    requests.reserve(total_slices);
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
@@ -1053,6 +1059,12 @@ TransferSubmitter::submit_batch_get_offload_object(
     const std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    // Pre-allocate to avoid repeated vector growth.
+    size_t total_slices = 0;
+    for (const auto& [key, slices] : batched_slices) {
+        total_slices += slices.size();
+    }
+    requests.reserve(total_slices);
     // Open the segment once — all keys share the same transfer_engine_addr.
     SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
     if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
@@ -1089,42 +1101,81 @@ TransferSubmitter::submit_batch_get_offload_object(
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
-    auto state = std::make_shared<MemcpyOperationState>();
-
-    // Create memcpy operations
-    std::vector<MemcpyOperation> operations;
-    operations.reserve(slices.size());
+    // For same-process memcpy transfers, do the memcpy INLINE on the calling
+    // thread instead of dispatching to the single-threaded worker pool.
+    // This avoids ~20-50us of thread-scheduling overhead (queue lock + context
+    // switch + CV signal + CV wait) per transfer. The memcpy itself is only
+    // ~10-20us for 128KB, so the worker pool overhead was often >100% of the
+    // actual work. We still use the worker pool for very large transfers
+    // (>1MB) to avoid blocking the calling thread for too long.
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
     uint64_t offset = src_offset;
+    uint64_t total_size = 0;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
+        if (slice.ptr != nullptr) {
+            total_size += slice.size;
+        }
+    }
 
+    // For transfers <= 1MB, do inline memcpy to avoid worker pool overhead
+    constexpr uint64_t kInlineMemcpyThreshold = 1ull * 1024 * 1024;
+
+    if (total_size <= kInlineMemcpyThreshold) {
+        offset = src_offset;
+        for (size_t i = 0; i < slices.size(); ++i) {
+            const auto& slice = slices[i];
+            if (slice.ptr == nullptr) continue;
+
+            void* dest;
+            const void* src;
+            if (op_code == TransferRequest::READ) {
+                dest = slice.ptr;
+                src = reinterpret_cast<const void*>(base_address + offset);
+            } else {
+                dest = reinterpret_cast<void*>(base_address + offset);
+                src = slice.ptr;
+            }
+            offset += slice.size;
+            std::memcpy(dest, src, slice.size);
+        }
+
+        // Return a pre-completed future (no async work needed)
+        auto state = std::make_shared<EmptyOperationState>();
+        VLOG(2) << "Inline memcpy completed: " << slices.size() << " slices, "
+                << total_size << " bytes";
+        return TransferFuture(state);
+    }
+
+    // For large transfers (>1MB), use the worker pool to avoid blocking
+    auto state = std::make_shared<MemcpyOperationState>();
+    std::vector<MemcpyOperation> operations;
+    operations.reserve(slices.size());
+    offset = src_offset;
+
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& slice = slices[i];
         if (slice.ptr == nullptr) continue;
 
         void* dest;
         const void* src;
-
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local buffer)
             dest = slice.ptr;
             src = reinterpret_cast<const void*>(base_address + offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote buffer)
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
         offset += slice.size;
-
         operations.emplace_back(dest, src, slice.size);
     }
 
-    // Submit memcpy operations to worker pool for async execution
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
-            << " operations";
+    VLOG(1) << "Large memcpy submitted to worker pool: " << slices.size()
+            << " slices, " << total_size << " bytes";
 
     return TransferFuture(state);
 }
