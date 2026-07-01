@@ -77,6 +77,7 @@ setup(
             sources=[
                 "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",
+                "src/mooncake_pg_experimental.cpp",
                 "src/p2p_proxy.cpp",
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_host.cpp",
