@@ -272,8 +272,13 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 
     auto &local_slice_queue = collective_slice_queue_[thread_id];
-    for (int shard_id = thread_id; shard_id < kShardCount;
-         shard_id += kTransferWorkerCount) {
+    // When thread 0 is dedicated poller, remap posting threads to cover all shards
+    const int post_count =
+        (kTransferWorkerCount > 1) ? (kTransferWorkerCount - 1) : kTransferWorkerCount;
+    const int post_tid =
+        (kTransferWorkerCount > 1) ? (thread_id - 1) : thread_id;
+    for (int shard_id = post_tid; shard_id < kShardCount;
+         shard_id += post_count) {
         if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) == 0)
             continue;
 
@@ -370,8 +375,7 @@ void WorkerPool::performPollCq(int thread_id) {
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int *, int> qp_depth_set;
     SliceList failed_slice_list;  // Unified: collect all slices for redispatch
-    for (int cq_index = thread_id; cq_index < context_.cqCount();
-         cq_index += kTransferWorkerCount) {
+    for (int cq_index = 0; cq_index < context_.cqCount(); cq_index++) {
         ibv_wc wc[kPollCount];
         int nr_poll = context_.poll(kPollCount, wc, cq_index);
         if (nr_poll < 0) {
@@ -513,6 +517,8 @@ void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
     uint64_t last_wait_ts = getCurrentTimeInNano();
+    // When multiple workers, thread 0 is dedicated CQ poller, others only post
+    const bool is_dedicated_poller = (kTransferWorkerCount > 1 && thread_id == 0);
     while (workers_running_.load(std::memory_order_relaxed)) {
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
@@ -537,10 +543,13 @@ void WorkerPool::transferWorker(int thread_id) {
             }
             continue;
         }
-        performPostSend(thread_id);
+        if (is_dedicated_poller) {
 #ifndef USE_FAKE_POST_SEND
-        performPollCq(thread_id);
+            performPollCq(thread_id);
 #endif
+        } else {
+            performPostSend(thread_id);
+        }
         last_wait_ts = getCurrentTimeInNano();
     }
 }
