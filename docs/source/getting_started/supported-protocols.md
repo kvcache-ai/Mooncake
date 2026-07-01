@@ -9,6 +9,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **tcp** | Standard network | General purpose, works everywhere | ✅ Primary |
 | **rdma** | RDMA-capable NIC | High-performance, low-latency | ✅ Primary |
 | **efa** | AWS EFA-capable instance | High-performance on AWS (libfabric SRD) | ✅ Primary |
+| **cxi** | HPE Slingshot/CXI fabric | High-performance on HPE Cray systems | ⚠️ Advanced |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
 | **nvlink_intra** | NVIDIA NVLink | Intra-node GPU communication | ⚠️ Advanced |
@@ -90,14 +91,14 @@ engine.initialize(
     hostname="node1",
     metadata_server="P2PHANDSHAKE",
     protocol="rdma",
-    device_name="auto-discovery"  # Automatically detect optimal device
+    device_name=""  # Empty string enables topology auto-discovery
 )
 ```
 
 ```bash
 # Environment variables
 export MOONCAKE_PROTOCOL="rdma"
-export MOONCAKE_DEVICE="mlx5_0"  # or "auto-discovery"
+export MOONCAKE_DEVICE="mlx5_0"  # leave unset or empty for auto-discovery
 ```
 
 **Device Discovery:**
@@ -164,6 +165,40 @@ cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON
 - ~88% of RoCE RDMA throughput
 
 **Documentation:** See [EFA Transport](../design/transfer-engine/efa_transport.md) for build instructions, benchmarks, and tuning.
+
+### CXI (HPE Slingshot)
+
+**Description:** HPE Slingshot/CXI transport using libfabric's CXI provider for systems with HPE Cray Slingshot networking.
+
+**Use When:**
+- Running on HPE Cray systems with Slingshot/CXI networking
+- High-performance fabric access is required outside traditional ibverbs RDMA
+
+**Configuration:**
+```python
+# Python API
+engine.initialize(
+    hostname="localhost",
+    metadata_server="P2PHANDSHAKE",
+    protocol="cxi",
+    device_name=""  # Empty string discovers available CXI devices
+)
+```
+
+**Build Requirements:**
+```bash
+cmake .. -DUSE_CXI=ON
+```
+
+> **Note:** `-DUSE_CXI=ON` requires libfabric with CXI provider support and CXI-capable hardware/runtime libraries.
+
+**Advantages:**
+- Uses native CXI fabric support through libfabric
+- Supports multi-NIC registration and transfer paths on Slingshot systems
+
+**Limitations:**
+- Requires HPE Slingshot/CXI hardware and matching libfabric provider
+- Intended for specialized HPC environments
 
 ## Advanced Protocols (C++ Transfer Engine)
 
@@ -306,7 +341,7 @@ export MOONCAKE_DEVICE="mlx5_0"
 
 # RDMA with auto-discovery
 export MOONCAKE_PROTOCOL="rdma"
-export MOONCAKE_DEVICE="auto-discovery"
+export MOONCAKE_DEVICE=""
 
 # Other configuration
 export MOONCAKE_MASTER="10.0.0.1:50051"
@@ -321,6 +356,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Development/Testing | tcp | Simple setup, no special hardware |
 | Production Inference | rdma | Best performance and latency |
 | AWS Cloud (EFA instances) | efa | High performance on p5e, p6-b200, p4d, etc. |
+| HPE Cray / Slingshot | cxi | Requires `-DUSE_CXI=ON` and CXI-capable libfabric |
 | Cloud Environments | tcp or rdma (if available) | Check cloud provider support |
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |

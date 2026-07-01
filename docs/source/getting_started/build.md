@@ -275,6 +275,7 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DMLU_INCLUDE_DIR=/path/to/include`: Override the Neuware include directory when `-DUSE_MLU=ON`.
 - `-DMLU_LIB_DIR=/path/to/lib64`: Override the Neuware library directory when `-DUSE_MLU=ON`.
 - `-DUSE_EFA=[ON|OFF]`: Enable AWS Elastic Fabric Adapter transport via libfabric. **Default: OFF.** See [EFA Transport](../design/transfer-engine/efa_transport.md) for details.
+- `-DUSE_CXI=[ON|OFF]`: Enable HPE Slingshot/CXI transport via libfabric. **Default: OFF.** Requires CXI-capable hardware and a libfabric build with the CXI provider.
 - `-DUSE_INTRA_NVLINK=[ON|OFF]`: Enable intranode nvlink transport
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
