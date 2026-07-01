@@ -1,10 +1,20 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
 #include <transfer_engine.h>
 
 namespace mooncake {
+
+namespace {
+
+int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce) {
+    if (!is_roce) return qps_per_rank;
+    return std::min(qps_per_rank, kEpActiveQpsPerRank);
+}
+
+}  // namespace
 
 // Initialize an RDMA transport: register memory, allocate control buffer,
 // create QPs.  Returns true on success, false if IBGDA is unavailable.
@@ -209,6 +219,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
+    int active_qps_per_rank = active_qps_per_rank_for_ep(
+        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce());
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
@@ -247,7 +259,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases);
+            timeout_ticks, phases, active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -367,6 +379,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
+    int active_qps_per_rank = active_qps_per_rank_for_ep(
+        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce());
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
@@ -405,7 +419,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy);
+            zero_copy, active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
