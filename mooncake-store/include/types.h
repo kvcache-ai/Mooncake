@@ -468,9 +468,10 @@ struct Segment {
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
     std::string protocol;
+    std::string host_id{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
  * @brief Allocation strategy type for segment allocation
@@ -480,6 +481,7 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
     SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    LOCAL_FIRST            // Prefer local host before ordered remote fallback
 };
 
 /**

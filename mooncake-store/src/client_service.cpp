@@ -278,12 +278,17 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr,
                      tenant_id),
       local_hostname_(local_hostname),
+      host_id_(ResolveMooncakeHostId(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
+    if (!host_id_.empty()) {
+        master_client_.SetHostId(host_id_);
+        LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
+    }
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
@@ -386,6 +391,14 @@ Client::~Client() {
     hot_cache_handler_.reset();
     UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
+}
+
+ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
+    ReplicateConfig client_cfg = config;
+    if (!host_id_.empty()) {
+        client_cfg.host_id = host_id_;
+    }
+    return client_cfg;
 }
 
 static std::optional<bool> get_auto_discover() {
@@ -1515,7 +1528,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1625,7 +1638,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1711,7 +1724,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2547,7 +2560,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2797,6 +2810,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
+        segment.host_id = host_id_;
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {

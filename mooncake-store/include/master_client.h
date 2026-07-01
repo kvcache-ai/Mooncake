@@ -415,6 +415,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
 
+    void SetHostId(std::string host_id) { host_id_ = std::move(host_id); }
+
     /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
@@ -704,6 +706,7 @@ class MasterClient {
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
+    std::string host_id_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
 

@@ -575,7 +575,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
-    auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
+    auto Ping(const UUID& client_id, const std::string& host_id = "")
+        -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name
@@ -829,6 +830,8 @@ class MasterService {
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
     std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+    void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
+    std::string GetClientHostId(const UUID& client_id) const;
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
@@ -1860,6 +1863,7 @@ class MasterService {
     mutable std::shared_mutex client_mutex_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
+    std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
