@@ -65,6 +65,26 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                                        buffer_id, device_id, retry_count);
 }
 
+static bool workerCanPost(int thread_id) {
+    return kTransferWorkerCount == 1 || thread_id != 0;
+}
+
+static bool workerCanPoll(int thread_id) {
+    return kTransferWorkerCount == 1 || thread_id == 0;
+}
+
+static void getPostingShardAssignment(int thread_id, int &post_tid,
+                                      int &post_count) {
+    assert(workerCanPost(thread_id));
+    if (kTransferWorkerCount > 1) {
+        post_tid = thread_id - 1;
+        post_count = kTransferWorkerCount - 1;
+    } else {
+        post_tid = thread_id;
+        post_count = kTransferWorkerCount;
+    }
+}
+
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
@@ -252,10 +272,14 @@ int WorkerPool::submitPostSend(
 }
 
 void WorkerPool::performPostSend(int thread_id) {
+    int post_tid = 0;
+    int post_count = 0;
+    getPostingShardAssignment(thread_id, post_tid, post_count);
+
     // Fast-fail if context is unhealthy due to catastrophic hardware failure
     if (!contextHealthy()) {
-        for (int shard_id = thread_id; shard_id < kShardCount;
-             shard_id += kTransferWorkerCount) {
+        for (int shard_id = post_tid; shard_id < kShardCount;
+             shard_id += post_count) {
             if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) ==
                 0)
                 continue;
@@ -272,11 +296,6 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 
     auto &local_slice_queue = collective_slice_queue_[thread_id];
-    // When thread 0 is dedicated poller, remap posting threads to cover all shards
-    const int post_count =
-        (kTransferWorkerCount > 1) ? (kTransferWorkerCount - 1) : kTransferWorkerCount;
-    const int post_tid =
-        (kTransferWorkerCount > 1) ? (thread_id - 1) : thread_id;
     for (int shard_id = post_tid; shard_id < kShardCount;
          shard_id += post_count) {
         if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) == 0)
@@ -454,6 +473,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             int thread_id) {
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
+    const bool use_local_queue = workerCanPost(thread_id);
+    int shared_redispatch_count = 0;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
         if (!segment_desc_map.count(target_id)) {
@@ -500,14 +521,32 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                         << ", length=" << slice->length
                         << ", retry_cnt=" << slice->rdma.retry_cnt;
             }
-            collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+            if (use_local_queue) {
+                collective_slice_queue_[thread_id][peer_nic_path].push_back(
+                    slice);
+            } else {
+                int shard_id =
+                    (slice->target_id * 10007 + device_id) % kShardCount;
+                slice_queue_lock_[shard_id].lock();
+                slice_queue_[shard_id][peer_nic_path].push_back(slice);
+                slice_queue_count_[shard_id].fetch_add(
+                    1, std::memory_order_relaxed);
+                slice_queue_lock_[shard_id].unlock();
+                shared_redispatch_count++;
+            }
         }
+    }
+
+    if (shared_redispatch_count &&
+        parked_worker_count_.load(std::memory_order_acquire) > 0) {
+        std::lock_guard<std::mutex> lock(cond_mutex_);
+        cond_var_.notify_all();
     }
 }
 
 bool WorkerPool::hasOutstandingCq(int thread_id) {
-    for (int cq_index = thread_id; cq_index < context_.cqCount();
-         cq_index += kTransferWorkerCount) {
+    if (!workerCanPoll(thread_id)) return false;
+    for (int cq_index = 0; cq_index < context_.cqCount(); ++cq_index) {
         if (*context_.cqOutstandingCount(cq_index) > 0) return true;
     }
     return false;
@@ -517,8 +556,8 @@ void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
     uint64_t last_wait_ts = getCurrentTimeInNano();
-    // When multiple workers, thread 0 is dedicated CQ poller, others only post
-    const bool is_dedicated_poller = (kTransferWorkerCount > 1 && thread_id == 0);
+    const bool can_post = workerCanPost(thread_id);
+    const bool can_poll = workerCanPoll(thread_id);
     while (workers_running_.load(std::memory_order_relaxed)) {
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
@@ -543,13 +582,14 @@ void WorkerPool::transferWorker(int thread_id) {
             }
             continue;
         }
-        if (is_dedicated_poller) {
-#ifndef USE_FAKE_POST_SEND
-            performPollCq(thread_id);
-#endif
-        } else {
+        if (can_post) {
             performPostSend(thread_id);
         }
+#ifndef USE_FAKE_POST_SEND
+        if (can_poll) {
+            performPollCq(thread_id);
+        }
+#endif
         last_wait_ts = getCurrentTimeInNano();
     }
 }
