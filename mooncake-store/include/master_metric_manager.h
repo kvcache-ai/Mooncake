@@ -44,6 +44,10 @@ class MasterMetricManager {
     void dec_mem_cache_nums(int64_t val = 1);
     void dec_file_cache_nums(int64_t val = 1);
     void reset_cache_total_nums();
+    void inc_hidden_allocated_mem_size(int64_t val);
+    void dec_hidden_allocated_mem_size(int64_t val);
+    void reset_hidden_allocated_mem_size();
+    int64_t get_hidden_allocated_mem_size();
 
     void inc_valid_get_nums(int64_t val = 1);
     void inc_total_get_nums(int64_t val = 1);
@@ -518,6 +522,7 @@ class MasterMetricManager {
         mem_allocated_size_;  // Overall memory usage update for gauge
     ylt::metric::gauge_t
         mem_total_capacity_;  // Overall memory capacity update for gauge
+    ylt::metric::gauge_t hidden_allocated_mem_size_;
     ylt::metric::dynamic_gauge_1t
         mem_allocated_size_per_segment_;  // Segment memory usage update for
                                           // gauge

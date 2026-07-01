@@ -42,6 +42,16 @@ struct MasterConfig {
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
+    bool enable_hidden_type_aware_eviction =
+        DEFAULT_ENABLE_HIDDEN_TYPE_AWARE_EVICTION;
+    double hidden_memory_budget_ratio = DEFAULT_HIDDEN_MEMORY_BUDGET_RATIO;
+    double hidden_memory_high_watermark_ratio =
+        DEFAULT_HIDDEN_MEMORY_HIGH_WATERMARK_RATIO;
+    bool allow_hidden_in_global_eviction =
+        DEFAULT_ALLOW_HIDDEN_IN_GLOBAL_EVICTION;
+    uint64_t default_hidden_lease_ttl = DEFAULT_HIDDEN_LEASE_TTL_MS;
+    uint64_t soft_pinned_hidden_lease_ttl =
+        DEFAULT_HIDDEN_SOFT_PIN_LEASE_TTL_MS;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
@@ -169,6 +179,16 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
+    bool enable_hidden_type_aware_eviction =
+        DEFAULT_ENABLE_HIDDEN_TYPE_AWARE_EVICTION;
+    double hidden_memory_budget_ratio = DEFAULT_HIDDEN_MEMORY_BUDGET_RATIO;
+    double hidden_memory_high_watermark_ratio =
+        DEFAULT_HIDDEN_MEMORY_HIGH_WATERMARK_RATIO;
+    bool allow_hidden_in_global_eviction =
+        DEFAULT_ALLOW_HIDDEN_IN_GLOBAL_EVICTION;
+    uint64_t default_hidden_lease_ttl = DEFAULT_HIDDEN_LEASE_TTL_MS;
+    uint64_t soft_pinned_hidden_lease_ttl =
+        DEFAULT_HIDDEN_SOFT_PIN_LEASE_TTL_MS;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -383,6 +403,16 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    bool enable_hidden_type_aware_eviction =
+        DEFAULT_ENABLE_HIDDEN_TYPE_AWARE_EVICTION;
+    double hidden_memory_budget_ratio = DEFAULT_HIDDEN_MEMORY_BUDGET_RATIO;
+    double hidden_memory_high_watermark_ratio =
+        DEFAULT_HIDDEN_MEMORY_HIGH_WATERMARK_RATIO;
+    bool allow_hidden_in_global_eviction =
+        DEFAULT_ALLOW_HIDDEN_IN_GLOBAL_EVICTION;
+    uint64_t default_hidden_lease_ttl = DEFAULT_HIDDEN_LEASE_TTL_MS;
+    uint64_t soft_pinned_hidden_lease_ttl =
+        DEFAULT_HIDDEN_SOFT_PIN_LEASE_TTL_MS;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -457,6 +487,15 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        enable_hidden_type_aware_eviction =
+            config.enable_hidden_type_aware_eviction;
+        hidden_memory_budget_ratio = config.hidden_memory_budget_ratio;
+        hidden_memory_high_watermark_ratio =
+            config.hidden_memory_high_watermark_ratio;
+        allow_hidden_in_global_eviction =
+            config.allow_hidden_in_global_eviction;
+        default_hidden_lease_ttl = config.default_hidden_lease_ttl;
+        soft_pinned_hidden_lease_ttl = config.soft_pinned_hidden_lease_ttl;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -554,6 +593,15 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        enable_hidden_type_aware_eviction =
+            config.enable_hidden_type_aware_eviction;
+        hidden_memory_budget_ratio = config.hidden_memory_budget_ratio;
+        hidden_memory_high_watermark_ratio =
+            config.hidden_memory_high_watermark_ratio;
+        allow_hidden_in_global_eviction =
+            config.allow_hidden_in_global_eviction;
+        default_hidden_lease_ttl = config.default_hidden_lease_ttl;
+        soft_pinned_hidden_lease_ttl = config.soft_pinned_hidden_lease_ttl;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -622,6 +670,16 @@ class MasterServiceConfigBuilder {
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    bool enable_hidden_type_aware_eviction_ =
+        DEFAULT_ENABLE_HIDDEN_TYPE_AWARE_EVICTION;
+    double hidden_memory_budget_ratio_ = DEFAULT_HIDDEN_MEMORY_BUDGET_RATIO;
+    double hidden_memory_high_watermark_ratio_ =
+        DEFAULT_HIDDEN_MEMORY_HIGH_WATERMARK_RATIO;
+    bool allow_hidden_in_global_eviction_ =
+        DEFAULT_ALLOW_HIDDEN_IN_GLOBAL_EVICTION;
+    uint64_t default_hidden_lease_ttl_ = DEFAULT_HIDDEN_LEASE_TTL_MS;
+    uint64_t soft_pinned_hidden_lease_ttl_ =
+        DEFAULT_HIDDEN_SOFT_PIN_LEASE_TTL_MS;
     double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio_ =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -697,6 +755,39 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(
         double ratio) {
         eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_hidden_type_aware_eviction(
+        bool enable) {
+        enable_hidden_type_aware_eviction_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_hidden_memory_budget_ratio(double ratio) {
+        hidden_memory_budget_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_hidden_memory_high_watermark_ratio(
+        double ratio) {
+        hidden_memory_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_allow_hidden_in_global_eviction(
+        bool allow) {
+        allow_hidden_in_global_eviction_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_default_hidden_lease_ttl(uint64_t ttl) {
+        default_hidden_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_soft_pinned_hidden_lease_ttl(uint64_t ttl) {
+        soft_pinned_hidden_lease_ttl_ = ttl;
         return *this;
     }
 
@@ -960,6 +1051,16 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    bool enable_hidden_type_aware_eviction =
+        DEFAULT_ENABLE_HIDDEN_TYPE_AWARE_EVICTION;
+    double hidden_memory_budget_ratio = DEFAULT_HIDDEN_MEMORY_BUDGET_RATIO;
+    double hidden_memory_high_watermark_ratio =
+        DEFAULT_HIDDEN_MEMORY_HIGH_WATERMARK_RATIO;
+    bool allow_hidden_in_global_eviction =
+        DEFAULT_ALLOW_HIDDEN_IN_GLOBAL_EVICTION;
+    uint64_t default_hidden_lease_ttl = DEFAULT_HIDDEN_LEASE_TTL_MS;
+    uint64_t soft_pinned_hidden_lease_ttl =
+        DEFAULT_HIDDEN_SOFT_PIN_LEASE_TTL_MS;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -1030,6 +1131,15 @@ class MasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        enable_hidden_type_aware_eviction =
+            config.enable_hidden_type_aware_eviction;
+        hidden_memory_budget_ratio = config.hidden_memory_budget_ratio;
+        hidden_memory_high_watermark_ratio =
+            config.hidden_memory_high_watermark_ratio;
+        allow_hidden_in_global_eviction =
+            config.allow_hidden_in_global_eviction;
+        default_hidden_lease_ttl = config.default_hidden_lease_ttl;
+        soft_pinned_hidden_lease_ttl = config.soft_pinned_hidden_lease_ttl;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -1104,6 +1214,14 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.enable_hidden_type_aware_eviction =
+        enable_hidden_type_aware_eviction_;
+    config.hidden_memory_budget_ratio = hidden_memory_budget_ratio_;
+    config.hidden_memory_high_watermark_ratio =
+        hidden_memory_high_watermark_ratio_;
+    config.allow_hidden_in_global_eviction = allow_hidden_in_global_eviction_;
+    config.default_hidden_lease_ttl = default_hidden_lease_ttl_;
+    config.soft_pinned_hidden_lease_ttl = soft_pinned_hidden_lease_ttl_;
     config.nof_eviction_ratio = nof_eviction_ratio_;
     config.nof_eviction_high_watermark_ratio =
         nof_eviction_high_watermark_ratio_;

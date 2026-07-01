@@ -12,6 +12,12 @@ default_kv_soft_pin_ttl: 1800000
 allow_evict_soft_pinned_objects: true
 eviction_ratio: 0.1
 eviction_high_watermark_ratio: 1.0
+enable_hidden_type_aware_eviction: false
+hidden_memory_budget_ratio: 1.0
+hidden_memory_high_watermark_ratio: 0.9
+allow_hidden_in_global_eviction: false
+default_hidden_lease_ttl: 5000
+soft_pinned_hidden_lease_ttl: 1800000
 
 enable_multi_tenants: false
 tenant_quota_connector_type: "file"

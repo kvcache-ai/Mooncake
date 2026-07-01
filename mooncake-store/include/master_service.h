@@ -912,6 +912,7 @@ class MasterService {
         const bool hard_pinned{false};          // immutable, set at creation
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
+        uint64_t hidden_allocated_accounted_bytes{0};
         uint64_t reserved_quota_charge_bytes{0};
         uint64_t committed_quota_charge_bytes{0};
         uint64_t pending_replaced_quota_charge_bytes{0};
@@ -1433,6 +1434,10 @@ class MasterService {
     void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
     TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
     uint64_t GetTenantQuotaCapacityBytes();
+    uint64_t SelectLeaseTtl(
+        const ObjectMetadata& metadata,
+        const std::chrono::system_clock::time_point& now) const;
+    long CountHiddenObjects();
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -1540,8 +1545,14 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                     // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const bool enable_hidden_type_aware_eviction_;
+    const double hidden_memory_budget_ratio_;          // in range [0.0, 1.0]
+    const double hidden_memory_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const bool allow_hidden_in_global_eviction_;
+    const uint64_t default_hidden_lease_ttl_;         // in milliseconds
+    const uint64_t soft_pinned_hidden_lease_ttl_;     // in milliseconds
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
