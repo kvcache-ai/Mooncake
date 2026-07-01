@@ -17,6 +17,7 @@
 
 #include <functional>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -124,7 +125,7 @@ class NVLinkTransport : public Transport {
     uint64_t async_memcpy_threshold_;
     bool host_register_;
 
-    std::mutex register_mutex_;
+    mutable std::mutex register_mutex_;
     std::unordered_set<uint64_t> registered_base_addrs_;
 };
 }  // namespace tent

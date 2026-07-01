@@ -162,42 +162,56 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     return Status::OK();
 }
 
-static int detectDeviceFromPointer(void *ptr) {
-    if (!ptr) return -1;
-    cudaPointerAttributes attrs = {};
-    auto err = cudaPointerGetAttributes(&attrs, ptr);
-    if (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice)
-        return attrs.device;
-    cudaGetLastError();
-    return -1;
-}
-
 Status MnnvlTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
 
-    if (!mnnvl_batch->async_stream.get()) {
-        int device_id = -1;
-        for (auto &req : request_list) {
-            device_id = detectDeviceFromPointer(req.source);
-            if (device_id >= 0) break;
-        }
-        if (device_id < 0) cudaGetDevice(&device_id);
-        CHECK_STATUS(
-            platform_->getStreamFromPool(mnnvl_batch->sync_stream, device_id));
-        CHECK_STATUS(
-            platform_->getStreamFromPool(mnnvl_batch->async_stream, device_id));
-    }
-
     if (request_list.size() + mnnvl_batch->task_list.size() >
         mnnvl_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    // Get local segment for buffer lookup
+    auto &segment_manager = metadata_->segmentManager();
+    SegmentDesc *local_segment = segment_manager.getLocal();
+    if (!local_segment)
+        return Status::InternalError("Local segment not found" LOC_MARK);
+
+    // Determine device for this batch and validate all requests
+    int batch_device_id = -1;
+    bool device_determined = false;
     std::vector<MnnvlTask *> new_tasks;
+
     for (auto &request : request_list) {
+        // Find the buffer this source pointer belongs to
+        BufferDesc *buf = local_segment->findBuffer(
+            reinterpret_cast<uint64_t>(request.source), request.length);
+        if (!buf) {
+            return Status::InvalidArgument(
+                "Unregistered buffer: source pointer not in any registered "
+                "buffer" LOC_MARK);
+        }
+
+        // Parse device ID from buffer location (e.g., "cuda:0" -> 0, "cpu" ->
+        // -1)
+        LocationParser location(buf->location);
+        int device_id = location.index();
+
+        // Capture the first GPU device encountered for stream creation.
+        // Mixed-GPU batches use the first GPU's stream and rely on CUDA P2P
+        // for cross-device access (same behavior as pre-#2569 code).
+        // A future refactor could group requests by device and dispatch to
+        // per-device streams, but that requires SubBatch structure changes.
+        if (!device_determined && device_id >= 0) {
+            batch_device_id = device_id;
+            device_determined = true;
+        }
+
+        // Create and populate task
         mnnvl_batch->task_list.push_back(MnnvlTask{});
         auto &task = mnnvl_batch->task_list[mnnvl_batch->task_list.size() - 1];
+
         uint64_t target_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
@@ -208,11 +222,27 @@ Status MnnvlTransport::submitTransferTasks(
                 return status;
             }
         }
+
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
+        task.cuda_id = device_id;
         new_tasks.push_back(&task);
     }
+
+    // Get or create streams for this batch's device
+    if (!mnnvl_batch->async_stream.get()) {
+        int stream_device = batch_device_id;
+        if (stream_device < 0) {
+            // CPU-only batch: use current CUDA device
+            cudaGetDevice(&stream_device);
+        }
+        CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream,
+                                                  stream_device));
+        CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream,
+                                                  stream_device));
+    }
+
     startTransfer(new_tasks, mnnvl_batch);
     return Status::OK();
 }
