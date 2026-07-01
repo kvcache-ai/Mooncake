@@ -225,6 +225,8 @@ DEFINE_uint32(promotion_max_per_heartbeat, 1,
               "SSD-read + RDMA-write on the client; serializing them avoids "
               "blocking past the client-liveness window. Default 1 is "
               "conservative.");
+DEFINE_bool(disable_quota_fast_path, false,
+            "Disable lock-free fast-path in ComputeTenantQuotaDeficit");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -482,6 +484,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_max_per_heartbeat",
                              &master_config.promotion_max_per_heartbeat,
                              FLAGS_promotion_max_per_heartbeat);
+    default_config.GetBool("disable_quota_fast_path",
+                           &master_config.disable_quota_fast_path,
+                           FLAGS_disable_quota_fast_path);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",

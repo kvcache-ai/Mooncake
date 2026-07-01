@@ -402,6 +402,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    // Ablation study controls (for paper experiments)
+    disable_quota_fast_path_ = config.disable_quota_fast_path;
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -1085,6 +1088,29 @@ uint64_t MasterService::ComputeTenantQuotaDeficit(
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     auto& quota_shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+
+    // Fast path: lock-free quota check using atomic reads.
+    // In the common case (sufficient quota), we avoid acquiring the mutex.
+    if (!disable_quota_fast_path_) {
+        auto fast_quota_it = quota_shard.tenants.find(normalized_tenant);
+        if (fast_quota_it != quota_shard.tenants.end()) {
+            const auto& state = fast_quota_it->second;
+            const uint64_t used =
+                __atomic_load_n(&state.used_bytes, __ATOMIC_RELAXED);
+            const uint64_t reserved =
+                __atomic_load_n(&state.reserved_bytes, __ATOMIC_RELAXED);
+            const unsigned __int128 demand =
+                static_cast<unsigned __int128>(used) +
+                static_cast<unsigned __int128>(reserved) +
+                incoming_quota_charge;
+            if (demand <= __atomic_load_n(&state.effective_quota_bytes,
+                                          __ATOMIC_RELAXED)) {
+                return 0;  // Fast path: sufficient quota, no mutex needed
+            }
+        }
+    }
+
+    // Slow path: acquire mutex and recompute under lock
     std::lock_guard<std::mutex> lock(quota_shard.mutex);
     auto quota_it = quota_shard.tenants.find(normalized_tenant);
     if (quota_it == quota_shard.tenants.end()) {

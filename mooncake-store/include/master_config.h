@@ -132,6 +132,9 @@ struct MasterConfig {
     // liveness window. Default 1 is conservative; small-object or RDMA-
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
+
+    // Ablation study controls (for paper experiments)
+    bool disable_quota_fast_path = false;
 };
 
 class MasterServiceSupervisorConfig {
@@ -212,6 +215,9 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // Ablation study controls (for paper experiments)
+    bool disable_quota_fast_path = false;
+
     // Pod identity for K8s label-based routing
     std::string pod_name;
     std::string pod_namespace;
@@ -253,6 +259,7 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_quota_fast_path = config.disable_quota_fast_path;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -403,6 +410,8 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    // Ablation study controls (for paper experiments)
+    bool disable_quota_fast_path = false;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -476,6 +485,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_quota_fast_path = config.disable_quota_fast_path;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -570,6 +580,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_quota_fast_path = config.disable_quota_fast_path;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -669,6 +680,9 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+
+    // Ablation study controls (for paper experiments)
+    bool disable_quota_fast_path_ = false;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -938,6 +952,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_disable_quota_fast_path(bool v) {
+        disable_quota_fast_path_ = v;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -980,6 +999,8 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    // Ablation study controls (for paper experiments)
+    bool disable_quota_fast_path = false;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1049,6 +1070,7 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        disable_quota_fast_path = config.disable_quota_fast_path;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
@@ -1152,6 +1174,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.disable_quota_fast_path = disable_quota_fast_path_;
     return config;
 }
 
