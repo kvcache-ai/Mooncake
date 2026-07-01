@@ -1485,16 +1485,23 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
+        // Zero-copy O_DIRECT fast path: issue ALL of this bucket's reads as one
+        // io_uring batch (up to QUEUE_DEPTH in flight) instead of a serial
+        // per-key read_aligned loop. This raises the across-value queue depth
+        // from ~1 (drain per value) to QD32, so a single thread can saturate
+        // the device (Little's Law: throughput = in-flight / latency). Falls
+        // back to per-key vector_read for the buffered PosixFile path.
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            // Build one aligned descriptor per key. Each reads a 4096-aligned
+            // SUPERSET of the value into dest_slice.ptr (which is oversized by
+            // AllocateBatch / the bench BufferPool to hold it); the value then
+            // lives at ptr + offset_in_buffer (adjusted below, no memcpy).
+            std::vector<UringFile::ReadDesc> descs;
+            descs.reserve(read_plans.size());
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
@@ -1503,41 +1510,48 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
                     static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
-
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-
-                if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    read_res = plan.dest_slice.size;
-                }
-            } else
-#endif
-            {
-                // Fallback to vector_read for non-UringFile
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
+                descs.push_back(
+                    UringFile::ReadDesc{plan.dest_slice.ptr, aligned_size,
+                                        static_cast<off_t>(aligned_offset)});
             }
 
+            auto read_res = uring_file->batch_read(
+                descs.data(), static_cast<int>(descs.size()));
             if (!read_res) {
-                LOG(ERROR) << "vector_read failed for key: " << plan.key
-                           << ", bucket_id=" << plan.bucket_id
+                LOG(ERROR) << "batch_read failed for bucket_id=" << bucket_id
                            << ", error: " << read_res.error();
                 return tl::make_unexpected(read_res.error());
             }
 
-            if (read_res.value() != plan.dest_slice.size) {
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
-                           << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            // Point each slice at the actual value start within its buffer.
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                int64_t offset_in_buffer =
+                    actual_offset -
+                    align_down(actual_offset, kDirectIOAlignment);
+                batch_object.at(plan.key).ptr =
+                    static_cast<char*>(plan.dest_slice.ptr) + offset_in_buffer;
+            }
+        } else
+#endif
+        {
+            // Buffered fallback: per-key vector_read (PosixFile, page cache).
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                auto read_res = file->vector_read(&iov, 1, actual_offset);
+                if (!read_res) {
+                    LOG(ERROR) << "vector_read failed for key: " << plan.key
+                               << ", bucket_id=" << plan.bucket_id
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
+                }
+                if (read_res.value() != plan.dest_slice.size) {
+                    LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                               << ", expected: " << plan.dest_slice.size
+                               << ", got: " << read_res.value();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
             }
         }
     }
