@@ -1,4 +1,5 @@
 #include <mooncake_ep_buffer.h>
+#include <memory>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
@@ -21,7 +22,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t>())
+        .def(py::init([](int rank, int num_ranks, int64_t num_ep_buffer_bytes) {
+            if (num_ranks <= 0) {
+                throw py::value_error("num_ranks must be greater than 0");
+            }
+            if (num_ranks > MAX_QP_COUNT) {
+                throw py::value_error(
+                    "num_ranks must be less than or equal to MAX_QP_COUNT");
+            }
+            if (rank < 0 || rank >= num_ranks) {
+                throw py::value_error("rank must be in [0, num_ranks)");
+            }
+            if (num_ep_buffer_bytes <= 0) {
+                throw py::value_error(
+                    "num_ep_buffer_bytes must be greater than 0");
+            }
+            return std::make_unique<MooncakeEpBuffer>(rank, num_ranks,
+                                                      num_ep_buffer_bytes);
+        }))
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
         .def("update_local_qpns", &MooncakeEpBuffer::update_local_qpns)
