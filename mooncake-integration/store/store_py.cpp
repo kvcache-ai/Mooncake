@@ -537,9 +537,8 @@ class MooncakeStorePyWrapper {
                 }
                 if (runtime_accelerator.FindDeviceForPointer(data->ptr())) {
                     std::string host_buf(data->size(), '\0');
-                    if (!runtime_accelerator.CopyToHost(host_buf.data(),
-                                                        data->ptr(),
-                                                        data->size())) {
+                    if (!runtime_accelerator.CopyToHost(
+                            host_buf.data(), data->ptr(), data->size())) {
                         LOG(ERROR) << "Failed to copy buffer to host memory";
                         results.emplace_back(kNullString);
                         continue;

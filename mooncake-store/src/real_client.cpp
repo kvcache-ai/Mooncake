@@ -1040,13 +1040,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate protocol is supported
-    if (protocol != "tcp" && protocol != "rdma" && protocol != "sunrise_link") {
-        LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << protocol
-                   << ", must be 'tcp', 'rdma', or 'sunrise_link'";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
 

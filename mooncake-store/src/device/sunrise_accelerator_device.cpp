@@ -5,6 +5,7 @@
 #if defined(USE_SUNRISE)
 #include <tang_runtime_api.h>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace mooncake {
@@ -21,7 +22,16 @@ struct SavedTangDevice {
     SavedTangDevice& operator=(const SavedTangDevice&) = delete;
 };
 
-void FreeSunrisePinnedHostBuffer(void* addr) { tangFreeHost(addr); }
+void FreeSunrisePinnedHostBuffer(void* addr) {
+    if (!addr) return;
+    {
+        std::lock_guard<std::mutex> guard(
+            mooncake::sunrise_alloc_detail::tangAllocMutex());
+        mooncake::sunrise_alloc_detail::tangHostAllocatedSet().erase(addr);
+    }
+    mooncake::sunrise_alloc_detail::removeStoreMemRange(addr);
+    tangFreeHost(addr);
+}
 
 class SunriseAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
    public:
@@ -98,71 +108,22 @@ class SunriseAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             }
 
             case CopyDirection::kDeviceToDevice:
-                return tangMemcpy(dst, src, size,
-                                  tangMemcpyDeviceToDevice) == tangSuccess;
+                return tangMemcpy(dst, src, size, tangMemcpyDeviceToDevice) ==
+                       tangSuccess;
 
             case CopyDirection::kAuto: {
                 bool src_dev =
                     sunrise_is_device_memory_range(const_cast<void*>(src));
                 bool dst_dev = sunrise_is_device_memory_range(dst);
-                bool src_host_alloc =
-                    sunrise_is_host_allocated(const_cast<void*>(src));
-                bool dst_host_alloc = sunrise_is_host_allocated(dst);
-
-                if (!src_dev && !dst_dev && !src_host_alloc &&
-                    !dst_host_alloc) {
+                if (!src_dev && !dst_dev) {
                     std::memcpy(dst, src, size);
                     return true;
                 }
-
-                if (src_dev && dst_host_alloc && !dst_dev) {
-                    SavedTangDevice saved;
-                    tangSetDevice(0);
-                    std::vector<char> staging(size);
-                    if (tangMemcpy(staging.data(), src, size,
-                                   tangMemcpyDeviceToHost) != tangSuccess)
-                        return false;
-                    tangDeviceSynchronize();
-                    std::memcpy(dst, staging.data(), size);
-                    return true;
-                }
-
-                if (src_host_alloc && !src_dev && dst_dev) {
-                    SavedTangDevice saved;
-                    tangSetDevice(0);
-                    std::vector<char> staging(size);
-                    std::memcpy(staging.data(), src, size);
-                    return tangMemcpy(dst, staging.data(), size,
-                                      tangMemcpyHostToDevice) == tangSuccess;
-                }
-
-                if ((src_host_alloc || dst_host_alloc) && !src_dev &&
-                    !dst_dev) {
-                    std::memcpy(dst, src, size);
-                    return true;
-                }
-
-                enum tangMemcpyKind kind = tangMemcpyHostToHost;
-                if ((src_dev || src_host_alloc) &&
-                    (dst_dev || dst_host_alloc))
-                    kind = tangMemcpyDeviceToDevice;
-                else if (src_dev || src_host_alloc)
-                    kind = tangMemcpyDeviceToHost;
-                else if (dst_dev || dst_host_alloc)
-                    kind = tangMemcpyHostToDevice;
-
-                if (kind == tangMemcpyHostToHost) {
-                    std::memcpy(dst, src, size);
-                    return true;
-                }
-
-                SavedTangDevice saved;
-                tangSetDevice(0);
-                if (tangMemcpy(dst, src, size, kind) != tangSuccess)
-                    return false;
-                if (dst_host_alloc || kind == tangMemcpyDeviceToHost)
-                    tangDeviceSynchronize();
-                return true;
+                if (src_dev && dst_dev)
+                    return Copy(dst, src, size, CopyDirection::kDeviceToDevice);
+                if (src_dev)
+                    return Copy(dst, src, size, CopyDirection::kDeviceToHost);
+                return Copy(dst, src, size, CopyDirection::kHostToDevice);
             }
         }
         return false;
@@ -171,8 +132,14 @@ class SunriseAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
         if (tangHostAlloc(&addr, size, tangHostAllocDefault) == tangSuccess) {
-            return PinnedHostBuffer(addr, size,
-                                    FreeSunrisePinnedHostBuffer);
+            {
+                std::lock_guard<std::mutex> guard(
+                    mooncake::sunrise_alloc_detail::tangAllocMutex());
+                mooncake::sunrise_alloc_detail::tangHostAllocatedSet().insert(
+                    addr);
+            }
+            mooncake::sunrise_alloc_detail::addStoreMemRange(addr, size);
+            return PinnedHostBuffer(addr, size, FreeSunrisePinnedHostBuffer);
         }
         return PinnedHostBuffer();
     }
