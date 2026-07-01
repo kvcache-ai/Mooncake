@@ -17,6 +17,10 @@ namespace mooncake {
 // Forward declaration
 class OpLogStore;
 
+namespace test {
+class OpLogApplierTest;
+}  // namespace test
+
 /**
  * @brief Apply OpLog entries to Standby metadata store with ordering guarantee
  *
@@ -87,9 +91,44 @@ class OpLogApplier {
     struct GapResolveResult {
         size_t attempted{0};
         size_t fetched{0};
+        size_t applied_puts{0};
         size_t applied_deletes{0};
     };
     GapResolveResult TryResolveGapsOnceForPromotion(size_t max_ids = 1024);
+
+    /**
+     * @brief Returns the count of missing/skipped sequence ids that have not
+     *        yet been resolved. Thread-safe.
+     */
+    size_t GetUnresolvedGapCount() const;
+
+    /**
+     * @brief Convenience: true iff GetUnresolvedGapCount() > 0.
+     */
+    bool HasUnresolvedGaps() const;
+
+    // Test-only: seed a missing/skipped gap so promotion fail-closed tests can
+    // exercise the unresolved-gaps rejection path without driving the full
+    // timer-based state machine.
+    void AddMissingGapForTesting(uint64_t seq);
+    void AddSkippedGapForTesting(uint64_t seq);
+
+    const StandbySegmentRegistry& GetSegmentRegistry() const;
+    void ApplySegmentMount(const OpLogEntry& entry);
+    void ApplySegmentUnmount(const OpLogEntry& entry);
+    void ApplySegmentUpdate(const OpLogEntry& entry);
+
+    /**
+     * @brief Load segment registry from snapshot baseline.
+     * Clears existing registry and replaces with given segments.
+     */
+    void LoadSegmentRegistry(const std::vector<StandbySegmentInfo>& segments);
+
+    // Tests need direct access to pending_mutex_, missing_sequence_ids_,
+    // and skipped_sequence_ids_ to seed state without driving the full
+    // timer-based skip transition. Friend declaration is the minimal
+    // coupling for unit tests.
+    friend class ::mooncake::test::OpLogApplierTest;
 
    private:
     /**
@@ -98,6 +137,11 @@ class OpLogApplier {
      * @return true if order is valid, false otherwise
      */
     bool CheckSequenceOrder(const OpLogEntry& entry);
+
+    // Apply a PUT_END only if its sequence_id is not older than the existing
+    // per-key metadata last_sequence_id. Returns true on apply or successful
+    // no-op (stale).
+    bool ApplyPutEndIfNewer(const OpLogEntry& entry);
 
     /**
      * @brief Apply PUT_END operation
@@ -150,6 +194,9 @@ class OpLogApplier {
     // Next expected global sequence_id. Read frequently from monitoring thread,
     // updated by watch/apply thread. Use atomic to avoid data races.
     std::atomic<uint64_t> expected_sequence_id_{1};
+
+    // Standby segment registry
+    StandbySegmentRegistry segment_registry_;
 
     // Constants for missing entry handling
     // IMPORTANT: request must happen BEFORE skip, otherwise we will never

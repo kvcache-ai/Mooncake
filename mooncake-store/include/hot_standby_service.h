@@ -51,6 +51,19 @@ struct HotStandbyConfig {
     OpLogStoreType oplog_store_type{kDefaultOpLogStoreType};
     std::string oplog_store_root_dir{kDefaultOpLogRootDir};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+
+    // Programmatic migration escape hatch (default: fail-closed).
+    // When true, FinalCatchUpForPromotionLocked returns
+    // INCOMPLETE_OPLOG_CATCH_UP if the standby cannot prove it has applied
+    // every durable OpLog entry. When false, falls back to the previous
+    // best-effort behavior (WARNING log + OK).
+    bool fail_closed_on_incomplete_catch_up{true};
+
+    // Programmatic migration escape hatch (default: fail-closed).
+    // When true, promotion is refused while OpLogApplier has unresolved
+    // missing/skipped sequence ids, even if the final catch-up loop drained
+    // a batch successfully. When false, the gap check is skipped entirely.
+    bool fail_closed_on_unresolved_gaps{true};
 };
 
 /**
@@ -65,6 +78,7 @@ struct StandbySyncStatus {
     bool is_connected{false};
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
+    size_t unresolved_gap_count{0};
 };
 
 /**
@@ -128,6 +142,17 @@ class HotStandbyService {
     ErrorCode Promote();
 
     /**
+     * @brief Promote this standby to Primary and export a snapshot atomically.
+     *
+     * Holds mutex_ through the entire promotion + export process, ensuring
+     * the snapshot is captured before any state is released.
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return ErrorCode::OK on success, other codes on failure
+     */
+    ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
+
+    /**
      * @brief Get the number of metadata entries in the local store
      */
     size_t GetMetadataCount() const;
@@ -145,8 +170,18 @@ class HotStandbyService {
     // Export a point-in-time snapshot of all replicated metadata.
     // This is used by MasterServiceSupervisor to initialize the new Primary
     // after leader election (fast recovery).
-    bool ExportMetadataSnapshot(
-        std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+    bool ExportMetadataSnapshot(std::vector<StandbyObjectEntry>& out) const;
+
+    /**
+     * Export complete standby snapshot including:
+     * - Applied OpLog sequence ID
+     * - All object metadata
+     * - All registered segments (via OpLogApplier's segment registry)
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return true on success, false on failure (e.g., service not running)
+     */
+    bool ExportStandbySnapshot(StandbySnapshot& out) const;
 
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
@@ -154,6 +189,21 @@ class HotStandbyService {
     // Notify callers when standby sync status changes. The callback is invoked
     // from existing standby worker threads; no extra monitor thread is created.
     void SetSyncStatusCallback(SyncStatusCallback callback);
+
+    /**
+     * @brief Test seam: when set, FinalCatchUpForPromotionLocked uses this
+     *        store instead of calling OpLogStoreFactory::Create. Production
+     *        code never calls this; tests inject a MockOpLogStore.
+     */
+    void SetCatchUpOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
+
+    /**
+     * @brief Test seam: returns the internal OpLogApplier so tests can seed
+     *        gaps via AddMissingGapForTesting / AddSkippedGapForTesting.
+     */
+    OpLogApplier* GetOpLogApplierForTesting() const {
+        return oplog_applier_.get();
+    }
 
     /**
      * @brief Get current state from state machine
@@ -181,6 +231,19 @@ class HotStandbyService {
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     void ResolvePromotionGapsLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
+
+    // Legacy best-effort variant of FinalCatchUpForPromotionLocked, only
+    // used when config_.fail_closed_on_incomplete_catch_up == false.
+    ErrorCode FinalCatchUpBestEffortLocked(
+        std::shared_ptr<OpLogStore> catch_up_store,
+        uint64_t current_applied_seq_id);
+
+    // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
+    // promotion sequence machine transitions + gap resolution + final
+    // catch-up + post catch-up gap check + success transition. Returns
+    // ErrorCode::OK on success or any fail-closed error code.
+    ErrorCode PromoteLockedInternal(uint64_t current_applied_seq_id);
+
     void NotifySyncStatus();
 
     /**
@@ -222,25 +285,30 @@ class HotStandbyService {
     // Simple in-memory metadata store implementation
     class StandbyMetadataStore : public MetadataStore {
        public:
-        bool PutMetadata(const std::string& key,
+        bool PutMetadata(const std::string& tenant_id, const std::string& key,
                          const StandbyObjectMetadata& metadata) override;
         bool Put(const std::string& key,
                  const std::string& payload = std::string()) override;
         std::optional<StandbyObjectMetadata> GetMetadata(
+            const std::string& tenant_id,
             const std::string& key) const override;
-        bool Remove(const std::string& key) override;
-        bool Exists(const std::string& key) const override;
+        bool Remove(const std::string& tenant_id,
+                    const std::string& key) override;
+        bool Exists(const std::string& tenant_id,
+                    const std::string& key) const override;
+        size_t GetKeyCountForTenant(
+            const std::string& tenant_id) const override;
         size_t GetKeyCount() const override;
         void Clear();
 
         // Snapshot for promotion/restore.
-        void Snapshot(
-            std::vector<std::pair<std::string, StandbyObjectMetadata>>& out)
-            const;
+        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
 
        private:
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, StandbyObjectMetadata> store_;
+        std::unordered_map<
+            std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
+            store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
@@ -251,6 +319,8 @@ class HotStandbyService {
     std::shared_ptr<OpLogStore> watcher_oplog_store_;
     std::unique_ptr<OpLogChangeNotifier> oplog_change_notifier_;
     std::unique_ptr<OpLogReplicator> oplog_replicator_;
+
+    std::shared_ptr<OpLogStore> catch_up_oplog_store_for_testing_;
 
     // Configuration for OpLog sync
     std::string oplog_endpoints_;
