@@ -570,7 +570,7 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
-    MutexLocker guard(&m_mutex);
+    SharedMutexLocker guard(&m_mutex);
     if (!m_allocator) {
         return std::nullopt;
     }
@@ -606,7 +606,7 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
-    MutexLocker guard(&m_mutex);
+    SharedMutexLocker guard(&m_mutex, shared_lock);
     if (!m_allocator) {
         return {0, 0};
     }
@@ -616,7 +616,7 @@ OffsetAllocStorageReport OffsetAllocator::storageReport() const {
 }
 
 OffsetAllocStorageReportFull OffsetAllocator::storageReportFull() const {
-    MutexLocker lock(&m_mutex);
+    SharedMutexLocker lock(&m_mutex, shared_lock);
     if (!m_allocator) {
         OffsetAllocStorageReportFull report{};
         return report;
@@ -648,13 +648,13 @@ OffsetAllocatorMetrics OffsetAllocator::get_metrics_internal() const {
 }
 
 OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
-    MutexLocker guard(&m_mutex);
+    SharedMutexLocker guard(&m_mutex, shared_lock);
     return get_metrics_internal();
 }
 
 void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
                                      uint64_t size) {
-    MutexLocker lock(&m_mutex);
+    SharedMutexLocker lock(&m_mutex);
     if (m_allocator) {
         m_allocator->free(allocation);
         // Update lightweight metrics
