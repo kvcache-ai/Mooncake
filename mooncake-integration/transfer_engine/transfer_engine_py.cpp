@@ -208,6 +208,16 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << engine_->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
+#elif defined(USE_CXI)
+
+    bool use_cxi = (proto == "cxi");
+    engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    if (use_cxi) {
+        engine_->getLocalTopology()->discover(device_filter);
+        LOG(INFO) << "Topology discovery complete for CXI. Found "
+                  << engine_->getLocalTopology()->getHcaList().size()
+                  << " devices.";
+    }
 #else
     engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
@@ -250,6 +260,38 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         // (RDMA QP creation fails on EFA devices).
         LOG(INFO)
             << "Installing TCP transport (auto_discover disabled in EFA build)";
+        auto transport = engine_->installTransport("tcp", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install TCP transport";
+            return -1;
+        }
+        LOG(INFO) << "TCP transport installed successfully";
+    }
+#elif defined(USE_CXI)
+    if (use_cxi) {
+        LOG(INFO)
+            << "Installing CXI transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("cxi", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install CXI transport";
+            return -1;
+        }
+        LOG(INFO) << "CXI transport installed successfully";
+    } else if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
+    } else {
+        // For non-EFA protocols (e.g. TCP), manually install TCP transport
+        // since auto_discover is disabled to prevent RDMA installation
+        // (RDMA QP creation fails on EFA devices).
+        LOG(INFO)
+            << "Installing TCP transport (auto_discover disabled in CXI build)";
         auto transport = engine_->installTransport("tcp", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install TCP transport";

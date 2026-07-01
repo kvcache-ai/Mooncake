@@ -256,6 +256,7 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_used_bytes{tenant_id}`
 - `mooncake_tenant_quota_reserved_bytes{tenant_id}`
 - `mooncake_tenant_quota_committed_count{tenant_id}`
+- `mooncake_tenant_quota_metadata_object_count{tenant_id}`
 - `mooncake_tenant_quota_over_quota{tenant_id}`
 - `mooncake_tenant_quota_explicit_policy{tenant_id}`
 - `mooncake_tenant_quota_reject_total{tenant_id,reason}`
@@ -268,16 +269,29 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 
 ## Tenant Quota Management
 
-Tenant quota admission is disabled by default. Enable it on the master when you want memory writes admitted against per-tenant quota:
+Tenant quota admission is disabled by default. Enable strict multi-tenant mode on the master when you want memory writes admitted against connector-managed per-tenant quota:
 
 ```bash
 mooncake_master \
-  --enable_tenant_quota=true \
-  --default_tenant_quota_bytes=1073741824 \
-  --tenant_quota_pool_capacity_bytes=0
+  --enable_multi_tenants=true \
+  --tenant_quota_connector_type=file \
+  --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
 ```
 
-`tenant_quota_pool_capacity_bytes=0` uses the full registered memory capacity as the quota allocation pool. A nonzero value caps the capacity used to compute effective tenant quotas.
+The v1 connector is a writable YAML file. The file must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
+
+```yaml
+version: 1
+
+tenants:
+  - name: tenant-a
+    quota: 200GB
+
+  - name: tenant-b
+    quota: 500GB
+```
+
+When strict multi-tenant mode is enabled, write requests must include a registered tenant. The `default` tenant is not special unless it is explicitly registered in the connector policy.
 
 The same HTTP port used for metrics exposes the tenant quota admin API:
 
@@ -293,14 +307,8 @@ curl -s -X PUT "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-
   -H 'Content-Type: application/json' \
   -d '{"requested_quota_bytes":2147483648}'
 
-# Delete an explicit policy so the tenant inherits the default policy again.
+# Delete an explicit policy. The tenant must not own objects or quota usage.
 curl -s -X DELETE "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
-
-# Query or update the default requested quota. The default may be 0.
-curl -s http://<master_host>:9003/api/v1/tenant_quotas/default
-curl -s -X PUT http://<master_host>:9003/api/v1/tenant_quotas/default \
-  -H 'Content-Type: application/json' \
-  -d '{"requested_quota_bytes":1073741824}'
 ```
 
 Each tenant quota snapshot returns:
@@ -315,13 +323,14 @@ Each tenant quota snapshot returns:
     "used_bytes": 0,
     "reserved_bytes": 0,
     "committed_count": 0,
+    "metadata_object_count": 0,
     "over_quota": false,
     "has_explicit_policy": true
   }
 }
 ```
 
-In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If tenant quota is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`.
+In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If strict multi-tenant mode is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`. Deleting a non-empty tenant returns HTTP 409 with `TENANT_NOT_EMPTY`.
 
 ---
 
@@ -465,9 +474,9 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable_tenant_quota` | `false` | Enable per-tenant memory quota admission |
-| `--default_tenant_quota_bytes` | `0` | Default requested quota for tenants without explicit policy; `0` is allowed and inherited-default tenants still share capacity left by explicit tenants |
-| `--tenant_quota_pool_capacity_bytes` | `0` | Capacity used to compute effective tenant quotas; `0` means total registered memory capacity |
+| `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
+| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type |
+| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path |
 
 ### High Availability
 
@@ -524,6 +533,8 @@ Flags for controlling data movement between DRAM and SSD.
 | `--enable_offload` | `false` | Enable offload from DRAM to SSD |
 | `--offload_on_evict` | `false` | Defer offload to eviction time rather than at `Put` |
 | `--offload_force_evict` | `false` | Force-evict objects exceeding capacity without offload |
+| `--offloading_queue_limit` | `50000` | Max number of objects allowed in the offloading queue per local disk segment. Increase to allow more objects to be offloaded to SSD before force-eviction kicks in |
+| `--offload_cap_ratio` | `0.5` | Per-cycle offload cap as a fraction of `offloading_queue_limit` (range `[0.0, 1.0]`). Controls how many objects can be queued for offload in a single eviction cycle before falling back to force-evict |
 | `--promotion_on_hit` | `false` | Promote SSD-resident keys to DRAM on read hit |
 | `--promotion_admission_threshold` | `2` | Min CountMinSketch count to allow promotion (`1` = disable gating) |
 | `--promotion_max_per_heartbeat` | `1` | Max promotion tasks handed to a single client per heartbeat. Each task is a synchronous SSD-read + RDMA-write on the client; serializing them avoids blocking past the client-liveness window |
@@ -532,6 +543,8 @@ Flags for controlling data movement between DRAM and SSD.
 | `--enable_disk_eviction` | `true` | Enable disk eviction |
 
 Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued.
+
+When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at most `offloading_queue_limit * offload_cap_ratio` objects for SSD offload (default: `50000 * 0.5 = 25000`); objects exceeding this cap fall back to force-evict (discard) if `--offload_force_evict=true`, otherwise they remain in memory. For SSD-heavy workloads where NVMe bandwidth is underutilized while the KV-cache hit rate suffers, raise both `--offloading_queue_limit` and `--offload_cap_ratio` so more objects per cycle are actually persisted to SSD instead of discarded. Example: `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` yields a per-cycle cap of `400000` (vs the default `25000`).
 
 ### CXL Memory
 
@@ -603,7 +616,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `metadata_server` | str | required | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
 | `global_segment_size` | int (bytes) | required | DRAM contributed to the cluster (the sample uses 3.2 GB) |
 | `local_buffer_size` | int (bytes) | required | Transfer Engine buffer |
-| `protocol` | str | required | `tcp` / `rdma` / `cxl` / `ascend` |
+| `protocol` | str | required | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
 | `rdma_devices` | str | required | RDMA NIC(s), comma-separated (pass `""` for non-RDMA). **Keyword is `rdma_devices`, not `device_name`** |
 | `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
@@ -631,8 +644,8 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 |----------|-------------------------|---------|-------------|
 | `MOONCAKE_MASTER` | `master_server_addr` | — (required unless `MOONCAKE_CONFIG_PATH`) | Master `host:port` |
 | `MOONCAKE_TE_META_DATA_SERVER` | `metadata_server` | `P2PHANDSHAKE` | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
-| `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `cxl` / `ascend` |
-| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA device(s), comma-separated; `auto-discovery` supported |
+| `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
+| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated; `auto-discovery` supported |
 | `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |

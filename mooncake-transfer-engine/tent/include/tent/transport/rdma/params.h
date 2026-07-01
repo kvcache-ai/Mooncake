@@ -72,7 +72,8 @@ struct RdmaParams {
     DeviceParams device;
     EndPointParams endpoint;
     WorkerParams workers;
-    bool verbose;
+    bool verbose = false;
+    bool log_slice_affinity = false;
 };
 }  // namespace tent
 }  // namespace mooncake

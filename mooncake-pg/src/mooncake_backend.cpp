@@ -354,7 +354,7 @@ MooncakeBackend::MooncakeBackend(
         engine_, P2PProxy::Options{
                      .is_cpu = isCpu_,
                      .rank = rank_,
-                     .size = size_,
+                     .size = max_size,
                      .cuda_device_index = cuda_device_index,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);

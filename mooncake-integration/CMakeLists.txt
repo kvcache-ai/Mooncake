@@ -27,7 +27,7 @@ include_directories("../mooncake-transfer-engine/include")
 
 find_package(
   Python3
-  COMPONENTS Interpreter Development
+  COMPONENTS Interpreter Development.Module
   REQUIRED)
 
 execute_process(
@@ -51,6 +51,9 @@ if(WITH_TE)
   # Propagate EFA compile definition to engine target
   if(USE_EFA)
     target_compile_definitions(engine PRIVATE USE_EFA)
+  endif()
+  if(USE_CXI)
+    target_compile_definitions(engine PRIVATE USE_CXI)
   endif()
 
   # Propagate USE_TENT compile definition to engine target
@@ -101,9 +104,14 @@ if(USE_UBSHMEM)
 endif()
 
 if(WITH_STORE)
-  pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-                      store/store_py.cpp store/buffer_pool.cpp
-                      store/engram_store_py.cpp integration_utils.h)
+  pybind11_add_module(
+    store
+    ${SOURCES}
+    ${CACHE_ALLOCATOR_SOURCES}
+    store/store_py.cpp
+    store/buffer_pool.cpp
+    store/engram_store_py.cpp
+    integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
   if(USE_ASCEND_DIRECT)
     target_link_libraries(

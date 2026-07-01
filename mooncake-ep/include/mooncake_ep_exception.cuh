@@ -42,7 +42,7 @@ class EPException : public std::exception {
 #endif
 
 #ifndef EP_DEVICE_ASSERT
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
 // MUSA SDK 4.3.x can turn kernels that merely contain a device-side __trap()
 // branch into illegal memory accesses, even when the assertion condition is
 // true.  Keep these invariants as host/static checks on MUSA builds.

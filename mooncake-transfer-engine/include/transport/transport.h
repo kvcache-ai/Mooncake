@@ -113,11 +113,12 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
+        std::string source_location;
         SliceStatus status;
         TransferTask *task;
-        // EFA's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
+        // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
         // are 32-bit. Use a scoped alias so the width is defined in one place.
-#ifdef USE_EFA
+#if defined(USE_EFA) || defined(USE_CXI)
         using mr_key_t = uint64_t;
 #else
         using mr_key_t = uint32_t;

@@ -24,6 +24,8 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <utility>
+#include <vector>
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
@@ -37,13 +39,9 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 
 namespace mooncake {
-
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
 
 namespace {
 
@@ -393,18 +391,23 @@ Client::~Client() {
 static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
-        int iv = std::stoi(ev_ad);
-        if (iv == 1) {
-            LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
-            return true;
-        } else if (iv == 0) {
-            LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
-            return false;
-        } else {
-            LOG(WARNING)
-                << "invalid MC_MS_AUTO_DISC value: " << ev_ad
-                << ", should be 0 or 1, using default: auto discovery not set";
+        try {
+            int iv = std::stoi(ev_ad);
+            if (iv == 1) {
+                LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
+                return true;
+            } else if (iv == 0) {
+                LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
+                return false;
+            }
+        } catch (const std::exception&) {
+            // A non-numeric or out-of-range value makes std::stoi throw; fall
+            // through to the warning below and use the default instead of
+            // letting the exception abort client initialization.
         }
+        LOG(WARNING)
+            << "invalid MC_MS_AUTO_DISC value: " << ev_ad
+            << ", should be 0 or 1, using default: auto discovery not set";
     }
     return std::nullopt;
 }
@@ -648,9 +651,10 @@ ErrorCode Client::InitTransferEngine(
     }
 
     // Check if using TENT mode - TENT handles transport configuration
-    // internally
-    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
-                    (std::getenv("MC_USE_TEV1") != nullptr);
+    // internally. Use the engine's own check rather than the raw env var:
+    // if Mooncake was built without USE_TENT, the env var has no effect on
+    // the TransferEngine, so the store must still install transports.
+    bool use_tent = transfer_engine_->isUsingTent();
 
     bool auto_discover = false;
     if (!use_tent) {
@@ -805,6 +809,13 @@ ErrorCode Client::InitTransferEngine(
             if (!transport) {
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
+            }
+        } else if (protocol == "cxi") {
+            try {
+                transport = transfer_engine_->installTransport("cxi", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxi_transport_install_failed error_message=\""
+                           << e.what() << "\"";
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
@@ -3341,16 +3352,21 @@ void Client::PutToLocalFile(const std::string& key,
     // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
 
     for (const auto& slice : slices) {
-        int device_id = -1;
-        if (IsDevicePointer(slice.ptr, &device_id)) {
-            SetDevice(device_id);
+        device::PointerInfo info{};
+        auto* device =
+            runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+        if (device) {
+            device->SetContext(info.device_id);
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+            if (!device->Copy(buf.data, slice.ptr, slice.size,
+                              device::CopyDirection::kDeviceToHost)) {
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
-                pinned_buffer_pool_->Release(buf);
+                pinned_buffer_pool_->Release(std::move(buf));
                 // Must revoke to avoid phantom replica in master
                 auto revoke_result =
                     master_client_.PutRevoke(key, ReplicaType::DISK);
@@ -3361,7 +3377,7 @@ void Client::PutToLocalFile(const std::string& key,
                 return;
             }
             value.append(buf.data, slice.size);
-            pinned_buffer_pool_->Release(buf);
+            pinned_buffer_pool_->Release(std::move(buf));
         } else {
             value.append(static_cast<char*>(slice.ptr), slice.size);
         }

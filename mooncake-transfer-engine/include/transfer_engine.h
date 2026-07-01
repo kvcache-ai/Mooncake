@@ -25,7 +25,8 @@ class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
 };
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
 namespace device {
 class P2pTransport;
 class RdmaTransport;
@@ -91,6 +92,8 @@ class TransferEngine {
     std::string getLocalIpAndPort();
 
     int getRpcPort();
+
+    bool isUsingTent() const { return use_tent_; }
 
     SegmentHandle openSegment(const std::string& segment_name);
 
@@ -160,7 +163,8 @@ class TransferEngine {
 
     Transport* getTransport(const std::string& proto);
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
     // Device transport accessors (P2P + IBGDA).  Lazily created on first
     // call and owned by the TransferEngine.  These allow EP (and future
     // CPU-proxy paths) to obtain device transports from an engine instance

@@ -1,0 +1,161 @@
+name: Release MUSA
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-22.04
+    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+
+    permissions:
+      contents: write
+
+    strategy:
+      max-parallel: 2
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+
+    env:
+      BUILD_WITH_EP: "0"
+      MUSA_BUILD: "1"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark repository as safe
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set Python bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHON_BIN="$(command -v python${{ matrix.python-version }})"
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -m pip --version
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          bash -x dependencies.sh -y
+          echo "PATH=/usr/local/go/bin:/usr/local/musa/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/usr/local/musa/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Configure project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          rm -rf build
+          mkdir build
+          cd build
+          cmake_args=(
+            -DUSE_MUSA=ON
+            -DUSE_HTTP=ON
+            -DUSE_ETCD=ON
+            -DSTORE_USE_ETCD=ON
+            -DBUILD_UNIT_TESTS=OFF
+            -DENABLE_DEBUG_SYMBOLS=OFF
+            -DCMAKE_BUILD_TYPE=Release
+            -DPython3_EXECUTABLE="${PYTHON_BIN}"
+          )
+          cmake -G Ninja .. "${cmake_args[@]}"
+
+      - name: Build project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          cd build
+          cmake --build . -j"$(nproc)"
+
+      - name: Build MUSA allocator
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          bash build.sh --use-mcc ../../build/mooncake-transfer-engine/nvlink-allocator/
+
+      - name: Install project
+        shell: bash
+        run: |
+          set -eo pipefail
+          cd build
+          cmake --install .
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        shell: bash
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+
+      - name: Build Python wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib:/usr/local/musa/lib"
+          MUSA_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-musa-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-musa-x86_64-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-musa-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
+  publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: pypi
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+          pattern: mooncake-wheel-musa-*
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          echo "Collected wheels for release:"
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mooncake-wheel/dist-release/*.whl
+
+      - name: Publish package to PyPI
+        if: github.repository == 'kvcache-ai/Mooncake'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist-release/

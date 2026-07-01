@@ -2214,6 +2214,26 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     TentMetrics::instance().recordWriteCompleted(
                         task.request.length, latency_seconds);
                 }
+                // Observability only (RFC #2519): if this transfer carried a
+                // deadline, emit the post-hoc feasibility ratio MLU =
+                // actual_transfer_time / available_window, where the window is
+                // (deadline - submit_time). MLU < 1 met the deadline; >= 1
+                // missed it. This does not drive any admission/scheduling yet.
+                if (task.request.deadline_ns != 0) {
+                    uint64_t start_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            start_time.time_since_epoch())
+                            .count());
+                    if (task.request.deadline_ns > start_ns) {
+                        double window_seconds =
+                            (task.request.deadline_ns - start_ns) / 1e9;
+                        TentMetrics::instance().recordDeadlineMLU(
+                            latency_seconds / window_seconds);
+                    } else {
+                        // Deadline already in the past at submit: infeasible.
+                        TentMetrics::instance().recordDeadlineMLU(5.0);
+                    }
+                }
             } else if (new_status == FAILED) {
                 if (task.request.opcode == Request::READ) {
                     TentMetrics::instance().recordReadFailed(
