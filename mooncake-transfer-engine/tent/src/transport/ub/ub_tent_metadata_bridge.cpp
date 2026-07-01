@@ -55,7 +55,8 @@ UbTentMetadataBridge::convertFromTent(const tent::SegmentDesc* tent_seg) const {
 
     const auto& mem = std::get<tent::MemorySegmentDesc>(tent_seg->detail);
 
-    // Extract per-device EIDs stored in transport_attrs[UB].
+    // Collect device names for topology construction.
+    std::vector<std::string> ub_device_names;
     for (const auto& dev : mem.devices) {
         TransferMetadata::DeviceDesc d;
         d.name = dev.name;
@@ -64,12 +65,16 @@ UbTentMetadataBridge::convertFromTent(const tent::SegmentDesc* tent_seg) const {
             d.eid = it->second;
         }
         desc->devices.push_back(d);
+        ub_device_names.push_back(dev.name);
     }
 
     // Extract per-buffer tseg handles stored in transport_attrs[UB] as a
     // JSON array of strings.
     for (const auto& buf : mem.buffers) {
         TransferMetadata::BufferDesc b;
+        // The old-TE selectDevice() uses buffer.name as the topology storage
+        // key (e.g. "cpu:0" or "*").  Map TENT buf.location to this field.
+        b.name = buf.location.empty() ? kWildcardLocation : buf.location;
         b.addr = buf.addr;
         b.length = buf.length;
         auto it = buf.transport_attrs.find(TransportType::UB);
@@ -85,6 +90,37 @@ UbTentMetadataBridge::convertFromTent(const tent::SegmentDesc* tent_seg) const {
         }
         desc->buffers.push_back(std::move(b));
     }
+
+    // Build a minimal old-TE topology from the TENT device list so that
+    // selectDevice() can resolve storage_type → device index.  The old-TE
+    // topology is a JSON object of the form:
+    //   { "storage_type": [ ["preferred_hca"], ["avail_hca"] ] }
+    // We construct a wildcard "*" entry covering all UB devices, plus
+    // entries for each distinct buffer.location found in the remote segment.
+    if (!ub_device_names.empty()) {
+        json topo_j(json::object());
+        auto build_entry = [&ub_device_names](const std::string& key) {
+            json entry(json::array());
+            json preferred(json::array());
+            for (const auto& name : ub_device_names) preferred.push_back(name);
+            entry.push_back(std::move(preferred));
+            entry.push_back(json::array());  // empty avail_hca list
+            return entry;
+        };
+        topo_j["*"] = build_entry("*");
+        // Also register each buffer location so selectDevice can match it.
+        for (const auto& buf : mem.buffers) {
+            if (!buf.location.empty() && buf.location != kWildcardLocation) {
+                topo_j[buf.location] = build_entry(buf.location);
+            }
+        }
+        desc->topology.parse(topo_j.dump());
+    }
+
+    LOG(INFO) << "UbTentMetadataBridge::convertFromTent segment=" << desc->name
+              << " devices=" << desc->devices.size()
+              << " buffers=" << desc->buffers.size()
+              << " topology_entries=" << desc->topology.getMatrix().size();
 
     return desc;
 }
@@ -111,6 +147,16 @@ UbTentMetadataBridge::getSegmentDescByID(SegmentID segment_id,
         std::lock_guard<std::mutex> lock(cache_mutex_);
         auto it = remote_desc_cache_.find(segment_id);
         if (it != remote_desc_cache_.end()) return it->second;
+    } else {
+        // force_update: invalidate both the bridge cache and the TENT
+        // thread-local cache so that getRemoteCached() re-fetches from
+        // the metadata registry (etcd/p2p) instead of returning a stale
+        // copy (TENT's default TTL is ~1 hour).
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            remote_desc_cache_.erase(segment_id);
+        }
+        control_service_->segmentManager().invalidateRemote(segment_id);
     }
 
     tent::SegmentDesc* tent_desc = nullptr;

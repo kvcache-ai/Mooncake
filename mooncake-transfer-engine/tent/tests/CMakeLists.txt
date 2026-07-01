@@ -174,4 +174,18 @@ if(USE_UB)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-common/include)
   add_test(NAME tent_ub_transport_test COMMAND tent_ub_transport_test)
+
+  # UB + TENT dual-node e2e integration test (requires real URMA hardware and
+  # two machines sharing a TENT metadata backend).
+  add_executable(tent_ub_e2e_dual_node_test ub_e2e_dual_node_test.cpp)
+  target_link_libraries(tent_ub_e2e_dual_node_test
+                        PRIVATE ${TENT_GTEST_LINK_LIBS} gflags glog)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_ub_e2e_dual_node_test PRIVATE asio_shared)
+  endif()
+  target_include_directories(
+    tent_ub_e2e_dual_node_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-common/include)
 endif()
