@@ -17,6 +17,7 @@
 
 #include <functional>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -99,9 +100,6 @@ class NVLinkTransport : public Transport {
 
     Status setPeerAccess();
 
-    // Helper to look up registered device ID for a pointer
-    int getRegisteredDeviceId(void *ptr) const;
-
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -127,11 +125,8 @@ class NVLinkTransport : public Transport {
     uint64_t async_memcpy_threshold_;
     bool host_register_;
 
-    std::mutex register_mutex_;
+    mutable std::mutex register_mutex_;
     std::unordered_set<uint64_t> registered_base_addrs_;
-
-    // Map from buffer address to GPU device ID, populated at registration time
-    std::unordered_map<void *, int> registered_memory_gpu_id_;
 };
 }  // namespace tent
 }  // namespace mooncake

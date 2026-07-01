@@ -20,10 +20,10 @@
 
 #include <functional>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -103,9 +103,6 @@ class MnnvlTransport : public Transport {
 
     Status setPeerAccess();
 
-    // Helper to look up registered device ID for a pointer
-    int getRegisteredDeviceId(void *ptr) const;
-
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -136,10 +133,6 @@ class MnnvlTransport : public Transport {
     CUmemAllocationHandleType handle_type_;
 
     bool host_register_;
-
-    // Map from buffer address to GPU device ID, populated at registration time
-    std::unordered_map<void *, int> registered_memory_gpu_id_;
-    std::mutex registered_memory_mutex_;
 };
 }  // namespace tent
 }  // namespace mooncake

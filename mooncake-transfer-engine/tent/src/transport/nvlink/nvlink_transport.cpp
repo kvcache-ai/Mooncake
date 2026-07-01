@@ -54,28 +54,7 @@ Status restoreCudaDeviceForLocation(const LocationParser& location,
     return Status::OK();
 }
 
-int detectDeviceFromPointer(void* ptr) {
-    if (!ptr) return -1;
-    cudaPointerAttributes attrs = {};
-    auto err = cudaPointerGetAttributes(&attrs, ptr);
-    if (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice)
-        return attrs.device;
-    cudaGetLastError();
-    return -1;
-}
-
 }  // namespace
-
-// Helper to look up registered device ID for a pointer
-int NVLinkTransport::getRegisteredDeviceId(void* ptr) const {
-    if (!ptr) return -1;
-    std::lock_guard<std::mutex> lock(register_mutex_);
-    auto it = registered_memory_gpu_id_.find(ptr);
-    if (it != registered_memory_gpu_id_.end()) {
-        return it->second;
-    }
-    return -1;
-}
 
 NVLinkTransport::NVLinkTransport() : installed_(false) {}
 
@@ -150,45 +129,80 @@ Status NVLinkTransport::submitTransferTasks(
     if (!shm_batch)
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
 
-    if (!shm_batch->async_stream.get()) {
-        int device_id = -1;
-        // Use registered device ID instead of inferring from pointers
-        for (auto& req : request_list) {
-            device_id = getRegisteredDeviceId(req.source);
-            if (device_id >= 0) break;
-        }
-        // Fallback to pointer detection if not registered (backward
-        // compatibility)
-        if (device_id < 0) {
-            for (auto& req : request_list) {
-                device_id = detectDeviceFromPointer(req.source);
-                if (device_id >= 0) break;
-            }
-        }
-        if (device_id < 0) cudaGetDevice(&device_id);
-        CHECK_STATUS(
-            platform_->getStreamFromPool(shm_batch->sync_stream, device_id));
-        CHECK_STATUS(
-            platform_->getStreamFromPool(shm_batch->async_stream, device_id));
-    }
-
     if (request_list.size() + shm_batch->task_list.size() > shm_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    // Get local segment for buffer lookup
+    auto& segment_manager = metadata_->segmentManager();
+    SegmentDesc* local_segment = segment_manager.getLocal();
+    if (!local_segment)
+        return Status::InternalError("Local segment not found" LOC_MARK);
+
+    // Determine device for this batch and validate all requests
+    int batch_device_id = -1;
+    bool device_determined = false;
     std::vector<NVLinkTask*> new_tasks;
+
     for (auto& request : request_list) {
+        // Find the buffer this source pointer belongs to
+        BufferDesc* buf = local_segment->findBuffer(
+            reinterpret_cast<uint64_t>(request.source), request.length);
+        if (!buf) {
+            return Status::InvalidArgument(
+                "Unregistered buffer: source pointer not in any registered "
+                "buffer" LOC_MARK);
+        }
+
+        // Parse device ID from buffer location (e.g., "cuda:0" -> 0, "cpu" ->
+        // -1)
+        LocationParser location(buf->location);
+        int device_id = location.index();
+
+        // Multi-GPU batch validation: all requests must be from the same device
+        // Current SubBatch architecture (single sync_stream/async_stream pair)
+        // does not support per-device stream management. Multi-GPU batches
+        // would require either:
+        //   1. Grouping + dispatching per-device internally (needs SubBatch
+        //   refactor)
+        //   2. Caller responsibility to split batches by device
+        // For now, reject mixed-GPU batches explicitly rather than silently
+        // using wrong stream.
+        if (!device_determined && device_id >= 0) {
+            batch_device_id = device_id;
+            device_determined = true;
+        } else if (device_id >= 0 && device_id != batch_device_id) {
+            return Status::InvalidArgument(
+                "Multi-GPU batch not supported: requests from different GPU "
+                "devices in the same batch" LOC_MARK);
+        }
+
+        // Create and populate task
         shm_batch->task_list.push_back(NVLinkTask{});
         auto& task = shm_batch->task_list[shm_batch->task_list.size() - 1];
+
         uint64_t target_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
                 target_addr, request.length, request.target_id);
             if (!status.ok()) return status;
         }
+
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
+        task.cuda_id = device_id;
         new_tasks.push_back(&task);
     }
+
+    // Get or create streams for this batch's device
+    if (!shm_batch->async_stream.get()) {
+        int stream_device = (batch_device_id >= 0) ? batch_device_id : 0;
+        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream,
+                                                  stream_device));
+        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream,
+                                                  stream_device));
+    }
+
     startTransfer(new_tasks, shm_batch);
     return Status::OK();
 }
@@ -381,20 +395,12 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
             registered_base_addrs_.insert((uint64_t)base_ptr);
-            // Capture GPU device ID from BufferDesc.location at registration
-            // time
-            registered_memory_gpu_id_[(void*)base_ptr] = location.index();
         }
     } else if (location.type() == "cpu" ||
                location.type() == kWildcardLocation) {
         if (host_register_)
             CHECK_CUDA(cudaHostRegister(((void*)desc.addr), desc.length,
                                         cudaHostRegisterDefault));
-        // Store CPU buffers with device ID -1
-        {
-            std::lock_guard<std::mutex> lock(register_mutex_);
-            registered_memory_gpu_id_[reinterpret_cast<void*>(desc.addr)] = -1;
-        }
     } else
         return Status::InvalidArgument(
             "Unrecognized location - neither cpu or cuda: " + location.type());
@@ -429,15 +435,11 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
             registered_base_addrs_.erase(key);
-            // Remove the buffer from the registered memory map
-            registered_memory_gpu_id_.erase((void*)key);
         }
-    } else if (location.type() == "cpu" && host_register_) {
-        CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
-        // Remove CPU buffer from the registered memory map
-        {
-            std::lock_guard<std::mutex> lock(register_mutex_);
-            registered_memory_gpu_id_.erase((void*)desc.addr);
+    } else if (location.type() == "cpu" ||
+               location.type() == kWildcardLocation) {
+        if (host_register_) {
+            CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
         }
     }
     desc.shm_path.clear();
