@@ -20,6 +20,7 @@
 
 #include "http_metadata_server.h"
 #include "master_metric_manager.h"
+#include "replica.h"
 #include "common.h"
 #include "segment.h"
 #ifdef USE_HTTP
@@ -54,7 +55,8 @@ static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
     "mooncake_snapshot_save_backup";
 static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
     "mooncake_snapshot_restore_backup";
-static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
+static const std::string SNAPSHOT_SERIALIZER_VERSION = "2.0.0";
+static const std::string SNAPSHOT_SERIALIZER_VERSION_LEGACY = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 namespace {
@@ -454,7 +456,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     if (enable_cxl_) {
-        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        // When CXL is enabled:
+        // - RAM storage uses RandomAllocationStrategy (original single-protocol
+        // strategy)
+        // - CXL storage uses CxlAllocationStrategy
+        cxl_allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
@@ -2663,6 +2669,15 @@ auto MasterService::AllocateAndInsertMetadata(
             preferred_segments = config.preferred_segments;
         }
 
+        // Select allocation strategy based on preferred_storage_level
+        // - CXL storage level uses CxlAllocationStrategy when CXL is enabled
+        // - RAM storage level uses the configured allocation strategy
+        std::shared_ptr<AllocationStrategy> strategy = allocation_strategy_;
+        if (enable_cxl_ &&
+            config.preferred_storage_level == StorageLevel::CXL) {
+            strategy = cxl_allocation_strategy_;
+        }
+
         const SsdMetricsProvider* ssd_provider = nullptr;
         std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
         if (allocation_strategy_type_ ==
@@ -2671,7 +2686,7 @@ auto MasterService::AllocateAndInsertMetadata(
             ssd_provider = &*ssd_access;
         }
 
-        auto allocation_result = allocation_strategy_->Allocate(
+        auto allocation_result = strategy->Allocate(
             allocator_manager, value_length, config.replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
             ssd_provider);
@@ -5021,9 +5036,9 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     // Watermark gate: don't promote if DRAM is already under eviction
     // pressure. The check is best-effort (state can change between this
     // sample and the actual allocation in PromotionAllocStart).
-    const double used_ratio =
-        MasterMetricManager::instance().get_global_mem_used_ratio();
-    if (used_ratio >= eviction_high_watermark_ratio_) {
+    const auto used_ratios =
+        MasterMetricManager::instance().get_global_used_ratio();
+    if (used_ratios.total >= eviction_high_watermark_ratio_) {
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
         return;
     }
@@ -5417,20 +5432,21 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        double used_ratio =
-            MasterMetricManager::instance().get_global_mem_used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
+        auto used_ratios =
+            MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratios.total > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
+            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratios.total
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
-            double evict_ratio_target = std::max(
-                eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
+            double evict_ratio_target =
+                std::max(eviction_ratio_, used_ratios.total -
+                                              eviction_high_watermark_ratio_ +
+                                              eviction_ratio_);
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
-                         used_ratio - eviction_high_watermark_ratio_);
+                         used_ratios.total - eviction_high_watermark_ratio_);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
@@ -6462,9 +6478,11 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                 "', expected '" + SNAPSHOT_SERIALIZER_TYPE +
                                 "'");
         }
-        if (version != SNAPSHOT_SERIALIZER_VERSION) {
+        if (version != SNAPSHOT_SERIALIZER_VERSION &&
+            version != SNAPSHOT_SERIALIZER_VERSION_LEGACY) {
             return fail_restore("incompatible snapshot version '" + version +
                                 "', expected '" + SNAPSHOT_SERIALIZER_VERSION +
+                                "' or '" + SNAPSHOT_SERIALIZER_VERSION_LEGACY +
                                 "'");
         }
 

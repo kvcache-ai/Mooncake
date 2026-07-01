@@ -69,6 +69,8 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    [[nodiscard]] StorageLevel getStorageLevel() const noexcept;
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);
@@ -106,6 +108,8 @@ class AllocatedBuffer {
 class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
+
+    virtual StorageLevel getStorageLevel() const = 0;
 
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
@@ -154,11 +158,14 @@ class CachelibBufferAllocator
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
+                            StorageLevel level = StorageLevel::RAM,
                             ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+
+    StorageLevel getStorageLevel() const override { return storage_level_; }
 
     void deallocate(AllocatedBuffer* handle) override;
 
@@ -185,6 +192,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    StorageLevel storage_level_;
     const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
@@ -207,11 +215,14 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
+                          StorageLevel level = StorageLevel::RAM,
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+
+    StorageLevel getStorageLevel() const override { return storage_level_; }
 
     void deallocate(AllocatedBuffer* handle) override;
 
@@ -240,6 +251,7 @@ class OffsetBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    StorageLevel storage_level_;
     const ReplicaType replica_type_;
 
     // offset allocator implementation

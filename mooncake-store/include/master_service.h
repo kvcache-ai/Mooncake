@@ -22,6 +22,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "cxl_allocation_strategy.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
@@ -1982,6 +1983,7 @@ class MasterService {
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::shared_ptr<AllocationStrategy> cxl_allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;
 
