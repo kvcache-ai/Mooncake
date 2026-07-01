@@ -108,6 +108,20 @@ class RedisHelper {
     void WatchLeader();
 
     /**
+     * @brief Fast-path watch: SUBSCRIBE to leader event channel, with a
+     *        polling thread as backup. Returns true if subscribe succeeded
+     *        and the watch completed, false if subscribe failed (caller
+     *        should fall back to pure polling).
+     */
+    bool WatchLeaderSubscribe();
+
+    /**
+     * @brief Slow-path watch: pure polling via a separate connection.
+     *        Blocks until the leader key expires or cancel is requested.
+     */
+    void WatchLeaderPolling();
+
+    /**
      * @brief Publish a leader event on the notification channel.
      *        Caller must hold election_mutex_.
      */
@@ -124,6 +138,14 @@ class RedisHelper {
      *        Used internally by Connect and for the polling connection.
      */
     redisContext* CreateConnection();
+
+    /**
+     * @brief Drain any pending replies from a subscribe context.
+     *        After UNSUBSCRIBE, buffered message frames may remain in the
+     *        socket. This function reads and discards them so that the next
+     *        SUBSCRIBE command receives a clean reply.
+     */
+    void DrainSubscribeContext();
 
     // === Redis key naming ===
 
@@ -154,7 +176,9 @@ class RedisHelper {
     std::string our_value_;  // JSON value we wrote, for Lua lease renewal
     std::string cluster_id_;
     std::atomic<bool> keep_alive_running_{false};
-    std::atomic<bool> cancel_requested_{false};
+    std::atomic<bool> cancel_keep_alive_{false};  // Cancel KeepLeader only
+    std::atomic<bool> cancel_election_{
+        false};  // Cancel ElectLeader/WatchLeader
     std::atomic<int> next_lease_id_{
         1};  // Local monotonic counter for lease IDs
 };

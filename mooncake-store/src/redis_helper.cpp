@@ -40,6 +40,7 @@ RedisHelper::RedisHelper(const std::string& cluster_id,
 }
 
 RedisHelper::~RedisHelper() {
+    cancel_election_ = true;
     CancelKeepAlive();
     if (subscribe_ctx_) {
         redisFree(subscribe_ctx_);
@@ -132,6 +133,9 @@ ErrorCode RedisHelper::Connect() {
         }
         election_ctx_ = CreateConnection();
         if (!election_ctx_) {
+            LOG(ERROR)
+                << "Connect: failed to create election connection to Redis at "
+                << redis_endpoint_;
             return ErrorCode::INTERNAL_ERROR;
         }
     }
@@ -139,8 +143,8 @@ ErrorCode RedisHelper::Connect() {
     // Subscribe connection (separate, as SUBSCRIBE blocks).
     // Set a 1-second read timeout so that redisGetReply in WatchLeader's
     // subscribe loop returns periodically, allowing the loop to check
-    // notified / cancel_requested_ flags even when no Pub/Sub message
-    // arrives (e.g. leader key expired without graceful handoff).
+    // cancel flags even when no Pub/Sub message arrives
+    // (e.g. leader key expired without graceful handoff).
     if (subscribe_ctx_) {
         redisFree(subscribe_ctx_);
         subscribe_ctx_ = nullptr;
@@ -150,8 +154,14 @@ ErrorCode RedisHelper::Connect() {
         struct timeval sub_timeout = {1, 0};  // 1 second
         redisSetTimeout(subscribe_ctx_, sub_timeout);
     } else {
-        // Non-fatal: WatchLeader will fall back to polling
-        LOG(ERROR) << "Failed to create subscribe connection to Redis";
+        // Non-fatal: WatchLeader will fall back to polling when
+        // subscribe_ctx_ is null. We intentionally do NOT retry
+        // here — reconnect is deferred to the next Connect() call
+        // (e.g. during a leadership re-election cycle), which is
+        // sufficient because the polling path provides a correct
+        // (if slower) fallback.
+        LOG(ERROR) << "Failed to create subscribe connection to Redis at "
+                   << redis_endpoint_;
     }
 
     LOG(INFO) << "Connected to Redis";
@@ -164,7 +174,8 @@ ErrorCode RedisHelper::Connect() {
 
 void RedisHelper::ElectLeader(const std::string& master_address,
                               ViewVersionId& version, int& lease_id) {
-    while (true) {
+    while (!cancel_election_) {
+        bool connected = false;
         {
             std::lock_guard<std::mutex> lock(election_mutex_);
             if (!election_ctx_) {
@@ -173,8 +184,9 @@ void RedisHelper::ElectLeader(const std::string& master_address,
                     LOG(ERROR) << "ElectLeader: connect failed, retry in 1s";
                 }
             }
+            connected = (election_ctx_ != nullptr);
         }
-        if (!election_ctx_) {
+        if (!connected) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
         }
@@ -229,8 +241,9 @@ void RedisHelper::ElectLeader(const std::string& master_address,
                 LOG(INFO) << "ElectLeader: current leader=" << current_addr
                           << " epoch=" << current_epoch << ", waiting...";
             } else {
-                LOG(INFO) << "ElectLeader: leader key exists but unparsable, "
-                             "waiting...";
+                LOG(WARNING)
+                    << "ElectLeader: leader key exists but unparsable: "
+                    << current_value << ", waiting...";
             }
 
             WatchLeader();  // Blocks until key expires or "vacant" received
@@ -238,8 +251,9 @@ void RedisHelper::ElectLeader(const std::string& master_address,
         }
 
         // Unexpected reply type
+        int reply_type = reply->type;
         freeReplyObject(reply);
-        LOG(ERROR) << "ElectLeader: unexpected reply type=" << reply->type;
+        LOG(ERROR) << "ElectLeader: unexpected reply type=" << reply_type;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
@@ -301,91 +315,156 @@ bool RedisHelper::TryElectOnce(const std::string& master_address,
 
 void RedisHelper::WatchLeader() {
     // Fast path: SUBSCRIBE for leader event notification
-    if (subscribe_ctx_) {
-        redisReply* reply = (redisReply*)redisCommand(
-            subscribe_ctx_, "SUBSCRIBE %b", leader_event_channel_.data(),
-            leader_event_channel_.size());
-
-        if (reply && reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3 &&
-            reply->element[0]->type == REDIS_REPLY_STRING &&
-            strncmp(reply->element[0]->str, "subscribe", 9) == 0) {
-            freeReplyObject(reply);
-
-            std::atomic<bool> notified{false};
-            redisContext* polling_ctx = CreateConnection();
-
-            // Polling thread: check if key still exists periodically.
-            // The subscribe_ctx_ has a 1-second timeout set in Connect(),
-            // so redisGetReply returns at least once per second regardless
-            // of whether a Pub/Sub message arrives, allowing the subscribe
-            // loop to check notified/cancel_requested_ flags.
-            std::thread polling_thread([this, &notified, polling_ctx]() {
-                auto interval = std::chrono::seconds(ttl_sec_);
-                while (!notified && !cancel_requested_) {
-                    std::this_thread::sleep_for(interval);
-                    if (notified || cancel_requested_) break;
-
-                    if (polling_ctx) {
-                        redisReply* r = (redisReply*)redisCommand(
-                            polling_ctx, "GET %b", master_view_key_.data(),
-                            master_view_key_.size());
-                        if (r) {
-                            if (r->type == REDIS_REPLY_NIL) {
-                                notified = true;
-                            }
-                            freeReplyObject(r);
-                        }
-                    }
-                }
-            });
-
-            // Subscribe loop: read messages until "vacant" or key gone.
-            // redisGetReply returns at least every 1s (subscribe_ctx_ timeout)
-            // so the loop can check notified/cancel_requested_ promptly.
-            while (!notified && !cancel_requested_) {
-                redisReply* msg = nullptr;
-                if (redisGetReply(subscribe_ctx_, (void**)&msg) != REDIS_OK) {
-                    // Timeout or connection error — re-check flags and retry
-                    continue;
-                }
-
-                if (msg) {
-                    if (msg->type == REDIS_REPLY_ARRAY && msg->elements >= 3) {
-                        if (msg->element[0]->type == REDIS_REPLY_STRING &&
-                            strncmp(msg->element[0]->str, "message", 7) == 0) {
-                            notified = true;
-                        }
-                    }
-                    freeReplyObject(msg);
-                }
-            }
-
-            notified = true;  // Signal polling thread to stop
-            polling_thread.join();
-
-            // Clean up polling connection
-            if (polling_ctx) {
-                redisFree(polling_ctx);
-            }
-
-            // Unsubscribe to restore connection state
-            redisReply* unsub = (redisReply*)redisCommand(
-                subscribe_ctx_, "UNSUBSCRIBE %b", leader_event_channel_.data(),
-                leader_event_channel_.size());
-            if (unsub) freeReplyObject(unsub);
-
-            return;
-        }
-        if (reply) freeReplyObject(reply);
-        // Subscribe failed — fall through to pure polling
+    if (subscribe_ctx_ && WatchLeaderSubscribe()) {
+        return;
     }
 
     // Slow path (fallback): pure polling — use a separate connection
+    WatchLeaderPolling();
+}
+
+bool RedisHelper::WatchLeaderSubscribe() {
+    // Attempt SUBSCRIBE; return true if successful, false to fall back to
+    // polling.
+    if (!subscribe_ctx_) return false;
+
+    redisReply* reply = (redisReply*)redisCommand(
+        subscribe_ctx_, "SUBSCRIBE %b", leader_event_channel_.data(),
+        leader_event_channel_.size());
+
+    if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements < 3 ||
+        reply->element[0]->type != REDIS_REPLY_STRING ||
+        strncmp(reply->element[0]->str, "subscribe", 9) != 0) {
+        if (reply) freeReplyObject(reply);
+        return false;  // Fall back to polling
+    }
+    freeReplyObject(reply);
+
+    std::atomic<bool> leader_lost{false};
+    redisContext* polling_ctx = CreateConnection();
+    if (!polling_ctx) {
+        LOG(WARNING) << "WatchLeaderSubscribe: failed to create polling "
+                        "connection; relying on subscribe loop only";
+    }
+
+    // Polling thread: check if key still exists periodically.
+    // The subscribe_ctx_ has a 1-second timeout set in Connect(),
+    // so redisGetReply returns at least once per second regardless
+    // of whether a Pub/Sub message arrives, allowing the subscribe
+    // loop to check leader_lost/cancel_election_ flags.
+    // Only create the polling thread if we have a valid connection.
+    std::thread polling_thread;
+    if (polling_ctx) {
+        polling_thread = std::thread([this, &leader_lost, polling_ctx]() {
+            auto interval = std::chrono::seconds(ttl_sec_);
+            while (!leader_lost && !cancel_election_) {
+                std::this_thread::sleep_for(interval);
+                if (leader_lost || cancel_election_) break;
+
+                redisReply* r = (redisReply*)redisCommand(
+                    polling_ctx, "GET %b", master_view_key_.data(),
+                    master_view_key_.size());
+                if (!r) {
+                    LOG(WARNING)
+                        << "WatchLeaderSubscribe: polling GET failed "
+                           "(connection error), exiting polling thread";
+                    break;
+                }
+                if (r->type == REDIS_REPLY_NIL) {
+                    leader_lost = true;
+                }
+                freeReplyObject(r);
+            }
+        });
+    }
+
+    // Subscribe loop: read messages until leader vacancy is detected.
+    // redisGetReply returns at least every 1s (subscribe_ctx_ timeout)
+    // so the loop can check leader_lost/cancel_election_ promptly.
+    int subscribe_errors = 0;
+    while (!leader_lost && !cancel_election_) {
+        redisReply* msg = nullptr;
+        if (redisGetReply(subscribe_ctx_, (void**)&msg) != REDIS_OK) {
+            // redisGetReply returns REDIS_ERR for both read timeouts
+            // (benign — the 1s timeout we set on subscribe_ctx_) and
+            // real connection errors. We cannot reliably distinguish
+            // them purely from subscribe_ctx_->err because Hiredis sets
+            // err=REDIS_ERR_IO even on timeout. Instead, clear the
+            // error state on the context and only treat persistent
+            // failures (3 consecutive errors without a successful read
+            // between them) as a broken connection.
+            if (subscribe_ctx_ && subscribe_ctx_->err != 0) {
+                subscribe_errors++;
+                LOG(WARNING) << "WatchLeaderSubscribe: subscribe connection "
+                             << "error (" << subscribe_errors
+                             << "): err=" << subscribe_ctx_->errstr;
+                // Clear error state so the next redisGetReply can retry.
+                // For timeouts, this allows normal operation to resume.
+                // For real connection errors, the next call will fail
+                // again and increment subscribe_errors.
+                subscribe_ctx_->err = 0;
+                subscribe_ctx_->errstr[0] = '\0';
+                if (subscribe_errors >= 3) {
+                    LOG(ERROR) << "WatchLeaderSubscribe: subscribe connection "
+                               << "unhealthy after 3 consecutive errors, "
+                               << "giving up";
+                    break;
+                }
+            }
+            // Timeout or cleared transient error — re-check flags
+            continue;
+        }
+        subscribe_errors = 0;  // Reset on successful read
+
+        if (msg) {
+            if (msg->type == REDIS_REPLY_ARRAY && msg->elements >= 3) {
+                if (msg->element[0]->type == REDIS_REPLY_STRING &&
+                    strncmp(msg->element[0]->str, "message", 7) == 0) {
+                    leader_lost = true;
+                }
+            }
+            freeReplyObject(msg);
+        }
+    }
+
+    // If the loop exited without leader_lost or cancel_election_, the
+    // subscribe connection is broken — fall back to pure polling.
+    const bool subscribe_failed = !leader_lost && !cancel_election_;
+    leader_lost = true;  // Signal polling thread to stop
+    if (polling_thread.joinable()) {
+        polling_thread.join();
+    }
+
+    // Clean up polling connection
+    if (polling_ctx) {
+        redisFree(polling_ctx);
+    }
+
+    if (subscribe_failed) {
+        // Subscribe connection is broken — skip UNSUBSCRIBE (it would fail
+        // anyway) and let WatchLeader fall back to pure polling.
+        return false;
+    }
+
+    // Unsubscribe to restore connection state
+    redisReply* unsub = (redisReply*)redisCommand(
+        subscribe_ctx_, "UNSUBSCRIBE %b", leader_event_channel_.data(),
+        leader_event_channel_.size());
+    if (unsub) freeReplyObject(unsub);
+
+    // Drain any buffered message frames remaining in the socket
+    // so the next SUBSCRIBE gets a clean reply.
+    DrainSubscribeContext();
+
+    return true;
+}
+
+void RedisHelper::WatchLeaderPolling() {
     LOG(INFO) << "WatchLeader: using polling fallback (interval=" << ttl_sec_
               << "s)";
     redisContext* polling_ctx = CreateConnection();
     auto interval = std::chrono::seconds(ttl_sec_);
-    while (!cancel_requested_) {
+    while (!cancel_election_) {
         std::this_thread::sleep_for(interval);
 
         if (!polling_ctx) {
@@ -418,8 +497,9 @@ void RedisHelper::WatchLeader() {
 // ============================================================
 
 void RedisHelper::KeepLeader(int lease_id) {
+    (void)lease_id;  // Reserved for future lease validation
     keep_alive_running_ = true;
-    cancel_requested_ = false;
+    cancel_keep_alive_ = false;
 
     // Lua script: atomically check ownership and renew TTL
     // KEYS[1] = master_view_key
@@ -437,7 +517,7 @@ void RedisHelper::KeepLeader(int lease_id) {
     LOG(INFO) << "KeepLeader: starting renewal loop (interval="
               << heartbeat_interval_sec_ << "s)";
 
-    while (keep_alive_running_ && !cancel_requested_) {
+    while (keep_alive_running_ && !cancel_keep_alive_) {
         bool renewed = false;
         {
             std::lock_guard<std::mutex> lock(election_mutex_);
@@ -459,9 +539,21 @@ void RedisHelper::KeepLeader(int lease_id) {
                         check->len == our_value_.size() &&
                         memcmp(check->str, our_value_.data(),
                                our_value_.size()) == 0) {
-                        // Still ours — continue renewing
+                        // Still ours — renew TTL after reconnection
                         freeReplyObject(check);
-                        renewed = true;
+                        redisReply* expire_reply = (redisReply*)redisCommand(
+                            election_ctx_, "EXPIRE %b %d",
+                            master_view_key_.data(), master_view_key_.size(),
+                            ttl_sec_);
+                        if (expire_reply &&
+                            expire_reply->type == REDIS_REPLY_INTEGER &&
+                            expire_reply->integer == 1) {
+                            renewed = true;
+                        } else {
+                            LOG(WARNING) << "KeepLeader: EXPIRE failed after "
+                                            "reconnect, key may have changed";
+                        }
+                        if (expire_reply) freeReplyObject(expire_reply);
                     } else {
                         // Not ours anymore
                         if (check) freeReplyObject(check);
@@ -493,10 +585,8 @@ void RedisHelper::KeepLeader(int lease_id) {
 }
 
 void RedisHelper::CancelKeepAlive() {
-    cancel_requested_ = true;
+    cancel_keep_alive_ = true;
     keep_alive_running_ = false;
-    // subscribe_ctx_ has a 1-second timeout, so WatchLeader's subscribe
-    // loop will check cancel_requested_ within 1 second.
 }
 
 // ============================================================
@@ -507,6 +597,8 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
                                      ViewVersionId& version) {
     std::lock_guard<std::mutex> lock(election_mutex_);
     if (!election_ctx_) {
+        LOG(ERROR) << "GetMasterView: not connected to Redis at "
+                   << redis_endpoint_;
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -515,12 +607,15 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
                                                   master_view_key_.size());
 
     if (!reply) {
+        LOG(ERROR) << "GetMasterView: GET failed (connection error) at "
+                   << redis_endpoint_;
         return ErrorCode::INTERNAL_ERROR;
     }
 
     if (reply->type == REDIS_REPLY_NIL) {
         freeReplyObject(reply);
-        return ErrorCode::INTERNAL_ERROR;  // No leader
+        LOG(WARNING) << "GetMasterView: no leader currently elected";
+        return ErrorCode::INTERNAL_ERROR;
     }
 
     if (reply->type == REDIS_REPLY_STRING) {
@@ -529,10 +624,13 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
         if (ParseLeaderValue(value, master_address, version)) {
             return ErrorCode::OK;
         }
+        LOG(ERROR) << "GetMasterView: failed to parse leader value: " << value;
         return ErrorCode::INTERNAL_ERROR;
     }
 
+    int reply_type = reply->type;
     freeReplyObject(reply);
+    LOG(ERROR) << "GetMasterView: unexpected reply type=" << reply_type;
     return ErrorCode::INTERNAL_ERROR;
 }
 
@@ -564,6 +662,29 @@ bool RedisHelper::Reconnect(redisContext*& ctx) {
 
     LOG(INFO) << "Reconnect: successfully reconnected to Redis";
     return true;
+}
+
+void RedisHelper::DrainSubscribeContext() {
+    if (!subscribe_ctx_) return;
+    // After UNSUBSCRIBE, buffered message frames may still be in the
+    // read buffer. Drain them so the next SUBSCRIBE gets a clean reply.
+    while (true) {
+        redisReply* reply = nullptr;
+        if (redisGetReply(subscribe_ctx_, (void**)&reply) != REDIS_OK ||
+            !reply) {
+            break;  // No more data or connection error
+        }
+        bool is_unsub_ack =
+            (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3 &&
+             reply->element[0]->type == REDIS_REPLY_STRING &&
+             strncmp(reply->element[0]->str, "unsubscribe", 11) == 0);
+        freeReplyObject(reply);
+        if (is_unsub_ack) {
+            // We've consumed the UNSUBSCRIBE acknowledgment — anything
+            // after this would be from a future SUBSCRIBE cycle.
+            break;
+        }
+    }
 }
 
 // ============================================================
