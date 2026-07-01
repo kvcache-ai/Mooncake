@@ -156,7 +156,7 @@ if(STORE_USE_K8S_LEASE)
     k8s_lease_helper.cpp
     PROPERTIES
       OBJECT_DEPENDS
-      "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
+      "${CMAKE_BINARY_DIR}/mooncake-common/ha-wrapper/libmooncake_ha_wrapper.h")
 endif()
 
 if(USE_NOF)
@@ -262,11 +262,10 @@ target_link_libraries(
          yaml-cpp
          asio_shared
   PRIVATE transfer_engine)
-if(STORE_USE_ETCD)
-  add_dependencies(mooncake_store build_etcd_wrapper)
-endif()
-if(STORE_USE_K8S_LEASE)
-  add_dependencies(mooncake_store build_k8s_lease_wrapper)
+if((USE_ETCD AND NOT USE_ETCD_LEGACY)
+   OR STORE_USE_ETCD
+   OR STORE_USE_K8S_LEASE)
+  add_dependencies(mooncake_store build_ha_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)
@@ -304,8 +303,10 @@ target_link_libraries(
           ${MASTER_EXTRA_LIBS}
           asio_shared)
 
-if(STORE_USE_ETCD)
-  add_dependencies(mooncake_master build_etcd_wrapper)
+if((USE_ETCD AND NOT USE_ETCD_LEGACY)
+   OR STORE_USE_ETCD
+   OR STORE_USE_K8S_LEASE)
+  add_dependencies(mooncake_master build_ha_wrapper)
 endif()
 
 # Client server binary

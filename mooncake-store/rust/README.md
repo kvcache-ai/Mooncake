@@ -51,7 +51,7 @@ directory, add the relevant build outputs to `LD_LIBRARY_PATH`:
 
 ```bash
 export LD_LIBRARY_PATH=$MOONCAKE_BUILD_DIR/mooncake-common:\
-$MOONCAKE_BUILD_DIR/mooncake-common/etcd:\
+$MOONCAKE_BUILD_DIR/mooncake-common/ha-wrapper:\
 $MOONCAKE_BUILD_DIR/mooncake-store/src:\
 $MOONCAKE_BUILD_DIR/mooncake-store/src/cachelib_memory_allocator:\
 $MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src:\

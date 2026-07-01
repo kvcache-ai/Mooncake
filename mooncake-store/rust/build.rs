@@ -258,7 +258,7 @@ fn main() {
             build_dir.join("mooncake-transfer-engine/src"),
             build_dir.join("mooncake-transfer-engine/src/common/base"),
             build_dir.join("mooncake-asio"),
-            build_dir.join("mooncake-common/etcd"),
+            build_dir.join("mooncake-common/ha-wrapper"),
         ] {
             push_existing_dir(&mut search_dirs, dir);
         }
@@ -273,7 +273,7 @@ fn main() {
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
         default_build_dir.join("mooncake-asio"),
         default_build_dir.join("mooncake-common"),
-        default_build_dir.join("mooncake-common/etcd"),
+        default_build_dir.join("mooncake-common/ha-wrapper"),
         PathBuf::from("/usr/local/lib"),
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
         PathBuf::from("/lib/x86_64-linux-gnu"),

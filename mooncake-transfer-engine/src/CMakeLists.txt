@@ -29,10 +29,8 @@ if(USE_ETCD)
       target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
     endif()
   else()
-    add_dependencies(transfer_engine build_etcd_wrapper)
-    set(ETCD_WRAPPER_LIB
-        ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so
-    )
+    add_dependencies(transfer_engine build_ha_wrapper)
+    set(ETCD_WRAPPER_LIB ${HA_WRAPPER_LIB})
     target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
   endif()
 endif()

@@ -40,7 +40,7 @@
 #ifdef USE_ETCD_LEGACY
 #include <etcd/SyncClient.hpp>
 #else
-#include <libetcd_wrapper.h>
+#include <libmooncake_ha_wrapper.h>
 #endif
 #endif  // USE_ETCD
 
