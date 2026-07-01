@@ -14,6 +14,7 @@
 #include <sstream>
 #include "connection_poller.h"
 #include "memory_location.h"
+#include "mooncake_pg_experimental.h"
 #include "mooncake_worker.cuh"
 #include "pg_utils.h"
 #include <transport/device/device_transport.h>
@@ -58,36 +59,6 @@ static bool useDeviceControlRegionsForNvlink() {
 
 static bool useStoreSyncForNvlinkPoc() {
     const char* value = std::getenv("MOONCAKE_PG_INTRA_STORE_SYNC");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pAllgatherPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AG");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDeviceApiCollectivesPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DEVICE_API_COLLECTIVES");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDeviceApiHierarchicalAllReducePoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DEVICE_API_HIER_AR");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool captureTraceEnabled() {
-    const char* value = std::getenv("MOONCAKE_PG_CAPTURE_TRACE");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool replayTraceEnabled() {
-    const char* value = std::getenv("MOONCAKE_PG_REPLAY_TRACE");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool replayTraceSequenceEnabled() {
-    const char* value = std::getenv("MOONCAKE_PG_REPLAY_TRACE_SEQUENCE");
     return value && value[0] != '\0' && value[0] != '0';
 }
 
@@ -241,191 +212,6 @@ static std::string serverHostOnly(const std::string& server_name) {
     const auto pos = server_name.rfind(':');
     if (pos == std::string::npos) return server_name;
     return server_name.substr(0, pos);
-}
-
-static bool directP2pAllgatherDebug() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AG_DEBUG");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDeviceRingAllgatherPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DEVICE_RING_AG");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static int deviceRingSignalMode() {
-    const char* value = std::getenv("MOONCAKE_PG_DEVICE_RING_AG");
-    if (value && value[0] == '2') return 1;  // release/acquire PTX
-    if (value && value[0] == '4') return 2;  // NCCL-like relaxed store + volatile load
-    return 0;                                // CUDA system atomics
-}
-
-static bool useDeviceFifoRingAllgatherPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DEVICE_RING_AG");
-    return value && value[0] == '3';
-}
-
-static bool useDeviceStoreSignalAllgatherPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DEVICE_RING_AG");
-    return value && value[0] == '5';
-}
-
-static bool useDeviceStoreSignalSlottedAllgatherPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DEVICE_RING_AG");
-    return value && value[0] == '6';
-}
-
-static int deviceStoreSignalSlots() {
-    const char* value = std::getenv("MOONCAKE_PG_STORE_SIGNAL_SLOTS");
-    if (!value || value[0] == '\0') {
-        return useDeviceApiCollectivesPoc() ? 64 : 8;
-    }
-    char* end = nullptr;
-    long parsed = std::strtol(value, &end, 10);
-    if (end == value || parsed < 2) return 2;
-    if (parsed > 64) return 64;
-    return static_cast<int>(parsed);
-}
-
-static size_t directP2pEffectiveBufferSize() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_BUFFER_MB");
-    if (!value || value[0] == '\0') return kDefaultBufferSize;
-    char* end = nullptr;
-    unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value || parsed == 0) return kDefaultBufferSize;
-    const size_t mb = static_cast<size_t>(parsed);
-    const size_t max_mb = kBufferSize >> 20;
-    const size_t clamped_mb = std::min(std::max<size_t>(mb, 16), max_mb);
-    return clamped_mb << 20;
-}
-
-static size_t directP2pSlotStride(size_t effectiveBufferSize,
-                                  size_t signalBytes, int slots,
-                                  int activeSize) {
-    if (slots <= 0 || activeSize <= 0 || effectiveBufferSize <= signalBytes) {
-        return 0;
-    }
-    return (((effectiveBufferSize - signalBytes) / static_cast<size_t>(slots) /
-             static_cast<size_t>(activeSize)) &
-            ~static_cast<size_t>(7));
-}
-
-static size_t directP2pSlottedControlBytes(int slots,
-                                           bool deviceApiCollective) {
-    const size_t signalBytes =
-        static_cast<size_t>(slots) * kMaxNumRanks * sizeof(uint32_t);
-    // Device API RDMA collectives use produce signals, consume signals, and an
-    // extra per-slot atomic scratch area for remote signal accumulation.
-    return signalBytes * (deviceApiCollective ? 3 : 2);
-}
-
-static bool useDirectP2pCurrentStream() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_CURRENT_STREAM");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pNoEventWork() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_NO_EVENT");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pOutputAllgatherPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_OUTPUT_AG");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pAllReduceDirectOutputAllgatherPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AR_DIRECT_OUTPUT_AG");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pReduceScatterPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_RS");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pAllReducePoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AR");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pAllReduceRingPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AR_RING");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pAllReduceFusedRsAgPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AR_FUSED_RSAG");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pAllReduceAllgatherSkipSelfPoc() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AR_AG_SKIP_SELF");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static size_t directP2pAllReduceMaxBytes() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_AR_MAX_BYTES");
-    if (!value || value[0] == '\0') return 256 * 1024;
-    char* end = nullptr;
-    unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value || parsed == 0) return 0;
-    return static_cast<size_t>(parsed);
-}
-
-static bool directP2pCountEnabled() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_COUNT");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool directP2pAllReduceStageProfileEnabled() {
-    const char* value = std::getenv("MOONCAKE_PG_AR_STAGE_PROFILE");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static uint64_t directP2pAllReduceStageProfileLimit() {
-    const char* value = std::getenv("MOONCAKE_PG_AR_STAGE_PROFILE_LIMIT");
-    if (!value || value[0] == '\0') return 8;
-    char* end = nullptr;
-    unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value || parsed == 0) return 8;
-    return parsed;
-}
-
-static bool useDirectP2pChunked() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_CHUNKED");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useDirectP2pDeviceSequence() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_DEVICE_SEQUENCE");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static bool useFusedDirectP2pDeviceSequenceReserve() {
-    const char* value = std::getenv("MOONCAKE_PG_FUSED_DEVICE_SEQUENCE");
-    return value && value[0] != '\0' && value[0] != '0';
-}
-
-static uint32_t directP2pDeviceSequenceSlotCapacity() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_DEVICE_SEQUENCE_SLOTS");
-    if (!value || value[0] == '\0') return 1u << 20;
-    char* end = nullptr;
-    unsigned long parsed = std::strtoul(value, &end, 10);
-    if (end == value || parsed < 128) return 128;
-    if (parsed > 1u << 20) return 1u << 20;
-    return static_cast<uint32_t>(parsed);
-}
-
-static bool disableDirectP2pDuringCudaGraphCapture() {
-    const char* value = std::getenv("MOONCAKE_PG_DIRECT_P2P_GRAPH_CAPTURE");
-    if (useDirectP2pDeviceSequence()) return false;
-    // The slotted direct-P2P protocol currently embeds host-generated sequence
-    // numbers into captured kernels. CUDA graph replay reuses those constants,
-    // which is unsafe for producer/consumer signals across graph replays. Keep
-    // graph capture correct by defaulting captured regions to the existing
-    // Mooncake PG path until a runtime device-sequence protocol is added.
-    return !value || value[0] == '\0' || value[0] == '0';
 }
 
 static bool isCudaStreamCapturing(cudaStream_t stream) {
@@ -1381,14 +1167,28 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             (direct_ar_segment_bytes <= rdma_ar_slot_stride ||
              useDirectP2pChunked());
         const bool can_device_api_p2p_full_ar = false;
+        const bool can_device_api_p2p_ar_rsag =
+            !direct_p2p_capture_disabled &&
+            useDeviceApiCollectivesPoc() &&
+            useDirectP2pAllReducePoc() && useDirectP2pReduceScatterPoc() &&
+            useDirectP2pAllgatherPoc() && useDirectP2pChunked() &&
+            directP2pAllgatherReady_ && use_device_sequence &&
+            tensor.is_contiguous() && meta_->activeSize == meta_->size &&
+            opts.reduceOp == c10d::ReduceOp::SUM && meta_->activeSize > 0 &&
+            tensorSize % static_cast<size_t>(meta_->activeSize) == 0 &&
+            direct_ar_segment_bytes % tensor.element_size() == 0 &&
+            direct_slot_stride > 0 && allActivePeersOnSameHost() &&
+            !forceDisableDirectP2pPeers();
         const bool device_api_ar_requested =
             useDeviceApiCollectivesPoc() && useDirectP2pAllReducePoc();
         if (device_api_ar_requested) {
             TORCH_CHECK(
-                can_device_api_rdma_ar || can_device_api_p2p_full_ar,
+                can_device_api_rdma_ar || can_device_api_p2p_full_ar ||
+                    can_device_api_p2p_ar_rsag,
                 "Mooncake PG Device API all_reduce requested but path is not "
                 "ready: capture_disabled=", direct_p2p_capture_disabled,
                 " rdma_ready=", directRdmaReady_,
+                " p2p_ready=", directP2pAllgatherReady_,
                 " direct_ar=", useDirectP2pAllReducePoc(),
                 " direct_rs=", useDirectP2pReduceScatterPoc(),
                 " direct_ag=", useDirectP2pAllgatherPoc(),
@@ -1396,14 +1196,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                 " contiguous=", tensor.is_contiguous(),
                 " full_active=", meta_->activeSize == meta_->size,
                 " sum=", opts.reduceOp == c10d::ReduceOp::SUM,
+                " same_host=", allActivePeersOnSameHost(),
                 " active_size=", meta_->activeSize,
                 " bytes=", tensorSize,
                 " segment_bytes=", direct_ar_segment_bytes,
                 " rdma_slot_stride=", rdma_ar_slot_stride,
-                " full_ar=", can_device_api_p2p_full_ar);
+                " full_ar=", can_device_api_p2p_full_ar,
+                " rsag=", can_device_api_p2p_ar_rsag);
         }
         const bool can_direct_ar_rsag = !direct_p2p_capture_disabled &&
-            !useDeviceApiCollectivesPoc() &&
             useDirectP2pAllReducePoc() && useDirectP2pReduceScatterPoc() &&
             useDirectP2pAllgatherPoc() && useDirectP2pChunked() &&
             directP2pAllgatherReady_ && tensor.is_contiguous() &&
@@ -1411,7 +1212,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             opts.reduceOp == c10d::ReduceOp::SUM && meta_->activeSize > 0 &&
             tensorSize % static_cast<size_t>(meta_->activeSize) == 0 &&
             direct_ar_segment_bytes % tensor.element_size() == 0 &&
-            direct_slot_stride > 0;
+            direct_slot_stride > 0 &&
+            (!useDeviceApiCollectivesPoc() ||
+             (use_device_sequence && allActivePeersOnSameHost() &&
+              !forceDisableDirectP2pPeers()));
         int cuda_device_count = 0;
         cudaGetDeviceCount(&cuda_device_count);
         const size_t hier_signal_bytes =
@@ -2451,11 +2255,17 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
             useDeviceApiCollectivesPoc() && directRdmaReady_ &&
             use_store_signal_slotted && use_device_sequence &&
             !use_direct_output;
+        const bool use_device_api_p2p_ag =
+            useDeviceApiCollectivesPoc() && !directRdmaReady_ &&
+            directP2pAllgatherReady_ && use_store_signal_slotted &&
+            use_device_sequence && !use_direct_output &&
+            allActivePeersOnSameHost() && !forceDisableDirectP2pPeers();
         const bool device_api_ag_requested =
             useDeviceApiCollectivesPoc() && useDirectP2pAllgatherPoc();
         if (device_api_ag_requested) {
             TORCH_CHECK(
-                !direct_p2p_capture_disabled && use_device_api_rdma_ag &&
+                !direct_p2p_capture_disabled &&
+                    (use_device_api_rdma_ag || use_device_api_p2p_ag) &&
                     inputBuffer.is_contiguous() && outputBuffer.is_contiguous() &&
                     meta_->activeSize == meta_->size &&
                     (!overlaps_output || use_store_signal ||
@@ -2464,6 +2274,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                 "Mooncake PG Device API all_gather_base requested but path is "
                 "not ready: capture_disabled=", direct_p2p_capture_disabled,
                 " rdma_ready=", directRdmaReady_,
+                " p2p_ready=", directP2pAllgatherReady_,
+                " same_host=", allActivePeersOnSameHost(),
                 " slotted=", use_store_signal_slotted,
                 " device_sequence=", use_device_sequence,
                 " chunked=", use_chunked_slotted,
@@ -2476,7 +2288,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                 " slot_stride=", direct_slot_stride);
         }
         const bool direct_device_collective_ready =
-            device_api_ag_requested ? use_device_api_rdma_ag
+            device_api_ag_requested
+                ? (use_device_api_rdma_ag || use_device_api_p2p_ag)
                                     : directP2pAllgatherReady_;
         if (!direct_p2p_capture_disabled && direct_device_collective_ready &&
             inputBuffer.is_contiguous() &&
@@ -2925,6 +2738,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         const bool use_device_api_rdma_rs =
             useDeviceApiCollectivesPoc() && directRdmaReady_ &&
             use_device_sequence;
+        const bool use_device_api_p2p_rs =
+            useDeviceApiCollectivesPoc() && !directRdmaReady_ &&
+            directP2pAllgatherReady_ && use_device_sequence &&
+            allActivePeersOnSameHost() && !forceDisableDirectP2pPeers();
         const bool device_api_rs_requested =
             useDeviceApiCollectivesPoc() && useDirectP2pReduceScatterPoc();
         const size_t rdma_rs_slot_stride = use_device_api_rdma_rs
@@ -2954,7 +2771,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             : 1;
         if (device_api_rs_requested) {
             TORCH_CHECK(
-                !direct_p2p_capture_disabled && use_device_api_rdma_rs &&
+                !direct_p2p_capture_disabled &&
+                    (use_device_api_rdma_rs || use_device_api_p2p_rs) &&
                     inputBuffer.is_contiguous() && outputBuffer.is_contiguous() &&
                     meta_->activeSize == meta_->size &&
                     opts.reduceOp == c10d::ReduceOp::SUM &&
@@ -2964,6 +2782,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                 "Mooncake PG Device API reduce_scatter_base requested but path "
                 "is not ready: capture_disabled=", direct_p2p_capture_disabled,
                 " rdma_ready=", directRdmaReady_,
+                " p2p_ready=", directP2pAllgatherReady_,
+                " same_host=", allActivePeersOnSameHost(),
                 " device_sequence=", use_device_sequence,
                 " input_contiguous=", inputBuffer.is_contiguous(),
                 " output_contiguous=", outputBuffer.is_contiguous(),
@@ -2975,7 +2795,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                 inputBuffer.numel() * inputBuffer.element_size());
         }
         const bool direct_device_collective_ready =
-            device_api_rs_requested ? use_device_api_rdma_rs
+            device_api_rs_requested ? (use_device_api_rdma_rs || use_device_api_p2p_rs)
                                     : directP2pAllgatherReady_;
         if (!direct_p2p_capture_disabled && useDirectP2pReduceScatterPoc() &&
             direct_device_collective_ready &&
@@ -3545,6 +3365,32 @@ void MooncakeBackend::publishLocalPeerMetadata() {
     meta_->store->set(serverNameKey, localServerName_);
 }
 
+bool MooncakeBackend::allActivePeersOnSameHost() const {
+    if (!meta_ || !meta_->store) return false;
+
+    const std::string local_server_host = serverHostOnly(localServerName_);
+    std::vector<std::string> server_name_keys;
+    server_name_keys.reserve(meta_->activeSize);
+    for (int j = 0; j < meta_->activeSize; ++j) {
+        server_name_keys.push_back(
+            ConnectionContext::getServerNameStoreKey(meta_->backendIndex, j));
+    }
+    BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
+        std::chrono::milliseconds(10)));
+    waiter.wait([&] { return meta_->store->check(server_name_keys); });
+
+    for (int j = 0; j < meta_->activeSize; ++j) {
+        if (!meta_->activeRanks[j]) continue;
+        const auto peer_server_name = meta_->store->get(server_name_keys[j]);
+        const std::string peer_server_name_str(peer_server_name.begin(),
+                                               peer_server_name.end());
+        if (serverHostOnly(peer_server_name_str) != local_server_host) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void MooncakeBackend::maybeInitHierarchicalAllReduceWorkspace() {
 #ifdef MOONCAKE_EP_USE_MUSA
     return;
@@ -3859,7 +3705,18 @@ void MooncakeBackend::maybeInitDirectP2pAllgather() {
                 cudaGetErrorString(peer_copy_err));
     debug_log("p2p_peer_table_copied");
 
-    if (useDeviceApiCollectivesPoc()) {
+    const bool all_active_peers_on_same_host = allActivePeersOnSameHost();
+    const bool should_skip_single_host_rdma =
+        useDeviceApiCollectivesPoc() && directP2pAllgatherReady_ &&
+        all_active_peers_on_same_host && !forceDisableDirectP2pPeers();
+    if (debug && should_skip_single_host_rdma) {
+        LOG(INFO) << "MOONCAKE_PG_DEVICE_API_RDMA debug rank=" << rank_
+                  << " stage=skip_single_host_rdma backend_index="
+                  << meta_->backendIndex
+                  << " reason=all_active_peers_on_same_host";
+    }
+
+    if (useDeviceApiCollectivesPoc() && !should_skip_single_host_rdma) {
         ensureCudaDevice();
         std::vector<std::string> rdma_filters = deviceFilters_;
         if (rdma_filters.empty()) rdma_filters = parseDeviceFilterEnv();

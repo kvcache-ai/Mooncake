@@ -223,6 +223,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     bool allActivePeersOnSameHost() const;
     void maybeInitDirectP2pAllgather();
     void maybeInitHierarchicalAllReduceWorkspace();
+    bool allActivePeersOnSameHost() const;
     void setLocalOnlyActiveRanks();
     void syncActiveRanksTensor();
 
