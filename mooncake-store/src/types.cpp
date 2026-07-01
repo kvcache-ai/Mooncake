@@ -74,7 +74,9 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::DFS_PERMISSION_DENIED, "DFS_PERMISSION_DENIED"},
         {ErrorCode::DFS_STALE_HANDLE, "DFS_STALE_HANDLE"},
         {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
-        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"}};
+        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
+        {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

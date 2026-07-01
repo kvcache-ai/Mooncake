@@ -55,10 +55,11 @@ def run_test_iteration(
     return_recv_hook: bool,
     use_fallback: bool,
     fail_rank: int,
+    buf: Buffer = None,
 ):
-    assert not (
-        async_finish and return_recv_hook
-    ), "Should be filtered out by generate_tests."
+    assert not (async_finish and return_recv_hook), (
+        "Should be filtered out by generate_tests."
+    )
 
     torch.manual_seed(2026 + rank)
     scale = 1.0 - 0.05 * (rank / num_ranks)
@@ -102,7 +103,8 @@ def run_test_iteration(
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
         max_tokens, hidden, num_ranks, num_experts
     )
-    buf = Buffer(group, num_ep_buffer_bytes)
+    if buf is None:
+        buf = Buffer(group, num_ep_buffer_bytes)
 
     if use_fallback:
         buf._use_fallback = True
@@ -230,7 +232,164 @@ def worker(rank, world_size, config_dict):
             num_ranks=world_size,
             **config_dict,
         )
-    except Exception as e:
+    except Exception:
+        traceback.print_exc()
+        raise
+
+    os._exit(0)
+
+
+def run_stale_data_test(
+    group: dist.ProcessGroup,
+    rank: int,
+    num_ranks: int,
+    max_tokens: int,
+    hidden: int,
+    num_experts: int,
+    top_k: int,
+):
+    """Verify combine does not read stale data from a previous round when
+    a peer rank times out.
+
+    Two rounds share the same buffer:
+      Round 1 — normal dispatch + combine (fills rdma_recv_data_buffer).
+      Round 2 — both ranks dispatch; rank 1 exits before combine; rank 0
+                combines with a short timeout.
+
+    Without the fix the reduction loop reads stale Round-1 data for rank 1's
+    experts, producing silently wrong results.
+    """
+    num_local_experts = num_experts // num_ranks
+    fail_rank = 1
+
+    def get_mock_factor(expert_id):
+        return expert_id * 0.1 + 1.0
+
+    num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
+        max_tokens, hidden, num_ranks, num_experts
+    )
+    buf = Buffer(group, num_ep_buffer_bytes)
+
+    # Round 1: normal round to fill buffer with data
+    run_test_iteration(
+        group=group,
+        rank=rank,
+        num_ranks=num_ranks,
+        max_tokens=max_tokens,
+        hidden=hidden,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_fp8=False,
+        zero_copy=False,
+        async_finish=True,
+        return_recv_hook=False,
+        use_fallback=False,
+        fail_rank=-1,
+        buf=buf,
+    )
+
+    # Round 2: dispatch, then rank 1 exits before combine
+    torch.manual_seed(200 + rank)
+    scale = 1.0 - 0.05 * (rank / num_ranks)
+    num_tokens = int(max_tokens * scale)
+    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32)
+    topk_idx = torch.topk(scores, top_k, dim=-1)[1]
+    topk_weights = torch.softmax(
+        torch.rand(num_tokens, top_k, dtype=torch.float32), dim=-1
+    )
+    active_ranks = torch.ones((num_ranks,), dtype=torch.int32)
+
+    # Expected output excluding fail_rank's experts
+    factors = get_mock_factor(topk_idx)
+    valid_mask = (topk_idx // num_local_experts) != fail_rank
+    factors = factors * valid_mask.to(factors.dtype)
+    expected = (x * (factors * topk_weights).sum(dim=1, keepdim=True)).to(
+        torch.bfloat16
+    )
+
+    dist.barrier(group)
+
+    recv_x, _, handle, event, _ = buf.dispatch(
+        x,
+        topk_idx,
+        active_ranks,
+        num_max_dispatch_tokens_per_rank=max_tokens,
+        num_experts=num_experts,
+        timeout_us=-1,
+        use_fp8=False,
+        async_finish=True,
+    )
+    event.current_stream_wait()
+    torch.cuda.synchronize()
+
+    dist.barrier(group)
+
+    if rank == fail_rank:
+        os._exit(0)
+
+    expert_out = torch.empty_like(recv_x)
+    for le in range(num_local_experts):
+        eid = rank * num_local_experts + le
+        expert_out[le] = recv_x[le] * get_mock_factor(eid)
+    expert_out = expert_out.to(torch.bfloat16)
+
+    out = torch.zeros_like(x)
+    combined_x, event, _ = buf.combine(
+        expert_out,
+        topk_idx,
+        topk_weights,
+        active_ranks,
+        timeout_us=5_000,
+        handle=handle,
+        async_finish=True,
+        out=out,
+    )
+    event.current_stream_wait()
+    torch.cuda.synchronize()
+
+    assert active_ranks[fail_rank].item() == 0, (
+        f"[Rank {rank}] active_ranks[{fail_rank}] should be 0 after timeout"
+    )
+    assert not torch.isnan(combined_x).any().item()
+    testing.assert_close(
+        combined_x,
+        expected,
+        rtol=5e-2,
+        atol=1e-3,
+        msg=lambda m: f"[Rank {rank}] Stale data read in combine reduction. {m}",
+    )
+
+
+def stale_data_worker(rank, world_size):
+    import_torchada_if_needed()
+
+    device_filter = [
+        f
+        for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
+        if f
+    ]
+    if device_filter:
+        pg.set_device_filter(device_filter)
+
+    torch.cuda.set_device(rank)
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+
+    dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
+    group = dist.group.WORLD
+
+    try:
+        run_stale_data_test(
+            group=group,
+            rank=rank,
+            num_ranks=world_size,
+            max_tokens=256,
+            hidden=2048,
+            num_experts=288,
+            top_k=8,
+        )
+    except Exception:
         traceback.print_exc()
         raise
 
@@ -248,6 +407,15 @@ class TestMooncakeEPBuffer(unittest.TestCase):
         mp.spawn(
             worker,
             args=(self.world_size, config_dict),
+            nprocs=self.world_size,
+            join=True,
+            daemon=False,
+        )
+
+    def test_combine_stale_data(self):
+        mp.spawn(
+            stale_data_worker,
+            args=(self.world_size,),
             nprocs=self.world_size,
             join=True,
             daemon=False,
