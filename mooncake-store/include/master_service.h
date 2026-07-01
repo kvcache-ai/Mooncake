@@ -1928,6 +1928,9 @@ class MasterService {
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
 
+    // Ablation study controls (for paper experiments)
+    bool disable_quota_fast_path_{false};
+
     const std::string ha_backend_type_;
 
     const std::string ha_backend_connstring_;
