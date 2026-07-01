@@ -10,6 +10,7 @@
 #include <aws/s3/model/DeleteObjectsRequest.h>
 #include <aws/s3/model/ObjectIdentifier.h>
 #include <aws/s3/model/Delete.h>
+#include <algorithm>
 #include <optional>
 #include <fstream>
 #include <iostream>
@@ -27,6 +28,7 @@
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
+#include <aws/core/client/ClientConfiguration.h>
 #include "utils/type_util.h"
 #include "fmt/format.h"
 
@@ -49,6 +51,14 @@ struct S3Env {
     std::string secret_key;
 
     bool use_virtual_addressing = true;
+
+    bool use_https = true;
+
+    Aws::Client::RequestChecksumCalculation request_checksum =
+        Aws::Client::RequestChecksumCalculation::WHEN_SUPPORTED;
+
+    Aws::Client::ResponseChecksumValidation response_checksum =
+        Aws::Client::ResponseChecksumValidation::WHEN_SUPPORTED;
 
     int64_t connect_timeout_ms = kDefaultS3ConnectTimeoutMs;
 
@@ -92,6 +102,20 @@ void AssignTimeoutFromEnv(const char *env_name, int64_t default_value,
     target = default_value;
 }
 
+template <typename T>
+T ParseChecksumMode(const std::string &value) {
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    if (lower == "when_required") return T::WHEN_REQUIRED;
+    if (lower == "when_supported") return T::WHEN_SUPPORTED;
+    if (!lower.empty()) {
+        LOG(WARNING) << "Invalid value: " << value
+                     << ", falling back to when_supported";
+    }
+    return T::WHEN_SUPPORTED;
+}
+
 }  // namespace
 
 bool S3Helper::aws_initialized = false;
@@ -113,6 +137,21 @@ void S3Helper::InitAPI() {
     AssignBoolFromEnv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING",
                       s3_env.use_virtual_addressing);
 
+    AssignBoolFromEnv("MOONCAKE_AWS_S3_USE_HTTPS", s3_env.use_https);
+
+    {
+        std::string tmp;
+        AssignStringFromEnv("MOONCAKE_AWS_S3_REQUEST_CHECKSUM", tmp);
+        s3_env.request_checksum =
+            ParseChecksumMode<Aws::Client::RequestChecksumCalculation>(tmp);
+    }
+    {
+        std::string tmp;
+        AssignStringFromEnv("MOONCAKE_AWS_S3_RESPONSE_CHECKSUM", tmp);
+        s3_env.response_checksum =
+            ParseChecksumMode<Aws::Client::ResponseChecksumValidation>(tmp);
+    }
+
     AssignTimeoutFromEnv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS",
                          kDefaultS3ConnectTimeoutMs, s3_env.connect_timeout_ms);
     AssignTimeoutFromEnv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS",
@@ -132,7 +171,10 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
 
     config.connectTimeoutMs = s3_env.connect_timeout_ms;
     config.requestTimeoutMs = s3_env.request_timeout_ms;
-    config.scheme = Aws::Http::Scheme::HTTPS;
+    config.scheme =
+        s3_env.use_https ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
+    config.checksumConfig.requestChecksumCalculation = s3_env.request_checksum;
+    config.checksumConfig.responseChecksumValidation = s3_env.response_checksum;
 
     if (!region.empty()) {
         config.region = region;
