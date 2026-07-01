@@ -354,6 +354,12 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
 
+// Ablation study controls (for paper experiments)
+DEFINE_bool(disable_parallel_batches, false,
+            "Disable parallel batch processing in BatchPutEnd/BatchPutRevoke");
+DEFINE_int32(min_batch_parallel_keys, 16,
+             "Minimum number of keys to trigger parallel batch processing");
+
 namespace {
 
 std::string ResolveHABackendConnstring(
@@ -604,6 +610,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("max_retry_attempts",
                              &master_config.max_retry_attempts,
                              FLAGS_max_retry_attempts);
+
+    // Ablation study controls (for paper experiments)
+    default_config.GetBool("disable_parallel_batches",
+                           &master_config.disable_parallel_batches,
+                           FLAGS_disable_parallel_batches);
+    default_config.GetInt32("min_batch_parallel_keys",
+                            &master_config.min_batch_parallel_keys,
+                            FLAGS_min_batch_parallel_keys);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,

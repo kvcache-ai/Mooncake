@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <future>
 #include <shared_mutex>
 #include <sstream>
 #include <thread>
@@ -401,6 +402,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ", max_per_heartbeat=" << promotion_max_per_heartbeat_
                   << ")";
     }
+
+    // Ablation study controls (for paper experiments)
+    disable_parallel_batches_ = config.disable_parallel_batches;
+    min_batch_parallel_keys_ = config.min_batch_parallel_keys;
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -3204,8 +3209,38 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const std::string& tenant_id, ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
+
+    // Group keys by metadata shard for parallel processing.
+    // Keys in different shards can be processed concurrently since each
+    // shard has its own lock.
+    if (!disable_parallel_batches_ &&
+        keys.size() >= static_cast<size_t>(min_batch_parallel_keys_)) {
+        // Group by shard index
+        std::unordered_map<size_t, std::vector<size_t>> shard_groups;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            size_t shard_idx = getMetadataShardIndex(tenant_id, keys[i]);
+            shard_groups[shard_idx].push_back(i);
+        }
+
+        // Process each shard group in parallel via std::async
+        std::vector<std::future<void>> futures;
+        results.resize(keys.size());
+        for (auto& [shard_idx, indices] : shard_groups) {
+            futures.emplace_back(std::async(
+                std::launch::async,
+                [&, shard_idx, indices = std::move(indices)]() {
+                    for (size_t idx : indices) {
+                        results[idx] = PutEnd(client_id, keys[idx], tenant_id,
+                                              replica_type);
+                    }
+                }));
+        }
+        for (auto& f : futures) f.wait();
+    } else {
+        for (const auto& key : keys) {
+            results.emplace_back(
+                PutEnd(client_id, key, tenant_id, replica_type));
+        }
     }
     return results;
 }
@@ -3215,9 +3250,34 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const std::string& tenant_id, ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(
-            PutRevoke(client_id, key, tenant_id, replica_type));
+
+    if (!disable_parallel_batches_ &&
+        keys.size() >= static_cast<size_t>(min_batch_parallel_keys_)) {
+        // Group by shard index
+        std::unordered_map<size_t, std::vector<size_t>> shard_groups;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            size_t shard_idx = getMetadataShardIndex(tenant_id, keys[i]);
+            shard_groups[shard_idx].push_back(i);
+        }
+
+        std::vector<std::future<void>> futures;
+        results.resize(keys.size());
+        for (auto& [shard_idx, indices] : shard_groups) {
+            futures.emplace_back(std::async(
+                std::launch::async,
+                [&, shard_idx, indices = std::move(indices)]() {
+                    for (size_t idx : indices) {
+                        results[idx] = PutRevoke(client_id, keys[idx],
+                                                 tenant_id, replica_type);
+                    }
+                }));
+        }
+        for (auto& f : futures) f.wait();
+    } else {
+        for (const auto& key : keys) {
+            results.emplace_back(
+                PutRevoke(client_id, key, tenant_id, replica_type));
+        }
     }
     return results;
 }
