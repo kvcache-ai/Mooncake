@@ -49,6 +49,20 @@ class FileStorage {
      */
     bool ReleaseBuffer(uint64_t batch_id);
 
+    tl::expected<size_t, ErrorCode> DirectGdsOffload(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<Slice>>& slices_per_key,
+        const std::string& tenant_id,
+        std::shared_ptr<std::promise<bool>> notify_barrier = nullptr);
+
+    bool IsGdsEnabled() const {
+        return storage_backend_->SupportsGds() &&
+               storage_backend_->IsGdsEnabled();
+    }
+
+    tl::expected<void, ErrorCode> DirectGdsBatchLoad(
+        std::unordered_map<std::string, Slice>& batch_object);
+
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;

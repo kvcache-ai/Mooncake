@@ -30,6 +30,7 @@
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "gpu_staging_utils.h"
+#include "gds/gds_device_ops.h"
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
@@ -930,6 +931,47 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "file storage init failed with error: "
                        << init_result.error();
             return init_result;
+        }
+    }
+
+    // ── GDS-only initialization ──
+    // When MOONCAKE_ENABLE_GDS=1 but enable_ssd_offload is NOT in config:
+    // create a minimal file_storage_ for GPU DMA without the full SSD-offload
+    // role (no RPC server, no local memory registration). The RPC server is
+    // skipped via start_offload_rpc_server=false. RegisterLocalMemory is
+    // skipped because GDS DMA operates on GPU memory and NVMe only — it never
+    // touches the local_buffer. MountLocalDiskSegment is still called so
+    // NotifyOffloadSuccess can add DISK replicas under this client_id.
+    if (!enable_ssd_offload && !file_storage_) {
+        auto gds_config = FileStorageConfig::FromEnvironment();
+        if (gds_config.enable_gds) {
+            std::string gds_path = ssd_offload_path;
+            if (gds_path.empty()) {
+                gds_path =
+                    GetEnvStringOr("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "");
+            }
+            if (!gds_path.empty()) {
+                gds_config.storage_filepath = gds_path;
+                gds_config.gds_client_only = true;
+                gds_config.local_buffer_size = 0;
+                file_storage_ = std::make_shared<FileStorage>(
+                    gds_config, client_, this->local_rpc_addr,
+                    client_->GetSsdMetricPtr());
+                auto init_result = file_storage_->Init();
+                if (!init_result) {
+                    LOG(WARNING) << "GDS-only file_storage init failed: "
+                                 << init_result.error()
+                                 << " (GDS DMA will not be available)";
+                    file_storage_.reset();
+                } else {
+                    LOG(INFO) << "GDS-only file_storage initialized "
+                              << "(DMA enabled, path=" << gds_path << ")";
+                }
+            } else {
+                LOG(WARNING) << "MOONCAKE_ENABLE_GDS=1 but no SSD path "
+                             << "configured; set ssd_offload_path in config "
+                             << "or MOONCAKE_OFFLOAD_FILE_STORAGE_PATH env var";
+            }
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
@@ -2896,6 +2938,41 @@ RealClient::batch_get_buffer_internal(
         allocateSlices(slices, replica, buffer_handle->ptr());
 
         if (replica.is_local_disk_replica()) {
+            // GDS fast path: if this node IS the storage node (local SSD)
+            // AND GDS is active, skip the RPC and call BatchLoad directly.
+            // GdsContext::ReadRecord internally handles cuFileRead vs pread.
+            bool gds_local_read =
+                (file_storage_ && file_storage_->config_.enable_gds &&
+                 file_storage_->IsGdsEnabled() &&
+                 replica.get_local_disk_descriptor().transport_endpoint ==
+                     local_rpc_addr);
+            if (gds_local_read) {
+                std::string storage_key =
+                    MakeTenantScopedStorageKey(client_->tenant_id(), key);
+                std::unordered_map<std::string, Slice> load_batch;
+                load_batch[storage_key] =
+                    Slice{buffer_handle->ptr(), total_size};
+                auto load_res = file_storage_->DirectGdsBatchLoad(load_batch);
+                if (load_res) {
+                    final_results[i] = std::make_shared<BufferHandle>(
+                        std::move(*buffer_handle));
+                    continue;  // GDS read succeeded — skip RPC
+                }
+                LOG(WARNING) << "GDS local BatchLoad failed for key: " << key
+                             << ", falling back to RPC path";
+                // GDS-only mode has no offload RPC server — the RPC
+                // fallback will fail. Skip it now with a clear error
+                // rather than producing a cryptic "connection refused".
+                if (!offload_rpc_server_) {
+                    LOG(ERROR) << "GDS-only mode: no RPC server for SSD "
+                               << "read fallback on key '" << key << "'. "
+                               << "The DISK replica is unreachable. Check "
+                               << "nvidia-fs.ko status and NVMe health. "
+                               << "Skipping this key.";
+                    continue;  // no RPC attempt
+                }
+            }
+
             // LOCAL_DISK: buffer is allocated and registered via
             // client_buffer_allocator_, route to SSD RPC path below.
             disk_ops.emplace_back(DiskKeyOp{
@@ -3647,7 +3724,67 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    // ── GDS parallel offload ──
+    bool gds_enabled = (file_storage_ && file_storage_->config_.enable_gds &&
+                        file_storage_->IsGdsEnabled());
+
+    if (!gds_enabled) {
+        return client_->BatchPut(keys, ordered_batched_slices, config);
+    }
+
+    std::string tenant_id_str = client_ ? client_->tenant_id() : "default";
+
+    auto gds_promise =
+        std::make_shared<std::promise<tl::expected<size_t, ErrorCode>>>();
+    auto gds_future = gds_promise->get_future();
+    auto notify_barrier = std::make_shared<std::promise<bool>>();
+
+    // Capture ordered_batched_slices by value into the GDS thread.
+    // Slice is {ptr, size} — cheap struct copy; actual GPU buffers are not
+    // copied. ordered_batched_slices has been chunked by kMaxSliceSize,
+    // same granularity as the CPU path (client_->BatchPut).
+    auto gds_cb = [this, &keys, &ordered_batched_slices, tenant = tenant_id_str,
+                   p = gds_promise, barrier = notify_barrier]() {
+        try {
+            std::thread([this, keys, ordered_batched_slices, tenant, p,
+                         barrier]() {
+                try {
+                    auto res = file_storage_->DirectGdsOffload(
+                        keys, ordered_batched_slices, tenant, barrier);
+                    p->set_value(res);
+                } catch (...) {
+                    p->set_exception(std::current_exception());
+                }
+            }).detach();
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Failed to start GDS thread: " << e.what();
+            p->set_value(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
+    };
+
+    auto results = client_->BatchPut(keys, ordered_batched_slices, config,
+                                     std::move(gds_cb));
+
+    bool batch_put_ok =
+        std::all_of(results.begin(), results.end(),
+                    [](const auto &r) { return r.has_value(); });
+    notify_barrier->set_value(
+        batch_put_ok);  // skip NotifyOffloadSuccess if BatchPut had failures
+                        // protects failed keys
+
+    if (gds_future.valid()) {
+        try {
+            auto r = gds_future.get();
+            if (!r)
+                LOG(WARNING) << "GDS offload failed: " << r.error()
+                             << " (DISK replica lost; heartbeat will retry if "
+                                "offload is enabled)";
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+        }
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
@@ -4617,6 +4754,63 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                        std::unordered_map<std::string, std::vector<Slice>>>
         offload_objects;
 
+    // ── GDS local read: bypass RPC for LOCAL_DISK on this node ──
+    // When this node is the storage node AND GDS is active,
+    // DirectGdsBatchLoad uses cuFileRead DMA directly into user GPU buffers.
+    bool gds_read_enabled =
+        (file_storage_ && file_storage_->config_.enable_gds &&
+         file_storage_->IsGdsEnabled());
+    std::unordered_set<std::string> gds_read_keys;  // keys handled locally
+
+    if (gds_read_enabled) {
+        for (auto &op_it : valid_local_disk_operations) {
+            const Replica::Descriptor *rptr = nullptr;
+            for (const auto &r : op_it.second.query_result.replicas) {
+                if (r.is_local_disk_replica()) {
+                    rptr = &r;
+                    break;
+                }
+            }
+            if (!rptr) continue;
+            if (rptr->get_local_disk_descriptor().transport_endpoint !=
+                local_rpc_addr)
+                continue;
+
+            // GDS local read: SSD -> user GPU buffer via cuFileRead
+            std::string storage_key =
+                MakeTenantScopedStorageKey(client_->tenant_id(), op_it.first);
+            std::unordered_map<std::string, Slice> load_batch;
+            // op_it.second.slices[0].ptr IS the user's GPU buffer
+            load_batch[storage_key] = op_it.second.slices[0];
+            auto load_res = file_storage_->DirectGdsBatchLoad(load_batch);
+            if (!load_res) {
+                LOG(WARNING)
+                    << "GDS local BatchLoad failed for key: " << op_it.first
+                    << " (" << load_res.error() << ")";
+                if (!offload_rpc_server_) {
+                    LOG(ERROR)
+                        << "GDS-only mode: no RPC server for SSD "
+                        << "read fallback on key '" << op_it.first << "'. "
+                        << "The DISK replica is unreachable. "
+                        << "Suppressing RPC attempt to avoid misleading "
+                           "errors.";
+                    results[op_it.second.original_index] =
+                        tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+                    gds_read_keys.insert(op_it.first);  // skip RPC retry
+                    continue;
+                }
+                continue;  // leave in valid_local_disk_operations -> RPC
+                           // fallback
+            }
+            // Success: mark as handled, skip RPC
+            gds_read_keys.insert(op_it.first);
+        }
+        // Remove successfully handled keys from the RPC queue
+        for (const auto &k : gds_read_keys) {
+            valid_local_disk_operations.erase(k);
+        }
+    }
+
     for (const auto &op_it : valid_local_disk_operations) {
         // Find the LOCAL_DISK replica from the list — replicas may be in
         // any order from Master.
@@ -4808,8 +5002,60 @@ RealClient::batch_put_from_multi_buffers_internal(
             batched_slices[i].emplace_back(Slice{buffers[j], sizes[j]});
         }
     }
-    // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    // GDS parallel offload (same pattern as batch_put_from_internal)
+    bool gds_enabled = (file_storage_ && file_storage_->config_.enable_gds &&
+                        file_storage_->IsGdsEnabled());
+
+    if (!gds_enabled) {
+        return client_->BatchPut(keys, batched_slices, config);
+    }
+
+    std::string tenant_id_str = client_ ? client_->tenant_id() : "default";
+
+    auto gds_promise =
+        std::make_shared<std::promise<tl::expected<size_t, ErrorCode>>>();
+    auto gds_future = gds_promise->get_future();
+    auto notify_barrier = std::make_shared<std::promise<bool>>();
+
+    // Pass batched_slices directly — non-contiguous GPU buffers OK.
+    // GdsContext::WriteRecord handles each slice independently via
+    // cuFileWrite. Slice is {ptr, size}, cheap struct copy.
+    auto gds_cb = [this, &keys, &batched_slices, tenant = tenant_id_str,
+                   p = gds_promise, barrier = notify_barrier]() {
+        try {
+            std::thread([this, keys, batched_slices, tenant, p, barrier]() {
+                try {
+                    auto res = file_storage_->DirectGdsOffload(
+                        keys, batched_slices, tenant, barrier);
+                    p->set_value(res);
+                } catch (...) {
+                    p->set_exception(std::current_exception());
+                }
+            }).detach();
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Failed to start GDS thread: " << e.what();
+            p->set_value(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
+    };
+
+    auto results =
+        client_->BatchPut(keys, batched_slices, config, std::move(gds_cb));
+
+    bool batch_put_ok =
+        std::all_of(results.begin(), results.end(),
+                    [](const auto &r) { return r.has_value(); });
+    notify_barrier->set_value(
+        batch_put_ok);  // skip NotifyOffloadSuccess if BatchPut had failures
+                        // protects failed keys
+    if (gds_future.valid()) {
+        try {
+            auto r = gds_future.get();
+            if (!r) LOG(WARNING) << "GDS offload failed: " << r.error();
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+        }
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
@@ -5020,6 +5266,73 @@ RealClient::batch_get_into_multi_buffers_internal(
         // register_buffer(), so the offload RDMA can scatter the on-disk blob
         // into non-contiguous per-layer GPU destinations natively — no temp
         // CPU buffer or H2D copy needed.
+
+        // ── GDS local read: if this IS the storage node, skip RPC ──
+        bool gds_read_enabled =
+            (file_storage_ && file_storage_->config_.enable_gds &&
+             file_storage_->IsGdsEnabled());
+        std::unordered_set<std::string> gds_read_keys;
+
+        if (gds_read_enabled) {
+            for (auto &[key, op] : valid_local_disk_ops) {
+                if (!op.is_local_disk) continue;
+                const Replica::Descriptor *rptr = nullptr;
+                for (const auto &r : op.query_result.replicas) {
+                    if (r.is_local_disk_replica()) {
+                        rptr = &r;
+                        break;
+                    }
+                }
+                if (!rptr) continue;
+                if (rptr->get_local_disk_descriptor().transport_endpoint !=
+                    local_rpc_addr)
+                    continue;
+
+                std::string sk =
+                    MakeTenantScopedStorageKey(client_->tenant_id(), key);
+
+                // Multi-fragment: read into first fragment via GDS, then
+                // CPU-copy to rest (V1: common case is single fragment per key
+                // from kMaxSliceSize)
+                if (op.buffers.empty()) continue;
+                std::unordered_map<std::string, Slice> lb;
+                lb[sk] = Slice{op.buffers[0], op.sizes[0]};
+                auto lr = file_storage_->DirectGdsBatchLoad(lb);
+                if (!lr) {
+                    LOG(WARNING) << "GDS local read failed for key=" << key
+                                 << " (" << lr.error() << ")";
+                    if (!offload_rpc_server_) {
+                        LOG(ERROR)
+                            << "GDS-only mode: no RPC server for SSD read "
+                            << "fallback on key '" << key << "'. "
+                            << "The DISK replica is unreachable. "
+                            << "Suppressing RPC attempt to avoid misleading "
+                               "errors.";
+                        gds_read_keys.insert(key);  // skip RPC retry
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+                        continue;
+                    }
+                    continue;
+                }
+                // Scatter to remaining fragments (CPU memcpy)
+                size_t copied = op.sizes[0];
+                char *src = static_cast<char *>(op.buffers[0]);
+                for (size_t j = 1;
+                     j < op.buffers.size() && copied < op.total_size; ++j) {
+                    size_t chunk =
+                        std::min(op.sizes[j], op.total_size - copied);
+                    gds_device_ops::CopyDeviceToDevice(op.buffers[j],
+                                                       src + copied, chunk);
+                    copied += chunk;
+                }
+                gds_read_keys.insert(key);
+            }
+        }
+
+        // Remove GDS-handled keys from the RPC queue
+        for (const auto &k : gds_read_keys) valid_local_disk_ops.erase(k);
+
         {
             std::unordered_map<
                 std::string,

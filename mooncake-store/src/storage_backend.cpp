@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "gds/gds_context.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -254,6 +255,18 @@ bool StorageBackend::InitQuotaEvict() {
 
         FileRecord evicted = EvictFile();
         if (evicted.path.empty()) {
+            // Queue is populated only on WriteBucket/WriteFile.
+            // After restart with stale on-disk data, used_space_
+            // may exceed total_space_ but the queue is empty.
+            // Not fatal — runtime eviction will bring space under
+            // quota when new writes come in.
+            if (initial_queue_size == 0) {
+                LOG(WARNING)
+                    << "Eviction queue empty at init. "
+                    << "used=" << used_space_ << " total=" << total_space_
+                    << ". Deferring to runtime eviction.";
+                break;
+            }
             LOG(ERROR) << "Failed to evict file to meet quota. "
                        << "The queue might be empty or a file is unremovable.";
             return false;
@@ -262,9 +275,15 @@ bool StorageBackend::InitQuotaEvict() {
     }
 
     if (used_space_ > total_space_) {
-        LOG(ERROR) << "Could not bring storage usage under quota after "
-                   << eviction_attempts << " eviction attempts.";
-        return false;
+        if (initial_queue_size == 0) {
+            LOG(WARNING) << "Eviction queue was empty at init. "
+                         << "used=" << used_space_ << " total=" << total_space_
+                         << ". Deferring to runtime eviction.";
+        } else {
+            LOG(ERROR) << "Could not bring storage usage under quota after "
+                       << eviction_attempts << " eviction attempts.";
+            return false;
+        }
     }
 
     // Recalculate available_space_ after eviction
@@ -2700,6 +2719,9 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath) {
     capacity_ = file_storage_config_.total_size_limit;
+    if (file_storage_config_.enable_gds) {
+        gds_ctx_ = std::make_unique<GdsContext>();
+    }
 }
 
 std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
@@ -2740,57 +2762,73 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Get data file path
         data_file_path_ = GetDataFilePath();
 
-        // RAII wrapper to ensure fd is closed on all error paths
-        struct FdGuard {
-            int fd;
-            explicit FdGuard(int fd) : fd(fd) {}
-            ~FdGuard() {
-                if (fd >= 0) {
-                    close(fd);
+        // GDS Init (try first; falls back to StorageFile on failure)
+        if (gds_ctx_) {
+            auto gds_init = gds_ctx_->Init(data_file_path_, capacity_);
+            if (!gds_init) {
+                LOG(WARNING) << "GDS init failed (err=" << gds_init.error()
+                             << "), falling back to non-GDS I/O";
+                gds_ctx_->Shutdown();
+                gds_ctx_.reset();
+            }
+        }
+
+        // StorageFile creation (only when GDS is not active)
+        if (!gds_ctx_ || !gds_ctx_->enabled_) {
+            // RAII wrapper to ensure fd is closed on all error paths
+            struct FdGuard {
+                int fd;
+                explicit FdGuard(int fd) : fd(fd) {}
+                ~FdGuard() {
+                    if (fd >= 0) {
+                        close(fd);
+                    }
+                }
+                // Release ownership (caller takes responsibility)
+                int release() {
+                    int ret = fd;
+                    fd = -1;
+                    return ret;
+                }
+                // Get fd without releasing (for operations)
+                int get() const { return fd; }
+            };
+
+            // Open/truncate data file in read-write mode
+            // We need raw fd for fallocate, so open directly
+            int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+            int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+            if (raw_fd < 0) {
+                LOG(ERROR) << "Failed to open data file: " << data_file_path_;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            FdGuard fd_guard(raw_fd);
+
+            // Use fallocate if available, otherwise ftruncate
+            if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
+                // Fallback to ftruncate
+                if (ftruncate(fd_guard.get(), capacity_) != 0) {
+                    LOG(ERROR)
+                        << "Failed to preallocate file: " << data_file_path_
+                        << ", capacity: " << capacity_
+                        << ", error: " << strerror(errno);
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
                 }
             }
-            // Release ownership (caller takes responsibility)
-            int release() {
-                int ret = fd;
-                fd = -1;
-                return ret;
-            }
-            // Get fd without releasing (for operations)
-            int get() const { return fd; }
-        };
 
-        // Open/truncate data file in read-write mode
-        // We need raw fd for fallocate, so open directly
-        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
-        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
-        if (raw_fd < 0) {
-            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-        }
-        FdGuard fd_guard(raw_fd);
-
-        // Use fallocate if available, otherwise ftruncate
-        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
-            // Fallback to ftruncate
-            if (ftruncate(fd_guard.get(), capacity_) != 0) {
-                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
-                           << ", capacity: " << capacity_
-                           << ", error: " << strerror(errno);
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-            }
-        }
-
-        // Release fd to StorageFile (takes ownership and will close it)
+            // Release fd to StorageFile (takes ownership and will close it)
 #ifdef USE_URING
-        if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
-        } else
+            if (file_storage_config_.use_uring) {
+                data_file_ = std::make_unique<UringFile>(
+                    data_file_path_, fd_guard.release(), 32, true);
+            } else
 #endif
-        {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
-                                                     fd_guard.release());
-        }
+            {
+                data_file_ = std::make_unique<PosixFile>(data_file_path_,
+                                                         fd_guard.release());
+            }
+
+        }  // end if (!gds_ctx_)
 
         // Create allocator with base=0, size=capacity
         allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
@@ -2921,8 +2959,15 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             iovs.push_back({slice.ptr, slice.size});
         }
 
-        auto write_result =
-            data_file_->vector_write(iovs.data(), iovs.size(), offset);
+        tl::expected<size_t, ErrorCode> write_result;
+        if (gds_ctx_ && gds_ctx_->enabled_) {
+            auto rec = gds_ctx_->WriteRecord(key, slices, offset);
+            write_result = rec ? tl::expected<size_t, ErrorCode>(record_size)
+                               : tl::make_unexpected(rec.error());
+        } else {
+            write_result =
+                data_file_->vector_write(iovs.data(), iovs.size(), offset);
+        }
         if (!write_result) {
             LOG(ERROR) << "Failed to write record for key: " << key
                        << ", error: " << write_result.error()
@@ -3066,6 +3111,14 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         RecordHeader header;
         iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
                                 {&header.value_len, sizeof(header.value_len)}};
+        if (gds_ctx_ && gds_ctx_->enabled_) {
+            Slice mutable_slice = plan.dest_slice;
+            auto rec = gds_ctx_->ReadRecord(plan.key, mutable_slice,
+                                            plan.offset, plan.value_size);
+            if (!rec) return tl::make_unexpected(rec.error());
+            continue;
+        }
+
         auto read_header_result =
             data_file_->vector_read(header_iovs, 2, plan.offset);
         if (!read_header_result) {
@@ -3309,6 +3362,17 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
+}
+
+// ── GDS destructor and helpers ──
+OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
+    if (gds_ctx_) {
+        gds_ctx_->Shutdown();
+    }
+}
+
+bool OffsetAllocatorStorageBackend::IsGdsEnabled() const {
+    return gds_ctx_ && gds_ctx_->enabled_;
 }
 
 }  // namespace mooncake

@@ -912,10 +912,19 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 LOG(INFO) << "Disk eviction enabled: "
                           << config.enable_disk_eviction;
                 LOG(INFO) << "Quota bytes: " << config.quota_bytes;
-                // Initialize storage backend with config from master
-                client->PrepareStorageBackend(storage_root_dir, fs_subdir,
-                                              config.enable_disk_eviction,
-                                              config.quota_bytes);
+                // When GDS handles all SSD I/O (MOONCAKE_ENABLE_GDS=1),
+                // skip the extra StorageBackend — it would compete with
+                // OffsetAllocator for disk space on the same drive and
+                // its eviction queue is always empty (no writes go through it).
+                const char* gds_env = std::getenv("MOONCAKE_ENABLE_GDS");
+                if (!gds_env || strcmp(gds_env, "1") != 0) {
+                    client->PrepareStorageBackend(storage_root_dir, fs_subdir,
+                                                  config.enable_disk_eviction,
+                                                  config.quota_bytes);
+                } else {
+                    LOG(INFO) << "GDS enabled (MOONCAKE_ENABLE_GDS=1), "
+                              << "skipping StorageBackend init";
+                }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
             }
@@ -1721,6 +1730,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+
     WaitForTransfers(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -2541,7 +2551,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config) {
+    const ReplicateConfig& config,
+    std::function<void()> after_submit_callback) {
     ReplicateConfig client_cfg = config;
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -2567,6 +2578,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+
+    // GDS hook: launch cuFile DMA in parallel with WaitForTransfers
+    if (after_submit_callback) {
+        after_submit_callback();  // non-blocking (callback launches detached
+                                  // thread)
+    }
+
     WaitForTransfers(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)

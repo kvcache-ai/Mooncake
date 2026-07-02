@@ -16,7 +16,10 @@
 #include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
 
+#include "gds/gds_context.h"  // GdsContext complete type (needed by any class with unique_ptr<GdsContext>)
+
 namespace mooncake {
+
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -229,6 +232,14 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // ── GDS ──
+    bool enable_gds = false;  // env: MOONCAKE_ENABLE_GDS
+
+    // GDS-only mode: skip RegisterLocalMemory (MR slots not consumed)
+    // and skip offload RPC server. Used when MOONCAKE_ENABLE_GDS=1
+    // but enable_ssd_offload is not in the config JSON.
+    bool gds_client_only = false;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -285,6 +296,29 @@ class StorageBackendInterface {
         std::function<bool(const std::string& key)> /* predicate */) {
         // Default: no-op (no test failures injected)
     }
+
+    virtual ~StorageBackendInterface() = default;
+
+    // Returns true if this backend type supports GDS DMA acceleration.
+    //
+    // Only OffsetAllocatorStorageBackend currently supports GDS — its
+    // on-disk RecordHeader format and direct Slice passthrough allow
+    // each Slice to be written via cuFileWrite (GPU pointer) or pwrite
+    // (CPU pointer) based on IsDevicePointer.
+    //
+    // BucketStorageBackend does NOT support GDS: its bucket format
+    // (bucket_id-indexed, metadata inline) differs from RecordHeader,
+    // and UringFile write_aligned path copies data to a CPU staging
+    // buffer which defeats DMA.
+    //
+    // StorageBackendAdaptor (FilePerKey) does NOT support GDS:
+    // ConcatSlicesToString merges all slices into a CPU std::string
+    // before writing — cuFileWrite would always fallback to pwrite.
+    virtual bool SupportsGds() const { return false; }
+
+    // Whether GDS is actually enabled on this instance
+    // (true after Init() if probe passed).
+    virtual bool IsGdsEnabled() const { return false; }
 
     FileStorageConfig file_storage_config_;
 };
@@ -994,6 +1028,12 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     OffsetAllocatorStorageBackend(
         const FileStorageConfig& file_storage_config_);
 
+    // ── GDS support ──
+    ~OffsetAllocatorStorageBackend();  // defined in .cpp
+                                       // (unique_ptr<GdsContext> 需要完整类型)
+    bool SupportsGds() const override { return true; }
+    bool IsGdsEnabled() const override;  // gds_ctx_ && gds_ctx_->enabled_
+
     /**
      * @brief Initializes the offset allocator storage backend.
      * Creates/truncates the data file and initializes the allocator.
@@ -1203,6 +1243,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
+    // ── GDS ──
+    std::unique_ptr<GdsContext> gds_ctx_;  // nullptr = GDS not enabled
+    // Always 8 bytes in class layout; size independent of USE_GDS_BACKEND
+    // 完整类型仅在 .cpp 中引入
+
     std::function<bool(const std::string& key)> test_failure_predicate_;
 };
 

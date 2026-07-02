@@ -73,6 +73,9 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::DFS_QUOTA_EXCEEDED, "DFS_QUOTA_EXCEEDED"},
         {ErrorCode::DFS_PERMISSION_DENIED, "DFS_PERMISSION_DENIED"},
         {ErrorCode::DFS_STALE_HANDLE, "DFS_STALE_HANDLE"},
+        {ErrorCode::GDS_HANDLE_REGISTER_FAIL, "GDS_HANDLE_REGISTER_FAIL"},
+        {ErrorCode::GDS_IO_FAIL, "GDS_IO_FAIL"},
+        {ErrorCode::GDS_NOT_AVAILABLE, "GDS_NOT_AVAILABLE"},
         {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
         {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"}};
 

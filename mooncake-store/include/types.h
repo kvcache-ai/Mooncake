@@ -407,7 +407,11 @@ enum class ErrorCode : int32_t {
     DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
     DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
     DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
-    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
+    // GDS errors (Range: -1210 to -1219)
+    GDS_HANDLE_REGISTER_FAIL = -1211,  // cuFileHandleRegister 失败
+    GDS_IO_FAIL = -1213,               // cuFileRead/cuFileWrite 失败
+    GDS_NOT_AVAILABLE = -1214,         // GDS 探测失败 / 未编译 / 硬件缺失
+    TENANT_QUOTA_EXCEEDED = -1700,     ///< Tenant memory quota exceeded.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

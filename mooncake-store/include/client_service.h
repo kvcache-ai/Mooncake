@@ -213,7 +213,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config);
+        const ReplicateConfig& config,
+        std::function<void()> after_submit_callback = nullptr);  // GDS hook
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
