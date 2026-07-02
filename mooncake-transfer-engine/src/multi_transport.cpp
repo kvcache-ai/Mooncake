@@ -455,6 +455,54 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target
+    // buffers owned by different transports (the device KV pool via hip, the
+    // host aux/metadata buffers via rdma). Route each request to the transport
+    // that owns the buffer covering the target address. When a buffer is
+    // registered under more than one protocol (the device KV pool is registered
+    // by both rdma and hip), pick the highest-performance transport by a fixed
+    // priority instead of relying on buffer registration order.
+    if (proto.find(',') != std::string::npos) {
+        auto protocol_priority = [](const std::string& p) {
+            if (p == "hip") return 4;
+            if (p == "cxl") return 3;
+            if (p == "rdma") return 2;
+            if (p == "tcp") return 1;
+            return 0;
+        };
+        std::string chosen;
+        int chosen_priority = -1;
+        for (const auto& buffer : target_segment_desc->buffers) {
+            // CXL buffers locate via offset + cxl_base_addr; all other
+            // protocols use the absolute virtual address in buffer.addr.
+            uint64_t start =
+                (buffer.protocol == "cxl")
+                    ? buffer.offset + target_segment_desc->cxl_base_addr
+                    : buffer.addr;
+            if (entry.target_offset >= start &&
+                entry.target_offset < start + buffer.length) {
+                int priority = protocol_priority(buffer.protocol);
+                if (priority > chosen_priority) {
+                    chosen = buffer.protocol;
+                    chosen_priority = priority;
+                }
+            }
+        }
+        if (chosen.empty()) {
+            return Status::InvalidArgument(
+                "No matching buffer for target offset in multi-protocol "
+                "segment " +
+                std::to_string(entry.target_id));
+        }
+        if (!transport_map_.count(chosen)) {
+            return Status::NotSupportedTransport("Transport " + chosen +
+                                                 " not installed");
+        }
+        transport = transport_map_[chosen].get();
+        return Status::OK();
+    }
+#endif
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
