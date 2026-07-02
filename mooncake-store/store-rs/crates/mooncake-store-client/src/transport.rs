@@ -104,6 +104,7 @@ impl From<BatchWaitError> for StoreError {
 pub use mooncake_store_transport_core::{StoreTransport, StoreTransportFactory};
 
 const CLASSIC_RDMA_STARTUP_PRETOUCH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const CLASSIC_WILDCARD_LOCATION: &str = "*";
 
 pub(crate) fn registration_chunks(
     addr: *mut c_void,
@@ -639,7 +640,7 @@ impl ClassicTeTransport {
         allocations
             .entry(addr as usize)
             .or_insert_with(|| ClassicAllocationRecord {
-                location: "cpu:0".to_string(),
+                location: CLASSIC_WILDCARD_LOCATION.to_string(),
                 size,
                 owner: ClassicAllocationOwner::Borrowed,
             })
@@ -1152,25 +1153,6 @@ impl StoreTransport for ClassicTeTransport {
         let location = self.registration_location(addr, size);
         let engine = self.engine.read();
         self.register_memory_with_engine(&engine, addr, size, &location)
-    }
-
-    fn register_memory_with_location(
-        &self,
-        addr: *mut c_void,
-        size: usize,
-        location: &str,
-    ) -> Result<()> {
-        let engine = self.engine.read();
-        self.register_memory_with_engine(&engine, addr, size, location)?;
-        self.allocations.lock().insert(
-            addr as usize,
-            ClassicAllocationRecord {
-                location: location.to_string(),
-                size,
-                owner: ClassicAllocationOwner::Borrowed,
-            },
-        );
-        Ok(())
     }
 
     fn register_startup_memory_batch(&self, entries: &[MemoryRegistration]) -> Result<()> {

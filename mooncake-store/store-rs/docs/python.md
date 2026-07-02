@@ -63,10 +63,10 @@ Store-RS-specific RL weight updates use
 for the reusable checkpoint flow and
 `mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient` for Store-RS
 object I/O. Trainer ranks register CUDA tensors with
-`register_buffer_with_location(..., "cuda:N")` and put bucket objects into
-Store-RS through registered-buffer writes. Rollout ranks read the selected
-buckets from Store-RS into CUDA buffers and then broadcast inside the rollout
-process group.
+the Mooncake-compatible `register_buffer(ptr, size)` API and put bucket objects
+into Store-RS through registered-buffer writes. Rollout ranks read the selected
+buckets from Store-RS into registered CUDA buffers and then broadcast inside the
+rollout process group.
 
 The P2P data path is the same data path as `MooncakeDistributedStore`: the
 Python adapter calls Store-RS registered-buffer APIs, and the Rust transport
@@ -116,10 +116,10 @@ Real-mode `batch_put_from(...)` keeps the caller's batch together by default so 
 can coalesce placement, remote transfer, route publication, and replica tracking. Operators that
 prefer Python-side sharding for a specific workload can set
 `MC_STORE_RS_PY_BATCH_PUT_FROM_FANOUT` to an explicit positive fanout width.
-Real-mode callers can use `register_buffer_with_location(ptr, size, "cuda:N")` for CUDA source
-buffers. Those buffers are transferred as registered sources and are not read by the CPU; writes
-therefore require remote registered-transfer placement and publish routes without a CPU payload
-checksum.
+Real-mode callers use `register_buffer(ptr, size)` for registered source buffers,
+matching the upstream Mooncake Python API. CUDA buffers are transferred as
+registered sources and are not read by the CPU; writes therefore require remote
+registered-transfer placement and publish routes without a CPU payload checksum.
 
 `setup(...)` accepts `eviction_high_watermark_percent=` and
 `eviction_low_watermark_percent=` for storage-role runtimes. The same values can come from

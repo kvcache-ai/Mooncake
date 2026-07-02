@@ -51,12 +51,6 @@ pub trait MooncakeCompatibilityFacade {
     ) -> Result<CasResult>;
     fn register_local_memory(&self) -> Result<()>;
     fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
-    fn register_buffer_with_location(
-        &self,
-        buffer: *mut c_void,
-        size: usize,
-        location: &str,
-    ) -> Result<()>;
     fn unregister_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
     fn get_hostname(&self) -> Result<String>;
     fn get_size(&self, key: &str) -> Result<usize>;
@@ -622,24 +616,13 @@ impl StoreClient {
             }
 
             if use_batch_put_from {
-                let host_readable = {
-                    let state = self.state.lock();
-                    state.registered_buffer_host_readable(request.buffer.cast_mut(), request.size)
-                };
-                let value = if host_readable {
-                    Some(unsafe {
-                        slice::from_raw_parts(request.buffer.cast::<u8>(), request.size)
-                    })
-                } else {
-                    None
-                };
                 let routed = BatchPutItem {
                     tenant: request.tenant,
                     domain: request.domain,
                     object_set: request.object_set,
                     qos_tier: request.qos_tier,
                     key: request.key,
-                    value,
+                    value: None,
                     value_len: request.size,
                     registered_source: Some(request.buffer.cast_mut()),
                 };
@@ -1129,35 +1112,6 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let transport = self.transport()?;
         let mut state = self.state.lock();
         let result = state.register_external_buffer(transport, buffer, size);
-        tracker.finish(&result, 0);
-        result
-    }
-
-    fn register_buffer_with_location(
-        &self,
-        buffer: *mut c_void,
-        size: usize,
-        location: &str,
-    ) -> Result<()> {
-        let _span = info_span!(
-            "store.register_buffer",
-            runtime = %self.lease.runtime,
-            size,
-            location
-        )
-        .entered();
-        let tracker = OperationTracker::new("register_buffer").input_bytes(size as u64);
-        if size == 0 {
-            let result = Err(StoreError::Allocator(
-                "registered buffer size must be greater than zero".to_string(),
-            ));
-            tracker.finish(&result, 0);
-            return result;
-        }
-        let transport = self.transport()?;
-        let mut state = self.state.lock();
-        let result =
-            state.register_external_buffer_with_location(transport, buffer, size, Some(location));
         tracker.finish(&result, 0);
         result
     }

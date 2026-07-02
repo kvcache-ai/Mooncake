@@ -101,10 +101,10 @@ and `mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient` to move weight
 buckets through Store-RS instead of host offload or an external
 `checkpoint_engine` package.
 
-In this mode, trainer ranks register CUDA weight buckets with location-aware
-registered buffers and write them to Store-RS. Rollout ranks read the assigned
-buckets from Store-RS directly into CUDA buffers, then broadcast the bucket
-inside the rollout process group.
+In this mode, trainer ranks register CUDA weight buckets with the
+Mooncake-compatible `register_buffer(ptr, size)` API and write them to Store-RS.
+Rollout ranks read the assigned buckets from Store-RS directly into registered
+CUDA buffers, then broadcast the bucket inside the rollout process group.
 
 The reusable Store-RS checkpoint engine owns the send/receive weight flow,
 bucket manifest exchange, Store-RS put/get calls, and rollout-side broadcast.
