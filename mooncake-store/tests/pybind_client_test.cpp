@@ -1015,7 +1015,8 @@ TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
         << "Setup should preserve zero-size pure client/server semantics";
 }
 
-TEST_F(RealClientTest, ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {
+TEST_F(RealClientTest,
+       ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {
     LogCaptureSink sink;
     google::AddLogSink(&sink);
 
