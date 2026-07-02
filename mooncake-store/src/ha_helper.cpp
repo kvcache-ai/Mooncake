@@ -154,7 +154,7 @@ int MasterServiceSupervisor::Start() {
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
-            std::thread([&server, &mv_helper, lease_id]() {
+            std::thread([&server, mv_helper = mv_helper.get(), lease_id]() {
                 mv_helper->KeepLeader(lease_id);
                 LOG(INFO) << "Trying to stop server...";
                 server.stop();

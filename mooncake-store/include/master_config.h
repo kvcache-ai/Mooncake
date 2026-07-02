@@ -249,13 +249,22 @@ class MasterServiceSupervisorConfig {
             throw std::runtime_error(
                 "redis_endpoint is required when election_backend is redis");
         }
-        if (election_backend == ElectionBackend::REDIS &&
-            redis_heartbeat_interval_sec >= redis_master_view_ttl_sec) {
-            throw std::runtime_error(
-                "redis_heartbeat_interval_sec (" +
-                std::to_string(redis_heartbeat_interval_sec) +
-                ") must be less than redis_master_view_ttl_sec (" +
-                std::to_string(redis_master_view_ttl_sec) + ")");
+        if (election_backend == ElectionBackend::REDIS) {
+            if (redis_master_view_ttl_sec <= 0) {
+                throw std::runtime_error(
+                    "redis_master_view_ttl_sec must be greater than 0");
+            }
+            if (redis_heartbeat_interval_sec <= 0) {
+                throw std::runtime_error(
+                    "redis_heartbeat_interval_sec must be greater than 0");
+            }
+            if (redis_heartbeat_interval_sec >= redis_master_view_ttl_sec) {
+                throw std::runtime_error(
+                    "redis_heartbeat_interval_sec (" +
+                    std::to_string(redis_heartbeat_interval_sec) +
+                    ") must be less than redis_master_view_ttl_sec (" +
+                    std::to_string(redis_master_view_ttl_sec) + ")");
+            }
         }
     }
 };

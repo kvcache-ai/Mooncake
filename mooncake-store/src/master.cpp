@@ -596,6 +596,13 @@ int main(int argc, char* argv[]) {
                    << ". Must be 'etcd' or 'redis'";
         return 1;
     }
+#ifndef STORE_USE_REDIS
+    if (master_config.enable_ha && master_config.election_backend == "redis") {
+        LOG(FATAL) << "Redis election backend requested but STORE_USE_REDIS "
+                      "is not enabled at compile time";
+        return 1;
+    }
+#endif
     if (master_config.enable_ha && master_config.etcd_endpoints.empty() &&
         master_config.election_backend != "redis") {
         LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true and "
@@ -609,14 +616,23 @@ int main(int argc, char* argv[]) {
                "and enable_ha is true";
         return 1;
     }
-    if (master_config.election_backend == "redis" &&
-        master_config.redis_heartbeat_interval_sec >=
+    if (master_config.election_backend == "redis") {
+        if (master_config.redis_master_view_ttl_sec <= 0) {
+            LOG(FATAL) << "redis_master_view_ttl_sec must be greater than 0";
+            return 1;
+        }
+        if (master_config.redis_heartbeat_interval_sec <= 0) {
+            LOG(FATAL) << "redis_heartbeat_interval_sec must be greater than 0";
+            return 1;
+        }
+        if (master_config.redis_heartbeat_interval_sec >=
             master_config.redis_master_view_ttl_sec) {
-        LOG(FATAL) << "redis_heartbeat_interval_sec ("
-                   << master_config.redis_heartbeat_interval_sec
-                   << ") must be less than redis_master_view_ttl_sec ("
-                   << master_config.redis_master_view_ttl_sec << ")";
-        return 1;
+            LOG(FATAL) << "redis_heartbeat_interval_sec ("
+                       << master_config.redis_heartbeat_interval_sec
+                       << ") must be less than redis_master_view_ttl_sec ("
+                       << master_config.redis_master_view_ttl_sec << ")";
+            return 1;
+        }
     }
     if (!master_config.enable_ha && !master_config.etcd_endpoints.empty()) {
         LOG(WARNING)
