@@ -1,324 +1,530 @@
-# TENT UB Transport Phase 3 — 测试指南
+# TENT UB Transport Phase 3 Test Guide
 
-本文档涵盖 Phase 3 所有改动的验证方法，分为**本地 Mock 测试**（无需真实硬件，在 CI 中运行）和**真机集成测试**（需 Kunpeng + URMA 硬件）两部分。
+This guide documents the tests for the `UB_TENT` branch. It is written against
+the current code in this branch and calls out the functional differences from
+`main` so that reviewers can map each test to the changed code.
 
----
+`main` in this repository is `812eb8d67bbf83dc96d51013cdc2e8f9ec358b80`.
+`UB_TENT` is `7604e53a187e0c5e52076f250a92697b5d1cff45`.
 
-## 一、编译前置条件
+## 1. Scope Compared With `main`
+
+`UB_TENT` adds the TENT adapter for Kunpeng UB/URMA and also adjusts the
+existing old Transfer Engine UB implementation so that it can be reused by
+TENT.
+
+| Area | `main` | `UB_TENT` |
+|---|---|---|
+| TENT transport enum | No `UB` transport type | Adds `TransportType::UB`, Python binding, and `"ub"` string mapping |
+| Transport loading | TENT cannot instantiate UB | `transport_loader` creates `UbTentTransport` when `USE_UB=ON` and `transports/ub/enable` is true |
+| Selector | Policy strings cannot select `"ub"` | `TransportSelector` parses and prints `"ub"` and can route policy entries to UB |
+| Metadata bridge | UB only uses old-TE `TransferMetadata` | Adds `UbTentMetadataBridge` to convert TENT segment metadata into old-TE UB descriptors |
+| Handshake | Old UB uses the old handshake path | Adds TENT `BootstrapUb` RPC and routes UB jetty exchange through TENT control plane |
+| Local segment publishing | TENT memory segments do not carry UB-specific EID/tseg data | UB transport writes device EIDs and buffer tseg handles into TENT `transport_attrs` |
+| Submit fallback | A submit failure with `UNSPEC` type did not get poll-time resubmit | Failed sub-batch submit resets `failover_count` and poll failover can resubmit |
+| Old UB registration | Each context attempted to register the same VA | Primary context registers once; other contexts adopt the segment to avoid URMA duplicate registration |
+| Tests | No TENT UB tests | Adds `tent_ub_transport_test` and `tent_ub_e2e_dual_node_test` |
+
+Changed files to review when validating the branch:
+
+- TENT UB adapter: `tent/src/transport/ub/*`,
+  `tent/include/tent/transport/ub/*`
+- TENT control-plane changes: `tent/include/tent/runtime/control_plane.h`,
+  `tent/src/runtime/control_plane.cpp`, `tent/include/tent/rpc/rpc.h`
+- TENT selection/loading changes: `tent/include/tent/common/types.h`,
+  `tent/src/runtime/transport_selector.cpp`,
+  `tent/src/runtime/transport_loader.cpp`,
+  `tent/src/runtime/transfer_engine_impl.cpp`
+- Tests: `tent/tests/ub_tent_transport_test.cpp`,
+  `tent/tests/ub_e2e_dual_node_test.cpp`, `tent/tests/CMakeLists.txt`
+- Old UB support changes:
+  `include/transport/kunpeng_transport/ub_context.h`,
+  `include/transport/kunpeng_transport/urma/urma_endpoint.h`,
+  `src/transport/kunpeng_transport/ub_transport.cpp`,
+  `src/transport/kunpeng_transport/urma/urma_endpoint.cpp`
+
+## 2. Build Configuration
+
+There is no `MOCK_URMA` CMake option in the current code. Mock URMA is selected
+by the existing UB CMake logic when `liburma.so` is not found:
+
+- If `/usr/lib64/liburma.so` is found, `ub_transport` links the real URMA
+  library.
+- If it is not found, `ub_transport` builds with
+  `src/transport/kunpeng_transport/urma/mock_urma.cpp`.
+- URMA headers are still required. Provide them with `URMA_INCLUDE_DIR`, with
+  `FETCHCONTENT_SOURCE_DIR_URMA`, or allow `FindUrma.cmake` to fetch UMDK.
+
+Use `BUILD_UNIT_TESTS`, not `BUILD_TESTS`.
 
 ```bash
-# 在 build 目录中配置（需要 USE_UB + USE_TENT 同时开启）
-cmake .. \
-  -DUSE_UB=ON \
+cmake -S . -B build-ub-tent \
   -DUSE_TENT=ON \
-  -DMOCK_URMA=ON \       # 本地 Mock 测试时加此选项
-  -DBUILD_TESTS=ON \
+  -DUSE_UB=ON \
+  -DBUILD_UNIT_TESTS=ON \
   -DCMAKE_BUILD_TYPE=Debug
 
-# 编译目标
-cmake --build . --target tent_xport_ub -j4          # 核心库
-cmake --build . --target tent_ub_transport_test -j4 # 单元测试
+cmake --build build-ub-tent \
+  --target tent_xport_ub tent_ub_transport_test tent_ub_e2e_dual_node_test \
+  --parallel
 ```
 
----
-
-## 二、Mock 单元测试（无硬件可运行）
-
-> 文件：`mooncake-transfer-engine/tent/tests/ub_tent_transport_test.cpp`
-
-### 2.1 运行方式
+If URMA headers are installed in a non-default location:
 
 ```bash
-# 在 build 目录
-./mooncake-transfer-engine/tent/tests/tent_ub_transport_test
+cmake -S . -B build-ub-tent \
+  -DUSE_TENT=ON \
+  -DUSE_UB=ON \
+  -DBUILD_UNIT_TESTS=ON \
+  -DURMA_INCLUDE_DIR=/path/to/urma/include
 ```
 
-或使用 CTest：
+## 3. Local Unit Test
+
+Unit test source:
+
+```text
+mooncake-transfer-engine/tent/tests/ub_tent_transport_test.cpp
+```
+
+CTest target:
 
 ```bash
-ctest -R tent_ub_transport_test -V
+ctest --test-dir build-ub-tent -R '^tent_ub_transport_test$' \
+  --output-on-failure -V
 ```
 
-### 2.2 覆盖的测试用例
+Direct binary:
 
-| 测试名称 | 验证点 |
+```bash
+cd build-ub-tent
+GLOG_logtostderr=1 \
+  ./mooncake-transfer-engine/tent/tests/tent_ub_transport_test
+```
+
+Run a single real GTest case:
+
+```bash
+cd build-ub-tent
+GLOG_logtostderr=1 \
+  ./mooncake-transfer-engine/tent/tests/tent_ub_transport_test \
+  --gtest_filter="UbTentTransportTest.InstallWithMockUrma"
+```
+
+The executable is registered with CTest as `tent_ub_transport_test`.
+
+### Covered GTest Cases
+
+| Test case | Coverage |
 |---|---|
-| `UbSelectorTest` | TransportSelector 在策略配置 UB 时能正确选到 UB transport |
-| `UbInstallUninstallTest` | `install()` + `uninstall()` 生命周期，Mock URMA 环境下无崩溃 |
-| `UbAddRemoveBufferTest` | `addMemoryBuffer()` / `removeMemoryBuffer()` 成功注册 MR，`tseg` 序列化写入 `BufferDesc.transport_attrs[UB]` |
-| `UbSubBatchLifecycleTest` | `allocateSubBatch()` / `freeSubBatch()` 正常分配和释放 |
-| `UbSubmitMockTransferTest` | Mock 模式下 `submitTransferTasks()` 不返回错误 |
-| `UbGetStatusTest` | `getTransferStatus()` 返回合法状态 |
+| `UbSelectorTest.TypeNameRoundTrip` | `TransportSelector::transportTypeName(UB)` returns `"ub"` |
+| `UbSelectorTest.ParseUbString` | `"ub"` parses to `TransportType::UB` |
+| `UbSelectorTest.ParseUnknownStillReturnsUnspec` | Unknown transport strings still return `UNSPEC` |
+| `UbSelectorTest.UbEnumValue` | `UB` enum is inside the supported transport range |
+| `UbSelectorTest.SelectorPicksUbWhenFirstInPolicy` | A policy with `"transports": ["ub", "rdma", "tcp"]` selects UB when UB is available |
+| `UbTentTransportTest.InstallWithMockUrma` | `UbTentTransport::install()` succeeds with mock URMA, exposes name `"ub"`, and advertises DRAM-to-DRAM capability |
+| `UbTentTransportTest.AddAndRemoveMemoryBuffer` | Page-aligned memory can be registered/unregistered and `desc.transports` is updated with/removes `UB` |
+| `UbTentTransportTest.AllocateAndFreeSubBatch` | TENT sub-batches allocate/free through old-TE UB batch IDs |
+| `UbTentTransportTest.SubmitAndPollMockTransfer` | Local mock submit/poll path does not crash or hang, even if mock submit cannot complete a real peer transfer |
+| `UbTentTransportTest.DoubleUninstallSafe` | `uninstall()` is idempotent |
 
-### 2.3 关键检查点（手动查看日志）
+On a host where real `liburma.so` is present but no usable UB HCA exists, the
+transport install may fail and the hardware-dependent unit tests will call
+`GTEST_SKIP()`. That is an expected local-developer outcome; on a pure mock
+build, these tests should run.
 
-运行时应看到以下日志（`GLOG_logtostderr=1`）：
+In short, the mock test covers selector mapping, install/uninstall, memory
+buffer lifecycle, sub-batch lifecycle, and a mock transfer no-crash/no-hang
+path. It does not guarantee that the real UB data plane completes, and it does
+not guarantee the full semantics of `transport_attrs[UB]`.
 
-```
-I UbTentTransport: installed on segment 'test_node'
-I UbTransport: initialize Ub resources done
-I UbTransport: allocate local segment done
-I UbTransport: start handshake daemon done    # 来自 bridge，实际为 no-op
-I UbTentTransport: setupUbLocalSegment()      # 写入 EID 到 TENT segment
-```
+### What The Unit Test Does Not Assert
 
----
-
-## 三、桥接层（UbTentMetadataBridge）单元验证
-
-> 这部分改动可在 Mock 环境下通过间接行为验证，无需专门的 Bridge 测试二进制。
-
-### 3.1 验证 `startHandshakeDaemon` 变为 no-op
-
-**方法：** 在 Mock 测试中，`install()` 成功后检查 `control_service_` 的 UB bootstrap 回调已被注册（通过 `setBootstrapUbCallback`）。
-
-**预期：** 没有 TCP daemon 启动，没有绑定端口的 log。
-
-### 3.2 验证 `getSegmentDescByID(LOCAL_SEGMENT_ID)` 正常
-
-**方法：** 调用 `addMemoryBuffer()` 后，验证 `BufferDesc.transport_attrs[UB]` 非空（说明 bridge 成功读回了 local segment 里的 tseg）。
-
-**检查代码（伪）：**
+The unit test currently checks that `desc.transports` contains `UB`, but it does
+not assert the serialized tseg stored in `desc.transport_attrs[UB]`. That field
+is populated by `UbTentTransport::addMemoryBuffer()` from the old-TE local
+segment and is consumed by `UbTentMetadataBridge::convertFromTent()` on remote
+nodes. For debugging, inspect the descriptor after registration:
 
 ```cpp
-BufferDesc desc;
-desc.addr = reinterpret_cast<uint64_t>(buf);
-desc.length = 4096;
-ASSERT_TRUE(transport.addMemoryBuffer(desc, options).ok());
-// tseg 写入了 transport_attrs
-EXPECT_FALSE(desc.transport_attrs.count(TransportType::UB) == 0);
-auto tseg_json = desc.transport_attrs.at(TransportType::UB);
-EXPECT_FALSE(nlohmann::json::parse(tseg_json).empty());
+auto it = desc.transport_attrs.find(TransportType::UB);
+CHECK(it != desc.transport_attrs.end());
+LOG(INFO) << "UB tseg JSON: " << it->second;
 ```
 
----
+## 4. TENT UB Behavior To Validate
 
-## 四、真机集成测试（需 Kunpeng URMA 硬件）
+### 4.1 Transport Selection
 
-以下测试需要两台配置了 Kunpeng URMA 网卡的节点，分别称为 **节点 A**（sender）和 **节点 B**（receiver）。
+The branch adds `UB` to the TENT transport enum and maps it to `"ub"`.
+The selector should accept this policy:
 
-### 4.1 环境准备
+```json
+{
+  "policy": [
+    {
+      "name": "kunpeng_ub_memory",
+      "segment_type": "memory",
+      "local_memory": "cpu",
+      "remote_memory": "cpu",
+      "same_machine": false,
+      "transports": ["ub", "rdma", "tcp"]
+    }
+  ]
+}
+```
+
+This is covered by `UbSelectorTest.SelectorPicksUbWhenFirstInPolicy`.
+
+### 4.2 UB Transport Loading
+
+When built with `-DUSE_UB=ON -DUSE_TENT=ON`, TENT loads UB if:
+
+```json
+{
+  "transports": {
+    "ub": { "enable": true }
+  }
+}
+```
+
+The default in `transport_loader.cpp` is also true when the key is absent.
+Disable it explicitly with:
+
+```json
+{
+  "transports": {
+    "ub": { "enable": false }
+  }
+}
+```
+
+### 4.3 Device Selection
+
+`UbTentTransport::install()` resolves UB devices in this order:
+
+1. TENT config key `transports/ub/device_name`
+2. Environment variable `MC_UB_DEVICE_NAME`
+3. Auto-discover all UB devices
+
+`device_name` and `MC_UB_DEVICE_NAME` may be comma-separated lists. Production
+deployments normally pin one logical/bonded device, for example:
+
+```json
+{
+  "transports": {
+    "ub": {
+      "enable": true,
+      "device_name": "bonding_dev_0"
+    }
+  }
+}
+```
+
+Equivalent environment override:
 
 ```bash
-# 两台机器均执行
-# 1. 确认 URMA 设备可用
-ls /dev/urma*        # 应有设备文件
+export MC_UB_DEVICE_NAME=bonding_dev_0
+```
 
-# 2. 加载驱动（如需）
+### 4.4 Local Segment Publishing
+
+After `UbTentTransport::install()` succeeds, `setupUbLocalSegment()` mirrors
+old-TE UB device EIDs into the local TENT `MemorySegmentDesc.devices` and sets
+segment-level UB availability:
+
+- Each UB device is written as `DeviceDesc.transport_attrs[UB] = <eid>`.
+- The memory segment is tagged with
+  `MemorySegmentDesc.transport_attrs[static_cast<int>(UB)] = "ub"`.
+- `SegmentManager::synchronizeLocal()` publishes the updated segment.
+
+After `registerLocalMemory()`, `addMemoryBuffer()` also records each buffer's
+UB tseg handle in `BufferDesc.transport_attrs[UB]` and adds `UB` to
+`BufferDesc.transports`.
+
+### 4.5 Metadata Bridge
+
+`UbTentMetadataBridge` replaces old-TE remote metadata lookup for the UB data
+path:
+
+- `LOCAL_SEGMENT_ID` still uses the old-TE base-class in-memory cache.
+- Remote `getSegmentDescByID()` uses TENT `SegmentManager::getRemoteCached()`.
+- `force_update=true` invalidates both the bridge cache and TENT remote cache.
+- `getSegmentDescByName()` reads the remote TENT segment and converts it.
+- `getSegmentID(name)` opens the TENT remote segment and returns that handle as
+  the old-TE segment ID.
+- `convertFromTent()` extracts device EIDs and buffer tsegs from
+  `transport_attrs[UB]` and builds a minimal old-TE topology.
+
+### 4.6 UB Handshake Through TENT RPC
+
+`startHandshakeDaemon()` is a no-op in the bridge. It stores the old-TE UB
+handshake callback. `UbTentTransport::install()` registers that callback with
+`ControlService::setBootstrapUbCallback()`.
+
+Active connection setup calls:
+
+```text
+UbEndpoint -> TransferMetadata::sendHandshake()
+           -> UbTentMetadataBridge::sendHandshake()
+           -> ControlClient::bootstrapUb()
+           -> remote ControlService::onBootstrapUb()
+           -> stored old-TE UB handshake callback
+```
+
+`UbBootstrapDesc` carries:
+
+- `local_nic_path`
+- `peer_nic_path`
+- `jetty_num`
+- `local_eid`
+- `reply_msg`
+
+The old-TE URMA endpoint was also changed so that active/passive setup can use
+the `local_eid` returned by the RPC response directly.
+
+## 5. Dual-Node Integration Test
+
+Integration test source:
+
+```text
+mooncake-transfer-engine/tent/tests/ub_e2e_dual_node_test.cpp
+```
+
+Build target:
+
+```bash
+cmake --build build-ub-tent --target tent_ub_e2e_dual_node_test --parallel
+```
+
+This executable is intentionally not registered with CTest because it requires
+real Kunpeng URMA hardware and two nodes sharing a TENT metadata backend.
+
+### 5.1 Hardware And Service Requirements
+
+On both nodes:
+
+```bash
+ls /dev/urma*
+urma_cmd -q all
+```
+
+If needed, load the platform driver before running the test:
+
+```bash
 modprobe urma_udrv
-
-# 3. 检查 EID（每块网卡一个）
-urma_cmd -q all      # 应显示 EID 列表
 ```
 
-### 4.2 编译（不加 MOCK_URMA）
+Both nodes must also be able to reach:
+
+- The shared TENT metadata backend, such as etcd.
+- Each other's TENT RPC server address.
+- The UB/URMA fabric.
+
+### 5.2 Recommended Config Files
+
+The test binary has a built-in UB-only config, but for real two-node testing it
+is clearer to provide explicit config files with shared metadata and stable
+segment names.
+
+Node A (`node_a_ub.json`, used as `/path/to/ub_config.json` on the server):
+
+```json
+{
+  "metadata_type": "etcd",
+  "metadata_servers": "ETCD_IP:2379",
+  "local_segment_name": "node_a_seg",
+  "rpc_server_hostname": "NODE_A_IP",
+  "rpc_server_port": 0,
+  "transports": {
+    "tcp": { "enable": false },
+    "rdma": { "enable": false },
+    "ub": {
+      "enable": true,
+      "device_name": "bonding_dev_0"
+    }
+  },
+  "policy": [
+    {
+      "name": "ub_memory",
+      "segment_type": "memory",
+      "local_memory": "cpu",
+      "remote_memory": "cpu",
+      "same_machine": false,
+      "transports": ["ub"]
+    }
+  ]
+}
+```
+
+Node B (`node_b_ub.json`, used as `/path/to/ub_config.json` on the client)
+should use the same metadata backend but a different local segment name and
+hostname:
+
+```json
+{
+  "metadata_type": "etcd",
+  "metadata_servers": "ETCD_IP:2379",
+  "local_segment_name": "node_b",
+  "rpc_server_hostname": "NODE_B_IP",
+  "rpc_server_port": 0,
+  "transports": {
+    "tcp": { "enable": false },
+    "rdma": { "enable": false },
+    "ub": {
+      "enable": true,
+      "device_name": "bonding_dev_0"
+    }
+  },
+  "policy": [
+    {
+      "name": "ub_memory",
+      "segment_type": "memory",
+      "local_memory": "cpu",
+      "remote_memory": "cpu",
+      "same_machine": false,
+      "transports": ["ub"]
+    }
+  ]
+}
+```
+
+Notes:
+
+- `--segment_name` is required by the server test, but the actual TENT segment
+  name comes from `local_segment_name` in the config for non-`p2p` metadata.
+  Keep them identical to avoid confusion.
+- If `metadata_type` is left as `p2p`, TENT replaces the local segment name
+  with the RPC address (`host:port`). In that mode, the client must open that
+  generated segment name rather than `node_a_seg`.
+
+### 5.3 Run The Test
+
+Node A:
 
 ```bash
-cmake .. \
-  -DUSE_UB=ON \
-  -DUSE_TENT=ON \
-  -DBUILD_TESTS=ON \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j$(nproc)
-```
-
-### 4.3 测试一：UB Local Segment 发布（单节点）
-
-**目的：** 验证 `setupUbLocalSegment()` 正确把 EID 写进 TENT 段。
-
-**步骤：**
-
-```bash
-# 节点 A 上
-GLOG_logtostderr=1 ./tent/tests/tent_ub_transport_test \
-  --gtest_filter="UbInstallUninstallTest"
-```
-
-**预期日志：**
-
-```
-I UbTentTransport: setupUbLocalSegment — writing N devices
-I SegmentManager: synchronizeLocal succeeded
-```
-
-**手动检查（gdb 或 instrumentation）：**
-
-1. 在 `setupUbLocalSegment()` 返回后，调用 `control_service_->segmentManager().getLocal()`
-2. 取 `MemorySegmentDesc.devices`，每个 device 的 `transport_attrs[UB]` 应等于 `urma_cmd -q` 输出的 EID 字符串
-
----
-
-### 4.4 测试二：双节点 Metadata 同步
-
-**目的：** 验证节点 A 的 TENT segment（含 tseg/eid）能被节点 B 的 `UbTentMetadataBridge::getSegmentDescByID()` 正确读回。
-
-**步骤：**
-
-```bash
-# 节点 A：启动 TENT transfer engine，注册一块内存
-./tent/tests/tent_ub_transfer_test --role=server \
+cd build-ub-tent
+GLOG_logtostderr=1 GLOG_v=1 \
+  ./mooncake-transfer-engine/tent/tests/tent_ub_e2e_dual_node_test \
+  --role=server \
   --segment_name=node_a_seg \
-  --metastore=etcd://ETCD_IP:2379
+  --transport_config=/path/to/ub_config.json
+```
 
-# 节点 B：打开节点 A 的 remote segment，验证能拿到 tseg
-./tent/tests/tent_ub_transfer_test --role=client \
+Node B:
+
+```bash
+cd build-ub-tent
+GLOG_logtostderr=1 GLOG_v=1 \
+  ./mooncake-transfer-engine/tent/tests/tent_ub_e2e_dual_node_test \
+  --role=client \
   --remote_segment=node_a_seg \
-  --metastore=etcd://ETCD_IP:2379
+  --transport_config=/path/to/ub_config.json \
+  --data_size=1048576 \
+  --operation=write
 ```
 
-**预期结果（节点 B 日志）：**
+Client-side expected result:
 
+```text
+Client: WRITE 1048576 bytes ... COMPLETED
+Client: READ 1048576 bytes ... COMPLETED
+Client: data integrity VERIFIED
+Client: test PASSED
 ```
-I UbTentMetadataBridge: getSegmentDescByID(X) — found in TENT SegmentManager
-I convertFromTent: extracted N buffers, M devices
-I BufferDesc tseg[0]: <tseg handle string>
-I DeviceDesc eid: <eid string matching node A>
-```
 
-**失败排查：**
+`--operation=write` writes a known pattern to the remote buffer, reads it back,
+and verifies every byte. `--operation=read` only executes the read path and
+does not verify a known pattern.
 
-| 现象 | 可能原因 |
+### 5.4 What This Integration Test Covers
+
+- The server publishes a memory segment with UB device EIDs.
+- The server registers page-aligned memory for old-TE UB.
+- The client opens the server's TENT segment.
+- The client reads remote `SegmentInfo` and uses the first remote buffer base.
+- The client submits WRITE and READ through the TENT API.
+- `UbTentTransport` translates TENT requests to old-TE UB transfer requests.
+- UB endpoint setup uses TENT `BootstrapUb` RPC for the URMA jetty exchange.
+- Data integrity is verified after write + read-back.
+
+### 5.5 Debugging Integration Failures
+
+| Symptom | Checks |
 |---|---|
-| `getSegmentDescByID` 返回 nullptr | TENT segment 未同步；检查 metastore 连通性 |
-| tseg 列表为空 | `addMemoryBuffer()` 没有写入 `transport_attrs[UB]`；检查 bridge 的 local segment 读取 |
-| eid 字段为空 | `setupUbLocalSegment()` 未能从 `context_list_` 拿到 EID；检查 URMA 初始化 |
+| `openSegment('node_a_seg') failed` | Confirm Node A used non-`p2p` metadata, `local_segment_name` is `node_a_seg`, both nodes point to the same metadata backend, and Node A is still running |
+| UB transport skipped during startup | Check `USE_UB=ON`, `transports/ub/enable=true`, URMA headers/library, device name, and `MC_UB_DEVICE_NAME` |
+| Remote segment has no buffers | Confirm server `registerLocalMemory()` succeeded and segment publication reached the metadata backend |
+| BootstrapUb RPC failed | Check remote segment `rpc_server_addr`, firewall, RPC hostname, and whether `setBootstrapUbCallback()` was registered after UB install |
+| URMA duplicate registration | Confirm the branch contains the old UB changes that register on the primary context and adopt the segment on other contexts |
+| Data mismatch | Confirm both nodes use the same `data_size`, the client used `--operation=write`, and no fallback transport was enabled accidentally |
 
----
-
-### 4.5 测试三：UB Bootstrap / Handshake（双节点）
-
-**目的：** 验证 TENT BootstrapUb RPC 替代旧 TCP handshake daemon 正常完成 URMA jetty 交换。
-
-**步骤：**
-
-1. 节点 A 启动，`UbTentTransport::install()` 后 `setBootstrapUbCallback` 已注册
-2. 节点 B 发起 `submitTransfer` 到节点 A 的某地址
-3. `UbEndPoint::setupConnections()` 触发 `sendHandshake`
-4. Bridge 的 `sendHandshake` 调用 `ControlClient::bootstrapUb(node_a_rpc_addr, ...)`
-5. 节点 A 的 `ControlService::onBootstrapUb` 被触发，调用注册的回调（`UbTransport::onSetupConnections`）
-6. URMA jetty 交换成功
-
-**验证方法（查看 glog）：**
-
-节点 A：
-```
-I ControlService::onBootstrapUb: received from <node_B_nic_path>
-I UbTransport::onSetupConnections: setting up jetty for <node_B_nic_path>
-```
-
-节点 B：
-```
-I UbTentMetadataBridge::sendHandshake: RPC to <node_A_rpc_addr>
-I UbEndPoint: setupConnectionsByPassive succeeded
-```
-
-**失败排查：**
-
-| 现象 | 可能原因 |
-|---|---|
-| RPC call 超时 | `rpc_server_addr` 解析错误；检查 TENT segment 中的 `rpc_server_addr` 字段 |
-| `onSetupConnections` 未被调用 | `setBootstrapUbCallback` 注册时机在 install 成功后，检查时序 |
-| jetty mismatch | `UbBootstrapDesc.jetty_num` 和 `HandShakeDesc.jetty_num` 的转换逻辑，检查 `#ifdef USE_UB` 宏 |
-
----
-
-### 4.6 测试四：端到端 DRAM→DRAM 传输
-
-**目的：** 完整验证从 `submitTransfer` 到 URMA 数据面写完成的全链路。
-
-**步骤（参考已有 RDMA loopback 测试改写为 UB 版本）：**
+Useful metadata inspection with etcd:
 
 ```bash
-# 节点 A（receiver）
-./tent/tests/tent_ub_e2e_test --role=receiver \
-  --segment=node_a --transport=ub \
-  --metastore=etcd://ETCD_IP:2379
-
-# 节点 B（sender）
-./tent/tests/tent_ub_e2e_test --role=sender \
-  --remote_segment=node_a --transport=ub \
-  --size=1048576 \                   # 1MB
-  --metastore=etcd://ETCD_IP:2379
+etcdctl get mooncake/tent/ --prefix
+etcdctl get mooncake/tent/node_a_seg --print-value-only | python3 -m json.tool
 ```
 
-**预期：**
+Look for:
 
-```
-Sender: transfer completed, 1048576 bytes, status=COMPLETED
-Receiver: data verified OK
-```
+- `detail.devices[*].transport_attrs` containing the UB enum key and EID.
+- `detail.buffers[*].transport_attrs` containing the UB enum key and tseg JSON.
+- `rpc_server_addr` pointing to Node A's reachable TENT RPC address.
 
-**Fallback 验证（测试 submit-fallback 改动）：**
+## 6. Fallback And Regression Tests
 
-1. 在节点 B 上用 `--transport=ub,tcp` 同时启用 UB 和 TCP
-2. 断开 URMA 链路（拔网线或 `ip link set dev urma0 down`）
-3. 触发 `submitTransfer`
-4. 观察日志：应看到 UB submit 失败 → `failover_count=0` 重置 → 下一次 poll 触发 `resubmitTransferTask` → 切换到 TCP
+`UB_TENT` changes `TransferEngineImpl::commitPreparedSubmit()` and
+`updateTaskStatusAfterPoll()` so a failed sub-batch submit can still be retried
+by poll-time failover. This is not UB-specific and should be covered by the
+existing TENT failover tests.
 
-```
-W UbTentTransport: submitTransferTask failed: ...
-I TransferEngineImpl: Transport failover: UB -> TCP (attempt 1/3)
-I Transfer completed via TCP
-```
-
----
-
-## 五、回归测试（确保老 TE 接口不受影响）
-
-Phase 3 在 `transfer_metadata.h` 中对几个方法加了 `virtual`，需要确认旧 TE 功能正常。
+Run:
 
 ```bash
-# 编译并运行老 TE 的单元测试
-cmake --build . --target transfer_engine -j4
-ctest -R transport_uint_test -V
-ctest -R rdma_transport_test -V
+ctest --test-dir build-ub-tent -R '^tent_engine_failover_e2e_test$' \
+  --output-on-failure -V
+
+ctest --test-dir build-ub-tent -R '^tent_transport_hint_test$' \
+  --output-on-failure -V
+
+ctest --test-dir build-ub-tent -R '^tent_transport_selector_test$' \
+  --output-on-failure -V
 ```
 
-**预期：** 所有旧测试 PASS，无回归。
-
----
-
-## 六、测试矩阵汇总
-
-| 测试 | 需要硬件 | 可在 CI 中跑 | 对应 todo |
-|---|---|---|---|
-| Mock install/uninstall | 否（MOCK_URMA） | ✅ | `install-refactor` |
-| tseg 写入 TENT BufferDesc | 否（MOCK_URMA） | ✅ | `add-buffer-tseg` |
-| Local segment EID 发布 | 是（URMA 网卡） | ❌ | `setup-local-segment` |
-| 双节点 metadata 同步 | 是 | ❌ | `bridge-class` |
-| BootstrapUb RPC handshake | 是 | ❌ | `ub-bootstrap` |
-| getTESegmentID 无 fallback | 是 | ❌ | `segment-id-fix` |
-| UB→TCP fallback | 是（或 Mock 注入错误） | ⚠️ 部分 | `submit-fallback` |
-| 老 TE 回归 | 否 | ✅ | — |
-
----
-
-## 七、常用调试命令
+Old Transfer Engine UB regression target:
 
 ```bash
-# 打开所有 glog 日志
-GLOG_logtostderr=1 GLOG_v=2 ./your_test_binary
+cmake --build build-ub-tent --target ub_transport_test --parallel
 
-# 检查 TENT segment JSON（发布后）
-# 在 etcd 中查询（若使用 etcd metastore）
-etcdctl get /mooncake/segment/ --prefix
-
-# 验证 UB transport_attrs 字段存在
-etcdctl get /mooncake/segment/node_a_seg | python3 -m json.tool | grep -A5 transport_attrs
-
-# 查看 URMA 设备状态
-urma_cmd -q all -f json
-
-# 抓取 TENT RPC 通信（BootstrapUb）
-tcpdump -i any port <TENT_RPC_PORT> -A -s0 | grep BootstrapUb
+GLOG_logtostderr=1 \
+  build-ub-tent/mooncake-transfer-engine/tests/ub_transport_test \
+  --device_name=mock_urma_device
 ```
 
----
+`ub_transport_test` is built when `USE_UB=ON`, but it is not registered with
+CTest in the current code. It allocates a large NUMA buffer and may not be
+appropriate for every developer machine.
 
-## 八、已知限制
+## 7. Test Matrix
 
-1. **`addLocalMemoryBuffer` 和 `updateLocalSegmentDesc` 未 virtual**：这两个方法在 bridge 中走基类的 P2P 本地缓存实现，P2P 模式不向外发布，这是有意设计（TENT 的 `synchronizeLocal` 承担发布职责）。
+| Test | Hardware | CTest | Main-to-UB_TENT coverage |
+|---|---:|---:|---|
+| `tent_ub_transport_test` | No real UB hardware if mock URMA is compiled | Yes | UB enum/string mapping, selector, install lifecycle, memory registration, sub-batch lifecycle, submit/poll smoke |
+| `tent_ub_e2e_dual_node_test` | Yes, two Kunpeng URMA nodes | No | TENT segment publishing, metadata bridge, BootstrapUb RPC, old-TE UB data path through TENT |
+| `tent_engine_failover_e2e_test` | No | Yes | Submit-failure poll-time resubmit behavior |
+| `tent_transport_hint_test` | No | Yes | Per-request routing remains valid with the expanded transport enum |
+| `tent_transport_selector_test` | No | Yes | Selector regression around transport policy handling |
+| `ub_transport_test` | Mock or real UB, depending on build | No | Old-TE UB registration/transfer regression |
 
-2. **`#ifdef USE_UB` 宏依赖**：`HandShakeDesc.jetty_num` 字段只在 `USE_UB=ON` 时编译，`UbBootstrapDesc` ↔ `HandShakeDesc` 的转换代码在 bridge 和 transport 中均有对应 `#ifdef` 保护，真机测试必须以 `USE_UB=ON` 编译。
+## 8. Common Pitfalls
 
-3. **Fallback 边界**：`submit-fallback` 改动移除了 `updateTaskStatusAfterPoll` 中对 UNSPEC 任务的豁免，现在所有 UNSPEC 任务在 poll 时都会触发 `resubmitTransferTask`。如果没有可用的 fallback transport，`resubmitTransferTask` 会返回错误，任务最终标为 FAILED，行为与之前一致。
+- Do not pass `-DMOCK_URMA=ON`; the option does not exist.
+- Do not use `-DBUILD_TESTS=ON`; the correct option is `-DBUILD_UNIT_TESTS=ON`.
+- Use the real UB TENT targets: `tent_ub_transport_test` and
+  `tent_ub_e2e_dual_node_test`.
+- The dual-node executable is not a CTest test.
+- `--segment_name` in the dual-node server does not override TENT config; use
+  `local_segment_name` in the config for stable cross-node names.
+- UB memory registration should use page-aligned buffers. The tests use
+  `posix_memalign(..., 4096, size)` for this reason.
