@@ -54,7 +54,7 @@ class CountMinSketch {
         // Decay check: use relaxed counter
         size_t prev = total_increments_.fetch_add(1, std::memory_order_relaxed);
         if (prev + 1 >= width_ * depth_) {
-            decay();
+            tryAutoDecay();
         }
         return min_val;
     }
@@ -73,8 +73,10 @@ class CountMinSketch {
         return min_val;
     }
 
-    // Halve all counters. Protected by a mutex since this is a bulk operation
-    // that requires consistency across all cells.
+   public:
+    // Halve all counters unconditionally. Intended for manual decay (tests,
+    // periodic maintenance). Resets total_increments_ to 0 since all counters
+    // are halved.
     //
     // Note: cell.store(cell.load() >> 1) is a non-atomic RMW. A concurrent
     // increment() CAS that succeeds between the load and store may be silently
@@ -82,24 +84,36 @@ class CountMinSketch {
     // inherently approximate, and the alternative (a CAS retry loop per cell
     // during decay) would livelock under contention. The practical impact is
     // bounded — at most one increment lost per cell per decay cycle.
-    void decay() {
+    void decay() { decayImpl(true); }
+
+   private:
+    // Guarded auto-decay triggered from increment() when the counter threshold
+    // is reached. Uses a double-check under the mutex to prevent multiple
+    // threads from performing redundant decay passes: the first thread to
+    // acquire the lock decays and resets the counter; subsequent threads see
+    // the counter below threshold and skip.
+    void tryAutoDecay() { decayImpl(false); }
+
+    void decayImpl(bool force) {
         std::lock_guard<std::mutex> lock(decay_mu_);
-        // Only one thread performs decay; others that reached the threshold
-        // find total_increments_ already reset and skip.
-        if (total_increments_.load(std::memory_order_relaxed) <
-            width_ * depth_) {
+        if (!force && total_increments_.load(std::memory_order_relaxed) <
+                          width_ * depth_) {
             return;
         }
         for (auto& cell : table_) {
             cell.store(cell.load(std::memory_order_relaxed) >> 1,
                        std::memory_order_relaxed);
         }
-        // Use fetch_sub to preserve concurrent increments that arrived during
-        // decay. store(0) would silently erase them, causing counter drift and
-        // delayed subsequent decay cycles. fetch_sub(threshold) subtracts only
-        // the increments accounted for by this decay pass; any extras remain
-        // counted.
-        total_increments_.fetch_sub(width_ * depth_, std::memory_order_relaxed);
+        if (force) {
+            // Manual decay: reset counter to start a fresh frequency window.
+            total_increments_.store(0, std::memory_order_relaxed);
+        } else {
+            // Auto-decay: use fetch_sub to preserve concurrent increments that
+            // arrived during decay. store(0) would silently erase them, causing
+            // counter drift and delayed subsequent decay cycles.
+            total_increments_.fetch_sub(width_ * depth_,
+                                        std::memory_order_relaxed);
+        }
     }
 
    private:
