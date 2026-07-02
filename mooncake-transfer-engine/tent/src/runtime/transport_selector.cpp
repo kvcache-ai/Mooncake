@@ -29,20 +29,32 @@ namespace tent {
 // Transport type name mapping
 static const std::unordered_map<std::string, TransportType> kTransportNameMap =
     {
-        {"unspec", UNSPEC},       {"rdma", RDMA},
-        {"mnnvl", MNNVL},         {"shm", SHM},
-        {"nvlink", NVLINK},       {"gds", GDS},
-        {"io_uring", IOURING},    {"tcp", TCP},
-        {"ascend", AscendDirect}, {"sunrise_link", SUNRISE_LINK},
+        {"unspec", UNSPEC},
+        {"rdma", RDMA},
+        {"mnnvl", MNNVL},
+        {"shm", SHM},
+        {"nvlink", NVLINK},
+        {"gds", GDS},
+        {"io_uring", IOURING},
+        {"tcp", TCP},
+        {"ascend", AscendDirect},
+        {"sunrise_link", SUNRISE_LINK},
+        {"tpu", TPU},
 };
 
 static const std::unordered_map<TransportType, std::string>
     kTransportTypeNames = {
-        {UNSPEC, "unspec"},       {RDMA, "rdma"},
-        {MNNVL, "mnnvl"},         {SHM, "shm"},
-        {NVLINK, "nvlink"},       {GDS, "gds"},
-        {IOURING, "io_uring"},    {TCP, "tcp"},
-        {AscendDirect, "ascend"}, {SUNRISE_LINK, "sunrise_link"},
+        {UNSPEC, "unspec"},
+        {RDMA, "rdma"},
+        {MNNVL, "mnnvl"},
+        {SHM, "shm"},
+        {NVLINK, "nvlink"},
+        {GDS, "gds"},
+        {IOURING, "io_uring"},
+        {TCP, "tcp"},
+        {AscendDirect, "ascend"},
+        {SUNRISE_LINK, "sunrise_link"},
+        {TPU, "tpu"},
 };
 
 // Memory type name mapping for pattern matching
@@ -236,6 +248,9 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
         case MTYPE_ROCM:
             type_str = "rocm";
             break;
+        case MTYPE_TPU:
+            type_str = "tpu";
+            break;
         default:
             type_str = "unknown";
             break;
@@ -319,15 +334,21 @@ bool TransportSelector::isTransportAvailable(
     }
 
     // Special constraints
-    if ((type == NVLINK || type == SHM) && !context.same_machine) {
-        return false;  // NVLINK and SHM only work on same machine
+    if ((type == NVLINK || type == SHM || type == TPU) &&
+        !context.same_machine) {
+        // NVLINK/SHM only work on same machine; TPU is a local-stage-only
+        // executor (HBM<->host), so it must never be picked for a remote hop.
+        return false;
     }
 
     const auto& caps = transport->capabilities();
 
-    // Helper to check if memory type is GPU/NPU
+    // Helper to check if memory type is a device (GPU/NPU/TPU). TPU is included
+    // so its device<->host staging hop routes to TpuTransport (gpu_to_dram /
+    // dram_to_gpu); it never satisfies gpu_to_gpu, so cross-node TPU traffic is
+    // always staged through host DRAM.
     auto is_gpu = [](MemoryType t) {
-        return t == MTYPE_CUDA || t == MTYPE_ROCM;
+        return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU;
     };
 
     // For file segments, check file-specific capabilities (original logic)

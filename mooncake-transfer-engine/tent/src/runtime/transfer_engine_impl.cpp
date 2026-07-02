@@ -645,6 +645,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
+    if (transport_list_[TPU]) result.push_back(TPU);
     return result;
 }
 
@@ -877,7 +878,12 @@ class TransferEngineImpl::BatchRef {
 };
 
 static bool isGpuType(MemoryType t) {
-    return t == MTYPE_CUDA || t == MTYPE_ROCM;
+    // TPU HBM behaves like a GPU that lacks NIC access: it is a device-side
+    // memory that can only reach the network by staging through host DRAM.
+    // Treating it as a "gpu type" makes the capability checks route its
+    // device<->host hop to TpuTransport (gpu_to_dram / dram_to_gpu) while
+    // leaving gpu_to_gpu unsatisfiable, which forces host-DRAM staging.
+    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU;
 }
 
 static bool checkAvailability(const std::shared_ptr<Transport>& xport,
@@ -905,6 +911,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
     if (type == "rocm") return MTYPE_ROCM;
+    if (type == "tpu") return MTYPE_TPU;
     return MTYPE_UNKNOWN;
 }
 
@@ -964,7 +971,11 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                 auto remote_mtype =
                     getTypeEnum(LocationParser(entry->location).type());
                 for (auto type : entry->transports) {
-                    if ((type == NVLINK || type == SHM) && !same_machine)
+                    // NVLINK/SHM are same-machine only; TPU is a
+                    // local-stage-only executor and must never carry a remote
+                    // hop.
+                    if ((type == NVLINK || type == SHM || type == TPU) &&
+                        !same_machine)
                         continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
@@ -1042,6 +1053,8 @@ static const char* transportTypeName(TransportType type) {
             return "AscendDirect";
         case SUNRISE_LINK:
             return "SUNRISE_LINK";
+        case TPU:
+            return "TPU";
     }
     return "UNKNOWN";
 }
@@ -1326,6 +1339,34 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
             policy.push_back("");  // no local stage
             policy.push_back(desc->getMemory().topology.findNearMem(
                 remote, Topology::MEM_CUDA));
+        }
+    }
+    // case 3: TPU. HBM is not NIC-addressable, so any hop touching TPU memory
+    // is staged through host DRAM: TpuTransport performs the local HBM<->host
+    // copy (via the PJRT adapter) and the host<->host hop is carried by
+    // whatever host-DRAM network transport is present. TPU deployments (e.g.
+    // cloud TPU VMs) are typically TCP/multi-NIC rather than RDMA, so we gate
+    // on either; the cross stage itself is routed by capability (dram_to_dram),
+    // so TCP is selected when RDMA is absent. We also require TpuTransport (the
+    // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
+    // An empty stage location means "no staging needed on that side".
+    if (transport_list_[TPU] &&
+        (transport_list_[RDMA] || transport_list_[TCP])) {
+        if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
+            policy.clear();
+            policy.push_back(server_addr);
+            policy.push_back(topology_->findNearMem(local));
+            policy.push_back(desc->getMemory().topology.findNearMem(remote));
+        } else if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_CPU) {
+            policy.clear();
+            policy.push_back(server_addr);
+            policy.push_back(topology_->findNearMem(local));
+            policy.push_back("");  // remote already host DRAM
+        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_TPU) {
+            policy.clear();
+            policy.push_back(server_addr);
+            policy.push_back("");  // local already host DRAM
+            policy.push_back(desc->getMemory().topology.findNearMem(remote));
         }
     }
 }
