@@ -81,7 +81,13 @@ Status SegmentManager::updateLocal(
         std::unique_lock<std::shared_mutex> guard(local_desc_lock_);
         local_desc_ = std::move(next);
     }
-    local_desc_version_.fetch_add(1, std::memory_order_relaxed);
+    // Release pairs with the acquire load in getLocal(): a reader that
+    // observes the new version must also observe the pointer swap above.
+    // With a relaxed bump, on weakly-ordered architectures the version
+    // store may become visible before the swap, letting a reader tag the
+    // OLD snapshot with the NEW version — which its thread-local cache
+    // would then serve until the next publication.
+    local_desc_version_.fetch_add(1, std::memory_order_release);
     {
         std::lock_guard<std::mutex> jg(local_json_cache_mu_);
         local_json_cache_.reset();
@@ -214,8 +220,9 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
 std::shared_ptr<const std::string> SegmentManager::getLocalDumpedJson() {
     // Capture the snapshot together with its publication version so a slow
     // dump of an older snapshot can never overwrite the cache entry computed
-    // from a newer one.
-    auto version = local_desc_version_.load(std::memory_order_relaxed);
+    // from a newer one. Acquire keeps the tag conservative: the snapshot
+    // read below is then guaranteed to be at least as new as the tag.
+    auto version = local_desc_version_.load(std::memory_order_acquire);
     auto snapshot = getLocal();
     {
         std::lock_guard<std::mutex> g(local_json_cache_mu_);

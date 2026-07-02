@@ -157,6 +157,35 @@ TEST(SegmentTrackerTest, RefCountedAddRemove) {
     EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
 }
 
+TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+
+    auto ok = [](std::vector<BufferDesc>&) -> Status { return Status::OK(); };
+    std::vector<BufferDesc> first{makeBuffer(0x20000, 0x1000)};
+    ASSERT_TRUE(tracker.addInBatch(first, ok).ok());
+    ASSERT_EQ(buffersOf(manager->getLocal())[0].ref_count, 1);
+
+    // A duplicate registration whose transport callback fails must not leave
+    // the ref-count bumped, or the buffer could never be deregistered.
+    auto fail = [](std::vector<BufferDesc>&) -> Status {
+        return Status::InternalError("injected transport failure");
+    };
+    std::vector<BufferDesc> dup{makeBuffer(0x20000, 0x1000)};
+    EXPECT_FALSE(tracker.addInBatch(dup, fail).ok());
+    ASSERT_EQ(buffersOf(manager->getLocal()).size(), 1u);
+    EXPECT_EQ(buffersOf(manager->getLocal())[0].ref_count, 1);
+
+    int remove_callbacks = 0;
+    auto on_remove = [&](BufferDesc&) -> Status {
+        remove_callbacks++;
+        return Status::OK();
+    };
+    ASSERT_TRUE(tracker.remove(0x20000, 0x1000, on_remove).ok());
+    EXPECT_EQ(remove_callbacks, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
 TEST(SegmentTrackerTest, AddProbesRealMemoryAndRefCounts) {
     auto manager = makeManager();
     SegmentTracker tracker(*manager);

@@ -104,6 +104,12 @@ Status SegmentTracker::addInBatch(
             }
         }
     }
+    // Ranges whose ref_count we bumped; used to roll back if the callback
+    // fails. The bump must happen under the writer mutex *before* the
+    // callback: it is what pins the duplicate entry (ref_count >= 2) so a
+    // concurrent unregister cannot erase it out from under this
+    // registration.
+    std::vector<std::pair<uint64_t, uint64_t>> bumped;
     if (any_dup) {
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
             assert(desc.type == SegmentType::Memory);
@@ -117,7 +123,11 @@ Status SegmentTracker::addInBatch(
                         break;
                     }
                 }
-                if (!found) new_desc_list.push_back(std::move(entry));
+                if (found) {
+                    bumped.emplace_back(entry.addr, entry.length);
+                } else {
+                    new_desc_list.push_back(std::move(entry));
+                }
             }
             return Status::OK();
         }));
@@ -125,7 +135,31 @@ Status SegmentTracker::addInBatch(
         new_desc_list = std::move(desc_list);
     }
     auto status = callback(new_desc_list);
-    if (!status.ok()) return status;
+    if (!status.ok()) {
+        // Roll back the duplicate ref-counts so a failed registration does
+        // not leave buffers pinned forever.
+        if (!bumped.empty()) {
+            manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+                auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+                for (auto& range : bumped) {
+                    for (auto it = detail.buffers.begin();
+                         it != detail.buffers.end(); ++it) {
+                        if (it->addr == range.first &&
+                            it->length == range.second) {
+                            it->ref_count--;
+                            // The original owner unregistered while we held
+                            // the extra reference; drop the entry so it is
+                            // no longer advertised.
+                            if (it->ref_count == 0) detail.buffers.erase(it);
+                            break;
+                        }
+                    }
+                }
+                return Status::OK();
+            });
+        }
+        return status;
+    }
     return manager_.updateLocal([&](SegmentDesc& desc) -> Status {
         assert(desc.type == SegmentType::Memory);
         auto& detail = std::get<MemorySegmentDesc>(desc.detail);
