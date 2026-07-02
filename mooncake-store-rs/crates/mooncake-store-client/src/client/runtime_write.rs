@@ -971,133 +971,143 @@ impl StoreClient {
                         .iter()
                         .zip(current_routes.iter().cloned())
                     {
-                let mut replicas = Vec::with_capacity(entry.targets.len());
-                let mut remote_requests = Vec::new();
-                for (priority, (target, reservation)) in entry
-                    .targets
-                    .iter()
-                    .zip(entry.reservations.iter())
-                    .enumerate()
-                {
-                    let is_local = target.storage_runtime == self.lease.runtime
-                        && self
-                            .state
-                            .lock()
-                            .memory_ref()
-                            .map(|memory| memory.has_storage_segment(&target.segment_name))
-                            .unwrap_or(false);
-                    let offset = if is_local {
-                        let value = entry.value.ok_or_else(|| {
-                            StoreError::Unsupported(format!(
-                                "tenant={} key={} non-host-readable registered source cannot use local storage target",
-                                entry.tenant,
-                                entry.object_id.logical_key
-                            ))
-                        })?;
-                        let addr = {
-                            let state = self.state.lock();
-                            state.memory_ref()?.storage_address(
-                                &target.segment_name,
-                                reservation.offset_bytes as usize,
-                            )?
-                        };
-                        unsafe {
-                            ptr::copy_nonoverlapping(
-                                value.as_ptr(),
-                                addr.cast::<u8>(),
-                                entry.value_len,
-                            );
-                        }
-                        addr as u64
-                    } else {
-                        if target.storage_runtime != self.lease.runtime
-                            && checked_runtimes.insert(target.storage_runtime.clone())
+                        let mut route_checksum = entry.checksum;
+                        let mut replicas = Vec::with_capacity(entry.targets.len());
+                        let mut remote_requests = Vec::new();
+                        for (priority, (target, reservation)) in entry
+                            .targets
+                            .iter()
+                            .zip(entry.reservations.iter())
+                            .enumerate()
                         {
-                            self.ensure_remote_runtime_reachable(
-                                &target.storage_runtime,
-                                &target.segment_name.0,
-                            )?;
-                        }
-                        let (handle, info) = {
-                            let mut state = self.state.lock();
-                            state.open_segment_with_info(
-                                transport,
-                                Self::transport_open_segment_name(
+                            let is_local = target.storage_runtime == self.lease.runtime
+                                && self
+                                    .state
+                                    .lock()
+                                    .memory_ref()
+                                    .map(|memory| memory.has_storage_segment(&target.segment_name))
+                                    .unwrap_or(false);
+                            let offset = if is_local {
+                                let value = if let Some(value) = entry.value {
+                                    value
+                                } else if let Some(source) = entry.registered_source {
+                                    unsafe {
+                                        slice::from_raw_parts(source.cast::<u8>(), entry.value_len)
+                                    }
+                                } else {
+                                    return Err(StoreError::InvalidState(format!(
+                                        "tenant={} key={} batch write has no host value or registered source",
+                                        entry.tenant,
+                                        entry.object_id.logical_key
+                                    )));
+                                };
+                                if route_checksum.is_none() {
+                                    route_checksum = Some(payload_checksum(value));
+                                }
+                                let addr = {
+                                    let state = self.state.lock();
+                                    state.memory_ref()?.storage_address(
+                                        &target.segment_name,
+                                        reservation.offset_bytes as usize,
+                                    )?
+                                };
+                                unsafe {
+                                    ptr::copy_nonoverlapping(
+                                        value.as_ptr(),
+                                        addr.cast::<u8>(),
+                                        entry.value_len,
+                                    );
+                                }
+                                addr as u64
+                            } else {
+                                if target.storage_runtime != self.lease.runtime
+                                    && checked_runtimes.insert(target.storage_runtime.clone())
+                                {
+                                    self.ensure_remote_runtime_reachable(
+                                        &target.storage_runtime,
+                                        &target.segment_name.0,
+                                    )?;
+                                }
+                                let (handle, info) = {
+                                    let mut state = self.state.lock();
+                                    state.open_segment_with_info(
+                                        transport,
+                                        Self::transport_open_segment_name(
+                                            &target.segment_name,
+                                            target.transport_endpoint.as_deref(),
+                                        ),
+                                    )?
+                                };
+                                let target_offset = Self::storage_target_offset(
+                                    &target.target_chunks,
                                     &target.segment_name,
-                                    target.transport_endpoint.as_deref(),
-                                ),
-                            )?
-                        };
-                        let target_offset = Self::storage_target_offset(
-                            &target.target_chunks,
-                            &target.segment_name,
-                            reservation.offset_bytes,
-                            entry.value_len as u64,
-                        )?;
-                        remote_requests.push(RemoteBatchTarget {
-                            owner: target.storage_runtime.clone(),
-                            segment_name: target.segment_name.clone(),
-                            segment: handle,
-                            offset: target_offset,
-                            length: entry.value_len as u64,
-                            info,
-                        });
-                        target_offset
-                    };
-                    replicas.push(ReplicaRoute {
-                        owner: target.storage_runtime.clone(),
-                        segment_name: target.segment_name.clone(),
-                        offset: Some(offset),
-                        segment_offset: reservation.offset_bytes,
-                        length: entry.value_len as u64,
-                        checksum: entry.checksum,
-                        tier: ReplicaTier::Dram,
-                        priority: priority as u16,
-                    });
-                }
-                if !remote_requests.is_empty() {
-                    remote_writes.push(RemoteBatchWrite {
-                        tenant: entry.value_tenant(),
-                        value: entry.value,
-                        value_len: entry.value_len,
-                        registered_source: entry.registered_source,
-                        requests: remote_requests,
-                    });
-                }
+                                    reservation.offset_bytes,
+                                    entry.value_len as u64,
+                                )?;
+                                remote_requests.push(RemoteBatchTarget {
+                                    owner: target.storage_runtime.clone(),
+                                    segment_name: target.segment_name.clone(),
+                                    segment: handle,
+                                    offset: target_offset,
+                                    length: entry.value_len as u64,
+                                    info,
+                                });
+                                target_offset
+                            };
+                            replicas.push(ReplicaRoute {
+                                owner: target.storage_runtime.clone(),
+                                segment_name: target.segment_name.clone(),
+                                offset: Some(offset),
+                                segment_offset: reservation.offset_bytes,
+                                length: entry.value_len as u64,
+                                checksum: route_checksum,
+                                tier: ReplicaTier::Dram,
+                                priority: priority as u16,
+                            });
+                        }
+                        if !remote_requests.is_empty() {
+                            remote_writes.push(RemoteBatchWrite {
+                                tenant: entry.value_tenant(),
+                                value: entry.value,
+                                value_len: entry.value_len,
+                                registered_source: entry.registered_source,
+                                requests: remote_requests,
+                            });
+                        }
 
-                let expected_version = current.as_ref().map(|route| route.version);
-                let next_version = current
-                    .as_ref()
-                    .map(|route| route.version.next())
-                    .unwrap_or(RouteVersion(1));
-                let mut route = ObjectRoute {
-                    key: entry.scoped_key.clone(),
-                    namespace: None,
-                    logical_key: None,
-                    canonical_key: None,
-                    sharing_scope: None,
-                    qos_tier: None,
-                    version: next_version,
-                    state: RouteState::Active,
-                    compatibility: self.lease.compatibility.clone(),
-                    replicas,
-                    cold_backing: None,
-                };
-                mooncake_store_core::apply_route_identity(&mut route, &entry.object_id);
-                route.qos_tier = Some(
-                    entry
-                        .qos_tier
-                        .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
-                        .to_string(),
-                );
-                routes.push(PendingRoutePublish {
-                    key: entry.scoped_key.clone(),
-                    expected_version,
-                    previous: current,
-                    quota_reservation: entry.quota_reservation.clone(),
-                    route,
-                });
-            }
+                        let expected_version = current.as_ref().map(|route| route.version);
+                        let next_version = current
+                            .as_ref()
+                            .map(|route| route.version.next())
+                            .unwrap_or(RouteVersion(1));
+                        let mut route = ObjectRoute {
+                            key: entry.scoped_key.clone(),
+                            namespace: None,
+                            logical_key: None,
+                            canonical_key: None,
+                            sharing_scope: None,
+                            qos_tier: None,
+                            version: next_version,
+                            state: RouteState::Active,
+                            compatibility: self.lease.compatibility.clone(),
+                            replicas,
+                            cold_backing: None,
+                        };
+                        mooncake_store_core::apply_route_identity(&mut route, &entry.object_id);
+                        route.qos_tier = Some(
+                            entry
+                                .qos_tier
+                                .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
+                                .to_string(),
+                        );
+                        routes.push(PendingRoutePublish {
+                            key: entry.scoped_key.clone(),
+                            expected_version,
+                            previous: current,
+                            quota_reservation: entry.quota_reservation.clone(),
+                            route,
+                        });
+                    }
             let mut remote_order = (0..remote_writes.len()).collect::<Vec<_>>();
             remote_order.sort_by(|left, right| {
                 remote_writes[*left].tenant.cmp(remote_writes[*right].tenant)
