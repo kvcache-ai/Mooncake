@@ -92,28 +92,24 @@ redisContext* RedisHelper::CreateConnection() {
 
     // Authenticate if password provided
     if (!password_.empty()) {
-        redisReply* reply = (redisReply*)redisCommand(
-            ctx, "AUTH %b", password_.data(), password_.size());
+        RedisReplyPtr reply((redisReply*)redisCommand(
+            ctx, "AUTH %b", password_.data(), password_.size()));
         if (!reply || reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "Redis AUTH failed";
-            if (reply) freeReplyObject(reply);
             redisFree(ctx);
             return nullptr;
         }
-        freeReplyObject(reply);
     }
 
     // Select DB if not default
     if (db_index_ != 0) {
-        redisReply* reply =
-            (redisReply*)redisCommand(ctx, "SELECT %d", db_index_);
+        RedisReplyPtr reply(
+            (redisReply*)redisCommand(ctx, "SELECT %d", db_index_));
         if (!reply || reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "Redis SELECT " << db_index_ << " failed";
-            if (reply) freeReplyObject(reply);
             redisFree(ctx);
             return nullptr;
         }
-        freeReplyObject(reply);
     }
 
     return ctx;
@@ -192,12 +188,12 @@ void RedisHelper::ElectLeader(const std::string& master_address,
         }
 
         // Step 1: Check if a leader already exists
-        redisReply* reply = nullptr;
+        RedisReplyPtr reply(nullptr);
         {
             std::lock_guard<std::mutex> lock(election_mutex_);
-            reply = (redisReply*)redisCommand(election_ctx_, "GET %b",
-                                              master_view_key_.data(),
-                                              master_view_key_.size());
+            reply.reset((redisReply*)redisCommand(election_ctx_, "GET %b",
+                                                  master_view_key_.data(),
+                                                  master_view_key_.size()));
         }
 
         if (!reply) {
@@ -213,7 +209,7 @@ void RedisHelper::ElectLeader(const std::string& master_address,
 
         if (reply->type == REDIS_REPLY_NIL) {
             // No leader exists — try to elect ourselves
-            freeReplyObject(reply);
+            reply.reset();
 
             bool elected = false;
             {
@@ -233,7 +229,7 @@ void RedisHelper::ElectLeader(const std::string& master_address,
         if (reply->type == REDIS_REPLY_STRING) {
             // A leader exists — watch until the key expires
             std::string current_value(reply->str, reply->len);
-            freeReplyObject(reply);
+            reply.reset();
 
             std::string current_addr;
             ViewVersionId current_epoch = 0;
@@ -252,7 +248,7 @@ void RedisHelper::ElectLeader(const std::string& master_address,
 
         // Unexpected reply type
         int reply_type = reply->type;
-        freeReplyObject(reply);
+        reply.reset();
         LOG(ERROR) << "ElectLeader: unexpected reply type=" << reply_type;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
@@ -262,26 +258,25 @@ bool RedisHelper::TryElectOnce(const std::string& master_address,
                                ViewVersionId& out_epoch) {
     // Caller must hold election_mutex_
     // Step 2: INCR epoch counter
-    redisReply* reply = (redisReply*)redisCommand(election_ctx_, "INCR %b",
+    RedisReplyPtr reply((redisReply*)redisCommand(election_ctx_, "INCR %b",
                                                   master_epoch_key_.data(),
-                                                  master_epoch_key_.size());
+                                                  master_epoch_key_.size()));
 
     if (!reply || reply->type != REDIS_REPLY_INTEGER) {
         LOG(ERROR) << "TryElectOnce: INCR failed";
-        if (reply) freeReplyObject(reply);
         return false;
     }
     out_epoch = reply->integer;
-    freeReplyObject(reply);
+    reply.reset();
 
     // Step 3: SET NX EX — atomically create leader key only if it doesn't exist
     std::string value =
         SerializeLeaderValue(master_address, out_epoch, ttl_sec_);
     our_value_ = value;
 
-    reply = (redisReply*)redisCommand(
+    reply.reset((redisReply*)redisCommand(
         election_ctx_, "SET %b %b EX %d NX", master_view_key_.data(),
-        master_view_key_.size(), value.data(), value.size(), ttl_sec_);
+        master_view_key_.size(), value.data(), value.size(), ttl_sec_));
 
     if (!reply) {
         LOG(ERROR) << "TryElectOnce: SET NX EX failed (connection error)";
@@ -292,7 +287,7 @@ bool RedisHelper::TryElectOnce(const std::string& master_address,
     if (reply->type == REDIS_REPLY_STATUS &&
         strncmp(reply->str, "OK", 2) == 0) {
         // We won the election!
-        freeReplyObject(reply);
+        reply.reset();
 
         // Publish election event
         std::string event =
@@ -303,7 +298,7 @@ bool RedisHelper::TryElectOnce(const std::string& master_address,
     }
 
     // Key already exists — someone else won
-    freeReplyObject(reply);
+    reply.reset();
     our_value_.clear();
     LOG(INFO) << "TryElectOnce: someone else won the election, retrying";
     return false;
@@ -328,17 +323,16 @@ bool RedisHelper::WatchLeaderSubscribe() {
     // polling.
     if (!subscribe_ctx_) return false;
 
-    redisReply* reply = (redisReply*)redisCommand(
+    RedisReplyPtr reply((redisReply*)redisCommand(
         subscribe_ctx_, "SUBSCRIBE %b", leader_event_channel_.data(),
-        leader_event_channel_.size());
+        leader_event_channel_.size()));
 
     if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements < 3 ||
         reply->element[0]->type != REDIS_REPLY_STRING ||
         strncmp(reply->element[0]->str, "subscribe", 9) != 0) {
-        if (reply) freeReplyObject(reply);
         return false;  // Fall back to polling
     }
-    freeReplyObject(reply);
+    reply.reset();
 
     std::atomic<bool> leader_lost{false};
     redisContext* polling_ctx = CreateConnection();
@@ -361,9 +355,9 @@ bool RedisHelper::WatchLeaderSubscribe() {
                 std::this_thread::sleep_for(interval);
                 if (leader_lost || cancel_election_) break;
 
-                redisReply* r = (redisReply*)redisCommand(
+                RedisReplyPtr r((redisReply*)redisCommand(
                     polling_ctx, "GET %b", master_view_key_.data(),
-                    master_view_key_.size());
+                    master_view_key_.size()));
                 if (!r) {
                     LOG(WARNING)
                         << "WatchLeaderSubscribe: polling GET failed "
@@ -373,7 +367,6 @@ bool RedisHelper::WatchLeaderSubscribe() {
                 if (r->type == REDIS_REPLY_NIL) {
                     leader_lost = true;
                 }
-                freeReplyObject(r);
             }
         });
     }
@@ -417,13 +410,14 @@ bool RedisHelper::WatchLeaderSubscribe() {
         subscribe_errors = 0;  // Reset on successful read
 
         if (msg) {
-            if (msg->type == REDIS_REPLY_ARRAY && msg->elements >= 3) {
-                if (msg->element[0]->type == REDIS_REPLY_STRING &&
-                    strncmp(msg->element[0]->str, "message", 7) == 0) {
+            RedisReplyPtr msg_guard(msg);
+            if (msg_guard->type == REDIS_REPLY_ARRAY &&
+                msg_guard->elements >= 3) {
+                if (msg_guard->element[0]->type == REDIS_REPLY_STRING &&
+                    strncmp(msg_guard->element[0]->str, "message", 7) == 0) {
                     leader_lost = true;
                 }
             }
-            freeReplyObject(msg);
         }
     }
 
@@ -447,10 +441,9 @@ bool RedisHelper::WatchLeaderSubscribe() {
     }
 
     // Unsubscribe to restore connection state
-    redisReply* unsub = (redisReply*)redisCommand(
+    RedisReplyPtr unsub((redisReply*)redisCommand(
         subscribe_ctx_, "UNSUBSCRIBE %b", leader_event_channel_.data(),
-        leader_event_channel_.size());
-    if (unsub) freeReplyObject(unsub);
+        leader_event_channel_.size()));
 
     // Drain any buffered message frames remaining in the socket
     // so the next SUBSCRIBE gets a clean reply.
@@ -473,16 +466,14 @@ void RedisHelper::WatchLeaderPolling() {
             continue;
         }
 
-        redisReply* reply = (redisReply*)redisCommand(polling_ctx, "GET %b",
+        RedisReplyPtr reply((redisReply*)redisCommand(polling_ctx, "GET %b",
                                                       master_view_key_.data(),
-                                                      master_view_key_.size());
+                                                      master_view_key_.size()));
         if (reply) {
             if (reply->type == REDIS_REPLY_NIL) {
-                freeReplyObject(reply);
                 redisFree(polling_ctx);
                 return;  // Key expired
             }
-            freeReplyObject(reply);
         } else {
             // Connection error — reconnect
             redisFree(polling_ctx);
@@ -522,29 +513,29 @@ void RedisHelper::KeepLeader(int lease_id) {
         {
             std::lock_guard<std::mutex> lock(election_mutex_);
             // Execute Lua renewal script
-            redisReply* reply = (redisReply*)redisCommand(
+            RedisReplyPtr reply((redisReply*)redisCommand(
                 election_ctx_, "EVAL %s 1 %b %d %b", renewal_script,
                 master_view_key_.data(), master_view_key_.size(), ttl_sec_,
-                our_value_.data(), our_value_.size());
+                our_value_.data(), our_value_.size()));
 
             if (!reply) {
                 LOG(ERROR)
                     << "KeepLeader: Lua renewal failed (connection error)";
                 if (Reconnect(election_ctx_)) {
                     // Reconnected — check if we still own the key
-                    redisReply* check = (redisReply*)redisCommand(
+                    RedisReplyPtr check((redisReply*)redisCommand(
                         election_ctx_, "GET %b", master_view_key_.data(),
-                        master_view_key_.size());
+                        master_view_key_.size()));
                     if (check && check->type == REDIS_REPLY_STRING &&
                         check->len == our_value_.size() &&
                         memcmp(check->str, our_value_.data(),
                                our_value_.size()) == 0) {
                         // Still ours — renew TTL after reconnection
-                        freeReplyObject(check);
-                        redisReply* expire_reply = (redisReply*)redisCommand(
+                        check.reset();
+                        RedisReplyPtr expire_reply((redisReply*)redisCommand(
                             election_ctx_, "EXPIRE %b %d",
                             master_view_key_.data(), master_view_key_.size(),
-                            ttl_sec_);
+                            ttl_sec_));
                         if (expire_reply &&
                             expire_reply->type == REDIS_REPLY_INTEGER &&
                             expire_reply->integer == 1) {
@@ -553,20 +544,15 @@ void RedisHelper::KeepLeader(int lease_id) {
                             LOG(WARNING) << "KeepLeader: EXPIRE failed after "
                                             "reconnect, key may have changed";
                         }
-                        if (expire_reply) freeReplyObject(expire_reply);
-                    } else {
-                        // Not ours anymore
-                        if (check) freeReplyObject(check);
                     }
+                    // check is auto-freed by RedisReplyPtr
                 }
             } else if (reply->type == REDIS_REPLY_INTEGER &&
                        reply->integer == 1) {
                 // Renewal succeeded
-                freeReplyObject(reply);
                 renewed = true;
             } else {
                 // Key no longer ours
-                freeReplyObject(reply);
                 LOG(WARNING)
                     << "KeepLeader: lost leadership (key no longer ours)";
             }
@@ -602,9 +588,9 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    redisReply* reply = (redisReply*)redisCommand(election_ctx_, "GET %b",
+    RedisReplyPtr reply((redisReply*)redisCommand(election_ctx_, "GET %b",
                                                   master_view_key_.data(),
-                                                  master_view_key_.size());
+                                                  master_view_key_.size()));
 
     if (!reply) {
         LOG(ERROR) << "GetMasterView: GET failed (connection error) at "
@@ -613,14 +599,12 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
     }
 
     if (reply->type == REDIS_REPLY_NIL) {
-        freeReplyObject(reply);
         LOG(WARNING) << "GetMasterView: no leader currently elected";
         return ErrorCode::INTERNAL_ERROR;
     }
 
     if (reply->type == REDIS_REPLY_STRING) {
         std::string value(reply->str, reply->len);
-        freeReplyObject(reply);
         if (ParseLeaderValue(value, master_address, version)) {
             return ErrorCode::OK;
         }
@@ -629,7 +613,6 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
     }
 
     int reply_type = reply->type;
-    freeReplyObject(reply);
     LOG(ERROR) << "GetMasterView: unexpected reply type=" << reply_type;
     return ErrorCode::INTERNAL_ERROR;
 }
@@ -641,10 +624,10 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
 void RedisHelper::PublishLeaderEvent(const std::string& event) {
     // Caller must hold election_mutex_
     if (!election_ctx_) return;
-    redisReply* reply = (redisReply*)redisCommand(
+    RedisReplyPtr reply((redisReply*)redisCommand(
         election_ctx_, "PUBLISH %b %b", leader_event_channel_.data(),
-        leader_event_channel_.size(), event.data(), event.size());
-    if (reply) freeReplyObject(reply);
+        leader_event_channel_.size(), event.data(), event.size()));
+    // Reply is auto-freed — we don't need to inspect it.
 }
 
 bool RedisHelper::Reconnect(redisContext*& ctx) {
@@ -669,16 +652,16 @@ void RedisHelper::DrainSubscribeContext() {
     // After UNSUBSCRIBE, buffered message frames may still be in the
     // read buffer. Drain them so the next SUBSCRIBE gets a clean reply.
     while (true) {
-        redisReply* reply = nullptr;
-        if (redisGetReply(subscribe_ctx_, (void**)&reply) != REDIS_OK ||
-            !reply) {
+        redisReply* raw_reply = nullptr;
+        if (redisGetReply(subscribe_ctx_, (void**)&raw_reply) != REDIS_OK ||
+            !raw_reply) {
             break;  // No more data or connection error
         }
+        RedisReplyPtr reply(raw_reply);
         bool is_unsub_ack =
             (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3 &&
              reply->element[0]->type == REDIS_REPLY_STRING &&
              strncmp(reply->element[0]->str, "unsubscribe", 11) == 0);
-        freeReplyObject(reply);
         if (is_unsub_ack) {
             // We've consumed the UNSUBSCRIBE acknowledgment — anything
             // after this would be from a future SUBSCRIBE cycle.

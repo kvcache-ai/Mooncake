@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -12,6 +13,17 @@
 #include "types.h"
 
 namespace mooncake {
+
+/// Custom deleter for redisReply* — used by RedisReplyPtr.
+struct RedisReplyDeleter {
+    void operator()(redisReply* reply) const {
+        if (reply) freeReplyObject(reply);
+    }
+};
+
+/// RAII wrapper for redisReply* — automatically calls freeReplyObject on
+/// destruction. Usage: RedisReplyPtr reply((redisReply*)redisCommand(...));
+using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
 
 /**
  * @brief Redis helper for leader election, mirroring EtcdHelper's role.

@@ -54,11 +54,10 @@ class RedisHelperTest : public ::testing::Test {
                 "mooncake:{" + FLAGS_cluster_id + "/}master_view";
             std::string master_epoch_key =
                 "mooncake:{" + FLAGS_cluster_id + "/}master_epoch";
-            redisReply* r = (redisReply*)redisCommand(
+            RedisReplyPtr r((redisReply*)redisCommand(
                 ctx, "DEL %b %b", master_view_key.data(),
                 master_view_key.size(), master_epoch_key.data(),
-                master_epoch_key.size());
-            if (r) freeReplyObject(r);
+                master_epoch_key.size()));
             redisFree(ctx);
         } else {
             if (ctx) redisFree(ctx);
@@ -296,11 +295,10 @@ TEST_F(RedisHelperTest, ElectLeaderUnparsableExistingValue) {
         std::stoi(
             FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1)));
     ASSERT_TRUE(ctx && !ctx->err);
-    redisReply* r = (redisReply*)redisCommand(
+    RedisReplyPtr r((redisReply*)redisCommand(
         ctx, "SET %b %b EX %d", master_view_key.data(), master_view_key.size(),
-        "garbage", 7, short_ttl);
+        "garbage", 7, short_ttl));
     ASSERT_TRUE(r != nullptr);
-    freeReplyObject(r);
 
     // ElectLeader should still work — it sees an unparsable leader value
     // and waits for it to expire, then wins election
@@ -374,11 +372,10 @@ TEST_F(RedisHelperTest, GetMasterViewCorruptedValue) {
         FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1));
     redisContext* ctx = redisConnect(host.c_str(), port);
     ASSERT_TRUE(ctx && !ctx->err);
-    redisReply* r = (redisReply*)redisCommand(
+    RedisReplyPtr r((redisReply*)redisCommand(
         ctx, "SET %b %b EX %d", master_view_key.data(), master_view_key.size(),
-        "not-json", 8, FLAGS_redis_ttl_sec);
+        "not-json", 8, FLAGS_redis_ttl_sec));
     ASSERT_TRUE(r != nullptr);
-    freeReplyObject(r);
     redisFree(ctx);
 
     std::string addr;
@@ -432,12 +429,11 @@ TEST_F(RedisHelperTest, KeepLeaderLosesLeadership) {
         FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1));
     redisContext* ctx = redisConnect(host.c_str(), port);
     ASSERT_TRUE(ctx && !ctx->err);
-    redisReply* r = (redisReply*)redisCommand(
+    RedisReplyPtr r((redisReply*)redisCommand(
         ctx, "SET %b %b EX %d", master_view_key.data(), master_view_key.size(),
         R"({"address":"10.0.0.99:50051","epoch":999,"ts":0,"ttl":2})", 57,
-        short_ttl);
+        short_ttl));
     ASSERT_TRUE(r != nullptr);
-    freeReplyObject(r);
     redisFree(ctx);
 
     // KeepLeader should detect the key no longer matches and exit
@@ -478,9 +474,8 @@ TEST_F(RedisHelperTest, WatchLeaderPollingFallback) {
         FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1));
     redisContext* admin = redisConnect(host.c_str(), port);
     ASSERT_TRUE(admin && !admin->err);
-    redisReply* kr =
-        (redisReply*)redisCommand(admin, "CLIENT KILL TYPE normal");
-    if (kr) freeReplyObject(kr);
+    RedisReplyPtr kr(
+        (redisReply*)redisCommand(admin, "CLIENT KILL TYPE normal"));
     redisFree(admin);
 
     // ElectLeader will reconnect election_ctx_, then find the leader key,
@@ -525,8 +520,8 @@ TEST_F(RedisHelperTest, ReconnectAfterConnectionLoss) {
     ASSERT_TRUE(admin && !admin->err);
 
     // CLIENT KILL to drop all normal clients except our admin connection
-    redisReply* r = (redisReply*)redisCommand(admin, "CLIENT KILL TYPE normal");
-    if (r) freeReplyObject(r);
+    RedisReplyPtr r(
+        (redisReply*)redisCommand(admin, "CLIENT KILL TYPE normal"));
     redisFree(admin);
 
     // KeepLeader should attempt reconnection and continue or exit gracefully
