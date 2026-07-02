@@ -265,14 +265,16 @@ std::string getMachineID() {
 
 Status TransferEngineImpl::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    segment->name = local_segment_name_;
-    segment->type = SegmentType::Memory;
-    segment->machine_id = getMachineID();
-    segment->rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
-    auto& detail = std::get<MemorySegmentDesc>(segment->detail);
-    detail.topology = *(topology_.get());
-    local_segment_tracker_ = std::make_unique<SegmentTracker>(segment);
+    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        segment.name = local_segment_name_;
+        segment.type = SegmentType::Memory;
+        segment.machine_id = getMachineID();
+        segment.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
+        auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+        detail.topology = *(topology_.get());
+        return Status::OK();
+    }));
+    local_segment_tracker_ = std::make_unique<SegmentTracker>(manager);
     return manager.synchronizeLocal();
 }
 
@@ -430,10 +432,13 @@ Status TransferEngineImpl::deconstruct() {
     staging_proxy_.reset();
 
     if (local_segment_tracker_) {
-        local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
+        local_segment_tracker_->forEach([&](const BufferDesc& desc) -> Status {
+            // Snapshot entries are immutable; transports may scrub fields of
+            // their deregistration argument, so hand them a copy.
+            BufferDesc copy = desc;
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 if (transport_list_[type])
-                    transport_list_[type]->removeMemoryBuffer(desc);
+                    transport_list_[type]->removeMemoryBuffer(copy);
             }
             return Status::OK();
         });
@@ -514,9 +519,10 @@ Status TransferEngineImpl::closeSegment(SegmentID handle) {
 }
 
 Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
-    SegmentDesc* desc = nullptr;
+    // Owning reference: keeps the snapshot alive while we read through it.
+    SegmentDescRef desc;
     if (handle == LOCAL_SEGMENT_ID) {
-        desc = metadata_->segmentManager().getLocal().get();
+        desc = metadata_->segmentManager().getLocal();
     } else {
         CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, handle));
     }
@@ -929,9 +935,10 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
-    SegmentDesc* desc;
+    // Owning reference: keeps the snapshot alive while we read through it.
+    SegmentDescRef desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
-        desc = metadata_->segmentManager().getLocal().get();
+        desc = metadata_->segmentManager().getLocal();
     } else {
         auto status = metadata_->segmentManager().getRemoteCached(
             desc, request.target_id);
@@ -1212,7 +1219,8 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     // Group requests by target_id so withCachedSegment fires at most once per
     // peer.
     std::vector<RequestBoundaryInfo> boundaries(requests.size());
-    auto* local_desc = metadata->segmentManager().getLocal().get();
+    // Owning reference: keeps the snapshot alive while we read through it.
+    auto local_desc = metadata->segmentManager().getLocal();
 
     if (local_desc) {
         for (size_t i = 0; i < requests.size(); ++i) {
@@ -1272,8 +1280,10 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
 
     SegmentDesc* desc = nullptr;
     BufferDesc* entry = nullptr;
+    // Owning reference: `entry` is used after the lambda returns.
+    SegmentDescRef pin;
     auto status = metadata_->segmentManager().withCachedSegment(
-        request.target_id, [&](SegmentDesc* segment) {
+        request.target_id, pin, [&](SegmentDesc* segment) {
             desc = segment;
             entry = desc->findBuffer(request.target_offset, request.length);
             if (!entry)

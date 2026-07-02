@@ -543,22 +543,23 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
 
 Status RdmaTransport::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    assert(segment);
-    // Store RDMA server name for dual-NIC setups; when it differs from
-    // local_segment_name_ the peer will use it for NIC path construction.
-    if (rdma_server_name_ != local_segment_name_) {
-        segment->rdma_server_name = rdma_server_name_;
-    }
-    auto& detail = std::get<MemorySegmentDesc>(segment->detail);
-    for (auto& context : context_set_) {
-        if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
-        DeviceDesc device_desc;
-        device_desc.name = context->name();
-        device_desc.lid = context->lid();
-        device_desc.gid = context->gid();
-        detail.devices.push_back(device_desc);
-    }
+    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        // Store RDMA server name for dual-NIC setups; when it differs from
+        // local_segment_name_ the peer will use it for NIC path construction.
+        if (rdma_server_name_ != local_segment_name_) {
+            segment.rdma_server_name = rdma_server_name_;
+        }
+        auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+        for (auto& context : context_set_) {
+            if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
+            DeviceDesc device_desc;
+            device_desc.name = context->name();
+            device_desc.lid = context->lid();
+            device_desc.gid = context->gid();
+            detail.devices.push_back(device_desc);
+        }
+        return Status::OK();
+    }));
     return manager.synchronizeLocal();
 }
 
@@ -606,13 +607,11 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                                                          int device_id) {
-    SegmentDesc* segment_desc = nullptr;
-    std::string rpc_server_addr, target_seg_name, target_dev_name;
+    std::string rpc_server_addr, target_seg_name, target_dev_name,
+        target_nic_path_name;
 
     auto status = metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc* segment) {
-            segment_desc = segment;
-
             if (segment->type != SegmentType::Memory) {
                 return Status::NeedsRefreshCache(
                     "Segment type is not Memory" LOC_MARK);
@@ -624,6 +623,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
             auto topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
             target_seg_name = segment->name;
+            target_nic_path_name = segment->nicPathServerName();
             target_dev_name = topo->getNicName(device_id);
             if (target_seg_name.empty() || target_dev_name.empty()) {
                 return Status::NeedsRefreshCache(
@@ -642,8 +642,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    std::string peer_name =
-        MakeNicPath(segment_desc->nicPathServerName(), target_dev_name);
+    std::string peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;

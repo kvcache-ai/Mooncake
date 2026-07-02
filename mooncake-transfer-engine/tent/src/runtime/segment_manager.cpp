@@ -25,8 +25,18 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+uint64_t nextManagerId() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace
+
 SegmentManager::SegmentManager(std::unique_ptr<SegmentRegistry> agent)
-    : next_id_(1), version_(0), registry_(std::move(agent)) {
+    : next_id_(1),
+      version_(0),
+      manager_id_(nextManagerId()),
+      registry_(std::move(agent)) {
     local_desc_ = std::make_shared<SegmentDesc>();
     subscribers_lock_ = std::make_shared<RWSpinlock>();
     subscribers_ = std::make_shared<std::unordered_set<std::string>>();
@@ -60,7 +70,33 @@ Status SegmentManager::closeRemote(SegmentID handle) {
     return Status::OK();
 }
 
+Status SegmentManager::updateLocal(
+    const std::function<Status(SegmentDesc &)> &mutator) {
+    std::lock_guard<std::mutex> g(local_update_mu_);
+    // No concurrent writer exists (serialized by local_update_mu_), so
+    // reading local_desc_ without local_desc_lock_ is safe here.
+    auto next = std::make_shared<SegmentDesc>(*local_desc_);
+    CHECK_STATUS(mutator(*next));
+    {
+        std::unique_lock<std::shared_mutex> guard(local_desc_lock_);
+        local_desc_ = std::move(next);
+    }
+    local_desc_version_.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> jg(local_json_cache_mu_);
+        local_json_cache_.reset();
+    }
+    return Status::OK();
+}
+
 Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
+    SegmentDescRef ref;
+    CHECK_STATUS(getRemoteCached(ref, handle));
+    desc = ref.get();
+    return Status::OK();
+}
+
+Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
     auto &cache = tl_remote_cache_.get();
     auto current_ts = getCurrentTimeInNano();
     auto current_version = version_.load(std::memory_order_relaxed);
@@ -78,7 +114,7 @@ Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
         cache.id_to_desc_map[handle] = desc_ref;
 
         std::string peer_rpc_addr = desc_ref->rpc_server_addr;
-        std::string local_rpc_addr = local_desc_->rpc_server_addr;
+        std::string local_rpc_addr = getLocal()->rpc_server_addr;
         if (!peer_rpc_addr.empty() && !local_rpc_addr.empty()) {
             // Send a subscription request to enable proactive cache
             // invalidation. This is a best-effort mechanism to reduce stale
@@ -92,7 +128,7 @@ Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
                        << "'.";
         }
     }
-    desc = cache.id_to_desc_map[handle].get();
+    desc = cache.id_to_desc_map[handle];
     assert(desc);
     return Status::OK();
 }
@@ -164,7 +200,7 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
     desc = std::make_shared<SegmentDesc>();
     desc->name = segment_name;
     desc->type = SegmentType::File;
-    desc->machine_id = local_desc_->machine_id;
+    desc->machine_id = getLocal()->machine_id;
     FileSegmentDesc detail;
     FileBufferDesc buffer;
     buffer.path = path;
@@ -176,26 +212,41 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
 }
 
 std::shared_ptr<const std::string> SegmentManager::getLocalDumpedJson() {
+    // Capture the snapshot together with its publication version so a slow
+    // dump of an older snapshot can never overwrite the cache entry computed
+    // from a newer one.
+    auto version = local_desc_version_.load(std::memory_order_relaxed);
+    auto snapshot = getLocal();
     {
         std::lock_guard<std::mutex> g(local_json_cache_mu_);
-        if (local_json_cache_) return local_json_cache_;
+        if (local_json_cache_ && local_json_cache_version_ == version)
+            return local_json_cache_;
     }
-    json j = *local_desc_;
+    json j = *snapshot;
     auto computed = std::make_shared<const std::string>(j.dump());
 
     std::lock_guard<std::mutex> g(local_json_cache_mu_);
-    if (!local_json_cache_) {
+    // Store only if no publication happened since we sampled `version`;
+    // otherwise this dump is already outdated and must not evict a cache
+    // entry computed from a newer snapshot.
+    if (local_desc_version_.load(std::memory_order_relaxed) == version &&
+        !local_json_cache_) {
         local_json_cache_ = computed;
+        local_json_cache_version_ = version;
     }
-    return local_json_cache_;
+    return computed;
 }
 
 Status SegmentManager::synchronizeLocal() {
     {
-        std::lock_guard<std::mutex> g(local_json_cache_mu_);
-        local_json_cache_.reset();
+        // Serialize {snapshot, put} pairs: without this, a put carrying an
+        // older snapshot could complete after (and overwrite) one carrying a
+        // newer snapshot in the registry, hiding a completed registration
+        // from peers until the next synchronizeLocal call.
+        std::lock_guard<std::mutex> g(local_sync_mu_);
+        auto snapshot = getLocal();
+        CHECK_STATUS(registry_->putSegmentDesc(snapshot));
     }
-    CHECK_STATUS(registry_->putSegmentDesc(local_desc_));
 
     std::vector<std::string> subscribers_snapshot;
     {
@@ -214,7 +265,7 @@ Status SegmentManager::synchronizeLocal() {
         // Remove subscribers that have failed (e.g., peer might shutdown)
         // to avoid repeated RPC failures.
         ControlClient::notifySegmentUpdatedAsync(
-            subscriber, local_desc_->name,
+            subscriber, getLocal()->name,
             /* on_failure */
             [subscribers = subscribers_, lock = subscribers_lock_, subscriber] {
                 RWSpinlock::WriteGuard guard(*lock);
@@ -225,7 +276,7 @@ Status SegmentManager::synchronizeLocal() {
 }
 
 Status SegmentManager::deleteLocal() {
-    return registry_->deleteSegmentDesc(local_desc_->name);
+    return registry_->deleteSegmentDesc(getLocal()->name);
 }
 
 }  // namespace tent
