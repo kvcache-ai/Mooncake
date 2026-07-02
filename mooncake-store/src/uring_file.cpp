@@ -244,10 +244,13 @@ class SharedUringRing {
     }
 
     static size_t max_rw_count() {
-        long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0) page_size = 4096;
-        return static_cast<size_t>(INT_MAX) &
-               ~(static_cast<size_t>(page_size) - 1);
+        static const size_t value = [] {
+            long page_size = sysconf(_SC_PAGESIZE);
+            if (page_size <= 0) page_size = 4096;
+            return static_cast<size_t>(INT_MAX) &
+                   ~(static_cast<size_t>(page_size) - 1);
+        }();
+        return value;
     }
 
     // Drain exactly @expected CQEs and accumulate bytes.
