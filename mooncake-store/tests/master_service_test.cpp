@@ -1944,6 +1944,9 @@ TEST_F(MasterServiceTest,
         EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
         EXPECT_TRUE(ResolveMooncakeHostId("::1").empty());
         EXPECT_TRUE(ResolveMooncakeHostId("[::1]:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("::").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("[::]").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("[::]:5000").empty());
     }
 }
 

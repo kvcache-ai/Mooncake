@@ -288,7 +288,6 @@ Client::Client(const std::string& local_hostname,
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
-        master_client_.SetHostId(host_id_);
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
     }
 

@@ -562,8 +562,9 @@ std::string ResolveMooncakeHostId(const std::string &local_hostname) {
     };
 
     const std::string hostname = trim(local_hostname);
-    const std::string host_id =
-        (hostname == "::1") ? hostname : trim(getHostNameWithoutPort(hostname));
+    const std::string host_id = (hostname == "::1" || hostname == "::")
+                                    ? hostname
+                                    : trim(getHostNameWithoutPort(hostname));
     if (host_id.empty()) {
         return "";
     }
@@ -572,7 +573,8 @@ std::string ResolveMooncakeHostId(const std::string &local_hostname) {
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char c) { return std::tolower(c); });
     if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
-        lower == "::1" || lower == "[::1]") {
+        lower == "::1" || lower == "[::1]" || lower == "::" ||
+        lower == "[::]") {
         return "";
     }
     return host_id;

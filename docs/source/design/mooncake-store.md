@@ -564,7 +564,7 @@ Mooncake Store provides multiple built-in allocation strategies to control how s
 ./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
 ```
 
-Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive).
+Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`, `cxl`, `local_first` (case-sensitive).
 
 #### How to Choose
 
@@ -572,7 +572,9 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 |---|---|---|
 | `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
 | `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
+| `ssd_free_ratio_first` | SSD-aware memory allocation when SSD offloading is enabled | Depends on SSD usage metrics; falls back to random allocation when needed |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
+| `local_first` | Colocated inference workers and memory store segments | Requires stable host identity in `local_hostname`; single memory replica only |
 
 **Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
 
@@ -580,7 +582,11 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
 
+**Use `ssd_free_ratio_first`** when SSD offloading is enabled and you want memory allocation to prefer segments whose backing SSD still has more free capacity.
+
 **Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
+
+**Use `local_first`** when inference workers and Mooncake Store memory segments are colocated and you want writes to prefer the writer's host before falling back to other hosts. For this strategy to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`.
 
 For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../performance/allocation-strategy-benchmark-result.md).
 
@@ -610,6 +616,16 @@ An improved strategy built on top of `RandomAllocationStrategy`. Instead of pick
 The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6*N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
 
 The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`ssd_free_ratio_first` — SsdFreeRatioFirstAllocationStrategy**
+
+An SSD-aware variant of the free-ratio-first strategy. It first tries preferred segments, then samples candidate segment names and sorts them by SSD free ratio reported by the local disk segment metrics provider. If it cannot satisfy all replicas from the sorted candidates, it falls back to random allocation for the remaining replicas.
+
+**`local_first` — Local-first allocation**
+
+Host-aware local-first allocation reuses the normal preferred-segment flow. The master derives the writer host id from the request's client host identity and builds an ordered preferred segment list: segments on the writer's host first, followed by remote hosts in lexicographic host-id order. Within the same host, segment names are sorted and rotated by key hash so multiple local segments do not always receive the first allocation attempt.
+
+This strategy currently applies to memory allocation with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` in `ReplicateConfig` are still tried first; if they are unavailable or full, allocation continues with the local-first ordered fallback list.
 
 **`cxl` — CxlAllocationStrategy**
 

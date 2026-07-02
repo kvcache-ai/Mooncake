@@ -1049,13 +1049,13 @@ WrappedMasterService::GetStorageConfig() {
 }
 
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
-    const UUID& client_id, const std::string& host_id) {
+    const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 
     MasterMetricManager::instance().inc_ping_requests();
 
-    auto result = master_service_.Ping(client_id, host_id);
+    auto result = master_service_.Ping(client_id);
 
     timer.LogResponseExpected(result);
     return result;

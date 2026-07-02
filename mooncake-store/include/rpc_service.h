@@ -173,8 +173,7 @@ class WrappedMasterService {
 
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
 
-    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id,
-                                               const std::string& host_id);
+    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 

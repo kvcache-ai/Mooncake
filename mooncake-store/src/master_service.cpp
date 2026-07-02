@@ -2699,7 +2699,8 @@ auto MasterService::AllocateAndInsertMetadata(
             config.replica_num == 1;
         std::string writer_host_id;
         if (use_local_first) {
-            writer_host_id = GetClientHostId(client_id);
+            writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
+                                                    : config.host_id;
         }
 
         ScopedAllocatorAccess allocator_access =
@@ -4683,10 +4684,9 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-auto MasterService::Ping(const UUID& client_id, const std::string& host_id)
+auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
     ClientStatus client_status;
-    bool need_host_update = false;
     {
         std::shared_lock<std::shared_mutex> lock(client_mutex_);
         auto it = ok_client_.find(client_id);
@@ -4695,14 +4695,6 @@ auto MasterService::Ping(const UUID& client_id, const std::string& host_id)
         } else {
             client_status = ClientStatus::NEED_REMOUNT;
         }
-        if (!host_id.empty()) {
-            auto host_it = client_host_id_.find(client_id);
-            need_host_update =
-                host_it == client_host_id_.end() || host_it->second != host_id;
-        }
-    }
-    if (need_host_update) {
-        UpdateClientHostId(client_id, host_id);
     }
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!client_ping_queue_.push(pod_client_id)) {

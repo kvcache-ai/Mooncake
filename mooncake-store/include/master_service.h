@@ -575,8 +575,7 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
-    auto Ping(const UUID& client_id, const std::string& host_id = "")
-        -> tl::expected<PingResponse, ErrorCode>;
+    auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name
