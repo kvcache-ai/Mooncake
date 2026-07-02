@@ -65,6 +65,7 @@ Remote read behavior:
 - when a `batch_get_into` destination range is already registered, the runtime issues direct remote batch reads into that buffer instead of staging through local scratch first
 - unregistered destination buffers still use the existing scratch-window planner and direct single-object fallback path when needed
 - `put_from` and `batch_put_from` now preserve the same registered-buffer zero-copy contract for remote writes: the transport request sources point at the caller-registered buffer ranges instead of a scratch copy
+- non-host-readable registered sources such as CUDA buffers are never exposed as CPU slices; routed writes use the registered transfer source directly, reject local/staged fallback placement, and publish replicas without a CPU payload checksum
 - `batch_put_from` uses the same registered-buffer batch writer in both default local-write mode and explicit routed-write mode when the batch has a shared replication policy
 - routed `batch_put_from` refreshes membership and re-ranks placement candidates on retry, so rollout-era write failures can fall forward onto newly visible live storage runtimes instead of reusing only the stale pre-retry ranking
 - routed `batch_put_from` applies the same retry envelope to reserve-stage placement gaps, so brief hot-upgrade windows with no active `storage=true` owner wait for successor promotion instead of failing the batch immediately
@@ -89,6 +90,32 @@ Main capabilities:
 - `batch_put_from_multi_buffers`
 - `batch_get_into_multi_buffers`
 - HiCache-compatible dummy and real paths for the Python layer
+
+### RL checkpoint updates
+
+The Python wheel includes `mooncake_rl.checkpoint_engine`, a Store-RS-maintained
+checkpoint-engine namespace derived from MoonshotAI checkpoint-engine v0.4.1.
+VeRL-style separated trainer/rollout deployments can use
+`mooncake_rl.checkpoint_engine.store_rs_checkpoint_engine.MooncakeStoreRSCheckpointEngine`
+and `mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient` to move weight
+buckets through Store-RS instead of host offload or an external
+`checkpoint_engine` package.
+
+In this mode, trainer ranks register CUDA weight buckets with location-aware
+registered buffers and write them to Store-RS. Rollout ranks read the assigned
+buckets from Store-RS directly into CUDA buffers, then broadcast the bucket
+inside the rollout process group.
+
+The reusable Store-RS checkpoint engine owns the send/receive weight flow,
+bucket manifest exchange, Store-RS put/get calls, and rollout-side broadcast.
+The VeRL plugin module,
+`mooncake_rl.checkpoint_engine.verl_backend`, only adapts VeRL runtime hooks and
+registers that engine with VeRL's `CheckpointEngineRegistry`. The old
+checkpoint-engine parameter server, host pinned-memory checkpoint registration,
+standalone HTTP service, and Ascend/HCCL hardware path are not shipped. P2P
+transfer is provided by the Store-RS Rust transport layer and the Mooncake
+Transfer Engine built from the repository submodule, not by the external Python
+`mooncake.engine` package.
 
 ## Python Read Acceleration
 

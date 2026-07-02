@@ -1154,6 +1154,25 @@ impl StoreTransport for ClassicTeTransport {
         self.register_memory_with_engine(&engine, addr, size, &location)
     }
 
+    fn register_memory_with_location(
+        &self,
+        addr: *mut c_void,
+        size: usize,
+        location: &str,
+    ) -> Result<()> {
+        let engine = self.engine.read();
+        self.register_memory_with_engine(&engine, addr, size, location)?;
+        self.allocations.lock().insert(
+            addr as usize,
+            ClassicAllocationRecord {
+                location: location.to_string(),
+                size,
+                owner: ClassicAllocationOwner::Borrowed,
+            },
+        );
+        Ok(())
+    }
+
     fn register_startup_memory_batch(&self, entries: &[MemoryRegistration]) -> Result<()> {
         let engine = self.engine.read();
         self.register_startup_entries_with_engine(&engine, entries)

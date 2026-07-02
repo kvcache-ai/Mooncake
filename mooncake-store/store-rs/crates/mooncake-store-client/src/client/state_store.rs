@@ -19,6 +19,16 @@ impl Drop for RouteWritePermit<'_> {
 }
 
 impl StoreState {
+    fn registered_buffer_host_readable_for_location(location: Option<&str>) -> bool {
+        let Some(location) = location else {
+            return true;
+        };
+        let normalized = location.trim().to_ascii_lowercase();
+        normalized.is_empty()
+            || normalized.starts_with("cpu")
+            || normalized.starts_with("host")
+    }
+
     fn memory_ref(&self) -> Result<&LocalMemoryState> {
         self.memory
             .as_ref()
@@ -209,9 +219,29 @@ impl StoreState {
         buffer: *mut c_void,
         size: usize,
     ) -> Result<()> {
+        self.register_external_buffer_with_location(transport, buffer, size, None)
+    }
+
+    fn register_external_buffer_with_location(
+        &mut self,
+        transport: &dyn StoreTransport,
+        buffer: *mut c_void,
+        size: usize,
+        location: Option<&str>,
+    ) -> Result<()> {
         self.ensure_non_overlapping(buffer, size)?;
-        transport.register_memory(buffer, size)?;
-        self.registered_buffers.insert(buffer as usize, size);
+        if let Some(location) = location {
+            transport.register_memory_with_location(buffer, size, location)?;
+        } else {
+            transport.register_memory(buffer, size)?;
+        }
+        self.registered_buffers.insert(
+            buffer as usize,
+            RegisteredBufferInfo {
+                size,
+                host_readable: Self::registered_buffer_host_readable_for_location(location),
+            },
+        );
         Ok(())
     }
 
@@ -222,14 +252,15 @@ impl StoreState {
         size: usize,
     ) -> Result<()> {
         match self.registered_buffers.remove(&(buffer as usize)) {
-            Some(registered) if registered == size => {
+            Some(registered) if registered.size == size => {
                 transport.unregister_memory(buffer, size)?;
                 Ok(())
             }
             Some(registered) => {
                 self.registered_buffers.insert(buffer as usize, registered);
                 Err(StoreError::Allocator(format!(
-                    "registered buffer size mismatch: requested={size} registered={registered}"
+                    "registered buffer size mismatch: requested={size} registered={}",
+                    registered.size
                 )))
             }
             None => Err(StoreError::NotFound(format!(
@@ -247,9 +278,23 @@ impl StoreState {
         self.registered_buffers
             .range(..=start)
             .next_back()
-            .is_some_and(|(registered_start, registered_size)| {
-                let registered_end = registered_start.saturating_add(*registered_size);
+            .is_some_and(|(registered_start, registered)| {
+                let registered_end = registered_start.saturating_add(registered.size);
                 start >= *registered_start && end <= registered_end
+            })
+    }
+
+    fn registered_buffer_host_readable(&self, buffer: *mut c_void, size: usize) -> bool {
+        let start = buffer as usize;
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
+        self.registered_buffers
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(registered_start, registered)| {
+                let registered_end = registered_start.saturating_add(registered.size);
+                start >= *registered_start && end <= registered_end && registered.host_readable
             })
     }
 
@@ -262,7 +307,7 @@ impl StoreState {
             .registered_buffers
             .range(..=start)
             .next_back()
-            .map(|(key, value)| (*key, *value))
+            .map(|(key, value)| (*key, value.size))
         {
             let other_end = other_start.saturating_add(other_size);
             if start < other_end {
@@ -276,7 +321,7 @@ impl StoreState {
             .registered_buffers
             .range(start..)
             .next()
-            .map(|(key, value)| (*key, *value))
+            .map(|(key, value)| (*key, value.size))
         {
             if end > other_start {
                 return Err(StoreError::Allocator(format!(

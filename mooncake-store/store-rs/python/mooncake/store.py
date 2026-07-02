@@ -94,6 +94,7 @@ _CACHE_BOOL = "bool"
 # failed cache operations. Non-cache control-plane methods stay strict.
 _CACHE_COMPAT_POLICY = {
     "register_buffer": _CACHE_STATUS,
+    "register_buffer_with_location": _CACHE_STATUS,
     "unregister_buffer": _CACHE_STATUS,
     "put": _CACHE_STATUS,
     "put_from": _CACHE_STATUS,
@@ -536,6 +537,23 @@ class MooncakeDistributedStore:
 
     def register_buffer(self, buffer_ptr: int, size: int):
         result = self._invoke_cache("register_buffer", buffer_ptr, size)
+        if result == 0:
+            with self._lock:
+                self._registered_buffers[int(buffer_ptr)] = int(size)
+        return result
+
+    def register_buffer_with_location(
+        self,
+        buffer_ptr: int,
+        size: int,
+        location: str = "cpu:0",
+    ):
+        result = self._invoke_cache(
+            "register_buffer_with_location",
+            buffer_ptr,
+            size,
+            location,
+        )
         if result == 0:
             with self._lock:
                 self._registered_buffers[int(buffer_ptr)] = int(size)
