@@ -408,6 +408,9 @@ EtcdTenantQuotaPolicyStore::Load() {
     EtcdRevisionId revision_id = 0;
     ErrorCode error =
         EtcdHelper::Get(key_.c_str(), key_.size(), content, revision_id);
+    if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return TenantQuotaPolicySnapshot{};
+    }
     if (error != ErrorCode::OK) {
         return tl::make_unexpected(
             "failed to load tenant quota policy from "
