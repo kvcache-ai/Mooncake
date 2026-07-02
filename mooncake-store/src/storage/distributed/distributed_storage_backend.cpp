@@ -80,8 +80,7 @@ DistributedStorageBackend::DistributedStorageBackend(
       fs_adapter_(std::move(fs_adapter)),
       desc_cache_(std::make_shared<DfsDescriptorCache>()),
       distributed_config_(distributed_config),
-      root_dir_(distributed_config.fsdir),
-      alignment_(distributed_config.alignment) {}
+      root_dir_(distributed_config.fsdir) {}
 
 DistributedStorageBackend::~DistributedStorageBackend() {
     for (auto& shard : shard_files_) {
@@ -177,12 +176,6 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
                 invalid = true;
                 break;
             }
-            if (reinterpret_cast<uintptr_t>(slice.ptr) % alignment_ != 0) {
-                LOG(WARNING) << "DFS write buffer is not aligned for key "
-                             << storage_key;
-                invalid = true;
-                break;
-            }
             total_size += slice.size;
             iovs.push_back({slice.ptr, slice.size});
         }
@@ -234,9 +227,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (slice.size < desc->object_size || !slice.ptr) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (reinterpret_cast<uintptr_t>(slice.ptr) % alignment_ != 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 

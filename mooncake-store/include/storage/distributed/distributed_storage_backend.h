@@ -82,7 +82,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::shared_ptr<DfsDescriptorCache> desc_cache_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
-    uint64_t alignment_;
     std::vector<std::unique_ptr<ShardFile>> shard_files_;
     bool initialized_ = false;
 };

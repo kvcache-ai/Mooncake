@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -548,6 +549,44 @@ TEST_F(DfsBackendTest, BatchOffloadAndBatchLoad) {
     ASSERT_TRUE(load_res.has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
               0);
+}
+
+TEST_F(DfsBackendTest, BatchOffloadAndBatchLoadAcceptUnalignedBuffers) {
+    constexpr size_t kObjectSize = 1234;
+    AlignedBuffer write_storage(kObjectSize + 1);
+    AlignedBuffer read_storage(kObjectSize + 3);
+    ASSERT_NE(write_storage.data(), nullptr);
+    ASSERT_NE(read_storage.data(), nullptr);
+
+    char* write_ptr = write_storage.data() + 1;
+    char* read_ptr = read_storage.data() + 3;
+    ASSERT_NE(reinterpret_cast<std::uintptr_t>(write_ptr) % 4096, 0);
+    ASSERT_NE(reinterpret_cast<std::uintptr_t>(read_ptr) % 4096, 0);
+    for (size_t i = 0; i < kObjectSize; ++i) {
+        write_ptr[i] = static_cast<char>('a' + (i % 26));
+    }
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch["unaligned"] = {{write_ptr, kObjectSize}};
+    desc_cache_->Put("unaligned", {ShardPath(0), 0, kObjectSize, 4096, 0});
+
+    std::vector<std::string> completed_keys;
+    auto offload_res =
+        backend_->BatchOffload(batch, [&](const std::vector<std::string>& keys,
+                                          std::vector<StorageObjectMetadata>&) {
+            completed_keys = keys;
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(offload_res.has_value());
+    EXPECT_EQ(*offload_res, 1);
+    ASSERT_EQ(completed_keys.size(), 1);
+    EXPECT_EQ(completed_keys[0], "unaligned");
+
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch["unaligned"] = {read_ptr, kObjectSize};
+    auto load_res = backend_->BatchLoad(load_batch);
+    ASSERT_TRUE(load_res.has_value());
+    EXPECT_EQ(std::memcmp(write_ptr, read_ptr, kObjectSize), 0);
 }
 
 TEST_F(DfsBackendTest, MultipleKeysAcrossShards) {
