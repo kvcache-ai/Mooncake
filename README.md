@@ -252,22 +252,22 @@ The table below summarizes how Mooncake's components are adopted across the LLM 
 
 | Feature | Project | Type | Transfer | EP/Torch Backend | Store | Ckpt Engine |
 | --- | --- | --- | :---: | :---: | :---: | :---: |
-| **Inference** | vLLM V0 | Inference | ✅ | ❌ | ✅ | ✅ |
-| | vLLM V1 (Omni) | Inference | ✅ | 🚧 | ✅ (native / LMCache / Nixl) | ❌ |
-| | SGLang (Omni) | Inference | ✅ | ✅ | ✅ | ✅ |
-| | LMDeploy | Inference | ✅ | ❌ | ✅ | ❌ |
-| | TensorRT-LLM | Inference | ✅ | ❌ | ✅ | ❌ |
-| | Chitu | Inference | ✅ | ❌ | ❌ | ❌ |
-| | xLLM | Inference | ✅ | ❌ | ✅ | ❌ |
-| | RTP (Alibaba) | Inference | ✅ | ❌ | ✅ | ❌ |
-| **Middleware** | KVCM (Alibaba) | Middleware | ✅ | — | ✅ | — |
-| | TBase (Ant) | Middleware | ✅ | — | ❌ | — |
-| | Dynamo | Framework | ✅ (w/ Nixl) | ❌ | ❌ | ❌ |
-| | LMCache | Middleware | ❌ | — | ✅ | — |
-| | TransferQueue | Middleware | — | — | ✅ | — |
-| **RL Post-Training** | Slime/Miles | RL | 🚧 | — | ✅ | — |
-| | ROLL (Alibaba) | RL | ❌ | — | ✅ | — |
-| | Verl | RL | ❌ | — | ✅ (w/ TransferQueue) | — |
+| **Inference** | <img src="https://github.com/vllm-project.png" width="18" height="18" alt="vLLM"/> [vLLM V0](https://github.com/vllm-project/vllm) | Inference | ✅ | ❌ | ✅ | ✅ |
+| | <img src="https://github.com/vllm-project.png" width="18" height="18" alt="vLLM"/> [vLLM V1 (Omni)](https://github.com/vllm-project/vllm) | Inference | ✅ | 🚧 | ✅ (native / LMCache / Nixl) | ❌ |
+| | <img src="https://github.com/sgl-project.png" width="18" height="18" alt="SGLang"/> [SGLang (Omni)](https://github.com/sgl-project/sglang) | Inference | ✅ | ✅ | ✅ | ✅ |
+| | <img src="https://github.com/InternLM.png" width="18" height="18" alt="LMDeploy"/> [LMDeploy](https://github.com/InternLM/lmdeploy) | Inference | ✅ | ❌ | ✅ | ❌ |
+| | <img src="https://github.com/NVIDIA.png" width="18" height="18" alt="NVIDIA"/> [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | Inference | ✅ | ❌ | ✅ | ❌ |
+| | <img src="https://github.com/thu-pacman.png" width="18" height="18" alt="Chitu"/> [Chitu](https://github.com/thu-pacman/chitu) | Inference | ✅ | ❌ | ❌ | ❌ |
+| | <img src="https://github.com/jd-opensource.png" width="18" height="18" alt="xLLM"/> [xLLM](https://github.com/jd-opensource/xllm) | Inference | ✅ | ❌ | ✅ | ❌ |
+| | <img src="https://github.com/alibaba.png" width="18" height="18" alt="Alibaba"/> [RTP (Alibaba)](https://github.com/alibaba/rtp-llm) | Inference | ✅ | ❌ | ✅ | ❌ |
+| **Middleware** | <img src="https://github.com/alibaba.png" width="18" height="18" alt="Alibaba"/> [KVCM (Alibaba)](https://github.com/alibaba) | Middleware | ✅ | — | ✅ | — |
+| | <img src="https://github.com/antgroup.png" width="18" height="18" alt="Ant Group"/> [TBase (Ant)](https://github.com/antgroup) | Middleware | ✅ | — | ❌ | — |
+| | <img src="https://github.com/ai-dynamo.png" width="18" height="18" alt="Dynamo"/> [Dynamo](https://github.com/ai-dynamo/dynamo) | Framework | ✅ (w/ Nixl) | ❌ | ❌ | ❌ |
+| | <img src="https://github.com/LMCache.png" width="18" height="18" alt="LMCache"/> [LMCache](https://github.com/LMCache/LMCache) | Middleware | ❌ | — | ✅ | — |
+| | <img src="https://github.com/Ascend.png" width="18" height="18" alt="TransferQueue"/> [TransferQueue](https://github.com/Ascend/TransferQueue) | Middleware | — | — | ✅ | — |
+| **RL Post-Training** | <img src="https://github.com/THUDM.png" width="18" height="18" alt="slime"/> [Slime/Miles](https://github.com/THUDM/slime) | RL | 🚧 | — | ✅ | — |
+| | <img src="https://github.com/alibaba.png" width="18" height="18" alt="Alibaba"/> [ROLL (Alibaba)](https://github.com/alibaba/ROLL) | RL | ❌ | — | ✅ | — |
+| | <img src="https://github.com/volcengine.png" width="18" height="18" alt="verl"/> [Verl](https://github.com/volcengine/verl) | RL | ❌ | — | ✅ (w/ TransferQueue) | — |
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
