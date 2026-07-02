@@ -339,25 +339,4 @@ void MooncakeBackend::resetDeviceCollectiveRuntime() {
     runtime.host_signals_bytes = 0;
 }
 
-DeviceCollectiveRuntimeSnapshot
-MooncakeBackend::getDeviceCollectiveRuntimeSnapshot() const {
-    DeviceCollectiveRuntimeSnapshot snapshot;
-    snapshot.enabled = useDeviceApiCollectivesPoc();
-    snapshot.active_size = meta_ ? meta_->activeSize : 0;
-    snapshot.direct_p2p_ready = device_collective_runtime_.direct_p2p_ready;
-    snapshot.rdma_ready = device_collective_runtime_.rdma_ready;
-    snapshot.same_host_only =
-        snapshot.enabled && snapshot.direct_p2p_ready && !snapshot.rdma_ready;
-    snapshot.has_sequence_counter =
-        device_collective_runtime_.device_sequence_counter != nullptr;
-    snapshot.has_sequence_slots =
-        device_collective_runtime_.device_sequence_slots != nullptr;
-    snapshot.has_host_signals = device_collective_runtime_.host_signals != nullptr;
-    snapshot.p2p_peer_ptr_count =
-        static_cast<int>(device_collective_runtime_.p2p_peer_ptrs_host.size());
-    snapshot.rdma_qps_per_rank = device_collective_runtime_.rdma_qps_per_rank;
-    snapshot.host_signals_bytes = device_collective_runtime_.host_signals_bytes;
-    return snapshot;
-}
-
 }  // namespace mooncake

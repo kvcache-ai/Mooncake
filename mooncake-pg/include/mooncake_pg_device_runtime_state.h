@@ -30,20 +30,6 @@ struct DeviceCollectiveRuntimeState {
     size_t host_signals_bytes{0};
 };
 
-struct DeviceCollectiveRuntimeSnapshot {
-    bool enabled{false};
-    bool direct_p2p_ready{false};
-    bool rdma_ready{false};
-    bool same_host_only{false};
-    bool has_sequence_counter{false};
-    bool has_sequence_slots{false};
-    bool has_host_signals{false};
-    int active_size{0};
-    int p2p_peer_ptr_count{0};
-    int rdma_qps_per_rank{0};
-    size_t host_signals_bytes{0};
-};
-
 }  // namespace mooncake
 
 #endif  // MOONCAKE_PG_DEVICE_RUNTIME_STATE_H

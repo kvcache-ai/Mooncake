@@ -212,8 +212,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     void joinGroup();
 
-    DeviceCollectiveRuntimeSnapshot getDeviceCollectiveRuntimeSnapshot() const;
-
    private:
     void ensureCudaDevice() const;
     void waitForExtensionState();
