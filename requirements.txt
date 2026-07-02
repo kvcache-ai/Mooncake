@@ -1,5 +1,5 @@
 # Development dependencies for Mooncake
-# Install with: pip install -r requirements-dev.txt
+# Install with: pip install -r requirements.txt
 # Then enable hooks: pre-commit install
 pre-commit==3.7.1
 ruff==0.6.9

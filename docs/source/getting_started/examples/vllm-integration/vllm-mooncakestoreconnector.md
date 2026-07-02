@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Guide: vLLM MooncakeStoreConnector
 
 ```{admonition} Archived
