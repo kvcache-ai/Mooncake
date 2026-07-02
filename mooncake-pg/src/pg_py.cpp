@@ -92,6 +92,25 @@ void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     mooncakeBackend->joinGroup();
 }
 
+py::dict getDeviceRuntimeSnapshot(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    auto snapshot = mooncakeBackend->getDeviceCollectiveRuntimeSnapshot();
+    py::dict out;
+    out["enabled"] = snapshot.enabled;
+    out["direct_p2p_ready"] = snapshot.direct_p2p_ready;
+    out["rdma_ready"] = snapshot.rdma_ready;
+    out["same_host_only"] = snapshot.same_host_only;
+    out["has_sequence_counter"] = snapshot.has_sequence_counter;
+    out["has_sequence_slots"] = snapshot.has_sequence_slots;
+    out["has_host_signals"] = snapshot.has_host_signals;
+    out["active_size"] = snapshot.active_size;
+    out["p2p_peer_ptr_count"] = snapshot.p2p_peer_ptr_count;
+    out["rdma_qps_per_rank"] = snapshot.rdma_qps_per_rank;
+    out["host_signals_bytes"] = snapshot.host_signals_bytes;
+    return out;
+}
+
 /// Python-facing wrapper that extracts the raw TransferEngine* from a
 /// mooncake.engine.TransferEngine Python object and passes it to
 /// MooncakeBackend::setExternalEngine().  The caller must ensure the
@@ -125,6 +144,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_peer_state", &getPeerState);
     m.def("recover_ranks", &recoverRanks);
     m.def("join_group", &joinGroup);
+    m.def("_device_runtime_snapshot", &getDeviceRuntimeSnapshot);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(

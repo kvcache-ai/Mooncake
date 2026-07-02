@@ -7,6 +7,7 @@
 #include <vector>
 #include <mooncake_worker.cuh>
 #include <connection_poller.h>
+#include <mooncake_pg_device_runtime_state.h>
 #include <p2p_proxy.h>
 #include <sys/types.h>
 #include <torch/torch.h>
@@ -156,6 +157,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
     static void setDeviceFilter(std::vector<std::string> filters) {
+        deviceFilters_ = filters;
         engine_->setWhitelistFilters(std::move(filters));
     }
 
@@ -210,13 +212,20 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     void joinGroup();
 
+    DeviceCollectiveRuntimeSnapshot getDeviceCollectiveRuntimeSnapshot() const;
+
    private:
+    void ensureCudaDevice() const;
     void waitForExtensionState();
     void publishLocalPeerMetadata();
+    void maybeInitDeviceCollectiveRuntime();
+    void resetDeviceCollectiveRuntime();
+    bool allActivePeersOnSameHost() const;
     void setLocalOnlyActiveRanks();
     void syncActiveRanksTensor();
 
     static TransferEngine* engine_;
+    static std::vector<std::string> deviceFilters_;
     std::shared_ptr<MooncakeWorker> worker_;
     static bool engineInitialized_;
     static int backendIndex_;
@@ -237,6 +246,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     bool isShutdown_{false};
     uint64_t local2global_rank_map_[kMaxNumRanks];
     std::string localServerName_;
+    // These runtime state groups define the intended PR1 ownership boundary
+    // for Device API collectives.
+    DeviceCollectiveRuntimeState device_collective_runtime_;
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than
