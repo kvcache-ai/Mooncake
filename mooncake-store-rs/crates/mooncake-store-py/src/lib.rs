@@ -518,6 +518,31 @@ impl PyMooncakeDistributedStore {
         }
     }
 
+    #[pyo3(signature = (buffer_ptr, size, location = "cpu:0"))]
+    fn register_buffer_with_location(
+        &self,
+        buffer_ptr: usize,
+        size: usize,
+        location: &str,
+    ) -> PyResult<i32> {
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let _ = location;
+                run_without_gil(move || dummy.register_buffer(buffer_ptr, size))
+                    .map_err(store_error_to_py)
+            }
+            StoreBackend::Real(dispatcher) => {
+                let _ = pointer_from_usize(buffer_ptr)?;
+                let location = location.to_string();
+                run_without_gil(move || {
+                    dispatcher.register_buffer_with_location(buffer_ptr, size, location)
+                })
+                .map_err(store_error_to_py)?;
+                Ok(0)
+            }
+        }
+    }
+
     fn unregister_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {

@@ -40,12 +40,43 @@ After installation:
 
 - `MooncakeDistributedStore` as the main compatibility API
 - `MooncakeHostMemAllocator` for caller-owned registered buffers
+- `mooncake_rl.checkpoint_engine` as a Store-RS-maintained RL checkpoint adapter
 - real and dummy execution modes for Mooncake / HiCache-style integration
 - batch I/O, registered-buffer I/O, and multi-buffer I/O
 - the same storage-owner CLOCK eviction and route-owner CAS reclaim as Rust callers
 - the same background watermark eviction defaults as Rust callers
 - route query, lifecycle, and metrics helpers
 - wheel packaging for the native extension plus the bundled runtime libraries
+
+## RL Checkpoint Integration
+
+The `mooncake_rl` package is part of the `mooncake` wheel. It vendors the
+MoonshotAI checkpoint-engine v0.4.1 CUDA/NCCL process-group shape under
+`mooncake_rl.checkpoint_engine`, then removes the legacy parameter server, host
+pinned-memory offload, standalone HTTP API, and Ascend/HCCL paths. Integrations
+should import the Store-RS RL client and CUDA/NCCL distributed helpers from
+`mooncake_rl.checkpoint_engine.*` instead of depending on an external
+`checkpoint_engine` or `mooncake.engine.TransferEngine` installation.
+
+Store-RS-specific RL weight updates use
+`mooncake_rl.checkpoint_engine.store_rs_checkpoint_engine.MooncakeStoreRSCheckpointEngine`
+for the reusable checkpoint flow and
+`mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient` for Store-RS
+object I/O. Trainer ranks register CUDA tensors with
+`register_buffer_with_location(..., "cuda:N")` and put bucket objects into
+Store-RS through registered-buffer writes. Rollout ranks read the selected
+buckets from Store-RS into CUDA buffers and then broadcast inside the rollout
+process group.
+
+The P2P data path is the same data path as `MooncakeDistributedStore`: the
+Python adapter calls Store-RS registered-buffer APIs, and the Rust transport
+layer uses the Mooncake Transfer Engine built from this repository's submodule.
+No Python-side host pin-memory bridge is used for these RL bucket transfers.
+VeRL integration is provided as an external plugin module,
+`mooncake_rl.checkpoint_engine.verl_backend`; it only adapts VeRL runtime hooks
+and registers the Store-RS checkpoint engine with VeRL's
+`CheckpointEngineRegistry`, so no Store-RS backend file has to live inside the
+VeRL source tree.
 
 ## Execution Modes
 
@@ -85,6 +116,10 @@ Real-mode `batch_put_from(...)` keeps the caller's batch together by default so 
 can coalesce placement, remote transfer, route publication, and replica tracking. Operators that
 prefer Python-side sharding for a specific workload can set
 `MC_STORE_RS_PY_BATCH_PUT_FROM_FANOUT` to an explicit positive fanout width.
+Real-mode callers can use `register_buffer_with_location(ptr, size, "cuda:N")` for CUDA source
+buffers. Those buffers are transferred as registered sources and are not read by the CPU; writes
+therefore require remote registered-transfer placement and publish routes without a CPU payload
+checksum.
 
 `setup(...)` accepts `eviction_high_watermark_percent=` and
 `eviction_low_watermark_percent=` for storage-role runtimes. The same values can come from

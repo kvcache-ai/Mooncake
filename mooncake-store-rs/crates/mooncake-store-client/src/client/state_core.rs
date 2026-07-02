@@ -306,7 +306,7 @@ mod state_core_tests {
 #[derive(Default)]
 struct StoreState {
     memory: Option<LocalMemoryState>,
-    registered_buffers: BTreeMap<usize, usize>,
+    registered_buffers: BTreeMap<usize, RegisteredBufferInfo>,
     local_transports: BTreeMap<String, Arc<dyn StoreTransport>>,
     remote_segments: BTreeMap<String, u64>,
     remote_segment_infos: BTreeMap<String, SegmentInfo>,
@@ -314,6 +314,12 @@ struct StoreState {
     segment_open_metadata: BTreeMap<String, SegmentTransportMetadata>,
     pending_reclaims: VecDeque<PendingReclaim>,
     next_local_segment_id: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RegisteredBufferInfo {
+    size: usize,
+    host_readable: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -859,7 +865,9 @@ struct PreparedObjectWrite<'a> {
     object_id: LogicalObjectId,
     qos_tier: Option<&'a str>,
     scoped_key: ObjectKey,
-    value: &'a [u8],
+    value: Option<&'a [u8]>,
+    value_len: usize,
+    checksum: Option<u64>,
     registered_source: Option<*mut c_void>,
     quota_reservation: Option<mooncake_store_core::TenantQuotaReservationRequest>,
     targets: Vec<ReplicaWriteTarget>,

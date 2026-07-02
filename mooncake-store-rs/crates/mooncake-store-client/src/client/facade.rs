@@ -51,6 +51,12 @@ pub trait MooncakeCompatibilityFacade {
     ) -> Result<CasResult>;
     fn register_local_memory(&self) -> Result<()>;
     fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
+    fn register_buffer_with_location(
+        &self,
+        buffer: *mut c_void,
+        size: usize,
+        location: &str,
+    ) -> Result<()>;
     fn unregister_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
     fn get_hostname(&self) -> Result<String>;
     fn get_size(&self, key: &str) -> Result<usize>;
@@ -593,7 +599,6 @@ impl StoreClient {
             .collect::<Vec<_>>();
         let mut routed_indices = Vec::with_capacity(requests.len());
         let mut routed_requests = Vec::with_capacity(requests.len());
-        let mut routed_sources = Vec::with_capacity(requests.len());
         let shared_put_from_policy = Self::shared_batch_put_from_replication_policy(requests);
         let use_batch_put_from = shared_put_from_policy.is_some();
 
@@ -617,27 +622,29 @@ impl StoreClient {
             }
 
             if use_batch_put_from {
-                let value =
-                    unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
-                let mut routed = PutRequest::new(request.key, value);
-                if let Some(tenant) = request.tenant {
-                    routed = routed.tenant(tenant);
-                }
-                if let Some(domain) = request.domain {
-                    routed = routed.domain(domain);
-                }
-                if let Some(object_set) = request.object_set {
-                    routed = routed.object_set(object_set);
-                }
-                if let Some(qos_tier) = request.qos_tier {
-                    routed = routed.qos_tier(qos_tier);
-                }
-                if let Some(policy) = request.policy.clone() {
-                    routed = routed.replication(policy);
-                }
+                let host_readable = {
+                    let state = self.state.lock();
+                    state.registered_buffer_host_readable(request.buffer.cast_mut(), request.size)
+                };
+                let value = if host_readable {
+                    Some(unsafe {
+                        slice::from_raw_parts(request.buffer.cast::<u8>(), request.size)
+                    })
+                } else {
+                    None
+                };
+                let routed = BatchPutItem {
+                    tenant: request.tenant,
+                    domain: request.domain,
+                    object_set: request.object_set,
+                    qos_tier: request.qos_tier,
+                    key: request.key,
+                    value,
+                    value_len: request.size,
+                    registered_source: Some(request.buffer.cast_mut()),
+                };
                 routed_indices.push(index);
                 routed_requests.push(routed);
-                routed_sources.push(request.buffer.cast_mut());
                 continue;
             }
 
@@ -667,35 +674,10 @@ impl StoreClient {
                 if let Some(shared_policy) = shared_put_from_policy {
                     self.batch_put_scoped_routed_accept_existing_statuses(
                         &routed_requests,
-                        &routed_sources,
                         shared_policy.as_ref(),
                     )
                 } else {
-                    routed_requests
-                        .iter()
-                        .zip(routed_sources.iter())
-                        .map(|(request, source)| {
-                            let mut object = ObjectRef::new(request.key);
-                            if let Some(tenant) = request.tenant {
-                                object = object.tenant(tenant);
-                            }
-                            if let Some(domain) = request.domain {
-                                object = object.domain(domain);
-                            }
-                            if let Some(object_set) = request.object_set {
-                                object = object.object_set(object_set);
-                            }
-                            if let Some(qos_tier) = request.qos_tier {
-                                object = object.qos_tier(qos_tier);
-                            }
-                            self.put_object_from_registered(
-                                &object,
-                                *source,
-                                request.value.len(),
-                                request.policy.as_ref(),
-                            )
-                        })
-                        .collect()
+                    unreachable!("routed requests are only built for shared put_from policy")
                 };
 
             for (index, status) in routed_indices.into_iter().zip(routed_statuses) {
@@ -1151,6 +1133,35 @@ impl MooncakeCompatibilityFacade for StoreClient {
         result
     }
 
+    fn register_buffer_with_location(
+        &self,
+        buffer: *mut c_void,
+        size: usize,
+        location: &str,
+    ) -> Result<()> {
+        let _span = info_span!(
+            "store.register_buffer",
+            runtime = %self.lease.runtime,
+            size,
+            location
+        )
+        .entered();
+        let tracker = OperationTracker::new("register_buffer").input_bytes(size as u64);
+        if size == 0 {
+            let result = Err(StoreError::Allocator(
+                "registered buffer size must be greater than zero".to_string(),
+            ));
+            tracker.finish(&result, 0);
+            return result;
+        }
+        let transport = self.transport()?;
+        let mut state = self.state.lock();
+        let result =
+            state.register_external_buffer_with_location(transport, buffer, size, Some(location));
+        tracker.finish(&result, 0);
+        result
+    }
+
     fn unregister_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()> {
         let _span = info_span!(
             "store.unregister_buffer",
@@ -1448,7 +1459,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .input_bytes(bytes_in);
         if matches!(self.write_mode, WriteMode::Routed { .. }) {
             if let Some(shared_policy) = Self::shared_batch_replication_policy(requests) {
-                let result = self.batch_put_scoped_routed(requests, None, shared_policy.as_ref());
+                let result = self.batch_put_scoped_routed(requests, shared_policy.as_ref());
                 tracker.finish(&result, bytes_in);
                 return result;
             }

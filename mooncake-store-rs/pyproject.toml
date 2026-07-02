@@ -30,6 +30,9 @@ Homepage = "https://github.com/kvcache-ai/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 
 [project.optional-dependencies]
+rl = [
+    "torch>=2.5.0",
+]
 dev = [
     "ruff>=0.6",
 ]

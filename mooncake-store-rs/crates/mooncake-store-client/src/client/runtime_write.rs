@@ -39,8 +39,39 @@ impl BatchPutReserveStageError {
     }
 }
 
+#[derive(Clone, Debug)]
+struct BatchPutItem<'a> {
+    tenant: Option<&'a str>,
+    domain: Option<&'a str>,
+    object_set: Option<&'a str>,
+    qos_tier: Option<&'a str>,
+    key: &'a str,
+    value: Option<&'a [u8]>,
+    value_len: usize,
+    registered_source: Option<*mut c_void>,
+}
+
+impl<'a> BatchPutItem<'a> {
+    fn from_put_request(request: &PutRequest<'a>) -> Self {
+        Self {
+            tenant: request.tenant,
+            domain: request.domain,
+            object_set: request.object_set,
+            qos_tier: request.qos_tier,
+            key: request.key,
+            value: Some(request.value),
+            value_len: request.value.len(),
+            registered_source: None,
+        }
+    }
+
+    fn checksum(&self) -> Option<u64> {
+        self.value.map(payload_checksum)
+    }
+}
+
 impl StoreClient {
-    fn batch_put_reserve_needs_current_routes(&self, requests: &[PutRequest<'_>]) -> Result<bool> {
+    fn batch_put_reserve_needs_current_routes(&self, requests: &[BatchPutItem<'_>]) -> Result<bool> {
         if self.namespace_quota.is_some() {
             return Ok(true);
         }
@@ -308,12 +339,14 @@ impl StoreClient {
     fn batch_put_scoped_routed(
         &self,
         requests: &[PutRequest<'_>],
-        registered_sources: Option<&[*mut c_void]>,
         policy: Option<&ReplicationPolicy>,
     ) -> Result<Vec<ObjectRoute>> {
+        let items = requests
+            .iter()
+            .map(BatchPutItem::from_put_request)
+            .collect::<Vec<_>>();
         self.batch_put_scoped_routed_with_route_conflicts(
-            requests,
-            registered_sources,
+            &items,
             policy,
             BatchPutRouteConflictPolicy::Strict,
         )
@@ -321,13 +354,11 @@ impl StoreClient {
 
     fn batch_put_scoped_routed_accept_existing(
         &self,
-        requests: &[PutRequest<'_>],
-        registered_sources: Option<&[*mut c_void]>,
+        requests: &[BatchPutItem<'_>],
         policy: Option<&ReplicationPolicy>,
     ) -> Result<Vec<ObjectRoute>> {
         self.batch_put_scoped_routed_with_route_conflicts(
             requests,
-            registered_sources,
             policy,
             BatchPutRouteConflictPolicy::AcceptExistingActiveRoute,
         )
@@ -335,8 +366,7 @@ impl StoreClient {
 
     fn batch_put_scoped_routed_accept_existing_statuses(
         &self,
-        requests: &[PutRequest<'_>],
-        registered_sources: &[*mut c_void],
+        requests: &[BatchPutItem<'_>],
         policy: Option<&ReplicationPolicy>,
     ) -> Vec<Result<ObjectRoute>> {
         if requests.is_empty() {
@@ -344,20 +374,17 @@ impl StoreClient {
         }
         self.batch_put_scoped_routed_accept_existing_statuses_inner(
             requests,
-            registered_sources,
             policy,
         )
     }
 
     fn batch_put_scoped_routed_accept_existing_statuses_inner(
         &self,
-        requests: &[PutRequest<'_>],
-        registered_sources: &[*mut c_void],
+        requests: &[BatchPutItem<'_>],
         policy: Option<&ReplicationPolicy>,
     ) -> Vec<Result<ObjectRoute>> {
         match self.batch_put_scoped_routed_accept_existing(
             requests,
-            Some(registered_sources),
             policy,
         ) {
             Ok(routes) if routes.len() == requests.len() => routes.into_iter().map(Ok).collect(),
@@ -382,12 +409,10 @@ impl StoreClient {
                 let mid = requests.len() / 2;
                 let mut statuses = self.batch_put_scoped_routed_accept_existing_statuses_inner(
                     &requests[..mid],
-                    &registered_sources[..mid],
                     policy,
                 );
                 statuses.extend(self.batch_put_scoped_routed_accept_existing_statuses_inner(
                     &requests[mid..],
-                    &registered_sources[mid..],
                     policy,
                 ));
                 statuses
@@ -397,21 +422,13 @@ impl StoreClient {
 
     fn batch_put_scoped_routed_with_route_conflicts(
         &self,
-        requests: &[PutRequest<'_>],
-        registered_sources: Option<&[*mut c_void]>,
+        requests: &[BatchPutItem<'_>],
         policy: Option<&ReplicationPolicy>,
         conflict_policy: BatchPutRouteConflictPolicy,
     ) -> Result<Vec<ObjectRoute>> {
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
         self.validate_unique_requests(requests)?;
-        if let Some(registered_sources) = registered_sources {
-            if registered_sources.len() != requests.len() {
-                return Err(StoreError::InvalidState(
-                    "registered sources and routed requests length mismatch".to_string(),
-                ));
-            }
-        }
         let transport = self.transport()?;
         let planner = self.request_placement_planner();
         let resolved_policy = self.resolve_replication_policy(policy)?;
@@ -475,7 +492,10 @@ impl StoreClient {
                 qos_tier: Option<&'a str>,
                 scoped_key: ObjectKey,
                 current: Option<ObjectRoute>,
-                value: &'a [u8],
+                value: Option<&'a [u8]>,
+                value_len: usize,
+                checksum: Option<u64>,
+                registered_source: Option<*mut c_void>,
                 quota_reservation: Option<TenantQuotaReservationRequest>,
                 candidates: Vec<ReplicaPlacementCandidate>,
                 next_candidate: usize,
@@ -496,7 +516,7 @@ impl StoreClient {
             let reserve_tracker = OperationTracker::new("batch_put_stage_reserve").input_bytes(
                 requests
                     .iter()
-                    .map(|request| request.value.len())
+                    .map(|request| request.value_len)
                     .sum::<usize>() as u64,
             );
             let reserve_result = (|| -> std::result::Result<
@@ -677,6 +697,9 @@ impl StoreClient {
                     )),
                     current,
                     value: request.value,
+                    value_len: request.value_len,
+                    checksum: request.checksum(),
+                    registered_source: request.registered_source,
                     quota_reservation: None,
                     candidates,
                     next_candidate: 0,
@@ -699,7 +722,7 @@ impl StoreClient {
                         &entry.object_id,
                         &entry.scoped_key,
                         entry.current.as_ref(),
-                        entry.value.len(),
+                        entry.value_len,
                     )
                 };
                 match reserve_result {
@@ -749,7 +772,7 @@ impl StoreClient {
                         require_local_memory: storage_runtime == self.lease.runtime,
                         storage_runtime,
                         segment_name,
-                        length_bytes: entry.value.len() as u64,
+                        length_bytes: entry.value_len as u64,
                     });
                 }
                 if let Some(key) = exhausted_key {
@@ -815,14 +838,16 @@ impl StoreClient {
             }
 
             let mut prepared = Vec::with_capacity(pending.len());
-            for (index, entry) in pending.into_iter().enumerate() {
+            for entry in pending.into_iter() {
                 prepared.push(PreparedObjectWrite {
                     tenant: entry.tenant,
                     object_id: entry.object_id,
                     qos_tier: entry.qos_tier,
                     scoped_key: entry.scoped_key,
                     value: entry.value,
-                    registered_source: registered_sources.and_then(|sources| sources.get(index).copied()),
+                    value_len: entry.value_len,
+                    checksum: entry.checksum,
+                    registered_source: entry.registered_source,
                     quota_reservation: entry.quota_reservation,
                     targets: entry.targets,
                     reservations: entry.reservations,
@@ -894,7 +919,7 @@ impl StoreClient {
         };
         let write_bytes = prepared
             .iter()
-            .map(|entry| entry.value.len())
+            .map(|entry| entry.value_len)
             .sum::<usize>() as u64;
         let total_target_count = prepared
             .iter()
@@ -924,7 +949,8 @@ impl StoreClient {
                 let attempt_result = (|| {
                     struct RemoteBatchWrite<'a> {
                         tenant: &'a str,
-                        value: &'a [u8],
+                        value: Option<&'a [u8]>,
+                        value_len: usize,
                         registered_source: Option<*mut c_void>,
                         requests: Vec<RemoteBatchTarget>,
                     }
@@ -945,7 +971,6 @@ impl StoreClient {
                         .iter()
                         .zip(current_routes.iter().cloned())
                     {
-                let checksum = payload_checksum(entry.value);
                 let mut replicas = Vec::with_capacity(entry.targets.len());
                 let mut remote_requests = Vec::new();
                 for (priority, (target, reservation)) in entry
@@ -962,6 +987,13 @@ impl StoreClient {
                             .map(|memory| memory.has_storage_segment(&target.segment_name))
                             .unwrap_or(false);
                     let offset = if is_local {
+                        let value = entry.value.ok_or_else(|| {
+                            StoreError::Unsupported(format!(
+                                "tenant={} key={} non-host-readable registered source cannot use local storage target",
+                                entry.tenant,
+                                entry.object_id.logical_key
+                            ))
+                        })?;
                         let addr = {
                             let state = self.state.lock();
                             state.memory_ref()?.storage_address(
@@ -971,9 +1003,9 @@ impl StoreClient {
                         };
                         unsafe {
                             ptr::copy_nonoverlapping(
-                                entry.value.as_ptr(),
+                                value.as_ptr(),
                                 addr.cast::<u8>(),
-                                entry.value.len(),
+                                entry.value_len,
                             );
                         }
                         addr as u64
@@ -1000,14 +1032,14 @@ impl StoreClient {
                             &target.target_chunks,
                             &target.segment_name,
                             reservation.offset_bytes,
-                            entry.value.len() as u64,
+                            entry.value_len as u64,
                         )?;
                         remote_requests.push(RemoteBatchTarget {
                             owner: target.storage_runtime.clone(),
                             segment_name: target.segment_name.clone(),
                             segment: handle,
                             offset: target_offset,
-                            length: entry.value.len() as u64,
+                            length: entry.value_len as u64,
                             info,
                         });
                         target_offset
@@ -1017,8 +1049,8 @@ impl StoreClient {
                         segment_name: target.segment_name.clone(),
                         offset: Some(offset),
                         segment_offset: reservation.offset_bytes,
-                        length: entry.value.len() as u64,
-                        checksum: Some(checksum),
+                        length: entry.value_len as u64,
+                        checksum: entry.checksum,
                         tier: ReplicaTier::Dram,
                         priority: priority as u16,
                     });
@@ -1027,6 +1059,7 @@ impl StoreClient {
                     remote_writes.push(RemoteBatchWrite {
                         tenant: entry.value_tenant(),
                         value: entry.value,
+                        value_len: entry.value_len,
                         registered_source: entry.registered_source,
                         requests: remote_requests,
                     });
@@ -1106,7 +1139,7 @@ impl StoreClient {
                         }
                     }
                     if write.registered_source.is_none() {
-                        scratch_lengths.push(write.value.len());
+                        scratch_lengths.push(write.value_len);
                         let planned = {
                             let state = self.state.lock();
                             state.memory_ref()?.plan_scratch(&scratch_lengths)
@@ -1150,7 +1183,12 @@ impl StoreClient {
                             .as_ref()
                             .expect("scratch reservation should exist for staged writes")
                             [scratch_position];
-                        copy_into_region(allocation, write.value);
+                        let value = write.value.ok_or_else(|| {
+                            StoreError::Unsupported(format!(
+                                "tenant={tenant} non-host-readable registered source requires direct registered transfer"
+                            ))
+                        })?;
+                        copy_into_region(allocation, value);
                         for request in &write.requests {
                             transfer_requests.extend(Self::target_buffer_transfer_requests(
                                 Opcode::Write,
@@ -1515,7 +1553,7 @@ impl StoreClient {
                     let route = match self.finalize_published_route(
                         pending.quota_reservation.as_ref(),
                         &pending.route,
-                        prepared[index].value.len(),
+                        prepared[index].value_len,
                         "batch_put",
                     ) {
                         Ok(Some(updated)) => updated,
@@ -1625,7 +1663,7 @@ impl StoreClient {
         Ok(published)
     }
 
-    fn validate_unique_requests(&self, requests: &[PutRequest<'_>]) -> Result<()> {
+    fn validate_unique_requests(&self, requests: &[BatchPutItem<'_>]) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
