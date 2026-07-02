@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -12,13 +13,44 @@ namespace mooncake {
 
 struct TenantQuotaState {
     uint64_t requested_quota_bytes = 0;
-    uint64_t effective_quota_bytes = 0;
-    uint64_t used_bytes = 0;
-    uint64_t reserved_bytes = 0;
+    // Atomic fields for lock-free reads in the quota fast-path.
+    // All stores use memory_order_relaxed; the shard mutex provides
+    // ordering guarantees for write-side consistency.
+    std::atomic<uint64_t> effective_quota_bytes{0};
+    std::atomic<uint64_t> used_bytes{0};
+    std::atomic<uint64_t> reserved_bytes{0};
     uint64_t committed_count = 0;
     uint64_t metadata_object_count = 0;
     bool has_explicit_policy = false;
     bool over_quota = false;
+
+    // Explicit copy/move since std::atomic deletes implicit ones.
+    TenantQuotaState() = default;
+    TenantQuotaState(const TenantQuotaState& o)
+        : requested_quota_bytes(o.requested_quota_bytes),
+          effective_quota_bytes(
+              o.effective_quota_bytes.load(std::memory_order_relaxed)),
+          used_bytes(o.used_bytes.load(std::memory_order_relaxed)),
+          reserved_bytes(o.reserved_bytes.load(std::memory_order_relaxed)),
+          committed_count(o.committed_count),
+          metadata_object_count(o.metadata_object_count),
+          has_explicit_policy(o.has_explicit_policy),
+          over_quota(o.over_quota) {}
+    TenantQuotaState& operator=(const TenantQuotaState& o) {
+        requested_quota_bytes = o.requested_quota_bytes;
+        effective_quota_bytes.store(
+            o.effective_quota_bytes.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        used_bytes.store(o.used_bytes.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+        reserved_bytes.store(o.reserved_bytes.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+        committed_count = o.committed_count;
+        metadata_object_count = o.metadata_object_count;
+        has_explicit_policy = o.has_explicit_policy;
+        over_quota = o.over_quota;
+        return *this;
+    }
 };
 
 struct TenantQuotaSnapshot {

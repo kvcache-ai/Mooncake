@@ -595,7 +595,7 @@ MasterService::GetTenantQuotaSnapshotForTesting(
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     const auto shard_idx = getTenantQuotaShardIndex(normalized_tenant);
     const auto& shard = tenant_quota_shards_[shard_idx];
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    SharedMutexLocker lock(&shard.mutex);
     auto it = shard.tenants.find(normalized_tenant);
     if (it == shard.tenants.end()) {
         return std::nullopt;
@@ -612,7 +612,7 @@ std::vector<TenantQuotaSnapshot> MasterService::ListTenantQuotaSnapshots()
     std::vector<TenantQuotaSnapshot> snapshots;
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         const auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         for (const auto& [tenant_id, state] : shard.tenants) {
             if (IsLazyEmptyTenantQuotaState(state)) {
                 continue;
@@ -693,7 +693,7 @@ MasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
         auto& shard =
             tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
         {
-            std::lock_guard<std::mutex> lock(shard.mutex);
+            SharedMutexLocker lock(&shard.mutex);
             auto& state = shard.tenants[normalized_tenant];
             state.requested_quota_bytes = requested_quota_bytes;
             state.has_explicit_policy = true;
@@ -705,7 +705,7 @@ MasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
     {
         auto& shard =
             tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         auto quota_it = shard.tenants.find(normalized_tenant);
         if (quota_it == shard.tenants.end() ||
             !quota_it->second.has_explicit_policy) {
@@ -718,7 +718,7 @@ MasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
         }
         state.has_explicit_policy = false;
         state.requested_quota_bytes = 0;
-        state.effective_quota_bytes = 0;
+        state.effective_quota_bytes.store(0, std::memory_order_relaxed);
         RefreshTenantQuotaOverQuota(state);
     }
 
@@ -931,7 +931,7 @@ bool MasterService::IsTenantRegistered(const std::string& tenant_id) const {
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     const auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    SharedMutexLocker lock(&shard.mutex);
     auto it = shard.tenants.find(normalized_tenant);
     return it != shard.tenants.end() && it->second.has_explicit_policy;
 }
@@ -982,7 +982,7 @@ TenantQuotaPolicySnapshot MasterService::BuildTenantQuotaPolicySnapshot()
     TenantQuotaPolicySnapshot snapshot;
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         const auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         for (const auto& [tenant_id, state] : shard.tenants) {
             if (state.has_explicit_policy) {
                 snapshot.tenant_quotas[tenant_id] = state.requested_quota_bytes;
@@ -1005,7 +1005,7 @@ void MasterService::ApplyTenantQuotaPolicies(
 
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         for (auto it = shard.tenants.begin(); it != shard.tenants.end();) {
             const auto policy_it = snapshot.tenant_quotas.find(it->first);
             auto& state = it->second;
@@ -1017,7 +1017,7 @@ void MasterService::ApplyTenantQuotaPolicies(
             } else {
                 state.has_explicit_policy = false;
                 state.requested_quota_bytes = 0;
-                state.effective_quota_bytes = 0;
+                state.effective_quota_bytes.store(0, std::memory_order_relaxed);
                 if (IsLazyEmptyTenantQuotaState(state)) {
                     it = shard.tenants.erase(it);
                 } else {
@@ -1089,29 +1089,31 @@ uint64_t MasterService::ComputeTenantQuotaDeficit(
     auto& quota_shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
 
-    // Fast path: lock-free quota check using atomic reads.
-    // In the common case (sufficient quota), we avoid acquiring the mutex.
+    // Fast path: shared-lock quota check using atomic reads.
+    // Uses SharedMutexLocker with shared_lock to safely access the map
+    // while allowing concurrent readers. Writers still take exclusive lock.
     if (!disable_quota_fast_path_) {
+        SharedMutexLocker fast_guard(&quota_shard.mutex, shared_lock);
         auto fast_quota_it = quota_shard.tenants.find(normalized_tenant);
         if (fast_quota_it != quota_shard.tenants.end()) {
             const auto& state = fast_quota_it->second;
             const uint64_t used =
-                __atomic_load_n(&state.used_bytes, __ATOMIC_RELAXED);
+                state.used_bytes.load(std::memory_order_relaxed);
             const uint64_t reserved =
-                __atomic_load_n(&state.reserved_bytes, __ATOMIC_RELAXED);
+                state.reserved_bytes.load(std::memory_order_relaxed);
             const unsigned __int128 demand =
                 static_cast<unsigned __int128>(used) +
                 static_cast<unsigned __int128>(reserved) +
                 incoming_quota_charge;
-            if (demand <= __atomic_load_n(&state.effective_quota_bytes,
-                                          __ATOMIC_RELAXED)) {
-                return 0;  // Fast path: sufficient quota, no mutex needed
+            if (demand <=
+                state.effective_quota_bytes.load(std::memory_order_relaxed)) {
+                return 0;
             }
         }
     }
 
-    // Slow path: acquire mutex and recompute under lock
-    std::lock_guard<std::mutex> lock(quota_shard.mutex);
+    // Slow path
+    SharedMutexLocker lock(&quota_shard.mutex);
     auto quota_it = quota_shard.tenants.find(normalized_tenant);
     if (quota_it == quota_shard.tenants.end()) {
         return deficit;
@@ -1161,7 +1163,7 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     std::map<std::string, TenantQuotaState> active_tenants;
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         for (auto it = shard.tenants.begin(); it != shard.tenants.end();) {
             const auto& tenant_id = it->first;
             auto& state = it->second;
@@ -1171,7 +1173,7 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
             }
             if (!state.has_explicit_policy) {
                 state.requested_quota_bytes = 0;
-                state.effective_quota_bytes = 0;
+                state.effective_quota_bytes.store(0, std::memory_order_relaxed);
                 RefreshTenantQuotaOverQuota(state);
             }
             active_tenants.emplace(tenant_id, state);
@@ -1183,7 +1185,7 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
          BuildEffectiveQuotaAssignments(active_tenants, capacity)) {
         auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(
             assignment.tenant_id)];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         auto it = shard.tenants.find(assignment.tenant_id);
         if (it == shard.tenants.end()) {
             continue;
@@ -1209,7 +1211,7 @@ tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
     {
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         auto it = shard.tenants.find(normalized_tenant);
         if (it == shard.tenants.end() || !it->second.has_explicit_policy) {
             return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
@@ -1223,7 +1225,7 @@ tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
             return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
         }
 
-        state.reserved_bytes += bytes;
+        state.reserved_bytes.fetch_add(bytes, std::memory_order_relaxed);
         RefreshTenantQuotaOverQuota(state);
         return {};
     }
@@ -1237,7 +1239,7 @@ void MasterService::CommitTenantQuota(const std::string& tenant_id,
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    SharedMutexLocker lock(&shard.mutex);
     auto it = shard.tenants.find(normalized_tenant);
     if (it == shard.tenants.end()) {
         LOG(ERROR) << "tenant quota commit mismatch tenant="
@@ -1252,11 +1254,11 @@ void MasterService::CommitTenantQuota(const std::string& tenant_id,
                    << ", reserved=" << state.reserved_bytes;
         return;
     }
-    state.reserved_bytes -= bytes;
+    state.reserved_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     if (state.used_bytes > std::numeric_limits<uint64_t>::max() - bytes) {
         state.used_bytes = std::numeric_limits<uint64_t>::max();
     } else {
-        state.used_bytes += bytes;
+        state.used_bytes.fetch_add(bytes, std::memory_order_relaxed);
     }
     ++state.committed_count;
     RefreshTenantQuotaOverQuota(state);
@@ -1272,7 +1274,7 @@ void MasterService::AbortTenantQuota(const std::string& tenant_id,
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
     bool recompute_needed = false;
     {
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         auto it = shard.tenants.find(normalized_tenant);
         if (it == shard.tenants.end()) {
             LOG(ERROR) << "tenant quota abort mismatch tenant="
@@ -1287,7 +1289,7 @@ void MasterService::AbortTenantQuota(const std::string& tenant_id,
                        << ", reserved=" << state.reserved_bytes;
             return;
         }
-        state.reserved_bytes -= bytes;
+        state.reserved_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         if (IsLazyEmptyTenantQuotaState(state)) {
             shard.tenants.erase(it);
             recompute_needed = true;
@@ -1310,7 +1312,7 @@ void MasterService::ReleaseTenantQuota(const std::string& tenant_id,
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
     bool recompute_needed = false;
     {
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         auto it = shard.tenants.find(normalized_tenant);
         if (it == shard.tenants.end()) {
             LOG(ERROR) << "tenant quota release mismatch tenant="
@@ -1325,7 +1327,7 @@ void MasterService::ReleaseTenantQuota(const std::string& tenant_id,
                        << ", used=" << state.used_bytes;
             return;
         }
-        state.used_bytes -= bytes;
+        state.used_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         if (state.committed_count > 0) {
             --state.committed_count;
         }
@@ -1349,7 +1351,7 @@ void MasterService::ReleaseTenantQuotaPartial(const std::string& tenant_id,
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    SharedMutexLocker lock(&shard.mutex);
     auto it = shard.tenants.find(normalized_tenant);
     if (it == shard.tenants.end()) {
         LOG(ERROR) << "tenant quota partial release mismatch tenant="
@@ -1363,7 +1365,7 @@ void MasterService::ReleaseTenantQuotaPartial(const std::string& tenant_id,
                    << ", used=" << state.used_bytes;
         return;
     }
-    state.used_bytes -= bytes;
+    state.used_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     RefreshTenantQuotaOverQuota(state);
 }
 
@@ -1375,7 +1377,7 @@ void MasterService::CommitAdditionalTenantQuota(const std::string& tenant_id,
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    SharedMutexLocker lock(&shard.mutex);
     auto it = shard.tenants.find(normalized_tenant);
     if (it == shard.tenants.end()) {
         LOG(ERROR) << "tenant quota additional commit mismatch tenant="
@@ -1390,11 +1392,11 @@ void MasterService::CommitAdditionalTenantQuota(const std::string& tenant_id,
                    << ", reserved=" << state.reserved_bytes;
         return;
     }
-    state.reserved_bytes -= bytes;
+    state.reserved_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     if (state.used_bytes > std::numeric_limits<uint64_t>::max() - bytes) {
         state.used_bytes = std::numeric_limits<uint64_t>::max();
     } else {
-        state.used_bytes += bytes;
+        state.used_bytes.fetch_add(bytes, std::memory_order_relaxed);
     }
     RefreshTenantQuotaOverQuota(state);
 }
@@ -1412,7 +1414,7 @@ void MasterService::IncrementTenantMetadataObjectCount(
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
     auto& shard =
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    SharedMutexLocker lock(&shard.mutex);
     auto& state = shard.tenants[normalized_tenant];
     if (state.metadata_object_count < std::numeric_limits<uint64_t>::max()) {
         ++state.metadata_object_count;
@@ -1430,7 +1432,7 @@ void MasterService::DecrementTenantMetadataObjectCount(
         tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
     bool recompute_needed = false;
     {
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         auto it = shard.tenants.find(normalized_tenant);
         if (it == shard.tenants.end()) {
             LOG(WARNING) << "tenant metadata object count decrement mismatch "
@@ -1501,7 +1503,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
 
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         for (auto& [_, state] : shard.tenants) {
             state.used_bytes = 0;
             state.reserved_bytes = 0;
@@ -1511,12 +1513,12 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
     }
     for (const auto& tenant_id : metadata_tenants) {
         auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        SharedMutexLocker lock(&shard.mutex);
         auto [it, inserted] = shard.tenants.try_emplace(tenant_id);
         auto& state = it->second;
         if (inserted || !state.has_explicit_policy) {
             state.requested_quota_bytes = 0;
-            state.effective_quota_bytes = 0;
+            state.effective_quota_bytes.store(0, std::memory_order_relaxed);
             state.has_explicit_policy = false;
             LOG(WARNING)
                 << "tenant " << tenant_id
@@ -8816,7 +8818,7 @@ tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
         job = it->second;
     }
 
-    std::lock_guard<std::mutex> job_lock(job->mutex);
+    SharedMutexLocker job_lock(&job->mutex);
     QueryJobResponse response;
     response.id = job->id;
     response.type = job->type;
@@ -8853,7 +8855,7 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
 
     std::vector<std::string> segments_to_restore;
     {
-        std::lock_guard<std::mutex> job_lock(job->mutex);
+        SharedMutexLocker job_lock(&job->mutex);
         if (job->status == JobStatus::SUCCEEDED ||
             job->status == JobStatus::FAILED ||
             job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
@@ -9173,7 +9175,7 @@ void MasterService::ProcessDrainJobs() {
         if (!job) {
             continue;
         }
-        std::lock_guard<std::mutex> job_lock(job->mutex);
+        SharedMutexLocker job_lock(&job->mutex);
         if (job->status == JobStatus::SUCCEEDED ||
             job->status == JobStatus::FAILED ||
             job->status == JobStatus::CANCELED) {

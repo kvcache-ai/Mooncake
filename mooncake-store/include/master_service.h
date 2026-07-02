@@ -1248,7 +1248,7 @@ class MasterService {
 
     static constexpr size_t kNumTenantQuotaShards = 1024;
     struct TenantQuotaShard {
-        mutable std::mutex mutex;
+        mutable SharedMutex mutex;
         std::unordered_map<std::string, TenantQuotaState> tenants
             GUARDED_BY(mutex);
     };
@@ -2065,7 +2065,7 @@ class MasterService {
     };
 
     struct DrainJob {
-        mutable std::mutex mutex;
+        mutable SharedMutex mutex;
         UUID id;
         JobType type{JobType::DRAIN};
         JobStatus status{JobStatus::CREATED};
