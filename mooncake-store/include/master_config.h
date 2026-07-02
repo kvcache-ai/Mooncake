@@ -54,6 +54,9 @@ struct MasterConfig {
     std::string ha_backend_type;
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
+    std::string etcd_ca_file;
+    std::string etcd_cert_file;
+    std::string etcd_key_file;
 
     std::string cluster_id;
     std::string root_fs_dir;
@@ -168,6 +171,9 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
+    std::string etcd_ca_file;
+    std::string etcd_cert_file;
+    std::string etcd_key_file;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -263,6 +269,9 @@ class MasterServiceSupervisorConfig {
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
         ha_backend_type = config.ha_backend_type;
         etcd_endpoints = config.etcd_endpoints;
+        etcd_ca_file = config.etcd_ca_file;
+        etcd_cert_file = config.etcd_cert_file;
+        etcd_key_file = config.etcd_key_file;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);

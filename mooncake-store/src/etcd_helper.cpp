@@ -11,10 +11,35 @@ namespace mooncake {
 std::string EtcdHelper::connected_endpoints_ = "";
 std::mutex EtcdHelper::etcd_mutex_;
 bool EtcdHelper::etcd_connected_ = false;
+std::string EtcdHelper::etcd_ca_file_ = "";
+std::string EtcdHelper::etcd_cert_file_ = "";
+std::string EtcdHelper::etcd_key_file_ = "";
+
+void EtcdHelper::SetTLSConfig(const std::string& ca_file,
+                              const std::string& cert_file,
+                              const std::string& key_file) {
+    etcd_ca_file_ = ca_file;
+    etcd_cert_file_ = cert_file;
+    etcd_key_file_ = key_file;
+}
+
+bool EtcdHelper::IsTLSConfigured() {
+    return !etcd_ca_file_.empty() || !etcd_cert_file_.empty() ||
+           !etcd_key_file_.empty();
+}
 
 #ifdef STORE_USE_ETCD
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
+    // If TLS is globally configured, delegate to the TLS variant
+    if (IsTLSConfigured()) {
+        LOG(INFO) << "TLS is configured for etcd, delegating to "
+                     "ConnectToEtcdStoreClientWithTLS (ca="
+                  << etcd_ca_file_ << ", cert=" << etcd_cert_file_
+                  << ", key=" << etcd_key_file_ << ")";
+        return ConnectToEtcdStoreClientWithTLS(etcd_endpoints, etcd_ca_file_,
+                                               etcd_cert_file_, etcd_key_file_);
+    }
     std::lock_guard<std::mutex> lock(etcd_mutex_);
     if (etcd_connected_) {
         if (connected_endpoints_ != etcd_endpoints) {
@@ -42,7 +67,57 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     }
 }
 
+ErrorCode EtcdHelper::ConnectToEtcdStoreClientWithTLS(
+    const std::string& etcd_endpoints, const std::string& ca_file,
+    const std::string& cert_file, const std::string& key_file) {
+    std::lock_guard<std::mutex> lock(etcd_mutex_);
+    if (etcd_connected_) {
+        if (connected_endpoints_ != etcd_endpoints) {
+            LOG(ERROR) << "Etcd client already connected to "
+                       << connected_endpoints_
+                       << ", while trying to connect to " << etcd_endpoints;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        return ErrorCode::OK;
+    } else {
+        // If no TLS files provided, fall back to the non-TLS path
+        if (ca_file.empty() && cert_file.empty() && key_file.empty()) {
+            LOG(WARNING) << "ConnectToEtcdStoreClientWithTLS called with empty "
+                            "TLS file paths, falling back to non-TLS";
+            return ConnectToEtcdStoreClient(etcd_endpoints);
+        }
+        LOG(INFO) << "Connecting to etcd store client with TLS (ca="
+                  << ca_file << ", cert=" << cert_file
+                  << ", key=" << key_file << ")";
+        char* err_msg = nullptr;
+        int ret = NewStoreEtcdClientWithTLS(
+            const_cast<char*>(etcd_endpoints.c_str()),
+            const_cast<char*>(ca_file.c_str()),
+            const_cast<char*>(cert_file.c_str()),
+            const_cast<char*>(key_file.c_str()),
+            &err_msg);
+        if (ret != 0 && ret != -2) {
+            LOG(ERROR) << "Failed to initialize etcd TLS client: " << err_msg;
+            free(err_msg);
+            err_msg = nullptr;
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+        connected_endpoints_ = etcd_endpoints;
+        etcd_connected_ = true;
+        return ErrorCode::OK;
+    }
+}
+
 ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {
+    // If TLS is globally configured, delegate to the TLS variant
+    if (IsTLSConfigured()) {
+        LOG(INFO) << "TLS is configured for etcd, delegating to "
+                     "ResetEtcdStoreClientWithTLS (ca="
+                  << etcd_ca_file_ << ", cert=" << etcd_cert_file_
+                  << ", key=" << etcd_key_file_ << ")";
+        return ResetEtcdStoreClientWithTLS(etcd_endpoints, etcd_ca_file_,
+                                           etcd_cert_file_, etcd_key_file_);
+    }
     std::lock_guard<std::mutex> lock(etcd_mutex_);
 
     char* err_msg = nullptr;
@@ -50,6 +125,42 @@ ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {
         const_cast<char*>(etcd_endpoints.c_str()), &err_msg);
     if (ret != 0) {
         LOG(ERROR) << "Failed to reset etcd store client: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+
+    connected_endpoints_ = etcd_endpoints;
+    etcd_connected_ = true;
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::ResetEtcdStoreClientWithTLS(
+    const std::string& etcd_endpoints, const std::string& ca_file,
+    const std::string& cert_file, const std::string& key_file) {
+    std::lock_guard<std::mutex> lock(etcd_mutex_);
+
+    // If no TLS files provided, fall back to the non-TLS path
+    if (ca_file.empty() && cert_file.empty() && key_file.empty()) {
+        LOG(WARNING) << "ResetEtcdStoreClientWithTLS called with empty "
+                        "TLS file paths, falling back to non-TLS";
+        return ResetEtcdStoreClient(etcd_endpoints);
+    }
+    LOG(INFO) << "Resetting etcd store client with TLS (ca="
+              << ca_file << ", cert=" << cert_file
+              << ", key=" << key_file << ")";
+
+    char* err_msg = nullptr;
+    int ret = EtcdStoreResetClientWrapperWithTLS(
+        const_cast<char*>(etcd_endpoints.c_str()),
+        const_cast<char*>(ca_file.c_str()),
+        const_cast<char*>(cert_file.c_str()),
+        const_cast<char*>(key_file.c_str()),
+        &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to reset etcd store TLS client: "
                    << (err_msg == nullptr ? "" : err_msg);
         if (err_msg != nullptr) {
             free(err_msg);
@@ -605,6 +716,40 @@ ErrorCode EtcdHelper::WaitWatchWithPrefixStopped(const char* prefix,
     (void)timeout_ms;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::ConnectToEtcdStoreClientWithTLS(
+    const std::string& etcd_endpoints, const std::string& ca_file,
+    const std::string& cert_file, const std::string& key_file) {
+    (void)etcd_endpoints;
+    (void)ca_file;
+    (void)cert_file;
+    (void)key_file;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::ResetEtcdStoreClientWithTLS(
+    const std::string& etcd_endpoints, const std::string& ca_file,
+    const std::string& cert_file, const std::string& key_file) {
+    (void)etcd_endpoints;
+    (void)ca_file;
+    (void)cert_file;
+    (void)key_file;
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+}
+
+void EtcdHelper::SetTLSConfig(const std::string& ca_file,
+                              const std::string& cert_file,
+                              const std::string& key_file) {
+    (void)ca_file;
+    (void)cert_file;
+    (void)key_file;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+}
+
+bool EtcdHelper::IsTLSConfigured() {
+    return false;
 }
 
 #endif

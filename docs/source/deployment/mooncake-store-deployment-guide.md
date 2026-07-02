@@ -147,6 +147,43 @@ mooncake_master \
 
 Each instance must specify its own reachable `--rpc_address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
+**etcd TLS support:**
+
+When the HA etcd cluster requires TLS client authentication, provide certificate paths with the following flags:
+
+```bash
+mooncake_master \
+  --enable_ha=true \
+  --etcd_endpoints="https://10.0.0.1:2379;https://10.0.0.2:2379;https://10.0.0.3:2379" \
+  --etcd_ca_file=/etc/etcd/ca.pem \
+  --etcd_cert_file=/etc/etcd/client.pem \
+  --etcd_key_file=/etc/etcd/client-key.pem \
+  --rpc_address=10.0.0.1
+```
+
+- `--etcd_ca_file`: Path to the CA certificate file (required for verifying the etcd server).
+- `--etcd_cert_file`: Path to the client certificate file (required for mTLS).
+- `--etcd_key_file`: Path to the client private key file (required for mTLS).
+
+These flags may also be specified via the master's configuration file (see `etcd_ca_file` / `etcd_cert_file` / `etcd_key_file` keys). If none are provided, the connection falls back to plain-text (non-TLS), preserving backward compatibility. TLS configuration takes effect before the first etcd connection is established.
+
+**`mooncake_client` TLS support:**
+
+When running a `mooncake_client` in HA mode with TLS-protected etcd, supply the same certificate flags:
+
+```bash
+mooncake_client \
+  --global_segment_size="4GB" \
+  --master_server_address="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --metadata_server="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --port=50052 \
+  --etcd_ca_file=/etc/etcd/ca.pem \
+  --etcd_cert_file=/etc/etcd/client.pem \
+  --etcd_key_file=/etc/etcd/client-key.pem
+```
+
+> **Important:** The `--etcd_ca_file`, `--etcd_cert_file`, and `--etcd_key_file` flags are **only available when mooncake is built with `STORE_USE_ETCD=ON`**. The TLS configuration is applied to **both** the HA backend (leader election) and the Transfer Engine's metadata etcd connection. It must be provided **before** any etcd connection is made; `ParseCommandLineFlags` handles this automatically by calling the TLS init functions at the top of `main()`.
+
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
 ---
@@ -487,6 +524,9 @@ mooncake_master \
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | etcd endpoints, semicolon separated (when `--ha_backend_type=etcd`) |
+| `--etcd_ca_file` | empty | Path to CA certificate file for etcd TLS connections |
+| `--etcd_cert_file` | empty | Path to client certificate file for etcd TLS connections |
+| `--etcd_key_file` | empty | Path to client key file for etcd TLS connections |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 
 ```{caution}
@@ -711,6 +751,9 @@ mooncake_client \
 | `--device_names` | empty | Transfer device name(s), comma-separated |
 | `--threads` | `1` | Client worker thread count |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
+| `--etcd_ca_file` | empty | CA certificate file path for etcd TLS (HA mode) |
+| `--etcd_cert_file` | empty | Client certificate file path for etcd TLS (HA mode) |
+| `--etcd_key_file` | empty | Client key file path for etcd TLS (HA mode) |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 
 ### Engine Runtime Tuning (`MC_*`)

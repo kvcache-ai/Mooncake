@@ -320,6 +320,10 @@ add_executable(mooncake_client real_client_main.cpp)
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
                                               asio_shared)
 
+if(STORE_USE_ETCD)
+  add_dependencies(mooncake_client build_etcd_wrapper)
+endif()
+
 # Optimize binary sizes only in Release mode
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")

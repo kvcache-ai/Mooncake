@@ -6,6 +6,11 @@
 #include "config.h"
 #include "real_client.h"
 
+#ifdef STORE_USE_ETCD
+#include "libetcd_wrapper.h"
+#include "etcd_helper.h"
+#endif
+
 using namespace mooncake;
 
 DEFINE_string(host, "0.0.0.0", "Local hostname");
@@ -26,6 +31,12 @@ DEFINE_bool(start_offload_rpc_server, true,
             "Disable for a write-only owner.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
+
+#ifdef STORE_USE_ETCD
+DEFINE_string(etcd_ca_file, "", "Path to CA certificate file for etcd TLS");
+DEFINE_string(etcd_cert_file, "", "Path to client certificate file for etcd TLS");
+DEFINE_string(etcd_key_file, "", "Path to client key file for etcd TLS");
+#endif
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
@@ -105,6 +116,23 @@ int main(int argc, char *argv[]) {
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
     globalConfig().ascend_agent_mode = true;
+#endif
+
+#ifdef STORE_USE_ETCD
+    if (!FLAGS_etcd_ca_file.empty() || !FLAGS_etcd_cert_file.empty() ||
+        !FLAGS_etcd_key_file.empty()) {
+        // Configure TLS for transfer engine's etcd client (globalClient)
+        SetGlobalTLSConfig(
+            const_cast<char*>(FLAGS_etcd_ca_file.c_str()),
+            const_cast<char*>(FLAGS_etcd_cert_file.c_str()),
+            const_cast<char*>(FLAGS_etcd_key_file.c_str()));
+        // Configure TLS for HA backend's etcd store client (storeClient)
+        mooncake::EtcdHelper::SetTLSConfig(FLAGS_etcd_ca_file,
+                                            FLAGS_etcd_cert_file,
+                                            FLAGS_etcd_key_file);
+        LOG(INFO) << "etcd TLS configured for client (ca="
+                  << FLAGS_etcd_ca_file << ")";
+    }
 #endif
 
     auto client_inst = RealClient::create();
