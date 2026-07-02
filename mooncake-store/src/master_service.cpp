@@ -7207,2335 +7207,2714 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         bool has_evictable = can_evict_replicas(it->second);
                         if (has_evictable) shard_evictable_count++;
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
-            // To achieve evicted_count / object_count = evict_ratio_target,
-            // ideally how many object should be evicted in this shard
-            const long ideal_evict_num =
-                std::ceil(object_count * evict_ratio_target) - evicted_count;
+                            // To achieve evicted_count / object_count =
+                            // evict_ratio_target, ideally how many object
+                            // should be evicted in this shard
+                            const long ideal_evict_num =
+                                std::ceil(object_count * evict_ratio_target) -
+                                evicted_count;
 
-            std::vector<std::chrono::system_clock::time_point>
-                candidates;  // can be removed
-            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
-                for (auto it = tenant_state.metadata.begin();
-                     it != tenant_state.metadata.end(); it++) {
-                    if (it->second.IsHardPinned()) {
-                        continue;
-                    }
-                    if (!it->second.IsLeaseExpired(now) ||
-                        !can_evict_replicas(it->second)) {
-                        continue;
-                    }
-                    if (!it->second.IsSoftPinned(now)) {
-                        // CMS frequency-aware: hot objects use virtual
-                        // lease extension, biasing eviction toward cold
-                        // objects.
-                        auto effective_timeout =
-                            AdjustLeaseTimeoutWithFrequency(
-                                tenant_id, it->first, it->second.lease_timeout);
-                        if (ideal_evict_num > 0) {
-                            candidates.push_back(effective_timeout);
-                        } else {
-                            no_pin_objects.push_back(effective_timeout);
-                        }
-                    } else if (allow_evict_soft_pinned_objects_) {
-                        soft_pin_objects.push_back(
-                            AdjustLeaseTimeoutWithFrequency(
-                                tenant_id, it->first,
-                                it->second.lease_timeout));
-                    }
-                }
-            }
-
-            if (ideal_evict_num > 0 && !candidates.empty()) {
-                long evict_num =
-                    std::min(ideal_evict_num, (long)candidates.size());
-                long shard_evicted_count =
-                    0;  // number of objects evicted from this shard
-                std::nth_element(candidates.begin(),
-                                 candidates.begin() + (evict_num - 1),
-                                 candidates.end());
-                auto target_timeout = candidates[evict_num - 1];
-                for (auto tenant_it = shard->tenants.begin();
-                     tenant_it != shard->tenants.end();) {
-                    auto& tenant_state = tenant_it->second;
-                    auto it = tenant_state.metadata.begin();
-                    while (it != tenant_state.metadata.end()) {
-                        if (it->second.IsHardPinned() ||
-                            !it->second.IsLeaseExpired(now) ||
-                            it->second.IsSoftPinned(now) ||
-                            !can_evict_replicas(it->second)) {
-                            ++it;
-                            continue;
-                        if (!it->second.IsSoftPinned(now)) {
-                            local_candidates[t].push_back(
-                                {s, tenant_id, it->first,
-                                 it->second.lease_timeout});
-                        } else if (allow_evict_soft_pinned_objects_) {
-                            local_soft_pin[t].push_back(
-                                it->second.lease_timeout);
-                        }
-                        if (AdjustLeaseTimeoutWithFrequency(
-                                tenant_it->first, it->first,
-                                it->second.lease_timeout) <= target_timeout) {
-                            auto evict_result = try_evict_group_or_object(
-                                tenant_it->first, it->first, it->second, shard,
-                                tenant_state, deferred_replicas,
-                                /*allow_soft_pinned=*/false);
-                            total_freed_size += evict_result.freed_bytes;
-                            if (it->second.IsValid() == false) {
-                                it = EraseMetadata(tenant_state, it,
-                                                   tenant_it->first);
-                            } else {
-                                ++it;
+                        std::vector<std::chrono::system_clock::time_point>
+                            candidates;  // can be removed
+                        for (const auto& [tenant_id, tenant_state] :
+                             shard->tenants) {
+                            for (auto it = tenant_state.metadata.begin();
+                                 it != tenant_state.metadata.end(); it++) {
+                                if (it->second.IsHardPinned()) {
+                                    continue;
+                                }
+                                if (!it->second.IsLeaseExpired(now) ||
+                                    !can_evict_replicas(it->second)) {
+                                    continue;
+                                }
+                                if (!it->second.IsSoftPinned(now)) {
+                                    // CMS frequency-aware: hot objects use
+                                    // virtual lease extension, biasing eviction
+                                    // toward cold objects.
+                                    auto effective_timeout =
+                                        AdjustLeaseTimeoutWithFrequency(
+                                            tenant_id, it->first,
+                                            it->second.lease_timeout);
+                                    if (ideal_evict_num > 0) {
+                                        candidates.push_back(effective_timeout);
+                                    } else {
+                                        no_pin_objects.push_back(
+                                            effective_timeout);
+                                    }
+                                } else if (allow_evict_soft_pinned_objects_) {
+                                    soft_pin_objects.push_back(
+                                        AdjustLeaseTimeoutWithFrequency(
+                                            tenant_id, it->first,
+                                            it->second.lease_timeout));
+                                }
                             }
-                            shard_evicted_count += evict_result.evicted_objects;
-                        } else {
-                            no_pin_objects.push_back(it->second.lease_timeout);
-                            ++it;
                         }
+
+                        if (ideal_evict_num > 0 && !candidates.empty()) {
+                            long evict_num = std::min(ideal_evict_num,
+                                                      (long)candidates.size());
+                            long shard_evicted_count =
+                                0;  // number of objects evicted from this shard
+                            std::nth_element(
+                                candidates.begin(),
+                                candidates.begin() + (evict_num - 1),
+                                candidates.end());
+                            auto target_timeout = candidates[evict_num - 1];
+                            for (auto tenant_it = shard->tenants.begin();
+                                 tenant_it != shard->tenants.end();) {
+                                auto& tenant_state = tenant_it->second;
+                                auto it = tenant_state.metadata.begin();
+                                while (it != tenant_state.metadata.end()) {
+                                    if (it->second.IsHardPinned() ||
+                                        !it->second.IsLeaseExpired(now) ||
+                                        it->second.IsSoftPinned(now) ||
+                                        !can_evict_replicas(it->second)) {
+                                        ++it;
+                                        continue;
+                                        if (!it->second.IsSoftPinned(now)) {
+                                            local_candidates[t].push_back(
+                                                {s, tenant_id, it->first,
+                                                 it->second.lease_timeout});
+                                        } else if (
+                                            allow_evict_soft_pinned_objects_) {
+                                            local_soft_pin[t].push_back(
+                                                it->second.lease_timeout);
+                                        }
+                                        if (AdjustLeaseTimeoutWithFrequency(
+                                                tenant_it->first, it->first,
+                                                it->second.lease_timeout) <=
+                                            target_timeout) {
+                                            auto evict_result =
+                                                try_evict_group_or_object(
+                                                    tenant_it->first, it->first,
+                                                    it->second, shard,
+                                                    tenant_state,
+                                                    deferred_replicas,
+                                                    /*allow_soft_pinned=*/
+                                                    false);
+                                            total_freed_size +=
+                                                evict_result.freed_bytes;
+                                            if (it->second.IsValid() == false) {
+                                                it = EraseMetadata(
+                                                    tenant_state, it,
+                                                    tenant_it->first);
+                                            } else {
+                                                ++it;
+                                            }
+                                            shard_evicted_count +=
+                                                evict_result.evicted_objects;
+                                        } else {
+                                            no_pin_objects.push_back(
+                                                it->second.lease_timeout);
+                                            ++it;
+                                        }
+                                    }
+                                    if (tenant_state.Empty()) {
+                                        tenant_it =
+                                            shard->tenants.erase(tenant_it);
+                                    } else {
+                                        ++tenant_it;
+                                    }
+                                }
+                                local_object_count[t] += shard_metadata_count;
+                                local_eviction_base[t] += shard_evictable_count;
+                            }
+                        });
                     }
-                    if (tenant_state.Empty()) {
-                        tenant_it = shard->tenants.erase(tenant_it);
-                    } else {
-                        ++tenant_it;
+                    for (auto& t : threads) t.join();
+
+                    // Merge per-thread results
+                    long total_eviction_base = 0;
+                    for (auto v : local_eviction_base) total_eviction_base += v;
+
+                    long object_count = 0;
+                    for (auto v : local_object_count) object_count += v;
+
+                    std::vector<Candidate> candidates;
+                    {
+                        size_t total = 0;
+                        for (auto& v : local_candidates) total += v.size();
+                        candidates.reserve(total);
                     }
-                }
-                local_object_count[t] += shard_metadata_count;
-                local_eviction_base[t] += shard_evictable_count;
-            }
-        });
-    }
-    for (auto& t : threads) t.join();
+                    for (auto& v : local_candidates) {
+                        candidates.insert(candidates.end(),
+                                          std::make_move_iterator(v.begin()),
+                                          std::make_move_iterator(v.end()));
+                    }
 
-    // Merge per-thread results
-    long total_eviction_base = 0;
-    for (auto v : local_eviction_base) total_eviction_base += v;
+                    std::vector<std::chrono::system_clock::time_point>
+                        soft_pin_objects;
+                    {
+                        size_t total = 0;
+                        for (auto& v : local_soft_pin) total += v.size();
+                        soft_pin_objects.reserve(total);
+                    }
+                    for (auto& v : local_soft_pin) {
+                        soft_pin_objects.insert(
+                            soft_pin_objects.end(),
+                            std::make_move_iterator(v.begin()),
+                            std::make_move_iterator(v.end()));
+                    }
 
-    long object_count = 0;
-    for (auto v : local_object_count) object_count += v;
+                    if (total_eviction_base == 0) {
+                        need_mem_eviction_ = false;
+                        VLOG(1)
+                            << "[EVICT-DIAG] object_count=" << object_count
+                            << " eviction_base=0 (no evictable memory objects)";
+                        return;
+                    }
 
-    std::vector<Candidate> candidates;
-    {
-        size_t total = 0;
-        for (auto& v : local_candidates) total += v.size();
-        candidates.reserve(total);
-    }
-    for (auto& v : local_candidates) {
-        candidates.insert(candidates.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
-    }
+                    // ===== Phase 2: Serial eviction via key lookup =====
+                    long evicted_count = 0;
+                    uint64_t total_freed_size = 0;
+                    std::vector<std::chrono::system_clock::time_point>
+                        no_pin_objects;
+                    std::vector<std::vector<Replica>> deferred_replicas;
 
-    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
-    {
-        size_t total = 0;
-        for (auto& v : local_soft_pin) total += v.size();
-        soft_pin_objects.reserve(total);
-    }
-    for (auto& v : local_soft_pin) {
-        soft_pin_objects.insert(soft_pin_objects.end(),
-                                std::make_move_iterator(v.begin()),
-                                std::make_move_iterator(v.end()));
-    }
+                    // First pass: evict candidates with no soft pin
+                    if (!candidates.empty()) {
+                        long ideal_evict_num =
+                            std::ceil(total_eviction_base * evict_ratio_target);
+                        long evict_num =
+                            std::min(ideal_evict_num, (long)candidates.size());
 
-    if (total_eviction_base == 0) {
-        need_mem_eviction_ = false;
-        VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
-                << " eviction_base=0 (no evictable memory objects)";
-        return;
-    }
+                        std::nth_element(
+                            candidates.begin(),
+                            candidates.begin() + (evict_num - 1),
+                            candidates.end(),
+                            [](const Candidate& a, const Candidate& b) {
+                                return a.lease_timeout < b.lease_timeout;
+                            });
+                        auto target_timeout =
+                            candidates[evict_num - 1].lease_timeout;
 
-    // ===== Phase 2: Serial eviction via key lookup =====
-    long evicted_count = 0;
-    uint64_t total_freed_size = 0;
-    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
-    std::vector<std::vector<Replica>> deferred_replicas;
-
-    // First pass: evict candidates with no soft pin
-    if (!candidates.empty()) {
-        long ideal_evict_num =
-            std::ceil(total_eviction_base * evict_ratio_target);
-        long evict_num = std::min(ideal_evict_num, (long)candidates.size());
-
-        std::nth_element(candidates.begin(),
-                         candidates.begin() + (evict_num - 1), candidates.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.lease_timeout < b.lease_timeout;
-                         });
-        auto target_timeout = candidates[evict_num - 1].lease_timeout;
-
-        // Treat evict_num as a minimum: if re-validation skips a candidate,
-        // continue trying the next one so actual evicted count reaches
-        // evict_num. This matches the old per-shard over-eviction behavior.
-        long evicted_this_pass = 0;
-        for (auto& c : candidates) {
-            if (evicted_this_pass >= evict_num &&
-                c.lease_timeout > target_timeout) {
-                no_pin_objects.push_back(c.lease_timeout);
-                continue;
-            }
-            {
-                MetadataShardAccessorRW shard(this, c.shard_idx);
-                auto tenant_it = shard->tenants.find(c.tenant_id);
-                if (tenant_it == shard->tenants.end()) continue;
-                auto& tenant_state = tenant_it->second;
-                auto it = tenant_state.metadata.find(c.key);
-                if (it == tenant_state.metadata.end()) continue;
-                // Re-validate: state may have changed since Phase 1
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
-                    no_pin_objects.push_back(c.lease_timeout);
-                    continue;
-                }
-                auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key, it->second, shard, tenant_state,
-                    deferred_replicas,
-                    /*allow_soft_pinned=*/false);
-                total_freed_size += evict_result.freed_bytes;
-                if (!it->second.IsValid()) {
-                    EraseMetadata(tenant_state, it, c.tenant_id,
-                                  QuotaEraseMode::kFull, &shard);
-                }
-                if (tenant_state.Empty()) {
-                    shard->tenants.erase(tenant_it);
-                }
-                evicted_count += evict_result.evicted_objects;
-                evicted_this_pass += evict_result.evicted_objects;
-            }
-            deferred_replicas.clear();
-        }
-    }
-
-    // Try releasing discarded replicas before we decide whether to do the
-    // second pass.
-    uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
-
-    // The ideal number of objects to evict in the second pass
-    long target_evict_num =
-        std::ceil(total_eviction_base * evict_ratio_lowerbound) -
-        evicted_count - released_discarded_cnt;
-    // The actual number of objects we can evict in the second pass
-    target_evict_num =
-        std::min(target_evict_num,
-                 (long)no_pin_objects.size() + (long)soft_pin_objects.size());
-
-    // Do second pass eviction only if 1). there are candidates that can be
-    // evicted AND 2). The evicted number in the first pass is less than
-    // evict_ratio_lowerbound.
-    if (target_evict_num > 0) {
-        if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
-            // Second pass A: only evict objects without soft pin.
-            std::nth_element(no_pin_objects.begin(),
-                             no_pin_objects.begin() + (target_evict_num - 1),
-                             no_pin_objects.end());
-            auto target_timeout = no_pin_objects[target_evict_num - 1];
-
-            // Evict via key lookup — avoid full metadata traversal
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                {
-                    MetadataShardAccessorRW shard(this,
-                                                  (start_idx + i) % kNumShards);
-                    for (auto tenant_it = shard->tenants.begin();
-                         tenant_it != shard->tenants.end() &&
-                         target_evict_num > 0;) {
-                        auto& tenant_state = tenant_it->second;
-                        auto it = tenant_state.metadata.begin();
-                        while (it != tenant_state.metadata.end() &&
-                               target_evict_num > 0) {
-                            if (!it->second.IsHardPinned() &&
-                                it->second.IsLeaseExpired(now) &&
-                                AdjustLeaseTimeoutWithFrequency(
-                                    tenant_it->first, it->first,
-                                    it->second.lease_timeout) <=
-                                    target_timeout &&
-                                !it->second.IsSoftPinned(now) &&
-                                can_evict_replicas(it->second)) {
+                        // Treat evict_num as a minimum: if re-validation skips
+                        // a candidate, continue trying the next one so actual
+                        // evicted count reaches evict_num. This matches the old
+                        // per-shard over-eviction behavior.
+                        long evicted_this_pass = 0;
+                        for (auto& c : candidates) {
+                            if (evicted_this_pass >= evict_num &&
+                                c.lease_timeout > target_timeout) {
+                                no_pin_objects.push_back(c.lease_timeout);
+                                continue;
+                            }
+                            {
+                                MetadataShardAccessorRW shard(this,
+                                                              c.shard_idx);
+                                auto tenant_it =
+                                    shard->tenants.find(c.tenant_id);
+                                if (tenant_it == shard->tenants.end()) continue;
+                                auto& tenant_state = tenant_it->second;
+                                auto it = tenant_state.metadata.find(c.key);
+                                if (it == tenant_state.metadata.end()) continue;
+                                // Re-validate: state may have changed since
+                                // Phase 1
+                                if (!it->second.IsLeaseExpired(now) ||
+                                    it->second.IsSoftPinned(now) ||
+                                    !can_evict_replicas(it->second)) {
+                                    no_pin_objects.push_back(c.lease_timeout);
+                                    continue;
+                                }
                                 auto evict_result = try_evict_group_or_object(
-                                    tenant_it->first, it->first, it->second,
-                                    shard, tenant_state, deferred_replicas,
+                                    c.tenant_id, c.key, it->second, shard,
+                                    tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/false);
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!it->second.IsValid()) {
+                                    EraseMetadata(tenant_state, it, c.tenant_id,
+                                                  QuotaEraseMode::kFull,
+                                                  &shard);
+                                }
+                                if (tenant_state.Empty()) {
+                                    shard->tenants.erase(tenant_it);
+                                }
+                                evicted_count += evict_result.evicted_objects;
+                                evicted_this_pass +=
+                                    evict_result.evicted_objects;
+                            }
+                            deferred_replicas.clear();
+                        }
+                    }
+
+                    // Try releasing discarded replicas before we decide whether
+                    // to do the second pass.
+                    uint64_t released_discarded_cnt =
+                        ReleaseExpiredDiscardedReplicas(now);
+
+                    // The ideal number of objects to evict in the second pass
+                    long target_evict_num = std::ceil(total_eviction_base *
+                                                      evict_ratio_lowerbound) -
+                                            evicted_count -
+                                            released_discarded_cnt;
+                    // The actual number of objects we can evict in the second
+                    // pass
+                    target_evict_num = std::min(
+                        target_evict_num, (long)no_pin_objects.size() +
+                                              (long)soft_pin_objects.size());
+
+                    // Do second pass eviction only if 1). there are candidates
+                    // that can be evicted AND 2). The evicted number in the
+                    // first pass is less than evict_ratio_lowerbound.
+                    if (target_evict_num > 0) {
+                        if (target_evict_num <=
+                            static_cast<long>(no_pin_objects.size())) {
+                            // Second pass A: only evict objects without soft
+                            // pin.
+                            std::nth_element(
+                                no_pin_objects.begin(),
+                                no_pin_objects.begin() + (target_evict_num - 1),
+                                no_pin_objects.end());
+                            auto target_timeout =
+                                no_pin_objects[target_evict_num - 1];
+
+                            // Evict via key lookup — avoid full metadata
+                            // traversal
+                            for (size_t i = 0;
+                                 i < kNumShards && target_evict_num > 0; i++) {
+                                {
+                                    MetadataShardAccessorRW shard(
+                                        this, (start_idx + i) % kNumShards);
+                                    for (auto tenant_it =
+                                             shard->tenants.begin();
+                                         tenant_it != shard->tenants.end() &&
+                                         target_evict_num > 0;) {
+                                        auto& tenant_state = tenant_it->second;
+                                        auto it = tenant_state.metadata.begin();
+                                        while (
+                                            it != tenant_state.metadata.end() &&
+                                            target_evict_num > 0) {
+                                            if (!it->second.IsHardPinned() &&
+                                                it->second.IsLeaseExpired(
+                                                    now) &&
+                                                AdjustLeaseTimeoutWithFrequency(
+                                                    tenant_it->first, it->first,
+                                                    it->second.lease_timeout) <=
+                                                    target_timeout &&
+                                                !it->second.IsSoftPinned(now) &&
+                                                can_evict_replicas(
+                                                    it->second)) {
+                                                auto evict_result =
+                                                    try_evict_group_or_object(
+                                                        tenant_it->first,
+                                                        it->first, it->second,
+                                                        shard, tenant_state,
+                                                        deferred_replicas,
+                                                        /*allow_soft_pinned=*/
+                                                        false);
+                                                total_freed_size +=
+                                                    evict_result.freed_bytes;
+                                                if (!it->second.IsValid()) {
+                                                    it = EraseMetadata(
+                                                        tenant_state, it,
+                                                        tenant_it->first,
+                                                        QuotaEraseMode::kFull,
+                                                        &shard);
+                                                } else {
+                                                    ++it;
+                                                }
+                                                evicted_count +=
+                                                    evict_result
+                                                        .evicted_objects;
+                                                target_evict_num -=
+                                                    evict_result
+                                                        .evicted_objects;
+                                            } else {
+                                                ++it;
+                                            }
+                                        }
+                                        if (tenant_state.Empty()) {
+                                            tenant_it =
+                                                shard->tenants.erase(tenant_it);
+                                        } else {
+                                            ++tenant_it;
+                                        }
+                                    }
+                                }
+                                deferred_replicas.clear();
+                            }
+                        } else if (!soft_pin_objects.empty()) {
+                            // Second pass B: Prioritize evicting objects
+                            // without soft pin, but also allow evicting soft
+                            // pinned objects.
+                            const long soft_pin_evict_num =
+                                target_evict_num -
+                                static_cast<long>(no_pin_objects.size());
+                            std::nth_element(soft_pin_objects.begin(),
+                                             soft_pin_objects.begin() +
+                                                 (soft_pin_evict_num - 1),
+                                             soft_pin_objects.end());
+                            auto soft_target_timeout =
+                                soft_pin_objects[soft_pin_evict_num - 1];
+
+                            for (size_t i = 0;
+                                 i < kNumShards && target_evict_num > 0; i++) {
+                                {
+                                    MetadataShardAccessorRW shard(
+                                        this, (start_idx + i) % kNumShards);
+
+                                    for (auto tenant_it =
+                                             shard->tenants.begin();
+                                         tenant_it != shard->tenants.end() &&
+                                         target_evict_num > 0;) {
+                                        auto& tenant_state = tenant_it->second;
+                                        auto it = tenant_state.metadata.begin();
+                                        while (
+                                            it != tenant_state.metadata.end() &&
+                                            target_evict_num > 0) {
+                                            if (it->second.IsHardPinned() ||
+                                                !it->second.IsLeaseExpired(
+                                                    now) ||
+                                                !can_evict_replicas(
+                                                    it->second)) {
+                                                ++it;
+                                                continue;
+                                            }
+                                            if (!it->second.IsSoftPinned(now) ||
+                                                AdjustLeaseTimeoutWithFrequency(
+                                                    tenant_it->first, it->first,
+                                                    it->second.lease_timeout) <=
+                                                    soft_target_timeout) {
+                                                auto evict_result =
+                                                    try_evict_group_or_object(
+                                                        tenant_it->first,
+                                                        it->first, it->second,
+                                                        shard, tenant_state,
+                                                        deferred_replicas,
+                                                        /*allow_soft_pinned=*/
+                                                        true);
+                                                total_freed_size +=
+                                                    evict_result.freed_bytes;
+                                                if (!it->second.IsValid()) {
+                                                    it = EraseMetadata(
+                                                        tenant_state, it,
+                                                        tenant_it->first,
+                                                        QuotaEraseMode::kFull,
+                                                        &shard);
+                                                } else {
+                                                    ++it;
+                                                }
+                                                evicted_count +=
+                                                    evict_result
+                                                        .evicted_objects;
+                                                target_evict_num -=
+                                                    evict_result
+                                                        .evicted_objects;
+                                            } else {
+                                                ++it;
+                                            }
+                                        }
+                                        if (tenant_state.Empty()) {
+                                            tenant_it =
+                                                shard->tenants.erase(tenant_it);
+                                        } else {
+                                            ++tenant_it;
+                                        }
+                                    }
+                                }
+                                deferred_replicas.clear();
+                            }
+                        } else {
+                            LOG(ERROR)
+                                << "Error in second pass eviction: "
+                                   "target_evict_num="
+                                << target_evict_num
+                                << ", no_pin_objects.size()="
+                                << no_pin_objects.size()
+                                << ", soft_pin_objects.size()="
+                                << soft_pin_objects.size()
+                                << ", evicted_count=" << evicted_count
+                                << ", eviction_base=" << total_eviction_base
+                                << ", evict_ratio_target=" << evict_ratio_target
+                                << ", evict_ratio_lowerbound="
+                                << evict_ratio_lowerbound;
+                        }
+                    }
+
+                    if (evicted_count > 0 || released_discarded_cnt > 0) {
+                        need_mem_eviction_ = false;
+                        MasterMetricManager::instance().inc_eviction_success(
+                            evicted_count, total_freed_size);
+                        MasterMetricManager::instance()
+                            .inc_mem_eviction_success(evicted_count,
+                                                      total_freed_size);
+                    } else if (offload_deferred_count > 0) {
+                        need_mem_eviction_ = false;
+                        MasterMetricManager::instance().inc_eviction_success(0,
+                                                                             0);
+                        MasterMetricManager::instance()
+                            .inc_mem_eviction_success(0, 0);
+                    } else {
+                        if (total_eviction_base == 0) {
+                            need_mem_eviction_ = false;
+                        }
+                        MasterMetricManager::instance().inc_eviction_fail();
+                        MasterMetricManager::instance().inc_mem_eviction_fail();
+                    }
+                    VLOG(1)
+                        << "action=evict_objects"
+                        << ", evicted_count=" << evicted_count
+                        << ", offload_deferred=" << offload_deferred_count
+                        << ", offload_cap_forced=" << offload_cap_forced_count
+                        << ", offload_push_failed_forced="
+                        << offload_push_failed_forced
+                        << ", total_freed_size=" << total_freed_size
+                        << ", eviction_base=" << total_eviction_base
+                        << ", actual_evict_ratio="
+                        << (total_eviction_base > 0
+                                ? (double)evicted_count / total_eviction_base
+                                : 0.0)
+                        << ", target_evict_ratio=" << evict_ratio_target;
+                    VLOG(1)
+                        << "[EVICT-DIAG] object_count=" << object_count
+                        << " disk_object_count="
+                        << (object_count - total_eviction_base)
+                        << " eviction_base=" << total_eviction_base
+                        << " disk_ratio="
+                        << (object_count > 0
+                                ? (double)(object_count - total_eviction_base) /
+                                      object_count
+                                : 0.0)
+                        << " ideal_evict_num_inflated="
+                        << (long)std::ceil(object_count * evict_ratio_target)
+                        << " ideal_evict_num_correct="
+                        << (long)std::ceil(total_eviction_base *
+                                           evict_ratio_target);
+                    LOG(INFO)
+                        << "[EVICT-RESULT] evicted_count=" << evicted_count
+                        << ", eviction_base=" << total_eviction_base
+                        << ", actual_evict_ratio="
+                        << (total_eviction_base > 0
+                                ? (double)evicted_count / total_eviction_base
+                                : 0.0)
+                        << ", target_evict_ratio=" << evict_ratio_target;
+                    if (offload_on_evict_ && evicted_count == 0 &&
+                        offload_deferred_count > 0) {
+                        LOG(WARNING) << "[EVICT] No memory freed this cycle; "
+                                     << offload_deferred_count
+                                     << " objects deferred for disk offload. "
+                                        "Consider lowering "
+                                        "eviction_high_watermark_ratio.";
+                    }
+                    if (offload_cap_forced_count > 0) {
+                        LOG(WARNING)
+                            << "[EVICT] Offload cap (" << offload_cap
+                            << ") reached; force-evicted "
+                            << offload_cap_forced_count
+                            << " object(s) without disk offload this cycle.";
+                    }
+                    if (offload_push_failed_forced > 0) {
+                        LOG(WARNING)
+                            << "[EVICT] PushOffloadingQueue failed for "
+                            << offload_push_failed_forced
+                            << " object(s); force-evicted without disk offload "
+                               "(offload_force_evict=true).";
+                    }
+                }
+
+                void MasterService::NoFBatchEvict(
+                    double evict_ratio_target, double evict_ratio_lowerbound) {
+                    if (evict_ratio_target < evict_ratio_lowerbound) {
+                        LOG(ERROR)
+                            << "nof_evict_ratio_target=" << evict_ratio_target
+                            << ", nof_evict_ratio_lowerbound="
+                            << evict_ratio_lowerbound
+                            << ", error=invalid_params";
+                        evict_ratio_lowerbound = evict_ratio_target;
+                    }
+
+                    auto now = std::chrono::system_clock::now();
+                    long evicted_count = 0;
+                    long object_count = 0;
+                    uint64_t total_freed_size = 0;
+
+                    size_t start_idx = RandomIndex(metadata_shards_.size());
+                    for (size_t i = 0; i < metadata_shards_.size(); i++) {
+                        MetadataShardAccessorRW shard(
+                            this, (start_idx + i) % metadata_shards_.size());
+                        DiscardExpiredProcessingReplicas(shard, now);
+                        for (const auto& [tenant_id, tenant_state] :
+                             shard->tenants) {
+                            object_count += tenant_state.metadata.size();
+                        }
+
+                        const long ideal_evict_num =
+                            std::ceil(object_count * evict_ratio_target) -
+                            evicted_count;
+                        if (ideal_evict_num <= 0) {
+                            continue;
+                        }
+
+                        long shard_evicted_count = 0;
+                        for (auto tenant_it = shard->tenants.begin();
+                             tenant_it != shard->tenants.end() &&
+                             shard_evicted_count < ideal_evict_num;) {
+                            auto& tenant_state = tenant_it->second;
+                            for (auto it = tenant_state.metadata.begin();
+                                 it != tenant_state.metadata.end() &&
+                                 shard_evicted_count < ideal_evict_num;) {
+                                auto& metadata = it->second;
+                                if (metadata.IsHardPinned() ||
+                                    !metadata.IsLeaseExpired(now) ||
+                                    metadata.IsSoftPinned(now)) {
+                                    ++it;
+                                    continue;
+                                }
+                                // CMS frequency-aware: hot objects get a
+                                // virtual lease extension, biasing eviction
+                                // toward cold objects.
+                                if (AdjustLeaseTimeoutWithFrequency(
+                                        tenant_id, it->first,
+                                        metadata.lease_timeout) > now) {
+                                    ++it;
+                                    continue;
+                                }
+
+                                const size_t erased = metadata.EraseReplicas(
+                                    [](const Replica& replica) {
+                                        return replica.is_nof_replica() &&
+                                               replica.is_completed() &&
+                                               replica.get_refcnt() == 0;
+                                    });
+                                if (erased == 0) {
+                                    ++it;
+                                    continue;
+                                }
+
+                                total_freed_size += metadata.size * erased;
+                                shard_evicted_count++;
+                                if (!metadata.IsValid()) {
                                     it = EraseMetadata(
                                         tenant_state, it, tenant_it->first,
                                         QuotaEraseMode::kFull, &shard);
                                 } else {
                                     ++it;
                                 }
-                                evicted_count += evict_result.evicted_objects;
-                                target_evict_num -=
-                                    evict_result.evicted_objects;
+                            }
+                            if (tenant_state.Empty()) {
+                                tenant_it = shard->tenants.erase(tenant_it);
+                            } else {
+                                ++tenant_it;
+                            }
+                        }
+                        evicted_count += shard_evicted_count;
+                    }
+
+                    if (evicted_count > 0) {
+                        need_nof_eviction_ = false;
+                        MasterMetricManager::instance().inc_eviction_success(
+                            evicted_count, total_freed_size);
+                        MasterMetricManager::instance()
+                            .inc_nof_eviction_success(evicted_count,
+                                                      total_freed_size);
+                    } else {
+                        if (object_count == 0) {
+                            need_nof_eviction_ = false;
+                        }
+                        MasterMetricManager::instance().inc_eviction_fail();
+                        MasterMetricManager::instance().inc_nof_eviction_fail();
+                    }
+
+                    VLOG(1) << "action=evict_nof_replicas"
+                            << ", evicted_count=" << evicted_count
+                            << ", total_freed_size=" << total_freed_size;
+                }
+
+                void MasterService::ClientMonitorFunc() {
+                    std::unordered_map<UUID,
+                                       std::chrono::steady_clock::time_point,
+                                       boost::hash<UUID>>
+                        client_ttl;
+                    while (client_monitor_running_) {
+                        auto now = std::chrono::steady_clock::now();
+
+                        // Update the client ttl
+                        PodUUID pod_client_id;
+                        while (client_ping_queue_.pop(pod_client_id)) {
+                            UUID client_id = {pod_client_id.first,
+                                              pod_client_id.second};
+                            client_ttl[client_id] =
+                                now +
+                                std::chrono::seconds(client_live_ttl_sec_);
+                        }
+
+                        // Find out expired clients
+                        std::vector<UUID> expired_clients;
+                        for (auto it = client_ttl.begin();
+                             it != client_ttl.end();) {
+                            if (it->second < now) {
+                                LOG(INFO) << "client_id=" << it->first
+                                          << ", action=client_expired";
+                                expired_clients.push_back(it->first);
+                                it = client_ttl.erase(it);
                             } else {
                                 ++it;
                             }
                         }
-                        if (tenant_state.Empty()) {
-                            tenant_it = shard->tenants.erase(tenant_it);
-                        } else {
-                            ++tenant_it;
-                        }
-                    }
-                }
-                deferred_replicas.clear();
-            }
-        } else if (!soft_pin_objects.empty()) {
-            // Second pass B: Prioritize evicting objects without soft pin,
-            // but also allow evicting soft pinned objects.
-            const long soft_pin_evict_num =
-                target_evict_num - static_cast<long>(no_pin_objects.size());
-            std::nth_element(
-                soft_pin_objects.begin(),
-                soft_pin_objects.begin() + (soft_pin_evict_num - 1),
-                soft_pin_objects.end());
-            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                {
-                    MetadataShardAccessorRW shard(this,
-                                                  (start_idx + i) % kNumShards);
-
-                    for (auto tenant_it = shard->tenants.begin();
-                         tenant_it != shard->tenants.end() &&
-                         target_evict_num > 0;) {
-                        auto& tenant_state = tenant_it->second;
-                        auto it = tenant_state.metadata.begin();
-                        while (it != tenant_state.metadata.end() &&
-                               target_evict_num > 0) {
-                            if (it->second.IsHardPinned() ||
-                                !it->second.IsLeaseExpired(now) ||
-                                !can_evict_replicas(it->second)) {
-                                ++it;
-                                continue;
+                        // Update the client status to NEED_REMOUNT
+                        if (!expired_clients.empty()) {
+                            // Notify graceful unmount scheduler to drop pending
+                            // records for expired clients. The actual unmount
+                            // is handled below.
+                            for (auto& cid : expired_clients) {
+                                graceful_unmount_scheduler_.RemoveIf(
+                                    [&cid](const GracefulUnmountDeadlineRecord&
+                                               record) {
+                                        return record.client_id == cid;
+                                    });
                             }
-                            if (!it->second.IsSoftPinned(now) ||
-                                AdjustLeaseTimeoutWithFrequency(
-                                    tenant_it->first, it->first,
-                                    it->second.lease_timeout) <=
-                                    soft_target_timeout) {
-                                auto evict_result = try_evict_group_or_object(
-                                    tenant_it->first, it->first, it->second,
-                                    shard, tenant_state, deferred_replicas,
-                                    /*allow_soft_pinned=*/true);
-                                total_freed_size += evict_result.freed_bytes;
-                                if (!it->second.IsValid()) {
-                                    it = EraseMetadata(
-                                        tenant_state, it, tenant_it->first,
-                                        QuotaEraseMode::kFull, &shard);
-                                } else {
-                                    ++it;
+
+                            // Record which segments are unmounted, will be used
+                            // in the commit phase.
+                            std::vector<UUID> unmount_segments;
+                            std::vector<size_t> dec_capacities;
+                            std::vector<UUID> client_ids;
+                            std::vector<std::string> segment_names;
+                            std::shared_lock<std::shared_mutex> shared_lock(
+                                snapshot_mutex_);
+                            {
+                                // Lock client_mutex and segment_mutex
+                                std::unique_lock<std::shared_mutex> lock(
+                                    client_mutex_);
+                                for (auto& client_id : expired_clients) {
+                                    auto it = ok_client_.find(client_id);
+                                    if (it != ok_client_.end()) {
+                                        ok_client_.erase(it);
+                                        MasterMetricManager::instance()
+                                            .dec_active_clients();
+                                    }
                                 }
-                                evicted_count += evict_result.evicted_objects;
-                                target_evict_num -=
-                                    evict_result.evicted_objects;
-                            } else {
-                                ++it;
+
+                                ScopedSegmentAccess segment_access =
+                                    segment_manager_.getSegmentAccess();
+                                for (auto& client_id : expired_clients) {
+                                    // mounted mem segemtns of this expired
+                                    // client
+                                    std::vector<Segment> segments;
+                                    segment_access.GetClientSegments(client_id,
+                                                                     segments);
+                                    for (auto& seg : segments) {
+                                        size_t metrics_dec_capacity = 0;
+                                        if (segment_access
+                                                .PrepareUnmountSegment(
+                                                    seg.id,
+                                                    metrics_dec_capacity) ==
+                                            ErrorCode::OK) {
+                                            unmount_segments.push_back(seg.id);
+                                            dec_capacities.push_back(
+                                                metrics_dec_capacity);
+                                            client_ids.push_back(client_id);
+                                            segment_names.push_back(seg.name);
+                                        } else {
+                                            LOG(ERROR)
+                                                << "client_id=" << client_id
+                                                << ", segment_name=" << seg.name
+                                                << ", "
+                                                   "error=prepare_unmount_"
+                                                   "expired_"
+                                                   "mem_segment_failed";
+                                        }
+                                    }
+                                }
+                            }  // Release the mutex before long-running
+                               // ClearInvalidHandles and avoid deadlocks
+
+                            // Always clean up invalid handles when there are
+                            // expired clients, even if no memory segments were
+                            // unmounted. This is necessary to clean up
+                            // local_disk replicas whose owner client has
+                            // expired.
+                            ClearInvalidHandles();
+
+                            // Commit unmount of memory segments and clean up
+                            // local_disk segments for expired clients. Both
+                            // require the exclusive segment lock.
+                            {
+                                ScopedSegmentAccess segment_access =
+                                    segment_manager_.getSegmentAccess();
+                                for (size_t i = 0; i < unmount_segments.size();
+                                     i++) {
+                                    segment_access.CommitUnmountSegment(
+                                        unmount_segments[i], client_ids[i],
+                                        dec_capacities[i]);
+                                    LOG(INFO)
+                                        << "client_id=" << client_ids[i]
+                                        << ", segment_name=" << segment_names[i]
+                                        << ", "
+                                           "action=unmount_expired_mem_segment";
+                                    // Clean up HTTP metadata if enabled
+                                    cleanupHttpMetadata(segment_names[i]);
+                                }
+                                for (auto& client_id : expired_clients) {
+                                    segment_access.UnmountLocalDiskSegment(
+                                        client_id);
+                                }
                             }
+                            RecomputeTenantEffectiveQuotas();
                         }
-                        if (tenant_state.Empty()) {
-                            tenant_it = shard->tenants.erase(tenant_it);
-                        } else {
-                            ++tenant_it;
-                        }
-                    }
-                }
-                deferred_replicas.clear();
-            }
-        } else {
-            LOG(ERROR) << "Error in second pass eviction: target_evict_num="
-                       << target_evict_num
-                       << ", no_pin_objects.size()=" << no_pin_objects.size()
-                       << ", soft_pin_objects.size()="
-                       << soft_pin_objects.size()
-                       << ", evicted_count=" << evicted_count
-                       << ", eviction_base=" << total_eviction_base
-                       << ", evict_ratio_target=" << evict_ratio_target
-                       << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
-        }
-    }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
-        need_mem_eviction_ = false;
-        MasterMetricManager::instance().inc_eviction_success(evicted_count,
-                                                             total_freed_size);
-        MasterMetricManager::instance().inc_mem_eviction_success(
-            evicted_count, total_freed_size);
-    } else if (offload_deferred_count > 0) {
-        need_mem_eviction_ = false;
-        MasterMetricManager::instance().inc_eviction_success(0, 0);
-        MasterMetricManager::instance().inc_mem_eviction_success(0, 0);
-    } else {
-        if (total_eviction_base == 0) {
-            need_mem_eviction_ = false;
-        }
-        MasterMetricManager::instance().inc_eviction_fail();
-        MasterMetricManager::instance().inc_mem_eviction_fail();
-    }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
-            << ", offload_deferred=" << offload_deferred_count
-            << ", offload_cap_forced=" << offload_cap_forced_count
-            << ", offload_push_failed_forced=" << offload_push_failed_forced
-            << ", total_freed_size=" << total_freed_size
-            << ", eviction_base=" << total_eviction_base
-            << ", actual_evict_ratio="
-            << (total_eviction_base > 0
-                    ? (double)evicted_count / total_eviction_base
-                    : 0.0)
-            << ", target_evict_ratio=" << evict_ratio_target;
-    VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
-            << " disk_object_count=" << (object_count - total_eviction_base)
-            << " eviction_base=" << total_eviction_base << " disk_ratio="
-            << (object_count > 0
-                    ? (double)(object_count - total_eviction_base) /
-                          object_count
-                    : 0.0)
-            << " ideal_evict_num_inflated="
-            << (long)std::ceil(object_count * evict_ratio_target)
-            << " ideal_evict_num_correct="
-            << (long)std::ceil(total_eviction_base * evict_ratio_target);
-    LOG(INFO) << "[EVICT-RESULT] evicted_count=" << evicted_count
-              << ", eviction_base=" << total_eviction_base
-              << ", actual_evict_ratio="
-              << (total_eviction_base > 0
-                      ? (double)evicted_count / total_eviction_base
-                      : 0.0)
-              << ", target_evict_ratio=" << evict_ratio_target;
-    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
-        LOG(WARNING) << "[EVICT] No memory freed this cycle; "
-                     << offload_deferred_count
-                     << " objects deferred for disk offload. "
-                        "Consider lowering eviction_high_watermark_ratio.";
-    }
-    if (offload_cap_forced_count > 0) {
-        LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
-                     << ") reached; force-evicted " << offload_cap_forced_count
-                     << " object(s) without disk offload this cycle.";
-    }
-    if (offload_push_failed_forced > 0) {
-        LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
-                     << offload_push_failed_forced
-                     << " object(s); force-evicted without disk offload "
-                        "(offload_force_evict=true).";
-    }
-}
-
-void MasterService::NoFBatchEvict(double evict_ratio_target,
-                                  double evict_ratio_lowerbound) {
-    if (evict_ratio_target < evict_ratio_lowerbound) {
-        LOG(ERROR) << "nof_evict_ratio_target=" << evict_ratio_target
-                   << ", nof_evict_ratio_lowerbound=" << evict_ratio_lowerbound
-                   << ", error=invalid_params";
-        evict_ratio_lowerbound = evict_ratio_target;
-    }
-
-    auto now = std::chrono::system_clock::now();
-    long evicted_count = 0;
-    long object_count = 0;
-    uint64_t total_freed_size = 0;
-
-    size_t start_idx = RandomIndex(metadata_shards_.size());
-    for (size_t i = 0; i < metadata_shards_.size(); i++) {
-        MetadataShardAccessorRW shard(
-            this, (start_idx + i) % metadata_shards_.size());
-        DiscardExpiredProcessingReplicas(shard, now);
-        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
-            object_count += tenant_state.metadata.size();
-        }
-
-        const long ideal_evict_num =
-            std::ceil(object_count * evict_ratio_target) - evicted_count;
-        if (ideal_evict_num <= 0) {
-            continue;
-        }
-
-        long shard_evicted_count = 0;
-        for (auto tenant_it = shard->tenants.begin();
-             tenant_it != shard->tenants.end() &&
-             shard_evicted_count < ideal_evict_num;) {
-            auto& tenant_state = tenant_it->second;
-            for (auto it = tenant_state.metadata.begin();
-                 it != tenant_state.metadata.end() &&
-                 shard_evicted_count < ideal_evict_num;) {
-                auto& metadata = it->second;
-                if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                    metadata.IsSoftPinned(now)) {
-                    ++it;
-                    continue;
-                }
-                // CMS frequency-aware: hot objects get a virtual lease
-                // extension, biasing eviction toward cold objects.
-                if (AdjustLeaseTimeoutWithFrequency(
-                        tenant_id, it->first, metadata.lease_timeout) > now) {
-                    ++it;
-                    continue;
-                }
-
-                const size_t erased =
-                    metadata.EraseReplicas([](const Replica& replica) {
-                        return replica.is_nof_replica() &&
-                               replica.is_completed() &&
-                               replica.get_refcnt() == 0;
-                    });
-                if (erased == 0) {
-                    ++it;
-                    continue;
-                }
-
-                total_freed_size += metadata.size * erased;
-                shard_evicted_count++;
-                if (!metadata.IsValid()) {
-                    it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
-                } else {
-                    ++it;
-                }
-            }
-            if (tenant_state.Empty()) {
-                tenant_it = shard->tenants.erase(tenant_it);
-            } else {
-                ++tenant_it;
-            }
-        }
-        evicted_count += shard_evicted_count;
-    }
-
-    if (evicted_count > 0) {
-        need_nof_eviction_ = false;
-        MasterMetricManager::instance().inc_eviction_success(evicted_count,
-                                                             total_freed_size);
-        MasterMetricManager::instance().inc_nof_eviction_success(
-            evicted_count, total_freed_size);
-    } else {
-        if (object_count == 0) {
-            need_nof_eviction_ = false;
-        }
-        MasterMetricManager::instance().inc_eviction_fail();
-        MasterMetricManager::instance().inc_nof_eviction_fail();
-    }
-
-    VLOG(1) << "action=evict_nof_replicas"
-            << ", evicted_count=" << evicted_count
-            << ", total_freed_size=" << total_freed_size;
-}
-
-void MasterService::ClientMonitorFunc() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
-                       boost::hash<UUID>>
-        client_ttl;
-    while (client_monitor_running_) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Update the client ttl
-        PodUUID pod_client_id;
-        while (client_ping_queue_.pop(pod_client_id)) {
-            UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] =
-                now + std::chrono::seconds(client_live_ttl_sec_);
-        }
-
-        // Find out expired clients
-        std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // Update the client status to NEED_REMOUNT
-        if (!expired_clients.empty()) {
-            // Notify graceful unmount scheduler to drop pending records
-            // for expired clients. The actual unmount is handled below.
-            for (auto& cid : expired_clients) {
-                graceful_unmount_scheduler_.RemoveIf(
-                    [&cid](const GracefulUnmountDeadlineRecord& record) {
-                        return record.client_id == cid;
-                    });
-            }
-
-            // Record which segments are unmounted, will be used in the commit
-            // phase.
-            std::vector<UUID> unmount_segments;
-            std::vector<size_t> dec_capacities;
-            std::vector<UUID> client_ids;
-            std::vector<std::string> segment_names;
-            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            {
-                // Lock client_mutex and segment_mutex
-                std::unique_lock<std::shared_mutex> lock(client_mutex_);
-                for (auto& client_id : expired_clients) {
-                    auto it = ok_client_.find(client_id);
-                    if (it != ok_client_.end()) {
-                        ok_client_.erase(it);
-                        MasterMetricManager::instance().dec_active_clients();
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(kClientMonitorSleepMs));
                     }
                 }
 
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (auto& client_id : expired_clients) {
-                    // mounted mem segemtns of this expired client
-                    std::vector<Segment> segments;
-                    segment_access.GetClientSegments(client_id, segments);
-                    for (auto& seg : segments) {
-                        size_t metrics_dec_capacity = 0;
-                        if (segment_access.PrepareUnmountSegment(
-                                seg.id, metrics_dec_capacity) ==
-                            ErrorCode::OK) {
-                            unmount_segments.push_back(seg.id);
-                            dec_capacities.push_back(metrics_dec_capacity);
-                            client_ids.push_back(client_id);
-                            segment_names.push_back(seg.name);
-                        } else {
-                            LOG(ERROR) << "client_id=" << client_id
-                                       << ", segment_name=" << seg.name
-                                       << ", "
-                                          "error=prepare_unmount_expired_"
-                                          "mem_segment_failed";
-                        }
-                    }
-                }
-            }  // Release the mutex before long-running ClearInvalidHandles and
-               // avoid deadlocks
-
-            // Always clean up invalid handles when there are expired clients,
-            // even if no memory segments were unmounted. This is necessary
-            // to clean up local_disk replicas whose owner client has expired.
-            ClearInvalidHandles();
-
-            // Commit unmount of memory segments and clean up local_disk
-            // segments for expired clients. Both require the exclusive
-            // segment lock.
-            {
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (size_t i = 0; i < unmount_segments.size(); i++) {
-                    segment_access.CommitUnmountSegment(
-                        unmount_segments[i], client_ids[i], dec_capacities[i]);
-                    LOG(INFO) << "client_id=" << client_ids[i]
-                              << ", segment_name=" << segment_names[i]
-                              << ", action=unmount_expired_mem_segment";
-                    // Clean up HTTP metadata if enabled
-                    cleanupHttpMetadata(segment_names[i]);
-                }
-                for (auto& client_id : expired_clients) {
-                    segment_access.UnmountLocalDiskSegment(client_id);
-                }
-            }
-            RecomputeTenantEffectiveQuotas();
-        }
-
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kClientMonitorSleepMs));
-    }
-}
-
-bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
-                                    std::string* error_reason) {
+                bool MasterService::ProbeNoFSegment(
+                    const std::string& te_endpoint, std::string* error_reason) {
 #ifndef USE_NOF
-    if (error_reason) {
-        *error_reason = "nof_pool_disabled";
-    }
-    return false;
+                    if (error_reason) {
+                        *error_reason = "nof_pool_disabled";
+                    }
+                    return false;
 #else
-    NoFProbeFn probe_fn;
-    {
-        std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
-        probe_fn = nof_probe_fn_;
-    }
-    if (!probe_fn) {
-        if (error_reason) {
-            *error_reason = "probe_not_configured";
-        }
-        return false;
-    }
-    return probe_fn(
-        te_endpoint,
-        static_cast<uint32_t>(nof_heartbeat_probe_timeout_ms_.count()),
-        error_reason);
+                    NoFProbeFn probe_fn;
+                    {
+                        std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
+                        probe_fn = nof_probe_fn_;
+                    }
+                    if (!probe_fn) {
+                        if (error_reason) {
+                            *error_reason = "probe_not_configured";
+                        }
+                        return false;
+                    }
+                    return probe_fn(
+                        te_endpoint,
+                        static_cast<uint32_t>(
+                            nof_heartbeat_probe_timeout_ms_.count()),
+                        error_reason);
 #endif
-}
+                }
 
-bool MasterService::TryUnmountNoFSegmentByHeartbeat(
-    const MountedNoFSegmentSnapshot& snapshot,
-    const std::string& error_reason) {
-    size_t metrics_dec_capacity = 0;
-    {
-        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
-        ErrorCode err = nof_segment_access.PrepareUnmountSegment(
-            snapshot.segment_id, metrics_dec_capacity);
-        if (err == ErrorCode::SEGMENT_NOT_FOUND ||
-            err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
-            std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-            nof_heartbeat_states_.erase(snapshot.segment_id);
-            VLOG(1) << "segment_id=" << snapshot.segment_id
-                    << ", action=skip_nof_heartbeat_unmount"
-                    << ", reason=" << toString(err);
-            return false;
-        }
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "segment_id=" << snapshot.segment_id
-                       << ", segment_name=" << snapshot.segment.name
-                       << ", error=prepare_unmount_nof_segment_by_"
-                          "heartbeat_failed"
-                       << ", reason=" << err;
-            return false;
-        }
-    }
-
-    ClearInvalidHandles();
-
-    {
-        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
-        ErrorCode err = nof_segment_access.CommitUnmountSegment(
-            snapshot.segment_id, snapshot.client_id, metrics_dec_capacity);
-        if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
-            LOG(ERROR) << "segment_id=" << snapshot.segment_id
-                       << ", segment_name=" << snapshot.segment.name
-                       << ", error=commit_unmount_nof_segment_by_"
-                          "heartbeat_failed"
-                       << ", reason=" << err;
-            return false;
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-        nof_heartbeat_states_.erase(snapshot.segment_id);
-    }
-    MasterMetricManager::instance()
-        .inc_nof_segments_unmounted_by_heartbeat_total();
-    LOG(INFO) << "segment_id=" << snapshot.segment_id
-              << ", client_id=" << snapshot.client_id
-              << ", segment_name=" << snapshot.segment.name
-              << ", endpoint=" << snapshot.segment.te_endpoint
-              << ", action=unmount_nof_segment_by_heartbeat"
-              << ", last_error_reason=" << error_reason;
-    return true;
-}
-
-void MasterService::NofHeartbeatThreadFunc() {
-    size_t next_probe_index = 0;
-    while (nof_heartbeat_running_) {
-        auto now = std::chrono::steady_clock::now();
-        std::vector<MountedNoFSegmentSnapshot> mounted_segments;
-        nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
-
-        std::vector<MountedNoFSegmentSnapshot> ok_segments;
-        ok_segments.reserve(mounted_segments.size());
-        for (const auto& snapshot : mounted_segments) {
-            if (snapshot.status == SegmentStatus::OK) {
-                ok_segments.push_back(snapshot);
-            }
-        }
-
-        std::optional<MountedNoFSegmentSnapshot> probe_target;
-        {
-            std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-            std::unordered_set<UUID, boost::hash<UUID>> live_segment_ids;
-            live_segment_ids.reserve(ok_segments.size());
-
-            const auto interval_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    nof_heartbeat_interval_sec_);
-            for (size_t i = 0; i < ok_segments.size(); ++i) {
-                const auto& snapshot = ok_segments[i];
-                live_segment_ids.insert(snapshot.segment_id);
-                auto [it, inserted] =
-                    nof_heartbeat_states_.try_emplace(snapshot.segment_id);
-                auto& state = it->second;
-                state.owner_client_id = snapshot.client_id;
-                state.segment_name = snapshot.segment.name;
-                state.te_endpoint = snapshot.segment.te_endpoint;
-                if (inserted) {
-                    int64_t spread_ms = 0;
-                    if (!ok_segments.empty()) {
-                        spread_ms = static_cast<int64_t>(
-                            (interval_ms.count() * i) / ok_segments.size());
+                bool MasterService::TryUnmountNoFSegmentByHeartbeat(
+                    const MountedNoFSegmentSnapshot& snapshot,
+                    const std::string& error_reason) {
+                    size_t metrics_dec_capacity = 0;
+                    {
+                        auto nof_segment_access =
+                            nof_segment_manager_.getNoFSegmentAccess();
+                        ErrorCode err =
+                            nof_segment_access.PrepareUnmountSegment(
+                                snapshot.segment_id, metrics_dec_capacity);
+                        if (err == ErrorCode::SEGMENT_NOT_FOUND ||
+                            err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                            std::lock_guard<std::mutex> lock(
+                                nof_heartbeat_mutex_);
+                            nof_heartbeat_states_.erase(snapshot.segment_id);
+                            VLOG(1) << "segment_id=" << snapshot.segment_id
+                                    << ", action=skip_nof_heartbeat_unmount"
+                                    << ", reason=" << toString(err);
+                            return false;
+                        }
+                        if (err != ErrorCode::OK) {
+                            LOG(ERROR)
+                                << "segment_id=" << snapshot.segment_id
+                                << ", segment_name=" << snapshot.segment.name
+                                << ", error=prepare_unmount_nof_segment_by_"
+                                   "heartbeat_failed"
+                                << ", reason=" << err;
+                            return false;
+                        }
                     }
-                    state.last_success_at = now;
-                    state.next_probe_at = now + nof_heartbeat_interval_sec_ +
-                                          std::chrono::milliseconds(spread_ms);
-                }
-            }
 
-            for (auto it = nof_heartbeat_states_.begin();
-                 it != nof_heartbeat_states_.end();) {
-                if (!live_segment_ids.contains(it->first)) {
-                    it = nof_heartbeat_states_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+                    ClearInvalidHandles();
 
-            if (!ok_segments.empty()) {
-                next_probe_index %= ok_segments.size();
-                for (size_t offset = 0; offset < ok_segments.size(); ++offset) {
-                    const auto& candidate =
-                        ok_segments[(next_probe_index + offset) %
-                                    ok_segments.size()];
-                    auto state_it =
-                        nof_heartbeat_states_.find(candidate.segment_id);
-                    if (state_it == nof_heartbeat_states_.end()) {
-                        continue;
+                    {
+                        auto nof_segment_access =
+                            nof_segment_manager_.getNoFSegmentAccess();
+                        ErrorCode err = nof_segment_access.CommitUnmountSegment(
+                            snapshot.segment_id, snapshot.client_id,
+                            metrics_dec_capacity);
+                        if (err != ErrorCode::OK &&
+                            err != ErrorCode::SEGMENT_NOT_FOUND) {
+                            LOG(ERROR)
+                                << "segment_id=" << snapshot.segment_id
+                                << ", segment_name=" << snapshot.segment.name
+                                << ", error=commit_unmount_nof_segment_by_"
+                                   "heartbeat_failed"
+                                << ", reason=" << err;
+                            return false;
+                        }
                     }
-                    if (state_it->second.next_probe_at <= now) {
-                        probe_target = candidate;
-                        next_probe_index = (next_probe_index + offset + 1) %
-                                           ok_segments.size();
-                        break;
+
+                    {
+                        std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+                        nof_heartbeat_states_.erase(snapshot.segment_id);
+                    }
+                    MasterMetricManager::instance()
+                        .inc_nof_segments_unmounted_by_heartbeat_total();
+                    LOG(INFO) << "segment_id=" << snapshot.segment_id
+                              << ", client_id=" << snapshot.client_id
+                              << ", segment_name=" << snapshot.segment.name
+                              << ", endpoint=" << snapshot.segment.te_endpoint
+                              << ", action=unmount_nof_segment_by_heartbeat"
+                              << ", last_error_reason=" << error_reason;
+                    return true;
+                }
+
+                void MasterService::NofHeartbeatThreadFunc() {
+                    size_t next_probe_index = 0;
+                    while (nof_heartbeat_running_) {
+                        auto now = std::chrono::steady_clock::now();
+                        std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+                        nof_segment_manager_.GetMountedSegmentsSnapshot(
+                            mounted_segments);
+
+                        std::vector<MountedNoFSegmentSnapshot> ok_segments;
+                        ok_segments.reserve(mounted_segments.size());
+                        for (const auto& snapshot : mounted_segments) {
+                            if (snapshot.status == SegmentStatus::OK) {
+                                ok_segments.push_back(snapshot);
+                            }
+                        }
+
+                        std::optional<MountedNoFSegmentSnapshot> probe_target;
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                nof_heartbeat_mutex_);
+                            std::unordered_set<UUID, boost::hash<UUID>>
+                                live_segment_ids;
+                            live_segment_ids.reserve(ok_segments.size());
+
+                            const auto interval_ms = std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                nof_heartbeat_interval_sec_);
+                            for (size_t i = 0; i < ok_segments.size(); ++i) {
+                                const auto& snapshot = ok_segments[i];
+                                live_segment_ids.insert(snapshot.segment_id);
+                                auto [it, inserted] =
+                                    nof_heartbeat_states_.try_emplace(
+                                        snapshot.segment_id);
+                                auto& state = it->second;
+                                state.owner_client_id = snapshot.client_id;
+                                state.segment_name = snapshot.segment.name;
+                                state.te_endpoint =
+                                    snapshot.segment.te_endpoint;
+                                if (inserted) {
+                                    int64_t spread_ms = 0;
+                                    if (!ok_segments.empty()) {
+                                        spread_ms = static_cast<int64_t>(
+                                            (interval_ms.count() * i) /
+                                            ok_segments.size());
+                                    }
+                                    state.last_success_at = now;
+                                    state.next_probe_at =
+                                        now + nof_heartbeat_interval_sec_ +
+                                        std::chrono::milliseconds(spread_ms);
+                                }
+                            }
+
+                            for (auto it = nof_heartbeat_states_.begin();
+                                 it != nof_heartbeat_states_.end();) {
+                                if (!live_segment_ids.contains(it->first)) {
+                                    it = nof_heartbeat_states_.erase(it);
+                                } else {
+                                    ++it;
+                                }
+                            }
+
+                            if (!ok_segments.empty()) {
+                                next_probe_index %= ok_segments.size();
+                                for (size_t offset = 0;
+                                     offset < ok_segments.size(); ++offset) {
+                                    const auto& candidate =
+                                        ok_segments[(next_probe_index +
+                                                     offset) %
+                                                    ok_segments.size()];
+                                    auto state_it = nof_heartbeat_states_.find(
+                                        candidate.segment_id);
+                                    if (state_it ==
+                                        nof_heartbeat_states_.end()) {
+                                        continue;
+                                    }
+                                    if (state_it->second.next_probe_at <= now) {
+                                        probe_target = candidate;
+                                        next_probe_index =
+                                            (next_probe_index + offset + 1) %
+                                            ok_segments.size();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!probe_target.has_value()) {
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(
+                                    kNoFHeartbeatThreadSleepMs));
+                            continue;
+                        }
+
+                        auto probe_start = std::chrono::steady_clock::now();
+                        std::string error_reason;
+                        bool probe_success = ProbeNoFSegment(
+                            probe_target->segment.te_endpoint, &error_reason);
+                        auto latency_ms =
+                            std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - probe_start)
+                                .count();
+                        MasterMetricManager::instance()
+                            .observe_nof_heartbeat_probe_latency_ms(latency_ms);
+
+                        if (probe_success) {
+                            MasterMetricManager::instance()
+                                .inc_nof_heartbeat_success_total();
+                            auto success_time =
+                                std::chrono::steady_clock::now();
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    nof_heartbeat_mutex_);
+                                auto it = nof_heartbeat_states_.find(
+                                    probe_target->segment_id);
+                                if (it != nof_heartbeat_states_.end()) {
+                                    it->second.consecutive_failures = 0;
+                                    it->second.last_success_at = success_time;
+                                    it->second.last_error_reason.clear();
+                                    it->second.next_probe_at =
+                                        success_time +
+                                        nof_heartbeat_interval_sec_;
+                                }
+                            }
+                            VLOG(1)
+                                << "segment_id=" << probe_target->segment_id
+                                << ", segment_name="
+                                << probe_target->segment.name << ", endpoint="
+                                << probe_target->segment.te_endpoint
+                                << ", action=nof_heartbeat_success"
+                                << ", latency_ms=" << latency_ms;
+                            continue;
+                        }
+
+                        MasterMetricManager::instance()
+                            .inc_nof_heartbeat_failure_total();
+                        if (error_reason == "completion_timeout") {
+                            MasterMetricManager::instance()
+                                .inc_nof_heartbeat_timeout_total();
+                        }
+
+                        bool should_unmount = false;
+                        uint32_t failure_count = 0;
+                        auto failure_time = std::chrono::steady_clock::now();
+                        auto alive_timeout =
+                            nof_heartbeat_interval_sec_ *
+                            static_cast<int64_t>(
+                                nof_heartbeat_failures_threshold_);
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                nof_heartbeat_mutex_);
+                            auto it = nof_heartbeat_states_.find(
+                                probe_target->segment_id);
+                            if (it != nof_heartbeat_states_.end()) {
+                                it->second.consecutive_failures++;
+                                failure_count = it->second.consecutive_failures;
+                                it->second.last_error_reason = error_reason;
+                                it->second.next_probe_at =
+                                    failure_time + nof_heartbeat_interval_sec_;
+                                should_unmount =
+                                    failure_time - it->second.last_success_at >=
+                                    alive_timeout;
+                            }
+                        }
+
+                        LOG(WARNING)
+                            << "segment_id=" << probe_target->segment_id
+                            << ", segment_name=" << probe_target->segment.name
+                            << ", endpoint="
+                            << probe_target->segment.te_endpoint
+                            << ", action=nof_heartbeat_failure"
+                            << ", failure_count=" << failure_count
+                            << ", latency_ms=" << latency_ms
+                            << ", reason=" << error_reason;
+
+                        if (should_unmount) {
+                            TryUnmountNoFSegmentByHeartbeat(*probe_target,
+                                                            error_reason);
+                        }
                     }
                 }
-            }
-        }
 
-        if (!probe_target.has_value()) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kNoFHeartbeatThreadSleepMs));
-            continue;
-        }
+                tl::expected<std::vector<uint8_t>, SerializationError>
+                MasterService::MetadataSerializer::Serialize() {
+                    msgpack::sbuffer sbuf;
+                    msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-        auto probe_start = std::chrono::steady_clock::now();
-        std::string error_reason;
-        bool probe_success =
-            ProbeNoFSegment(probe_target->segment.te_endpoint, &error_reason);
-        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - probe_start)
-                              .count();
-        MasterMetricManager::instance().observe_nof_heartbeat_probe_latency_ms(
-            latency_ms);
+                    // Create top-level map with 3 fields: "shards",
+                    // "discarded_replicas", "replica_next_id"
+                    packer.pack_map(3);
 
-        if (probe_success) {
-            MasterMetricManager::instance().inc_nof_heartbeat_success_total();
-            auto success_time = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-                auto it = nof_heartbeat_states_.find(probe_target->segment_id);
-                if (it != nof_heartbeat_states_.end()) {
-                    it->second.consecutive_failures = 0;
-                    it->second.last_success_at = success_time;
-                    it->second.last_error_reason.clear();
-                    it->second.next_probe_at =
-                        success_time + nof_heartbeat_interval_sec_;
+                    // 1. Serialize metadata shards
+                    packer.pack("shards");
+
+                    // First count shards that have actual metadata entries.
+                    // A shard may have empty tenants left after eviction erased
+                    // all metadata but didn't clean up the tenant map; using
+                    // metadata_count (not tenants.empty()) ensures the count
+                    // matches the skip logic below.
+                    size_t valid_shards = 0;
+                    for (size_t i = 0; i < kNumShards; ++i) {
+                        size_t metadata_count = 0;
+                        for (const auto& [tid, ts] :
+                             service_->metadata_shards_[i].tenants) {
+                            metadata_count += ts.metadata.size();
+                        }
+                        if (metadata_count > 0) {
+                            valid_shards++;
+                        }
+                    }
+
+                    // Create shards map
+                    packer.pack_map(valid_shards);
+
+                    // Iterate through all shards, serialize each shard
+                    // independently
+                    for (size_t shard_idx = 0; shard_idx < kNumShards;
+                         ++shard_idx) {
+                        const auto& shard =
+                            service_->metadata_shards_[shard_idx];
+
+                        // Skip shards with no actual metadata entries.
+                        // A shard may have empty tenants left after eviction
+                        // erased all metadata but didn't clean up the tenant
+                        // map; serializing those would produce an entry that
+                        // deserialization never recreates, breaking the
+                        // snapshot round-trip comparison.
+                        size_t metadata_count = 0;
+                        for (const auto& [tid, ts] : shard.tenants) {
+                            metadata_count += ts.metadata.size();
+                        }
+                        if (metadata_count == 0) {
+                            continue;
+                        }
+
+                        // Use shard index as key
+                        packer.pack(shard_idx);
+
+                        // Create independent serialization buffer for current
+                        // shard
+                        msgpack::sbuffer shard_buffer;
+                        msgpack::packer<msgpack::sbuffer> shard_packer(
+                            &shard_buffer);
+
+                        // Serialize shard using SerializeShard
+                        auto result = SerializeShard(shard, shard_packer);
+                        if (!result) {
+                            return tl::make_unexpected(SerializationError(
+                                result.error().code,
+                                fmt::format("Failed to serialize shard {}: {}",
+                                            shard_idx,
+                                            result.error().message)));
+                        }
+
+                        // Compress data
+                        std::vector<uint8_t> compressed_data =
+                            zstd_compress(reinterpret_cast<const uint8_t*>(
+                                              shard_buffer.data()),
+                                          shard_buffer.size(), 3);
+                        // Write entire shard serialized data as binary to main
+                        // buffer
+                        packer.pack_bin(compressed_data.size());
+                        packer.pack_bin_body(reinterpret_cast<const char*>(
+                                                 compressed_data.data()),
+                                             compressed_data.size());
+                    }
+
+                    // 2. Serialize discarded_replicas
+                    packer.pack("discarded_replicas");
+                    auto dr_result = SerializeDiscardedReplicas(packer);
+                    if (!dr_result) {
+                        return tl::make_unexpected(SerializationError(
+                            dr_result.error().code,
+                            "Failed to serialize discarded_replicas: " +
+                                dr_result.error().message));
+                    }
+
+                    // 3. Serialize replica_next_id (static variable for
+                    // generating unique replica IDs)
+                    packer.pack("replica_next_id");
+                    packer.pack(
+                        static_cast<uint64_t>(Replica::next_id_.load()));
+
+                    return std::vector<uint8_t>(
+                        reinterpret_cast<const uint8_t*>(sbuf.data()),
+                        reinterpret_cast<const uint8_t*>(sbuf.data()) +
+                            sbuf.size());
                 }
-            }
-            VLOG(1) << "segment_id=" << probe_target->segment_id
-                    << ", segment_name=" << probe_target->segment.name
-                    << ", endpoint=" << probe_target->segment.te_endpoint
-                    << ", action=nof_heartbeat_success"
-                    << ", latency_ms=" << latency_ms;
-            continue;
-        }
 
-        MasterMetricManager::instance().inc_nof_heartbeat_failure_total();
-        if (error_reason == "completion_timeout") {
-            MasterMetricManager::instance().inc_nof_heartbeat_timeout_total();
-        }
+                tl::expected<void, SerializationError>
+                MasterService::MetadataSerializer::Deserialize(
+                    const std::vector<uint8_t>& data) {
+                    // Parse MessagePack data directly
+                    msgpack::object_handle oh;
+                    try {
+                        oh = msgpack::unpack(
+                            reinterpret_cast<const char*>(data.data()),
+                            data.size());
+                    } catch (const std::exception& e) {
+                        return tl::make_unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "Failed to unpack MessagePack data: " +
+                                std::string(e.what())));
+                    }
 
-        bool should_unmount = false;
-        uint32_t failure_count = 0;
-        auto failure_time = std::chrono::steady_clock::now();
-        auto alive_timeout =
-            nof_heartbeat_interval_sec_ *
-            static_cast<int64_t>(nof_heartbeat_failures_threshold_);
-        {
-            std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-            auto it = nof_heartbeat_states_.find(probe_target->segment_id);
-            if (it != nof_heartbeat_states_.end()) {
-                it->second.consecutive_failures++;
-                failure_count = it->second.consecutive_failures;
-                it->second.last_error_reason = error_reason;
-                it->second.next_probe_at =
-                    failure_time + nof_heartbeat_interval_sec_;
-                should_unmount =
-                    failure_time - it->second.last_success_at >= alive_timeout;
-            }
-        }
+                    const msgpack::object& obj = oh.get();
 
-        LOG(WARNING) << "segment_id=" << probe_target->segment_id
-                     << ", segment_name=" << probe_target->segment.name
-                     << ", endpoint=" << probe_target->segment.te_endpoint
-                     << ", action=nof_heartbeat_failure"
-                     << ", failure_count=" << failure_count
-                     << ", latency_ms=" << latency_ms
-                     << ", reason=" << error_reason;
+                    // Check if it's a map
+                    if (obj.type != msgpack::type::MAP) {
+                        return tl::make_unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "Invalid MessagePack format: expected map"));
+                    }
 
-        if (should_unmount) {
-            TryUnmountNoFSegmentByHeartbeat(*probe_target, error_reason);
-        }
-    }
-}
+                    // Expected format: top-level map with "shards",
+                    // "discarded_replicas", and "replica_next_id"
+                    const msgpack::object* shards_obj = nullptr;
+                    const msgpack::object* discarded_replicas_obj = nullptr;
+                    const msgpack::object* replica_next_id_obj = nullptr;
 
-tl::expected<std::vector<uint8_t>, SerializationError>
-MasterService::MetadataSerializer::Serialize() {
-    msgpack::sbuffer sbuf;
-    msgpack::packer<msgpack::sbuffer> packer(&sbuf);
+                    // Extract fields from top-level map
+                    for (uint32_t i = 0; i < obj.via.map.size; ++i) {
+                        const auto& key_obj = obj.via.map.ptr[i].key;
+                        if (key_obj.type == msgpack::type::STR) {
+                            std::string key = key_obj.as<std::string>();
+                            if (key == "shards") {
+                                shards_obj = &obj.via.map.ptr[i].val;
+                            } else if (key == "discarded_replicas") {
+                                discarded_replicas_obj =
+                                    &obj.via.map.ptr[i].val;
+                            } else if (key == "replica_next_id") {
+                                replica_next_id_obj = &obj.via.map.ptr[i].val;
+                            }
+                        }
+                    }
 
-    // Create top-level map with 3 fields: "shards", "discarded_replicas",
-    // "replica_next_id"
-    packer.pack_map(3);
+                    // Check required "shards" field
+                    if (shards_obj == nullptr) {
+                        return tl::make_unexpected(
+                            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                               "Missing 'shards' field"));
+                    }
 
-    // 1. Serialize metadata shards
-    packer.pack("shards");
+                    // Iterate and deserialize each shard
+                    for (uint32_t i = 0; i < shards_obj->via.map.size; ++i) {
+                        // Get shard index
+                        uint32_t shard_idx =
+                            shards_obj->via.map.ptr[i].key.as<uint32_t>();
 
-    // First count shards that have actual metadata entries.
-    // A shard may have empty tenants left after eviction erased all
-    // metadata but didn't clean up the tenant map; using metadata_count
-    // (not tenants.empty()) ensures the count matches the skip logic below.
-    size_t valid_shards = 0;
-    for (size_t i = 0; i < kNumShards; ++i) {
-        size_t metadata_count = 0;
-        for (const auto& [tid, ts] : service_->metadata_shards_[i].tenants) {
-            metadata_count += ts.metadata.size();
-        }
-        if (metadata_count > 0) {
-            valid_shards++;
-        }
-    }
+                        // Check shard index validity
+                        if (shard_idx >= kNumShards) {
+                            return tl::make_unexpected(SerializationError(
+                                ErrorCode::DESERIALIZE_FAIL,
+                                fmt::format("Invalid shard index: {}",
+                                            shard_idx)));
+                        }
 
-    // Create shards map
-    packer.pack_map(valid_shards);
+                        // Get shard binary data
+                        const msgpack::object& shard_data_obj =
+                            shards_obj->via.map.ptr[i].val;
+                        if (shard_data_obj.type != msgpack::type::BIN) {
+                            return tl::make_unexpected(SerializationError(
+                                ErrorCode::DESERIALIZE_FAIL,
+                                "Invalid MessagePack format: expected binary "
+                                "data for shard"));
+                        }
 
-    // Iterate through all shards, serialize each shard independently
-    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
-        const auto& shard = service_->metadata_shards_[shard_idx];
+                        // Parse shard binary data directly, avoiding copy
+                        msgpack::object_handle shard_oh;
+                        try {
+                            auto decompressed_data = zstd_decompress(
+                                reinterpret_cast<const uint8_t*>(
+                                    shard_data_obj.via.bin.ptr),
+                                shard_data_obj.via.bin.size);
+                            shard_oh =
+                                msgpack::unpack(reinterpret_cast<const char*>(
+                                                    decompressed_data.data()),
+                                                decompressed_data.size());
+                        } catch (const std::exception& e) {
+                            return tl::make_unexpected(SerializationError(
+                                ErrorCode::DESERIALIZE_FAIL,
+                                "Failed to unpack shard data: " +
+                                    std::string(e.what())));
+                        }
 
-        // Skip shards with no actual metadata entries.
-        // A shard may have empty tenants left after eviction erased all
-        // metadata but didn't clean up the tenant map; serializing those
-        // would produce an entry that deserialization never recreates,
-        // breaking the snapshot round-trip comparison.
-        size_t metadata_count = 0;
-        for (const auto& [tid, ts] : shard.tenants) {
-            metadata_count += ts.metadata.size();
-        }
-        if (metadata_count == 0) {
-            continue;
-        }
+                        const msgpack::object& shard_obj = shard_oh.get();
 
-        // Use shard index as key
-        packer.pack(shard_idx);
+                        // Get shard reference and deserialize
+                        auto& shard = service_->metadata_shards_[shard_idx];
+                        auto result = DeserializeShard(shard_obj, shard);
+                        if (!result) {
+                            return tl::make_unexpected(SerializationError(
+                                result.error().code,
+                                fmt::format(
+                                    "Failed to deserialize shard {}: {}",
+                                    shard_idx, result.error().message)));
+                        }
+                    }
 
-        // Create independent serialization buffer for current shard
-        msgpack::sbuffer shard_buffer;
-        msgpack::packer<msgpack::sbuffer> shard_packer(&shard_buffer);
+                    // Deserialize discarded_replicas
+                    if (discarded_replicas_obj == nullptr) {
+                        return tl::make_unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "Missing required field 'discarded_replicas' in "
+                            "snapshot data"));
+                    }
+                    auto dr_result =
+                        DeserializeDiscardedReplicas(*discarded_replicas_obj);
+                    if (!dr_result) {
+                        return tl::make_unexpected(SerializationError(
+                            dr_result.error().code,
+                            "Failed to deserialize discarded_replicas: " +
+                                dr_result.error().message));
+                    }
 
-        // Serialize shard using SerializeShard
-        auto result = SerializeShard(shard, shard_packer);
-        if (!result) {
-            return tl::make_unexpected(SerializationError(
-                result.error().code,
-                fmt::format("Failed to serialize shard {}: {}", shard_idx,
-                            result.error().message)));
-        }
+                    // Restore replica_next_id
+                    if (replica_next_id_obj == nullptr) {
+                        return tl::make_unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "Missing required field 'replica_next_id' in "
+                            "snapshot data"));
+                    }
+                    auto next_id = replica_next_id_obj->as<uint64_t>();
+                    Replica::next_id_.store(next_id);
+                    LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
+                    service_->RebuildGroupRoutingIndex();
+                    return {};
+                }
 
-        // Compress data
-        std::vector<uint8_t> compressed_data =
-            zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
-                          shard_buffer.size(), 3);
-        // Write entire shard serialized data as binary to main buffer
-        packer.pack_bin(compressed_data.size());
-        packer.pack_bin_body(
-            reinterpret_cast<const char*>(compressed_data.data()),
-            compressed_data.size());
-    }
+                void MasterService::MetadataSerializer::Reset() {
+                    for (auto& shard : service_->metadata_shards_) {
+                        shard.tenants.clear();
+                    }
+                    {
+                        std::unique_lock<std::shared_mutex> lock(
+                            service_->group_routing_mutex_);
+                        service_->object_group_ids_.clear();
+                        service_->groups_needing_lease_refresh_.clear();
+                    }
+                    {
+                        std::lock_guard lock(
+                            service_->discarded_replicas_mutex_);
+                        service_->discarded_replicas_.clear();
+                    }
+                    Replica::next_id_.store(1);
+                }
 
-    // 2. Serialize discarded_replicas
-    packer.pack("discarded_replicas");
-    auto dr_result = SerializeDiscardedReplicas(packer);
-    if (!dr_result) {
-        return tl::make_unexpected(SerializationError(
-            dr_result.error().code, "Failed to serialize discarded_replicas: " +
-                                        dr_result.error().message));
-    }
+                tl::expected<void, SerializationError>
+                MasterService::MetadataSerializer::SerializeShard(
+                    const MetadataShard& shard, MsgpackPacker& packer) const {
+                    // MetadataShard format: map with "metadata" field
+                    packer.pack_map(1);
 
-    // 3. Serialize replica_next_id (static variable for generating unique
-    // replica IDs)
-    packer.pack("replica_next_id");
-    packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
+                    // Serialize metadata
+                    packer.pack("metadata");
+                    size_t metadata_count = 0;
+                    for (const auto& [tenant_id, tenant_state] :
+                         shard.tenants) {
+                        metadata_count += tenant_state.metadata.size();
+                    }
+                    packer.pack_array(metadata_count);
 
-    return std::vector<uint8_t>(
-        reinterpret_cast<const uint8_t*>(sbuf.data()),
-        reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
-}
+                    // Sort tenant/key pairs to ensure consistent serialization
+                    // order. NOTE: sort may be slow for large shards.
+                    struct SortedEntry {
+                        std::string tenant_id;
+                        std::string key;
+                        const ObjectMetadata* metadata;
+                    };
+                    std::vector<SortedEntry> sorted_entries;
+                    sorted_entries.reserve(metadata_count);
+                    for (const auto& [tenant_id, tenant_state] :
+                         shard.tenants) {
+                        for (const auto& [key, metadata] :
+                             tenant_state.metadata) {
+                            sorted_entries.push_back(
+                                {tenant_id, key, &metadata});
+                        }
+                    }
+                    std::sort(
+                        sorted_entries.begin(), sorted_entries.end(),
+                        [](const SortedEntry& lhs, const SortedEntry& rhs) {
+                            if (lhs.tenant_id != rhs.tenant_id) {
+                                return lhs.tenant_id < rhs.tenant_id;
+                            }
+                            return lhs.key < rhs.key;
+                        });
 
-tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::Deserialize(
-    const std::vector<uint8_t>& data) {
-    // Parse MessagePack data directly
-    msgpack::object_handle oh;
-    try {
-        oh = msgpack::unpack(reinterpret_cast<const char*>(data.data()),
-                             data.size());
-    } catch (const std::exception& e) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "Failed to unpack MessagePack data: " + std::string(e.what())));
-    }
+                    for (const auto& entry : sorted_entries) {
+                        // Each metadata item format: [tenant_id, key,
+                        // metadata_object].
+                        packer.pack_array(3);
+                        packer.pack(entry.tenant_id);
+                        packer.pack(entry.key);
 
-    const msgpack::object& obj = oh.get();
+                        auto result =
+                            SerializeMetadata(*entry.metadata, packer);
+                        if (!result) {
+                            return tl::make_unexpected(SerializationError(
+                                result.error().code,
+                                fmt::format("Failed to serialize metadata for "
+                                            "key '{}': {}",
+                                            entry.key,
+                                            result.error().message)));
+                        }
+                    }
 
-    // Check if it's a map
-    if (obj.type != msgpack::type::MAP) {
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "Invalid MessagePack format: expected map"));
-    }
+                    return {};
+                }
 
-    // Expected format: top-level map with "shards", "discarded_replicas",
-    // and "replica_next_id"
-    const msgpack::object* shards_obj = nullptr;
-    const msgpack::object* discarded_replicas_obj = nullptr;
-    const msgpack::object* replica_next_id_obj = nullptr;
+                tl::expected<void, SerializationError>
+                MasterService::MetadataSerializer::DeserializeShard(
+                    const msgpack::object& obj, MetadataShard& shard) {
+                    if (obj.type != msgpack::type::MAP) {
+                        return tl::make_unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "Invalid shard format: expected map"));
+                    }
 
-    // Extract fields from top-level map
-    for (uint32_t i = 0; i < obj.via.map.size; ++i) {
-        const auto& key_obj = obj.via.map.ptr[i].key;
-        if (key_obj.type == msgpack::type::STR) {
-            std::string key = key_obj.as<std::string>();
-            if (key == "shards") {
-                shards_obj = &obj.via.map.ptr[i].val;
-            } else if (key == "discarded_replicas") {
-                discarded_replicas_obj = &obj.via.map.ptr[i].val;
-            } else if (key == "replica_next_id") {
-                replica_next_id_obj = &obj.via.map.ptr[i].val;
-            }
-        }
-    }
+                    const msgpack::object* metadata_array = nullptr;
 
-    // Check required "shards" field
-    if (shards_obj == nullptr) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL, "Missing 'shards' field"));
-    }
+                    // Extract fields from shard map
+                    for (uint32_t i = 0; i < obj.via.map.size; ++i) {
+                        const auto& key_obj = obj.via.map.ptr[i].key;
+                        if (key_obj.type == msgpack::type::STR) {
+                            std::string field_key(key_obj.via.str.ptr,
+                                                  key_obj.via.str.size);
+                            if (field_key == "metadata") {
+                                metadata_array = &obj.via.map.ptr[i].val;
+                            }
+                        }
+                    }
 
-    // Iterate and deserialize each shard
-    for (uint32_t i = 0; i < shards_obj->via.map.size; ++i) {
-        // Get shard index
-        uint32_t shard_idx = shards_obj->via.map.ptr[i].key.as<uint32_t>();
+                    // Clear existing data
+                    shard.tenants.clear();
 
-        // Check shard index validity
-        if (shard_idx >= kNumShards) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                fmt::format("Invalid shard index: {}", shard_idx)));
-        }
+                    // Deserialize metadata
+                    if (metadata_array == nullptr ||
+                        metadata_array->type != msgpack::type::ARRAY) {
+                        return tl::make_unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "Missing or invalid 'metadata' field in shard"));
+                    }
 
-        // Get shard binary data
-        const msgpack::object& shard_data_obj = shards_obj->via.map.ptr[i].val;
-        if (shard_data_obj.type != msgpack::type::BIN) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "Invalid MessagePack format: expected binary data for shard"));
-        }
+                    shard.tenants.reserve(metadata_array->via.array.size);
 
-        // Parse shard binary data directly, avoiding copy
-        msgpack::object_handle shard_oh;
-        try {
-            auto decompressed_data = zstd_decompress(
-                reinterpret_cast<const uint8_t*>(shard_data_obj.via.bin.ptr),
-                shard_data_obj.via.bin.size);
-            shard_oh = msgpack::unpack(
-                reinterpret_cast<const char*>(decompressed_data.data()),
-                decompressed_data.size());
-        } catch (const std::exception& e) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "Failed to unpack shard data: " + std::string(e.what())));
-        }
+                    for (uint32_t j = 0; j < metadata_array->via.array.size;
+                         ++j) {
+                        const msgpack::object& item =
+                            metadata_array->via.array.ptr[j];
 
-        const msgpack::object& shard_obj = shard_oh.get();
+                        if (item.type != msgpack::type::ARRAY ||
+                            (item.via.array.size != 2 &&
+                             item.via.array.size != 3)) {
+                            return tl::make_unexpected(SerializationError(
+                                ErrorCode::DESERIALIZE_FAIL,
+                                "Invalid metadata item format: expected [key, "
+                                "metadata] or "
+                                "[tenant_id, key, metadata]"));
+                        }
 
-        // Get shard reference and deserialize
-        auto& shard = service_->metadata_shards_[shard_idx];
-        auto result = DeserializeShard(shard_obj, shard);
-        if (!result) {
-            return tl::make_unexpected(SerializationError(
-                result.error().code,
-                fmt::format("Failed to deserialize shard {}: {}", shard_idx,
-                            result.error().message)));
-        }
-    }
+                        std::string tenant_id = "default";
+                        std::string key;
+                        const msgpack::object* value_obj = nullptr;
+                        if (item.via.array.size == 2) {
+                            key = item.via.array.ptr[0].as<std::string>();
+                            value_obj = &item.via.array.ptr[1];
+                        } else {
+                            tenant_id = NormalizeTenantId(
+                                item.via.array.ptr[0].as<std::string>());
+                            key = item.via.array.ptr[1].as<std::string>();
+                            value_obj = &item.via.array.ptr[2];
+                        }
 
-    // Deserialize discarded_replicas
-    if (discarded_replicas_obj == nullptr) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "Missing required field 'discarded_replicas' in snapshot data"));
-    }
-    auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj);
-    if (!dr_result) {
-        return tl::make_unexpected(
-            SerializationError(dr_result.error().code,
-                               "Failed to deserialize discarded_replicas: " +
-                                   dr_result.error().message));
-    }
+                        auto metadata_result = DeserializeMetadata(*value_obj);
+                        if (!metadata_result) {
+                            LOG(ERROR)
+                                << "Failed to deserialize metadata for key: "
+                                << key << ": "
+                                << metadata_result.error().message;
+                            continue;
+                        }
 
-    // Restore replica_next_id
-    if (replica_next_id_obj == nullptr) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "Missing required field 'replica_next_id' in snapshot data"));
-    }
-    auto next_id = replica_next_id_obj->as<uint64_t>();
-    Replica::next_id_.store(next_id);
-    LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
-    service_->RebuildGroupRoutingIndex();
-    return {};
-}
+                        auto metadata_ptr = std::move(metadata_result.value());
+                        auto& tenant_state = shard.tenants[tenant_id];
+                        const std::string user_key = key;
+                        auto [it, inserted] = tenant_state.metadata.emplace(
+                            std::piecewise_construct,
+                            std::forward_as_tuple(std::move(key)),
+                            std::forward_as_tuple(
+                                metadata_ptr->client_id,
+                                metadata_ptr->put_start_time,
+                                metadata_ptr->size, metadata_ptr->PopReplicas(),
+                                metadata_ptr->soft_pin_timeout.has_value(),
+                                metadata_ptr->IsHardPinned(),
+                                metadata_ptr->data_type, metadata_ptr->group_id,
+                                tenant_id, user_key));
 
-void MasterService::MetadataSerializer::Reset() {
-    for (auto& shard : service_->metadata_shards_) {
-        shard.tenants.clear();
-    }
-    {
-        std::unique_lock<std::shared_mutex> lock(
-            service_->group_routing_mutex_);
-        service_->object_group_ids_.clear();
-        service_->groups_needing_lease_refresh_.clear();
-    }
-    {
-        std::lock_guard lock(service_->discarded_replicas_mutex_);
-        service_->discarded_replicas_.clear();
-    }
-    Replica::next_id_.store(1);
-}
+                        it->second.lease_timeout = metadata_ptr->lease_timeout;
+                        it->second.soft_pin_timeout =
+                            metadata_ptr->soft_pin_timeout;
 
-tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
-                                                  MsgpackPacker& packer) const {
-    // MetadataShard format: map with "metadata" field
-    packer.pack_map(1);
+                        // Recompute disk_object_count for restored metadata
+                        if (it->second.HasReplica([](const Replica& r) {
+                                return r.is_local_disk_replica() &&
+                                       r.is_completed();
+                            })) {
+                            shard.disk_object_count++;
+                        }
+                    }
 
-    // Serialize metadata
-    packer.pack("metadata");
-    size_t metadata_count = 0;
-    for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-        metadata_count += tenant_state.metadata.size();
-    }
-    packer.pack_array(metadata_count);
+                    return {};
+                }
 
-    // Sort tenant/key pairs to ensure consistent serialization order.
-    // NOTE: sort may be slow for large shards.
-    struct SortedEntry {
-        std::string tenant_id;
-        std::string key;
-        const ObjectMetadata* metadata;
-    };
-    std::vector<SortedEntry> sorted_entries;
-    sorted_entries.reserve(metadata_count);
-    for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-        for (const auto& [key, metadata] : tenant_state.metadata) {
-            sorted_entries.push_back({tenant_id, key, &metadata});
-        }
-    }
-    std::sort(sorted_entries.begin(), sorted_entries.end(),
-              [](const SortedEntry& lhs, const SortedEntry& rhs) {
-                  if (lhs.tenant_id != rhs.tenant_id) {
-                      return lhs.tenant_id < rhs.tenant_id;
-                  }
-                  return lhs.key < rhs.key;
-              });
+                tl::expected<void, SerializationError>
+                MasterService::MetadataSerializer::SerializeMetadata(
+                    const MasterService::ObjectMetadata& metadata,
+                    MsgpackPacker& packer) const {
+                    // Pack ObjectMetadata using array structure for efficiency
+                    // Format: [client_id, put_start_time, size, lease_timeout,
+                    // has_soft_pin_timeout, soft_pin_timeout, replicas_count,
+                    // data_type, replicas..., hard_pinned, group_id]
 
-    for (const auto& entry : sorted_entries) {
-        // Each metadata item format: [tenant_id, key, metadata_object].
-        packer.pack_array(3);
-        packer.pack(entry.tenant_id);
-        packer.pack(entry.key);
-
-        auto result = SerializeMetadata(*entry.metadata, packer);
-        if (!result) {
-            return tl::make_unexpected(SerializationError(
-                result.error().code,
-                fmt::format("Failed to serialize metadata for key '{}': {}",
-                            entry.key, result.error().message)));
-        }
-    }
-
-    return {};
-}
-
-tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
-                                                    MetadataShard& shard) {
-    if (obj.type != msgpack::type::MAP) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL, "Invalid shard format: expected map"));
-    }
-
-    const msgpack::object* metadata_array = nullptr;
-
-    // Extract fields from shard map
-    for (uint32_t i = 0; i < obj.via.map.size; ++i) {
-        const auto& key_obj = obj.via.map.ptr[i].key;
-        if (key_obj.type == msgpack::type::STR) {
-            std::string field_key(key_obj.via.str.ptr, key_obj.via.str.size);
-            if (field_key == "metadata") {
-                metadata_array = &obj.via.map.ptr[i].val;
-            }
-        }
-    }
-
-    // Clear existing data
-    shard.tenants.clear();
-
-    // Deserialize metadata
-    if (metadata_array == nullptr ||
-        metadata_array->type != msgpack::type::ARRAY) {
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "Missing or invalid 'metadata' field in shard"));
-    }
-
-    shard.tenants.reserve(metadata_array->via.array.size);
-
-    for (uint32_t j = 0; j < metadata_array->via.array.size; ++j) {
-        const msgpack::object& item = metadata_array->via.array.ptr[j];
-
-        if (item.type != msgpack::type::ARRAY ||
-            (item.via.array.size != 2 && item.via.array.size != 3)) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "Invalid metadata item format: expected [key, metadata] or "
-                "[tenant_id, key, metadata]"));
-        }
-
-        std::string tenant_id = "default";
-        std::string key;
-        const msgpack::object* value_obj = nullptr;
-        if (item.via.array.size == 2) {
-            key = item.via.array.ptr[0].as<std::string>();
-            value_obj = &item.via.array.ptr[1];
-        } else {
-            tenant_id =
-                NormalizeTenantId(item.via.array.ptr[0].as<std::string>());
-            key = item.via.array.ptr[1].as<std::string>();
-            value_obj = &item.via.array.ptr[2];
-        }
-
-        auto metadata_result = DeserializeMetadata(*value_obj);
-        if (!metadata_result) {
-            LOG(ERROR) << "Failed to deserialize metadata for key: " << key
-                       << ": " << metadata_result.error().message;
-            continue;
-        }
-
-        auto metadata_ptr = std::move(metadata_result.value());
-        auto& tenant_state = shard.tenants[tenant_id];
-        const std::string user_key = key;
-        auto [it, inserted] = tenant_state.metadata.emplace(
-            std::piecewise_construct, std::forward_as_tuple(std::move(key)),
-            std::forward_as_tuple(
-                metadata_ptr->client_id, metadata_ptr->put_start_time,
-                metadata_ptr->size, metadata_ptr->PopReplicas(),
-                metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
-                metadata_ptr->group_id, tenant_id, user_key));
-
-        it->second.lease_timeout = metadata_ptr->lease_timeout;
-        it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
-
-        // Recompute disk_object_count for restored metadata
-        if (it->second.HasReplica([](const Replica& r) {
-                return r.is_local_disk_replica() && r.is_completed();
-            })) {
-            shard.disk_object_count++;
-        }
-    }
-
-    return {};
-}
-
-tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::SerializeMetadata(
-    const MasterService::ObjectMetadata& metadata,
-    MsgpackPacker& packer) const {
-    // Pack ObjectMetadata using array structure for efficiency
-    // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id]
-
-    size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
+                    size_t array_size =
+                        10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
-    array_size += metadata.CountReplicas();  // One element per replica
-    packer.pack_array(array_size);
-
-    // Serialize client_id
-    std::string client_id = UuidToString(metadata.client_id);
-    packer.pack(client_id);
-
-    // Serialize put_start_time (convert to timestamp)
-    auto put_start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              metadata.put_start_time.time_since_epoch())
-                              .count();
-    packer.pack(put_start_time);
-
-    // Serialize size
-    packer.pack(static_cast<uint64_t>(metadata.size));
-
-    // Serialize lease_timeout (convert to timestamp)
-    auto lease_timestamp =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            metadata.lease_timeout.time_since_epoch())
-            .count();
-    packer.pack(lease_timestamp);
-
-    // Serialize soft_pin_timeout (if exists)
-    if (metadata.soft_pin_timeout.has_value()) {
-        packer.pack(true);  // Mark soft_pin_timeout exists
-        auto soft_pin_timestamp =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                metadata.soft_pin_timeout.value().time_since_epoch())
-                .count();
-        packer.pack(soft_pin_timestamp);
-    } else {
-        packer.pack(false);        // Mark soft_pin_timeout does not exist
-        packer.pack(uint64_t(0));  // Placeholder
-    }
-
-    // Serialize replicas count
-    packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
-
-    // Serialize data_type
-    packer.pack(static_cast<uint8_t>(metadata.data_type));
-
-    // Serialize replicas
-    for (const auto& replica : metadata.GetAllReplicas()) {
-        auto result = Serializer<Replica>::serialize(
-            replica, service_->segment_manager_.getView(), packer);
-        if (!result) {
-            return tl::unexpected(result.error());
-        }
-    }
-
-    packer.pack(metadata.IsHardPinned());
-    packer.pack(metadata.group_id);
-
-    return {};
-}
-
-tl::expected<std::unique_ptr<MasterService::ObjectMetadata>, SerializationError>
-MasterService::MetadataSerializer::DeserializeMetadata(
-    const msgpack::object& obj) const {
-    // Check if input is a valid array
-    if (obj.type != msgpack::type::ARRAY) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize ObjectMetadata state is not an array"));
-    }
-
-    // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    if (obj.via.array.size < 7) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize ObjectMetadata array size is too small"));
-    }
-
-    msgpack::object* array = obj.via.array.ptr;
-    uint32_t index = 0;
-
-    // Deserialize client_id string
-    std::string client_id_str = array[index++].as<std::string>();
-    UUID client_id;
-    StringToUuid(client_id_str, client_id);
-
-    // Deserialize put_start_time
-    uint64_t put_start_time_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize size
-    auto size = static_cast<size_t>(array[index++].as<uint64_t>());
-
-    // Deserialize lease_timeout
-    uint64_t lease_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize soft_pin_timeout flag
-    bool has_soft_pin_timeout = array[index++].as<bool>();
-
-    // Deserialize soft_pin_timeout value
-    uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize replicas count
-    uint32_t replicas_count = array[index++].as<uint32_t>();
-
-    // Format detection (decode optional fields by type for back-compat):
-    //   v1: 7 + replicas_count, no optional fields
-    //   v2: 8 + replicas_count, either data_type or hard_pinned
-    //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
-    //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
-    // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
-    // replicas_count from wrapping the bounds and slipping an out-of-bounds
-    // index past the size check.
-    constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 3;
-    const uint64_t total_elements = obj.via.array.size;
-    const uint64_t min_elements = kBaseFieldCount + replicas_count;
-    if (total_elements < min_elements ||
-        total_elements > min_elements + kMaxOptionalFieldCount) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize ObjectMetadata array size mismatch"));
-    }
-
-    ObjectDataType data_type = ObjectDataType::UNKNOWN;
-    if (index < total_elements &&
-        array[index].type == msgpack::type::POSITIVE_INTEGER) {
-        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
-    }
-
-    // Deserialize replicas
-    std::vector<Replica> replicas;
-    replicas.reserve(replicas_count);
-
-    for (uint32_t i = 0; i < replicas_count; i++) {
-        // Defensive bound: the data_type skip above can consume a slot the
-        // size check counted on, so a crafted entry whose first post-count
-        // field looks like a data_type could otherwise read past the array.
-        // Mirrors the standby reader in catalog_backed_snapshot_provider.cpp.
-        if (index >= total_elements) {
-            return tl::unexpected(
-                SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                   "deserialize ObjectMetadata truncated"));
-        }
-        auto result = Serializer<Replica>::deserialize(
-            array[index++], service_->segment_manager_.getView());
-        if (!result) {
-            return tl::unexpected(result.error());
-        }
-        replicas.emplace_back(std::move(*result.value()));
-    }
-
-    // Deserialize hard_pinned (if present, otherwise default to false)
-    bool is_hard_pinned = false;
-    if (index < obj.via.array.size &&
-        array[index].type == msgpack::type::BOOLEAN) {
-        is_hard_pinned = array[index++].as<bool>();
-    }
-
-    std::string group_id;
-    if (index < obj.via.array.size && array[index].type == msgpack::type::STR) {
-        group_id = array[index++].as<std::string>();
-    }
-
-    // Create ObjectMetadata instance
-    bool enable_soft_pin = has_soft_pin_timeout;
-    auto metadata = std::make_unique<ObjectMetadata>(
-        client_id,
-        std::chrono::system_clock::time_point(
-            std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
-        group_id);
-    metadata->lease_timeout = std::chrono::system_clock::time_point(
-        std::chrono::milliseconds(lease_timestamp));
-
-    // Set soft_pin_timeout (if exists)
-    if (has_soft_pin_timeout) {
-        metadata->soft_pin_timeout.emplace(
-            std::chrono::system_clock::time_point(
-                std::chrono::milliseconds(soft_pin_timestamp)));
-    }
-
-    return metadata;
-}
-
-std::string MasterService::FormatTimestamp(
-    const std::chrono::system_clock::time_point& tp) {
-    auto time_t = std::chrono::system_clock::to_time_t(tp);
-
-    std::stringstream ss;
-    ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
-
-    // Add milliseconds to ensure uniqueness
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  tp.time_since_epoch()) %
-              1000;
-
-    ss << "_" << std::setfill('0') << std::setw(3) << ms.count();
-
-    return ss.str();
-}
-
-tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
-    const std::string& key, const std::string& tenant_id,
-    const std::vector<std::string>& targets) {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
-    if (!normalized_tenant_result) {
-        return tl::make_unexpected(normalized_tenant_result.error());
-    }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    if (targets.empty()) {
-        LOG(ERROR) << "key=" << key << ", error=empty_targets";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    MetadataAccessorRO accessor(this, object_id);
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
-    for (const auto& target : targets) {
-        if (!segment_accessor.ExistsSegmentName(target)) {
-            LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                       << ", error=target_segment_not_mounted";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (!segment_accessor.IsSegmentAllocatable(target)) {
-            LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                       << ", error=target_segment_not_allocatable";
-            return tl::make_unexpected(
-                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-    }
-
-    const auto& metadata = accessor.Get();
-    const auto& segment_names = metadata.GetReplicaSegmentNames();
-    if (segment_names.empty()) {
-        LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    // Randomly pick a segment from the source replicas
-    static thread_local std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
-    std::string selected_source_segment = segment_names[dis(gen)];
-    UUID select_client;
-    ErrorCode error = segment_accessor.GetClientIdBySegmentName(
-        selected_source_segment, select_client);
-    if (error != ErrorCode::OK) {
-        LOG(ERROR) << "key=" << key
-                   << ", segment_name=" << selected_source_segment
-                   << ", error=client_id_not_found";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    return task_manager_.get_write_access()
-        .submit_task_typed<TaskType::REPLICA_COPY>(
-            select_client, {.tenant_id = object_id.tenant_id,
-                            .key = object_id.user_key,
-                            .source = selected_source_segment,
-                            .targets = targets});
-}
-
-tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
-    const std::string& key, const std::string& tenant_id,
-    const std::string& source, const std::string& target) {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
-    if (!normalized_tenant_result) {
-        return tl::make_unexpected(normalized_tenant_result.error());
-    }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, object_id);
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    if (source == target) {
-        LOG(ERROR) << "key=" << key << ", source_segment=" << source
-                   << ", target_segment=" << target
-                   << ", error=source_target_segments_are_same";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
-    if (!segment_accessor.ExistsSegmentName(target)) {
-        LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                   << ", error=target_segment_not_mounted";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (!segment_accessor.IsSegmentAllocatable(target)) {
-        LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                   << ", error=target_segment_not_allocatable";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
-
-    const auto& metadata = accessor.Get();
-    const auto& segment_names = metadata.GetReplicaSegmentNames();
-    if (std::find(segment_names.begin(), segment_names.end(), source) ==
-        segment_names.end()) {
-        LOG(ERROR) << "key=" << key << ", source_segment=" << source
-                   << ", error=source_segment_not_found";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    UUID select_client;
-    ErrorCode error =
-        segment_accessor.GetClientIdBySegmentName(source, select_client);
-
-    if (error != ErrorCode::OK) {
-        LOG(ERROR) << "key=" << key << ", segment_name=" << source
-                   << ", error=client_id_not_found";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    return task_manager_.get_write_access()
-        .submit_task_typed<TaskType::REPLICA_MOVE>(
-            select_client, {.tenant_id = object_id.tenant_id,
-                            .key = object_id.user_key,
-                            .source = source,
-                            .target = target});
-}
-
-tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
-    const UUID& task_id) {
-    const auto& task_option =
-        task_manager_.get_read_access().find_task_by_id(task_id);
-    if (!task_option.has_value()) {
-        LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
-        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
-    }
-    return QueryTaskResponse(task_option.value());
-}
-
-tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
-    const UUID& client_id, size_t batch_size) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto& tasks =
-        task_manager_.get_write_access().pop_tasks(client_id, batch_size);
-    std::vector<TaskAssignment> assignments;
-    for (const auto& task : tasks) {
-        assignments.emplace_back(task);
-    }
-    return assignments;
-}
-
-tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
-    const UUID& client_id, const TaskCompleteRequest& request) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto write_access = task_manager_.get_write_access();
-    ErrorCode err = write_access.complete_task(client_id, request.id,
-                                               request.status, request.message);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "task_id=" << request.id
-                   << ", error=complete_task_failed";
-        return tl::make_unexpected(err);
-    }
-    return {};
-}
-
-tl::expected<void, ErrorCode> MasterService::ValidateDrainRequest(
-    const CreateDrainJobRequest& request) {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return ValidateDrainRequestLocked(segment_access, request);
-}
-
-tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
-    ScopedSegmentAccess& segment_access, const CreateDrainJobRequest& request) {
-    if (request.segments.empty() || request.max_concurrency == 0) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::unordered_set<std::string> unique_segments(request.segments.begin(),
-                                                    request.segments.end());
-    if (unique_segments.size() != request.segments.size()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    for (const auto& segment_name : request.segments) {
-        if (!segment_access.ExistsSegmentName(segment_name)) {
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-        }
-        SegmentStatus status = SegmentStatus::UNDEFINED;
-        auto err = segment_access.GetSegmentStatusByName(segment_name, status);
-        if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
-        }
-        if (status != SegmentStatus::OK) {
-            return tl::make_unexpected(
-                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-    }
-
-    for (const auto& target_segment : request.target_segments) {
-        if (unique_segments.contains(target_segment)) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (!segment_access.ExistsSegmentName(target_segment)) {
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-        }
-        if (!segment_access.IsSegmentAllocatable(target_segment)) {
-            return tl::make_unexpected(
-                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-    }
-    return {};
-}
-
-tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
-    const CreateDrainJobRequest& request) {
-    std::vector<std::string> draining_segments;
-    {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        auto valid = ValidateDrainRequestLocked(segment_access, request);
-        if (!valid.has_value()) {
-            return tl::make_unexpected(valid.error());
-        }
-
-        draining_segments.reserve(request.segments.size());
-        for (const auto& segment_name : request.segments) {
-            auto err = segment_access.SetSegmentStatusByName(
-                segment_name, SegmentStatus::DRAINING);
-            if (err != ErrorCode::OK) {
-                for (const auto& updated_segment : draining_segments) {
-                    (void)segment_access.SetSegmentStatusByName(
-                        updated_segment, SegmentStatus::OK);
-                }
-                return tl::make_unexpected(err);
-            }
-            draining_segments.push_back(segment_name);
-        }
-    }
-
-    auto job = std::make_shared<DrainJob>();
-    job->id = generate_uuid();
-    job->request = request;
-    job->created_at = std::chrono::system_clock::now();
-    job->last_updated_at = job->created_at;
-    job->status = JobStatus::CREATED;
-    job->message = "Drain job created";
-
-    {
-        std::lock_guard<std::mutex> lock(job_mutex_);
-        drain_jobs_.emplace(job->id, job);
-    }
-
-    return job->id;
-}
-
-tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
-    const UUID& job_id) {
-    std::shared_ptr<DrainJob> job;
-    {
-        std::lock_guard<std::mutex> lock(job_mutex_);
-        auto it = drain_jobs_.find(job_id);
-        if (it == drain_jobs_.end()) {
-            return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
-        }
-        job = it->second;
-    }
-
-    std::lock_guard<std::mutex> job_lock(job->mutex);
-    QueryJobResponse response;
-    response.id = job->id;
-    response.type = job->type;
-    response.status = job->status;
-    response.created_at_ms_epoch = static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->created_at.time_since_epoch())
-            .count());
-    response.last_updated_at_ms_epoch = static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->last_updated_at.time_since_epoch())
-            .count());
-    response.segments = job->request.segments;
-    response.succeeded_units = job->succeeded_units;
-    response.failed_units = job->failed_units;
-    response.blocked_units = job->blocked_units;
-    response.active_units = static_cast<uint64_t>(job->active_tasks.size());
-    response.migrated_bytes = job->migrated_bytes;
-    response.message = job->message;
-    return response;
-}
-
-tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
-    const UUID& job_id) {
-    std::shared_ptr<DrainJob> job;
-    {
-        std::lock_guard<std::mutex> lock(job_mutex_);
-        auto it = drain_jobs_.find(job_id);
-        if (it == drain_jobs_.end()) {
-            return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
-        }
-        job = it->second;
-    }
-
-    std::vector<std::string> segments_to_restore;
-    {
-        std::lock_guard<std::mutex> job_lock(job->mutex);
-        if (job->status == JobStatus::SUCCEEDED ||
-            job->status == JobStatus::FAILED ||
-            job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
-            return tl::make_unexpected(
-                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-
-        job->status = JobStatus::CANCELED;
-        job->last_updated_at = std::chrono::system_clock::now();
-        job->message = "Drain job canceled";
-        segments_to_restore = job->request.segments;
-    }
-
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    for (const auto& segment_name : segments_to_restore) {
-        SegmentStatus status = SegmentStatus::UNDEFINED;
-        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                ErrorCode::OK &&
-            status != SegmentStatus::UNMOUNTING) {
-            (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                        SegmentStatus::OK);
-        }
-    }
-    return {};
-}
-
-std::string MasterService::MakeDrainUnitKey(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& source_segment) const {
-    const auto normalized_tenant = NormalizeTenantId(tenant_id);
-    return std::to_string(normalized_tenant.size()) + ":" + normalized_tenant +
-           ":" + std::to_string(key.size()) + ":" + key + ":" + source_segment;
-}
-
-std::optional<std::string> MasterService::SelectDrainTargetForKey(
-    const ObjectMetadata& metadata, const std::string& source_segment,
-    const std::vector<std::string>& requested_targets) {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    std::vector<std::string> candidate_segments = requested_targets;
-    if (candidate_segments.empty()) {
-        auto err = segment_access.GetAllSegments(candidate_segments);
-        if (err != ErrorCode::OK) {
-            return std::nullopt;
-        }
-    }
-
-    const auto existing_segments = metadata.GetReplicaSegmentNames();
-    double best_util = std::numeric_limits<double>::max();
-    std::optional<std::string> best_target;
-    for (const auto& candidate : candidate_segments) {
-        if (candidate == source_segment) {
-            continue;
-        }
-        if (std::find(existing_segments.begin(), existing_segments.end(),
-                      candidate) != existing_segments.end()) {
-            continue;
-        }
-        if (!segment_access.IsSegmentAllocatable(candidate)) {
-            continue;
-        }
-        size_t used = 0, capacity = 0;
-        if (segment_access.QuerySegments(candidate, used, capacity) !=
-                ErrorCode::OK ||
-            capacity == 0) {
-            continue;
-        }
-        const double util =
-            static_cast<double>(used) / static_cast<double>(capacity);
-        if (util < best_util) {
-            best_util = util;
-            best_target = candidate;
-        }
-    }
-    return best_target;
-}
-
-void MasterService::RefreshDrainJobTasks(DrainJob& job) {
-    auto read_access = task_manager_.get_read_access();
-    std::vector<UUID> finished_task_ids;
-    finished_task_ids.reserve(job.active_tasks.size());
-
-    for (const auto& [task_id, active_task] : job.active_tasks) {
-        auto task_opt = read_access.find_task_by_id(task_id);
-        if (!task_opt.has_value()) {
-            finished_task_ids.push_back(task_id);
-            job.failed_units++;
-            job.terminal_failed_unit_keys.insert(active_task.unit_key);
-            continue;
-        }
-        if (!task_opt->is_finished()) {
-            continue;
-        }
-
-        finished_task_ids.push_back(task_id);
-        if (task_opt->status == TaskStatus::SUCCESS) {
-            job.succeeded_units++;
-            job.migrated_bytes += active_task.bytes;
-            job.completed_unit_keys.insert(active_task.unit_key);
-        } else {
-            job.failed_units++;
-            auto& retry_count = job.retry_counts[active_task.unit_key];
-            retry_count++;
-            if (retry_count >= kMaxDrainUnitRetries) {
-                job.terminal_failed_unit_keys.insert(active_task.unit_key);
-            }
-        }
-    }
-
-    for (const auto& task_id : finished_task_ids) {
-        job.active_tasks.erase(task_id);
-    }
-}
-
-void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
-    if (job.status == JobStatus::CREATED) {
-        job.status = JobStatus::PLANNING;
-    }
-
-    const uint32_t max_concurrency =
-        std::max<uint32_t>(1, job.request.max_concurrency);
-    if (job.active_tasks.size() >= max_concurrency) {
-        job.status = JobStatus::RUNNING;
-        return;
-    }
-
-    struct DrainPlan {
-        std::string tenant_id;
-        std::string key;
-        std::string source_segment;
-        std::string target_segment;
-        size_t bytes;
-        std::string unit_key;
-    };
-
-    const size_t slots = max_concurrency - job.active_tasks.size();
-    std::vector<DrainPlan> plans;
-    plans.reserve(slots);
-    std::unordered_set<std::string> active_unit_keys;
-    for (const auto& [_, task] : job.active_tasks) {
-        active_unit_keys.insert(task.unit_key);
-    }
-
-    std::unordered_set<std::string> blocked_unit_keys;
-    {
-        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        for (size_t i = 0; i < kNumShards; ++i) {
-            MetadataShardAccessorRO shard(this, i);
-            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
-                for (const auto& [key, metadata] : tenant_state.metadata) {
-                    for (const auto& source_segment : job.request.segments) {
-                        const auto unit_key =
-                            MakeDrainUnitKey(tenant_id, key, source_segment);
-                        if (job.completed_unit_keys.contains(unit_key) ||
-                            active_unit_keys.contains(unit_key) ||
-                            job.terminal_failed_unit_keys.contains(unit_key)) {
-                            continue;
-                        }
-
-                        const auto replica_segments =
-                            metadata.GetReplicaSegmentNames();
-                        if (std::find(replica_segments.begin(),
-                                      replica_segments.end(), source_segment) ==
-                            replica_segments.end()) {
-                            continue;
-                        }
-
-                        if (metadata.IsHardPinned() ||
-                            !metadata.IsLeaseExpired() ||
-                            !metadata.AllReplicas(&Replica::fn_is_completed) ||
-                            tenant_state.replication_tasks.contains(key)) {
-                            blocked_unit_keys.insert(unit_key);
-                            continue;
-                        }
-
-                        auto target = SelectDrainTargetForKey(
-                            metadata, source_segment,
-                            job.request.target_segments);
-                        if (!target.has_value()) {
-                            blocked_unit_keys.insert(unit_key);
-                            continue;
-                        }
-
-                        if (plans.size() < slots) {
-                            plans.push_back({tenant_id, key, source_segment,
-                                             *target, metadata.size, unit_key});
+                    array_size +=
+                        metadata.CountReplicas();  // One element per replica
+                    packer.pack_array(array_size);
+
+                    // Serialize client_id
+                    std::string client_id = UuidToString(metadata.client_id);
+                    packer.pack(client_id);
+
+                    // Serialize put_start_time (convert to timestamp)
+                    auto put_start_time =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            metadata.put_start_time.time_since_epoch())
+                            .count();
+                    packer.pack(put_start_time);
+
+                    // Serialize size
+                    packer.pack(static_cast<uint64_t>(metadata.size));
+
+                    // Serialize lease_timeout (convert to timestamp)
+                    auto lease_timestamp =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            metadata.lease_timeout.time_since_epoch())
+                            .count();
+                    packer.pack(lease_timestamp);
+
+                    // Serialize soft_pin_timeout (if exists)
+                    if (metadata.soft_pin_timeout.has_value()) {
+                        packer.pack(true);  // Mark soft_pin_timeout exists
+                        auto soft_pin_timestamp =
+                            std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                metadata.soft_pin_timeout.value()
+                                    .time_since_epoch())
+                                .count();
+                        packer.pack(soft_pin_timestamp);
+                    } else {
+                        packer.pack(
+                            false);  // Mark soft_pin_timeout does not exist
+                        packer.pack(uint64_t(0));  // Placeholder
+                    }
+
+                    // Serialize replicas count
+                    packer.pack(
+                        static_cast<uint32_t>(metadata.CountReplicas()));
+
+                    // Serialize data_type
+                    packer.pack(static_cast<uint8_t>(metadata.data_type));
+
+                    // Serialize replicas
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        auto result = Serializer<Replica>::serialize(
+                            replica, service_->segment_manager_.getView(),
+                            packer);
+                        if (!result) {
+                            return tl::unexpected(result.error());
                         }
                     }
+
+                    packer.pack(metadata.IsHardPinned());
+                    packer.pack(metadata.group_id);
+
+                    return {};
                 }
-            }
-        }
-    }
 
-    job.blocked_units = blocked_unit_keys.size();
+                tl::expected<std::unique_ptr<MasterService::ObjectMetadata>,
+                             SerializationError>
+                MasterService::MetadataSerializer::DeserializeMetadata(
+                    const msgpack::object& obj) const {
+                    // Check if input is a valid array
+                    if (obj.type != msgpack::type::ARRAY) {
+                        return tl::unexpected(
+                            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                               "deserialize ObjectMetadata "
+                                               "state is not an array"));
+                    }
 
-    for (const auto& plan : plans) {
-        auto task_id = CreateMoveTask(plan.key, plan.tenant_id,
-                                      plan.source_segment, plan.target_segment);
-        if (task_id.has_value()) {
-            ActiveDrainTask active_task;
-            active_task.task_id = task_id.value();
-            active_task.tenant_id = plan.tenant_id;
-            active_task.key = plan.key;
-            active_task.source_segment = plan.source_segment;
-            active_task.target_segment = plan.target_segment;
-            active_task.bytes = plan.bytes;
-            active_task.unit_key = plan.unit_key;
-            job.active_tasks.emplace(task_id.value(), std::move(active_task));
-        } else if (task_id.error() == ErrorCode::NO_AVAILABLE_HANDLE ||
-                   task_id.error() ==
-                       ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
-                   task_id.error() == ErrorCode::OBJECT_HAS_REPLICATION_TASK) {
-            job.blocked_units++;
-        } else {
-            job.failed_units++;
-            auto& retry_count = job.retry_counts[plan.unit_key];
-            retry_count++;
-            if (retry_count >= kMaxDrainUnitRetries) {
-                job.terminal_failed_unit_keys.insert(plan.unit_key);
-            }
-        }
-    }
+                    // Need at least 7 elements: client_id, put_start_time,
+                    // size, lease_timeout, has_soft_pin_timeout,
+                    // soft_pin_timeout, replicas_count
+                    if (obj.via.array.size < 7) {
+                        return tl::unexpected(
+                            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                               "deserialize ObjectMetadata "
+                                               "array size is too small"));
+                    }
 
-    job.status = JobStatus::RUNNING;
-    job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job running";
-}
+                    msgpack::object* array = obj.via.array.ptr;
+                    uint32_t index = 0;
 
-bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
-    if (!job.active_tasks.empty()) {
-        return false;
-    }
+                    // Deserialize client_id string
+                    std::string client_id_str =
+                        array[index++].as<std::string>();
+                    UUID client_id;
+                    StringToUuid(client_id_str, client_id);
 
-    std::unordered_set<std::string> remaining_segments;
-    std::unordered_set<std::string> remaining_unit_keys;
-    {
-        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        for (size_t i = 0; i < kNumShards; ++i) {
-            MetadataShardAccessorRO shard(this, i);
-            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
-                for (const auto& [key, metadata] : tenant_state.metadata) {
-                    const auto replica_segments =
+                    // Deserialize put_start_time
+                    uint64_t put_start_time_timestamp =
+                        array[index++].as<uint64_t>();
+
+                    // Deserialize size
+                    auto size =
+                        static_cast<size_t>(array[index++].as<uint64_t>());
+
+                    // Deserialize lease_timeout
+                    uint64_t lease_timestamp = array[index++].as<uint64_t>();
+
+                    // Deserialize soft_pin_timeout flag
+                    bool has_soft_pin_timeout = array[index++].as<bool>();
+
+                    // Deserialize soft_pin_timeout value
+                    uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
+
+                    // Deserialize replicas count
+                    uint32_t replicas_count = array[index++].as<uint32_t>();
+
+                    // Format detection (decode optional fields by type for
+                    // back-compat):
+                    //   v1: 7 + replicas_count, no optional fields
+                    //   v2: 8 + replicas_count, either data_type or hard_pinned
+                    //   v3: 9 + replicas_count, data_type + hard_pinned or
+                    //   hard_pinned + group_id v4: 10 + replicas_count,
+                    //   data_type + hard_pinned + group_id
+                    // 64-bit arithmetic keeps an attacker-controlled
+                    // near-UINT32_MAX replicas_count from wrapping the bounds
+                    // and slipping an out-of-bounds index past the size check.
+                    constexpr uint64_t kBaseFieldCount = 7;
+                    constexpr uint64_t kMaxOptionalFieldCount = 3;
+                    const uint64_t total_elements = obj.via.array.size;
+                    const uint64_t min_elements =
+                        kBaseFieldCount + replicas_count;
+                    if (total_elements < min_elements ||
+                        total_elements >
+                            min_elements + kMaxOptionalFieldCount) {
+                        return tl::unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "deserialize ObjectMetadata array size mismatch"));
+                    }
+
+                    ObjectDataType data_type = ObjectDataType::UNKNOWN;
+                    if (index < total_elements &&
+                        array[index].type == msgpack::type::POSITIVE_INTEGER) {
+                        data_type = static_cast<ObjectDataType>(
+                            array[index++].as<uint8_t>());
+                    }
+
+                    // Deserialize replicas
+                    std::vector<Replica> replicas;
+                    replicas.reserve(replicas_count);
+
+                    for (uint32_t i = 0; i < replicas_count; i++) {
+                        // Defensive bound: the data_type skip above can consume
+                        // a slot the size check counted on, so a crafted entry
+                        // whose first post-count field looks like a data_type
+                        // could otherwise read past the array. Mirrors the
+                        // standby reader in
+                        // catalog_backed_snapshot_provider.cpp.
+                        if (index >= total_elements) {
+                            return tl::unexpected(SerializationError(
+                                ErrorCode::DESERIALIZE_FAIL,
+                                "deserialize ObjectMetadata truncated"));
+                        }
+                        auto result = Serializer<Replica>::deserialize(
+                            array[index++],
+                            service_->segment_manager_.getView());
+                        if (!result) {
+                            return tl::unexpected(result.error());
+                        }
+                        replicas.emplace_back(std::move(*result.value()));
+                    }
+
+                    // Deserialize hard_pinned (if present, otherwise default to
+                    // false)
+                    bool is_hard_pinned = false;
+                    if (index < obj.via.array.size &&
+                        array[index].type == msgpack::type::BOOLEAN) {
+                        is_hard_pinned = array[index++].as<bool>();
+                    }
+
+                    std::string group_id;
+                    if (index < obj.via.array.size &&
+                        array[index].type == msgpack::type::STR) {
+                        group_id = array[index++].as<std::string>();
+                    }
+
+                    // Create ObjectMetadata instance
+                    bool enable_soft_pin = has_soft_pin_timeout;
+                    auto metadata = std::make_unique<ObjectMetadata>(
+                        client_id,
+                        std::chrono::system_clock::time_point(
+                            std::chrono::milliseconds(
+                                put_start_time_timestamp)),
+                        size, std::move(replicas), enable_soft_pin,
+                        is_hard_pinned, data_type, group_id);
+                    metadata->lease_timeout =
+                        std::chrono::system_clock::time_point(
+                            std::chrono::milliseconds(lease_timestamp));
+
+                    // Set soft_pin_timeout (if exists)
+                    if (has_soft_pin_timeout) {
+                        metadata->soft_pin_timeout.emplace(
+                            std::chrono::system_clock::time_point(
+                                std::chrono::milliseconds(soft_pin_timestamp)));
+                    }
+
+                    return metadata;
+                }
+
+                std::string MasterService::FormatTimestamp(
+                    const std::chrono::system_clock::time_point& tp) {
+                    auto time_t = std::chrono::system_clock::to_time_t(tp);
+
+                    std::stringstream ss;
+                    ss << std::put_time(std::localtime(&time_t),
+                                        "%Y%m%d_%H%M%S");
+
+                    // Add milliseconds to ensure uniqueness
+                    auto ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            tp.time_since_epoch()) %
+                        1000;
+
+                    ss << "_" << std::setfill('0') << std::setw(3)
+                       << ms.count();
+
+                    return ss.str();
+                }
+
+                tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
+                    const std::string& key, const std::string& tenant_id,
+                    const std::vector<std::string>& targets) {
+                    auto normalized_tenant_result =
+                        NormalizeTenantIdForWrite(tenant_id);
+                    if (!normalized_tenant_result) {
+                        return tl::make_unexpected(
+                            normalized_tenant_result.error());
+                    }
+                    const ObjectIdentity object_id{
+                        normalized_tenant_result.value(), key};
+                    std::shared_lock<std::shared_mutex> shared_lock(
+                        snapshot_mutex_);
+                    if (targets.empty()) {
+                        LOG(ERROR) << "key=" << key << ", error=empty_targets";
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    MetadataAccessorRO accessor(this, object_id);
+                    if (!accessor.Exists()) {
+                        VLOG(1) << "key=" << key << ", info=object_not_found";
+                        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                    }
+
+                    ScopedSegmentAccess segment_accessor =
+                        segment_manager_.getSegmentAccess();
+                    for (const auto& target : targets) {
+                        if (!segment_accessor.ExistsSegmentName(target)) {
+                            LOG(ERROR) << "key=" << key
+                                       << ", target_segment=" << target
+                                       << ", error=target_segment_not_mounted";
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                        if (!segment_accessor.IsSegmentAllocatable(target)) {
+                            LOG(ERROR)
+                                << "key=" << key
+                                << ", target_segment=" << target
+                                << ", error=target_segment_not_allocatable";
+                            return tl::make_unexpected(
+                                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                        }
+                    }
+
+                    const auto& metadata = accessor.Get();
+                    const auto& segment_names =
                         metadata.GetReplicaSegmentNames();
-                    for (const auto& source_segment : job.request.segments) {
-                        if (std::find(replica_segments.begin(),
-                                      replica_segments.end(), source_segment) !=
-                            replica_segments.end()) {
-                            remaining_segments.insert(source_segment);
-                            remaining_unit_keys.insert(MakeDrainUnitKey(
-                                tenant_id, key, source_segment));
+                    if (segment_names.empty()) {
+                        LOG(ERROR) << "key=" << key
+                                   << ", error=no_valid_source_replicas";
+                        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
+
+                    // Randomly pick a segment from the source replicas
+                    static thread_local std::mt19937 gen(
+                        std::random_device{}());
+                    std::uniform_int_distribution<size_t> dis(
+                        0, segment_names.size() - 1);
+                    std::string selected_source_segment =
+                        segment_names[dis(gen)];
+                    UUID select_client;
+                    ErrorCode error = segment_accessor.GetClientIdBySegmentName(
+                        selected_source_segment, select_client);
+                    if (error != ErrorCode::OK) {
+                        LOG(ERROR)
+                            << "key=" << key
+                            << ", segment_name=" << selected_source_segment
+                            << ", error=client_id_not_found";
+                        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
+                    return task_manager_.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_COPY>(
+                            select_client, {.tenant_id = object_id.tenant_id,
+                                            .key = object_id.user_key,
+                                            .source = selected_source_segment,
+                                            .targets = targets});
+                }
+
+                tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
+                    const std::string& key, const std::string& tenant_id,
+                    const std::string& source, const std::string& target) {
+                    auto normalized_tenant_result =
+                        NormalizeTenantIdForWrite(tenant_id);
+                    if (!normalized_tenant_result) {
+                        return tl::make_unexpected(
+                            normalized_tenant_result.error());
+                    }
+                    const ObjectIdentity object_id{
+                        normalized_tenant_result.value(), key};
+                    std::shared_lock<std::shared_mutex> shared_lock(
+                        snapshot_mutex_);
+                    MetadataAccessorRO accessor(this, object_id);
+                    if (!accessor.Exists()) {
+                        VLOG(1) << "key=" << key << ", info=object_not_found";
+                        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                    }
+
+                    if (source == target) {
+                        LOG(ERROR)
+                            << "key=" << key << ", source_segment=" << source
+                            << ", target_segment=" << target
+                            << ", error=source_target_segments_are_same";
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+
+                    ScopedSegmentAccess segment_accessor =
+                        segment_manager_.getSegmentAccess();
+                    if (!segment_accessor.ExistsSegmentName(target)) {
+                        LOG(ERROR)
+                            << "key=" << key << ", target_segment=" << target
+                            << ", error=target_segment_not_mounted";
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    if (!segment_accessor.IsSegmentAllocatable(target)) {
+                        LOG(ERROR)
+                            << "key=" << key << ", target_segment=" << target
+                            << ", error=target_segment_not_allocatable";
+                        return tl::make_unexpected(
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                    }
+
+                    const auto& metadata = accessor.Get();
+                    const auto& segment_names =
+                        metadata.GetReplicaSegmentNames();
+                    if (std::find(segment_names.begin(), segment_names.end(),
+                                  source) == segment_names.end()) {
+                        LOG(ERROR)
+                            << "key=" << key << ", source_segment=" << source
+                            << ", error=source_segment_not_found";
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+
+                    UUID select_client;
+                    ErrorCode error = segment_accessor.GetClientIdBySegmentName(
+                        source, select_client);
+
+                    if (error != ErrorCode::OK) {
+                        LOG(ERROR)
+                            << "key=" << key << ", segment_name=" << source
+                            << ", error=client_id_not_found";
+                        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
+
+                    return task_manager_.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_MOVE>(
+                            select_client, {.tenant_id = object_id.tenant_id,
+                                            .key = object_id.user_key,
+                                            .source = source,
+                                            .target = target});
+                }
+
+                tl::expected<QueryTaskResponse, ErrorCode>
+                MasterService::QueryTask(const UUID& task_id) {
+                    const auto& task_option =
+                        task_manager_.get_read_access().find_task_by_id(
+                            task_id);
+                    if (!task_option.has_value()) {
+                        LOG(ERROR) << "task_id=" << task_id
+                                   << ", error=task_not_found";
+                        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+                    }
+                    return QueryTaskResponse(task_option.value());
+                }
+
+                tl::expected<std::vector<TaskAssignment>, ErrorCode>
+                MasterService::FetchTasks(const UUID& client_id,
+                                          size_t batch_size) {
+                    std::shared_lock<std::shared_mutex> shared_lock(
+                        snapshot_mutex_);
+                    const auto& tasks =
+                        task_manager_.get_write_access().pop_tasks(client_id,
+                                                                   batch_size);
+                    std::vector<TaskAssignment> assignments;
+                    for (const auto& task : tasks) {
+                        assignments.emplace_back(task);
+                    }
+                    return assignments;
+                }
+
+                tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
+                    const UUID& client_id, const TaskCompleteRequest& request) {
+                    std::shared_lock<std::shared_mutex> shared_lock(
+                        snapshot_mutex_);
+                    auto write_access = task_manager_.get_write_access();
+                    ErrorCode err = write_access.complete_task(
+                        client_id, request.id, request.status, request.message);
+                    if (err != ErrorCode::OK) {
+                        LOG(ERROR) << "task_id=" << request.id
+                                   << ", error=complete_task_failed";
+                        return tl::make_unexpected(err);
+                    }
+                    return {};
+                }
+
+                tl::expected<void, ErrorCode>
+                MasterService::ValidateDrainRequest(
+                    const CreateDrainJobRequest& request) {
+                    ScopedSegmentAccess segment_access =
+                        segment_manager_.getSegmentAccess();
+                    return ValidateDrainRequestLocked(segment_access, request);
+                }
+
+                tl::expected<void, ErrorCode>
+                MasterService::ValidateDrainRequestLocked(
+                    ScopedSegmentAccess & segment_access,
+                    const CreateDrainJobRequest& request) {
+                    if (request.segments.empty() ||
+                        request.max_concurrency == 0) {
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+
+                    std::unordered_set<std::string> unique_segments(
+                        request.segments.begin(), request.segments.end());
+                    if (unique_segments.size() != request.segments.size()) {
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+
+                    for (const auto& segment_name : request.segments) {
+                        if (!segment_access.ExistsSegmentName(segment_name)) {
+                            return tl::make_unexpected(
+                                ErrorCode::SEGMENT_NOT_FOUND);
+                        }
+                        SegmentStatus status = SegmentStatus::UNDEFINED;
+                        auto err = segment_access.GetSegmentStatusByName(
+                            segment_name, status);
+                        if (err != ErrorCode::OK) {
+                            return tl::make_unexpected(err);
+                        }
+                        if (status != SegmentStatus::OK) {
+                            return tl::make_unexpected(
+                                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
                         }
                     }
+
+                    for (const auto& target_segment : request.target_segments) {
+                        if (unique_segments.contains(target_segment)) {
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                        if (!segment_access.ExistsSegmentName(target_segment)) {
+                            return tl::make_unexpected(
+                                ErrorCode::SEGMENT_NOT_FOUND);
+                        }
+                        if (!segment_access.IsSegmentAllocatable(
+                                target_segment)) {
+                            return tl::make_unexpected(
+                                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                        }
+                    }
+                    return {};
                 }
-            }
-        }
-    }
 
-    {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        for (const auto& segment_name : job.request.segments) {
-            if (!remaining_segments.contains(segment_name)) {
-                (void)segment_access.SetSegmentStatusByName(
-                    segment_name, SegmentStatus::DRAINED);
-            }
-        }
-    }
+                tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
+                    const CreateDrainJobRequest& request) {
+                    std::vector<std::string> draining_segments;
+                    {
+                        ScopedSegmentAccess segment_access =
+                            segment_manager_.getSegmentAccess();
+                        auto valid =
+                            ValidateDrainRequestLocked(segment_access, request);
+                        if (!valid.has_value()) {
+                            return tl::make_unexpected(valid.error());
+                        }
 
-    if (remaining_segments.empty()) {
-        job.status = JobStatus::SUCCEEDED;
-        job.last_updated_at = std::chrono::system_clock::now();
-        job.message = "Drain job finished successfully";
-        return true;
-    }
+                        draining_segments.reserve(request.segments.size());
+                        for (const auto& segment_name : request.segments) {
+                            auto err = segment_access.SetSegmentStatusByName(
+                                segment_name, SegmentStatus::DRAINING);
+                            if (err != ErrorCode::OK) {
+                                for (const auto& updated_segment :
+                                     draining_segments) {
+                                    (void)segment_access.SetSegmentStatusByName(
+                                        updated_segment, SegmentStatus::OK);
+                                }
+                                return tl::make_unexpected(err);
+                            }
+                            draining_segments.push_back(segment_name);
+                        }
+                    }
 
-    bool all_remaining_terminal_failed = !remaining_unit_keys.empty();
-    for (const auto& unit_key : remaining_unit_keys) {
-        if (!job.terminal_failed_unit_keys.contains(unit_key)) {
-            all_remaining_terminal_failed = false;
-            break;
-        }
-    }
-    if (!all_remaining_terminal_failed) {
-        return false;
-    }
+                    auto job = std::make_shared<DrainJob>();
+                    job->id = generate_uuid();
+                    job->request = request;
+                    job->created_at = std::chrono::system_clock::now();
+                    job->last_updated_at = job->created_at;
+                    job->status = JobStatus::CREATED;
+                    job->message = "Drain job created";
 
-    {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        for (const auto& segment_name : job.request.segments) {
-            SegmentStatus status = SegmentStatus::UNDEFINED;
-            if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                    ErrorCode::OK &&
-                status != SegmentStatus::UNMOUNTING) {
-                (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                            SegmentStatus::OK);
-            }
-        }
-    }
+                    {
+                        std::lock_guard<std::mutex> lock(job_mutex_);
+                        drain_jobs_.emplace(job->id, job);
+                    }
 
-    job.status = JobStatus::FAILED;
-    job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job failed: unrecoverable units remain";
-    return true;
-}
+                    return job->id;
+                }
 
-void MasterService::ProcessDrainJobs() {
-    std::vector<std::shared_ptr<DrainJob>> jobs;
-    {
-        std::lock_guard<std::mutex> lock(job_mutex_);
-        jobs.reserve(drain_jobs_.size());
-        for (const auto& [_, job] : drain_jobs_) {
-            jobs.push_back(job);
-        }
-    }
+                tl::expected<QueryJobResponse, ErrorCode>
+                MasterService::QueryDrainJob(const UUID& job_id) {
+                    std::shared_ptr<DrainJob> job;
+                    {
+                        std::lock_guard<std::mutex> lock(job_mutex_);
+                        auto it = drain_jobs_.find(job_id);
+                        if (it == drain_jobs_.end()) {
+                            return tl::make_unexpected(
+                                ErrorCode::JOB_NOT_FOUND);
+                        }
+                        job = it->second;
+                    }
 
-    for (const auto& job : jobs) {
-        if (!job) {
-            continue;
-        }
-        std::lock_guard<std::mutex> job_lock(job->mutex);
-        if (job->status == JobStatus::SUCCEEDED ||
-            job->status == JobStatus::FAILED ||
-            job->status == JobStatus::CANCELED) {
-            continue;
-        }
-        RefreshDrainJobTasks(*job);
-        if (MaybeCompleteDrainJob(*job)) {
-            continue;
-        }
-        ScheduleDrainJobTasks(*job);
-    }
-}
+                    std::lock_guard<std::mutex> job_lock(job->mutex);
+                    QueryJobResponse response;
+                    response.id = job->id;
+                    response.type = job->type;
+                    response.status = job->status;
+                    response.created_at_ms_epoch = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            job->created_at.time_since_epoch())
+                            .count());
+                    response.last_updated_at_ms_epoch = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            job->last_updated_at.time_since_epoch())
+                            .count());
+                    response.segments = job->request.segments;
+                    response.succeeded_units = job->succeeded_units;
+                    response.failed_units = job->failed_units;
+                    response.blocked_units = job->blocked_units;
+                    response.active_units =
+                        static_cast<uint64_t>(job->active_tasks.size());
+                    response.migrated_bytes = job->migrated_bytes;
+                    response.message = job->message;
+                    return response;
+                }
 
-void MasterService::JobDispatchThreadFunc() {
-    while (job_dispatch_running_) {
-        ProcessDrainJobs();
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kJobDispatchThreadSleepMs));
-    }
-}
+                tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
+                    const UUID& job_id) {
+                    std::shared_ptr<DrainJob> job;
+                    {
+                        std::lock_guard<std::mutex> lock(job_mutex_);
+                        auto it = drain_jobs_.find(job_id);
+                        if (it == drain_jobs_.end()) {
+                            return tl::make_unexpected(
+                                ErrorCode::JOB_NOT_FOUND);
+                        }
+                        job = it->second;
+                    }
 
-tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::SerializeDiscardedReplicas(
-    MsgpackPacker& packer) const {
-    std::lock_guard lock(service_->discarded_replicas_mutex_);
+                    std::vector<std::string> segments_to_restore;
+                    {
+                        std::lock_guard<std::mutex> job_lock(job->mutex);
+                        if (job->status == JobStatus::SUCCEEDED ||
+                            job->status == JobStatus::FAILED ||
+                            job->status == JobStatus::CANCELED ||
+                            !job->active_tasks.empty()) {
+                            return tl::make_unexpected(
+                                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                        }
 
-    // Serialize as array: [count, item1, item2, ...]
-    packer.pack_array(service_->discarded_replicas_.size());
+                        job->status = JobStatus::CANCELED;
+                        job->last_updated_at = std::chrono::system_clock::now();
+                        job->message = "Drain job canceled";
+                        segments_to_restore = job->request.segments;
+                    }
 
-    for (const auto& item : service_->discarded_replicas_) {
-        // Each item: [ttl_timestamp, mem_size, replica_count, replica1,
-        // replica2, ...]
-        auto ttl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          item.ttl_.time_since_epoch())
-                          .count();
+                    ScopedSegmentAccess segment_access =
+                        segment_manager_.getSegmentAccess();
+                    for (const auto& segment_name : segments_to_restore) {
+                        SegmentStatus status = SegmentStatus::UNDEFINED;
+                        if (segment_access.GetSegmentStatusByName(
+                                segment_name, status) == ErrorCode::OK &&
+                            status != SegmentStatus::UNMOUNTING) {
+                            (void)segment_access.SetSegmentStatusByName(
+                                segment_name, SegmentStatus::OK);
+                        }
+                    }
+                    return {};
+                }
 
-        packer.pack_array(3 + item.replicas_.size());
-        packer.pack(ttl_ms);          // ttl timestamp
-        packer.pack(item.mem_size_);  // mem_size
-        packer.pack(
-            static_cast<uint32_t>(item.replicas_.size()));  // replica count
+                std::string MasterService::MakeDrainUnitKey(
+                    const std::string& tenant_id, const std::string& key,
+                    const std::string& source_segment) const {
+                    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+                    return std::to_string(normalized_tenant.size()) + ":" +
+                           normalized_tenant + ":" +
+                           std::to_string(key.size()) + ":" + key + ":" +
+                           source_segment;
+                }
 
-        // Serialize each replica
-        for (const auto& replica : item.replicas_) {
-            auto result = Serializer<Replica>::serialize(
-                replica, service_->segment_manager_.getView(), packer);
-            if (!result) {
-                return tl::unexpected(result.error());
-            }
-        }
-    }
+                std::optional<std::string>
+                MasterService::SelectDrainTargetForKey(
+                    const ObjectMetadata& metadata,
+                    const std::string& source_segment,
+                    const std::vector<std::string>& requested_targets) {
+                    ScopedSegmentAccess segment_access =
+                        segment_manager_.getSegmentAccess();
+                    std::vector<std::string> candidate_segments =
+                        requested_targets;
+                    if (candidate_segments.empty()) {
+                        auto err =
+                            segment_access.GetAllSegments(candidate_segments);
+                        if (err != ErrorCode::OK) {
+                            return std::nullopt;
+                        }
+                    }
 
-    return {};
-}
+                    const auto existing_segments =
+                        metadata.GetReplicaSegmentNames();
+                    double best_util = std::numeric_limits<double>::max();
+                    std::optional<std::string> best_target;
+                    for (const auto& candidate : candidate_segments) {
+                        if (candidate == source_segment) {
+                            continue;
+                        }
+                        if (std::find(existing_segments.begin(),
+                                      existing_segments.end(),
+                                      candidate) != existing_segments.end()) {
+                            continue;
+                        }
+                        if (!segment_access.IsSegmentAllocatable(candidate)) {
+                            continue;
+                        }
+                        size_t used = 0, capacity = 0;
+                        if (segment_access.QuerySegments(
+                                candidate, used, capacity) != ErrorCode::OK ||
+                            capacity == 0) {
+                            continue;
+                        }
+                        const double util = static_cast<double>(used) /
+                                            static_cast<double>(capacity);
+                        if (util < best_util) {
+                            best_util = util;
+                            best_target = candidate;
+                        }
+                    }
+                    return best_target;
+                }
 
-tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
-    const msgpack::object& obj) {
-    if (obj.type != msgpack::type::ARRAY) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL, "discarded_replicas: expected array"));
-    }
+                void MasterService::RefreshDrainJobTasks(DrainJob & job) {
+                    auto read_access = task_manager_.get_read_access();
+                    std::vector<UUID> finished_task_ids;
+                    finished_task_ids.reserve(job.active_tasks.size());
 
-    std::list<DiscardedReplicas> temp_list;
+                    for (const auto& [task_id, active_task] :
+                         job.active_tasks) {
+                        auto task_opt = read_access.find_task_by_id(task_id);
+                        if (!task_opt.has_value()) {
+                            finished_task_ids.push_back(task_id);
+                            job.failed_units++;
+                            job.terminal_failed_unit_keys.insert(
+                                active_task.unit_key);
+                            continue;
+                        }
+                        if (!task_opt->is_finished()) {
+                            continue;
+                        }
 
-    for (uint32_t i = 0; i < obj.via.array.size; ++i) {
-        const msgpack::object& item_obj = obj.via.array.ptr[i];
+                        finished_task_ids.push_back(task_id);
+                        if (task_opt->status == TaskStatus::SUCCESS) {
+                            job.succeeded_units++;
+                            job.migrated_bytes += active_task.bytes;
+                            job.completed_unit_keys.insert(
+                                active_task.unit_key);
+                        } else {
+                            job.failed_units++;
+                            auto& retry_count =
+                                job.retry_counts[active_task.unit_key];
+                            retry_count++;
+                            if (retry_count >= kMaxDrainUnitRetries) {
+                                job.terminal_failed_unit_keys.insert(
+                                    active_task.unit_key);
+                            }
+                        }
+                    }
 
-        if (item_obj.type != msgpack::type::ARRAY ||
-            item_obj.via.array.size < 3) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                fmt::format("Invalid discarded_replicas item at index {}: "
-                            "expected array with at least 3 elements",
-                            i)));
-        }
+                    for (const auto& task_id : finished_task_ids) {
+                        job.active_tasks.erase(task_id);
+                    }
+                }
 
-        const msgpack::object* item_array = item_obj.via.array.ptr;
+                void MasterService::ScheduleDrainJobTasks(DrainJob & job) {
+                    if (job.status == JobStatus::CREATED) {
+                        job.status = JobStatus::PLANNING;
+                    }
 
-        // Deserialize ttl
-        uint64_t ttl_ms = item_array[0].as<uint64_t>();
-        auto ttl = std::chrono::system_clock::time_point(
-            std::chrono::milliseconds(ttl_ms));
+                    const uint32_t max_concurrency =
+                        std::max<uint32_t>(1, job.request.max_concurrency);
+                    if (job.active_tasks.size() >= max_concurrency) {
+                        job.status = JobStatus::RUNNING;
+                        return;
+                    }
 
-        // Deserialize mem_size
-        uint64_t mem_size = item_array[1].as<uint64_t>();
+                    struct DrainPlan {
+                        std::string tenant_id;
+                        std::string key;
+                        std::string source_segment;
+                        std::string target_segment;
+                        size_t bytes;
+                        std::string unit_key;
+                    };
 
-        // Deserialize replica count
-        uint32_t replica_count = item_array[2].as<uint32_t>();
+                    const size_t slots =
+                        max_concurrency - job.active_tasks.size();
+                    std::vector<DrainPlan> plans;
+                    plans.reserve(slots);
+                    std::unordered_set<std::string> active_unit_keys;
+                    for (const auto& [_, task] : job.active_tasks) {
+                        active_unit_keys.insert(task.unit_key);
+                    }
 
-        if (item_obj.via.array.size != 3 + replica_count) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                fmt::format(
-                    "Discarded replicas item size mismatch at index {}: "
-                    "expected {} elements, got {}",
-                    i, 3 + replica_count, item_obj.via.array.size)));
-        }
+                    std::unordered_set<std::string> blocked_unit_keys;
+                    {
+                        std::shared_lock<std::shared_mutex> shared_lock(
+                            snapshot_mutex_);
+                        for (size_t i = 0; i < kNumShards; ++i) {
+                            MetadataShardAccessorRO shard(this, i);
+                            for (const auto& [tenant_id, tenant_state] :
+                                 shard->tenants) {
+                                for (const auto& [key, metadata] :
+                                     tenant_state.metadata) {
+                                    for (const auto& source_segment :
+                                         job.request.segments) {
+                                        const auto unit_key = MakeDrainUnitKey(
+                                            tenant_id, key, source_segment);
+                                        if (job.completed_unit_keys.contains(
+                                                unit_key) ||
+                                            active_unit_keys.contains(
+                                                unit_key) ||
+                                            job.terminal_failed_unit_keys
+                                                .contains(unit_key)) {
+                                            continue;
+                                        }
 
-        // Deserialize replicas
-        std::vector<Replica> replicas;
-        replicas.reserve(replica_count);
+                                        const auto replica_segments =
+                                            metadata.GetReplicaSegmentNames();
+                                        if (std::find(replica_segments.begin(),
+                                                      replica_segments.end(),
+                                                      source_segment) ==
+                                            replica_segments.end()) {
+                                            continue;
+                                        }
 
-        for (uint32_t j = 0; j < replica_count; ++j) {
-            auto replica_result = Serializer<Replica>::deserialize(
-                item_array[3 + j], service_->segment_manager_.getView());
-            if (!replica_result) {
-                return tl::make_unexpected(SerializationError(
-                    ErrorCode::DESERIALIZE_FAIL,
-                    fmt::format("Failed to deserialize replica {} in "
-                                "discarded_replicas item {}: {}",
-                                j, i, replica_result.error().message)));
-            }
-            replicas.emplace_back(std::move(*replica_result.value()));
-        }
+                                        if (metadata.IsHardPinned() ||
+                                            !metadata.IsLeaseExpired() ||
+                                            !metadata.AllReplicas(
+                                                &Replica::fn_is_completed) ||
+                                            tenant_state.replication_tasks
+                                                .contains(key)) {
+                                            blocked_unit_keys.insert(unit_key);
+                                            continue;
+                                        }
 
-        // Create DiscardedReplicas and manually set mem_size_
-        temp_list.emplace_back(std::move(replicas), ttl);
-        // Set the deserialized mem_size
-        temp_list.back().mem_size_ = mem_size;
-    }
+                                        auto target = SelectDrainTargetForKey(
+                                            metadata, source_segment,
+                                            job.request.target_segments);
+                                        if (!target.has_value()) {
+                                            blocked_unit_keys.insert(unit_key);
+                                            continue;
+                                        }
 
-    // Move deserialized items to service's discarded_replicas_
-    if (!temp_list.empty()) {
-        std::lock_guard lock(service_->discarded_replicas_mutex_);
-        service_->discarded_replicas_ = std::move(temp_list);
-    }
+                                        if (plans.size() < slots) {
+                                            plans.push_back(
+                                                {tenant_id, key, source_segment,
+                                                 *target, metadata.size,
+                                                 unit_key});
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
-    return {};
-}
+                    job.blocked_units = blocked_unit_keys.size();
 
-void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
-    http_metadata_server_ = server;
-    if (server) {
-        LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
-                     "(co-located metadata server)";
-    }
-}
+                    for (const auto& plan : plans) {
+                        auto task_id = CreateMoveTask(plan.key, plan.tenant_id,
+                                                      plan.source_segment,
+                                                      plan.target_segment);
+                        if (task_id.has_value()) {
+                            ActiveDrainTask active_task;
+                            active_task.task_id = task_id.value();
+                            active_task.tenant_id = plan.tenant_id;
+                            active_task.key = plan.key;
+                            active_task.source_segment = plan.source_segment;
+                            active_task.target_segment = plan.target_segment;
+                            active_task.bytes = plan.bytes;
+                            active_task.unit_key = plan.unit_key;
+                            job.active_tasks.emplace(task_id.value(),
+                                                     std::move(active_task));
+                        } else if (task_id.error() ==
+                                       ErrorCode::NO_AVAILABLE_HANDLE ||
+                                   task_id.error() ==
+                                       ErrorCode::
+                                           UNAVAILABLE_IN_CURRENT_STATUS ||
+                                   task_id.error() ==
+                                       ErrorCode::OBJECT_HAS_REPLICATION_TASK) {
+                            job.blocked_units++;
+                        } else {
+                            job.failed_units++;
+                            auto& retry_count = job.retry_counts[plan.unit_key];
+                            retry_count++;
+                            if (retry_count >= kMaxDrainUnitRetries) {
+                                job.terminal_failed_unit_keys.insert(
+                                    plan.unit_key);
+                            }
+                        }
+                    }
 
-void MasterService::setHttpMetadataRemoteUrl(
-    const std::string& metadata_connstring) {
+                    job.status = JobStatus::RUNNING;
+                    job.last_updated_at = std::chrono::system_clock::now();
+                    job.message = "Drain job running";
+                }
+
+                bool MasterService::MaybeCompleteDrainJob(DrainJob & job) {
+                    if (!job.active_tasks.empty()) {
+                        return false;
+                    }
+
+                    std::unordered_set<std::string> remaining_segments;
+                    std::unordered_set<std::string> remaining_unit_keys;
+                    {
+                        std::shared_lock<std::shared_mutex> shared_lock(
+                            snapshot_mutex_);
+                        for (size_t i = 0; i < kNumShards; ++i) {
+                            MetadataShardAccessorRO shard(this, i);
+                            for (const auto& [tenant_id, tenant_state] :
+                                 shard->tenants) {
+                                for (const auto& [key, metadata] :
+                                     tenant_state.metadata) {
+                                    const auto replica_segments =
+                                        metadata.GetReplicaSegmentNames();
+                                    for (const auto& source_segment :
+                                         job.request.segments) {
+                                        if (std::find(replica_segments.begin(),
+                                                      replica_segments.end(),
+                                                      source_segment) !=
+                                            replica_segments.end()) {
+                                            remaining_segments.insert(
+                                                source_segment);
+                                            remaining_unit_keys.insert(
+                                                MakeDrainUnitKey(
+                                                    tenant_id, key,
+                                                    source_segment));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    {
+                        ScopedSegmentAccess segment_access =
+                            segment_manager_.getSegmentAccess();
+                        for (const auto& segment_name : job.request.segments) {
+                            if (!remaining_segments.contains(segment_name)) {
+                                (void)segment_access.SetSegmentStatusByName(
+                                    segment_name, SegmentStatus::DRAINED);
+                            }
+                        }
+                    }
+
+                    if (remaining_segments.empty()) {
+                        job.status = JobStatus::SUCCEEDED;
+                        job.last_updated_at = std::chrono::system_clock::now();
+                        job.message = "Drain job finished successfully";
+                        return true;
+                    }
+
+                    bool all_remaining_terminal_failed =
+                        !remaining_unit_keys.empty();
+                    for (const auto& unit_key : remaining_unit_keys) {
+                        if (!job.terminal_failed_unit_keys.contains(unit_key)) {
+                            all_remaining_terminal_failed = false;
+                            break;
+                        }
+                    }
+                    if (!all_remaining_terminal_failed) {
+                        return false;
+                    }
+
+                    {
+                        ScopedSegmentAccess segment_access =
+                            segment_manager_.getSegmentAccess();
+                        for (const auto& segment_name : job.request.segments) {
+                            SegmentStatus status = SegmentStatus::UNDEFINED;
+                            if (segment_access.GetSegmentStatusByName(
+                                    segment_name, status) == ErrorCode::OK &&
+                                status != SegmentStatus::UNMOUNTING) {
+                                (void)segment_access.SetSegmentStatusByName(
+                                    segment_name, SegmentStatus::OK);
+                            }
+                        }
+                    }
+
+                    job.status = JobStatus::FAILED;
+                    job.last_updated_at = std::chrono::system_clock::now();
+                    job.message =
+                        "Drain job failed: unrecoverable units remain";
+                    return true;
+                }
+
+                void MasterService::ProcessDrainJobs() {
+                    std::vector<std::shared_ptr<DrainJob>> jobs;
+                    {
+                        std::lock_guard<std::mutex> lock(job_mutex_);
+                        jobs.reserve(drain_jobs_.size());
+                        for (const auto& [_, job] : drain_jobs_) {
+                            jobs.push_back(job);
+                        }
+                    }
+
+                    for (const auto& job : jobs) {
+                        if (!job) {
+                            continue;
+                        }
+                        std::lock_guard<std::mutex> job_lock(job->mutex);
+                        if (job->status == JobStatus::SUCCEEDED ||
+                            job->status == JobStatus::FAILED ||
+                            job->status == JobStatus::CANCELED) {
+                            continue;
+                        }
+                        RefreshDrainJobTasks(*job);
+                        if (MaybeCompleteDrainJob(*job)) {
+                            continue;
+                        }
+                        ScheduleDrainJobTasks(*job);
+                    }
+                }
+
+                void MasterService::JobDispatchThreadFunc() {
+                    while (job_dispatch_running_) {
+                        ProcessDrainJobs();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(
+                            kJobDispatchThreadSleepMs));
+                    }
+                }
+
+                tl::expected<void, SerializationError>
+                MasterService::MetadataSerializer::SerializeDiscardedReplicas(
+                    MsgpackPacker & packer) const {
+                    std::lock_guard lock(service_->discarded_replicas_mutex_);
+
+                    // Serialize as array: [count, item1, item2, ...]
+                    packer.pack_array(service_->discarded_replicas_.size());
+
+                    for (const auto& item : service_->discarded_replicas_) {
+                        // Each item: [ttl_timestamp, mem_size, replica_count,
+                        // replica1, replica2, ...]
+                        auto ttl_ms = std::chrono::duration_cast<
+                                          std::chrono::milliseconds>(
+                                          item.ttl_.time_since_epoch())
+                                          .count();
+
+                        packer.pack_array(3 + item.replicas_.size());
+                        packer.pack(ttl_ms);          // ttl timestamp
+                        packer.pack(item.mem_size_);  // mem_size
+                        packer.pack(static_cast<uint32_t>(
+                            item.replicas_.size()));  // replica count
+
+                        // Serialize each replica
+                        for (const auto& replica : item.replicas_) {
+                            auto result = Serializer<Replica>::serialize(
+                                replica, service_->segment_manager_.getView(),
+                                packer);
+                            if (!result) {
+                                return tl::unexpected(result.error());
+                            }
+                        }
+                    }
+
+                    return {};
+                }
+
+                tl::expected<void, SerializationError>
+                MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
+                    const msgpack::object& obj) {
+                    if (obj.type != msgpack::type::ARRAY) {
+                        return tl::make_unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "discarded_replicas: expected array"));
+                    }
+
+                    std::list<DiscardedReplicas> temp_list;
+
+                    for (uint32_t i = 0; i < obj.via.array.size; ++i) {
+                        const msgpack::object& item_obj = obj.via.array.ptr[i];
+
+                        if (item_obj.type != msgpack::type::ARRAY ||
+                            item_obj.via.array.size < 3) {
+                            return tl::make_unexpected(SerializationError(
+                                ErrorCode::DESERIALIZE_FAIL,
+                                fmt::format(
+                                    "Invalid discarded_replicas item at index "
+                                    "{}: "
+                                    "expected array with at least 3 elements",
+                                    i)));
+                        }
+
+                        const msgpack::object* item_array =
+                            item_obj.via.array.ptr;
+
+                        // Deserialize ttl
+                        uint64_t ttl_ms = item_array[0].as<uint64_t>();
+                        auto ttl = std::chrono::system_clock::time_point(
+                            std::chrono::milliseconds(ttl_ms));
+
+                        // Deserialize mem_size
+                        uint64_t mem_size = item_array[1].as<uint64_t>();
+
+                        // Deserialize replica count
+                        uint32_t replica_count = item_array[2].as<uint32_t>();
+
+                        if (item_obj.via.array.size != 3 + replica_count) {
+                            return tl::make_unexpected(SerializationError(
+                                ErrorCode::DESERIALIZE_FAIL,
+                                fmt::format("Discarded replicas item size "
+                                            "mismatch at index {}: "
+                                            "expected {} elements, got {}",
+                                            i, 3 + replica_count,
+                                            item_obj.via.array.size)));
+                        }
+
+                        // Deserialize replicas
+                        std::vector<Replica> replicas;
+                        replicas.reserve(replica_count);
+
+                        for (uint32_t j = 0; j < replica_count; ++j) {
+                            auto replica_result =
+                                Serializer<Replica>::deserialize(
+                                    item_array[3 + j],
+                                    service_->segment_manager_.getView());
+                            if (!replica_result) {
+                                return tl::make_unexpected(SerializationError(
+                                    ErrorCode::DESERIALIZE_FAIL,
+                                    fmt::format(
+                                        "Failed to deserialize replica {} in "
+                                        "discarded_replicas item {}: {}",
+                                        j, i, replica_result.error().message)));
+                            }
+                            replicas.emplace_back(
+                                std::move(*replica_result.value()));
+                        }
+
+                        // Create DiscardedReplicas and manually set mem_size_
+                        temp_list.emplace_back(std::move(replicas), ttl);
+                        // Set the deserialized mem_size
+                        temp_list.back().mem_size_ = mem_size;
+                    }
+
+                    // Move deserialized items to service's discarded_replicas_
+                    if (!temp_list.empty()) {
+                        std::lock_guard lock(
+                            service_->discarded_replicas_mutex_);
+                        service_->discarded_replicas_ = std::move(temp_list);
+                    }
+
+                    return {};
+                }
+
+                void MasterService::setHttpMetadataServer(HttpMetadataServer *
+                                                          server) {
+                    http_metadata_server_ = server;
+                    if (server) {
+                        LOG(INFO) << "HTTP metadata cleanup on client timeout: "
+                                     "enabled "
+                                     "(co-located metadata server)";
+                    }
+                }
+
+                void MasterService::setHttpMetadataRemoteUrl(
+                    const std::string& metadata_connstring) {
 #ifdef USE_HTTP
-    // Only http(s) is supported; guard the scheme to avoid
-    // MetadataStoragePlugin::Create()'s LOG(FATAL) on other backends.
-    if (metadata_connstring.rfind("http://", 0) == 0 ||
-        metadata_connstring.rfind("https://", 0) == 0) {
-        try {
-            http_metadata_remote_ =
-                MetadataStoragePlugin::Create(metadata_connstring);
-            LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
-                         "(remote metadata server "
-                      << metadata_connstring << ")";
-            // Start async cleanup worker now that http_metadata_remote_ is
-            // ready
-            http_metadata_cleanup_running_ = true;
-            http_metadata_cleanup_thread_ = std::thread(
-                &MasterService::HttpMetadataCleanupThreadFunc, this);
-            LOG(INFO) << "HTTP metadata cleanup worker thread started";
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to initialize remote HTTP metadata client "
-                            "for "
-                         << metadata_connstring << ": " << e.what()
-                         << ". Metadata cleanup on timeout disabled.";
-            http_metadata_remote_.reset();
-        }
-        return;
-    }
-    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but the "
-                    "configured metadata server '"
-                 << metadata_connstring
-                 << "' is not an HTTP endpoint; remote cleanup currently "
-                    "supports only http(s). Metadata cleanup on timeout "
-                    "disabled.";
+                    // Only http(s) is supported; guard the scheme to avoid
+                    // MetadataStoragePlugin::Create()'s LOG(FATAL) on other
+                    // backends.
+                    if (metadata_connstring.rfind("http://", 0) == 0 ||
+                        metadata_connstring.rfind("https://", 0) == 0) {
+                        try {
+                            http_metadata_remote_ =
+                                MetadataStoragePlugin::Create(
+                                    metadata_connstring);
+                            LOG(INFO) << "HTTP metadata cleanup on client "
+                                         "timeout: enabled "
+                                         "(remote metadata server "
+                                      << metadata_connstring << ")";
+                            // Start async cleanup worker now that
+                            // http_metadata_remote_ is ready
+                            http_metadata_cleanup_running_ = true;
+                            http_metadata_cleanup_thread_ = std::thread(
+                                &MasterService::HttpMetadataCleanupThreadFunc,
+                                this);
+                            LOG(INFO) << "HTTP metadata cleanup worker thread "
+                                         "started";
+                        } catch (const std::exception& e) {
+                            LOG(WARNING)
+                                << "Failed to initialize remote HTTP metadata "
+                                   "client "
+                                   "for "
+                                << metadata_connstring << ": " << e.what()
+                                << ". Metadata cleanup on timeout disabled.";
+                            http_metadata_remote_.reset();
+                        }
+                        return;
+                    }
+                    LOG(WARNING)
+                        << "enable_metadata_cleanup_on_timeout is set but the "
+                           "configured metadata server '"
+                        << metadata_connstring
+                        << "' is not an HTTP endpoint; remote cleanup "
+                           "currently "
+                           "supports only http(s). Metadata cleanup on timeout "
+                           "disabled.";
 #else
-    (void)metadata_connstring;
-    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but this build "
-                    "has no HTTP metadata support (USE_HTTP=OFF); metadata "
-                    "cleanup on timeout disabled.";
+                    (void)metadata_connstring;
+                    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set "
+                                    "but this build "
+                                    "has no HTTP metadata support "
+                                    "(USE_HTTP=OFF); metadata "
+                                    "cleanup on timeout disabled.";
 #endif
-}
+                }
 
-void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
-    // Co-located: remove in-process, safe to run inline (no network I/O).
-    if (http_metadata_server_) {
-        const std::string ram_key =
-            http_metadata_prefix_ + "ram/" + segment_name;
-        const std::string rpc_key =
-            http_metadata_prefix_ + "rpc_meta/" + segment_name;
-        bool ram_removed = http_metadata_server_->removeKey(ram_key);
-        bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
-        LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
-                  << ", ram_key_removed=" << ram_removed
-                  << ", rpc_key_removed=" << rpc_removed;
-        return;
-    }
+                void MasterService::cleanupHttpMetadata(
+                    const std::string& segment_name) {
+                    // Co-located: remove in-process, safe to run inline (no
+                    // network I/O).
+                    if (http_metadata_server_) {
+                        const std::string ram_key =
+                            http_metadata_prefix_ + "ram/" + segment_name;
+                        const std::string rpc_key =
+                            http_metadata_prefix_ + "rpc_meta/" + segment_name;
+                        bool ram_removed =
+                            http_metadata_server_->removeKey(ram_key);
+                        bool rpc_removed =
+                            http_metadata_server_->removeKey(rpc_key);
+                        LOG(INFO) << "Cleaned up HTTP metadata for segment: "
+                                  << segment_name
+                                  << ", ram_key_removed=" << ram_removed
+                                  << ", rpc_key_removed=" << rpc_removed;
+                        return;
+                    }
 
-    // Separately-deployed: enqueue for async cleanup so a slow/unreachable
-    // server never blocks the client monitor thread.
-    if (http_metadata_remote_) {
-        {
-            std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);
-            http_metadata_cleanup_queue_.push_back(segment_name);
-        }
-        http_metadata_cleanup_cv_.notify_one();
-        return;
-    }
+                    // Separately-deployed: enqueue for async cleanup so a
+                    // slow/unreachable server never blocks the client monitor
+                    // thread.
+                    if (http_metadata_remote_) {
+                        {
+                            std::lock_guard<std::mutex> lk(
+                                http_metadata_cleanup_mutex_);
+                            http_metadata_cleanup_queue_.push_back(
+                                segment_name);
+                        }
+                        http_metadata_cleanup_cv_.notify_one();
+                        return;
+                    }
 
-    // Neither configured: cleanup is disabled, nothing to do.
-}
+                    // Neither configured: cleanup is disabled, nothing to do.
+                }
 
-void MasterService::HttpMetadataCleanupThreadFunc() {
-    LOG(INFO) << "HTTP metadata cleanup worker started";
-    while (http_metadata_cleanup_running_) {
-        std::vector<std::string> batch;
-        {
-            std::unique_lock<std::mutex> lk(http_metadata_cleanup_mutex_);
-            http_metadata_cleanup_cv_.wait(lk, [&] {
-                return !http_metadata_cleanup_queue_.empty() ||
-                       !http_metadata_cleanup_running_.load();
-            });
-            if (!http_metadata_cleanup_running_ &&
-                http_metadata_cleanup_queue_.empty()) {
-                break;
-            }
-            batch.swap(http_metadata_cleanup_queue_);
-        }
+                void MasterService::HttpMetadataCleanupThreadFunc() {
+                    LOG(INFO) << "HTTP metadata cleanup worker started";
+                    while (http_metadata_cleanup_running_) {
+                        std::vector<std::string> batch;
+                        {
+                            std::unique_lock<std::mutex> lk(
+                                http_metadata_cleanup_mutex_);
+                            http_metadata_cleanup_cv_.wait(lk, [&] {
+                                return !http_metadata_cleanup_queue_.empty() ||
+                                       !http_metadata_cleanup_running_.load();
+                            });
+                            if (!http_metadata_cleanup_running_ &&
+                                http_metadata_cleanup_queue_.empty()) {
+                                break;
+                            }
+                            batch.swap(http_metadata_cleanup_queue_);
+                        }
 
-        for (const auto& segment_name : batch) {
-            const std::string ram_key =
-                http_metadata_prefix_ + "ram/" + segment_name;
-            const std::string rpc_key =
-                http_metadata_prefix_ + "rpc_meta/" + segment_name;
+                        for (const auto& segment_name : batch) {
+                            const std::string ram_key =
+                                http_metadata_prefix_ + "ram/" + segment_name;
+                            const std::string rpc_key = http_metadata_prefix_ +
+                                                        "rpc_meta/" +
+                                                        segment_name;
 
-            // Each key attempted independently so one failure does not
-            // prevent cleanup of the other.
-            bool ram_removed = false;
-            bool rpc_removed = false;
-            try {
-                ram_removed = http_metadata_remote_->remove(ram_key);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Remote HTTP metadata cleanup failed for ram_key: "
-                    << ram_key << ": " << e.what();
-            }
-            try {
-                rpc_removed = http_metadata_remote_->remove(rpc_key);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Remote HTTP metadata cleanup failed for rpc_key: "
-                    << rpc_key << ": " << e.what();
-            }
-            LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
-                      << segment_name << ", ram_key_removed=" << ram_removed
-                      << ", rpc_key_removed=" << rpc_removed;
-        }
-    }
-    LOG(INFO) << "HTTP metadata cleanup worker stopped";
-}
+                            // Each key attempted independently so one failure
+                            // does not prevent cleanup of the other.
+                            bool ram_removed = false;
+                            bool rpc_removed = false;
+                            try {
+                                ram_removed =
+                                    http_metadata_remote_->remove(ram_key);
+                            } catch (const std::exception& e) {
+                                LOG(WARNING) << "Remote HTTP metadata cleanup "
+                                                "failed for ram_key: "
+                                             << ram_key << ": " << e.what();
+                            }
+                            try {
+                                rpc_removed =
+                                    http_metadata_remote_->remove(rpc_key);
+                            } catch (const std::exception& e) {
+                                LOG(WARNING) << "Remote HTTP metadata cleanup "
+                                                "failed for rpc_key: "
+                                             << rpc_key << ": " << e.what();
+                            }
+                            LOG(INFO) << "Cleaned up remote HTTP metadata for "
+                                         "segment: "
+                                      << segment_name
+                                      << ", ram_key_removed=" << ram_removed
+                                      << ", rpc_key_removed=" << rpc_removed;
+                        }
+                    }
+                    LOG(INFO) << "HTTP metadata cleanup worker stopped";
+                }
 
-}  // namespace mooncake
+            }  // namespace mooncake
