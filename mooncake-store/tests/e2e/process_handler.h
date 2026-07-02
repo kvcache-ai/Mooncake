@@ -26,6 +26,17 @@ inline const char* const TEST_UNMOUNT_FAILURE_STR = "[TEST_UNMOUNT_FAILURE]";
  *
  * This class is used to start and stop the master process.
  */
+struct MasterRunnerConfig {
+    std::string election_backend = "etcd";
+    std::string etcd_endpoints;
+    std::string redis_endpoint;
+    std::string redis_password;
+    int redis_db_index = 0;
+    int redis_master_view_ttl_sec = 5;
+    int redis_heartbeat_interval_sec = 2;
+    std::string cluster_id;
+};
+
 class MasterProcessHandler {
    public:
     /**
@@ -39,6 +50,9 @@ class MasterProcessHandler {
      */
     MasterProcessHandler(const std::string& path,
                          const std::string& etcd_endpoints, const int port,
+                         const int index, const std::string& out_dir);
+    MasterProcessHandler(const std::string& path,
+                         const MasterRunnerConfig& config, const int port,
                          const int index, const std::string& out_dir);
     ~MasterProcessHandler();
 
@@ -64,8 +78,8 @@ class MasterProcessHandler {
     pid_t master_pid_{0};
     // The path to the master executable.
     std::string master_path_;
-    // The etcd endpoints.
-    std::string etcd_endpoints_;
+    // The master start parameters.
+    MasterRunnerConfig config_;
     // The port of the master process.
     int port_;
     // The index of the master, used to name the log file.

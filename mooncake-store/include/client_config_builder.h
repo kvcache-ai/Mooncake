@@ -83,7 +83,8 @@ struct RealClientConfigBase {
 
     // The entry of master server:
     // 1. "IP:Port" for non-HA mode
-    // 2. "etcd://IP:Port;...;IP:Port" for HA mode
+    // 2. "etcd://IP:Port;...;IP:Port" for etcd-based HA mode
+    // 3. "redis://IP:Port" for Redis-based HA mode
     std::string master_server_entry = "127.0.0.1:50051";
 
     // Size of the local buffer (0 to skip).
@@ -122,6 +123,14 @@ struct RealClientConfigBase {
     // Periodic client-metric reporting interval, in seconds.
     // When it is 0, metric reporting is disabled.
     uint64_t metric_report_interval_seconds = 60;
+
+    // Redis election backend configuration.
+    // Only used when master_server_entry starts with "redis://".
+    std::string redis_cluster_id = DEFAULT_CLUSTER_ID;
+    std::string redis_password;
+    int redis_db_index = 0;
+    int redis_master_view_ttl_sec = 5;
+    int redis_heartbeat_interval_sec = 2;
 };
 
 /**

@@ -101,6 +101,9 @@ void CentralizedClientService::Destroy() {
 ErrorCode CentralizedClientService::Init(
     const CentralizedClientConfig& config) {
     auto master_server_entry = config.master_server_entry;
+    master_server_entry_ = master_server_entry;
+    SetMasterDiscoveryConfig(config);
+
     ErrorCode err = ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to connect to master: " << err;

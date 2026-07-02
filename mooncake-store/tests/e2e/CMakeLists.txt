@@ -65,3 +65,22 @@ target_link_libraries(chaos_rand_test PUBLIC
     pthread
     ${ETCD_WRAPPER_LIB}
 )
+
+if(STORE_USE_REDIS)
+    add_executable(redis_chaos_test redis_chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
+    target_link_libraries(redis_chaos_test PUBLIC
+        mooncake_store
+        transfer_engine
+        cachelib_memory_allocator
+        glog
+        gtest
+        pthread
+        ${ETCD_WRAPPER_LIB}
+    )
+    add_test(
+        NAME redis_chaos_test
+        COMMAND redis_chaos_test
+            --master_path=${CMAKE_BINARY_DIR}/mooncake-store/src/mooncake_master
+            --out_dir=${CMAKE_BINARY_DIR}/redis_chaos_output
+    )
+endif()

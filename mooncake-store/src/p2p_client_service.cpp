@@ -5,6 +5,7 @@
 #include <csignal>
 #include <algorithm>
 #include <coroutine>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <future>
@@ -156,6 +157,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     // Saved so a later re-registration (after UnregisterClient) can restart
     // the heartbeat with the same master entry.
     master_server_entry_ = config.master_server_entry;
+    SetMasterDiscoveryConfig(config);
 
     local_ip_ = config.local_ip;
 

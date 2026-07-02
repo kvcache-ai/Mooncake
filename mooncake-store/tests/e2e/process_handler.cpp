@@ -20,8 +20,16 @@ MasterProcessHandler::MasterProcessHandler(const std::string& path,
                                            const std::string& etcd_endpoints,
                                            const int port, const int index,
                                            const std::string& out_dir)
+    : master_path_(path), port_(port), index_(index), out_dir_(out_dir) {
+    config_.etcd_endpoints = etcd_endpoints;
+}
+
+MasterProcessHandler::MasterProcessHandler(const std::string& path,
+                                           const MasterRunnerConfig& config,
+                                           const int port, const int index,
+                                           const std::string& out_dir)
     : master_path_(path),
-      etcd_endpoints_(etcd_endpoints),
+      config_(config),
       port_(port),
       index_(index),
       out_dir_(out_dir) {}
@@ -114,11 +122,40 @@ bool MasterProcessHandler::start() {
         // Execute the master
         std::string rpc_address_arg = "--rpc-address=0.0.0.0";
         std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
-        LOG(INFO) << "[m" << index_ << "] Execl master" << " "
-                  << rpc_address_arg << " " << rpc_port_arg;
-        execl(master_path_.c_str(), master_path_.c_str(), "--enable-ha=true",
-              ("--etcd-endpoints=" + etcd_endpoints_).c_str(),
-              rpc_address_arg.c_str(), rpc_port_arg.c_str(), nullptr);
+        std::vector<std::string> args = {master_path_, "--enable-ha=true",
+                                         rpc_address_arg, rpc_port_arg};
+
+        if (config_.election_backend == "redis") {
+            args.emplace_back("--election-backend=redis");
+            args.emplace_back("--redis-endpoint=" + config_.redis_endpoint);
+            args.emplace_back("--redis-db-index=" +
+                              std::to_string(config_.redis_db_index));
+            args.emplace_back(
+                "--redis-master-view-ttl-sec=" +
+                std::to_string(config_.redis_master_view_ttl_sec));
+            args.emplace_back(
+                "--redis-heartbeat-interval-sec=" +
+                std::to_string(config_.redis_heartbeat_interval_sec));
+            if (!config_.redis_password.empty()) {
+                args.emplace_back("--redis-password=" + config_.redis_password);
+            }
+            if (!config_.cluster_id.empty()) {
+                args.emplace_back("--cluster-id=" + config_.cluster_id);
+            }
+        } else {
+            args.emplace_back("--etcd-endpoints=" + config_.etcd_endpoints);
+        }
+
+        LOG(INFO) << "[m" << index_ << "] Exec master " << rpc_address_arg
+                  << " " << rpc_port_arg
+                  << " backend=" << config_.election_backend;
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (auto& arg : args) {
+            argv.push_back(arg.data());
+        }
+        argv.push_back(nullptr);
+        execv(master_path_.c_str(), argv.data());
 
         // If execl returns, it means there was an error
         LOG(ERROR) << "[m" << index_
