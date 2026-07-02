@@ -45,37 +45,134 @@ static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
 namespace mooncake {
 
 namespace {
-struct CudaStreamNVLinkRAII {
-    cudaStream_t stream_;
-    CudaStreamNVLinkRAII() : stream_(nullptr) {
-        auto err = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
-        if (err != cudaSuccess) {
-            LOG(FATAL) << "Failed to create NVLink CUDA stream: " << err
-                       << " - " << cudaGetErrorString(err);
-        }
-    }
-    ~CudaStreamNVLinkRAII() { cudaStreamDestroy(stream_); }
+
+/// Per-device CUDA stream pool (thread-local).
+/// Each thread maintains a map of device_id → stream.
+/// The source buffer's device is queried via cudaPointerGetAttributes,
+/// and the stream for THAT device is used for DMA copy submission.
+struct CudaStreamEntry {
+    cudaStream_t stream;
+    int device_id;
 };
 
-static thread_local CudaStreamNVLinkRAII tl_nvlink_stream;
+class PerDeviceStreamPool {
+   public:
+    CudaStreamEntry getOrCreate(int device_id) {
+        auto it = pool_.find(device_id);
+        if (it != pool_.end()) return it->second;
 
-/// Thread-local CUDA event for GPU-level stream synchronization.
-/// Used to establish a GPU-visible dependency between cudaStreamPerThread
-/// and nvlink_stream, which is required by cudaMemcpyBatchAsync's
-/// srcAccessOrderStream attribute for cross-stream P2P copies.
-struct CudaEventNVLinkRAII {
-    cudaEvent_t event_;
-    CudaEventNVLinkRAII() {
-        auto err = cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
-        if (err != cudaSuccess) {
-            LOG(FATAL) << "Failed to create NVLink CUDA sync event: " << err
-                       << " - " << cudaGetErrorString(err);
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        if (cudaSetDevice(device_id) != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaSetDevice(" << device_id
+                       << ") failed when creating stream";
+            return {nullptr, -1};
         }
+        CudaStreamEntry entry;
+        entry.device_id = device_id;
+        cudaError_t err =
+            cudaStreamCreateWithFlags(&entry.stream, cudaStreamNonBlocking);
+        if (err != cudaSuccess)
+            LOG(FATAL) << "Failed to create NVLink CUDA stream on device "
+                       << device_id << ": " << cudaGetErrorString(err);
+        cudaSetDevice(saved_device);
+
+        cudaDeviceProp prop;
+        std::string pci = "unknown";
+        if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess) {
+            pci = std::string(prop.name) + " PCI " +
+                  std::to_string(prop.pciBusID) + ":" +
+                  std::to_string(prop.pciDeviceID);
+        }
+        const char *visible = getenv("CUDA_VISIBLE_DEVICES");
+        LOG(INFO) << "NvlinkTransport: NVLink CUDA stream created on device "
+                  << device_id << " [physical: " << pci
+                  << "] CUDA_VISIBLE_DEVICES="
+                  << (visible ? visible : "(not set)") << " pid=" << getpid();
+        pool_[device_id] = entry;
+        return entry;
     }
-    ~CudaEventNVLinkRAII() { cudaEventDestroy(event_); }
+    ~PerDeviceStreamPool() {
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        for (auto &kv : pool_) {
+            cudaSetDevice(kv.first);
+            if (kv.second.stream) cudaStreamDestroy(kv.second.stream);
+        }
+        cudaSetDevice(saved_device);
+    }
+
+   private:
+    std::unordered_map<int, CudaStreamEntry> pool_;
 };
 
-static thread_local CudaEventNVLinkRAII tl_nvlink_sync_event;
+static thread_local PerDeviceStreamPool tl_device_stream_pool;
+
+/// Per-device event pool (thread-local). Caches one event per device to
+/// avoid repeated create/destroy on device switches, and ensures proper
+/// cleanup when the thread exits.
+class PerDeviceEventPool {
+   public:
+    cudaEvent_t getOrCreate(int device_id) {
+        auto it = pool_.find(device_id);
+        if (it != pool_.end()) return it->second;
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        if (cudaSetDevice(device_id) != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaSetDevice(" << device_id
+                       << ") failed when creating event";
+            return nullptr;
+        }
+        cudaEvent_t event = nullptr;
+        cudaError_t err =
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+            LOG(FATAL) << "Failed to create NVLink sync event on device "
+                       << device_id << ": " << cudaGetErrorString(err);
+        cudaSetDevice(saved_device);
+        pool_[device_id] = event;
+        return event;
+    }
+    ~PerDeviceEventPool() {
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        for (auto &kv : pool_) {
+            cudaSetDevice(kv.first);
+            if (kv.second) cudaEventDestroy(kv.second);
+        }
+        cudaSetDevice(saved_device);
+    }
+
+   private:
+    std::unordered_map<int, cudaEvent_t> pool_;
+};
+
+static thread_local PerDeviceEventPool tl_device_event_pool;
+
+static cudaEvent_t getCallerSyncEvent() {
+    int current_device = 0;
+    cudaGetDevice(&current_device);
+    return tl_device_event_pool.getOrCreate(current_device);
+}
+
+static int getDeviceForPointer(const void *ptr) {
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    return (attr.type == cudaMemoryTypeDevice) ? attr.device : -1;
+}
+
+static CudaStreamEntry getStreamForRequest(const void *source) {
+    int device_id = getDeviceForPointer(source);
+    if (device_id < 0) {
+        cudaGetDevice(&device_id);
+        if (device_id < 0) device_id = 0;
+    }
+    return tl_device_stream_pool.getOrCreate(device_id);
+}
+
 }  // anonymous namespace
 
 using Slice = Transport::Slice;
@@ -366,33 +463,30 @@ Status NvlinkTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    // Synchronize with the caller's CUDA stream before issuing any memcpy.
-    // PyTorch uses cudaStreamPerThread (per-thread default stream), NOT the
-    // legacy default stream (nullptr). Recording an event on
-    // cudaStreamPerThread and making nvlink_stream wait for it ensures that all
-    // PyTorch GPU operations on source/dest buffers complete before the NVLink
-    // memcpy starts. This GPU-level dependency is also required by
-    // cudaMemcpyBatchAsync's srcAccessOrderStream attribute, which needs
-    // the source data to be visible through the nvlink_stream's access order.
-    //
-    // Do NOT use the legacy default stream (nullptr) for cudaEventRecord,
-    // as it would trigger implicit synchronization with blocking streams and
-    // could cause deadlocks.
-    cudaStream_t stream = tl_nvlink_stream.stream_;
-    cudaError_t sync_err =
-        cudaEventRecord(tl_nvlink_sync_event.event_, cudaStreamPerThread);
+    // Get per-device transfer stream for the source buffer's device.
+    CudaStreamEntry stream_entry =
+        getStreamForRequest(entries.empty() ? nullptr : entries[0].source);
+    cudaStream_t stream = stream_entry.stream;
+    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
+
+    // Synchronize with the caller's GPU work (e.g., PyTorch gather operations)
+    // that produced the source data. We use cudaEventSynchronize (CPU-blocking)
+    // instead of cudaStreamWaitEvent to avoid expensive cross-device event
+    // operations on non-NVIDIA GPUs. The CPU blocking is acceptable because
+    // the transfer depends on the caller's work anyway — they cannot overlap.
+    cudaEvent_t sync_event = getCallerSyncEvent();
+    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "NvlinkTransport: cudaEventRecord on "
-                      "cudaStreamPerThread failed: "
+        LOG(ERROR) << "NvlinkTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(sync_err);
         return Status::Context("cudaEventRecord failed: " +
                                std::string(cudaGetErrorString(sync_err)));
     }
-    sync_err = cudaStreamWaitEvent(stream, tl_nvlink_sync_event.event_, 0);
+    sync_err = cudaEventSynchronize(sync_event);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "NvlinkTransport: cudaStreamWaitEvent failed: "
+        LOG(ERROR) << "NvlinkTransport: cudaEventSynchronize failed: "
                    << cudaGetErrorString(sync_err);
-        return Status::Context("cudaStreamWaitEvent failed: " +
+        return Status::Context("cudaEventSynchronize failed: " +
                                std::string(cudaGetErrorString(sync_err)));
     }
 
@@ -452,8 +546,10 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     auto &task = batch_desc.task_list[task_id];
     // Poll POSTED slices for async completion via cudaStreamQuery.
-    // Cache the query result per stream to avoid redundant driver calls,
-    // since multiple slices typically share the same CUDA stream.
+    // Cache the query result per stream to avoid redundant driver calls.
+    // With SGLang-side torch.cuda.device(gpu_id), the calling thread's
+    // active device matches the stream's device, so no device switching
+    // is needed.
     std::unordered_map<cudaStream_t, cudaError_t> stream_status_cache;
     for (auto *slice : task.slice_list) {
         if (slice && slice->status == Slice::POSTED) {
@@ -471,7 +567,6 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             } else if (cuda_err != cudaErrorNotReady) {
                 slice->markFailed();
             }
-            // cudaErrorNotReady means still in progress, keep POSTED
         }
     }
     status.transferred_bytes = task.transferred_bytes;
@@ -492,23 +587,25 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status NvlinkTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    // Synchronize with the caller's CUDA stream before issuing any memcpy.
-    // See submitTransfer() for detailed rationale.
-    cudaStream_t stream = tl_nvlink_stream.stream_;
-    cudaError_t sync_err =
-        cudaEventRecord(tl_nvlink_sync_event.event_, cudaStreamPerThread);
+    // Get per-device transfer stream. See submitTransfer() for rationale.
+    CudaStreamEntry stream_entry = getStreamForRequest(
+        task_list.empty() ? nullptr : task_list[0]->request->source);
+    cudaStream_t stream = stream_entry.stream;
+    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
+    // Synchronize with caller's GPU work via cudaEventSynchronize.
+    cudaEvent_t sync_event = getCallerSyncEvent();
+    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "NvlinkTransport: cudaEventRecord on "
-                      "cudaStreamPerThread failed: "
+        LOG(ERROR) << "NvlinkTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(sync_err);
         return Status::Context("cudaEventRecord failed: " +
                                std::string(cudaGetErrorString(sync_err)));
     }
-    sync_err = cudaStreamWaitEvent(stream, tl_nvlink_sync_event.event_, 0);
+    sync_err = cudaEventSynchronize(sync_event);
     if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "NvlinkTransport: cudaStreamWaitEvent failed: "
+        LOG(ERROR) << "NvlinkTransport: cudaEventSynchronize failed: "
                    << cudaGetErrorString(sync_err);
-        return Status::Context("cudaStreamWaitEvent failed: " +
+        return Status::Context("cudaEventSynchronize failed: " +
                                std::string(cudaGetErrorString(sync_err)));
     }
 
