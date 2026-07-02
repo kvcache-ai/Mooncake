@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - depends on built extension
 
 import msgpack as _msgpack
 
-DEFAULT_BUNDLE_CHUNK_BYTES = 512 * 1024**2
+DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
 AUTO_PARALLEL_MIN_BYTES = 4 * 1024**3
 AUTO_PARALLEL_MIN_CHUNKS = 8
 MISSING_OBJECT_ERROR = (
@@ -4264,32 +4264,10 @@ class _MooncakePayloadTransport:
         if not chunk_keys:
             return
         sizes = [_buffer_group_nbytes(group) for group in chunk_groups]
-        total = sum(sizes)
-        # When total fits comfortably in pool, batch all leases and issue one
-        # batch_put_from call. Otherwise stream one-at-a-time to avoid pool
-        # exhaustion.
         pool = self._buffer_pool
-        if len(chunk_keys) > 1 and total <= getattr(pool, "size", 0) // 2:
-            leases: list[Any] = []
-            try:
-                for group, size in zip(chunk_groups, sizes):
-                    lease = pool.acquire(size)
-                    _copy_memoryviews_to_lease(group, lease)
-                    leases.append(lease)
-                results = batch_put_from(
-                    list(chunk_keys),
-                    [lease.ptr for lease in leases],
-                    sizes,
-                )
-                self._check_batch_put_results(results, chunk_keys, "batch_put_from")
-            except Exception:
-                _cleanup_keys(self._store, list(chunk_keys), strict=False)
-                raise
-            finally:
-                for lease in leases:
-                    lease.release()
-            return
-        # Fallback: one chunk at a time for large payloads.
+        # Stream one chunk at a time: acquire → memcpy → put → release.
+        # This keeps pool pressure minimal (one lease per call) and allows
+        # RDMA transfers to pipeline across threads.
         for chunk_key, group, size in zip(chunk_keys, chunk_groups, sizes):
             lease = pool.acquire(size)
             try:
@@ -4898,11 +4876,16 @@ def _buffer_group_nbytes(buffers: Sequence[memoryview]) -> int:
 
 
 def _copy_memoryviews(buffers: Sequence[memoryview], destination: memoryview) -> None:
+    dst_arr = np.frombuffer(destination, dtype=np.uint8)
+    dst_ptr = dst_arr.ctypes.data
     offset = 0
     for buffer in buffers:
-        next_offset = offset + len(buffer)
-        destination[offset:next_offset] = buffer
-        offset = next_offset
+        n = len(buffer)
+        if n == 0:
+            continue
+        src_arr = np.frombuffer(buffer, dtype=np.uint8)
+        ctypes.memmove(dst_ptr + offset, src_arr.ctypes.data, n)
+        offset += n
 
 
 def _copy_memoryviews_to_lease(buffers: Sequence[memoryview], lease: Any) -> None:
