@@ -1058,16 +1058,14 @@ jobs:
         sudo cmake --install .
       shell: bash
 
+    # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
+    # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
+    # runtime and drives some dispatch paths past the fake objects the
+    # unit tests rely on, causing false failures. cuda-on still validates
+    # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
+      if: '!matrix.need_cuda'
       run: |
-        if [ "${{ matrix.need_cuda }}" = "true" ]; then
-          # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
-          if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
-             [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
-            sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-          fi
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        fi
         cd build-tent
         ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
       shell: bash
