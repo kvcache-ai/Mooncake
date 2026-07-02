@@ -200,14 +200,6 @@ static bool forceDisableDirectP2pPeers() {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-void MooncakeBackend::ensureCudaDevice() const {
-    if (isCpu_ || cudaDeviceIndex_ < 0) return;
-    cudaError_t err = cudaSetDevice(cudaDeviceIndex_);
-    TORCH_CHECK(err == cudaSuccess,
-                "Failed to restore Mooncake PG CUDA device ",
-                cudaDeviceIndex_, ": ", cudaGetErrorString(err));
-}
-
 static std::string serverHostOnly(const std::string& server_name) {
     const auto pos = server_name.rfind(':');
     if (pos == std::string::npos) return server_name;
@@ -3363,32 +3355,6 @@ void MooncakeBackend::publishLocalPeerMetadata() {
     auto serverNameKey =
         ConnectionContext::getServerNameStoreKey(meta_->backendIndex, rank_);
     meta_->store->set(serverNameKey, localServerName_);
-}
-
-bool MooncakeBackend::allActivePeersOnSameHost() const {
-    if (!meta_ || !meta_->store) return false;
-
-    const std::string local_server_host = serverHostOnly(localServerName_);
-    std::vector<std::string> server_name_keys;
-    server_name_keys.reserve(meta_->activeSize);
-    for (int j = 0; j < meta_->activeSize; ++j) {
-        server_name_keys.push_back(
-            ConnectionContext::getServerNameStoreKey(meta_->backendIndex, j));
-    }
-    BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
-        std::chrono::milliseconds(10)));
-    waiter.wait([&] { return meta_->store->check(server_name_keys); });
-
-    for (int j = 0; j < meta_->activeSize; ++j) {
-        if (!meta_->activeRanks[j]) continue;
-        const auto peer_server_name = meta_->store->get(server_name_keys[j]);
-        const std::string peer_server_name_str(peer_server_name.begin(),
-                                               peer_server_name.end());
-        if (serverHostOnly(peer_server_name_str) != local_server_host) {
-            return false;
-        }
-    }
-    return true;
 }
 
 void MooncakeBackend::maybeInitHierarchicalAllReduceWorkspace() {
