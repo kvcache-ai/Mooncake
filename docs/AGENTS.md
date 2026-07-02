@@ -20,9 +20,10 @@ Run documentation commands from the `docs` directory:
 cd docs
 ```
 
-Install dependencies with `uv` when needed. If there is an existing venv,
-prefer using the existing one. Otherwise, create one before installing
-dependencies:
+Install dependencies with `uv` when needed. The requirements file is
+`docs/requirements-docs.txt`; after `cd docs`, use the local filename. If there
+is an existing venv, prefer using the existing one. Otherwise, create one before
+installing dependencies:
 
 ```
 uv venv
