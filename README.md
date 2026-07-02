@@ -250,24 +250,24 @@ The table below summarizes how Mooncake's components are adopted across the LLM 
 
 **Legend:** ✅ Supported &nbsp;·&nbsp; 🚧 Work in progress &nbsp;·&nbsp; ❌ Not supported &nbsp;·&nbsp; — Not applicable
 
-| Feature | Project | Type | Transfer | EP/Torch Backend | Store | Ckpt Engine |
+| <sub>Feature</sub> | <sub>Project</sub> | <sub>Type</sub> | <sub>Transfer</sub> | <sub>EP/Torch Backend</sub> | <sub>Store</sub> | <sub>Ckpt Engine</sub> |
 | --- | --- | --- | :---: | :---: | :---: | :---: |
-| **Inference** | <img src="https://github.com/vllm-project.png" width="18" height="18" alt="vLLM"/> [vLLM V0](https://github.com/vllm-project/vllm) | Inference | ✅ | ❌ | ✅ | ✅ |
-| | <img src="https://github.com/vllm-project.png" width="18" height="18" alt="vLLM"/> [vLLM V1 (Omni)](https://github.com/vllm-project/vllm) | Inference | ✅ | 🚧 | ✅ (native / LMCache / Nixl) | ❌ |
-| | <img src="https://github.com/sgl-project.png" width="18" height="18" alt="SGLang"/> [SGLang (Omni)](https://github.com/sgl-project/sglang) | Inference | ✅ | ✅ | ✅ | ✅ |
-| | <img src="https://github.com/InternLM.png" width="18" height="18" alt="LMDeploy"/> [LMDeploy](https://github.com/InternLM/lmdeploy) | Inference | ✅ | ❌ | ✅ | ❌ |
-| | <img src="https://github.com/NVIDIA.png" width="18" height="18" alt="NVIDIA"/> [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | Inference | ✅ | ❌ | ✅ | ❌ |
-| | <img src="https://github.com/thu-pacman.png" width="18" height="18" alt="Chitu"/> [Chitu](https://github.com/thu-pacman/chitu) | Inference | ✅ | ❌ | ❌ | ❌ |
-| | <img src="https://github.com/jd-opensource.png" width="18" height="18" alt="xLLM"/> [xLLM](https://github.com/jd-opensource/xllm) | Inference | ✅ | ❌ | ✅ | ❌ |
-| | <img src="https://github.com/alibaba.png" width="18" height="18" alt="Alibaba"/> [RTP (Alibaba)](https://github.com/alibaba/rtp-llm) | Inference | ✅ | ❌ | ✅ | ❌ |
-| **Middleware** | <img src="https://github.com/alibaba.png" width="18" height="18" alt="Alibaba"/> [KVCM (Alibaba)](https://github.com/alibaba) | Middleware | ✅ | — | ✅ | — |
-| | <img src="https://github.com/antgroup.png" width="18" height="18" alt="Ant Group"/> [TBase (Ant)](https://github.com/antgroup) | Middleware | ✅ | — | ❌ | — |
-| | <img src="https://github.com/ai-dynamo.png" width="18" height="18" alt="Dynamo"/> [Dynamo](https://github.com/ai-dynamo/dynamo) | Framework | ✅ (w/ Nixl) | ❌ | ❌ | ❌ |
-| | <img src="https://github.com/LMCache.png" width="18" height="18" alt="LMCache"/> [LMCache](https://github.com/LMCache/LMCache) | Middleware | ❌ | — | ✅ | — |
-| | <img src="https://github.com/Ascend.png" width="18" height="18" alt="TransferQueue"/> [TransferQueue](https://github.com/Ascend/TransferQueue) | Middleware | — | — | ✅ | — |
-| **RL Post-Training** | <img src="https://github.com/THUDM.png" width="18" height="18" alt="slime"/> [Slime/Miles](https://github.com/THUDM/slime) | RL | 🚧 | — | ✅ | — |
-| | <img src="https://github.com/alibaba.png" width="18" height="18" alt="Alibaba"/> [ROLL (Alibaba)](https://github.com/alibaba/ROLL) | RL | ❌ | — | ✅ | — |
-| | <img src="https://github.com/volcengine.png" width="18" height="18" alt="verl"/> [Verl](https://github.com/volcengine/verl) | RL | ❌ | — | ✅ (w/ TransferQueue) | — |
+| <sub>**Inference**</sub> | <img src="https://github.com/vllm-project.png" width="16" height="16" alt="vLLM"/> <sub>[vLLM V0](https://github.com/vllm-project/vllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>✅</sub> |
+| | <img src="https://github.com/vllm-project.png" width="16" height="16" alt="vLLM"/> <sub>[vLLM V1 (Omni)](https://github.com/vllm-project/vllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>🚧</sub> | <sub>✅ (native / LMCache / Nixl)</sub> | <sub>❌</sub> |
+| | <img src="https://github.com/sgl-project.png" width="16" height="16" alt="SGLang"/> <sub>[SGLang (Omni)](https://github.com/sgl-project/sglang)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>✅</sub> | <sub>✅</sub> | <sub>✅</sub> |
+| | <img src="https://github.com/InternLM.png" width="16" height="16" alt="LMDeploy"/> <sub>[LMDeploy](https://github.com/InternLM/lmdeploy)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
+| | <img src="https://github.com/NVIDIA.png" width="16" height="16" alt="NVIDIA"/> <sub>[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
+| | <img src="https://github.com/thu-pacman.png" width="16" height="16" alt="Chitu"/> <sub>[Chitu](https://github.com/thu-pacman/chitu)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>❌</sub> | <sub>❌</sub> |
+| | <img src="https://github.com/jd-opensource.png" width="16" height="16" alt="xLLM"/> <sub>[xLLM](https://github.com/jd-opensource/xllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
+| | <img src="https://github.com/alibaba.png" width="16" height="16" alt="Alibaba"/> <sub>[RTP (Alibaba)](https://github.com/alibaba/rtp-llm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
+| <sub>**Middleware**</sub> | <img src="https://github.com/alibaba.png" width="16" height="16" alt="Alibaba"/> <sub>[KVCM (Alibaba)](https://github.com/alibaba)</sub> | <sub>Middleware</sub> | <sub>✅</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
+| | <img src="https://github.com/antgroup.png" width="16" height="16" alt="Ant Group"/> <sub>[TBase (Ant)](https://github.com/antgroup)</sub> | <sub>Middleware</sub> | <sub>✅</sub> | <sub>—</sub> | <sub>❌</sub> | <sub>—</sub> |
+| | <img src="https://github.com/ai-dynamo.png" width="16" height="16" alt="Dynamo"/> <sub>[Dynamo](https://github.com/ai-dynamo/dynamo)</sub> | <sub>Framework</sub> | <sub>✅ (w/ Nixl)</sub> | <sub>❌</sub> | <sub>❌</sub> | <sub>❌</sub> |
+| | <img src="https://github.com/LMCache.png" width="16" height="16" alt="LMCache"/> <sub>[LMCache](https://github.com/LMCache/LMCache)</sub> | <sub>Middleware</sub> | <sub>❌</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
+| | <img src="https://github.com/Ascend.png" width="16" height="16" alt="TransferQueue"/> <sub>[TransferQueue](https://github.com/Ascend/TransferQueue)</sub> | <sub>Middleware</sub> | <sub>—</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
+| <sub>**RL Post-Training**</sub> | <img src="https://github.com/THUDM.png" width="16" height="16" alt="slime"/> <sub>[Slime/Miles](https://github.com/THUDM/slime)</sub> | <sub>RL</sub> | <sub>🚧</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
+| | <img src="https://github.com/alibaba.png" width="16" height="16" alt="Alibaba"/> <sub>[ROLL (Alibaba)](https://github.com/alibaba/ROLL)</sub> | <sub>RL</sub> | <sub>❌</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
+| | <img src="https://github.com/volcengine.png" width="16" height="16" alt="verl"/> <sub>[Verl](https://github.com/volcengine/verl)</sub> | <sub>RL</sub> | <sub>❌</sub> | <sub>—</sub> | <sub>✅ (w/ TransferQueue)</sub> | <sub>—</sub> |
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
