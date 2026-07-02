@@ -49,6 +49,18 @@ mooncake_store_t mooncake_store_create();
 
 void mooncake_store_destroy(mooncake_store_t store);
 
+/*
+ * Configure etcd TLS certificates.
+ *
+ * Must be called BEFORE mooncake_store_setup().
+ * Passing NULL or empty string for all three parameters disables TLS.
+ * All parameters are copied internally; caller may free them after return.
+ */
+void mooncake_store_set_etcd_tls_config(mooncake_store_t store,
+                                        const char *ca_file,
+                                        const char *cert_file,
+                                        const char *key_file);
+
 int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          const char *metadata_server,
                          uint64_t global_segment_size,

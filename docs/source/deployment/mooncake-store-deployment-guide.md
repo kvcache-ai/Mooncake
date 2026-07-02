@@ -184,6 +184,40 @@ mooncake_client \
 
 > **Important:** The `--etcd_ca_file`, `--etcd_cert_file`, and `--etcd_key_file` flags are **only available when mooncake is built with `STORE_USE_ETCD=ON`**. The TLS configuration is applied to **both** the HA backend (leader election) and the Transfer Engine's metadata etcd connection. It must be provided **before** any etcd connection is made; `ParseCommandLineFlags` handles this automatically by calling the TLS init functions at the top of `main()`.
 
+**Python / C API TLS support:**
+
+The Python `MooncakeDistributedStore` and the C API (`mooncake_store_*`) also support etcd TLS. Configure it **before** calling `setup()`:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.set_etcd_tls_config(
+    ca_file="/etc/etcd/ca.pem",
+    cert_file="/etc/etcd/client.pem",
+    key_file="/etc/etcd/client-key.pem"
+)
+store.setup(
+    local_hostname="node1",
+    metadata_server="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379",
+    global_segment_size=1073741824,
+    local_buffer_size=1073741824,
+    protocol="tcp",
+    rdma_devices="",
+    master_server_addr="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379"
+)
+```
+
+Alternatively, set environment variables to avoid code changes:
+```bash
+export MC_ETCD_CA_FILE=/etc/etcd/ca.pem
+export MC_ETCD_CERT_FILE=/etc/etcd/client.pem
+export MC_ETCD_KEY_FILE=/etc/etcd/client-key.pem
+python my_client_script.py
+```
+
+The `set_etcd_tls_config()` call is optional — if you skip it, the code falls back to the `MC_ETCD_CA_FILE`, `MC_ETCD_CERT_FILE`, and `MC_ETCD_KEY_FILE` environment variables, preserving backward compatibility.
+
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
 ---
@@ -664,6 +698,24 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `ssd_offload_path` | str | empty | *(advanced)* SSD offload directory |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 
+**etcd TLS configuration (Method A):**
+
+Call `set_etcd_tls_config(ca_file, cert_file, key_file)` **before** `setup()`:
+
+```python
+store = MooncakeDistributedStore()
+store.set_etcd_tls_config(
+    ca_file="/etc/etcd/ca.pem",
+    cert_file="/etc/etcd/client.pem",
+    key_file="/etc/etcd/client-key.pem"
+)
+store.setup(...)
+```
+
+| Method | Arguments | Default | Description |
+|--------|-----------|---------|-------------|
+| `set_etcd_tls_config(ca_file, cert_file, key_file)` | 3 strings | empty | Configure etcd TLS certificates. All three default to `""`. If all are empty, environment variables `MC_ETCD_CA_FILE`, `MC_ETCD_CERT_FILE`, `MC_ETCD_KEY_FILE` are used as fallback. Must be called **before** `setup()`. |
+
 ```{note}
 The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A only the `MC_*` engine variables below have any effect — `MOONCAKE_*` are ignored.
 ```
@@ -692,6 +744,9 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
+| `MC_ETCD_CA_FILE` | `etcd_ca_file` | empty | etcd CA certificate path (TLS). Also read directly by the engine at setup time — the recommended way to configure TLS when env vars are accessible |
+| `MC_ETCD_CERT_FILE` | `etcd_cert_file` | empty | etcd client certificate path (TLS) |
+| `MC_ETCD_KEY_FILE` | `etcd_key_file` | empty | etcd client key path (TLS) |
 
 ```{note}
 `MooncakeConfig` (Method B) defaults `global_segment_size`/`local_buffer_size` to 3.125 GiB / 1 GiB. A direct `setup()` (Method A) has **no** default for these — they are required arguments. Unlike `MC_STORE_LOCAL_HOT_CACHE_SIZE` (raw bytes only), `MOONCAKE_GLOBAL_SEGMENT_SIZE` / `MOONCAKE_LOCAL_BUFFER_SIZE` accept human-readable suffixes (`kb`/`mb`/`gb`/…) because they are parsed by `MooncakeConfig`.
@@ -708,6 +763,14 @@ python -m mooncake.mooncake_store_service
 # HTTP metadata server
 MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_TE_META_DATA_SERVER=http://127.0.0.1:8080/metadata \
+python -m mooncake.mooncake_store_service
+
+# HA mode with etcd TLS
+MOONCAKE_MASTER=192.168.1.1:50051 \
+MOONCAKE_TE_META_DATA_SERVER=etcd://192.168.1.1:2379 \
+MC_ETCD_CA_FILE=/etc/etcd/ca.pem \
+MC_ETCD_CERT_FILE=/etc/etcd/client.pem \
+MC_ETCD_KEY_FILE=/etc/etcd/client-key.pem \
 python -m mooncake.mooncake_store_service
 ```
 

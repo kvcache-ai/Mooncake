@@ -14,6 +14,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "store_c.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -2059,6 +2060,28 @@ PYBIND11_MODULE(store, m) {
 
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
+        .def(
+            "set_etcd_tls_config",
+            [](MooncakeStorePyWrapper &self, const std::string &ca_file,
+               const std::string &cert_file, const std::string &key_file) {
+                mooncake_store_set_etcd_tls_config(
+                    nullptr,
+                    ca_file.empty() ? nullptr : ca_file.c_str(),
+                    cert_file.empty() ? nullptr : cert_file.c_str(),
+                    key_file.empty() ? nullptr : key_file.c_str());
+            },
+            py::arg("ca_file") = "",
+            py::arg("cert_file") = "",
+            py::arg("key_file") = "",
+            "Configure etcd TLS certificates.\n\n"
+            "Must be called BEFORE setup().\n"
+            "If all parameters are empty/unset, environment variables\n"
+            "MC_ETCD_CA_FILE, MC_ETCD_CERT_FILE, MC_ETCD_KEY_FILE are\n"
+            "used as fallback.\n\n"
+            "Args:\n"
+            "    ca_file: Path to etcd CA certificate file.\n"
+            "    cert_file: Path to etcd client certificate file.\n"
+            "    key_file: Path to etcd client key file.")
         .def(
             "_get_pyclient_capsule",
             [make_pyclient_capsule](MooncakeStorePyWrapper &self)

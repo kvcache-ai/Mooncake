@@ -129,6 +129,12 @@ class MooncakeConfig:
         master_server_address (str): The address of the master server.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.
+        etcd_ca_file (str): Path to etcd CA certificate file (TLS). Default "".
+        etcd_cert_file (str): Path to etcd client certificate file (TLS). Default "".
+        etcd_key_file (str): Path to etcd client key file (TLS). Default "".
+
+        TLS can also be configured via environment variables:
+          MC_ETCD_CA_FILE, MC_ETCD_CERT_FILE, MC_ETCD_KEY_FILE
 
     Example of configuration file:
         {
@@ -155,6 +161,20 @@ class MooncakeConfig:
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload"
         }
+
+        With etcd TLS:
+        {
+            "local_hostname": "node1",
+            "metadata_server": "etcd://192.168.1.1:2379",
+            "global_segment_size": 3355443200,
+            "local_buffer_size": 1073741824,
+            "protocol": "tcp",
+            "device_name": "",
+            "master_server_address": "master:8081",
+            "etcd_ca_file": "/etc/etcd/ca.pem",
+            "etcd_cert_file": "/etc/etcd/client.pem",
+            "etcd_key_file": "/etc/etcd/client-key.pem"
+        }
     """
     local_hostname: str
     metadata_server: str
@@ -165,6 +185,9 @@ class MooncakeConfig:
     master_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
+    etcd_ca_file: str = ""
+    etcd_cert_file: str = ""
+    etcd_key_file: str = ""
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
@@ -193,6 +216,9 @@ class MooncakeConfig:
             master_server_address=config.get("master_server_address"),
             enable_ssd_offload=_parse_bool(config.get("enable_ssd_offload", False)),
             ssd_offload_path=str(config.get("ssd_offload_path", "")),
+            etcd_ca_file=str(config.get("etcd_ca_file", "")),
+            etcd_cert_file=str(config.get("etcd_cert_file", "")),
+            etcd_key_file=str(config.get("etcd_key_file", "")),
         )
 
     @staticmethod

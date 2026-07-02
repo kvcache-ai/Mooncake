@@ -121,6 +121,18 @@ class MooncakeStoreService:
                 )
 
                 self.store = MooncakeDistributedStore()
+
+                # Configure etcd TLS if provided
+                if self.config.etcd_ca_file or self.config.etcd_cert_file or self.config.etcd_key_file:
+                    self.store.set_etcd_tls_config(
+                        self.config.etcd_ca_file,
+                        self.config.etcd_cert_file,
+                        self.config.etcd_key_file
+                    )
+                    logging.info(
+                        f"etcd TLS configured (ca={self.config.etcd_ca_file})"
+                    )
+
                 ret = self.store.setup(
                     self.config.local_hostname,
                     self.config.metadata_server,
