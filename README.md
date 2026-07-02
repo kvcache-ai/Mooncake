@@ -78,6 +78,61 @@ Mooncake features a KVCache-centric disaggregated architecture that separates th
 
 ![architecture](image/architecture.png)
 
+<details>
+<summary>Disaggregated architecture (Mermaid view)</summary>
+
+The diagram below shows how Mooncake decomposes multimodal LLM serving into independently scalable stages — Encode–Prefill–Decode (EPD) separation, Prefill/Decode (PD) separation, Attention/Expert (AM) separation for MoE models, and RL disaggregation for post-training — all connected through the shared KVCache pool.
+
+```mermaid
+flowchart LR
+    User(["User: text + image"])
+
+    subgraph EPD["EPD Separation · Encode"]
+        VE["Vision Encoder"]
+        KV[("KV-Cache Pool")]
+        VE --> KV
+    end
+
+    subgraph PREFILL["PD Separation · Prefill"]
+        PF["Prefill KV to generate TP/DP"]
+    end
+
+    subgraph DECODE["PD Separation · Decode"]
+        DEC["Decode autoregressive generation"]
+    end
+
+    subgraph AM["AM Separation · Attention / Expert"]
+        ATT["Attention"]
+        EXP["Sparse Expert FFN"]
+        ATT <--> EXP
+    end
+
+    subgraph RLD["RL Disaggregation"]
+        RM["RL reward model"]
+        FSP[("Flow sample pool")]
+        TR["Training Rollout"]
+        MW[("Model warehouse")]
+        RM --> FSP
+        FSP <--> TR
+        TR --> MW
+    end
+
+    ANS(["Answers / Samples"])
+    UW["Update Weights"]
+
+    User --> VE
+    KV --> PF
+    PF --> DEC
+    DEC <--> AM
+    DEC --> ANS
+    DEC --> TR
+    ANS --> UW
+    MW --> UW
+    UW --> DEC
+```
+
+</details>
+
 The core of Mooncake is its KVCache-centric scheduler, which balances maximizing overall effective throughput while meeting latency-related Service Level Objectives (SLOs). Unlike traditional studies that assume all requests will be processed, Mooncake faces challenges in highly overloaded scenarios. To mitigate these, we developed a prediction-based early rejection policy. Experiments show that Mooncake excels in long-context scenarios. Compared to the baseline method, Mooncake can achieve up to a 525% increase in throughput in certain simulated scenarios while adhering to SLOs. Under real workloads, Mooncake’s innovative architecture enables <a href="https://kimi.ai/">Kimi</a> to handle 75% more requests.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
@@ -190,6 +245,31 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 - **vLLM-Omni stage communication**: Mooncake also integrates with [vLLM-Omni](https://github.com/vllm-project/vllm-omni) through `MooncakeTransferEngineConnector` and `MooncakeStoreConnector`, enabling efficient cross-node data exchange between vLLM-Omni stages.
 
 </details>
+
+<h2 id="support-status">📊 Current Support Status</h2>
+
+The table below summarizes how Mooncake's components are adopted across the LLM inference, middleware, and RL post-training ecosystem.
+
+**Legend:** ✅ Supported &nbsp;·&nbsp; 🚧 Work in progress &nbsp;·&nbsp; ❌ Not supported &nbsp;·&nbsp; — Not applicable
+
+| Feature | Project | Type | Transfer | EP/Torch Backend | Store | Ckpt Engine |
+| --- | --- | --- | :---: | :---: | :---: | :---: |
+| **Inference** | vLLM V0 | Inference | ✅ | ❌ | ✅ | ✅ |
+| | vLLM V1 (Omni) | Inference | ✅ | 🚧 | ✅ (native / LMCache / Nixl) | ❌ |
+| | SGLang (Omni) | Inference | ✅ | ✅ | ✅ | ✅ |
+| | LMDeploy | Inference | ✅ | ❌ | ✅ | ❌ |
+| | TensorRT-LLM | Inference | ✅ | ❌ | ✅ | ❌ |
+| | Chitu | Inference | ✅ | ❌ | ❌ | ❌ |
+| | xLLM | Inference | ✅ | ❌ | ✅ | ❌ |
+| | RTP (Alibaba) | Inference | ✅ | ❌ | ✅ | ❌ |
+| **Middleware** | KVCM (Alibaba) | Middleware | ✅ | — | ✅ | — |
+| | TBase (Ant) | Middleware | ✅ | — | ❌ | — |
+| | Dynamo | Framework | ✅ (w/ Nixl) | ❌ | ❌ | ❌ |
+| | LMCache | Middleware | ❌ | — | ✅ | — |
+| | TransferQueue | Middleware | — | — | ✅ | — |
+| **RL Post-Training** | Slime/Miles | RL | 🚧 | — | ✅ | — |
+| | ROLL (Alibaba) | RL | ❌ | — | ✅ | — |
+| | Verl | RL | ❌ | — | ✅ (w/ TransferQueue) | — |
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
