@@ -38,6 +38,12 @@
 namespace mooncake {
 namespace device {
 
+#if defined(__GNUC__) || defined(__clang__)
+#define MOONCAKE_DEVICE_TRANSPORT_EXPORT __attribute__((visibility("default")))
+#else
+#define MOONCAKE_DEVICE_TRANSPORT_EXPORT
+#endif
+
 // ---------------------------------------------------------------------------
 // P2pTransport
 //
@@ -155,13 +161,15 @@ class RdmaTransport {
 // ---------------------------------------------------------------------------
 
 // Create the platform-native P2P transport (NVLink on CUDA, MTLink on MUSA).
-std::unique_ptr<P2pTransport> createP2pDeviceTransport(int num_ranks);
+MOONCAKE_DEVICE_TRANSPORT_EXPORT std::unique_ptr<P2pTransport>
+createP2pDeviceTransport(int num_ranks);
 
 // Create the IBGDA RDMA transport backed by TE's RdmaContext.
 // device_filter: optional whitelist of NIC names (e.g. {"mlx5_1", "mlx5_2"}).
 //   Empty vector = auto-detect via TE's Topology::discover() with no filter.
 //   Non-empty = restrict discovery to these NICs, then pick the closest one.
-std::unique_ptr<RdmaTransport> createIbgdaDeviceTransport(
+MOONCAKE_DEVICE_TRANSPORT_EXPORT std::unique_ptr<RdmaTransport>
+createIbgdaDeviceTransport(
     const std::vector<std::string>& device_filter = {});
 
 }  // namespace device
