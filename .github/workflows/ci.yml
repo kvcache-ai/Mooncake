@@ -729,26 +729,6 @@ jobs:
         sudo cmake --install .
       shell: bash
 
-    - name: Configure project with TENT
-      run: |
-        mkdir build-tent
-        cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project with TENT
-      run: |
-        cd build-tent
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Test (TENT)
-      run: |
-        cd build-tent
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
-      shell: bash
-
     - name: Build nvlink_allocator.so
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
@@ -925,12 +905,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
+      should-run-tent: ${{ steps.dispatch-override.outputs.tent || steps.filter.outputs.tent }}
     steps:
       # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
       - name: Default to true for workflow_dispatch
         id: dispatch-override
         if: github.event_name == 'workflow_dispatch'
-        run: echo "src=true" >> $GITHUB_OUTPUT
+        run: |
+          echo "src=true" >> $GITHUB_OUTPUT
+          echo "tent=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
         if: github.event_name != 'workflow_dispatch'
         with:
@@ -948,6 +931,12 @@ jobs:
               - 'dependencies.sh'
               - 'scripts/**'
               - '.github/workflows/**'
+            tent:
+              - 'mooncake-transfer-engine/**'
+              - 'mooncake-common/**'
+              - 'CMakeLists.txt'
+              - 'dependencies.sh'
+              - '.github/workflows/ci.yml'
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -985,6 +974,109 @@ jobs:
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
+  tent-ci:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-tent == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cuda-on
+            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
+            need_cuda: true
+          - name: cuda-off
+            cmake_flags: '-DUSE_CUDA=OFF'
+            need_cuda: false
+    name: tent-ci (${{ matrix.name }})
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Free up disk space
+      if: matrix.need_cuda
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/lib/android
+        df -h
+
+    - name: Install CUDA Toolkit
+      if: matrix.need_cuda
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc", "nvrtc-dev"]'
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Install dependencies
+      run: |
+        sudo apt update -y
+        sudo apt install -y ninja-build
+        sudo bash -x dependencies.sh -y
+        df -h
+      shell: bash
+
+    - name: Configure project with TENT
+      run: |
+        mkdir build-tent
+        cd build-tent
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }}
+      shell: bash
+
+    - name: Build project with TENT
+      run: |
+        if [ "${{ matrix.need_cuda }}" = "true" ]; then
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+        fi
+        cd build-tent
+        cmake --build .
+        sudo cmake --install .
+      shell: bash
+
+    - name: Test (TENT)
+      run: |
+        if [ "${{ matrix.need_cuda }}" = "true" ]; then
+          # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
+          if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+             [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+            sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+          fi
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        fi
+        cd build-tent
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
+      shell: bash
+
+    - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -1000,6 +1092,7 @@ jobs:
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-efa
+      - tent-ci
       - ascend-test
       - integration-test
     runs-on: ubuntu-latest
