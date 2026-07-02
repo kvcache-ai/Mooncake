@@ -1,11 +1,11 @@
 if(USE_UB)
   file(GLOB UB_TENT_SOURCES "*.cpp")
 
-  # Include ub_transport object files directly so that tent_xport_ub is a
-  # self-contained static library (no dangling OBJECT library dependency at the
-  # final link step).
-  add_library(tent_xport_ub STATIC ${UB_TENT_SOURCES}
-                                   $<TARGET_OBJECTS:ub_transport>)
+  # Keep this library limited to the TENT UB adapter sources.  The old-TE
+  # ub_transport objects are already provided by the transfer_engine target when
+  # USE_UB is enabled; embedding them here as well makes final executables link
+  # the same object files twice.
+  add_library(tent_xport_ub STATIC ${UB_TENT_SOURCES})
 
   # Old-TE public headers (transfer_metadata.h, topology.h, transport/*.h).
   # These are already on the global include path when building inside the

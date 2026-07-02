@@ -81,22 +81,21 @@ target_include_directories(tent_failover_test
 add_test(NAME tent_failover_test COMMAND tent_failover_test)
 
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
-target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main
-                                                           tent_link_group)
+target_link_libraries(tent_endpoint_lifecycle_test
+                      PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(tent_endpoint_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
 
 add_executable(tent_endpoint_store_test endpoint_store_test.cpp)
-target_link_libraries(tent_endpoint_store_test PRIVATE gtest gtest_main
-                                                       tent_link_group)
+target_link_libraries(tent_endpoint_store_test PRIVATE ${TENT_GTEST_LINK_LIBS})
 target_include_directories(tent_endpoint_store_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_store_test COMMAND tent_endpoint_store_test)
 
 add_executable(tent_rdma_transport_test rdma_transport_test.cpp)
-target_link_libraries(tent_rdma_transport_test PRIVATE gtest gtest_main
-                                                       tent_link_group ibverbs)
+target_link_libraries(tent_rdma_transport_test PRIVATE ${TENT_GTEST_LINK_LIBS}
+                                                       ibverbs)
 target_include_directories(tent_rdma_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
