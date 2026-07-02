@@ -50,29 +50,38 @@ TransferEngine* MooncakeBackend::externalEngine_ = nullptr;
 std::vector<uint8_t> serialize(const ExtensionState& state) {
     uint32_t rankCount = static_cast<uint32_t>(state.activeRanks.size());
 
+    // Calculate bytes needed for the bitmap: 1 bit per rank, rounded up to
+    // nearest byte
     size_t bitmapSize = (rankCount + 7) / 8;
+
+    // Total size = count field + bitmap + p2pEpochs[] + taskCount
     size_t totalSize = sizeof(uint32_t) + bitmapSize +
                        sizeof(uint32_t) * rankCount + sizeof(int32_t);
 
     std::vector<uint8_t> buffer(totalSize, 0);
     uint8_t* ptr = buffer.data();
 
+    // 1. Store the number of ranks
     std::memcpy(ptr, &rankCount, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
 
+    // 2. Store activeRanks as a bitset
     for (size_t i = 0; i < rankCount; ++i) {
         if (state.activeRanks[i]) {
+            // Set the i-th bit to 1 if the rank is active
             ptr[i / 8] |= (1 << (i % 8));
         }
     }
     ptr += bitmapSize;
 
+    // 3. Store per-peer p2pEpochs
     for (size_t i = 0; i < rankCount; ++i) {
         std::memcpy(ptr + i * sizeof(uint32_t), &state.p2pEpochs[i],
                     sizeof(uint32_t));
     }
     ptr += sizeof(uint32_t) * rankCount;
 
+    // 4. Store taskCount
     int32_t taskCount = static_cast<int32_t>(state.taskCount);
     std::memcpy(ptr, &taskCount, sizeof(int32_t));
 
@@ -85,27 +94,35 @@ ExtensionState deserialize(const std::vector<uint8_t>& buffer) {
 
     const uint8_t* ptr = buffer.data();
 
+    // 1. Read the number of ranks
     uint32_t rankCount = 0;
     std::memcpy(&rankCount, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
 
+    // Calculate expected total size and verify buffer is sufficient before
+    // proceeding with further reads.
     size_t bitmapSize = (rankCount + 7) / 8;
     size_t expectedSize = sizeof(uint32_t) + bitmapSize +
                           sizeof(uint32_t) * rankCount + sizeof(int32_t);
     if (buffer.size() < expectedSize) return state;
 
+    // 2. Read the bitmap and reconstruct the activeRanks vector
     state.activeRanks.resize(rankCount);
     for (size_t i = 0; i < rankCount; ++i) {
-        state.activeRanks[i] = ptr[i / 8] & (1 << (i % 8));
+        // Check if the i-th bit is set
+        bool isActive = ptr[i / 8] & (1 << (i % 8));
+        state.activeRanks[i] = isActive;
     }
     ptr += bitmapSize;
 
+    // 3. Read per-peer p2pEpochs
     state.p2pEpochs.resize(rankCount);
     for (size_t i = 0; i < rankCount; ++i) {
         std::memcpy(&state.p2pEpochs[i], ptr, sizeof(uint32_t));
         ptr += sizeof(uint32_t);
     }
 
+    // 4. Read taskCount
     int32_t taskCount = 0;
     std::memcpy(&taskCount, ptr, sizeof(int32_t));
     state.taskCount = static_cast<int>(taskCount);
@@ -1079,7 +1096,7 @@ void MooncakeBackend::publishLocalPeerMetadata() {
                 "Publishing local peer metadata requires a valid Store.");
 
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
-    std::memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
+    memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
 
     auto bufferKey =
         ConnectionContext::getBufferStoreKey(meta_->backendIndex, rank_);
@@ -1105,19 +1122,23 @@ void MooncakeBackend::waitForExtensionState() {
 
     BackoffWaiter waiter(
         BackoffWaiterConfig::constantSleep(std::chrono::milliseconds(50)));
+
     waiter.wait([&] { return meta_->store->check({state_key}); });
 
     auto state_data = meta_->store->get(state_key);
     auto state = deserialize(state_data);
 
+    // taskCount
     meta_->taskCount = state.taskCount;
 
+    // p2pEpochs
     TORCH_CHECK(static_cast<size_t>(meta_->size) == state.p2pEpochs.size(),
                 "Invalid p2pEpochs size");
     for (int i = 0; i < meta_->size; ++i) {
         p2p_proxy_->setEpoch(i, state.p2pEpochs[i]);
     }
 
+    // activeRanks
     TORCH_CHECK(static_cast<size_t>(meta_->size) == state.activeRanks.size(),
                 "Invalid activeRanks");
     for (int i = 0; i < meta_->size; ++i) {
@@ -1125,6 +1146,7 @@ void MooncakeBackend::waitForExtensionState() {
     }
     syncActiveRanksTensor();
 
+    // activeSize: count the number of active ranks (contiguous from 0)
     int newActiveSize = 0;
     for (int i = 0; i < meta_->size; ++i) {
         if (meta_->activeRanks[i]) {
@@ -1248,6 +1270,7 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
         meta_->activeRanks[rank] = true;
     }
 
+    // Expand activeSize if any recovered rank is beyond the current boundary.
     if (!ranks.empty()) {
         const int max_rank = *std::max_element(ranks.begin(), ranks.end());
         if (max_rank >= meta_->activeSize) {

@@ -13,12 +13,4 @@ except ModuleNotFoundError:
         f"Mooncake PG was not built against torch=={torch_version}.\n"
         f"Open an issue at https://github.com/kvcache-ai/Mooncake/issues."
     )
-_EXPORT_PRIVATE_NAMES = {"_device_runtime_snapshot"}
-
-globals().update(
-    {
-        k: v
-        for k, v in backend_module.__dict__.items()
-        if not k.startswith("_") or k in _EXPORT_PRIVATE_NAMES
-    }
-)
+globals().update({k: v for k, v in backend_module.__dict__.items() if not k.startswith("_")})
