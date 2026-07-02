@@ -623,7 +623,7 @@ An SSD-aware variant of the free-ratio-first strategy. It first tries preferred 
 
 **`local_first` — Local-first allocation**
 
-Host-aware local-first allocation reuses the normal preferred-segment flow. The master derives the writer host id from the request's client host identity and builds an ordered preferred segment list: segments on the writer's host first, followed by remote hosts in lexicographic host-id order. Within the same host, segment names are sorted and rotated by key hash so multiple local segments do not always receive the first allocation attempt.
+Host-aware local-first allocation reuses the normal preferred-segment flow. The master derives the writer host id from the request's client host identity and builds an ordered preferred segment list: active hosts are visited in cyclic lexicographic host-id order, starting from the writer host when it has active segments, or otherwise from the next greater active host id. Within the same host, segment names are sorted and rotated by key hash so multiple local segments do not always receive the first allocation attempt.
 
 This strategy currently applies to memory allocation with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` in `ReplicateConfig` are still tried first; if they are unavailable or full, allocation continues with the local-first ordered fallback list.
 
