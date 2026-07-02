@@ -306,7 +306,7 @@ mod state_core_tests {
 #[derive(Default)]
 struct StoreState {
     memory: Option<LocalMemoryState>,
-    registered_buffers: BTreeMap<usize, RegisteredBufferInfo>,
+    registered_buffers: BTreeMap<usize, usize>,
     local_transports: BTreeMap<String, Arc<dyn StoreTransport>>,
     remote_segments: BTreeMap<String, u64>,
     remote_segment_infos: BTreeMap<String, SegmentInfo>,
@@ -314,12 +314,6 @@ struct StoreState {
     segment_open_metadata: BTreeMap<String, SegmentTransportMetadata>,
     pending_reclaims: VecDeque<PendingReclaim>,
     next_local_segment_id: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RegisteredBufferInfo {
-    size: usize,
-    host_readable: bool,
 }
 
 #[derive(Clone, Debug, Default)]
