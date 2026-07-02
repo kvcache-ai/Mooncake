@@ -41,7 +41,6 @@ struct NVLinkTask {
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
     bool is_cuda_ipc;
-    int cuda_id = 0;
     cudaEvent_t completion_event = nullptr;
 };
 

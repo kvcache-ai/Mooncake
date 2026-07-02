@@ -180,7 +180,6 @@ Status MnnvlTransport::submitTransferTasks(
 
     // Determine device for this batch and validate all requests
     int batch_device_id = -1;
-    bool device_determined = false;
     std::vector<MnnvlTask *> new_tasks;
 
     for (auto &request : request_list) {
@@ -195,17 +194,15 @@ Status MnnvlTransport::submitTransferTasks(
 
         // Parse device ID from buffer location (e.g., "cuda:0" -> 0, "cpu" ->
         // -1)
-        LocationParser location(buf->location);
-        int device_id = location.index();
+        int device_id = LocationParser(buf->location).index();
 
         // Capture the first GPU device encountered for stream creation.
         // Mixed-GPU batches use the first GPU's stream and rely on CUDA P2P
         // for cross-device access (same behavior as pre-#2569 code).
         // A future refactor could group requests by device and dispatch to
         // per-device streams, but that requires SubBatch structure changes.
-        if (!device_determined && device_id >= 0) {
+        if (batch_device_id < 0 && device_id >= 0) {
             batch_device_id = device_id;
-            device_determined = true;
         }
 
         // Create and populate task
@@ -226,7 +223,6 @@ Status MnnvlTransport::submitTransferTasks(
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-        task.cuda_id = device_id;
         new_tasks.push_back(&task);
     }
 
