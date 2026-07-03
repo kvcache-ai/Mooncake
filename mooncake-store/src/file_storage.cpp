@@ -928,8 +928,9 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         ++heartbeat_rounds;
         {
             std::lock_guard<std::mutex> lock(promotion_queue_mutex_);
-            if (promotion_task_queue_.size() >=
-                std::max<size_t>(1, config_.promotion_queue_capacity)) {
+            if (config_.promotion_queue_capacity > 0 &&
+                promotion_task_queue_.size() >=
+                    config_.promotion_queue_capacity) {
                 break;
             }
         }
