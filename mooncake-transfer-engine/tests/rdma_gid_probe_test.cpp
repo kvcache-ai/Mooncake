@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
+#include <string>
 #include <vector>
 
 #include "transport/rdma_transport/rdma_gid_probe.h"
@@ -509,6 +511,30 @@ TEST(RdmaGidProbeTest, NetworkLinkLocalStillOutranksNoNetworkPrivateV4) {
     EXPECT_EQ(selection->gid_index, 1);
     EXPECT_EQ(selection->candidate_class,
               AutoGidCandidateClass::kNetworkDegraded);
+}
+
+// Completeness pin for the tier tables: every class has a distinct
+// priority consistent with its enum order and a unique display name, so a
+// future class insertion cannot silently create a tie or reuse a label.
+TEST(RdmaGidProbeTest, ClassPriorityAndNameTablesAreComplete) {
+    const AutoGidCandidateClass all[] = {
+        AutoGidCandidateClass::kNetworkRoutable,
+        AutoGidCandidateClass::kNoNetworkRoutable,
+        AutoGidCandidateClass::kNetworkPrivateV4,
+        AutoGidCandidateClass::kNetworkDegraded,
+        AutoGidCandidateClass::kNoNetworkPrivateV4,
+        AutoGidCandidateClass::kNoNetworkDegraded,
+        AutoGidCandidateClass::kFallbackNonzero,
+    };
+    int expected_priority = 0;
+    std::set<std::string> names;
+    for (auto cls : all) {
+        EXPECT_EQ(autoGidCandidateClassPriority(cls), expected_priority++);
+        std::string name = autoGidCandidateClassToString(cls);
+        EXPECT_NE(name, "unknown");
+        EXPECT_TRUE(names.insert(name).second)
+            << "duplicate class name: " << name;
+    }
 }
 
 // When only link-local candidates exist, behavior is unchanged: lowest
