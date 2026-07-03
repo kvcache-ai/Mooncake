@@ -6945,22 +6945,36 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
             }
 
             bool queued = false;
-            metadata.VisitReplicas(
-                is_evictable_memory_replica,
-                [this, &key, &normalized_tenant, &tenant_state, &queued,
-                 &now](Replica& replica) {
-                    if (queued) {
-                        return;
-                    }
-                    auto result = PushOffloadingQueue(
-                        MakeObjectIdentity(key, normalized_tenant), replica);
-                    if (result) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            key, OffloadingTask{replica.id(), now});
-                        queued = true;
-                    }
-                });
+            // Skip if an offloading task is already in flight for this key to
+            // avoid the cross-cycle re-pin refcnt leak (see Bug J part 1).
+            if (tenant_state.offloading_tasks.count(key) == 0) {
+                metadata.VisitReplicas(
+                    is_evictable_memory_replica,
+                    [this, &key, &normalized_tenant, &tenant_state, &queued,
+                     &now](Replica& replica) {
+                        if (queued) return;
+                        auto result = PushOffloadingQueue(
+                            MakeObjectIdentity(key, normalized_tenant),
+                            replica);
+                        if (result) {
+                            replica.inc_refcnt();
+                            auto [it, inserted] =
+                                tenant_state.offloading_tasks.emplace(
+                                    key, OffloadingTask{replica.id(), now});
+                            if (!inserted) {
+                                replica.dec_refcnt();
+                                LOG(WARNING)
+                                    << "[TENANT-EVICT-OFFLOAD-EMPLACE-FAIL] "
+                                       "key="
+                                    << key
+                                    << " already has offloading_task; rolled "
+                                       "back refcnt";
+                            } else {
+                                queued = true;
+                            }
+                        }
+                    });
+            }
 
             if (queued) {
                 ++offload_queued_this_call;
