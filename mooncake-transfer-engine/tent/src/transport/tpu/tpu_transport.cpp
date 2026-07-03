@@ -102,6 +102,7 @@ void TpuTransport::startTransfer(TpuTask *task, TpuSubBatch *batch) {
                    << task->request.target_id
                    << "; TPU only supports local staging copies";
         task->status_word = TransferStatusEnum::FAILED;
+        task->transferred_bytes = 0;
         batch->notifyProgress();
         return;
     }

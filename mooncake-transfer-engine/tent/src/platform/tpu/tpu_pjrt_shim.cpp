@@ -51,6 +51,7 @@ void TpuPjrtShim::load() {
                      << "': " << dlerror()
                      << ". TPU transfers will be unavailable. Set "
                         "MC_TPU_PJRT_LIB to override the adapter path.";
+        available_ = false;
         return;
     }
 
@@ -84,6 +85,7 @@ void TpuPjrtShim::load() {
                    << "' does not satisfy the required ABI; disabling TPU.";
         dlclose(handle_);
         handle_ = nullptr;
+        available_ = false;
         return;
     }
 
@@ -91,6 +93,7 @@ void TpuPjrtShim::load() {
         LOG(ERROR) << "TpuPjrtShim: mc_tpu_pjrt_init() failed; disabling TPU.";
         dlclose(handle_);
         handle_ = nullptr;
+        available_ = false;
         return;
     }
 
