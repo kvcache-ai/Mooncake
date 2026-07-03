@@ -2045,33 +2045,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // Allocate aligned buffer if needed
+        // Allocate a per-call aligned buffer. The shared member
+        // aligned_io_buffer_ is NOT safe for concurrent WriteBucket calls
+        // (parallel WriteBucket dispatches multiple buckets simultaneously
+        // via worker threads); using it here would cause data corruption.
         void* write_buffer = nullptr;
-        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
-                                                           [](void*) {}};
+        std::unique_ptr<void, void (*)(void*)> temp_buffer{
+            nullptr, [](void*) {}};
 
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
-        } else {
-            // Allocate a temporary larger buffer
-            void* buf = nullptr;
-            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
-            if (ret != 0) {
-                LOG(ERROR)
-                    << "Failed to allocate aligned buffer for WriteBucket: "
-                    << strerror(ret);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            temp_buffer.reset(buf);
-            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
-                buf, [](void* p) { free(p); });
-            write_buffer = buf;
-            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
-                         << " requires " << aligned_size
-                         << " bytes, exceeds buffer size " << kAlignedBufferSize
-                         << ", using temporary allocation";
+        void* buf = nullptr;
+        int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
+        if (ret != 0) {
+            LOG(ERROR)
+                << "Failed to allocate aligned buffer for WriteBucket: "
+                << strerror(ret);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+        temp_buffer = std::unique_ptr<void, void (*)(void*)>(
+            buf, [](void* p) { free(p); });
+        write_buffer = buf;
 
         // Aggregate all iovs data into the aligned buffer
         char* dst = static_cast<char*>(write_buffer);
