@@ -36,6 +36,8 @@ class WorkerPool {
 
     void performPollCq(int thread_id);
 
+    void checkSliceTimeouts();
+
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id);
 
     void transferWorker(int thread_id);
@@ -106,6 +108,11 @@ class WorkerPool {
         collective_slice_queue_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
+
+    // Value is the enqueue timestamp, or 0 after timeout handling.
+    std::unordered_map<Transport::Slice *, uint64_t> inflight_slices_;
+    std::mutex inflight_slices_lock_;
+    uint64_t last_timeout_check_ns_ = 0;
 
     // Rail state management: peer_nic_path -> RailState
     std::unordered_map<std::string, RailState> rail_states_;

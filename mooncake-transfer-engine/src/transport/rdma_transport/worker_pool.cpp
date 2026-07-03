@@ -369,7 +369,22 @@ void WorkerPool::performPostSend(int thread_id) {
         for (auto &slice : entry.second) {
             slice->rdma.endpoint = endpoint.get();
         }
+        {
+            std::lock_guard<std::mutex> lock(inflight_slices_lock_);
+            for (auto *slice : entry.second) {
+                inflight_slices_[slice] = getCurrentTimeInNano();
+            }
+        }
+        const size_t failed_before = failed_slice_list.size();
         endpoint->submitPostSend(entry.second, failed_slice_list);
+        {
+            std::lock_guard<std::mutex> lock(inflight_slices_lock_);
+            // These slices were deferred or rejected, so no CQE will refer to
+            // them for this submission.
+            for (auto *slice : entry.second) inflight_slices_.erase(slice);
+            for (size_t i = failed_before; i < failed_slice_list.size(); ++i)
+                inflight_slices_.erase(failed_slice_list[i]);
+        }
 #endif
     }
 
@@ -390,6 +405,8 @@ void WorkerPool::performPostSend(int thread_id) {
 }
 
 void WorkerPool::performPollCq(int thread_id) {
+    checkSliceTimeouts();
+
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int *, int> qp_depth_set;
@@ -400,6 +417,15 @@ void WorkerPool::performPollCq(int thread_id) {
         if (nr_poll < 0) {
             LOG(ERROR) << "Worker: Failed to poll completion queues";
             continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(inflight_slices_lock_);
+            for (int i = 0; i < nr_poll; ++i) {
+                auto *slice =
+                    reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
+                inflight_slices_.erase(slice);
+            }
         }
 
         for (int i = 0; i < nr_poll; ++i) {
@@ -466,6 +492,47 @@ void WorkerPool::performPollCq(int thread_id) {
 
     if (!failed_slice_list.empty()) {
         redispatch(failed_slice_list, thread_id);
+    }
+}
+
+void WorkerPool::checkSliceTimeouts() {
+    const int64_t timeout_seconds = globalConfig().slice_timeout;
+    if (timeout_seconds <= 0) return;
+
+    const uint64_t now = getCurrentTimeInNano();
+    constexpr uint64_t kTimeoutCheckIntervalNs = 100000000ull;  // 100 ms
+    if (now - last_timeout_check_ns_ < kTimeoutCheckIntervalNs) return;
+    last_timeout_check_ns_ = now;
+
+    const uint64_t timeout_ns =
+        static_cast<uint64_t>(timeout_seconds) * 1000000000ull;
+    std::unordered_map<RdmaEndPoint *, std::string> endpoints_to_reset;
+    std::vector<Transport::Slice *> timed_out_now;
+
+    {
+        std::lock_guard<std::mutex> lock(inflight_slices_lock_);
+        for (auto &[slice, posted_at] : inflight_slices_) {
+            if (posted_at == 0 || now <= posted_at ||
+                now - posted_at <= timeout_ns)
+                continue;
+
+            posted_at = 0;  // Do not reset the same endpoint repeatedly.
+            endpoints_to_reset.emplace(slice->rdma.endpoint,
+                                       slice->peer_nic_path);
+            timed_out_now.push_back(slice);
+        }
+    }
+
+    for (auto *slice : timed_out_now) {
+        LOG(WARNING) << "RDMA slice timed out after " << timeout_seconds
+                     << "s (source_addr=" << slice->source_addr
+                     << ", length=" << slice->length
+                     << ", peer_nic=" << slice->peer_nic_path << ")";
+    }
+    for (const auto &[endpoint, peer_nic_path] : endpoints_to_reset) {
+        LOG(WARNING) << "Resetting RDMA endpoint after slice timeout: "
+                     << peer_nic_path;
+        context_.deleteEndpointByPtr(endpoint);
     }
 }
 
