@@ -1420,7 +1420,7 @@ class MooncakeBundleTransfer:
         """Store a legacy rollout dict as a structured object."""
         return self._put_stage(
             None,
-            _legacy_dict_to_dataproto_envelope(data),
+            _legacy_dict_to_envelope(data),
             namespace=namespace,
             partition=partition,
             stage=stage,
@@ -1432,7 +1432,7 @@ class MooncakeBundleTransfer:
 
     def get_legacy_dict(self, ref: DataProtoRefLike) -> dict[str, Any]:
         """Materialize a legacy rollout dict stored by put_legacy_dict()."""
-        return _dataproto_envelope_to_legacy_dict(
+        return _envelope_to_legacy_dict(
             self._materialize_ref(_resolve_ref(ref))
         )
 
@@ -1761,7 +1761,7 @@ LEGACY_DICT_META_FIELDS = frozenset(
 )
 
 
-def _legacy_dict_to_dataproto_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
+def _legacy_dict_to_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(data, Mapping):
         raise TypeError("legacy rollout data must be a mapping")
     partition = data.get("partition")
@@ -1789,7 +1789,7 @@ def _legacy_dict_to_dataproto_envelope(data: Mapping[str, Any]) -> dict[str, Any
     }
 
 
-def _dataproto_envelope_to_legacy_dict(data: Mapping[str, Any]) -> dict[str, Any]:
+def _envelope_to_legacy_dict(data: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(_mapping_to_dict(data.get("meta_info")))
     result.update(_mapping_to_dict(data.get("batch")))
     for key, value in _mapping_to_dict(data.get("non_tensor_batch")).items():
