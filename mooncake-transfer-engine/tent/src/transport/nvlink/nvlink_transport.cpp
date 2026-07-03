@@ -106,8 +106,8 @@ Status NVLinkTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     batch = shm_batch;
     shm_batch->task_list.reserve(max_size);
     shm_batch->max_size = max_size;
-    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream));
-    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream));
+    // Streams are created lazily in submitTransferTasks where the correct
+    // GPU device can be inferred from request source pointers.
     return Status::OK();
 }
 
@@ -115,7 +115,9 @@ Status NVLinkTransport::freeSubBatch(SubBatchRef& batch) {
     auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
     if (!shm_batch)
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
-    // CHECK_CUDA(cudaStreamDestroy(shm_batch->stream));
+    // Completion events are destroyed by ~NVLinkSubBatch(), which Slab's
+    // deallocate() invokes before returning the storage. Streams are
+    // pool-managed and not destroyed here.
     Slab<NVLinkSubBatch>::Get().deallocate(shm_batch);
     batch = nullptr;
     return Status::OK();
@@ -126,23 +128,73 @@ Status NVLinkTransport::submitTransferTasks(
     auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
     if (!shm_batch)
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+
     if (request_list.size() + shm_batch->task_list.size() > shm_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    // Get local segment for buffer lookup
+    auto& segment_manager = metadata_->segmentManager();
+    SegmentDesc* local_segment = segment_manager.getLocal().get();
+    if (!local_segment)
+        return Status::InternalError("Local segment not found" LOC_MARK);
+
+    // Determine device for this batch and validate all requests
+    int batch_device_id = -1;
     std::vector<NVLinkTask*> new_tasks;
+
     for (auto& request : request_list) {
+        // Find the buffer this source pointer belongs to
+        BufferDesc* buf = local_segment->findBuffer(
+            reinterpret_cast<uint64_t>(request.source), request.length);
+        if (!buf) {
+            return Status::InvalidArgument(
+                "Unregistered buffer: source pointer not in any registered "
+                "buffer" LOC_MARK);
+        }
+
+        // Parse device ID from buffer location (e.g., "cuda:0" -> 0, "cpu" ->
+        // -1)
+        int device_id = LocationParser(buf->location).index();
+
+        // Capture the first GPU device encountered for stream creation.
+        // Mixed-GPU batches use the first GPU's stream and rely on CUDA P2P
+        // for cross-device access (same behavior as pre-#2569 code).
+        // A future refactor could group requests by device and dispatch to
+        // per-device streams, but that requires SubBatch structure changes.
+        if (batch_device_id < 0 && device_id >= 0) {
+            batch_device_id = device_id;
+        }
+
+        // Create and populate task
         shm_batch->task_list.push_back(NVLinkTask{});
         auto& task = shm_batch->task_list[shm_batch->task_list.size() - 1];
+
         uint64_t target_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
                 target_addr, request.length, request.target_id);
             if (!status.ok()) return status;
         }
+
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
         new_tasks.push_back(&task);
     }
+
+    // Get or create streams for this batch's device
+    if (!shm_batch->async_stream.get()) {
+        int stream_device = batch_device_id;
+        if (stream_device < 0) {
+            // CPU-only batch: use current CUDA device
+            cudaGetDevice(&stream_device);
+        }
+        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream,
+                                                  stream_device));
+        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream,
+                                                  stream_device));
+    }
+
     startTransfer(new_tasks, shm_batch);
     return Status::OK();
 }
@@ -221,8 +273,22 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     }
 
     cudaEvent_t event;
-    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-    cudaEventRecord(event, batch->async_stream.get());
+    auto event_err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    if (event_err != cudaSuccess) {
+        LOG(ERROR) << "NVLinkTransport: cudaEventCreateWithFlags failed: "
+                   << cudaGetErrorString(event_err);
+        for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
+    auto record_err = cudaEventRecord(event, batch->async_stream.get());
+    if (record_err != cudaSuccess) {
+        LOG(ERROR) << "NVLinkTransport: cudaEventRecord failed: "
+                   << cudaGetErrorString(record_err);
+        cudaEventDestroy(event);
+        for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
+    batch->completion_events.push_back(event);
     for (auto* task : tasks) task->completion_event = event;
 }
 
@@ -233,7 +299,6 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto& task = shm_batch->task_list[task_id];
-    status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
         auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
@@ -243,6 +308,9 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
             task.status_word = TransferStatusEnum::FAILED;
         }
     }
+    // Read status AFTER the poll so a just-observed completion/failure is
+    // reported on this call rather than one poll cycle late.
+    status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
 
@@ -360,8 +428,11 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
             std::lock_guard<std::mutex> lock(register_mutex_);
             registered_base_addrs_.erase(key);
         }
-    } else if (location.type() == "cpu" && host_register_) {
-        CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
+    } else if (location.type() == "cpu" ||
+               location.type() == kWildcardLocation) {
+        if (host_register_) {
+            CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
+        }
     }
     desc.shm_path.clear();
     return Status::OK();

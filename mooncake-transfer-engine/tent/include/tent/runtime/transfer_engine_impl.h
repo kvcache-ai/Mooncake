@@ -30,14 +30,14 @@
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/common/types.h"
-#include "tent/common/concurrent/thread_local_storage.h"
+#include "tent/runtime/admission_queue.h"
+#include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 
 namespace mooncake {
 namespace tent {
 
 class Batch;
-class BatchSet;
 class Topology;
 class Transport;
 class SegmentDesc;
@@ -176,11 +176,13 @@ class TransferEngineImpl {
     }
 
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
-    // enable_progress_worker is false. Currently used by test/integration
-    // hooks; transports will be migrated to call this in a follow-up PR.
+    // enable_progress_worker is false. Transport completion paths use this as
+    // an idempotent "maybe ready" signal.
     void notifyBatchMaybeReady(BatchID batch_id);
 
    private:
+    friend class ProgressWorker;
+
     Status construct();
 
     Status deconstruct();
@@ -196,6 +198,54 @@ class TransferEngineImpl {
         TransportType request_type);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
+
+    Status retainBatch(BatchID batch_id, Batch*& batch);
+
+    Status releaseBatch(Batch* batch);
+
+    class BatchRef;
+
+    struct PreparedSubmit;
+
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<Request>& request_list,
+                          const Notification* notifi,
+                          QueueOwnerKind owner_kind);
+
+    Status submitStagingTransfer(BatchID batch_id,
+                                 const std::vector<Request>& request_list);
+
+    Status enqueuePreparedSubmit(Batch* batch, const PreparedSubmit& prepared,
+                                 QueueOwnerKind owner_kind);
+
+    bool shouldQueueSubmit(const PreparedSubmit& prepared,
+                           QueueOwnerKind owner_kind) const;
+
+    Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
+                         PreparedSubmit& prepared);
+
+    Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
+
+    void attachProgressNotifier(Batch* batch, Transport::SubBatchRef sub_batch);
+
+    uint64_t nextBatchToken();
+
+    Status refillDispatchWindow();
+
+    Status progressRuntimeQueue();
+
+    bool hasActiveRuntimeQueue();
+
+    void notifyRuntimeQueueReady();
+
+    Status dispatchQueuedOwner(QueueOwnerId owner_id);
+
+    Status markQueuedOwnerSubmitted(QueueOwnerId owner_id);
+
+    Status finishQueuedOwner(QueueOwnerId owner_id,
+                             TransferStatusEnum terminal_status);
+
+    Status retireQueueForBatch(Batch* batch);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
@@ -220,6 +270,10 @@ class TransferEngineImpl {
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
+    void addSubmitHook(Batch* batch, size_t start_task_id,
+                       const std::vector<Request>& request_list,
+                       const Notification& notifi);
+
     void recordTaskCompletionMetrics(TaskInfo& task,
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);
@@ -237,6 +291,22 @@ class TransferEngineImpl {
         std::vector<Batch*> freelist;
     };
 
+    struct RuntimeQueueConfig {
+        bool enabled{false};
+        QueueLimits limits{};
+        size_t max_dispatch_owners{0};
+        size_t max_dispatch_bytes{0};
+        std::chrono::microseconds progress_fallback_interval{50000};
+    };
+
+    struct QueuedOwnerState {
+        Batch* batch{nullptr};
+        size_t owner_task_id{0};
+        std::vector<size_t> public_task_ids;
+        size_t byte_charge{0};
+        bool in_dispatch_window{false};
+    };
+
    private:
     std::shared_ptr<Config> conf_;
     std::shared_ptr<ControlService> metadata_;
@@ -248,7 +318,7 @@ class TransferEngineImpl {
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
 
-    ThreadLocalStorage<BatchSet> batch_set_;
+    BatchSet batch_set_;
 
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
@@ -263,6 +333,12 @@ class TransferEngineImpl {
     int max_failover_attempts_{3};
     bool enable_auto_failover_on_poll_{true};
     bool enable_progress_worker_{false};
+    RuntimeQueueConfig runtime_queue_config_;
+    std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
+    std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
+    size_t dispatch_inflight_owners_{0};
+    size_t dispatch_inflight_bytes_{0};
+    uint64_t next_batch_token_{1};
 
     // Guards alive_batches_ and serializes pollTaskStatus /
     // updateTaskStatusAfterPoll / lazyFreeBatch against the optional

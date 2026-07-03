@@ -91,6 +91,46 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 >
 > The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
 
+### Tenant Quota
+
+The Master Service can optionally enforce strict multi-tenant memory quota admission. This feature is disabled by default. When `enable_multi_tenants=false`, request tenant IDs are ignored for object placement, all objects use the `default` namespace, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
+
+When strict multi-tenant mode is enabled, the tenant quota policy is loaded from the configured connector. The v1 connector is a writable YAML file configured by `tenant_quota_connector_type=file` and `tenant_quota_connector_uri=<path>`. Tenants must be explicitly present in that connector policy before they can write. Missing tenants, empty tenants, and an unregistered `default` tenant are rejected with `TENANT_NOT_REGISTERED`.
+
+The YAML policy uses schema version `1`:
+
+```yaml
+version: 1
+
+tenants:
+  - name: tenant-a
+    quota: 200GB
+```
+
+Tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters. Quotas must be positive integers and may use `B`, `KB`, `MB`, `GB`, or `TB` units.
+
+Effective quota is recomputed from the current registered memory capacity:
+
+- If explicit tenant requests fit within the registered memory capacity, tenants receive their requested quotas and remaining capacity stays unallocated.
+- If explicit tenant requests exceed registered memory capacity, explicit tenants receive quota scaled proportionally by request size.
+- Remainders are assigned deterministically by tenant ID, so repeated recomputes produce stable results.
+- Tenants present in restored metadata but missing from the connector policy become in-memory orphans with requested quota `0`, effective quota `0`, and `over_quota=true` while they still own metadata. Reads and removals are allowed so operators can clean them up; writes remain blocked until the tenant is re-registered or emptied.
+
+`PutStart` and size-changing `UpsertStart` charge quota before memory is allocated. If the first reservation fails, the master performs tenant-scoped memory eviction for the target tenant and retries the reservation. The retry is bounded to two eviction attempts. Tenant quota eviction scans only the target tenant, skips hard-pinned objects, honors soft-pin eviction configuration, and preserves grouped-object lease safety checks.
+
+Admin policy changes are persisted before the final in-memory policy is applied. `PUT` writes the connector first and then applies the policy in memory. `DELETE` first marks the tenant unregistered in memory to block concurrent writes, verifies the tenant is empty, writes the connector, and rolls back the in-memory mark if the connector write fails. The admin HTTP API exposes:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/tenant_quotas` | List quota snapshots for active or explicit tenants |
+| `GET` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Query one tenant quota snapshot |
+| `PUT` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Create or update a tenant quota policy |
+| `DELETE` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Delete an empty tenant quota policy |
+
+Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `metadata_object_count`, `over_quota`, and `has_explicit_policy`.
+
+Snapshots restore object runtime state only. Tenant quota policy is always loaded from the connector after metadata restore, then usage and effective quota are rebuilt from restored metadata and current registered capacity. If the connector cannot be loaded in strict multi-tenant mode, startup fails.
+
 ### Master Service APIs
 
 The protobuf definition between Master and Client is as follows:
@@ -524,7 +564,7 @@ Mooncake Store provides multiple built-in allocation strategies to control how s
 ./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
 ```
 
-Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive).
+Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`, `cxl`, `local_first` (case-sensitive).
 
 #### How to Choose
 
@@ -532,7 +572,9 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 |---|---|---|
 | `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
 | `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
+| `ssd_free_ratio_first` | SSD-aware memory allocation when SSD offloading is enabled | Depends on SSD usage metrics; falls back to random allocation when needed |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
+| `local_first` | Colocated inference workers and memory store segments | Requires stable host identity in `local_hostname`; single memory replica only |
 
 **Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
 
@@ -540,7 +582,11 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
 
+**Use `ssd_free_ratio_first`** when SSD offloading is enabled and you want memory allocation to prefer segments whose backing SSD still has more free capacity.
+
 **Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
+
+**Use `local_first`** when inference workers and Mooncake Store memory segments are colocated and you want writes to prefer the writer's host before falling back to other hosts. For this strategy to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`.
 
 For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../performance/allocation-strategy-benchmark-result.md).
 
@@ -570,6 +616,16 @@ An improved strategy built on top of `RandomAllocationStrategy`. Instead of pick
 The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6*N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
 
 The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`ssd_free_ratio_first` — SsdFreeRatioFirstAllocationStrategy**
+
+An SSD-aware variant of the free-ratio-first strategy. It first tries preferred segments, then samples candidate segment names and sorts them by SSD free ratio reported by the local disk segment metrics provider. If it cannot satisfy all replicas from the sorted candidates, it falls back to random allocation for the remaining replicas.
+
+**`local_first` — Local-first allocation**
+
+Host-aware local-first allocation reuses the normal preferred-segment flow. The master derives the writer host id from the request's client host identity and builds an ordered preferred segment list: active hosts are visited in cyclic lexicographic host-id order, starting from the writer host when it has active segments, or otherwise from the next greater active host id. Within the same host, segment names are sorted and rotated by key hash so multiple local segments do not always receive the first allocation attempt.
+
+This strategy currently applies to memory allocation with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` in `ReplicateConfig` are still tried first; if they are unavailable or full, allocation continues with the local-first ordered fallback list.
 
 **`cxl` — CxlAllocationStrategy**
 

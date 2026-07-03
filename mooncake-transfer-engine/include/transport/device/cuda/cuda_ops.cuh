@@ -116,7 +116,7 @@ __device__ __forceinline__ void mc_bar_sync(int bar_id, int num_threads) {
 }
 
 // ---------------------------------------------------------------------------
-// Grid-level sync — cooperative_groups::this_grid().sync()
+// Grid-level sync — cooperative_groups::this_grid().sync().
 // On MUSA this is a no-op because the host always uses separate kernel
 // launches (return_recv_hook=true), so SEND and RECV never run in the same
 // kernel invocation.
@@ -124,6 +124,19 @@ __device__ __forceinline__ void mc_bar_sync(int bar_id, int num_threads) {
 __device__ __forceinline__ void mc_grid_sync() {
     cooperative_groups::this_grid().sync();
 }
+
+// ---------------------------------------------------------------------------
+// System-level memory fence: no-op on CUDA (hardware guarantees P2P
+// visibility through NVLink without explicit fences).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence() {}
+
+// ---------------------------------------------------------------------------
+// Fence/barrier/fence: ensures all threads' writes are globally visible
+// before any thread proceeds.  On CUDA, __syncthreads() implies a memory
+// fence, so a single __syncthreads() is sufficient.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence_barrier_fence() { __syncthreads(); }
 
 // ---------------------------------------------------------------------------
 // Byte-swap helpers (for mlx5 big-endian WQE fields)

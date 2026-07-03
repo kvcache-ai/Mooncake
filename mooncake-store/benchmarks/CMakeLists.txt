@@ -8,6 +8,11 @@ add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
 
+# Add BatchGetReplicaList latency benchmark executable
+add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
+target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
+                                                       mooncake_store)
+
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)

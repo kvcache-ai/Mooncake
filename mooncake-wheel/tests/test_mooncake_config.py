@@ -70,6 +70,43 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.enable_ssd_offload, False)
         self.assertEqual(config.ssd_offload_path, "")
 
+    def test_enable_ssd_offload_string_values(self):
+        """from_file must parse string booleans like load_from_env, and reject typos.
+
+        from_file used bool(value), so any non-empty string (including "false")
+        turned SSD offload on, disagreeing with load_from_env which parses the
+        string. _parse_bool now understands the common textual forms and raises
+        on anything unrecognized instead of silently defaulting to False.
+        """
+        required = {
+            "local_hostname": "localhost",
+            "metadata_server": "localhost:8080",
+            "master_server_address": "localhost:8081",
+        }
+        cases = [
+            ("false", False),
+            ("False", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            (True, True),
+            (False, False),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.write_config({**required, "enable_ssd_offload": raw})
+                config = MooncakeConfig.from_file(self.config_file)
+                self.assertEqual(config.enable_ssd_offload, expected)
+
+        # An unrecognized string is a config error, not a silent disable.
+        self.write_config({**required, "enable_ssd_offload": "notabool"})
+        with self.assertRaises(ValueError):
+            MooncakeConfig.from_file(self.config_file)
+
     def test_missing_required_field(self):
         """Test missing required field"""
         for field in ["local_hostname", "metadata_server", "master_server_address"]:

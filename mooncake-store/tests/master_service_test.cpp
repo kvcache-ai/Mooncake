@@ -8,17 +8,59 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <random>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_set>
-#include <utility>
 
+#include <unistd.h>
+
+#include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake::test {
+
+class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(const char* name) : name_(name) {
+        Capture();
+        ::unsetenv(name_.c_str());
+    }
+
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        Capture();
+        ::setenv(name_.c_str(), value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_value_.has_value()) {
+            ::setenv(name_.c_str(), previous_value_->c_str(), 1);
+        } else {
+            ::unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    void Capture() {
+        const char* value = ::getenv(name_.c_str());
+        if (value != nullptr) {
+            previous_value_ = value;
+        }
+    }
+
+    std::string name_;
+    std::optional<std::string> previous_value_;
+};
 
 class MasterServiceTest : public ::testing::Test {
    protected:
@@ -34,16 +76,64 @@ class MasterServiceTest : public ::testing::Test {
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
+    static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
+
+    std::string WriteTenantPolicyFile(
+        const std::map<std::string, uint64_t>& tenant_quotas) {
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas = tenant_quotas;
+        auto path =
+            std::filesystem::temp_directory_path() /
+            ("mooncake_master_service_test_" + std::to_string(::getpid()) +
+             "_" + std::to_string(next_policy_file_++) + ".yaml");
+        std::ofstream out(path);
+        out << FormatTenantQuotaPolicyYaml(snapshot);
+        out.close();
+        policy_files_.push_back(path.string());
+        return path.string();
+    }
+
+    MasterServiceConfig MakeStrictTenantConfig(
+        const std::vector<std::string>& tenants) {
+        std::map<std::string, uint64_t> tenant_quotas;
+        for (const auto& tenant : tenants) {
+            tenant_quotas.emplace(tenant, kStrictTenantQuotaBytes);
+        }
+        return MasterServiceConfig::builder()
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile(tenant_quotas))
+            .build();
+    }
+
+    WrappedMasterServiceConfig MakeStrictWrappedConfig(
+        const std::vector<std::string>& tenants) {
+        WrappedMasterServiceConfig config;
+        config.default_kv_lease_ttl = 100;
+        config.enable_metric_reporting = false;
+        config.enable_multi_tenants = true;
+        config.tenant_quota_connector_type = "file";
+        std::map<std::string, uint64_t> tenant_quotas;
+        for (const auto& tenant : tenants) {
+            tenant_quotas.emplace(tenant, kStrictTenantQuotaBytes);
+        }
+        config.tenant_quota_connector_uri =
+            WriteTenantPolicyFile(tenant_quotas);
+        return config;
+    }
 
     Segment MakeSegment(std::string name = "test_segment",
                         size_t base = kDefaultSegmentBase,
-                        size_t size = kDefaultSegmentSize) const {
+                        size_t size = kDefaultSegmentSize,
+                        std::string host_id = "") const {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
         segment.base = base;
         segment.size = size;
         segment.te_endpoint = segment.name;
+        segment.host_id = std::move(host_id);
         return segment;
     }
 
@@ -65,9 +155,10 @@ class MasterServiceTest : public ::testing::Test {
 
     MountedSegmentContext PrepareSimpleSegment(
         MasterService& service, std::string name = "test_segment",
-        size_t base = kDefaultSegmentBase,
-        size_t size = kDefaultSegmentSize) const {
-        Segment segment = MakeSegment(std::move(name), base, size);
+        size_t base = kDefaultSegmentBase, size_t size = kDefaultSegmentSize,
+        std::string host_id = "") const {
+        Segment segment =
+            MakeSegment(std::move(name), base, size, std::move(host_id));
         UUID client_id = generate_uuid();
         auto mount_result = service.MountSegment(segment, client_id);
         EXPECT_TRUE(mount_result.has_value());
@@ -217,8 +308,16 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     std::vector<Replica::Descriptor> replica_list;
+    std::vector<std::string> policy_files_;
+    size_t next_policy_file_ = 0;
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {
+        for (const auto& path : policy_files_) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+        google::ShutdownGoogleLogging();
+    }
 };
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
@@ -670,13 +769,14 @@ TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
 }
 
 TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
     const std::string key = "tenant_grouped_shared_user_key";
     const std::string tenant_a = "tenant_group_route_a";
     const std::string tenant_b = "tenant_group_route_b";
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant_a, tenant_b}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
     const std::string group_a = FindGroupIdOnDifferentShard(key);
     std::string group_b;
     for (int i = 0; i < 10000; ++i) {
@@ -713,11 +813,100 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
 }
 
-TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
+TEST_F(MasterServiceTest, BatchGetReplicaListPreservesOrderWithGroupedKeys) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
+
+    const std::string grouped_key_a = "batch_get_grouped_a";
+    const std::string missing_key = "batch_get_missing";
+    const std::string ungrouped_key = "batch_get_ungrouped";
+    const std::string grouped_key_b = "batch_get_grouped_b";
+    const std::string pending_key = "batch_get_pending";
+
+    ReplicateConfig grouped_config_a;
+    grouped_config_a.replica_num = 1;
+    grouped_config_a.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(grouped_key_a)};
+    PutCompletedObject(*service_, client_id, grouped_key_a, grouped_config_a);
+
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, ungrouped_key, ungrouped_config);
+
+    ReplicateConfig grouped_config_b;
+    grouped_config_b.replica_num = 1;
+    grouped_config_b.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(grouped_key_b)};
+    PutCompletedObject(*service_, client_id, grouped_key_b, grouped_config_b);
+
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, pending_key, "default", 1024,
+                               ungrouped_config)
+                    .has_value());
+
+    const std::vector<std::string> keys = {
+        grouped_key_a, missing_key, ungrouped_key, grouped_key_b, pending_key};
+    auto results = service_->BatchGetReplicaList(keys, "default");
+
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_FALSE(results[0]->replicas.empty());
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, results[1].error());
+    ASSERT_TRUE(results[2].has_value());
+    EXPECT_FALSE(results[2]->replicas.empty());
+    ASSERT_TRUE(results[3].has_value());
+    EXPECT_FALSE(results[3]->replicas.empty());
+    ASSERT_FALSE(results[4].has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, results[4].error());
+}
+
+TEST_F(MasterServiceTest, BatchGetReplicaListKeepsTenantIsolation) {
+    const std::string key = "batch_get_tenant_shared_key";
+    const std::string tenant_a = "batch_get_tenant_a";
+    const std::string tenant_b = "batch_get_tenant_b";
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_a, tenant_b}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config_a;
+    config_a.replica_num = 1;
+    config_a.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_a, 1024, config_a)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+
+    ReplicateConfig config_b;
+    config_b.replica_num = 1;
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_b, 2048, config_b)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto tenant_a_results = service_->BatchGetReplicaList({key}, tenant_a);
+    auto tenant_b_results = service_->BatchGetReplicaList({key}, tenant_b);
+    auto default_results = service_->BatchGetReplicaList({key}, "default");
+
+    ASSERT_EQ(tenant_a_results.size(), 1u);
+    ASSERT_EQ(tenant_b_results.size(), 1u);
+    ASSERT_EQ(default_results.size(), 1u);
+    EXPECT_TRUE(tenant_a_results[0].has_value());
+    EXPECT_TRUE(tenant_b_results[0].has_value());
+    ASSERT_FALSE(default_results[0].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, default_results[0].error());
+}
+
+TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
     const std::string tenant_a = "tenant_get_all_keys_a";
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_a}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
     const std::string shared_key = "shared_listing_key";
     const std::string default_only_key = "default_listing_key";
     const std::string tenant_only_key = "tenant_listing_key";
@@ -1451,13 +1640,14 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
 }
 
 TEST_F(MasterServiceTest, TenantPutGetRemoveIsolatesSameUserKey) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
     const std::string key = "shared_user_key";
     const std::string tenant_a = "tenant_a";
     const std::string tenant_b = "tenant_b";
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_a, tenant_b}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -1485,13 +1675,14 @@ TEST_F(MasterServiceTest, TenantPutGetRemoveIsolatesSameUserKey) {
 }
 
 TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
     const std::string key = "regex_shared_key";
     const std::string tenant_a = "tenant_regex_a";
     const std::string tenant_b = "tenant_regex_b";
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_a, tenant_b}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -1530,15 +1721,15 @@ TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
 }
 
 TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
-    auto svc = std::make_unique<MasterService>();
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
-    const UUID client_id = generate_uuid();
-
     const std::vector<std::string> keys = {"tenant_batch_upsert_key_a",
                                            "tenant_batch_upsert_key_b"};
     const std::vector<uint64_t> sizes = {1024, 2048};
     const std::string tenant_a = "tenant_batch_upsert_a";
     const std::string tenant_b = "tenant_batch_upsert_b";
+    auto svc = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_a, tenant_b}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -1584,13 +1775,13 @@ TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
 }
 
 TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
-    auto svc = std::make_unique<MasterService>();
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
-    const UUID client_id = generate_uuid();
-
     const std::string shared_key = "tenant_batch_remove_shared_key";
     const std::string tenant_a = "tenant_batch_remove_a";
     const std::string tenant_b = "tenant_batch_remove_b";
+    auto svc = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_a, tenant_b}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -1627,13 +1818,13 @@ TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
 }
 
 TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
-    auto svc = std::make_unique<MasterService>();
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
-    const UUID client_id = generate_uuid();
-
     const std::string key = "legacy_remove_all_shared_key";
     const std::string tenant_a = "legacy_remove_all_a";
     const std::string tenant_b = "legacy_remove_all_b";
+    auto svc = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_a, tenant_b}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -1740,6 +1931,197 @@ TEST_F(MasterServiceTest, PutWithPreferredSegments) {
     auto put_end_result =
         service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
+}
+
+TEST_F(MasterServiceTest,
+       ResolveMooncakeHostIdUsesLocalHostnameAndRejectsLoopback) {
+    {
+        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+        EXPECT_EQ(ResolveMooncakeHostId("hostB:5001"), "hostB");
+        EXPECT_EQ(ResolveMooncakeHostId("[2001:db8::1]:5000"), "2001:db8::1");
+        EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("127.0.0.1:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("::1").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("[::1]:5000").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("::").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("[::]").empty());
+        EXPECT_TRUE(ResolveMooncakeHostId("[::]:5000").empty());
+    }
+}
+
+TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
+    MasterConfig config{};
+    config.allocation_strategy = "local_first";
+
+    WrappedMasterServiceConfig wrapped_config(config, 0);
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(service_config.allocation_strategy_type,
+              AllocationStrategyType::LOCAL_FIRST);
+}
+
+TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "local_first_key",
+                                      "default", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+}
+
+TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host2 = PrepareSimpleSegment(
+        service, "segment_host2", 0x400000000, kDefaultSegmentSize, "host2");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "ordered_fallback_key",
+                                      "default", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host2");
+}
+
+TEST_F(MasterServiceTest, LocalFirstPutFallsBackWhenLocalSegmentIsFull) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto local = PrepareSimpleSegment(
+        service, "segment_host1", 0x300000000, 1024, "host1");
+    [[maybe_unused]] const auto remote = PrepareSimpleSegment(
+        service, "segment_host2", 0x400000000, kDefaultSegmentSize, "host2");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+
+    auto fill_start = service.PutStart(writer_client_id, "fill_local_segment",
+                                       "default", 1024, config);
+    ASSERT_TRUE(fill_start.has_value());
+    ASSERT_EQ(fill_start->size(), 1u);
+    EXPECT_EQ((*fill_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+    ASSERT_TRUE(service
+                    .PutEnd(writer_client_id, "fill_local_segment", "default",
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    auto fallback_start = service.PutStart(
+        writer_client_id, "fallback_after_local_full", "default", 1, config);
+    ASSERT_TRUE(fallback_start.has_value());
+    ASSERT_EQ(fallback_start->size(), 1u);
+    EXPECT_EQ((*fallback_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host2");
+}
+
+TEST_F(MasterServiceTest, ExplicitPreferredSegmentOverridesLocalFirst) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+    config.preferred_segment = "segment_host0";
+
+    auto put_start = service.PutStart(
+        writer_client_id, "explicit_preferred_key", "default", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host0");
+}
+
+TEST_F(MasterServiceTest, ExplicitPreferredSegmentFallsBackToLocalFirst) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build();
+    MasterService service(service_config);
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto preferred = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, 1024, "host0");
+    [[maybe_unused]] const auto local = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.host_id = "host1";
+    config.preferred_segment = "segment_host0";
+
+    auto fill_start = service.PutStart(writer_client_id, "fill_preferred",
+                                       "default", 1024, config);
+    ASSERT_TRUE(fill_start.has_value());
+    ASSERT_EQ(fill_start->size(), 1u);
+    EXPECT_EQ((*fill_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host0");
+    ASSERT_TRUE(service
+                    .PutEnd(writer_client_id, "fill_preferred", "default",
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    auto fallback_start =
+        service.PutStart(writer_client_id, "fallback_after_preferred_full",
+                         "default", 1, config);
+    ASSERT_TRUE(fallback_start.has_value());
+    ASSERT_EQ(fallback_start->size(), 1u);
+    EXPECT_EQ((*fallback_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
 }
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
@@ -4350,7 +4732,9 @@ TEST_F(MasterServiceTest, BatchExistKeyGroupedAndIncompletePreservesOrder) {
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTenantAwarePreservesOrder) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    const std::string tenant_id = "tenant_batch_exist";
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({"default", tenant_id}));
     const UUID client_id = generate_uuid();
 
     constexpr size_t buffer = 0x300000000;
@@ -4360,7 +4744,7 @@ TEST_F(MasterServiceTest, BatchExistKeyTenantAwarePreservesOrder) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    const std::string tenant_id = "tenant_batch_exist";
+
     const std::string tenant_only_key = "batch_tenant_only";
     const std::string default_only_key = "batch_default_only";
     const std::string incomplete_key = "batch_tenant_incomplete";
@@ -4392,9 +4776,8 @@ TEST_F(MasterServiceTest, BatchExistKeyTenantAwarePreservesOrder) {
 }
 
 TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
-    WrappedMasterServiceConfig service_config;
-    service_config.default_kv_lease_ttl = 100;
-    service_config.enable_metric_reporting = false;
+    const std::string tenant_id = "wrapped_batch_exist_tenant";
+    auto service_config = MakeStrictWrappedConfig({"default", tenant_id});
     WrappedMasterService service_(service_config);
 
     Segment segment = MakeSegment("wrapped_batch_exist_segment");
@@ -4403,7 +4786,6 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    const std::string tenant_id = "wrapped_batch_exist_tenant";
     const std::string tenant_key_a = "wrapped_batch_tenant_a";
     const std::string tenant_key_b = "wrapped_batch_tenant_b";
     const std::string default_only_key = "wrapped_batch_default_only";
@@ -5570,7 +5952,9 @@ TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
 }
 
 TEST_F(MasterServiceTest, TenantTasksCarryTenantInPayload) {
-    auto service = std::make_unique<MasterService>();
+    const std::string tenant_id = "tenant_for_async_task";
+    auto service =
+        std::make_unique<MasterService>(MakeStrictTenantConfig({tenant_id}));
     const auto ctx0 = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
     [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
@@ -5578,7 +5962,6 @@ TEST_F(MasterServiceTest, TenantTasksCarryTenantInPayload) {
 
     const UUID put_client_id = generate_uuid();
     const std::string key = "tenant_task_key";
-    const std::string tenant_id = "tenant_for_async_task";
 
     ReplicateConfig config;
     config.replica_num = 1;

@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # vLLM V0 Disaggregated Serving Demo
 
 ```{admonition} Archived

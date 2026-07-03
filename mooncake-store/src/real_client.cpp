@@ -1,6 +1,3 @@
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -29,8 +26,9 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #include "default_config.h"
+#include "uds_transport.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #ifdef USE_NOF
@@ -49,6 +47,8 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -268,18 +268,11 @@ void fill_ranged_read_results_with_error(
 // tl::expected<int64_t, ErrorCode>.
 inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     void *dst, const void *src, size_t size, const std::string &context) {
-    int device_id = -1;
-    if (gpu_staging::IsDevicePointer(dst, &device_id)) {
-        gpu_staging::SetDevice(device_id);
-        if (!gpu_staging::CopyHostToDevice(dst, src, size)) {
-            LOG(ERROR) << "H2D copy failed: " << context;
-            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
-        }
-    } else if (gpu_staging::IsHostPointer(dst)) {
-        memcpy(dst, src, size);
-    } else {
-        LOG(ERROR) << "Unknown memory type for dst buffer: " << context;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyFromHost(dst, src, size)) {
+        LOG(ERROR) << "H2D copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
     return {};
 }
@@ -657,8 +650,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #endif
 
     std::optional<std::string> device_name =
-        (rdma_devices.empty() ? std::nullopt
-                              : std::make_optional(rdma_devices));
+        ((rdma_devices.empty() || rdma_devices == "auto-discovery")
+             ? std::nullopt
+             : std::make_optional(rdma_devices));
 
     // Validate required parameters
     if (local_hostname.empty()) {
@@ -860,6 +854,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
+            } else if (this->protocol == "sunrise_link") {
+#if defined(USE_SUNRISE)
+                sunrise_segment_ptrs_.emplace_back(ptr,
+                                                   SunriseSegmentDeleter{});
+#else
+                LOG(ERROR)
+                    << "sunrise_link protocol requires USE_SUNRISE build";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
@@ -1049,13 +1052,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate protocol is supported
-    if (protocol != "tcp" && protocol != "rdma") {
-        LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << protocol
-                   << ", must be 'tcp' or 'rdma'";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
 
@@ -1130,6 +1126,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+#if defined(USE_SUNRISE)
+    sunrise_segment_ptrs_.clear();
+#endif
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -1704,7 +1703,11 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    auto scatter_result = scatter_host_to_maybe_device(
+        buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
+    if (!scatter_result) {
+        return tl::unexpected(scatter_result.error());
+    }
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
 
@@ -1782,7 +1785,12 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            buffer_handle.ptr(), value.data(), value.size_bytes(),
+            "put_batch:" + key);
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         auto slices = split_into_slices(buffer_handle);
         buffer_handles.emplace_back(std::move(*alloc_result));
         batched_slices.emplace(key, std::move(slices));
@@ -1886,8 +1894,12 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     // Copy all parts into the contiguous buffer
     size_t offset = 0;
     for (const auto &value : values) {
-        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
-               value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
+            value.size_bytes(), "put_multi_value");
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         offset += value.size_bytes();
     }
 
@@ -2615,8 +2627,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // MEMORY / DISK: use client_->Get.  FilterQueryResult ensures
     // Client::Get's internal FindFirstCompleteReplica can only see
     // the replica we selected, preventing accidental LOCAL_DISK picks.
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
     if (replica.is_disk_replica() &&
-        gpu_staging::IsDevicePointer(buffer_handle->ptr(), nullptr)) {
+        runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
         LOG(WARNING) << "DISK replica for key '" << key
                      << "' received a device pointer from the allocator; "
                      << "file I/O cannot write to GPU memory — read will fail. "
@@ -2921,8 +2935,10 @@ RealClient::batch_get_buffer_internal(
         // DISK replicas use storage_backend::vector_read (file I/O) which
         // can only write to CPU-addressable memory.  If the allocator ever
         // returns device memory for DISK, the read will silently fail.
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
         if (replica.is_disk_replica() &&
-            gpu_staging::IsDevicePointer(buffer_handle->ptr(), nullptr)) {
+            runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << "DISK replica for key '" << key
                 << "' received a device pointer from the allocator; "
@@ -3736,7 +3752,11 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    auto scatter_result = scatter_host_to_maybe_device(
+        buffer_handle.ptr(), value.data(), value.size_bytes(), "upsert:" + key);
+    if (!scatter_result) {
+        return tl::unexpected(scatter_result.error());
+    }
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
 
@@ -3982,8 +4002,12 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     auto &buffer_handle = *alloc_result;
     size_t offset = 0;
     for (const auto &value : values) {
-        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
-               value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
+            value.size_bytes(), "upsert_parts:" + key);
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         offset += value.size_bytes();
     }
 
@@ -4066,7 +4090,12 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        auto scatter_result = scatter_host_to_maybe_device(
+            buffer_handle.ptr(), value.data(), value.size_bytes(),
+            "upsert_batch:" + key);
+        if (!scatter_result) {
+            return tl::unexpected(scatter_result.error());
+        }
         auto slices = split_into_slices(buffer_handle);
         buffer_handles.emplace_back(std::move(*alloc_result));
         batched_slices.emplace(key, std::move(slices));
@@ -4164,15 +4193,6 @@ RealClient::batch_get_into_dummy_helper(
     const std::vector<uint64_t> &dummy_buffers,
     const std::vector<size_t> &sizes, int32_t device_id,
     const UUID &client_id) {
-#ifdef USE_ASCEND_DIRECT
-    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
-            device_id)) {
-        LOG(ERROR) << "Failed to set context for physical device " << device_id;
-        co_return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-#endif
-
     // Hold shared_lock for the entire operation to prevent SHM from being
     // unmapped while batch_get_into_internal is using the translated buffers.
     auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(
@@ -4205,15 +4225,25 @@ RealClient::batch_get_into_dummy_helper(
         std::vector<size_t> sizes;
         std::vector<void *> buffers;
         std::shared_ptr<std::shared_lock<std::shared_mutex>> lock;
+        int32_t device_id;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
     state->buffers = std::move(buffers_result.value());
     state->lock = std::move(lock);
+    state->device_id = device_id;
 
     auto *s = state.get();
     auto try_result = co_await coro_io::post([this, s]() {
+#ifdef USE_ASCEND_DIRECT
+        auto context_result =
+            set_context_if_needed(protocol, s->device_id, "batch_get worker");
+        if (!context_result) {
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                s->keys.size(), tl::unexpected(context_result.error()));
+        }
+#endif
         return batch_get_into_internal(s->keys, s->buffers, s->sizes);
     });
     co_return try_result.value();
@@ -5286,107 +5316,48 @@ void RealClient::stop_dummy_client_monitor() {
     }
 }
 int RealClient::start_ipc_server() {
-    ipc_running_ = true;
-    ipc_thread_ = std::jthread(&RealClient::ipc_server_func, this);
+    uds_acceptor_ = std::make_unique<UdsAcceptor>(ipc_socket_path_);
+    uds_acceptor_->registerHandler([this](UdsConnection &connection) {
+        auto timeout_result = connection.setRecvTimeout(kIpcRequestRecvTimeout);
+        if (!timeout_result) {
+            LOG(ERROR) << timeout_result.error();
+            return;
+        }
+
+        IpcRequestType req_type;
+        if (connection.recvRaw(&req_type, sizeof(req_type)) != 0) {
+            LOG(ERROR) << "Failed to read IPC request type";
+            return;
+        }
+
+        if (req_type == IPC_SHM_REGISTER) {
+            handle_ipc_shm_register(connection);
+        } else if (req_type == IPC_SHM_FD_REQUEST) {
+            handle_ipc_shm_fd_request(connection);
+        } else {
+            LOG(ERROR) << "Unknown IPC request type: " << req_type;
+        }
+    });
+    auto start_result = uds_acceptor_->start();
+    if (!start_result) {
+        LOG(ERROR) << start_result.error();
+        uds_acceptor_.reset();
+        return -1;
+    }
     return 0;
 }
 
 int RealClient::stop_ipc_server() {
-    ipc_running_ = false;
-    // Connect to self to unblock accept if blocked, or unlink
-    if (!ipc_socket_path_.empty()) {
-        // Create a dummy socket and connect
-        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sock >= 0) {
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            strncpy(&addr.sun_path[1], ipc_socket_path_.c_str(),
-                    sizeof(addr.sun_path) - 2);
-            connect(sock, (struct sockaddr *)&addr,
-                    sizeof(sa_family_t) + strlen(&addr.sun_path[1]) + 1);
-            close(sock);
-        }
+    if (uds_acceptor_) {
+        uds_acceptor_->stop();
+        uds_acceptor_.reset();
     }
-    // jthread will join on destruction or we can explicitly join if needed
-    // But recvmsg/accept might block. The logic above attempts to unblock.
     return 0;
 }
 
-void RealClient::ipc_server_func() {
-    int server_sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        LOG(ERROR) << "Failed to create IPC socket";
-        return;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    // Using abstract namespace, so we don't need to unlink
-    strncpy(&addr.sun_path[1], ipc_socket_path_.c_str(),
-            sizeof(addr.sun_path) - 2);
-
-    if (bind(server_sock, (struct sockaddr *)&addr,
-             sizeof(sa_family_t) + strlen(&addr.sun_path[1]) + 1) < 0) {
-        LOG(ERROR) << "Failed to bind IPC socket: " << strerror(errno);
-        close(server_sock);
-        return;
-    }
-
-    if (listen(server_sock, 5) < 0) {
-        LOG(ERROR) << "Failed to listen on IPC socket: " << strerror(errno);
-        close(server_sock);
-        return;
-    }
-
-    LOG(INFO) << "IPC server is listening";
-
-    while (ipc_running_) {
-        int client_sock = accept(server_sock, nullptr, nullptr);
-        if (client_sock < 0) {
-            if (ipc_running_) {
-                LOG(ERROR) << "Accept failed: " << strerror(errno);
-            }
-            continue;
-        }
-
-        if (!ipc_running_) {
-            close(client_sock);
-            break;
-        }
-
-        // Set recv timeout to prevent slow/malicious clients from blocking
-        struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
-        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        // Read request type discriminator
-        IpcRequestType req_type;
-        if (recv(client_sock, &req_type, sizeof(req_type), MSG_WAITALL) !=
-            sizeof(req_type)) {
-            LOG(ERROR) << "Failed to read IPC request type";
-            close(client_sock);
-            continue;
-        }
-
-        if (req_type == IPC_SHM_REGISTER) {
-            handle_ipc_shm_register(client_sock);
-        } else if (req_type == IPC_SHM_FD_REQUEST) {
-            handle_ipc_shm_fd_request(client_sock);
-        } else {
-            LOG(ERROR) << "Unknown IPC request type: " << req_type;
-        }
-
-        close(client_sock);
-    }
-
-    close(server_sock);
-    LOG(INFO) << "IPC server stopped";
-}
-
-void RealClient::handle_ipc_shm_register(int client_sock) {
+void RealClient::handle_ipc_shm_register(UdsConnection &connection) {
     ShmRegisterRequest req;
-    int fd = ipc_recv_fd(client_sock, &req, sizeof(req));
+    int fd = connection.recvFd(&req, sizeof(req));
     if (fd < 0) {
         LOG(ERROR) << "Failed to receive fd for SHM_REGISTER";
         return;
@@ -5398,12 +5369,12 @@ void RealClient::handle_ipc_shm_register(int client_sock) {
         req.device_id, client_id);
 
     int status = result.has_value() ? 0 : -1;
-    ::send(client_sock, &status, sizeof(status), 0);
+    connection.sendRaw(&status, sizeof(status));
 }
 
-void RealClient::handle_ipc_shm_fd_request(int client_sock) {
+void RealClient::handle_ipc_shm_fd_request(UdsConnection &connection) {
     ShmFdRequest req;
-    if (recv(client_sock, &req, sizeof(req), MSG_WAITALL) != sizeof(req)) {
+    if (connection.recvRaw(&req, sizeof(req)) != 0) {
         LOG(ERROR) << "Failed to read ShmFdRequest payload";
         return;
     }
@@ -5419,7 +5390,7 @@ void RealClient::handle_ipc_shm_fd_request(int client_sock) {
         if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
             LOG(ERROR) << "Unregistered client_id in fd request: "
                        << client_id.first << ":" << client_id.second;
-            ::send(client_sock, &resp, sizeof(resp), 0);
+            connection.sendRaw(&resp, sizeof(resp));
             return;
         }
     }
@@ -5427,13 +5398,13 @@ void RealClient::handle_ipc_shm_fd_request(int client_sock) {
     // Currently only SHM_SEG_HOT_CACHE is supported
     if (req.segment_type != SHM_SEG_HOT_CACHE) {
         LOG(ERROR) << "Unknown segment_type: " << req.segment_type;
-        ::send(client_sock, &resp, sizeof(resp), 0);
+        connection.sendRaw(&resp, sizeof(resp));
         return;
     }
 
     if (!client_ || !client_->IsHotCacheEnabled()) {
         LOG(ERROR) << "Hot cache not available for fd request";
-        ::send(client_sock, &resp, sizeof(resp), 0);
+        connection.sendRaw(&resp, sizeof(resp));
         return;
     }
 
@@ -5441,14 +5412,14 @@ void RealClient::handle_ipc_shm_fd_request(int client_sock) {
     auto seg = hot_cache->GetShmSegment();
     if (!seg || seg->fd < 0) {
         LOG(ERROR) << "Hot cache shm segment not available";
-        ::send(client_sock, &resp, sizeof(resp), 0);
+        connection.sendRaw(&resp, sizeof(resp));
         return;
     }
 
     resp.status = 0;
     resp.shm_size = seg->size;
 
-    if (ipc_send_fd(client_sock, seg->fd, &resp, sizeof(resp)) < 0) {
+    if (connection.sendFd(seg->fd, &resp, sizeof(resp)) < 0) {
         LOG(ERROR) << "Failed to send hot cache fd to dummy client";
     }
 }
