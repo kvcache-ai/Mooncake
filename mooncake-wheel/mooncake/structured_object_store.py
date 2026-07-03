@@ -1434,6 +1434,30 @@ class MooncakeBundleTransfer:
         """Remove a legacy rollout dict stored by put_legacy_dict()."""
         self.cleanup_dataproto(ref)
 
+    @staticmethod
+    def release_result(result: Any) -> None:
+        """Release pool-backed buffers in a GET result.
+
+        After get_dataproto / get_legacy_dict, ndarray payloads may be backed by
+        the BufferPool.  Call this to release those leases deterministically
+        instead of waiting for GC ``__del__``.
+        """
+        if not isinstance(result, Mapping):
+            return
+        for value in result.values():
+            owner = getattr(value, "_mooncake_pool_owner", None)
+            if owner is not None:
+                owner.release()
+                continue
+            if (
+                isinstance(value, np.ndarray)
+                and value.dtype == object
+            ):
+                for item in value.flat:
+                    item_owner = getattr(item, "_mooncake_pool_owner", None)
+                    if item_owner is not None:
+                        item_owner.release()
+
     def _append_dataproto_stage_manifest(
         self,
         old_stage_ref: RemoteBundleRef,
