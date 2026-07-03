@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - depends on built extension
 import msgpack as _msgpack
 
 DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
-AUTO_PARALLEL_MIN_BYTES = 4 * 1024**3
+AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
 AUTO_PARALLEL_MIN_CHUNKS = 8
 MISSING_OBJECT_ERROR = (
     -704
