@@ -2,24 +2,6 @@
 
 This document describes how to build Mooncake.
 
-## PyPI Package
-Install the Mooncake Transfer Engine package from PyPI, which includes both Mooncake Transfer Engine and Mooncake Store Python bindings:
-
-**For CUDA-enabled systems:**
-```bash
-pip install mooncake-transfer-engine
-```
-📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
-
-**For non-CUDA systems:**
-```bash
-pip install mooncake-transfer-engine-non-cuda
-```
-📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
-
-> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies, but it still requires the system runtime libraries used by the transfer stack. On Ubuntu, install them with `sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2`.
-> **Note**: MLU support is currently source-build only. If you need Cambricon MLU memory support, install Neuware and build with `-DUSE_MLU=ON`.
-
 ## Build From Source
 
 ### Recommended Version
@@ -200,7 +182,7 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
-| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.9.1"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. |
+| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.12.1"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
 
 ### Build Behavior Options
 

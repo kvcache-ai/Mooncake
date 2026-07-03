@@ -43,6 +43,9 @@ DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
 #endif
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
@@ -116,6 +119,13 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_allocate_memory(total_size, protocol);
+    }
+#endif
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_allocate_memory(
+            total_size, alignment,
+            mooncake::globalConfig().sunrise_use_device_mem);
     }
 #endif
 #if defined(USE_UB)
@@ -377,6 +387,11 @@ void free_memory(const std::string &protocol, void *ptr) {
         return ascend_free_memory(protocol, ptr);
     }
 #endif
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_free_memory(ptr);
+    }
+#endif
 #if defined(USE_UB)
     if (protocol == "ub") {
         mooncake::ub_free_memory(ptr);
@@ -549,6 +564,35 @@ int64_t time_gen() {
 std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     const char *env_val = std::getenv(name);
     return env_val ? std::string(env_val) : default_value;
+}
+
+std::string ResolveMooncakeHostId(const std::string &local_hostname) {
+    auto trim = [](std::string value) {
+        const auto begin = value.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) {
+            return std::string();
+        }
+        const auto end = value.find_last_not_of(" \t\r\n");
+        return value.substr(begin, end - begin + 1);
+    };
+
+    const std::string hostname = trim(local_hostname);
+    const std::string host_id = (hostname == "::1" || hostname == "::")
+                                    ? hostname
+                                    : trim(getHostNameWithoutPort(hostname));
+    if (host_id.empty()) {
+        return "";
+    }
+
+    std::string lower = host_id;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
+        lower == "::1" || lower == "[::1]" || lower == "::" ||
+        lower == "[::]") {
+        return "";
+    }
+    return host_id;
 }
 
 static std::string SanitizeKey(const std::string &key) {

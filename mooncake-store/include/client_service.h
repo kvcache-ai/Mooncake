@@ -791,6 +791,7 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
+    ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
     // Client identification
     const UUID client_id_;
@@ -832,6 +833,7 @@ class Client {
 
     // Configuration
     const std::string local_hostname_;
+    const std::string host_id_;
     const std::string metadata_connstring_;
     const std::string protocol_;
 
