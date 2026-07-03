@@ -71,7 +71,7 @@ set(MOONCAKE_STORE_SOURCES
     memory_alloc.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp
-    storage/gds/gds_context.cpp)
+)
 
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -246,6 +246,12 @@ endif()
 
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
+set(GDS_CORE_SOURCES
+    gds/gds_context.cpp
+    gds/fallback_gds_device.cpp
+    gds/gds_device_factory.cpp
+)
+list(APPEND MOONCAKE_STORE_SOURCES ${GDS_CORE_SOURCES})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)
@@ -364,8 +370,10 @@ endif()
 
 # GDS (GPU Direct Storage) — multi-vendor support
 # USE_GDS_BACKEND: guards gds_context.cpp (existing, retained)
-# USE_GDS_NVIDIA:  guards gds_device_ops.h vendor dispatch (new)
+# USE_GDS_NVIDIA:  enables nvidia_gds_device.cpp
 option(USE_GDS_BACKEND "Build with GPUDirect Storage (vendor SDK required)" OFF)
+
+# GDS core sources — always compiled
 
 if(USE_GDS_BACKEND)
     find_package(CUDAToolkit REQUIRED)
@@ -389,6 +397,7 @@ if(USE_GDS_BACKEND)
         target_link_libraries(mooncake_store PRIVATE cufile_gds)
         target_link_libraries(mooncake_client PRIVATE cufile_gds)
         target_link_libraries(mooncake_master PRIVATE cufile_gds)
+        target_sources(mooncake_store PRIVATE gds/nvidia_gds_device.cpp)
     else()
         message(FATAL_ERROR
             "USE_GDS_BACKEND=ON but cuFile not found. "

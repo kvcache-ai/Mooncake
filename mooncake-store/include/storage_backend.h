@@ -804,13 +804,15 @@ class BucketStorageBackend : public StorageBackendInterface {
     /**
      * @brief Checks whether the backend is allowed to continue offloading.
      * @return tl::expected<bool, ErrorCode>
-     * - On success: true 表示可以继续 offload；false 表示达到上限/不允许继续。
-     * - On failure: 返回错误码（例如 IO/内部错误）。
+     * - On success: true if offloading can proceed; false if the limit is
+     * reached or disallowed.
+     * - On failure: returns the error code (e.g. IO or internal error).
      */
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
     /**
-     * @brief 根据后端 bucket 限制（keys/size）将 offloading_objects 分桶。
+     * @brief Split offloading_objects into buckets according to backend bucket
+     * limits (keys/size).
      * @param offloading_objects Input map of object keys and their sizes
      * (bytes).
      * @param buckets_keys Output: bucketized keys; each inner vector is a
@@ -1030,7 +1032,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // ── GDS support ──
     ~OffsetAllocatorStorageBackend();  // defined in .cpp
-                                       // (unique_ptr<GdsContext> 需要完整类型)
+                                       // (unique_ptr<GdsContext> requires
+                                       // complete type)
     bool SupportsGds() const override { return true; }
     bool IsGdsEnabled() const override;  // gds_ctx_ && gds_ctx_->enabled_
 
@@ -1246,7 +1249,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // ── GDS ──
     std::unique_ptr<GdsContext> gds_ctx_;  // nullptr = GDS not enabled
     // Always 8 bytes in class layout; size independent of USE_GDS_BACKEND
-    // 完整类型仅在 .cpp 中引入
+    // Complete type only introduced in .cpp
 
     std::function<bool(const std::string& key)> test_failure_predicate_;
 };

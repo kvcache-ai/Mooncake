@@ -26,7 +26,6 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
-#include "gpu_staging_utils.h"
 #include "gds/gds_device_ops.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
@@ -5351,8 +5350,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                      j < op.buffers.size() && copied < op.total_size; ++j) {
                     size_t chunk =
                         std::min(op.sizes[j], op.total_size - copied);
-                    gds_device_ops::CopyDeviceToDevice(op.buffers[j],
-                                                       src + copied, chunk);
+                    GetGdsDeviceOpsSingleton()->CopyDeviceToDevice(
+                        op.buffers[j], src + copied, chunk);
                     copied += chunk;
                 }
                 gds_read_keys.insert(key);

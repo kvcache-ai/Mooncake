@@ -440,10 +440,11 @@ enum class ErrorCode : int32_t {
     // GDS errors (Range: -1210 to -1219)
     GDS_HANDLE_REGISTER_FAIL = -1211,  // cuFileHandleRegister failed
     GDS_IO_FAIL = -1213,               // cuFileRead/cuFileWrite failed
-    GDS_NOT_AVAILABLE = -1214,         // GDS probe failed / not compiled / hardware missing
-    TENANT_QUOTA_EXCEEDED = -1700,     ///< Tenant memory quota exceeded.
-    TENANT_NOT_REGISTERED = -1701,     ///< Tenant has no quota policy.
-    TENANT_NOT_EMPTY = -1702,          ///< Tenant still owns objects or quota.
+    GDS_NOT_AVAILABLE =
+        -1214,  // GDS probe failed / not compiled / hardware missing
+    TENANT_QUOTA_EXCEEDED = -1700,  ///< Tenant memory quota exceeded.
+    TENANT_NOT_REGISTERED = -1701,  ///< Tenant has no quota policy.
+    TENANT_NOT_EMPTY = -1702,       ///< Tenant still owns objects or quota.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

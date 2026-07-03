@@ -18,13 +18,14 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <glog/logging.h>
 
 #ifdef USE_GDS_BACKEND
 #include "gds/gds_device_ops.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #endif
 
 namespace mooncake {
@@ -35,7 +36,10 @@ namespace mooncake {
 tl::expected<void, ErrorCode> GdsContext::Init(
     const std::string& data_file_path, uint64_t capacity) {
 #ifdef USE_GDS_BACKEND
-    // 0. Create parent directory
+    // 0. Lazy-init ops_
+    if (!ops_) ops_ = CreateGdsDeviceOps();
+
+    // 1. Create parent directory
     std::filesystem::path p(data_file_path);
     std::string data_dir = p.parent_path().string();
     std::error_code ec;
@@ -46,12 +50,12 @@ tl::expected<void, ErrorCode> GdsContext::Init(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    // 1. Probe GDS availability
+    // 2. Probe GDS availability
     if (!ProbeGdsAvailable(data_dir)) {
         return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
     }
 
-    // 2. Open the data file (no O_DIRECT — cuFile handles alignment
+    // 3. Open the data file (no O_DIRECT — cuFile handles alignment
     // internally). If a previous GDS run left data behind, unlink and create
     // fresh. O_TRUNC alone is insufficient: cuFile DMA can fail on NVMe blocks
     // that still have stale physical mappings from the old file.
@@ -86,7 +90,7 @@ tl::expected<void, ErrorCode> GdsContext::Init(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    // 3. Pre-allocate physical blocks for cuFile DMA.
+    // 4. Pre-allocate physical blocks for cuFile DMA.
     // cuFile DMA bypasses the kernel write path and writes directly
     // to NVMe — it cannot extend a sparse file. posix_fallocate
     // guarantees real block allocation (unlike fallocate which may
@@ -101,8 +105,8 @@ tl::expected<void, ErrorCode> GdsContext::Init(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    // 4. Register cuFile handle via abstraction layer
-    auto status = gds_device_ops::FileHandleRegister(&cu_file_handle_, gds_fd_);
+    // 5. Register cuFile handle via ops_
+    auto status = ops_->FileHandleRegister(&cu_file_handle_, gds_fd_);
     if (status.IsErr()) {
         LOG(ERROR) << "GDS: FileHandleRegister failed: err=" << status.err;
         ::close(gds_fd_);
@@ -127,7 +131,7 @@ tl::expected<void, ErrorCode> GdsContext::Init(
 bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 #ifdef USE_GDS_BACKEND
     // 1. Check device node via abstraction layer
-    if (!gds_device_ops::ProbeDeviceNode()) {
+    if (!ops_->ProbeDeviceNode()) {
         LOG(WARNING) << "GDS probe: device node not available";
         return false;
     }
@@ -137,8 +141,9 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
     // occurs for the lifetime of this process.
     static std::once_flag gds_driver_once_;
     static bool gds_driver_ok_ = false;
-    std::call_once(gds_driver_once_, []() {
-        gds_driver_ok_ = gds_device_ops::DriverOpen().IsOk();
+    auto* ops_raw = ops_.get();  // capture by value in lambda
+    std::call_once(gds_driver_once_, [ops_raw]() {
+        gds_driver_ok_ = ops_raw->DriverOpen().IsOk();
         if (!gds_driver_ok_)
             LOG(WARNING) << "GDS probe: DriverOpen failed, "
                          << "GDS will not be available for this process";
@@ -146,29 +151,29 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
     if (!gds_driver_ok_) return false;
 
     // 3. End-to-end DMA write/read/verify (RAII cleanup)
+    static std::atomic<uint64_t> probe_counter{0};
     std::string probe_path =
-        data_dir + "/.gds_probe_" + std::to_string(getpid());
+        data_dir + "/.gds_probe_" + std::to_string(getpid()) + "_" +
+        std::to_string(probe_counter.fetch_add(1, std::memory_order_relaxed));
     struct ProbeCleanup {
         std::string path;
         int fd = -1;
-        gds_device_ops::GdsDeviceFileHandle fh = nullptr;
+        GdsDeviceFileHandle fh = nullptr;
         void* gpu_buf = nullptr;  // write buffer (registered for GDS)
         bool gpu_buf_ok = false;  // true if gpu_buf was successfully registered
-        void* verify_buf =
-            nullptr;  // read-back verify buffer (not GDS-registered)
+        GdsDeviceOps* ops = nullptr;  // for cleanup (not owned)
         // Note: driver is managed by std::call_once at process level
 
         ~ProbeCleanup() {
             // Deregister buffers before freeing GPU memory, then
             // deregister file handle before closing fd (cuFile order).
-            if (gpu_buf_ok) gds_device_ops::BufDeregister(gpu_buf);
-            if (gpu_buf) gds_device_ops::Free(gpu_buf);
-            if (verify_buf) gds_device_ops::Free(verify_buf);
-            if (fh) gds_device_ops::FileHandleDeregister(fh);
+            if (gpu_buf_ok && ops) ops->BufDeregister(gpu_buf);
+            if (gpu_buf && ops) ops->Free(gpu_buf);
+            if (fh && ops) ops->FileHandleDeregister(fh);
             if (fd >= 0) ::close(fd);
             ::unlink(path.c_str());
         }
-    } cleanup{probe_path};
+    } cleanup{probe_path, -1, nullptr, nullptr, false, ops_.get()};
 
     // Create temporary file
     cleanup.fd = ::open(probe_path.c_str(),
@@ -180,24 +185,27 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
     }
 
     // Register file handle
-    if (!gds_device_ops::FileHandleRegister(&cleanup.fh, cleanup.fd).IsOk()) {
+    if (!ops_->FileHandleRegister(&cleanup.fh, cleanup.fd).IsOk()) {
         LOG(WARNING) << "GDS probe: FileHandleRegister failed";
         return false;
     }
 
     // Allocate GPU buffer
-    int probe_device = gds_device_ops::GetDevice();
+    int probe_device = ops_->GetDevice();
     LOG(INFO) << "GDS probe: using GPU device " << probe_device;
-    mooncake::gpu_staging::SetDevice(probe_device);
+    auto probe_devices = device::GetAcceleratorRegistry().RegisteredDevices();
+    if (!probe_devices.empty()) {
+        probe_devices[0]->SetContext(probe_device);
+    }
 
-    cleanup.gpu_buf = gds_device_ops::Malloc(4096);
+    cleanup.gpu_buf = ops_->Malloc(4096);
     if (!cleanup.gpu_buf) {
         LOG(WARNING) << "GDS probe: GPU Malloc failed";
         return false;
     }
 
     // Register GPU buffer — failure means probe failure (no bounce buffer)
-    if (!gds_device_ops::BufRegister(cleanup.gpu_buf, 4096).IsOk()) {
+    if (!ops_->BufRegister(cleanup.gpu_buf, 4096).IsOk()) {
         LOG(WARNING) << "GDS probe: BufRegister failed";
         return false;
     }
@@ -205,37 +213,35 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 
     // 4. Write known pattern via DMA
     constexpr uint8_t kPattern = 0xA5;
-    gds_device_ops::Memset(cleanup.gpu_buf, kPattern, 4096);
-    gds_device_ops::DeviceSynchronize();
-    if (gds_device_ops::Write(cleanup.fh, cleanup.gpu_buf, 4096, 0) != 4096) {
+    ops_->Memset(cleanup.gpu_buf, kPattern, 4096);
+    ops_->DeviceSynchronize();
+    if (ops_->Write(cleanup.fh, cleanup.gpu_buf, 4096, 0) != 4096) {
         LOG(WARNING) << "GDS probe: DMA write failed";
         return false;
     }
 
     // 5. Read back via DMA and verify byte-by-byte.
-    // verify_buf is tracked by ProbeCleanup RAII — freed on all paths.
-    // probe_device was set via gpu_staging::SetDevice() above; no device
+    // Reuse gpu_buf (already registered with cuFile): zero it, read
+    // back via DMA, then D2H copy and compare. Avoids allocating a
+    // separate buffer that would use the internal bounce-buffer path
+    // because it is never registered with BufRegister.
+    // probe_device was set via SetContext() above; no device
     // switches occur between Malloc and this point.
-    cleanup.verify_buf = gds_device_ops::Malloc(4096);
-    if (!cleanup.verify_buf) {
-        LOG(WARNING) << "GDS probe: verify buffer Malloc failed";
-        return false;
-    }
-    gds_device_ops::Memset(cleanup.verify_buf, 0, 4096);
+    ops_->Memset(cleanup.gpu_buf, 0, 4096);
+    ops_->DeviceSynchronize();
 
-    if (gds_device_ops::Read(cleanup.fh, cleanup.verify_buf, 4096, 0) != 4096) {
+    if (ops_->Read(cleanup.fh, cleanup.gpu_buf, 4096, 0) != 4096) {
         LOG(WARNING) << "GDS probe: DMA read failed";
         return false;
     }
 
     std::vector<uint8_t> host(4096);
-    if (!mooncake::gpu_staging::CopyDeviceToHost(host.data(),
-                                                 cleanup.verify_buf, 4096)) {
+    auto probe_runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!probe_runtime.CopyToHost(host.data(), cleanup.gpu_buf, 4096)) {
         LOG(WARNING) << "GDS probe: CopyDeviceToHost failed";
         return false;
     }
-    gds_device_ops::DeviceSynchronize();
-    // verify_buf freed by ~ProbeCleanup()
+    ops_->DeviceSynchronize();
 
     for (size_t i = 0; i < 4096; ++i) {
         if (host[i] != kPattern) {
@@ -258,6 +264,11 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 tl::expected<void, ErrorCode> GdsContext::WriteRecord(
     const std::string& key, const std::vector<Slice>& slices, uint64_t offset) {
 #ifdef USE_GDS_BACKEND
+    if (key.size() > UINT32_MAX) {
+        LOG(ERROR) << "WriteRecord: key size " << key.size()
+                   << " exceeds UINT32_MAX";
+        return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+    }
     uint32_t klen = static_cast<uint32_t>(key.size());
     size_t t = 0;
     for (const auto& s : slices) t += s.size;
@@ -286,16 +297,19 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
 
     // value slices
-    gds_device_ops::GdsDeviceFileHandle cfh = cu_file_handle_;
+    GdsDeviceFileHandle cfh = cu_file_handle_;
     uint64_t vo = offset + RecordHeader::SIZE + klen;
 
     for (const auto& s : slices) {
         if (s.size == 0) continue;
         if (!s.ptr) return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
 
-        int dev = -1;
-        if (mooncake::gpu_staging::IsDevicePointer(s.ptr, &dev)) {
-            mooncake::gpu_staging::SetDevice(dev);
+        auto wr_runtime =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        device::PointerInfo wr_info;
+        const auto* wr_dev = wr_runtime.FindDeviceForPointer(s.ptr, &wr_info);
+        if (wr_dev) {
+            wr_dev->SetContext(wr_info.device_id);
 
             // Use registration cache to avoid repeated Register/Deregister
             // for the same GPU address across multiple I/O operations.
@@ -308,7 +322,7 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
                         << " size=" << s.size;
             }
 
-            ssize_t w = gds_device_ops::Write(cfh, s.ptr, s.size,
+            ssize_t w = ops_->Write(cfh, s.ptr, s.size,
                                               static_cast<off_t>(vo));
             VLOG(1) << "[GDS WRITE] cuFileWrite DMA: size=" << s.size
                     << " offset=" << vo << " ret=" << w;
@@ -347,6 +361,12 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
         hdr.value_len != expected_value_size)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 
+    if (hdr.key_len > 65536) {
+        LOG(ERROR) << "ReadRecord: key_len " << hdr.key_len
+                   << " exceeds limit (corrupted record at offset " << offset
+                   << ")";
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
     std::string sk(hdr.key_len, '\0');
     if (::pread(gds_fd_, sk.data(), hdr.key_len,
                 static_cast<off_t>(offset + RecordHeader::SIZE)) !=
@@ -354,12 +374,15 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
         sk != key)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 
-    gds_device_ops::GdsDeviceFileHandle cfh = cu_file_handle_;
+    GdsDeviceFileHandle cfh = cu_file_handle_;
     uint64_t vo = offset + RecordHeader::SIZE + hdr.key_len;
-    int dev = -1;
+    auto rd_runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    device::PointerInfo rd_info;
+    const auto* rd_dev =
+        rd_runtime.FindDeviceForPointer(dest_slice.ptr, &rd_info);
 
-    if (mooncake::gpu_staging::IsDevicePointer(dest_slice.ptr, &dev)) {
-        mooncake::gpu_staging::SetDevice(dev);
+    if (rd_dev) {
+        rd_dev->SetContext(rd_info.device_id);
 
         // Use registration cache to avoid repeated Register/Deregister.
         bool buf_ok = EnsureBufferRegistered(dest_slice.ptr, dest_slice.size);
@@ -369,7 +392,7 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
                     << " size=" << dest_slice.size;
         }
 
-        ssize_t r = gds_device_ops::Read(cfh, dest_slice.ptr, dest_slice.size,
+        ssize_t r = ops_->Read(cfh, dest_slice.ptr, dest_slice.size,
                                          static_cast<off_t>(vo));
         VLOG(1) << "[GDS READ] cuFileRead DMA: size=" << dest_slice.size
                 << " offset=" << vo << " ret=" << r;
@@ -401,12 +424,12 @@ void GdsContext::Shutdown() {
     // Release order: buffers -> handle -> fd
     // (cuFile requires buffers deregistered before handle deregister)
     for (auto& [ptr, _] : registered_buffers_) {
-        gds_device_ops::BufDeregister(ptr);
+        ops_->BufDeregister(ptr);
     }
     registered_buffers_.clear();
 
     if (cu_file_handle_) {
-        gds_device_ops::FileHandleDeregister(cu_file_handle_);
+        ops_->FileHandleDeregister(cu_file_handle_);
         cu_file_handle_ = nullptr;
     }
 
@@ -416,6 +439,7 @@ void GdsContext::Shutdown() {
     }
 
     enabled_ = false;
+    ops_.reset();
 #endif
 }
 
@@ -432,11 +456,11 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
     auto it = registered_buffers_.find(gpu_ptr);
     if (it != registered_buffers_.end()) {
         if (it->second == size) return true;  // already registered, same size
-        gds_device_ops::BufDeregister(gpu_ptr);  // size changed, re-register
+        ops_->BufDeregister(gpu_ptr);  // size changed, re-register
         registered_buffers_.erase(it);
     }
 
-    if (gds_device_ops::BufRegister(gpu_ptr, size).IsOk()) {
+    if (ops_->BufRegister(gpu_ptr, size).IsOk()) {
         registered_buffers_[gpu_ptr] = size;
         return true;
     }
@@ -452,7 +476,7 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
 }
 
 #ifdef USE_GDS_BACKEND
-bool GdsContext::IsGdsAvailable() { return gds_device_ops::ProbeDeviceNode(); }
+bool GdsContext::IsGdsAvailable() { auto probe_ops = CreateGdsDeviceOps(); return probe_ops->ProbeDeviceNode(); }
 #endif
 
 // ===================================================================

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "mutex.h"
+#include "gds/gds_device_ops.h"
 #include "types.h"
 
 namespace mooncake {
@@ -33,7 +34,8 @@ struct RecordHeader {
 struct GdsContext {
     bool enabled_ = false;
     int gds_fd_ = -1;
-    void* cu_file_handle_ = nullptr;  // GdsDeviceFileHandle (via gds_device_ops)
+    void* cu_file_handle_ = nullptr;     // GdsDeviceFileHandle (via ops_)
+    std::unique_ptr<GdsDeviceOps> ops_;  // vendor implementation
 
     // Serializes record I/O: header + key + value are written/read as
     // a contiguous unit so concurrent callers do not interleave.
@@ -48,8 +50,8 @@ struct GdsContext {
     // Initialize GDS: probe -> open gds_fd_ -> fallocate ->
     // gds_device_ops::FileHandleRegister. Returns error on failure;
     // caller should Shutdown() + reset().
-    tl::expected<void, ErrorCode> Init(
-        const std::string& data_file_path, uint64_t capacity);
+    tl::expected<void, ErrorCode> Init(const std::string& data_file_path,
+                                       uint64_t capacity);
 
     // Release: registered_buffers_ -> cu_file_handle_ -> gds_fd_
     // (cuFile requires buffers deregistered before handle deregister)
@@ -64,18 +66,17 @@ struct GdsContext {
     //   header + key -> ::pwrite (CPU path, always)
     //   value (GPU slice) -> cuFileWrite (DMA)
     //   value (CPU slice) -> ::pwrite (fallback)
-    tl::expected<void, ErrorCode> WriteRecord(
-        const std::string& key,
-        const std::vector<Slice>& slices,
-        uint64_t offset);
+    tl::expected<void, ErrorCode> WriteRecord(const std::string& key,
+                                              const std::vector<Slice>& slices,
+                                              uint64_t offset);
 
     // Read one record from the data file:
     //   header + key -> ::pread (CPU) + verification
     //   value (GPU dst) -> cuFileRead (DMA)
     //   value (CPU dst) -> ::pread (fallback)
-    tl::expected<void, ErrorCode> ReadRecord(
-        const std::string& key, Slice& dest_slice,
-        uint64_t offset, uint32_t expected_value_size);
+    tl::expected<void, ErrorCode> ReadRecord(const std::string& key,
+                                             Slice& dest_slice, uint64_t offset,
+                                             uint32_t expected_value_size);
 
     // Register a GPU buffer for GDS I/O. Checks the registration cache:
     // if the same (ptr, size) is already registered, returns true
