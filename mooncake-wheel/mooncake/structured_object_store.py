@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - depends on built extension
 import msgpack as _msgpack
 
 DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
-AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
+AUTO_PARALLEL_MIN_BYTES = 4 * 1024**3
 AUTO_PARALLEL_MIN_CHUNKS = 8
 MISSING_OBJECT_ERROR = (
     -704
@@ -413,7 +413,11 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
     )
 
 
-def _resolve_dataproto_ref(ref: DataProtoRefLike) -> MooncakeDataProtoRef:
+export_ref = export_dataproto_ref
+import_ref = import_dataproto_ref
+
+
+def _resolve_ref(ref: DataProtoRefLike) -> MooncakeDataProtoRef:
     if isinstance(ref, MooncakeDataProtoRef):
         return ref
     if is_dataproto_ref_handle(ref):
@@ -583,8 +587,8 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy] = None,
         field_schemas: Optional[dict[str, FieldSchema]] = None,
     ) -> MooncakeDataProtoRef:
-        """Store DataProto fields, optionally using schema hints for non-tensor fields."""
-        return self._put_dataproto_stage(
+        """Store a DataProto-like object as a stage-level structured object."""
+        return self._put_stage(
             None,
             data,
             namespace=namespace,
@@ -607,9 +611,9 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy] = None,
         field_schemas: Optional[dict[str, FieldSchema]] = None,
     ) -> MooncakeDataProtoRef:
-        """Append DataProto fields, optionally using schema hints for new fields."""
-        ref = _resolve_dataproto_ref(ref)
-        return self._put_dataproto_stage(
+        """Append fields from a later DataProto stage without rewriting previous stages."""
+        ref = _resolve_ref(ref)
+        return self._put_stage(
             ref,
             data,
             namespace=ref.namespace,
@@ -623,7 +627,7 @@ class MooncakeBundleTransfer:
 
     def dataproto_manifest_view(self, ref: DataProtoRefLike) -> dict[str, Any]:
         """Return a DataProto field view derived from stage structured-object manifests."""
-        return _dataproto_manifest_view(self, _resolve_dataproto_ref(ref))
+        return _dataproto_manifest_view(self, _resolve_ref(ref))
 
     def get_dataproto(
         self,
@@ -638,7 +642,30 @@ class MooncakeBundleTransfer:
         rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
     ) -> Any:
         """Materialize selected DataProto fields from structured object refs."""
-        ref = _resolve_dataproto_ref(ref)
+        return self._materialize_ref(
+            _resolve_ref(ref),
+            fields=fields,
+            batch_fields=batch_fields,
+            non_tensor_fields=non_tensor_fields,
+            meta_info_keys=meta_info_keys,
+            data_cls=data_cls,
+            destinations=destinations,
+            rows=rows,
+        )
+
+    def _materialize_ref(
+        self,
+        ref: MooncakeDataProtoRef,
+        *,
+        fields: Optional[Sequence[str]] = None,
+        batch_fields: Optional[Sequence[str]] = None,
+        non_tensor_fields: Optional[Sequence[str]] = None,
+        meta_info_keys: Optional[Sequence[str]] = None,
+        data_cls: Optional[Any] = None,
+        destinations: Optional[Mapping[str, Any]] = None,
+        rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
+    ) -> Any:
+        """Core materialization logic shared by get_dataproto and get_legacy_dict."""
         row_selection = _coerce_dataproto_row_selection(rows, ref.batch_size)
         row_slice = None if row_selection is None else row_selection.member_slice
         row_indices = None if row_selection is None else row_selection.indices
@@ -1365,44 +1392,19 @@ class MooncakeBundleTransfer:
 
         raise ValueError(f"unknown structured non-tensor codec: {codec}")
 
-    def _read_ragged_tensor_dict_payload(
-        self,
-        payload_members: Mapping[str, str],
-        metadata: dict[str, Any],
-        *,
-        read_null_mask: Callable[[], Any],
-        read_key_payload: Callable[
-            [Mapping[str, Any]], tuple[dict[str, Any], Mapping[str, Any]]
-        ],
-    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
-        key_codecs = dict(metadata.get("key_codecs") or {})
-        metadata["key_codecs"] = key_codecs
-        dict_payload: dict[str, Any] = {"null_mask": read_null_mask()}
-        for key in _normalize_ragged_tensor_dict_keys(metadata.get("keys", [])):
-            key_members = _ragged_tensor_dict_payload_items(
-                payload_members, key, kind="manifest"
-            )
-            key_payload, key_metadata = read_key_payload(
-                {
-                    "codec": "ragged_tensor",
-                    "metadata": key_codecs.get(key) or {},
-                    "payload_members": key_members,
-                }
-            )
-            key_codecs[key] = key_metadata
-            for name, value in key_payload.items():
-                dict_payload[f"{key}.{name}"] = value
-        return dict_payload, metadata
-
-    def cleanup_dataproto(self, ref: DataProtoRefLike) -> None:
-        """Remove all structured object stages referenced by a DataProto handle."""
-        ref = _resolve_dataproto_ref(ref)
+    def _cleanup_ref(self, ref: DataProtoRefLike) -> None:
+        """Remove all structured object stages referenced by a handle."""
+        ref = _resolve_ref(ref)
         seen: set[str] = set()
         for stage_ref in ref.stage_refs.values():
             if stage_ref.manifest_key in seen:
                 continue
             seen.add(stage_ref.manifest_key)
             self.remove_bundle(stage_ref)
+
+    def cleanup_dataproto(self, ref: DataProtoRefLike) -> None:
+        """Remove all structured object stages referenced by a DataProto handle."""
+        self._cleanup_ref(ref)
 
     def put_legacy_dict(
         self,
@@ -1415,24 +1417,28 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy] = None,
         field_schemas: Optional[Mapping[str, "FieldSchema"]] = None,
     ) -> MooncakeDataProtoRef:
-        """Store a legacy rollout dict through the DataProto structured-object path."""
-        return self.put_dataproto(
+        """Store a legacy rollout dict as a structured object."""
+        return self._put_stage(
+            None,
             _legacy_dict_to_dataproto_envelope(data),
             namespace=namespace,
             partition=partition,
             stage=stage,
             chunk_bytes=chunk_bytes,
             policy=policy,
+            overwrite=False,
             field_schemas=field_schemas,
         )
 
     def get_legacy_dict(self, ref: DataProtoRefLike) -> dict[str, Any]:
         """Materialize a legacy rollout dict stored by put_legacy_dict()."""
-        return _dataproto_envelope_to_legacy_dict(self.get_dataproto(ref))
+        return _dataproto_envelope_to_legacy_dict(
+            self._materialize_ref(_resolve_ref(ref))
+        )
 
     def remove_legacy_dict(self, ref: DataProtoRefLike) -> None:
         """Remove a legacy rollout dict stored by put_legacy_dict()."""
-        self.cleanup_dataproto(ref)
+        self._cleanup_ref(ref)
 
     @staticmethod
     def release_result(result: Any) -> None:
@@ -1511,7 +1517,7 @@ class MooncakeBundleTransfer:
         self._bundle_store.remove_keys(obsolete_keys, strict=False)
         return merged_ref
 
-    def _put_dataproto_stage(
+    def _put_stage(
         self,
         ref: MooncakeDataProtoRef | None,
         data: Any,
