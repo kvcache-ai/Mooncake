@@ -83,21 +83,16 @@ namespace {
 
 void set_etcd_tls_config_internal(const char *ca_file, const char *cert_file,
                                   const char *key_file) {
-    // Empty / nullptr means "use environment variables as fallback"
+    bool use_fallback = (ca_file == nullptr && cert_file == nullptr && key_file == nullptr);
     std::string ca = ca_file ? ca_file : "";
     std::string cert = cert_file ? cert_file : "";
     std::string key = key_file ? key_file : "";
 
-    // Fallback to environment variables
-    if (ca.empty()) {
+    if (use_fallback) {
         const char *env_ca = std::getenv("MC_ETCD_CA_FILE");
         if (env_ca) ca = env_ca;
-    }
-    if (cert.empty()) {
         const char *env_cert = std::getenv("MC_ETCD_CERT_FILE");
         if (env_cert) cert = env_cert;
-    }
-    if (key.empty()) {
         const char *env_key = std::getenv("MC_ETCD_KEY_FILE");
         if (env_key) key = env_key;
     }

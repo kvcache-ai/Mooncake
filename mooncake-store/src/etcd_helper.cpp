@@ -80,27 +80,34 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClientWithTLS(
         }
         return ErrorCode::OK;
     } else {
-        // If no TLS files provided, fall back to the non-TLS path
+        char* err_msg = nullptr;
+        int ret = 0;
         if (ca_file.empty() && cert_file.empty() && key_file.empty()) {
             LOG(WARNING) << "ConnectToEtcdStoreClientWithTLS called with empty "
-                            "TLS file paths, falling back to non-TLS";
-            return ConnectToEtcdStoreClient(etcd_endpoints);
+                            "TLS file paths, using non-TLS client";
+            ret = NewStoreEtcdClient(
+                const_cast<char*>(etcd_endpoints.c_str()), &err_msg);
+        } else {
+            LOG(INFO) << "Connecting to etcd store client with TLS (ca="
+                      << ca_file << ", cert=" << cert_file
+                      << ", key=" << key_file << ")";
+            ret = NewStoreEtcdClientWithTLS(
+                const_cast<char*>(etcd_endpoints.c_str()),
+                const_cast<char*>(ca_file.c_str()),
+                const_cast<char*>(cert_file.c_str()),
+                const_cast<char*>(key_file.c_str()),
+                &err_msg);
         }
-        LOG(INFO) << "Connecting to etcd store client with TLS (ca="
-                  << ca_file << ", cert=" << cert_file
-                  << ", key=" << key_file << ")";
-        char* err_msg = nullptr;
-        int ret = NewStoreEtcdClientWithTLS(
-            const_cast<char*>(etcd_endpoints.c_str()),
-            const_cast<char*>(ca_file.c_str()),
-            const_cast<char*>(cert_file.c_str()),
-            const_cast<char*>(key_file.c_str()),
-            &err_msg);
         if (ret != 0 && ret != -2) {
-            LOG(ERROR) << "Failed to initialize etcd TLS client: " << err_msg;
-            free(err_msg);
-            err_msg = nullptr;
+            LOG(ERROR) << "Failed to initialize etcd client: "
+                       << (err_msg ? err_msg : "");
+            if (err_msg) {
+                free(err_msg);
+            }
             return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+        if (ret == -2 && err_msg) {
+            free(err_msg);
         }
         connected_endpoints_ = etcd_endpoints;
         etcd_connected_ = true;
@@ -142,25 +149,27 @@ ErrorCode EtcdHelper::ResetEtcdStoreClientWithTLS(
     const std::string& cert_file, const std::string& key_file) {
     std::lock_guard<std::mutex> lock(etcd_mutex_);
 
-    // If no TLS files provided, fall back to the non-TLS path
+    char* err_msg = nullptr;
+    int ret = 0;
     if (ca_file.empty() && cert_file.empty() && key_file.empty()) {
         LOG(WARNING) << "ResetEtcdStoreClientWithTLS called with empty "
-                        "TLS file paths, falling back to non-TLS";
-        return ResetEtcdStoreClient(etcd_endpoints);
+                        "TLS file paths, using non-TLS client";
+        ret = EtcdStoreResetClientWrapper(
+            const_cast<char*>(etcd_endpoints.c_str()), &err_msg);
+    } else {
+        LOG(INFO) << "Resetting etcd store client with TLS (ca="
+                  << ca_file << ", cert=" << cert_file
+                  << ", key=" << key_file << ")";
+        ret = EtcdStoreResetClientWrapperWithTLS(
+            const_cast<char*>(etcd_endpoints.c_str()),
+            const_cast<char*>(ca_file.c_str()),
+            const_cast<char*>(cert_file.c_str()),
+            const_cast<char*>(key_file.c_str()),
+            &err_msg);
     }
-    LOG(INFO) << "Resetting etcd store client with TLS (ca="
-              << ca_file << ", cert=" << cert_file
-              << ", key=" << key_file << ")";
 
-    char* err_msg = nullptr;
-    int ret = EtcdStoreResetClientWrapperWithTLS(
-        const_cast<char*>(etcd_endpoints.c_str()),
-        const_cast<char*>(ca_file.c_str()),
-        const_cast<char*>(cert_file.c_str()),
-        const_cast<char*>(key_file.c_str()),
-        &err_msg);
     if (ret != 0) {
-        LOG(ERROR) << "Failed to reset etcd store TLS client: "
+        LOG(ERROR) << "Failed to reset etcd store client: "
                    << (err_msg == nullptr ? "" : err_msg);
         if (err_msg != nullptr) {
             free(err_msg);
