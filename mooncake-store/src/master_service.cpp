@@ -3205,6 +3205,29 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Erase stale LOCAL_DISK replicas from a previous (restarted) store-server
+    // incarnation. Without this, a stale transport_endpoint lingers in metadata
+    // after the store-server restarts with a new client_id; the visitor below
+    // requires matching client_id, so the new replica would be silently dropped
+    // and reads would follow the dead endpoint (INVALID_KEY / RDMA errors).
+    bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
+        return r.is_local_disk_replica() && r.is_completed();
+    });
+    size_t stale_erased = EraseReplicasWithCacheTotalAccounting(
+        metadata,
+        [&client_id](const Replica& rep) {
+            return rep.is_local_disk_replica() &&
+                   rep.get_descriptor().get_local_disk_descriptor().client_id !=
+                       client_id;
+        });
+    if (stale_erased > 0) {
+        auto& shard = accessor.GetShard();
+        shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
+        LOG(INFO) << "[ADDREPLICA-STALE] erased " << stale_erased
+                  << " stale LOCAL_DISK replica(s) for key=" << key
+                  << " tenant=" << normalized_tenant;
+    }
+
     if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
