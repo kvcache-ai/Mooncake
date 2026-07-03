@@ -256,6 +256,7 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_used_bytes{tenant_id}`
 - `mooncake_tenant_quota_reserved_bytes{tenant_id}`
 - `mooncake_tenant_quota_committed_count{tenant_id}`
+- `mooncake_tenant_quota_metadata_object_count{tenant_id}`
 - `mooncake_tenant_quota_over_quota{tenant_id}`
 - `mooncake_tenant_quota_explicit_policy{tenant_id}`
 - `mooncake_tenant_quota_reject_total{tenant_id,reason}`
@@ -268,16 +269,29 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 
 ## Tenant Quota Management
 
-Tenant quota admission is disabled by default. Enable it on the master when you want memory writes admitted against per-tenant quota:
+Tenant quota admission is disabled by default. Enable strict multi-tenant mode on the master when you want memory writes admitted against connector-managed per-tenant quota:
 
 ```bash
 mooncake_master \
-  --enable_tenant_quota=true \
-  --default_tenant_quota_bytes=1073741824 \
-  --tenant_quota_pool_capacity_bytes=0
+  --enable_multi_tenants=true \
+  --tenant_quota_connector_type=file \
+  --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
 ```
 
-`tenant_quota_pool_capacity_bytes=0` uses the full registered memory capacity as the quota allocation pool. A nonzero value caps the capacity used to compute effective tenant quotas.
+The v1 connector is a writable YAML file. The file must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
+
+```yaml
+version: 1
+
+tenants:
+  - name: tenant-a
+    quota: 200GB
+
+  - name: tenant-b
+    quota: 500GB
+```
+
+When strict multi-tenant mode is enabled, write requests must include a registered tenant. The `default` tenant is not special unless it is explicitly registered in the connector policy.
 
 The same HTTP port used for metrics exposes the tenant quota admin API:
 
@@ -293,14 +307,8 @@ curl -s -X PUT "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-
   -H 'Content-Type: application/json' \
   -d '{"requested_quota_bytes":2147483648}'
 
-# Delete an explicit policy so the tenant inherits the default policy again.
+# Delete an explicit policy. The tenant must not own objects or quota usage.
 curl -s -X DELETE "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
-
-# Query or update the default requested quota. The default may be 0.
-curl -s http://<master_host>:9003/api/v1/tenant_quotas/default
-curl -s -X PUT http://<master_host>:9003/api/v1/tenant_quotas/default \
-  -H 'Content-Type: application/json' \
-  -d '{"requested_quota_bytes":1073741824}'
 ```
 
 Each tenant quota snapshot returns:
@@ -315,13 +323,14 @@ Each tenant quota snapshot returns:
     "used_bytes": 0,
     "reserved_bytes": 0,
     "committed_count": 0,
+    "metadata_object_count": 0,
     "over_quota": false,
     "has_explicit_policy": true
   }
 }
 ```
 
-In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If tenant quota is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`.
+In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If strict multi-tenant mode is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`. Deleting a non-empty tenant returns HTTP 409 with `TENANT_NOT_EMPTY`.
 
 ---
 
@@ -441,7 +450,7 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--allocation_strategy` | `random` | `random` (pure random, fastest), `free_ratio_first` (best load balance), or `cxl` (prefer CXL memory) |
+| `--allocation_strategy` | `random` | Allocation strategy: `random` (pure random, fastest), `free_ratio_first` (best memory load balance), `ssd_free_ratio_first` (SSD-aware free-ratio-first), `cxl` (prefer CXL memory), or `local_first` (prefer local host memory segments before ordered remote fallback) |
 
 ### PutStart Timeouts
 
@@ -465,9 +474,9 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable_tenant_quota` | `false` | Enable per-tenant memory quota admission |
-| `--default_tenant_quota_bytes` | `0` | Default requested quota for tenants without explicit policy; `0` is allowed and inherited-default tenants still share capacity left by explicit tenants |
-| `--tenant_quota_pool_capacity_bytes` | `0` | Capacity used to compute effective tenant quotas; `0` means total registered memory capacity |
+| `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
+| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type |
+| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path |
 
 ### High Availability
 
@@ -583,6 +592,20 @@ rpc_interface: "eth0"
 rpc_port: 50051
 ```
 
+### Local-first Allocation
+
+Mooncake can prefer memory segments on the writer's host before falling back to remote hosts. This is useful when colocating inference workers and store segments, because a store node failure only invalidates the KV cache written to that host instead of spreading one request's cache across the whole cluster.
+
+This feature is disabled by default. Enable it on the master by selecting the local-first allocation strategy:
+
+```yaml
+allocation_strategy: "local_first"
+```
+
+When enabled, the master applies local-first allocation only for memory replicas with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` are tried first; if they are unavailable or full, Mooncake falls back through active hosts in cyclic lexicographic host-id order, starting from the writer host when it has active segments, or otherwise from the next greater active host id. Within the same host, segment names are sorted and rotated by key hash so multiple segments on one host do not always receive the first allocation attempt.
+
+The client derives the host id from `local_hostname` by removing the port. For example, `host-a:50051` and `host-a:50052` map to the same host id, `host-a`. For local-first allocation to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`. In deployments with multiple NIC IPs, hostname aliases, or container/pod networking, choose one canonical host name or IP and use it consistently across processes on that host. Empty, loopback, and wildcard values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `::1`, and `::` are treated as unknown and do not trigger automatic local-first placement for that client.
+
 ---
 
 (reference-client-configuration-tuning)=
@@ -616,7 +639,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 
 ```{note}
-The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A only the `MC_*` engine variables below have any effect — `MOONCAKE_*` are ignored.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)

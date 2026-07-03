@@ -14,6 +14,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "device/accelerator_registry.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -181,7 +182,14 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         exported_data = new char[total_length];
         if (!exported_data) return pybind11::none();
 
-        memcpy(exported_data, buffer_handle->ptr(), total_length);
+        if (!mooncake::device::GetAcceleratorRegistry()
+                 .RuntimeAccelerators()
+                 .CopyToHost(exported_data, buffer_handle->ptr(),
+                             total_length)) {
+            LOG(ERROR) << "Failed to copy buffer to host memory";
+            delete[] exported_data;
+            return pybind11::none();
+        }
     } else {
         exported_data = usr_buffer;
         if (data_length < 0) {
@@ -478,6 +486,20 @@ class MooncakeStorePyWrapper {
             }
 
             py::gil_scoped_acquire acquire_gil;
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+            if (runtime_accelerator.FindDeviceForPointer(
+                    buffer_handle->ptr())) {
+                std::string host_buf(buffer_handle->size(), '\0');
+                if (!runtime_accelerator.CopyToHost(host_buf.data(),
+                                                    buffer_handle->ptr(),
+                                                    buffer_handle->size())) {
+                    LOG(ERROR) << "Failed to copy buffer to host memory";
+                    return pybind11::none();
+                }
+                return pybind11::bytes(host_buf);
+            }
             return pybind11::bytes((char *)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
@@ -504,10 +526,28 @@ class MooncakeStorePyWrapper {
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
 
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+
             for (const auto &data : batch_data) {
-                results.emplace_back(
-                    data ? pybind11::bytes((char *)data->ptr(), data->size())
-                         : kNullString);
+                if (!data) {
+                    results.emplace_back(kNullString);
+                    continue;
+                }
+                if (runtime_accelerator.FindDeviceForPointer(data->ptr())) {
+                    std::string host_buf(data->size(), '\0');
+                    if (!runtime_accelerator.CopyToHost(
+                            host_buf.data(), data->ptr(), data->size())) {
+                        LOG(ERROR) << "Failed to copy buffer to host memory";
+                        results.emplace_back(kNullString);
+                        continue;
+                    }
+                    results.emplace_back(pybind11::bytes(host_buf));
+                } else {
+                    results.emplace_back(
+                        pybind11::bytes((char *)data->ptr(), data->size()));
+                }
             }
             return results;
         }

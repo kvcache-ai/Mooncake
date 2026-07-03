@@ -50,7 +50,7 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 
 #### Setup
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 pre-commit install
 ```
 

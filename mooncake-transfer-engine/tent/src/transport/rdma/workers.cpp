@@ -17,6 +17,8 @@
 #include <sys/epoll.h>
 
 #include <cassert>
+#include <fstream>
+#include <sstream>
 
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/shared_quota.h"
@@ -48,6 +50,27 @@ Workers::Workers(RdmaTransport* transport)
     device_selector_ = std::make_unique<DeviceSelector>();
     device_selector_->loadTopology(transport_->local_topology_);
     auto& conf = transport_->conf_;
+
+    // RailMonitor consumes JSON text, while the public configuration is a file
+    // path. Load it once here instead of reopening the file for every worker
+    // and every remote machine. Invalid/missing files fall back to automatic
+    // topology matching in RailMonitor::load().
+    const auto& rail_topo_path = transport_->params_->workers.rail_topo_path;
+    if (!rail_topo_path.empty()) {
+        std::ifstream input(rail_topo_path);
+        if (!input.is_open()) {
+            LOG(WARNING) << "Unable to open RDMA rail topology file "
+                         << rail_topo_path << "; using automatic rail mapping";
+        } else {
+            std::ostringstream contents;
+            contents << input.rdbuf();
+            rail_topo_json_ = contents.str();
+            if (rail_topo_json_.empty()) {
+                LOG(WARNING) << "RDMA rail topology file " << rail_topo_path
+                             << " is empty; using automatic rail mapping";
+            }
+        }
+    }
 
     // ============================================================
     // Core Scheduling Configuration
@@ -685,6 +708,7 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
     auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
+    hint.location = std::move(location);
     return Status::OK();
 }
 
@@ -711,7 +735,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo, /*rail_topo_json=*/"",
+        rail.load(source.topo, target.topo, rail_topo_json_,
                   transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
@@ -847,6 +871,21 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     // lookup on the hot path.
     slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
                                            target.segment->machine_id);
+    if (transport_->params_->log_slice_affinity) {
+        const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);
+        const auto* remote_nic = target.topo->getNicEntry(slice->target_dev_id);
+        VLOG(1) << "RDMA slice affinity: source_location=" << source.location
+                << ", target_location=" << target.location
+                << ", local_device_name="
+                << (local_nic ? local_nic->name : "<unknown>")
+                << ", peer_device_name="
+                << (remote_nic ? remote_nic->name : "<unknown>")
+                << ", target_id=" << slice->task->request.target_id
+                << ", source_addr=" << static_cast<void*>(slice->source_addr)
+                << ", dest_addr=" << reinterpret_cast<void*>(slice->target_addr)
+                << ", length=" << slice->length
+                << ", retry_count=" << slice->retry_count;
+    }
     return Status::OK();
 }
 }  // namespace tent

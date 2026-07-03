@@ -1,0 +1,166 @@
+name: Publish Master Image
+
+# Manual trigger only: this installs an already-published PyPI wheel, so it must be
+# run after that version's wheel is published — avoids racing release.yaml, which builds
+# and publishes the wheel in the same v* tag event.
+#
+# Publish flow: validate input -> confirm amd64+arm64 wheels exist -> build multi-arch
+# and push the :<version> tag -> smoke-test amd64 AND arm64 -> only then promote :latest
+# (when requested). :latest is copied from the smoked :<version> digest, so the default
+# pull tag can never point at an image that failed smoke. A failed smoke still leaves the
+# :<version> tag public; since this is manual, delete it from Docker Hub by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      mooncake_version:
+        description: "Published mooncake-transfer-engine version (also the image tag), e.g. 0.3.11.post1"
+        required: true
+        type: string
+      tag_latest:
+        description: "Also move :latest to this build. Only enable when publishing the newest release (a backfill/retry of an older wheel must NOT move :latest)."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Serialize publishes so two concurrent runs can't interleave and move :latest backwards.
+concurrency:
+  group: publish-master-image
+  cancel-in-progress: false
+
+jobs:
+  publish-master:
+    runs-on: ubuntu-22.04
+    env:
+      REPO: docker.io/kvcacheai/mooncake
+      # inputs.* placed in env (not interpolated into shell source) — injection-safe.
+      MOONCAKE_VERSION: ${{ inputs.mooncake_version }}
+      # Pinned for the official image: provenance must always be the public PyPI index.
+      # Debug builds against another index belong in a separate workflow that does NOT
+      # push official kvcacheai/mooncake tags.
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate mooncake_version
+        run: |
+          if ! printf '%s' "$MOONCAKE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$'; then
+            echo "Invalid mooncake_version '$MOONCAKE_VERSION': expected e.g. 0.3.11 or 0.3.11.post1" >&2
+            exit 1
+          fi
+
+      # This image is intentionally the CPython 3.12 flavor: master.Dockerfile pins
+      # python:3.12-slim-trixie, so only cp312 wheels are ABI-compatible. If that base
+      # Python is ever bumped (e.g. to 3.13), update the "cp312" match below to match —
+      # otherwise this preflight would green-light wheels the image cannot import.
+      - name: Confirm cp312 amd64+arm64 wheels are published on PyPI
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          v = os.environ["MOONCAKE_VERSION"]
+          url = f"https://pypi.org/pypi/mooncake-transfer-engine/{v}/json"
+          try:
+              data = json.load(urllib.request.urlopen(url, timeout=30))
+          except Exception as e:
+              sys.exit(f"Cannot fetch PyPI metadata for {v}: {e}")
+          arch_ok = {"x86_64": False, "aarch64": False}
+          for f in data.get("urls", []):
+              fn = f.get("filename", "")
+              if fn.endswith(".whl") and "cp312" in fn:
+                  for arch in arch_ok:
+                      if arch in fn:
+                          arch_ok[arch] = True
+          missing = [a for a, ok in arch_ok.items() if not ok]
+          if missing:
+              sys.exit(f"Missing cp312 wheel(s) for {v}: {missing}. "
+                       "Both amd64 (x86_64) and arm64 (aarch64) must be published first.")
+          print(f"cp312 amd64+arm64 wheels present for {v}")
+          PY
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android
+          df -h
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          # For an org access token (OAT), the login username is the org name
+          # (Docker: docker login --username <ORG_NAME>) — not a secret.
+          username: kvcacheai
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build multi-arch and push ONLY the immutable :<version> tag. :latest is promoted
+      # in a later step, after smoke passes. provenance/sbom disabled to keep the index
+      # free of unknown/unknown attestation entries (they would otherwise show up in
+      # `imagetools inspect`).
+      - name: Build and push :<version> (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/master.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+          build-args: |
+            MOONCAKE_VERSION=${{ inputs.mooncake_version }}
+            PIP_INDEX_URL=${{ env.PIP_INDEX_URL }}
+          tags: ${{ env.REPO }}:${{ inputs.mooncake_version }}
+          push: true
+
+      # Smoke tests run AFTER the :<version> push (a failed smoke leaves :<version> public
+      # — delete it from Docker Hub by hand; this manual workflow wires no auto-cleanup).
+      # :latest is NOT pushed yet, so a bad build can never poison the default pull tag.
+      # We exercise real entrypoints, not just imports: `mooncake_master --version` runs the
+      # compiled binary through the console-script/cli.py path and exits 0 (gflags
+      # SetVersionString) — note `--help` would exit 1 under gflags, so --version is used.
+      # `mooncake_http_metadata_server --help` (argparse) exits 0 and proves that entrypoint.
+      - name: Smoke test amd64 (entrypoints)
+        run: |
+          docker run --rm --platform linux/amd64 \
+            "${REPO}:${MOONCAKE_VERSION}" bash -c '
+              set -euo pipefail
+              python3 -c "import mooncake.engine, mooncake.store"
+              mooncake_master --version
+              mooncake_http_metadata_server --help >/dev/null
+              echo "amd64 ok"
+            '
+
+      # arm64 is the riskier arch here: the aarch64 wheel is manylinux_2_39 (glibc >= 2.39),
+      # which is the whole reason master.Dockerfile pins a trixie base. Smoke it under QEMU.
+      - name: Smoke test arm64 (entrypoints, QEMU)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            "${REPO}:${MOONCAKE_VERSION}" bash -c '
+              set -euo pipefail
+              python3 -c "import mooncake.engine, mooncake.store"
+              mooncake_master --version
+              mooncake_http_metadata_server --help >/dev/null
+              echo "arm64 ok"
+            '
+
+      # Promote :latest ONLY after both arches pass smoke, and only when explicitly
+      # requested. imagetools create copies the tested :<version> manifest by digest
+      # (no rebuild), so :latest can never point at an image that didn't pass smoke.
+      - name: Promote :latest (post-smoke)
+        if: ${{ inputs.tag_latest }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${REPO}:latest" \
+            "${REPO}:${MOONCAKE_VERSION}"

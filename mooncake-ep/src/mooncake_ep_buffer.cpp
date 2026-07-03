@@ -1,5 +1,6 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
+#include <cstdlib>
 #include <sstream>
 #include <transfer_engine.h>
 
@@ -21,6 +22,14 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
         ret = t->createQueuePairs(stream);
     }
     return ret == 0;
+}
+
+static bool macaHostPhaseFenceCoversPeers() {
+#ifdef MOONCAKE_EP_USE_MACA
+    return true;
+#else
+    return false;
+#endif
 }
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
@@ -202,7 +211,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
 
     auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -210,7 +219,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     };
 
     auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -218,7 +227,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::mark_and_wait_phase_ack(
             gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
             rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
@@ -244,7 +253,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_send_done();
     } else {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);
@@ -260,6 +269,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         // before the stream-wait happens, so in Python API, we must wrap
         // all tensors into the event handle.
         event = EventHandle(launch_stream);
+    } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
+        event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
         stream_wait(compute_stream, launch_stream);
     }
@@ -268,7 +279,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
-            wait_peer_send_done();
+            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
 
@@ -358,7 +369,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
 
     auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -366,7 +377,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     };
 
     auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -374,7 +385,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::mark_and_wait_phase_ack(
             gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
             rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
@@ -400,7 +411,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_send_done();
     } else {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);
@@ -416,6 +427,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         // before the stream-wait happens, so in Python API, we must wrap
         // all tensors into the event handle.
         event = EventHandle(launch_stream);
+    } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
+        event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
         stream_wait(compute_stream, launch_stream);
     }
@@ -424,7 +437,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
-            wait_peer_send_done();
+            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
 

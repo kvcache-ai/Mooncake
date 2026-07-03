@@ -2,6 +2,8 @@
 #include <gtest/gtest.h>
 
 #include "serializer.h"
+#include "serialize/serializer.hpp"
+#include "segment.h"
 
 namespace mooncake::test {
 
@@ -163,6 +165,56 @@ TEST_F(SerializerTest, ExampleClassDeserializationWithException) {
     // exception.
     auto restored = deserialize_from<ExampleClassWithException>(buffer);
     EXPECT_EQ(restored, nullptr);
+}
+
+TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
+    MountedSegment original;
+    original.segment.id = generate_uuid();
+    original.segment.name = "segment_host1";
+    original.segment.base = 0x300000000;
+    original.segment.size = 1024 * 1024;
+    original.segment.te_endpoint = "segment_host1";
+    original.segment.host_id = "host1";
+    original.status = SegmentStatus::OK;
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(
+        Serializer<MountedSegment>::serialize(original, packer).has_value());
+
+    auto object_handle = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored =
+        Serializer<MountedSegment>::deserialize(object_handle.get());
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->segment.id, original.segment.id);
+    EXPECT_EQ(restored->segment.name, original.segment.name);
+    EXPECT_EQ(restored->segment.host_id, original.segment.host_id);
+    EXPECT_EQ(restored->status, original.status);
+}
+
+TEST_F(SerializerTest, MountedSegmentDeserializesLegacyFormatWithoutHostId) {
+    const UUID segment_id = generate_uuid();
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    packer.pack_array(8);
+    packer.pack(UuidToString(segment_id));
+    packer.pack(std::string("legacy_segment"));
+    packer.pack(static_cast<uint64_t>(0x300000000));
+    packer.pack(static_cast<uint64_t>(1024 * 1024));
+    packer.pack(std::string("legacy_segment"));
+    packer.pack(static_cast<int16_t>(SegmentStatus::OK));
+    packer.pack(false);
+    packer.pack_nil();
+
+    auto object_handle = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored =
+        Serializer<MountedSegment>::deserialize(object_handle.get());
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->segment.id, segment_id);
+    EXPECT_EQ(restored->segment.name, "legacy_segment");
+    EXPECT_TRUE(restored->segment.host_id.empty());
+    EXPECT_EQ(restored->status, SegmentStatus::OK);
 }
 
 }  // namespace mooncake::test

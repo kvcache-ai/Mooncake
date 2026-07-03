@@ -3,6 +3,9 @@
 
 #include <chrono>
 #include <csignal>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -15,6 +18,7 @@
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "utils.h"
 
@@ -81,6 +85,18 @@ struct HttpSegmentsDetailResponse {
     uint64_t total_segments{0};
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments);
+
+std::string WriteTenantQuotaPolicyForTest(
+    const std::map<std::string, uint64_t>& tenant_quotas) {
+    TenantQuotaPolicySnapshot snapshot;
+    snapshot.tenant_quotas = tenant_quotas;
+    auto path = std::filesystem::temp_directory_path() /
+                ("mooncake_admin_tenant_quota_" +
+                 UuidToString(generate_uuid()) + ".yaml");
+    std::ofstream out(path);
+    out << FormatTenantQuotaPolicyYaml(snapshot);
+    return path.string();
+}
 
 }  // namespace
 
@@ -477,12 +493,13 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
 }
 
 TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
+    const std::string policy_path = WriteTenantQuotaPolicyForTest({});
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
     svc_config.enable_metric_reporting = false;
-    svc_config.enable_tenant_quota = true;
-    svc_config.default_tenant_quota_bytes = 1000;
-    svc_config.tenant_quota_pool_capacity_bytes = 2000;
+    svc_config.enable_multi_tenants = true;
+    svc_config.tenant_quota_connector_type = "file";
+    svc_config.tenant_quota_connector_uri = policy_path;
     auto service = std::make_shared<WrappedMasterService>(svc_config);
 
     Segment segment;
@@ -499,17 +516,6 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
     admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
     admin.SetServiceDelegate(service);
     admin.SetServiceAvailable(true);
-
-    auto default_get = HttpGet(port, "/api/v1/tenant_quotas/default");
-    EXPECT_EQ(default_get.http_status, 200);
-    EXPECT_NE(default_get.body.find("\"requested_quota_bytes\":1000"),
-              std::string::npos);
-
-    auto default_put = HttpPutJson(port, "/api/v1/tenant_quotas/default",
-                                   "{\"requested_quota_bytes\":0}");
-    EXPECT_EQ(default_put.http_status, 200);
-    EXPECT_NE(default_put.body.find("\"requested_quota_bytes\":0"),
-              std::string::npos);
 
     auto upsert = HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
                               "{\"requested_quota_bytes\":800}");
@@ -532,6 +538,25 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
     EXPECT_NE(one.body.find("\"committed_count\":0"), std::string::npos);
     EXPECT_NE(one.body.find("\"over_quota\":false"), std::string::npos);
 
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto put =
+        service->PutStart(client_id, "quota_admin_key", 100, cfg, "tenant-a");
+    ASSERT_TRUE(put.has_value()) << toString(put.error());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "quota_admin_key", ReplicaType::MEMORY,
+                             "tenant-a")
+                    .has_value());
+
+    auto delete_non_empty =
+        HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
+    EXPECT_EQ(delete_non_empty.http_status, 409);
+    EXPECT_NE(delete_non_empty.body.find("TENANT_NOT_EMPTY"),
+              std::string::npos);
+
+    ASSERT_TRUE(service->Remove("quota_admin_key", /*force=*/true, "tenant-a")
+                    .has_value());
+
     auto deleted = HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
     EXPECT_EQ(deleted.http_status, 200);
 
@@ -539,15 +564,17 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
     EXPECT_EQ(missing.http_status, 404);
 
     admin.Stop();
+    std::filesystem::remove(policy_path);
 }
 
 TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
+    const std::string policy_path = WriteTenantQuotaPolicyForTest({});
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
     svc_config.enable_metric_reporting = false;
-    svc_config.enable_tenant_quota = true;
-    svc_config.default_tenant_quota_bytes = 1000;
-    svc_config.tenant_quota_pool_capacity_bytes = 1000;
+    svc_config.enable_multi_tenants = true;
+    svc_config.tenant_quota_connector_type = "file";
+    svc_config.tenant_quota_connector_uri = policy_path;
     auto service = std::make_shared<WrappedMasterService>(svc_config);
 
     int port = getFreeTcpPort();
@@ -579,13 +606,14 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
     EXPECT_EQ(missing_query.http_status, 404);
 
     admin.Stop();
+    std::filesystem::remove(policy_path);
 }
 
 TEST_F(MasterAdminServerTest, TenantQuotaAdminDisabledModeReturns409) {
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
     svc_config.enable_metric_reporting = false;
-    svc_config.enable_tenant_quota = false;
+    svc_config.enable_multi_tenants = false;
     auto service = std::make_shared<WrappedMasterService>(svc_config);
 
     int port = getFreeTcpPort();

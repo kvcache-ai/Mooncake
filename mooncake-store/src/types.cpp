@@ -77,7 +77,9 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::GDS_IO_FAIL, "GDS_IO_FAIL"},
         {ErrorCode::GDS_NOT_AVAILABLE, "GDS_NOT_AVAILABLE"},
         {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
-        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"}};
+        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
+        {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";
