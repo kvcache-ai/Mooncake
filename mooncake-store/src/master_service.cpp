@@ -1736,6 +1736,15 @@ MasterService::EraseMetadata(
     // becomes an orphan that only expires after 600s.
     auto offload_it = tenant_state.offloading_tasks.find(key);
     if (offload_it != tenant_state.offloading_tasks.end()) {
+        // BatchEvict is deleting metadata while the store worker still has an
+        // in-flight offload for this key. Without this cleanup the task would
+        // be an orphan that only expires after put_start_release_timeout_sec.
+        LOG(WARNING)
+            << "[CLEANUP-ORPHAN] erasing metadata for key=" << key
+            << " tenant=" << tenant_id
+            << " while offloading_task is still registered (source_id="
+            << offload_it->second.source_id
+            << "); dec_refcnt applied, offloading_task erased";
         auto source = metadata.GetReplicaByID(offload_it->second.source_id);
         if (source != nullptr) {
             source->dec_refcnt();
@@ -4981,6 +4990,23 @@ auto MasterService::NotifyOffloadSuccess(
                                << ". Expected ReplicaType::LOCAL_DISK.";
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
+                if (task_it == tenant_state.offloading_tasks.end()) {
+                    // Worker reports offload success for a key the master does
+                    // not remember queuing. Either the offloading_task already
+                    // expired (put_start_release_timeout_sec) or the metadata
+                    // was erased by BatchEvict's cleanup phase. Either way the
+                    // caller has done the work; we accept the LOCAL_DISK
+                    // replica via AddReplica below but log the mismatch so
+                    // orphan-task sources are visible.
+                    LOG(INFO)
+                        << "[OFFLOAD-NOTASK] NotifyOffloadSuccess received a "
+                           "complete for key="
+                        << request_object_id.user_key
+                        << " tenant=" << request_object_id.tenant_id
+                        << " but no offloading_task is registered (already "
+                           "expired or cleaned up); will add LOCAL_DISK "
+                           "replica via AddReplica";
+                }
 
                 // Existing orphan objects can only bypass tenant registration
                 // for a master-admitted offload completion. Without this task
@@ -5067,6 +5093,14 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
+        // Replica has no transport segments — nothing to offload. This is
+        // unusual for a MEMORY replica that triggered BatchEvict; log it so
+        // silent no-ops show up in diagnostics instead of mysteriously
+        // skipping the offload path.
+        LOG(WARNING) << "[PUSH-EMPTY] PushOffloadingQueue called for key="
+                     << object_id.user_key
+                     << " tenant=" << object_id.tenant_id
+                     << " but replica has no segment_names; offload skipped";
         return {};
     }
     for (const auto& segment_name_it : segment_names) {
