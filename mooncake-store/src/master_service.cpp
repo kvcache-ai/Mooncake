@@ -3151,24 +3151,43 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
-        bool task_created = false;
-        metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_completed() && replica.is_memory_replica();
-            },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
-                auto result = PushOffloadingQueue(object_id, replica);
-                if (result) {
-                    if (!task_created) {
+        // Skip if an offloading task is already in flight for this key —
+        // emplace would silently fail, leaving the inc_refcnt below as a
+        // permanent leak. With replica_num>1, the visitor would keep iterating
+        // after the first emplace, double-pinning the second replica.
+        if (tenant_state.offloading_tasks.count(object_id.user_key) == 0) {
+            bool task_created = false;
+            metadata.VisitReplicas(
+                [](const Replica& replica) {
+                    return replica.is_completed() && replica.is_memory_replica();
+                },
+                [this, &object_id, &tenant_state,
+                 &task_created](Replica& replica) {
+                    if (task_created) return;  // only pin one replica per key
+                    auto result = PushOffloadingQueue(object_id, replica);
+                    if (result) {
                         replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            object_id.user_key,
-                            OffloadingTask{replica.id(),
-                                           std::chrono::system_clock::now()});
-                        task_created = true;
+                        auto [it, inserted] =
+                            tenant_state.offloading_tasks.emplace(
+                                object_id.user_key,
+                                OffloadingTask{
+                                    replica.id(),
+                                    std::chrono::system_clock::now()});
+                        if (!inserted) {
+                            // Race: another path already queued this key.
+                            // Roll back the refcnt so it doesn't leak.
+                            replica.dec_refcnt();
+                            LOG(WARNING)
+                                << "[PUTEND-OFFLOAD-EMPLACE-FAIL] key="
+                                << object_id.user_key
+                                << " already has offloading_task; rolled "
+                                   "back refcnt";
+                        } else {
+                            task_created = true;
+                        }
                     }
-                }
-            });
+                });
+        }
     }
 
     // If the object is completed, remove it from the processing set.
