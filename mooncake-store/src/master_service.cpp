@@ -7188,24 +7188,40 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
 
         // Queue one MEMORY replica for offload; others will be evicted below.
+        // Skip if an offloading task is already in flight for this key —
+        // otherwise the emplace below silently fails and inc_refcnt leaks.
         bool queued = false;
-        metadata.VisitReplicas(
-            [](const Replica& r) {
-                return r.is_memory_replica() && r.is_completed() &&
-                       r.get_refcnt() == 0;
-            },
-            [this, &tenant_id, &key, &tenant_state, &queued,
-             &now](Replica& replica) {
-                if (queued) return;  // only need to pin one replica for offload
-                auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, tenant_id), replica);
-                if (result) {
-                    replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
-                    queued = true;
-                }
-            });
+        if (tenant_state.offloading_tasks.count(key) == 0) {
+            metadata.VisitReplicas(
+                [](const Replica& r) {
+                    return r.is_memory_replica() && r.is_completed() &&
+                           r.get_refcnt() == 0;
+                },
+                [this, &tenant_id, &key, &tenant_state, &queued,
+                 &now](Replica& replica) {
+                    if (queued) return;  // only pin one replica for offload
+                    auto result = PushOffloadingQueue(
+                        MakeObjectIdentity(key, tenant_id), replica);
+                    if (result) {
+                        replica.inc_refcnt();
+                        auto [it, inserted] =
+                            tenant_state.offloading_tasks.emplace(
+                                key, OffloadingTask{replica.id(), now});
+                        if (!inserted) {
+                            // Cross-cycle re-pin: another iteration already
+                            // queued this key. Roll back to avoid refcnt leak.
+                            replica.dec_refcnt();
+                            LOG(WARNING)
+                                << "[BATCHEVICT-OFFLOAD-EMPLACE-FAIL] key="
+                                << key
+                                << " already has offloading_task; rolled "
+                                   "back refcnt";
+                        } else {
+                            queued = true;
+                        }
+                    }
+                });
+        }
 
         if (queued) {
             offload_queued_this_cycle++;
