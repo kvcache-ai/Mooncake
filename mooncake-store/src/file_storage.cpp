@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-#include "aligned_client_buffer.hpp"
+#include "aligned_client_buffer.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"

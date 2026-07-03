@@ -14,7 +14,7 @@
 
 #include "pyclient.h"
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
