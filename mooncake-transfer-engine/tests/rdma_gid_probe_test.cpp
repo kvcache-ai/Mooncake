@@ -399,4 +399,137 @@ TEST(RdmaGidProbeTest, RetryActionRequiresObservedOrReprobedChange) {
               AutoGidRetryAction::kRetryWithObservedChange);
 }
 
+// Regression tests for #2729: a routable-fabric private-range IPv4 GID must
+// outrank a link-local IPv6 GID instead of tying with it in the degraded
+// tier (where the lowest-index tie-break used to pick fe80::).
+
+// Exactly the GID table from the #2729 report: fe80 v1/v2 at indices 0/1,
+// 10.14.x-mapped v1/v2 at indices 2/3, all on the same netdev. RoCE v1
+// entries are filtered by type; index 3 (private v4, RoCE v2) must win over
+// index 1 (link-local, RoCE v2).
+TEST(RdmaGidProbeTest, PrefersPrivateRangeV4OverLinkLocal) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/0, IBV_GID_TYPE_ROCE_V1,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/true),
+        makeCandidate(/*gid_index=*/1, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/true),
+        makeCandidate(/*gid_index=*/2, IBV_GID_TYPE_ROCE_V1,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/false,
+                      /*is_overlay_ipv4=*/true),
+        makeCandidate(/*gid_index=*/3, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/false,
+                      /*is_overlay_ipv4=*/true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 3);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkPrivateV4);
+}
+
+// A genuinely routable (non-private) v4 GID still outranks a private-range
+// one: the new tier sits strictly between routable and degraded.
+TEST(RdmaGidProbeTest, RoutableV4StillOutranksPrivateRangeV4) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/1, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/false,
+                      /*is_overlay_ipv4=*/true),
+        makeCandidate(/*gid_index=*/5, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 5);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkRoutable);
+}
+
+// An overlay-NAMED interface (docker0/cni/...) stays demoted below
+// private-range v4 even when its address is v4-mapped: the interface-name
+// heuristic remains the strongest demotion signal.
+TEST(RdmaGidProbeTest, OverlayInterfaceStaysDemotedBelowPrivateRangeV4) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/1, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/true,
+                      /*is_overlay_ipv4=*/true),
+        makeCandidate(/*gid_index=*/4, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/false,
+                      /*is_overlay_ipv4=*/true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 4);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkPrivateV4);
+}
+
+// Cross-tier order is preserved from before the split: a link-local GID
+// with a netdev still outranks a private-range v4 GID without one, exactly
+// as network-degraded outranked no-network-degraded before.
+TEST(RdmaGidProbeTest, NetworkLinkLocalStillOutranksNoNetworkPrivateV4) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/1, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/true),
+        makeCandidate(/*gid_index=*/3, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/false,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/false,
+                      /*is_overlay_ipv4=*/true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkDegraded);
+}
+
+// When only link-local candidates exist, behavior is unchanged: lowest
+// index wins within the tier.
+TEST(RdmaGidProbeTest, LinkLocalOnlyKeepsLowestIndexTieBreak) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/1, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/true),
+        makeCandidate(/*gid_index=*/2, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkDegraded);
+}
+
 }  // namespace

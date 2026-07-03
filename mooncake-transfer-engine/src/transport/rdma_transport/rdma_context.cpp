@@ -745,9 +745,11 @@ static GidNetworkState autoGidStateFromSelection(
     const AutoGidSelection &selection) {
     switch (selection.candidate_class) {
         case AutoGidCandidateClass::kNetworkRoutable:
+        case AutoGidCandidateClass::kNetworkPrivateV4:
         case AutoGidCandidateClass::kNetworkDegraded:
             return GidNetworkState::GID_WITH_NETWORK;
         case AutoGidCandidateClass::kNoNetworkRoutable:
+        case AutoGidCandidateClass::kNoNetworkPrivateV4:
         case AutoGidCandidateClass::kNoNetworkDegraded:
         case AutoGidCandidateClass::kFallbackNonzero:
             return GidNetworkState::GID_WITHOUT_NETWORK;
