@@ -1,5 +1,10 @@
 #pragma once
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+
 #include "client_service.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
@@ -101,6 +106,36 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
+    // Single-key promotion body factored out of ProcessPromotionTasks so it
+    // can be called by both the inline fallback path (when workers are not
+    // running) and the background worker threads. Returns a structured result
+    // so callers can compose failure reporting.
+    struct PromotionExecutionResult {
+        ErrorCode terminal_error{ErrorCode::OK};
+        bool alloc_attempted{false};
+        bool write_attempted{false};
+        bool notify_success_attempted{false};
+        bool notify_failure_attempted{false};
+        bool completed{false};
+    };
+    PromotionExecutionResult ProcessPromotionTask(
+        const PromotionTaskItem& task,
+        const std::vector<std::string>& preferred_segments);
+
+    // Hand a task to a background worker. Returns false (and the caller will
+    // fall back to ReleasePromotionTask) when workers are not running or the
+    // local queue is at capacity.
+    bool EnqueuePromotionTask(const PromotionTaskItem& task);
+
+    // Best-effort NotifyPromotionFailure; swallows errors because the master
+    // reaper is the long-stop.
+    void ReleasePromotionTask(const std::string& key,
+                              const std::string& tenant_id);
+
+    // Background worker main loop. Drains promotion_task_queue_ in batches of
+    // promotion_drain_batch_size.
+    void PromotionWorkerThreadFunc();
+
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
     tl::expected<void, ErrorCode> BatchLoad(
@@ -145,6 +180,17 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+
+    // Background promotion workers. ProcessPromotionTasks pulls candidates
+    // from the master and hands them to a pool of worker threads via
+    // promotion_task_queue_, so the heartbeat path is not gated by per-key
+    // SSD read + RDMA write latency. Workers drain the queue in batches of
+    // config_.promotion_drain_batch_size.
+    std::atomic<bool> promotion_workers_running_{false};
+    std::vector<std::thread> promotion_worker_threads_;
+    std::mutex promotion_queue_mutex_;
+    std::condition_variable promotion_queue_cv_;
+    std::deque<PromotionTaskItem> promotion_task_queue_;
 };
 
 }  // namespace mooncake
