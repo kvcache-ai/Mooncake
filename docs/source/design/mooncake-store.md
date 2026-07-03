@@ -731,7 +731,7 @@ When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, a
 
 ​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
-This DFS-backed path is separate from local SSD offload. Local SSD offload uses `--enable_offload=true` on the master and real client, stores data under the real client's `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, and records `LOCAL_DISK` replicas. Do not point `--root_fs_dir` at a node-local SSD directory for local SSD offload.
+This distributed filesystem-backed path is separate from the local filesystem-backed offload path. The local filesystem-backed path uses `--enable_offload=true` on the master and real client, stores data under the real client's `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, and records `LOCAL_DISK` replicas. Do not point `--root_fs_dir` at a per-node filesystem path for local offload.
 
 ### Persistent Storage Space Configuration​
 Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
