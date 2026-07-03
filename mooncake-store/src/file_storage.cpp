@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -93,6 +97,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.promotion_drain_batch_size =
         GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_PROMOTION_DRAIN_BATCH_SIZE",
                            config.promotion_drain_batch_size);
+    config.offload_write_threads =
+        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_WRITE_THREADS",
+                           config.offload_write_threads);
 
     auto use_uring_str =
         GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
@@ -451,9 +458,17 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // orphaned offloading_tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
+    std::mutex failed_tasks_mutex;
 
-    for (const auto& keys : buckets_keys) {
-        for (const auto& k : keys) all_bucket_keys.insert(k);
+    // The loop body is captured as a lambda so it can be dispatched either
+    // serially (offload_write_threads <= 1) or in parallel via a thread pool.
+    auto process_bucket = [&](const std::vector<std::string>& keys)
+        -> std::optional<ErrorCode> {
+        std::vector<OffloadTaskItem> local_failed;
+        {
+            std::lock_guard<std::mutex> lk(failed_tasks_mutex);
+            for (const auto& k : keys) all_bucket_keys.insert(k);
+        }
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
@@ -483,12 +498,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 if (it != user_batch_object.end()) {
                     batch_object.emplace(storage_key, std::move(it->second));
                 } else {
-                    failed_tasks.push_back(task);
+                    local_failed.push_back(task);
                 }
             }
         }
         if (batch_object.empty()) {
-            continue;
+            std::lock_guard<std::mutex> lk(failed_tasks_mutex);
+            for (auto& t : local_failed) failed_tasks.push_back(std::move(t));
+            return std::nullopt;
         }
 
         auto eviction_handler = [this](const std::vector<std::string>&
@@ -539,7 +556,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
                         pinned_buffer_pool_->Release(std::move(buf));
                         obj_success = false;
-                        failed_tasks.push_back(task_by_storage_key.at(obj_key));
+                        local_failed.push_back(task_by_storage_key.at(obj_key));
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
@@ -556,9 +573,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto offload_start = std::chrono::steady_clock::now();
         auto bucket_complete_handler =
             [this, offload_start, complete_handler](
-                const std::vector<std::string>& keys,
+                const std::vector<std::string>& bucket_keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
-            auto res = complete_handler(keys, metadatas);
+            auto res = complete_handler(bucket_keys, metadatas);
             if (res == ErrorCode::OK && ssd_metric_) {
                 auto elapsed_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -568,11 +585,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 for (const auto& metadata : metadatas) {
                     total_bytes += metadata.data_size;
                 }
-                ssd_metric_->ssd_write_ops.inc(keys.size());
+                ssd_metric_->ssd_write_ops.inc(bucket_keys.size());
                 ssd_metric_->ssd_write_bytes.inc(total_bytes);
                 ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
                 ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
-                ssd_metric_->ssd_total_ops.inc(keys.size());
+                ssd_metric_->ssd_total_ops.inc(bucket_keys.size());
                 ssd_metric_->ssd_total_bytes.inc(total_bytes);
                 ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
                 ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
@@ -592,15 +609,70 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
                 MutexLocker locker(&offloading_mutex_);
                 enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
+                return offload_res.error();
             }
             if (offload_res.error() == ErrorCode::INVALID_READ) {
                 for (const auto& [key, _] : host_batch_object) {
-                    failed_tasks.push_back(task_by_storage_key.at(key));
+                    local_failed.push_back(task_by_storage_key.at(key));
                 }
             } else {
-                return tl::make_unexpected(offload_res.error());
+                return offload_res.error();
             }
+        }
+        std::lock_guard<std::mutex> lk(failed_tasks_mutex);
+        for (auto& t : local_failed) failed_tasks.push_back(std::move(t));
+        return std::nullopt;
+    };
+
+    const uint32_t write_threads =
+        std::max<uint32_t>(1, config_.offload_write_threads);
+    if (write_threads == 1 || buckets_keys.size() <= 1) {
+        // Serial path — preserves prior behavior and avoids thread-pool
+        // overhead for the single-bucket (or disabled) case.
+        for (const auto& keys : buckets_keys) {
+            auto err = process_bucket(keys);
+            if (err.has_value()) {
+                return tl::make_unexpected(err.value());
+            }
+        }
+    } else {
+        // Parallel path — dispatch independent buckets concurrently.
+        // Each bucket is a separate file on SSD with no shared write state,
+        // so writes can safely overlap. A bounded set of worker threads pulls
+        // buckets from a shared index, capping memory pressure regardless of
+        // how many buckets GroupOffloadingKeysByBucket produced.
+        const size_t n = buckets_keys.size();
+        std::atomic<size_t> next_index{0};
+        std::atomic<bool> first_error_set{false};
+        std::optional<ErrorCode> first_error;  // protected by result_mutex
+        std::mutex result_mutex;
+
+        auto worker = [&]() {
+            for (;;) {
+                if (first_error_set.load()) return;
+                size_t i = next_index.fetch_add(1, std::memory_order_acq_rel);
+                if (i >= n) return;
+                auto err = process_bucket(buckets_keys[i]);
+                if (err.has_value()) {
+                    std::lock_guard<std::mutex> lk(result_mutex);
+                    if (!first_error_set.exchange(true)) {
+                        first_error = err.value();
+                    }
+                    return;
+                }
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(write_threads);
+        for (uint32_t i = 0; i < write_threads; ++i) {
+            workers.emplace_back(worker);
+        }
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
+        }
+        if (first_error.has_value()) {
+            return tl::make_unexpected(first_error.value());
         }
     }
 
