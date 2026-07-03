@@ -1449,18 +1449,21 @@ class MooncakeBundleTransfer:
         After get_dataproto / get_legacy_dict, ndarray payloads may be backed by
         the BufferPool.  Call this to release those leases deterministically
         instead of waiting for GC ``__del__``.
+
+        Works for both flat dicts (legacy_dict) and nested envelope dicts
+        (dataproto: {batch: {...}, non_tensor_batch: {...}, meta_info: {...}}).
         """
         if not isinstance(result, Mapping):
             return
         for value in result.values():
+            if isinstance(value, Mapping):
+                MooncakeBundleTransfer.release_result(value)
+                continue
             owner = getattr(value, "_mooncake_pool_owner", None)
             if owner is not None:
                 owner.release()
                 continue
-            if (
-                isinstance(value, np.ndarray)
-                and value.dtype == object
-            ):
+            if isinstance(value, np.ndarray) and value.dtype == object:
                 for item in value.flat:
                     item_owner = getattr(item, "_mooncake_pool_owner", None)
                     if item_owner is not None:
