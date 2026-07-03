@@ -229,7 +229,10 @@ struct FileStorageConfig {
     // Background worker settings for L2->L1 promotion-on-hit execution.
     // Set promotion_worker_threads to 0 to fall back to the synchronous
     // (inline-in-heartbeat) execution path used before PR #2529.
-    uint32_t promotion_worker_threads = 1;
+    // 4 matches production load where each heartbeat pulls 64 tasks and each
+    // task does a ~1-2 ms SSD read + RDMA write; 4 workers drain 64 tasks in
+    // ~16 ms, comfortably inside one heartbeat tick.
+    uint32_t promotion_worker_threads = 4;
     // Soft local backlog cap. 0 = unbounded.
     uint32_t promotion_queue_capacity = 1024;
     // Per-worker drain batch size.
