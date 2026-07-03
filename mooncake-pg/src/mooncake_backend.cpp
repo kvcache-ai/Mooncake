@@ -3357,6 +3357,32 @@ void MooncakeBackend::publishLocalPeerMetadata() {
     meta_->store->set(serverNameKey, localServerName_);
 }
 
+bool MooncakeBackend::allActivePeersOnSameHost() const {
+    if (!meta_ || !meta_->store) return false;
+
+    const std::string local_server_host = serverHostOnly(localServerName_);
+    std::vector<std::string> server_name_keys;
+    server_name_keys.reserve(meta_->activeSize);
+    for (int j = 0; j < meta_->activeSize; ++j) {
+        server_name_keys.push_back(
+            ConnectionContext::getServerNameStoreKey(meta_->backendIndex, j));
+    }
+    BackoffWaiter waiter(
+        BackoffWaiterConfig::constantSleep(std::chrono::milliseconds(10)));
+    waiter.wait([&] { return meta_->store->check(server_name_keys); });
+
+    for (int j = 0; j < meta_->activeSize; ++j) {
+        if (!meta_->activeRanks[j]) continue;
+        const auto peer_server_name = meta_->store->get(server_name_keys[j]);
+        const std::string peer_server_name_str(peer_server_name.begin(),
+                                               peer_server_name.end());
+        if (serverHostOnly(peer_server_name_str) != local_server_host) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void MooncakeBackend::maybeInitHierarchicalAllReduceWorkspace() {
 #ifdef MOONCAKE_EP_USE_MUSA
     return;
