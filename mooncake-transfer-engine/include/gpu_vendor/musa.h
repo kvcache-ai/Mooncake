@@ -62,6 +62,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
 #define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
+#define cudaErrorNotReady musaErrorNotReady
 #define cudaError_t musaError_t
 #define cudaFree musaFree
 #define cudaFreeHost musaFreeHost
@@ -94,10 +95,19 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaPointerGetAttributes musaPointerGetAttributes
 #define cudaSetDevice musaSetDevice
 #define cudaStreamCreate musaStreamCreate
+#define cudaStreamCreateWithFlags musaStreamCreateWithFlags
+#define cudaStreamNonBlocking musaStreamNonBlocking
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamSynchronize musaStreamSynchronize
+#define cudaStreamWaitEvent musaStreamWaitEvent
+#define cudaStreamQuery musaStreamQuery
+#define cudaStreamPerThread musaStreamPerThread
 #define cudaStream_t musaStream_t
 #define cudaEvent_t musaEvent_t
+#define cudaEventCreateWithFlags musaEventCreateWithFlags
+#define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventDestroy musaEventDestroy
+#define cudaEventRecord musaEventRecord
 #define cudaHostGetDevicePointer musaHostGetDevicePointer
 #define cudaSuccess musaSuccess
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
