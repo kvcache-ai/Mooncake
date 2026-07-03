@@ -79,6 +79,11 @@ class P2PStandbyMetadataStore : public MetadataStore {
                         uint16_t rpc_port,
                         const std::vector<Segment>& segments);
 
+    /// Unregister a client.
+    /// Also removes all replicas owned by this client from their objects
+    /// (cascade delete).
+    void UnRegisterClient(const UUID& client_id);
+
     /// Add (mount) a segment to a client.
     void AddSegment(const UUID& client_id, const Segment& segment);
 

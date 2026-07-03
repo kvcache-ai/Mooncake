@@ -27,18 +27,15 @@ Segment MakeSegment(const UUID& id, size_t size = 1024) {
 // P2PStandbyMetadataStore - Basic MetadataStore interface
 // ============================================================================
 
-TEST(P2PStandbyMetadataStoreTest, PutAndGetMetadata) {
+TEST(P2PStandbyMetadataStoreTest, PutMetadataIsCompatibilityNoop) {
     P2PStandbyMetadataStore store;
     StandbyObjectMetadata meta;
     meta.size = 4096;
     meta.last_sequence_id = 42;
 
     EXPECT_TRUE(store.PutMetadata("key1", meta));
-
-    auto result = store.GetMetadata("key1");
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(result->size, 4096u);
-    EXPECT_EQ(result->last_sequence_id, 42u);
+    EXPECT_FALSE(store.GetMetadata("key1").has_value());
+    EXPECT_EQ(store.GetKeyCount(), 0u);
 }
 
 TEST(P2PStandbyMetadataStoreTest, GetMetadataNotFound) {
@@ -51,7 +48,8 @@ TEST(P2PStandbyMetadataStoreTest, Remove) {
     P2PStandbyMetadataStore store;
     StandbyObjectMetadata meta;
     meta.size = 100;
-    store.PutMetadata("key1", meta);
+    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100, 0, {},
+                     MemoryType::DRAM);
 
     EXPECT_TRUE(store.Remove("key1"));
     EXPECT_FALSE(store.GetMetadata("key1").has_value());
@@ -61,8 +59,8 @@ TEST(P2PStandbyMetadataStoreTest, Remove) {
 TEST(P2PStandbyMetadataStoreTest, Exists) {
     P2PStandbyMetadataStore store;
     EXPECT_FALSE(store.Exists("key1"));
-    StandbyObjectMetadata meta;
-    store.PutMetadata("key1", meta);
+    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100, 0, {},
+                     MemoryType::DRAM);
     EXPECT_TRUE(store.Exists("key1"));
 }
 
@@ -70,10 +68,11 @@ TEST(P2PStandbyMetadataStoreTest, GetKeyCount) {
     P2PStandbyMetadataStore store;
     EXPECT_EQ(store.GetKeyCount(), 0u);
 
-    StandbyObjectMetadata meta;
-    store.PutMetadata("key1", meta);
+    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100, 0, {},
+                     MemoryType::DRAM);
     EXPECT_EQ(store.GetKeyCount(), 1u);
-    store.PutMetadata("key2", meta);
+    store.AddReplica("key2", MakeUUID(1, 0), MakeUUID(11, 0), 200, 0, {},
+                     MemoryType::DRAM);
     EXPECT_EQ(store.GetKeyCount(), 2u);
     store.Remove("key1");
     EXPECT_EQ(store.GetKeyCount(), 1u);
@@ -83,12 +82,11 @@ TEST(P2PStandbyMetadataStoreTest, GetKeyCount) {
 // AddReplica / RemoveReplica
 // ============================================================================
 
-TEST(P2PStandbyMetadataStoreTest, LegacyPut) {
+TEST(P2PStandbyMetadataStoreTest, PutIsCompatibilityNoop) {
     P2PStandbyMetadataStore store;
     EXPECT_TRUE(store.Put("key1"));
-    auto result = store.GetMetadata("key1");
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(result->size, 0u);
+    EXPECT_FALSE(store.GetMetadata("key1").has_value());
+    EXPECT_EQ(store.GetKeyCount(), 0u);
 }
 
 TEST(P2PStandbyMetadataStoreTest, AddReplicaAfterClientRegistered) {
@@ -108,6 +106,28 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaAfterClientRegistered) {
     // IP/port should be populated since client was registered first
     EXPECT_EQ(p2p.ip_address, "10.0.0.1");
     EXPECT_EQ(p2p.rpc_port, 50051u);
+}
+
+TEST(P2PStandbyMetadataStoreTest, AddReplicaUpdatesSegmentExtra) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto seg_id = MakeUUID(10, 0);
+    auto seg = MakeSegment(seg_id, 4096);
+    seg.GetP2PExtra().usage = 256;
+    store.RegisterClient(client_id, "10.0.0.1", 50051, {seg});
+
+    store.AddReplica("key1", client_id, seg_id, 1024, 7, {"hot", "ssd"},
+                     MemoryType::NVME);
+
+    auto* info = store.GetClient(client_id);
+    ASSERT_NE(info, nullptr);
+    ASSERT_EQ(info->segments.size(), 1u);
+    ASSERT_TRUE(info->segments[0].IsP2PSegment());
+    const auto& extra = info->segments[0].GetP2PExtra();
+    EXPECT_EQ(extra.priority, 7);
+    EXPECT_EQ(extra.tags, std::vector<std::string>({"hot", "ssd"}));
+    EXPECT_EQ(extra.memory_type, MemoryType::NVME);
+    EXPECT_EQ(extra.usage, 256u);
 }
 
 TEST(P2PStandbyMetadataStoreTest, AddReplicaCreatesObject) {
@@ -138,6 +158,19 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaMultiple) {
     auto it = store.GetObjects().find("key1");
     ASSERT_NE(it, store.GetObjects().end());
     EXPECT_EQ(it->second.replicas.size(), 2u);
+}
+
+TEST(P2PStandbyMetadataStoreTest, AddReplicaDuplicateIgnored) {
+    P2PStandbyMetadataStore store;
+    auto client = MakeUUID(1, 0);
+    auto seg = MakeUUID(10, 0);
+
+    store.AddReplica("key1", client, seg, 1024, 0, {}, MemoryType::DRAM);
+    store.AddReplica("key1", client, seg, 1024, 0, {}, MemoryType::DRAM);
+
+    auto it = store.GetObjects().find("key1");
+    ASSERT_NE(it, store.GetObjects().end());
+    EXPECT_EQ(it->second.replicas.size(), 1u);
 }
 
 TEST(P2PStandbyMetadataStoreTest, RemoveReplica) {
@@ -290,6 +323,86 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesReplicaIPs) {
         obj_it->second.replicas[0].descriptor_variant);
     EXPECT_EQ(exported_p2p.ip_address, "192.168.1.1");
     EXPECT_EQ(exported_p2p.rpc_port, 50051u);
+}
+
+// ============================================================================
+// UnRegisterClient
+// ============================================================================
+
+TEST(P2PStandbyMetadataStoreTest, UnRegisterClientUnknownClient) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+
+    // UnRegisterClient with unregistered client — should not crash
+    store.UnRegisterClient(client_id);
+
+    EXPECT_EQ(store.GetClient(client_id), nullptr);
+    EXPECT_EQ(store.GetKeyCount(), 0u);
+}
+
+TEST(P2PStandbyMetadataStoreTest, UnRegisterClientRemovesClientInfo) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto seg_id = MakeUUID(10, 0);
+
+    store.RegisterClient(client_id, "10.0.0.1", 50051,
+                         {MakeSegment(seg_id, 1024)});
+    ASSERT_NE(store.GetClient(client_id), nullptr);
+
+    store.UnRegisterClient(client_id);
+
+    EXPECT_EQ(store.GetClient(client_id), nullptr);
+    EXPECT_TRUE(store.GetClients().empty());
+}
+
+TEST(P2PStandbyMetadataStoreTest, UnRegisterClientCascadeDeletesReplicas) {
+    P2PStandbyMetadataStore store;
+    auto client_id = MakeUUID(1, 0);
+    auto seg1 = MakeUUID(10, 0);
+    auto seg2 = MakeUUID(11, 0);
+
+    store.RegisterClient(client_id, "10.0.0.1", 50051,
+                         {MakeSegment(seg1, 1024), MakeSegment(seg2, 2048)});
+    store.AddReplica("key1", client_id, seg1, 1024, 0, {}, MemoryType::DRAM);
+    store.AddReplica("key2", client_id, seg2, 2048, 0, {}, MemoryType::DRAM);
+    ASSERT_EQ(store.GetKeyCount(), 2u);
+
+    store.UnRegisterClient(client_id);
+
+    EXPECT_EQ(store.GetClient(client_id), nullptr);
+    EXPECT_EQ(store.GetKeyCount(), 0u);
+}
+
+TEST(P2PStandbyMetadataStoreTest, UnRegisterClientPreservesOtherClients) {
+    P2PStandbyMetadataStore store;
+    auto client1 = MakeUUID(1, 0);
+    auto client2 = MakeUUID(2, 0);
+    auto seg1 = MakeUUID(10, 0);
+    auto seg2 = MakeUUID(20, 0);
+
+    store.RegisterClient(client1, "10.0.0.1", 50051, {MakeSegment(seg1, 1024)});
+    store.RegisterClient(client2, "10.0.0.2", 50052, {MakeSegment(seg2, 2048)});
+    store.AddReplica("shared-key", client1, seg1, 1024, 0, {},
+                     MemoryType::DRAM);
+    store.AddReplica("shared-key", client2, seg2, 2048, 0, {},
+                     MemoryType::DRAM);
+    store.AddReplica("client1-only", client1, seg1, 512, 0, {},
+                     MemoryType::DRAM);
+
+    store.UnRegisterClient(client1);
+
+    EXPECT_EQ(store.GetClient(client1), nullptr);
+    ASSERT_NE(store.GetClient(client2), nullptr);
+    EXPECT_EQ(store.GetKeyCount(), 1u);
+
+    auto shared_it = store.GetObjects().find("shared-key");
+    ASSERT_NE(shared_it, store.GetObjects().end());
+    ASSERT_EQ(shared_it->second.replicas.size(), 1u);
+    const auto& p2p = std::get<P2PProxyDescriptor>(
+        shared_it->second.replicas[0].descriptor_variant);
+    EXPECT_EQ(p2p.client_id, client2);
+    EXPECT_EQ(store.GetObjects().find("client1-only"),
+              store.GetObjects().end());
 }
 
 // ============================================================================

@@ -10,16 +10,16 @@ namespace mooncake {
 // ============================================================================
 
 bool P2PStandbyMetadataStore::PutMetadata(
-    const std::string& key, const StandbyObjectMetadata& metadata) {
-    objects_[key] = metadata;
+    const std::string& /*key*/, const StandbyObjectMetadata& /*metadata*/) {
+    // Compatibility no-op. P2P standby metadata is reconstructed from
+    // P2P-specific oplog operations.
     return true;
 }
 
-bool P2PStandbyMetadataStore::Put(const std::string& key,
+bool P2PStandbyMetadataStore::Put(const std::string& /*key*/,
                                   const std::string& /*payload*/) {
-    // Legacy Put — create empty metadata. Called by OpLogApplier base class
-    // for PUT_END without payload (legacy compatibility).
-    objects_[key] = StandbyObjectMetadata{};
+    // Compatibility no-op. P2P standby metadata is reconstructed from
+    // P2P-specific oplog operations.
     return true;
 }
 
@@ -56,6 +56,35 @@ void P2PStandbyMetadataStore::AddReplica(const std::string& object_key,
     metadata.size = size;
     metadata.last_sequence_id = 0;  // Will be set by Applier
 
+    auto client_it = clients_.find(client_id);
+    if (client_it != clients_.end()) {
+        for (auto& segment : client_it->second.segments) {
+            if (segment.id != segment_id) {
+                continue;
+            }
+            auto& extra = segment.GetP2PExtra();
+            extra.priority = priority;
+            extra.tags = tags;
+            extra.memory_type = memory_type;
+            break;
+        }
+    }
+
+    for (const auto& desc : metadata.replicas) {
+        if (!std::holds_alternative<P2PProxyDescriptor>(
+                desc.descriptor_variant)) {
+            continue;
+        }
+        const auto& p2p = std::get<P2PProxyDescriptor>(desc.descriptor_variant);
+        if (p2p.client_id == client_id && p2p.segment_id == segment_id) {
+            VLOG(1) << "P2PStandbyMetadataStore::AddReplica key=" << object_key
+                    << " client=" << client_id.first << ":" << client_id.second
+                    << " seg=" << segment_id.first << ":" << segment_id.second
+                    << " already exists, ignoring duplicate";
+            return;
+        }
+    }
+
     // Build a Replica::Descriptor for this replica.
     // P2PProxyDescriptor is the P2P-specific descriptor type.
     Replica::Descriptor desc;
@@ -65,7 +94,6 @@ void P2PStandbyMetadataStore::AddReplica(const std::string& object_key,
     desc.id = replica_id;
 
     // Look up client info for IP/port
-    auto client_it = clients_.find(client_id);
     if (client_it != clients_.end()) {
         P2PProxyDescriptor p2p_desc;
         p2p_desc.client_id = client_id;
@@ -157,6 +185,36 @@ void P2PStandbyMetadataStore::RegisterClient(
     // IP/port backfilling is deferred to ExportMetadata() to avoid O(N*M)
     // overhead on the OpLog replication thread. IP/port is only needed after
     // promotion, so a one-time scan during ExportMetadata() is acceptable.
+}
+
+void P2PStandbyMetadataStore::UnRegisterClient(const UUID& client_id) {
+    clients_.erase(client_id);
+
+    // Cascade delete: remove all replicas owned by this client.
+    for (auto it = objects_.begin(); it != objects_.end();) {
+        auto& replicas = it->second.replicas;
+        replicas.erase(
+            std::remove_if(replicas.begin(), replicas.end(),
+                           [&](const Replica::Descriptor& desc) {
+                               if (!std::holds_alternative<P2PProxyDescriptor>(
+                                       desc.descriptor_variant)) {
+                                   return false;
+                               }
+                               const auto& p2p = std::get<P2PProxyDescriptor>(
+                                   desc.descriptor_variant);
+                               return p2p.client_id == client_id;
+                           }),
+            replicas.end());
+
+        if (replicas.empty()) {
+            it = objects_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    VLOG(1) << "P2PStandbyMetadataStore::UnRegisterClient "
+            << "client=" << client_id.first << ":" << client_id.second;
 }
 
 void P2PStandbyMetadataStore::AddSegment(const UUID& client_id,
