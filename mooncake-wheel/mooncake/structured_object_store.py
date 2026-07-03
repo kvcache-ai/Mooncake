@@ -148,6 +148,8 @@ class _TensorObjectBufferPayload:
 class _MultiBufferPayload:
     buffers: tuple[memoryview, ...]
     owners: tuple[Any, ...] = ()
+    dtype: str | None = None
+    shape: tuple[int, ...] | None = None
 
     @property
     def nbytes(self) -> int:
@@ -1036,7 +1038,7 @@ class MooncakeBundleTransfer:
                 for key in ("missing_payload", "row_mask_payload", "lengths_payload"):
                     payload_name = node.get(key)
                     if payload_name is not None:
-                        recursive_payload[payload_name] = read_member_indices()
+                        recursive_payload[payload_name] = read_member_indices(payload_name, indices)
             for leaf in metadata.get("leaves", []):
                 leaf_payload_members = leaf["payload_members"]
                 flat_payload_members = {
@@ -2496,17 +2498,23 @@ def _encode_ragged_tensor_values(
                 list(tensor.shape), dtype=_torch.int64
             )
     data_dtype = dtype or _torch.float32
+    np_dtype = _torch_dtype_to_numpy(str(data_dtype))
+    total_elems = int(offset)
     # Zero-copy: scatter-gather from original tensor memory, no concatenation
     if flat_parts:
         buffers = tuple(memoryview(flat.numpy().data).cast("B") for flat in flat_parts)
         owners = tuple(
             flat_parts
         )  # keep flat tensors alive (they reference original data)
-        data = _MultiBufferPayload(buffers=buffers, owners=owners)
-    else:
-        empty = np.empty(0, dtype=_torch_dtype_to_numpy(str(data_dtype)))
         data = _MultiBufferPayload(
-            buffers=(memoryview(empty.data).cast("B"),), owners=(empty,)
+            buffers=buffers, owners=owners,
+            dtype=np.dtype(np_dtype).str, shape=(total_elems,),
+        )
+    else:
+        empty = np.empty(0, dtype=np_dtype)
+        data = _MultiBufferPayload(
+            buffers=(memoryview(empty.data).cast("B"),), owners=(empty,),
+            dtype=np.dtype(np_dtype).str, shape=(0,),
         )
     payload = {
         "data": data,
@@ -2589,7 +2597,10 @@ def _encode_ragged_tensor_dict_values(
 
     keys = schema.metadata.get("keys")
     if not keys:
-        keys = sorted(non_null[0].keys())
+        all_keys: set[str] = set()
+        for v in non_null:
+            all_keys.update(v.keys())
+        keys = sorted(all_keys)
 
     payload: dict[str, Any] = {"null_mask": null_mask}
     key_codecs: dict[str, Any] = {}
@@ -2760,14 +2771,19 @@ def _encode_typed_ragged_values(
         if array.ndim > 0:
             shapes[row, : array.ndim] = array.shape
     # Zero-copy: scatter-gather from original numpy array memory, no concatenation
+    total_elems = int(offset)
     if flat_arrays:
         buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
         owners = tuple(flat_arrays)  # keep arrays alive
-        data = _MultiBufferPayload(buffers=buffers, owners=owners)
+        data = _MultiBufferPayload(
+            buffers=buffers, owners=owners,
+            dtype=np.dtype(dtype).str, shape=(total_elems,),
+        )
     else:
         empty = np.empty(0, dtype=dtype)
         data = _MultiBufferPayload(
-            buffers=(memoryview(empty.data).cast("B"),), owners=(empty,)
+            buffers=(memoryview(empty.data).cast("B"),), owners=(empty,),
+            dtype=np.dtype(dtype).str, shape=(0,),
         )
     ndarray_rows = [
         value is not None and isinstance(value, np.ndarray) for value in values
@@ -3271,7 +3287,7 @@ class _StructuredObjectLayer:
             raise ValueError(
                 f"structured bytes member {name} does not support materialize_into"
             )
-        # Always try pool-backed read first: pool memory is pre-registered,
+        # Try pool-backed read first: pool memory is pre-registered,
         # so RDMA reads go directly into pool memory without extra copies.
         expected_bytes = int(payload_spec.get("bytes", 0))
         if expected_bytes > 0:
@@ -3280,11 +3296,7 @@ class _StructuredObjectLayer:
             )
             if result is not None:
                 return result
-            # Pool array failed; use np.empty + chunked pool read (ctypes.memmove)
-            # instead of bytearray + bytes() which causes extra copies.
-            result = np.empty(expected_bytes, dtype=np.uint8)
-            self._bundle_store.read_payload_into(payload_spec, result)
-            return result
+        # Pool unavailable or size unknown — fall back to plain bytes.
         return self._bundle_store.read_payload(payload_spec)
 
     def _read_ndarray_member(
@@ -5049,6 +5061,12 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
     if isinstance(value, _TensorPayload):
         return _encode_torch_tensor_field(value.tensor)
     if isinstance(value, _MultiBufferPayload):
+        if value.dtype is not None and value.shape is not None:
+            return {
+                "encoding": "ndarray",
+                "dtype": value.dtype,
+                "shape": list(value.shape),
+            }, value
         return {"encoding": "bytes"}, value
     if _torch is not None and isinstance(value, _torch.Tensor):
         return _encode_torch_tensor_field(value)
