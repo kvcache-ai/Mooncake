@@ -57,9 +57,11 @@ tl::expected<size_t, ErrorCode> PosixFile::write(std::span<const char> data,
         if (written == -1) {
             if (errno == EINTR) continue;
             int saved_errno = errno;
+            char errbuf[256];
+            strerror_r(saved_errno, errbuf, sizeof(errbuf));
             LOG(ERROR) << "write failed for file: " << filename_
                        << ", errno=" << saved_errno
-                       << " (" << strerror(saved_errno) << ")"
+                       << " (" << errbuf << ")"
                        << ", fd=" << fd_
                        << ", remaining=" << remaining;
             return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
@@ -94,9 +96,11 @@ tl::expected<size_t, ErrorCode> PosixFile::read(std::string &buffer,
         if (n == -1) {
             if (errno == EINTR) continue;
             int saved_errno = errno;
+            char errbuf[256];
+            strerror_r(saved_errno, errbuf, sizeof(errbuf));
             LOG(ERROR) << "read failed for file: " << filename_
                        << ", errno=" << saved_errno
-                       << " (" << strerror(saved_errno) << ")"
+                       << " (" << errbuf << ")"
                        << ", fd=" << fd_
                        << ", length=" << length
                        << ", read_bytes=" << read_bytes;
@@ -133,9 +137,11 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
         ssize_t ret = ::pwritev(fd_, iov + idx, chunk_cnt, cur_offset);
         if (ret < 0) {
             int saved_errno = errno;
+            char errbuf[256];
+            strerror_r(saved_errno, errbuf, sizeof(errbuf));
             LOG(ERROR) << "pwritev failed for file: " << filename_
                        << ", errno=" << saved_errno
-                       << " (" << strerror(saved_errno) << ")"
+                       << " (" << errbuf << ")"
                        << ", fd=" << fd_
                        << ", iovcnt=" << iovcnt
                        << ", total_bytes=" << total_bytes
@@ -176,9 +182,11 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
         ssize_t ret = ::preadv(fd_, iov + idx, chunk_cnt, cur_offset);
         if (ret < 0) {
             int saved_errno = errno;
+            char errbuf[256];
+            strerror_r(saved_errno, errbuf, sizeof(errbuf));
             LOG(ERROR) << "preadv failed for file: " << filename_
                        << ", errno=" << saved_errno
-                       << " (" << strerror(saved_errno) << ")"
+                       << " (" << errbuf << ")"
                        << ", fd=" << fd_
                        << ", iovcnt=" << iovcnt
                        << ", total_bytes=" << total_bytes
