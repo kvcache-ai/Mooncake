@@ -237,6 +237,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_cxl_(config.enable_cxl),
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio) {
+    object_type_reuse_scales_.fill(1.0);
+    object_type_soft_pin_weights_.fill(1.0);
+    for (const auto& [data_type, policy] :
+         config.object_type_eviction_score_policies) {
+        const auto idx = static_cast<uint8_t>(data_type);
+        object_type_reuse_scales_[idx] = policy.reuse_scale;
+        object_type_soft_pin_weights_[idx] = policy.soft_pin_weight;
+    }
+
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -7139,6 +7148,23 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::string tenant_id;
         std::string key;
         std::chrono::system_clock::time_point lease_timeout;
+        int64_t adjusted_age;
+    };
+
+    const auto rank_reference_time = now;
+    auto adjusted_age = [this, rank_reference_time](
+                            const ObjectMetadata& metadata,
+                            bool is_soft_pinned) {
+        const auto idx = static_cast<uint8_t>(metadata.data_type);
+        const double reuse_scale = object_type_reuse_scales_[idx];
+        const double weight =
+            is_soft_pinned ? object_type_soft_pin_weights_[idx] : 1.0;
+        auto expired_age =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                rank_reference_time - metadata.lease_timeout)
+                .count();
+        expired_age = std::max<int64_t>(expired_age, 0);
+        return static_cast<int64_t>(expired_age * weight / reuse_scale);
     };
 
     // Randomly select a starting shard to avoid imbalance eviction between
@@ -7155,8 +7181,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
-    std::vector<std::vector<std::chrono::system_clock::time_point>>
-        local_soft_pin(num_threads);
+    std::vector<std::vector<int64_t>> local_soft_pin(num_threads);
 
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
@@ -7181,10 +7206,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (!it->second.IsSoftPinned(now)) {
                             local_candidates[t].push_back(
                                 {s, tenant_id, it->first,
-                                 it->second.lease_timeout});
+                                 it->second.lease_timeout,
+                                 adjusted_age(it->second,
+                                              /*is_soft_pinned=*/false)});
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(
-                                it->second.lease_timeout);
+                                adjusted_age(it->second,
+                                             /*is_soft_pinned=*/true));
                         }
                     }
                 }
@@ -7213,7 +7241,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                           std::make_move_iterator(v.end()));
     }
 
-    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
+    std::vector<int64_t> soft_pin_objects;
     {
         size_t total = 0;
         for (auto& v : local_soft_pin) total += v.size();
@@ -7235,7 +7263,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
-    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
+    std::vector<int64_t> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
 
     // First pass: evict candidates with no soft pin
@@ -7247,9 +7275,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::nth_element(candidates.begin(),
                          candidates.begin() + (evict_num - 1), candidates.end(),
                          [](const Candidate& a, const Candidate& b) {
-                             return a.lease_timeout < b.lease_timeout;
+                             return a.adjusted_age > b.adjusted_age;
                          });
-        auto target_timeout = candidates[evict_num - 1].lease_timeout;
+        auto target_adjusted_age = candidates[evict_num - 1].adjusted_age;
 
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
@@ -7257,8 +7285,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         long evicted_this_pass = 0;
         for (auto& c : candidates) {
             if (evicted_this_pass >= evict_num &&
-                c.lease_timeout > target_timeout) {
-                no_pin_objects.push_back(c.lease_timeout);
+                c.adjusted_age < target_adjusted_age) {
+                no_pin_objects.push_back(c.adjusted_age);
                 continue;
             }
             {
@@ -7272,7 +7300,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (!it->second.IsLeaseExpired(now) ||
                     it->second.IsSoftPinned(now) ||
                     !can_evict_replicas(it->second)) {
-                    no_pin_objects.push_back(c.lease_timeout);
+                    no_pin_objects.push_back(c.adjusted_age);
                     continue;
                 }
                 auto evict_result = try_evict_group_or_object(
@@ -7315,8 +7343,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Second pass A: only evict objects without soft pin.
             std::nth_element(no_pin_objects.begin(),
                              no_pin_objects.begin() + (target_evict_num - 1),
-                             no_pin_objects.end());
-            auto target_timeout = no_pin_objects[target_evict_num - 1];
+                             no_pin_objects.end(),
+                             [](int64_t a, int64_t b) { return a > b; });
+            auto target_adjusted_age = no_pin_objects[target_evict_num - 1];
 
             // Evict via key lookup — avoid full metadata traversal
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
@@ -7332,7 +7361,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                target_evict_num > 0) {
                             if (!it->second.IsHardPinned() &&
                                 it->second.IsLeaseExpired(now) &&
-                                it->second.lease_timeout <= target_timeout &&
+                                adjusted_age(it->second,
+                                             /*is_soft_pinned=*/false) >=
+                                    target_adjusted_age &&
                                 !it->second.IsSoftPinned(now) &&
                                 can_evict_replicas(it->second)) {
                                 auto evict_result = try_evict_group_or_object(
@@ -7371,8 +7402,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
             std::nth_element(
                 soft_pin_objects.begin(),
                 soft_pin_objects.begin() + (soft_pin_evict_num - 1),
-                soft_pin_objects.end());
-            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
+                soft_pin_objects.end(),
+                [](int64_t a, int64_t b) { return a > b; });
+            auto soft_target_adjusted_age =
+                soft_pin_objects[soft_pin_evict_num - 1];
 
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
                 {
@@ -7393,8 +7426,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 continue;
                             }
                             if (!it->second.IsSoftPinned(now) ||
-                                it->second.lease_timeout <=
-                                    soft_target_timeout) {
+                                adjusted_age(it->second,
+                                             /*is_soft_pinned=*/true) >=
+                                    soft_target_adjusted_age) {
                                 auto evict_result = try_evict_group_or_object(
                                     tenant_it->first, it->first, it->second,
                                     shard, tenant_state, deferred_replicas,

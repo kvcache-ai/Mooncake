@@ -3,6 +3,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 
 #include <glog/logging.h>
 
@@ -13,6 +14,11 @@ namespace mooncake {
 
 // Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
 class HttpMetadataServer;
+
+struct ObjectTypeEvictionScorePolicy {
+    double reuse_scale{1.0};
+    double soft_pin_weight{1.0};
+};
 
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
@@ -617,6 +623,8 @@ class MasterServiceConfigBuilder {
    private:
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionScorePolicy>
+        object_type_eviction_score_policies_;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
@@ -680,6 +688,15 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_default_kv_soft_pin_ttl(uint64_t ttl) {
         default_kv_soft_pin_ttl_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_object_type_eviction_score_policy(
+        ObjectDataType data_type, ObjectTypeEvictionScorePolicy policy) {
+        if (policy.reuse_scale <= 0.0) {
+            throw std::invalid_argument("reuse_scale must be greater than 0");
+        }
+        object_type_eviction_score_policies_[data_type] = policy;
         return *this;
     }
 
@@ -955,6 +972,8 @@ class MasterServiceConfig {
    public:
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionScorePolicy>
+        object_type_eviction_score_policies;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
@@ -1101,6 +1120,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
+    config.object_type_eviction_score_policies =
+        object_type_eviction_score_policies_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
