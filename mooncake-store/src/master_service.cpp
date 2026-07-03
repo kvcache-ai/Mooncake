@@ -7027,7 +7027,8 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
         [&, this](const std::string& key, ObjectMetadata& metadata,
                   TenantState& tenant_state,
                   std::vector<std::vector<Replica>>& deferred_replicas,
-                  bool allow_soft_pinned) -> TenantQuotaEvictionResult {
+                  bool allow_soft_pinned,
+                  MetadataShardAccessorRW* shard_ptr) -> TenantQuotaEvictionResult {
         if (!metadata.IsGrouped()) {
             uint64_t freed = try_evict_or_offload(key, metadata, tenant_state,
                                                   deferred_replicas);
@@ -7074,7 +7075,8 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                 ++result.evicted_objects;
             }
             if (member_key != key && !member_metadata.IsValid()) {
-                EraseMetadata(tenant_state, member_it, normalized_tenant);
+                EraseMetadata(tenant_state, member_it, normalized_tenant,
+                              QuotaEraseMode::kFull, shard_ptr);
             }
         }
         return result;
@@ -7108,11 +7110,12 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
 
                     auto evict_result = try_evict_group_or_object(
                         it->first, metadata, tenant_state, deferred_replicas,
-                        allow_soft_pinned);
+                        allow_soft_pinned, &shard);
                     total.freed_bytes += evict_result.freed_bytes;
                     total.evicted_objects += evict_result.evicted_objects;
                     if (!metadata.IsValid()) {
-                        it = EraseMetadata(tenant_state, it, normalized_tenant);
+                        it = EraseMetadata(tenant_state, it, normalized_tenant,
+                                           QuotaEraseMode::kFull, &shard);
                     } else {
                         ++it;
                     }
