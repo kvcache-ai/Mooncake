@@ -174,7 +174,7 @@ Status MnnvlTransport::submitTransferTasks(
 
     // Get local segment for buffer lookup
     auto &segment_manager = metadata_->segmentManager();
-    SegmentDesc *local_segment = segment_manager.getLocal();
+    SegmentDesc *local_segment = segment_manager.getLocal().get();
     if (!local_segment)
         return Status::InternalError("Local segment not found" LOC_MARK);
 
