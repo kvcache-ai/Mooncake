@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <errno.h>
+#include <cstdint>
 #include <cstring>
 
 #include <regex>
@@ -1576,7 +1577,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             if (entry.is_regular_file() &&
                 entry.path().extension() == BUCKET_METADATA_FILE_SUFFIX) {
                 const auto& bucket_id_str = entry.path().stem();
-                int64_t bucket_id = std::stoll(bucket_id_str);
+                int64_t bucket_id = 0;
+                try {
+                    bucket_id = std::stoll(bucket_id_str);
+                } catch (const std::exception& e) {
+                    LOG(WARNING)
+                        << "Skipping metadata file with a non-numeric "
+                           "bucket id: "
+                        << entry.path().string() << " (" << e.what() << ")";
+                    continue;
+                }
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
                 if (success) lru_index_.emplace(0LL, bucket_id);
@@ -1687,7 +1697,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             // Extract bucket ID from filename (e.g., "12345.bucket" ->
             // "12345")
             auto bucket_id_str = entry.path().stem();
-            int64_t bucket_id = std::stoll(bucket_id_str);
+            int64_t bucket_id = 0;
+            try {
+                bucket_id = std::stoll(bucket_id_str);
+            } catch (const std::exception& e) {
+                LOG(WARNING)
+                    << "Skipping orphan-scan file with a non-numeric "
+                       "bucket id: "
+                    << entry.path().string() << " (" << e.what() << ")";
+                continue;
+            }
 
             // Check if this bucket has valid metadata
             if (valid_bucket_ids.find(bucket_id) != valid_bucket_ids.end()) {
@@ -1906,10 +1925,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
-                LOG(ERROR) << "Object size exceeds bucket size limit: "
-                           << "key=" << it->first
-                           << ", object_size=" << it->second << ", limit="
-                           << bucket_backend_config_.bucket_size_limit;
+                VLOG(1) << "Object size exceeds bucket size limit: "
+                        << "key=" << it->first << ", object_size=" << it->second
+                        << ", limit="
+                        << bucket_backend_config_.bucket_size_limit;
                 ++it;
                 continue;
             }
@@ -1921,6 +1940,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                            << ", error=" << is_exist_result.error();
             }
             if (is_exist_result && is_exist_result.value()) {
+                VLOG(1) << "Key already exists in storage backend, skipping: "
+                        << "key=" << it->first;
                 ++it;
                 continue;
             }
@@ -2858,11 +2879,25 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             continue;  // Simulate allocation/write failure
         }
 
-        // Calculate total value size
-        uint32_t value_size = 0;
+        // Calculate total value size. RecordHeader stores value_len as a
+        // uint32_t (RecordHeader::SIZE is 8 bytes), so accumulating directly
+        // into a uint32_t would silently overflow for an object larger than
+        // 4 GiB: the record would be under-allocated and then its full slices
+        // written past the allocation. Sum in 64 bits and reject oversized
+        // objects instead of corrupting the storage arena.
+        uint64_t total_value_size = 0;
         for (const auto& slice : slices) {
-            value_size += static_cast<uint32_t>(slice.size);
+            total_value_size += slice.size;
         }
+        if (total_value_size > UINT32_MAX) {
+            LOG(ERROR)
+                << "Object too large for SSD offload (value_len must fit "
+                   "in 4 GiB) for key: "
+                << key << ", size: " << total_value_size
+                << " - skipping this key";
+            continue;  // partial-success model: keep processing other keys
+        }
+        uint32_t value_size = static_cast<uint32_t>(total_value_size);
 
         // Prepare record header
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),

@@ -34,10 +34,13 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_tenant_quota_test
+               master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
@@ -51,6 +54,7 @@ if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
 endif()
@@ -92,6 +96,7 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
@@ -157,6 +162,8 @@ if(STORE_USE_ETCD
 endif()
 add_ha_test(ha_backend_availability_test
             ha/leadership/ha_backend_availability_test.cpp)
+add_ha_test(leader_label_reconciler_test
+            ha/leadership/leader_label_reconciler_test.cpp)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(

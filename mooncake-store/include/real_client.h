@@ -18,6 +18,9 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/coro_io.hpp>
@@ -26,6 +29,8 @@
 namespace mooncake {
 
 class RealClient;
+class UdsAcceptor;
+class UdsConnection;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -787,12 +792,26 @@ class RealClient : public PyClient {
         }
     };
 
+#if defined(USE_SUNRISE)
+    struct SunriseSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                sunrise_free_memory(ptr);
+            }
+        }
+    };
+#endif
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+#if defined(USE_SUNRISE)
+    std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
+        sunrise_segment_ptrs_;
+#endif
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -885,18 +904,16 @@ class RealClient : public PyClient {
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;
-    std::jthread ipc_thread_;
-    std::atomic<bool> ipc_running_{false};
+    std::unique_ptr<UdsAcceptor> uds_acceptor_;
     int start_ipc_server();
     int stop_ipc_server();
-    void ipc_server_func();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server();
     void stop_http_server();
 
-    void handle_ipc_shm_register(int client_sock);
-    void handle_ipc_shm_fd_request(int client_sock);
+    void handle_ipc_shm_register(UdsConnection &connection);
+    void handle_ipc_shm_fd_request(UdsConnection &connection);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(

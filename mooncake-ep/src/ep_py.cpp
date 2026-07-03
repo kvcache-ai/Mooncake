@@ -16,7 +16,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<EventHandle>(m, "EventHandle")
         .def(py::init<>())
-        .def("current_stream_wait", &EventHandle::current_stream_wait);
+        .def("current_stream_wait", &EventHandle::current_stream_wait)
+        .def("synchronize", &EventHandle::synchronize);
 
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 

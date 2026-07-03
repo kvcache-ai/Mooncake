@@ -42,6 +42,26 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     }
 }
 
+ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {
+    std::lock_guard<std::mutex> lock(etcd_mutex_);
+
+    char* err_msg = nullptr;
+    int ret = EtcdStoreResetClientWrapper(
+        const_cast<char*>(etcd_endpoints.c_str()), &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to reset etcd store client: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+
+    connected_endpoints_ = etcd_endpoints;
+    etcd_connected_ = true;
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
                           std::string& value, EtcdRevisionId& revision_id) {
     char* err_msg = nullptr;
@@ -400,6 +420,11 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     (void)etcd_endpoints;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {
+    (void)etcd_endpoints;
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 }
 
 ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,

@@ -18,6 +18,7 @@
 #include <glog/logging.h>
 #include <netdb.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -25,7 +26,9 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include "tent/common/concurrent/rw_spinlock.h"
 #include "tent/common/concurrent/thread_local_storage.h"
@@ -221,6 +224,73 @@ inline void from_json(const json& j, SegmentDesc& s) {
 }
 
 using SegmentDescRef = std::shared_ptr<SegmentDesc>;
+
+// Coalesce a contiguous per-page NUMA probe into a small list of
+// routing-hint Regions. Each bucket emits one Region carrying the bucket's
+// majority NUMA label; receivers consume Region as a max-overlap NIC hint.
+//
+// Precondition: `entries` must tile the buffer as a gap-free, address-ordered
+// sequence (as produced by Platform::getLocation). Passing a non-contiguous or
+// unsorted vector still yields a monotonic byte offset and therefore mislabels
+// the address space; sort/validate at the call site if a producer cannot
+// guarantee this.
+//
+// Invariants: sum(out[i].size) == sum(entries[i].len), and ordering is
+// preserved. The per-bucket NUMA label is the byte-weighted majority, so
+// sub-bucket labels are deliberately lost -- this is a lossy routing hint, not
+// a faithful copy of the fine-grained probe.
+inline std::vector<Region> coalesceRegions(
+    const std::vector<RangeLocation>& entries, size_t max_buckets = 128,
+    size_t min_bucket_bytes = static_cast<size_t>(1) << 20) {
+    std::vector<Region> out;
+    if (entries.empty()) return out;
+
+    size_t total = 0;
+    for (auto& e : entries) total += e.len;
+    size_t computed = max_buckets > 0 ? total / max_buckets +
+                                            (total % max_buckets != 0 ? 1 : 0)
+                                      : 0;
+    // Defensive floor: bucket_bytes == 0 would loop forever / divide by zero.
+    // Hit only when caller passes both min_bucket_bytes=0 and max_buckets=0.
+    size_t bucket_bytes =
+        std::max<size_t>(1, std::max(min_bucket_bytes, computed));
+
+    std::vector<std::pair<std::string, size_t>> votes;
+    size_t bucket = 0;
+
+    auto add_vote = [&](const std::string& loc, size_t n) {
+        for (auto& v : votes) {
+            if (v.first == loc) {
+                v.second += n;
+                return;
+            }
+        }
+        votes.emplace_back(loc, n);
+    };
+    auto flush = [&]() {
+        if (bucket == 0) return;
+        const std::string* best = nullptr;
+        size_t best_n = 0;
+        for (auto& v : votes) {
+            // Strict > preserves "first-seen wins" on ties.
+            if (v.second > best_n) {
+                best_n = v.second;
+                best = &v.first;
+            }
+        }
+        out.push_back(Region{bucket, *best});
+        votes.clear();
+        bucket = 0;
+    };
+
+    for (auto& e : entries) {
+        add_vote(e.location, e.len);
+        bucket += e.len;
+        if (bucket >= bucket_bytes) flush();
+    }
+    flush();
+    return out;
+}
 
 }  // namespace tent
 }  // namespace mooncake

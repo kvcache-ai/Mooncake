@@ -33,6 +33,13 @@ target_include_directories(tent_ip_utils_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
 
+add_executable(tent_coalesce_regions_test coalesce_regions_test.cpp)
+target_link_libraries(tent_coalesce_regions_test PRIVATE tent_common gtest
+                                                         gtest_main)
+target_include_directories(tent_coalesce_regions_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_coalesce_regions_test COMMAND tent_coalesce_regions_test)
+
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
                                                  tent_link_group)
@@ -68,8 +75,25 @@ target_include_directories(tent_failover_test
 add_test(NAME tent_failover_test COMMAND tent_failover_test)
 
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
-target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main)
+target_link_libraries(tent_endpoint_lifecycle_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(tent_endpoint_lifecycle_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
+
+add_executable(tent_endpoint_store_test endpoint_store_test.cpp)
+target_link_libraries(tent_endpoint_store_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(tent_endpoint_store_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_endpoint_store_test COMMAND tent_endpoint_store_test)
+
+add_executable(tent_rdma_transport_test rdma_transport_test.cpp)
+target_link_libraries(tent_rdma_transport_test
+                      PRIVATE gtest gtest_main tent_link_group ibverbs)
+target_include_directories(tent_rdma_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
 
 if(USE_HIP)
   find_package(HIP REQUIRED)
@@ -154,3 +178,15 @@ target_include_directories(tent_progress_worker_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_progress_worker_test
          COMMAND tent_progress_worker_test)
+
+add_executable(tent_runtime_queue_dispatch_test
+               runtime_queue_dispatch_test.cpp)
+target_link_libraries(tent_runtime_queue_dispatch_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_runtime_queue_dispatch_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_runtime_queue_dispatch_test
+         COMMAND tent_runtime_queue_dispatch_test)

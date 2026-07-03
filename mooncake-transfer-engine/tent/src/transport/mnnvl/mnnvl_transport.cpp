@@ -145,8 +145,8 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
-    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream));
-    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream));
+    // Streams are created lazily in submitTransferTasks where the correct
+    // GPU device can be inferred from request source pointers.
     return Status::OK();
 }
 
@@ -154,10 +154,22 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
-    // CHECK_CUDA(cudaStreamDestroy(mnnvl_batch->stream));
+    // Completion events are destroyed by ~MnnvlSubBatch(), which Slab's
+    // deallocate() invokes before returning the storage. Streams are
+    // pool-managed and not destroyed here.
     Slab<MnnvlSubBatch>::Get().deallocate(mnnvl_batch);
     batch = nullptr;
     return Status::OK();
+}
+
+static int detectDeviceFromPointer(void *ptr) {
+    if (!ptr) return -1;
+    cudaPointerAttributes attrs = {};
+    auto err = cudaPointerGetAttributes(&attrs, ptr);
+    if (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice)
+        return attrs.device;
+    cudaGetLastError();
+    return -1;
 }
 
 Status MnnvlTransport::submitTransferTasks(
@@ -165,6 +177,20 @@ Status MnnvlTransport::submitTransferTasks(
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
+
+    if (!mnnvl_batch->async_stream.get()) {
+        int device_id = -1;
+        for (auto &req : request_list) {
+            device_id = detectDeviceFromPointer(req.source);
+            if (device_id >= 0) break;
+        }
+        if (device_id < 0) cudaGetDevice(&device_id);
+        CHECK_STATUS(
+            platform_->getStreamFromPool(mnnvl_batch->sync_stream, device_id));
+        CHECK_STATUS(
+            platform_->getStreamFromPool(mnnvl_batch->async_stream, device_id));
+    }
+
     if (request_list.size() + mnnvl_batch->task_list.size() >
         mnnvl_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
@@ -260,8 +286,22 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
     }
 
     cudaEvent_t event;
-    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-    cudaEventRecord(event, batch->async_stream.get());
+    auto event_err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    if (event_err != cudaSuccess) {
+        LOG(ERROR) << "MnnvlTransport: cudaEventCreateWithFlags failed: "
+                   << cudaGetErrorString(event_err);
+        for (auto *task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
+    auto record_err = cudaEventRecord(event, batch->async_stream.get());
+    if (record_err != cudaSuccess) {
+        LOG(ERROR) << "MnnvlTransport: cudaEventRecord failed: "
+                   << cudaGetErrorString(record_err);
+        cudaEventDestroy(event);
+        for (auto *task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
+    batch->completion_events.push_back(event);
     for (auto *task : tasks) task->completion_event = event;
 }
 
@@ -272,7 +312,6 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto &task = mnnvl_batch->task_list[task_id];
-    status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
         auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
@@ -282,6 +321,9 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
             task.status_word = TransferStatusEnum::FAILED;
         }
     }
+    // Read status AFTER the poll so a just-observed completion/failure is
+    // reported on this call rather than one poll cycle late.
+    status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
 
