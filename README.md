@@ -90,50 +90,63 @@ The diagram below shows how Mooncake decomposes multimodal LLM serving into inde
 
 ```mermaid
 flowchart LR
-    User(["User: text + image"])
+    User(["👤 User<br/>text + image"])
 
-    subgraph EPD["EPD Separation · Encode"]
+    subgraph EPD["🖼️ EPD Separation · Encode"]
+        direction TB
         VE["Vision Encoder"]
         KV[("KV-Cache Pool")]
-        VE --> KV
+        VE -- embeddings --> KV
     end
 
-    subgraph PREFILL["PD Separation · Prefill"]
-        PF["Prefill KV to generate TP/DP"]
+    subgraph PD["⚙️ PD Separation"]
+        direction TB
+        PF["Prefill<br/>KV → TP / DP"]
+        DEC["Decode<br/>autoregressive generation"]
+        PF -- KV cache --> DEC
     end
 
-    subgraph DECODE["PD Separation · Decode"]
-        DEC["Decode autoregressive generation"]
-    end
-
-    subgraph AM["AM Separation · Attention / Expert"]
+    subgraph AM["🧠 AM Separation · Attention ⇄ Expert"]
+        direction TB
         ATT["Attention"]
         EXP["Sparse Expert FFN"]
-        ATT <--> EXP
+        ATT <-->|activations| EXP
     end
 
-    subgraph RLD["RL Disaggregation"]
-        RM["RL reward model"]
-        FSP[("Flow sample pool")]
+    subgraph RLD["🔁 RL Disaggregation"]
+        direction TB
+        RM["RL Reward Model"]
+        FSP[("Flow Sample Pool")]
         TR["Training Rollout"]
-        MW[("Model warehouse")]
+        MW[("Model Warehouse")]
         RM --> FSP
         FSP <--> TR
-        TR --> MW
+        TR -- checkpoints --> MW
     end
 
-    ANS(["Answers / Samples"])
-    UW["Update Weights"]
+    ANS(["📝 Answers / Samples"])
+    UW["♻️ Update Weights"]
 
-    User --> VE
-    KV --> PF
-    PF --> DEC
-    DEC <--> AM
-    DEC --> ANS
-    DEC --> TR
-    ANS --> UW
-    MW --> UW
-    UW --> DEC
+    User -- prompt --> VE
+    KV -- prefix KV --> PF
+    DEC <-->|hidden states| AM
+    DEC -- tokens --> ANS
+    DEC -- rollouts --> TR
+    ANS -- rewards --> UW
+    MW -- new weights --> UW
+    UW -.->|weight sync| DEC
+
+    classDef enc fill:#DBEAFE,stroke:#3B82F6,stroke-width:1px,color:#1E3A8A;
+    classDef pd fill:#DCFCE7,stroke:#22C55E,stroke-width:1px,color:#14532D;
+    classDef am fill:#FFEDD5,stroke:#F97316,stroke-width:1px,color:#7C2D12;
+    classDef rl fill:#EDE9FE,stroke:#8B5CF6,stroke-width:1px,color:#4C1D95;
+    classDef io fill:#F1F5F9,stroke:#64748B,stroke-width:1px,color:#0F172A;
+
+    class VE,KV enc;
+    class PF,DEC pd;
+    class ATT,EXP am;
+    class RM,FSP,TR,MW rl;
+    class User,ANS,UW io;
 ```
 
 </details>
