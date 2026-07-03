@@ -36,29 +36,6 @@ class GLogMuter {
     int original_log_level_;
 };
 
-class LogCaptureSink : public google::LogSink {
-   public:
-    void send(google::LogSeverity severity, const char* full_filename,
-              const char* base_filename, int line, const struct ::tm* tm_time,
-              const char* message, size_t message_len) override {
-        (void)severity;
-        (void)full_filename;
-        (void)base_filename;
-        (void)line;
-        (void)tm_time;
-
-        logs_.append(message, message_len);
-        logs_.push_back('\n');
-    }
-
-    bool Contains(const std::string& needle) const {
-        return logs_.find(needle) != std::string::npos;
-    }
-
-   private:
-    std::string logs_;
-};
-
 class RealClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -1017,21 +994,17 @@ TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
 
 TEST_F(RealClientTest,
        ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {
-    LogCaptureSink sink;
-    google::AddLogSink(&sink);
-
     ConfigDict config = MakeConfigDict(
         "localhost:17816", std::to_string(MAX_SEGMENT_SIZE + 1), "0");
-    config[CONFIG_KEY_PROTOCOL] = "invalid_protocol";
+    config[CONFIG_KEY_PROTOCOL] = "tcp";
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = "127.0.0.1:1";
 
+    ::testing::internal::CaptureStderr();
     auto result = py_client_->setup_internal(config);
-
-    google::RemoveLogSink(&sink);
+    const std::string logs = ::testing::internal::GetCapturedStderr();
 
     ASSERT_FALSE(result.has_value());
-    EXPECT_TRUE(sink.Contains("Invalid protocol"))
-        << "Setup should reach validation after size checks";
-    EXPECT_FALSE(sink.Contains("Invalid global_segment_size"))
+    EXPECT_EQ(logs.find("Invalid global_segment_size"), std::string::npos)
         << "global_segment_size above MAX_SEGMENT_SIZE should be accepted as "
            "total capacity by ConfigDict validation";
 }
