@@ -170,7 +170,10 @@ class MooncakeStoreService:
             web.get('/api/get/{key}', _timed_handler("GET", self.handle_get)),
             web.get('/api/exist/{key}', _timed_handler("EXIST", self.handle_exist)),
             web.delete('/api/remove/{key}', _timed_handler("REMOVE", self.handle_remove)),
-            web.delete('/api/remove_all', _timed_handler("REMOVE_ALL", self.handle_remove_all))
+            web.delete('/api/remove_all', _timed_handler("REMOVE_ALL", self.handle_remove_all)),
+            web.get('/metrics', _timed_handler("METRICS", self.handle_metrics)),
+            web.get('/metrics/summary', _timed_handler("METRICS_SUMMARY", self.handle_metrics_summary)),
+            web.get('/health', _timed_handler("HEALTH", self.handle_health)),
         ])
         runner = web.AppRunner(app)
         await runner.setup()
@@ -618,6 +621,58 @@ class MooncakeStoreService:
                 text=json.dumps({'error': str(e)}),
                 content_type='application/json'
             )
+
+    async def handle_health(self, request):
+        try:
+            code = self.store.health_check()
+            status_map = {0: "healthy", 1: "not_initialized", 2: "master_unreachable"}
+            status_str = status_map.get(code, "unknown")
+            http_status = 200 if code == 0 else 503
+            # logging.info("health_check: code=%d status=%s remote=%s", code, status_str, request.remote)
+            return web.Response(
+                status=http_status,
+                text=json.dumps({"status": status_str, "code": code}),
+                content_type="application/json"
+            )
+        except Exception as e:
+            logging.error("HEALTH error: %s", e)
+            return web.Response(status=500, text=str(e))
+
+    async def handle_metrics(self, request):
+        try:
+            text = self.store.get_metrics()
+            if text is None:
+                return web.Response(status=503, text="metrics not available")
+            return web.Response(
+                status=200, text=text,
+                content_type="text/plain", charset="utf-8"
+            )
+        except AttributeError:
+            return web.Response(
+                status=501,
+                text="get_metrics() not available; rebuild store.so with metric bindings"
+            )
+        except Exception as e:
+            logging.error("METRICS error: %s", e)
+            return web.Response(status=500, text=str(e))
+
+    async def handle_metrics_summary(self, request):
+        try:
+            text = self.store.get_metrics_summary()
+            if text is None:
+                return web.Response(status=503, text="metrics not available")
+            return web.Response(
+                status=200, text=text,
+                content_type="text/plain", charset="utf-8"
+            )
+        except AttributeError:
+            return web.Response(
+                status=501,
+                text="get_metrics_summary() not available; rebuild store.so with metric bindings"
+            )
+        except Exception as e:
+            logging.error("METRICS_SUMMARY error: %s", e)
+            return web.Response(status=500, text=str(e))
 
     async def stop(self):
         if self.store:

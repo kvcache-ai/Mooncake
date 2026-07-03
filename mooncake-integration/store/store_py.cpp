@@ -2218,6 +2218,24 @@ PYBIND11_MODULE(store, m) {
                  return real_client ? real_client->get_offload_rpc_read_count()
                                     : 0;
              })
+        .def("get_metrics_summary",
+             [](MooncakeStorePyWrapper &self) -> py::object {
+                 auto real_client =
+                     std::dynamic_pointer_cast<RealClient>(self.store_);
+                 if (!real_client || !real_client->client_) return py::none();
+                 auto result = real_client->client_->GetSummaryMetrics();
+                 if (!result) return py::none();
+                 return py::str(*result);
+             })
+        .def("get_metrics",
+             [](MooncakeStorePyWrapper &self) -> py::object {
+                 auto real_client =
+                     std::dynamic_pointer_cast<RealClient>(self.store_);
+                 if (!real_client || !real_client->client_) return py::none();
+                 auto result = real_client->client_->SerializeMetrics();
+                 if (!result) return py::none();
+                 return py::str(*result);
+             })
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
