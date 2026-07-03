@@ -40,7 +40,7 @@ RedisHelper::RedisHelper(const std::string& cluster_id,
 }
 
 RedisHelper::~RedisHelper() {
-    cancel_election_ = true;
+    CancelElection();
     CancelKeepAlive();
     if (subscribe_ctx_) {
         redisFree(subscribe_ctx_);
@@ -338,7 +338,12 @@ bool RedisHelper::WatchLeaderSubscribe() {
     redisContext* polling_ctx = CreateConnection();
     if (!polling_ctx) {
         LOG(WARNING) << "WatchLeaderSubscribe: failed to create polling "
-                        "connection; relying on subscribe loop only";
+                        "connection; falling back to pure polling";
+        RedisReplyPtr unsub((redisReply*)redisCommand(
+            subscribe_ctx_, "UNSUBSCRIBE %b", leader_event_channel_.data(),
+            leader_event_channel_.size()));
+        DrainSubscribeContext();
+        return false;
     }
 
     // Polling thread: check if key still exists periodically.
@@ -574,6 +579,8 @@ void RedisHelper::CancelKeepAlive() {
     cancel_keep_alive_ = true;
     keep_alive_running_ = false;
 }
+
+void RedisHelper::CancelElection() { cancel_election_ = true; }
 
 // ============================================================
 // GetMasterView

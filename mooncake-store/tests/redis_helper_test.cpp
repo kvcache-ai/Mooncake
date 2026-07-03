@@ -189,7 +189,7 @@ TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
     // short_ttl=1, key should expire in ~2s; allow 10s safety margin
     if (future.wait_for(std::chrono::seconds(10)) !=
         std::future_status::ready) {
-        second.CancelKeepAlive();
+        second.CancelElection();
         elect_thread.join();
         FAIL() << "Timed out waiting for Redis leader election";
     }
@@ -545,10 +545,7 @@ TEST_F(RedisHelperTest, ReconnectAfterConnectionLoss) {
 
 // === Test 19: ElectLeader detects cancel via WatchLeader ===
 // Covers: redis_helper.cpp:171-179 (election_ctx_ null → retry)
-// ElectLeader's while(true) loop doesn't check cancel_requested_ directly,
-// but WatchLeader does. We create a scenario where ElectLeader enters
-// WatchLeader (which can be cancelled), covering the connect-retry path
-// at lines 171-179 along the way.
+// ElectLeader can be cancelled while waiting in WatchLeader.
 
 TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
     const int short_ttl = 2;
@@ -576,14 +573,14 @@ TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
 
     // Wait for second to enter WatchLeader
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    second.CancelKeepAlive();
-
-    // Cancel first so key expires, allowing second to win
-    first.CancelKeepAlive();
-    first_keep.join();
+    second.CancelElection();
     elect_thread.join();
 
-    ASSERT_GT(second_version, first_version);
+    // Clean up the first leader.
+    first.CancelKeepAlive();
+    first_keep.join();
+
+    ASSERT_EQ(0, second_version);
 }
 
 // === Test 20: Subscribe loop processes message ===
@@ -741,7 +738,7 @@ TEST_F(RedisElectionTest, ElectLeaderWaitsForKeyExpiry) {
     // short_ttl=1, key should expire in ~2s; allow 10s safety margin
     if (future.wait_for(std::chrono::seconds(10)) !=
         std::future_status::ready) {
-        second.CancelKeepAlive(second_lease);
+        second.CancelElection();
         elect_thread.join();
         FAIL() << "Timed out waiting for Redis master view election";
     }

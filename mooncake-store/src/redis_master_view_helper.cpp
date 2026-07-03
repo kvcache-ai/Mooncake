@@ -31,6 +31,8 @@ void RedisMasterViewHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     redis_helper_.CancelKeepAlive();
 }
 
+void RedisMasterViewHelper::CancelElection() { redis_helper_.CancelElection(); }
+
 ErrorCode RedisMasterViewHelper::GetMasterView(std::string& master_address,
                                                ViewVersionId& version) {
     return redis_helper_.GetMasterView(master_address, version);

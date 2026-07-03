@@ -35,6 +35,8 @@ class RedisMasterViewHelper : public MasterViewHelper {
 
     void CancelKeepAlive(EtcdLeaseId lease_id) override;
 
+    void CancelElection();
+
     ErrorCode GetMasterView(std::string& master_address,
                             ViewVersionId& version) override;
 
