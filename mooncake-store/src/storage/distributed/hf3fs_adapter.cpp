@@ -2,12 +2,15 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+
+#include <glog/logging.h>
 
 #include "hf3fs/hf3fs.h"
 
@@ -22,7 +25,14 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     const std::string& mount_path) {
     resource_manager_ = std::make_unique<USRBIOResourceManager>();
     Hf3fsConfig config{};
-    config.mount_root = mount_path;
+    char hf3fs_mount_point[PATH_MAX] = {};
+    int ret = hf3fs_extract_mount_point(
+        hf3fs_mount_point, sizeof(hf3fs_mount_point), mount_path.c_str());
+    if (ret > 0 && ret <= static_cast<int>(sizeof(hf3fs_mount_point))) {
+        config.mount_root = hf3fs_mount_point;
+    } else {
+        config.mount_root = mount_path;
+    }
     resource_manager_->setDefaultParams(config);
     return {};
 }
@@ -384,7 +394,7 @@ tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFile(const std::string& path) {
     int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
-    if (hf3fs_reg_fd(fd, 0) != 0) {
+    if (hf3fs_reg_fd(fd, 0) > 0) {
         close(fd);
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }

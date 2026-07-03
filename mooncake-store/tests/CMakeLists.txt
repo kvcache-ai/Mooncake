@@ -76,6 +76,9 @@ add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
+if(USE_3FS)
+  add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
+endif()
 add_store_test(
   embedded_snapshot_catalog_store_test
   ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp
