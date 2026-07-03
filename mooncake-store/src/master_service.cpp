@@ -2998,7 +2998,19 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     it = tenant_state.metadata.end();
                 } else {
                     auto& metadata = it->second;
-                    if (metadata.HasReplica(&Replica::fn_is_completed) ||
+                    // Block PutStart only when a completed MEMORY replica is
+                    // present. A LOCAL_DISK-only metadata (e.g. left over after
+                    // a store-server restart + ScanMeta recovery) must not
+                    // block writes — the LOCAL_DISK replica is there to serve
+                    // cache reads, not to gate new PutStart calls. Blocking on
+                    // any completed replica type (the previous behavior) caused
+                    // OBJECT_ALREADY_EXISTS for every key whose LOCAL_DISK
+                    // replica was re-registered after restart.
+                    bool has_completed_memory = metadata.HasReplica(
+                        [](const Replica& r) {
+                            return r.is_memory_replica() && r.is_completed();
+                        });
+                    if (has_completed_memory ||
                         metadata.put_start_time +
                                 put_start_discard_timeout_sec_ >=
                             now) {
