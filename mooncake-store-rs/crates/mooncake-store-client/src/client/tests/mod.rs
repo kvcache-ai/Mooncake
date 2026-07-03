@@ -10671,11 +10671,12 @@ fn drop_after_remove_flushes_pending_reclaims_to_remote_storage() {
 
     // Writer A: fill remote storage → remove all → drop
     {
+        let writer_a_transport = Arc::new(transport.peer("drop-flush-writer-a-seg"));
         let writer_a = StoreClientBuilder::new(metadata.clone(), "writer-drop-flush-a")
             .state(ClientLifecycleState::Active)
             .label("pool", "pool-a")
             .label("storage", "false")
-            .transport(transport.clone())
+            .transport(writer_a_transport)
             .local_memory(
                 LocalMemoryConfig::new()
                     .numa_aware(false)
@@ -10702,11 +10703,12 @@ fn drop_after_remove_flushes_pending_reclaims_to_remote_storage() {
     }
 
     // Writer B: write to the same remote storage node — must succeed.
+    let writer_b_transport = Arc::new(transport.peer("drop-flush-writer-b-seg"));
     let writer_b = StoreClientBuilder::new(metadata, "writer-drop-flush-b")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(transport)
+        .transport(writer_b_transport)
         .local_memory(
             LocalMemoryConfig::new()
                 .numa_aware(false)
