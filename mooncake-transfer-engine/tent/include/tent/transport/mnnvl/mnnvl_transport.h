@@ -20,6 +20,7 @@
 
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <unordered_set>
@@ -37,7 +38,6 @@ struct MnnvlTask {
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
-    int cuda_id = 0;
     cudaEvent_t completion_event = nullptr;
 };
 
