@@ -339,13 +339,14 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     client_buffer_gc_running_.store(true);
     client_buffer_gc_thread_ =
         std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
-    promotion_workers_running_.store(true);
-    const uint32_t worker_count =
-        std::max<uint32_t>(1, config_.promotion_worker_threads);
-    promotion_worker_threads_.reserve(worker_count);
-    for (uint32_t i = 0; i < worker_count; ++i) {
-        promotion_worker_threads_.emplace_back(
-            &FileStorage::PromotionWorkerThreadFunc, this);
+    if (config_.promotion_worker_threads > 0) {
+        promotion_workers_running_.store(true);
+        const uint32_t worker_count = config_.promotion_worker_threads;
+        promotion_worker_threads_.reserve(worker_count);
+        for (uint32_t i = 0; i < worker_count; ++i) {
+            promotion_worker_threads_.emplace_back(
+                &FileStorage::PromotionWorkerThreadFunc, this);
+        }
     }
     return {};
 }
