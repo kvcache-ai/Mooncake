@@ -51,23 +51,21 @@ tl::expected<void, ErrorCode> GdsContext::Init(
         return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
     }
 
-    // 2. Open the data file (no O_DIRECT — cuFile handles alignment internally).
-    // If a previous GDS run left data behind, unlink and create fresh.
-    // O_TRUNC alone is insufficient: cuFile DMA can fail on NVMe blocks
+    // 2. Open the data file (no O_DIRECT — cuFile handles alignment
+    // internally). If a previous GDS run left data behind, unlink and create
+    // fresh. O_TRUNC alone is insufficient: cuFile DMA can fail on NVMe blocks
     // that still have stale physical mappings from the old file.
     {
         struct stat existing_st;
         if (::stat(data_file_path.c_str(), &existing_st) == 0 &&
             existing_st.st_size > 0) {
-            const char* allow_reopen =
-                ::getenv("MOONCAKE_GDS_ALLOW_REOPEN");
+            const char* allow_reopen = ::getenv("MOONCAKE_GDS_ALLOW_REOPEN");
             if (!allow_reopen || strcmp(allow_reopen, "1") != 0) {
-                LOG(ERROR)
-                    << "GDS: data file already exists ("
-                    << existing_st.st_size
-                    << " bytes). Refusing to overwrite. "
-                    << "Remove the file manually or set "
-                    << "MOONCAKE_GDS_ALLOW_REOPEN=1 to override.";
+                LOG(ERROR) << "GDS: data file already exists ("
+                           << existing_st.st_size
+                           << " bytes). Refusing to overwrite. "
+                           << "Remove the file manually or set "
+                           << "MOONCAKE_GDS_ALLOW_REOPEN=1 to override.";
                 return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
             }
             LOG(WARNING) << "GDS: removing existing data file ("
@@ -93,12 +91,10 @@ tl::expected<void, ErrorCode> GdsContext::Init(
     // to NVMe — it cannot extend a sparse file. posix_fallocate
     // guarantees real block allocation (unlike fallocate which may
     // produce sparse files on some ext4 kernel versions).
-    int alloc_ret = ::posix_fallocate(gds_fd_, 0,
-                                       static_cast<off_t>(capacity));
+    int alloc_ret = ::posix_fallocate(gds_fd_, 0, static_cast<off_t>(capacity));
     if (alloc_ret != 0) {
-        LOG(ERROR) << "GDS: posix_fallocate failed for "
-                   << data_file_path << " (capacity=" << capacity
-                   << "): errno=" << alloc_ret
+        LOG(ERROR) << "GDS: posix_fallocate failed for " << data_file_path
+                   << " (capacity=" << capacity << "): errno=" << alloc_ret
                    << " (" << strerror(alloc_ret) << ")";
         ::close(gds_fd_);
         gds_fd_ = -1;
@@ -119,7 +115,8 @@ tl::expected<void, ErrorCode> GdsContext::Init(
               << data_file_path << ", capacity=" << capacity;
     return {};
 #else
-    (void)data_file_path; (void)capacity;
+    (void)data_file_path;
+    (void)capacity;
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 #endif
 }
@@ -149,25 +146,26 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
     if (!gds_driver_ok_) return false;
 
     // 3. End-to-end DMA write/read/verify (RAII cleanup)
-    std::string probe_path = data_dir + "/.gds_probe_" +
-                             std::to_string(getpid());
+    std::string probe_path =
+        data_dir + "/.gds_probe_" + std::to_string(getpid());
     struct ProbeCleanup {
         std::string path;
         int fd = -1;
         gds_device_ops::GdsDeviceFileHandle fh = nullptr;
-        void* gpu_buf = nullptr;       // write buffer (registered for GDS)
-        bool   gpu_buf_ok = false;     // true if gpu_buf was successfully registered
-        void* verify_buf = nullptr;    // read-back verify buffer (not GDS-registered)
+        void* gpu_buf = nullptr;  // write buffer (registered for GDS)
+        bool gpu_buf_ok = false;  // true if gpu_buf was successfully registered
+        void* verify_buf =
+            nullptr;  // read-back verify buffer (not GDS-registered)
         // Note: driver is managed by std::call_once at process level
 
         ~ProbeCleanup() {
             // Deregister buffers before freeing GPU memory, then
             // deregister file handle before closing fd (cuFile order).
             if (gpu_buf_ok) gds_device_ops::BufDeregister(gpu_buf);
-            if (gpu_buf)    gds_device_ops::Free(gpu_buf);
+            if (gpu_buf) gds_device_ops::Free(gpu_buf);
             if (verify_buf) gds_device_ops::Free(verify_buf);
-            if (fh)         gds_device_ops::FileHandleDeregister(fh);
-            if (fd >= 0)    ::close(fd);
+            if (fh) gds_device_ops::FileHandleDeregister(fh);
+            if (fd >= 0) ::close(fd);
             ::unlink(path.c_str());
         }
     } cleanup{probe_path};
@@ -216,7 +214,8 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 
     // 5. Read back via DMA and verify byte-by-byte.
     // verify_buf is tracked by ProbeCleanup RAII — freed on all paths.
-    // probe_device was set via gpu_staging::SetDevice() above; no device switches occur between Malloc and this point.
+    // probe_device was set via gpu_staging::SetDevice() above; no device
+    // switches occur between Malloc and this point.
     cleanup.verify_buf = gds_device_ops::Malloc(4096);
     if (!cleanup.verify_buf) {
         LOG(WARNING) << "GDS probe: verify buffer Malloc failed";
@@ -231,7 +230,7 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 
     std::vector<uint8_t> host(4096);
     if (!mooncake::gpu_staging::CopyDeviceToHost(host.data(),
-                                                  cleanup.verify_buf, 4096)) {
+                                                 cleanup.verify_buf, 4096)) {
         LOG(WARNING) << "GDS probe: CopyDeviceToHost failed";
         return false;
     }
@@ -257,9 +256,7 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 // GdsContext::WriteRecord()
 // ===================================================================
 tl::expected<void, ErrorCode> GdsContext::WriteRecord(
-    const std::string& key,
-    const std::vector<Slice>& slices,
-    uint64_t offset) {
+    const std::string& key, const std::vector<Slice>& slices, uint64_t offset) {
 #ifdef USE_GDS_BACKEND
     uint32_t klen = static_cast<uint32_t>(key.size());
     size_t t = 0;
@@ -284,8 +281,8 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
                  static_cast<off_t>(offset)) != RecordHeader::SIZE)
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     if (::pwrite(gds_fd_, key.data(), klen,
-                 static_cast<off_t>(offset + RecordHeader::SIZE))
-        != static_cast<ssize_t>(klen))
+                 static_cast<off_t>(offset + RecordHeader::SIZE)) !=
+        static_cast<ssize_t>(klen))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
 
     // value slices
@@ -294,8 +291,7 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
 
     for (const auto& s : slices) {
         if (s.size == 0) continue;
-        if (!s.ptr)
-            return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
+        if (!s.ptr) return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
 
         int dev = -1;
         if (mooncake::gpu_staging::IsDevicePointer(s.ptr, &dev)) {
@@ -313,23 +309,25 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
             }
 
             ssize_t w = gds_device_ops::Write(cfh, s.ptr, s.size,
-                                               static_cast<off_t>(vo));
-            LOG(INFO) << "[GDS WRITE] cuFileWrite DMA: size=" << s.size
-                      << " offset=" << vo << " ret=" << w;
+                                              static_cast<off_t>(vo));
+            VLOG(1) << "[GDS WRITE] cuFileWrite DMA: size=" << s.size
+                    << " offset=" << vo << " ret=" << w;
             if (w != static_cast<ssize_t>(s.size))
                 return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
         } else {
-            LOG(INFO) << "[GDS WRITE] pwrite fallback: size=" << s.size
-                      << " offset=" << vo;
-            if (::pwrite(gds_fd_, s.ptr, s.size, static_cast<off_t>(vo))
-                != static_cast<ssize_t>(s.size))
+            VLOG(1) << "[GDS WRITE] pwrite fallback: size=" << s.size
+                    << " offset=" << vo;
+            if (::pwrite(gds_fd_, s.ptr, s.size, static_cast<off_t>(vo)) !=
+                static_cast<ssize_t>(s.size))
                 return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         vo += s.size;
     }
     return {};
 #else
-    (void)key; (void)slices; (void)offset;
+    (void)key;
+    (void)slices;
+    (void)offset;
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 #endif
 }
@@ -338,21 +336,22 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
 // GdsContext::ReadRecord()
 // ===================================================================
 tl::expected<void, ErrorCode> GdsContext::ReadRecord(
-    const std::string& key, Slice& dest_slice,
-    uint64_t offset, uint32_t expected_value_size) {
+    const std::string& key, Slice& dest_slice, uint64_t offset,
+    uint32_t expected_value_size) {
 #ifdef USE_GDS_BACKEND
     MutexLocker io_lock(&io_mutex_);  // serialize record I/O
 
     RecordHeader hdr;
     if (::pread(gds_fd_, &hdr, RecordHeader::SIZE,
-                static_cast<off_t>(offset)) != RecordHeader::SIZE
-        || hdr.value_len != expected_value_size)
+                static_cast<off_t>(offset)) != RecordHeader::SIZE ||
+        hdr.value_len != expected_value_size)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 
     std::string sk(hdr.key_len, '\0');
     if (::pread(gds_fd_, sk.data(), hdr.key_len,
-                static_cast<off_t>(offset + RecordHeader::SIZE))
-        != static_cast<ssize_t>(hdr.key_len) || sk != key)
+                static_cast<off_t>(offset + RecordHeader::SIZE)) !=
+            static_cast<ssize_t>(hdr.key_len) ||
+        sk != key)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 
     gds_device_ops::GdsDeviceFileHandle cfh = cu_file_handle_;
@@ -363,8 +362,7 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
         mooncake::gpu_staging::SetDevice(dev);
 
         // Use registration cache to avoid repeated Register/Deregister.
-        bool buf_ok = EnsureBufferRegistered(dest_slice.ptr,
-                                              dest_slice.size);
+        bool buf_ok = EnsureBufferRegistered(dest_slice.ptr, dest_slice.size);
         if (!buf_ok) {
             VLOG(1) << "GDS READ: buffer not registered, relying on "
                     << "cuFile bounce buffer for ptr=" << dest_slice.ptr
@@ -372,22 +370,25 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
         }
 
         ssize_t r = gds_device_ops::Read(cfh, dest_slice.ptr, dest_slice.size,
-                                          static_cast<off_t>(vo));
-        LOG(INFO) << "[GDS READ] cuFileRead DMA: size=" << dest_slice.size
-                  << " offset=" << vo << " ret=" << r;
+                                         static_cast<off_t>(vo));
+        VLOG(1) << "[GDS READ] cuFileRead DMA: size=" << dest_slice.size
+                << " offset=" << vo << " ret=" << r;
         if (r != static_cast<ssize_t>(dest_slice.size))
             return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
     } else {
-        LOG(INFO) << "[GDS READ] pread fallback: size=" << dest_slice.size
-                  << " offset=" << vo;
+        VLOG(1) << "[GDS READ] pread fallback: size=" << dest_slice.size
+                << " offset=" << vo;
         if (::pread(gds_fd_, dest_slice.ptr, dest_slice.size,
-                    static_cast<off_t>(vo))
-            != static_cast<ssize_t>(dest_slice.size))
+                    static_cast<off_t>(vo)) !=
+            static_cast<ssize_t>(dest_slice.size))
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     return {};
 #else
-    (void)key; (void)dest_slice; (void)offset; (void)expected_value_size;
+    (void)key;
+    (void)dest_slice;
+    (void)offset;
+    (void)expected_value_size;
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 #endif
 }
@@ -430,8 +431,8 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
 
     auto it = registered_buffers_.find(gpu_ptr);
     if (it != registered_buffers_.end()) {
-        if (it->second == size) return true;       // already registered, same size
-        gds_device_ops::BufDeregister(gpu_ptr);    // size changed, re-register
+        if (it->second == size) return true;  // already registered, same size
+        gds_device_ops::BufDeregister(gpu_ptr);  // size changed, re-register
         registered_buffers_.erase(it);
     }
 
@@ -440,19 +441,18 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
         return true;
     }
 
-    VLOG(1) << "BufRegister failed for ptr=" << gpu_ptr
-            << " size=" << size << ", relying on cuFile bounce buffer";
+    VLOG(1) << "BufRegister failed for ptr=" << gpu_ptr << " size=" << size
+            << ", relying on cuFile bounce buffer";
     return false;
 #else
-    (void)gpu_ptr; (void)size;
+    (void)gpu_ptr;
+    (void)size;
     return false;
 #endif
 }
 
 #ifdef USE_GDS_BACKEND
-bool GdsContext::IsGdsAvailable() {
-    return gds_device_ops::ProbeDeviceNode();
-}
+bool GdsContext::IsGdsAvailable() { return gds_device_ops::ProbeDeviceNode(); }
 #endif
 
 // ===================================================================
@@ -460,34 +460,28 @@ bool GdsContext::IsGdsAvailable() {
 // ===================================================================
 #ifndef USE_GDS_BACKEND
 
-tl::expected<void, ErrorCode> GdsContext::Init(
-    const std::string&, uint64_t) {
+tl::expected<void, ErrorCode> GdsContext::Init(const std::string&, uint64_t) {
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 }
 
 void GdsContext::Shutdown() {}
 
-bool GdsContext::ProbeGdsAvailable(const std::string&) {
-    return false;
-}
+bool GdsContext::ProbeGdsAvailable(const std::string&) { return false; }
 
-tl::expected<void, ErrorCode> GdsContext::WriteRecord(
-    const std::string&, const std::vector<Slice>&, uint64_t) {
+tl::expected<void, ErrorCode> GdsContext::WriteRecord(const std::string&,
+                                                      const std::vector<Slice>&,
+                                                      uint64_t) {
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 }
 
-tl::expected<void, ErrorCode> GdsContext::ReadRecord(
-    const std::string&, Slice&, uint64_t, uint32_t) {
+tl::expected<void, ErrorCode> GdsContext::ReadRecord(const std::string&, Slice&,
+                                                     uint64_t, uint32_t) {
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 }
 
-bool GdsContext::EnsureBufferRegistered(void*, size_t) {
-    return false;
-}
+bool GdsContext::EnsureBufferRegistered(void*, size_t) { return false; }
 
-bool GdsContext::IsGdsAvailable() {
-    return false;
-}
+bool GdsContext::IsGdsAvailable() { return false; }
 
 #endif  // !USE_GDS_BACKEND
 
