@@ -218,7 +218,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void publishLocalPeerMetadata();
     void maybeInitDeviceCollectiveRuntime();
     void resetDeviceCollectiveRuntime();
-    bool allActivePeersOnSameHost() const;
     void setLocalOnlyActiveRanks();
     void syncActiveRanksTensor();
 
@@ -244,8 +243,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     bool isShutdown_{false};
     uint64_t local2global_rank_map_[kMaxNumRanks];
     std::string localServerName_;
-    // These runtime state groups define the intended PR1 ownership boundary
-    // for Device API collectives.
+    // Device-collective runtime state owned by the backend.
     DeviceCollectiveRuntimeState device_collective_runtime_;
 
     // P2P async infrastructure

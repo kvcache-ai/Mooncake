@@ -108,7 +108,6 @@ setup(
                 "src/mooncake_backend.cpp",
                 "src/mooncake_pg_device_bootstrap.cpp",
                 "src/mooncake_pg_device_runtime.cpp",
-                "src/mooncake_pg_experimental.cpp",
                 "src/p2p_proxy.cpp",
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_host.cpp",

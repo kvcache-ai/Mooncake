@@ -12,10 +12,8 @@ namespace mooncake {
 
 struct DeviceCollectiveRuntimeState {
     int cuda_device_index{-1};
-    bool sync_regions_on_device{false};
 
     bool direct_p2p_ready{false};
-    uint32_t direct_p2p_sequence{1};
     uint32_t* device_sequence_counter{nullptr};
     uint32_t* device_sequence_slots{nullptr};
     uint32_t device_sequence_slot_cursor{0};
@@ -25,9 +23,6 @@ struct DeviceCollectiveRuntimeState {
     bool rdma_ready{false};
     int rdma_qps_per_rank{1};
     std::vector<void*> p2p_peer_ptrs_host;
-
-    uint32_t* host_signals{nullptr};
-    size_t host_signals_bytes{0};
 };
 
 }  // namespace mooncake
