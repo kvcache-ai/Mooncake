@@ -422,8 +422,7 @@ void WorkerPool::performPollCq(int thread_id) {
         {
             std::lock_guard<std::mutex> lock(inflight_slices_lock_);
             for (int i = 0; i < nr_poll; ++i) {
-                auto *slice =
-                    reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
+                auto *slice = reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
                 inflight_slices_.erase(slice);
             }
         }
