@@ -2,7 +2,6 @@
 .vscode
 build
 build_ofed4
-build-single
 old
 local_test
 go.sum
@@ -213,4 +212,3 @@ core_*
 # MacOS
 .DS_Store
 .envrc
-build-ub-test/
