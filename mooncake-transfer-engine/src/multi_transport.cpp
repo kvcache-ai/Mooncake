@@ -14,6 +14,7 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 
@@ -465,7 +466,10 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     // priority instead of relying on buffer registration order.
     if (proto.find(',') != std::string::npos) {
         auto protocol_priority = [](const std::string& p) {
-            if (p == "hip") return 4;
+            // hip is intra-node GPU-IPC only. On a cross-node request a
+            // hip+rdma segment must fall through to rdma; allow deployments
+            // that know they need the cross-node path to de-prioritize hip.
+            if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
             if (p == "tcp") return 1;
