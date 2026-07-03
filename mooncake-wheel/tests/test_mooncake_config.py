@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 
+from mooncake import mooncake_config as _cfg_mod
 from mooncake.mooncake_config import (
     MooncakeConfig,
     DEFAULT_GLOBAL_SEGMENT_SIZE,
@@ -217,18 +218,54 @@ class TestMooncakeConfigValidation(unittest.TestCase):
         kwargs.update(overrides)
         return MooncakeConfig(**kwargs)
 
-    def test_valid_protocols_accepted(self):
-        for protocol in ["tcp", "rdma", "efa", "RDMA", "Tcp", "cxl", "ascend", "nvlink_intra"]:
-            with self.subTest(protocol=protocol):
-                config = self.make(protocol=protocol)
-                self.assertEqual(config.protocol, protocol)
+    def test_known_protocols_normalized_to_lowercase(self):
+        # Mixed-case input is canonicalised to lowercase so it matches the
+        # case-sensitive C++ engine; surrounding whitespace is trimmed. Known
+        # protocols (including Store modes the old hard allowlist rejected) do
+        # not warn.
+        cases = {
+            "tcp": "tcp",
+            "rdma": "rdma",
+            "efa": "efa",
+            "RDMA": "rdma",
+            "Tcp": "tcp",
+            "  rdma  ": "rdma",
+            "cxl": "cxl",
+            "ascend": "ascend",
+            "nvlink_intra": "nvlink_intra",
+            "ub": "ub",
+            "ubshmem": "ubshmem",
+            "maca": "maca",
+            "sunrise_link": "sunrise_link",
+            "rpc_only": "rpc_only",
+        }
+        for given, expected in cases.items():
+            with self.subTest(protocol=given):
+                config = self.make(protocol=given)
+                self.assertEqual(config.protocol, expected)
 
-    def test_invalid_protocol_raises(self):
-        for protocol in ["rmda", "udp", "", "foo"]:
+    def test_empty_protocol_raises(self):
+        # An empty or whitespace-only protocol is a caller error and still
+        # fails fast.
+        for protocol in ["", "   "]:
             with self.subTest(protocol=protocol):
                 with self.assertRaises(ValueError) as cm:
                     self.make(protocol=protocol)
                 self.assertIn("Invalid protocol", str(cm.exception))
+
+    def test_unknown_protocol_warns_but_is_passed_through(self):
+        # Unknown-but-non-empty values are no longer rejected in Python:
+        # MooncakeConfig drives both Transfer Engine and Store paths and the C++
+        # layer is the source of truth. We warn and pass the lowercased value
+        # through.
+        for given, expected in [("rmda", "rmda"), ("udp", "udp"), ("Foo", "foo")]:
+            with self.subTest(protocol=given):
+                with self.assertLogs(_cfg_mod.logger, level="WARNING") as cm:
+                    config = self.make(protocol=given)
+                self.assertEqual(config.protocol, expected)
+                self.assertTrue(
+                    any("Unrecognised protocol" in m for m in cm.output)
+                )
 
     def test_non_string_protocol_raises(self):
         with self.assertRaises(ValueError):
@@ -257,17 +294,18 @@ class TestMooncakeConfigValidation(unittest.TestCase):
                         self.make(**{field: bad})
                     self.assertIn(field, str(cm.exception))
 
-    def test_from_file_rejects_invalid_protocol(self):
+    def test_from_file_warns_on_unknown_protocol(self):
         with open(self.config_path, "w") as f:
             json.dump({
                 "local_hostname": "localhost",
                 "metadata_server": "localhost:8080",
                 "master_server_address": "localhost:8081",
-                "protocol": "rmda",  # typo
+                "protocol": "rmda",  # typo -> unknown, warned not rejected
             }, f)
-        with self.assertRaises(ValueError) as cm:
-            MooncakeConfig.from_file(self.config_path)
-        self.assertIn("Invalid protocol", str(cm.exception))
+        with self.assertLogs(_cfg_mod.logger, level="WARNING") as cm:
+            config = MooncakeConfig.from_file(self.config_path)
+        self.assertEqual(config.protocol, "rmda")
+        self.assertTrue(any("Unrecognised protocol" in m for m in cm.output))
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

@@ -29,6 +29,19 @@ In addition to tcp and rdma, the C++ Transfer Engine also supports:
 - cxl: Compute Express Link for memory pooling and sharing
 - ascend: Huawei Ascend NPU communication (HCCL and direct transport)
 
+Store Surface (mooncake-store):
+-------------------------------
+MooncakeConfig also drives the Mooncake Store, which additionally accepts:
+- ub / ubshmem: Unified Bus transport and its shared-memory variant
+- maca: MetaX MACA GPU transport
+- sunrise_link: SunriseLink interconnect transport
+- rpc_only: Store-only mode with no Transfer Engine attached
+
+Protocol names are matched case-sensitively by the C++ engine, so the value is
+normalised to lowercase when a MooncakeConfig is constructed (e.g. "RDMA" ->
+"rdma"). Because the authoritative, build-flag-dependent set lives in C++, an
+unrecognised protocol is passed through with a warning rather than rejected.
+
 For most use cases, 'tcp' or 'rdma' is recommended. The default is 'tcp'.
 For RDMA, you also need to specify the device_name (e.g., 'mlx5_0', 'erdma_0')
 or use auto-discovery.
@@ -47,9 +60,12 @@ export MOONCAKE_PROTOCOL="rdma"
 export MOONCAKE_DEVICE="auto-discovery"
 """
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
@@ -66,10 +82,17 @@ _SIZE_SUFFIXES = [
     ("b", 1),
 ]
 
-# All protocols accepted by the Transfer Engine. The Python API commonly uses
-# "tcp" and "rdma"; the remaining values are handled at the C++ level. Keep this
-# in sync with the protocol list documented in the module docstring above.
-_VALID_PROTOCOLS = frozenset({
+# Protocols Mooncake is known to accept. This is a *diagnostic hint*, not an
+# authoritative gate: MooncakeConfig drives both the Transfer Engine and the
+# Store, and the C++ layer is the source of truth for what a given build
+# actually supports (several transports are gated behind USE_* build flags).
+# The C++ comparisons are exact and lowercase (multi_transport.cpp
+# installTransport, mooncake-store client_service.cpp), so the protocol is
+# canonicalised to lowercase below and an unrecognised value only warns.
+# Union of Transfer Engine transports and Store-only modes. Keep in sync with
+# the protocol list documented in the module docstring above.
+_KNOWN_PROTOCOLS = frozenset({
+    # Transfer Engine transports (mooncake-transfer-engine installTransport)
     "tcp",
     "rdma",
     "efa",
@@ -80,6 +103,12 @@ _VALID_PROTOCOLS = frozenset({
     "barex",
     "cxl",
     "ascend",
+    "ub",
+    "ubshmem",
+    "maca",
+    "sunrise_link",
+    # Store-only mode (mooncake-store client_service.cpp: no transfer engine)
+    "rpc_only",
 })
 
 # Required fields that must be present AND non-empty.
@@ -118,10 +147,14 @@ class MooncakeConfig:
         metadata_server (str): The address of the metadata server.
         global_segment_size (int): The size of each global segment in bytes.
         local_buffer_size (int): The size of the local buffer in bytes.
-        protocol (str): The communication protocol to use. Supported values:
+        protocol (str): The communication protocol to use. Common values:
             - "tcp" (default): Standard TCP/IP protocol
             - "rdma": RDMA protocol (requires RDMA-capable NICs and device_name)
-            See module docstring for full list of supported protocols.
+            The value is normalised to lowercase (the C++ engine matches
+            protocol names case-sensitively). The Transfer Engine and Store
+            together accept a wider set; see the module docstring. An
+            unrecognised value is passed through to the engine with a warning,
+            not rejected.
         device_name (Optional[str]): The name of the RDMA device to use
             (e.g., "mlx5_0", "erdma_0", or "auto-discovery").
             Required when protocol is "rdma", optional for other protocols.
@@ -166,20 +199,38 @@ class MooncakeConfig:
     ssd_offload_path: str = ""
 
     def __post_init__(self):
-        """Validate configuration invariants, failing fast with clear errors.
+        """Validate and normalise configuration invariants.
 
         This runs for every ``MooncakeConfig`` instance regardless of how it is
-        constructed (``from_file``, ``load_from_env`` or direct instantiation),
-        so a misconfiguration is reported here with an actionable message
-        instead of surfacing as a cryptic failure deep inside the C++ engine.
+        constructed (``from_file``, ``load_from_env`` or direct instantiation).
+        The protocol is canonicalised to lowercase (the C++ engine is
+        case-sensitive) and an unrecognised protocol is warned about but passed
+        through, because the authoritative set is decided in the
+        build-flag-dependent C++ layer. Genuine structural problems (a
+        non-string or empty protocol, a negative size, an empty required field)
+        are still reported here with an actionable message instead of surfacing
+        as a cryptic failure deep inside the C++ engine.
         """
-        if (
-            not isinstance(self.protocol, str)
-            or self.protocol.lower() not in _VALID_PROTOCOLS
-        ):
+        if not isinstance(self.protocol, str) or not self.protocol.strip():
             raise ValueError(
-                f"Invalid protocol: {self.protocol!r}. Supported protocols are: "
-                f"{', '.join(sorted(_VALID_PROTOCOLS))}."
+                f"Invalid protocol: {self.protocol!r}. Protocol must be a "
+                f"non-empty string, e.g. 'tcp' or 'rdma'."
+            )
+        # Canonicalise to lowercase. The C++ engine matches protocol names
+        # case-sensitively against lowercase literals, so e.g. "RDMA" would be
+        # silently accepted here but rejected deep in the engine; normalising
+        # turns that hidden misconfiguration into a working configuration.
+        self.protocol = self.protocol.strip().lower()
+        # Warn (do not reject) on values we do not recognise: MooncakeConfig
+        # drives both Transfer Engine and Store paths, and a given build may
+        # support protocols beyond this list. The C++ layer is authoritative and
+        # will reject a genuinely unsupported protocol with its own error.
+        if self.protocol not in _KNOWN_PROTOCOLS:
+            logger.warning(
+                "Unrecognised protocol %r; passing it through to the Mooncake "
+                "engine unchanged. Known protocols are: %s.",
+                self.protocol,
+                ", ".join(sorted(_KNOWN_PROTOCOLS)),
             )
 
         for field_name in ("global_segment_size", "local_buffer_size"):
