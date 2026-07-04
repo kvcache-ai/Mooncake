@@ -7323,6 +7323,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<int64_t> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
 
+    // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
         const int64_t total_mem_capacity =
             MasterMetricManager::instance().get_total_mem_capacity();
@@ -7408,7 +7409,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     const long remaining_evict_num =
         std::ceil(total_eviction_base * evict_ratio_target) - evicted_count;
-    // First pass: evict candidates with no soft pin
     if (!candidates.empty() && remaining_evict_num > 0) {
         long evict_num =
             std::min(remaining_evict_num, (long)candidates.size());
