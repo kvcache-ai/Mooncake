@@ -1206,6 +1206,55 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     admin.Stop();
 }
 
+// /batch_query_keys returns replica metadata for disk-based keys via the
+// optional disk_values/local_disk_values/nof_values fields, while the existing
+// values field stays present (empty array) for backward compatibility.
+TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.enable_offload = true;  // required to mount local-disk segments
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    UUID client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "ld_segment";
+    segment.base = 0x600000000;
+    segment.size = 8 * 1024 * 1024;
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+
+    const std::string key = "ld_only_key";
+    const std::string endpoint = "127.0.0.1:9999";
+    StorageObjectMetadata sm;
+    sm.bucket_id = 0;
+    sm.offset = 0;
+    sm.key_size = static_cast<int64_t>(key.size());
+    sm.data_size = 2048;
+    sm.transport_endpoint = endpoint;
+    OffloadTaskItem task{.tenant_id = "default", .key = key, .size = 2048};
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, {task}, {sm}).has_value());
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto resp = HttpGet(port, "/batch_query_keys?keys=" + key);
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
+    EXPECT_NE(resp.body.find("local_disk_values"), std::string::npos);
+    EXPECT_NE(resp.body.find(endpoint), std::string::npos);
+    // Backward compat: a disk-only key still reports an (empty) values array.
+    EXPECT_NE(resp.body.find("\"values\":[]"), std::string::npos);
+
+    admin.Stop();
+}
+
 }  // namespace test
 }  // namespace mooncake
 
