@@ -6939,8 +6939,8 @@ TEST_F(MasterServiceTest,
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 
     config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
-        ObjectTypeEvictionScorePolicy{
-            std::numeric_limits<double>::infinity(), 1.0, 0};
+        ObjectTypeEvictionScorePolicy{std::numeric_limits<double>::infinity(),
+                                      1.0, 0};
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 }
 
