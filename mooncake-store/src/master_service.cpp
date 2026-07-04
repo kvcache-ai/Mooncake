@@ -241,6 +241,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     object_type_soft_pin_weights_.fill(1.0);
     for (const auto& [data_type, policy] :
          config.object_type_eviction_score_policies) {
+        ValidateObjectTypeEvictionScorePolicy(policy);
         const auto idx = static_cast<uint8_t>(data_type);
         object_type_reuse_scales_[idx] = policy.reuse_scale;
         object_type_soft_pin_weights_[idx] = policy.soft_pin_weight;
@@ -7164,7 +7165,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 rank_reference_time - metadata.lease_timeout)
                 .count();
         expired_age = std::max<int64_t>(expired_age, 0);
-        return static_cast<int64_t>(expired_age * weight / reuse_scale);
+        const double score = expired_age * weight / reuse_scale;
+        if (!std::isfinite(score) ||
+            score >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+            return std::numeric_limits<int64_t>::max();
+        }
+        return static_cast<int64_t>(score);
     };
 
     // Randomly select a starting shard to avoid imbalance eviction between
