@@ -3,9 +3,12 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <cmath>
+#include <cstdint>
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
+#include <limits>
 #include <memory>   // For std::unique_ptr
 #include <string>
 #include <thread>  // For std::thread
@@ -62,6 +65,13 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
                    << ". " << error;
     }
     return parsed_value;
+}
+
+bool TryGetDoubleConfig(const mooncake::DefaultConfig& default_config,
+                        const std::string& key, double* value) {
+    const double missing = std::numeric_limits<double>::quiet_NaN();
+    default_config.GetDouble(key, value, missing);
+    return !std::isnan(*value);
 }
 
 // Derive the metadata server address for cleanup when it is deployed
@@ -427,6 +437,47 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
+    for (uint16_t type_id = 0; type_id <= UINT8_MAX; ++type_id) {
+        const auto data_type =
+            static_cast<mooncake::ObjectDataType>(static_cast<uint8_t>(type_id));
+        const std::string type_key = std::to_string(type_id);
+
+        double reuse_scale = 0.0;
+        if (TryGetDoubleConfig(default_config,
+                               "object_type_eviction_score_policies." +
+                                   type_key + ".reuse_scale",
+                               &reuse_scale)) {
+            if (reuse_scale <= 0.0) {
+                LOG(FATAL)
+                    << "object_type_eviction_score_policies." << type_key
+                    << ".reuse_scale must be greater than 0";
+            }
+            master_config.object_type_eviction_score_policies[data_type]
+                .reuse_scale = reuse_scale;
+        }
+
+        double soft_pin_weight = 0.0;
+        if (TryGetDoubleConfig(default_config,
+                               "object_type_eviction_score_policies." +
+                                   type_key + ".soft_pin_weight",
+                               &soft_pin_weight)) {
+            master_config.object_type_eviction_score_policies[data_type]
+                .soft_pin_weight = soft_pin_weight;
+        }
+
+        double budget_ratio = 0.0;
+        if (TryGetDoubleConfig(default_config,
+                               "object_type_eviction_policies." + type_key +
+                                   ".budget_ratio",
+                               &budget_ratio)) {
+            if (budget_ratio < 0.0) {
+                LOG(FATAL) << "object_type_eviction_policies." << type_key
+                           << ".budget_ratio must be non-negative";
+            }
+            master_config.object_type_eviction_policies[data_type]
+                .budget_ratio = budget_ratio;
+        }
+    }
     default_config.GetDouble("eviction_ratio", &master_config.eviction_ratio,
                              FLAGS_eviction_ratio);
     default_config.GetDouble("eviction_high_watermark_ratio",
