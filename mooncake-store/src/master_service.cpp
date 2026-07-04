@@ -7156,10 +7156,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
-    std::vector<std::array<long, UINT8_MAX + 1>>
-        local_per_type_eviction_base(num_threads);
-    std::vector<std::array<uint64_t, UINT8_MAX + 1>>
-        local_per_type_used_bytes(num_threads);
+    std::vector<std::array<long, UINT8_MAX + 1>> local_per_type_eviction_base(
+        num_threads);
+    std::vector<std::array<uint64_t, UINT8_MAX + 1>> local_per_type_used_bytes(
+        num_threads);
     for (auto& counts : local_per_type_eviction_base) counts.fill(0);
     for (auto& used_bytes : local_per_type_used_bytes) used_bytes.fill(0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
@@ -7238,8 +7238,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     std::vector<Candidate> candidates;
-    std::array<std::vector<size_t>, UINT8_MAX + 1>
-        per_type_candidate_indices;
+    std::array<std::vector<size_t>, UINT8_MAX + 1> per_type_candidate_indices;
     {
         size_t total = 0;
         for (auto& v : local_candidates) total += v.size();
@@ -7248,8 +7247,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     for (auto& v : local_candidates) {
         for (auto& candidate : v) {
             const size_t candidate_idx = candidates.size();
-            const auto data_type_idx =
-                static_cast<size_t>(candidate.data_type);
+            const auto data_type_idx = static_cast<size_t>(candidate.data_type);
             per_type_candidate_indices[data_type_idx].push_back(candidate_idx);
             candidates.push_back(std::move(candidate));
         }
