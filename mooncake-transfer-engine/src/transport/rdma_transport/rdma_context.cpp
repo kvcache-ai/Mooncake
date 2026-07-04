@@ -746,6 +746,7 @@ static GidNetworkState autoGidStateFromSelection(
     switch (selection.candidate_class) {
         case AutoGidCandidateClass::kNetworkRoutable:
         case AutoGidCandidateClass::kNetworkDegraded:
+        case AutoGidCandidateClass::kNetworkLinkLocal:
             return GidNetworkState::GID_WITH_NETWORK;
         case AutoGidCandidateClass::kNoNetworkRoutable:
         case AutoGidCandidateClass::kNoNetworkDegraded:

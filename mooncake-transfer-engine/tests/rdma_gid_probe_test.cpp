@@ -101,6 +101,56 @@ TEST(RdmaGidProbeTest, DemotesOverlayCandidateBehindNormalNetworkCandidate) {
     EXPECT_EQ(selection->gid_index, 1);
 }
 
+// Regression for routed RoCEv2 fabrics: index 0 is a network-backed link-local
+// GID and index 1 is a network-backed IPv4 GID whose address falls in RFC1918
+// space (e.g. 10.0.0.0/8), so it is flagged as an overlay. Before the fix both
+// landed in the same "network-degraded" class and the tie-break on gid_index
+// picked the non-routable link-local GID, which breaks the cross-node RTR
+// handshake. The routable IPv4 GID must win.
+TEST(RdmaGidProbeTest, PrefersOverlayIpv4OverLinkLocalOnNetworkBackedDevice) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/0, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/true),
+        makeCandidate(/*gid_index=*/1, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/false,
+                      /*is_overlay_ipv4=*/true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkDegraded);
+}
+
+// Same scenario as above but with the candidate order reversed, to prove the
+// outcome comes from the class ranking rather than input ordering.
+TEST(RdmaGidProbeTest, PrefersOverlayIpv4OverLinkLocalRegardlessOfOrder) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/0, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/true,
+                      /*is_link_local_ipv6=*/false,
+                      /*is_overlay_network=*/false,
+                      /*is_overlay_ipv4=*/true),
+        makeCandidate(/*gid_index=*/1, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 0);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkDegraded);
+}
+
 TEST(RdmaGidProbeTest,
      PrefersNoNetworkRoutableOverDegradedNetworkBackedCandidate) {
     std::vector<AutoGidCandidate> candidates = {
