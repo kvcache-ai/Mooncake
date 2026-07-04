@@ -7171,11 +7171,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         const double weight =
             is_soft_pinned ? object_type_soft_pin_weights_[idx] : 1.0;
         const int64_t eviction_grace = object_type_eviction_graces_[idx];
-        auto expired_age =
+        const auto expired_age = std::max<int64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 rank_reference_time - metadata.lease_timeout)
-                .count();
-        expired_age = std::max<int64_t>(expired_age - eviction_grace, 0);
+                    .count() -
+                eviction_grace,
+            0);
         const double score = expired_age * weight / reuse_scale;
         if (!std::isfinite(score) ||
             score >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
@@ -7198,14 +7199,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
-    std::vector<std::vector<int64_t>> local_soft_pin(num_threads);
-
     std::vector<std::array<long, UINT8_MAX + 1>> local_per_type_eviction_base(
         num_threads);
     std::vector<std::array<uint64_t, UINT8_MAX + 1>> local_per_type_used_bytes(
         num_threads);
     for (auto& counts : local_per_type_eviction_base) counts.fill(0);
     for (auto& used_bytes : local_per_type_used_bytes) used_bytes.fill(0);
+    std::vector<std::vector<int64_t>> local_soft_pin(num_threads);
 
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
@@ -7410,12 +7410,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const long remaining_evict_num =
         std::ceil(total_eviction_base * evict_ratio_target) - evicted_count;
     if (!candidates.empty() && remaining_evict_num > 0) {
-        long evict_num =
-            std::min(remaining_evict_num, (long)candidates.size());
+        long evict_num = std::min(remaining_evict_num, (long)candidates.size());
 
         std::nth_element(candidates.begin(),
-                         candidates.begin() + (evict_num - 1),
-                         candidates.end(),
+                         candidates.begin() + (evict_num - 1), candidates.end(),
                          [](const Candidate& a, const Candidate& b) {
                              return a.adjusted_age > b.adjusted_age;
                          });
