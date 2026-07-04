@@ -2852,8 +2852,43 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
-    // 1. Query metadata for all keys
-    auto query_results = client_->BatchQuery(keys);
+    // 1. Query metadata for all keys (with prefix cache acceleration)
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    {
+        std::vector<std::string> missing_keys;
+        std::string common_prefix;
+        auto cached = LookupPrefixCache(keys, missing_keys, common_prefix);
+
+        if (missing_keys.empty()) {
+            // All keys satisfied from cache
+            query_results = std::move(cached);
+        } else {
+            // Query only the missing keys from master
+            auto fresh_results = client_->BatchQuery(missing_keys);
+
+            // Build complete result vector by merging cached + fresh
+            query_results.clear();
+            query_results.reserve(keys.size());
+            size_t fresh_idx = 0;
+            for (size_t ki = 0; ki < keys.size(); ++ki) {
+                if (!cached[ki]) {
+                    // This key was in missing_keys — use fresh result
+                    query_results.push_back(
+                        fresh_idx < fresh_results.size()
+                            ? std::move(fresh_results[fresh_idx])
+                            : tl::unexpected(ErrorCode::RPC_FAIL));
+                    ++fresh_idx;
+                } else {
+                    query_results.push_back(std::move(cached[ki]));
+                }
+            }
+
+            // Cache the fresh results under the common prefix
+            if (!common_prefix.empty() && !missing_keys.empty()) {
+                CachePrefixResults(common_prefix, missing_keys, fresh_results);
+            }
+        }
+    }
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
     struct KeyOp {
@@ -4400,8 +4435,39 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return results;
     }
 
-    // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
+    // Query metadata for all keys (with prefix cache acceleration)
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    {
+        std::vector<std::string> missing_keys;
+        std::string common_prefix;
+        auto cached = LookupPrefixCache(keys, missing_keys, common_prefix);
+
+        if (missing_keys.empty()) {
+            query_results = std::move(cached);
+        } else {
+            auto fresh_results = client_->BatchQuery(missing_keys);
+
+            // Merge cached + fresh results
+            query_results.clear();
+            query_results.reserve(keys.size());
+            size_t fresh_idx = 0;
+            for (size_t ki = 0; ki < keys.size(); ++ki) {
+                if (!cached[ki]) {
+                    query_results.push_back(
+                        fresh_idx < fresh_results.size()
+                            ? std::move(fresh_results[fresh_idx])
+                            : tl::unexpected(ErrorCode::RPC_FAIL));
+                    ++fresh_idx;
+                } else {
+                    query_results.push_back(std::move(cached[ki]));
+                }
+            }
+
+            if (!common_prefix.empty() && !missing_keys.empty()) {
+                CachePrefixResults(common_prefix, missing_keys, fresh_results);
+            }
+        }
+    }
 
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
@@ -5658,4 +5724,146 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             co_return result->result();
         }());
 }
+
+// --- Prefix cache helpers ---
+
+namespace {
+
+std::string FindLongestCommonPrefix(const std::vector<std::string> &keys) {
+    if (keys.empty()) return {};
+    if (keys.size() == 1) return keys[0];
+
+    // Sort a copy to find the common prefix between first and last
+    auto sorted = keys;
+    std::sort(sorted.begin(), sorted.end());
+    const auto &first = sorted.front();
+    const auto &last = sorted.back();
+    size_t i = 0;
+    while (i < first.size() && i < last.size() && first[i] == last[i]) {
+        ++i;
+    }
+    return first.substr(0, i);
+}
+
+}  // anonymous namespace
+
+std::vector<tl::expected<QueryResult, ErrorCode>>
+RealClient::LookupPrefixCache(const std::vector<std::string> &keys,
+                              std::vector<std::string> &missing_keys,
+                              std::string &common_prefix) const {
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(keys.size());
+    missing_keys.clear();
+    common_prefix.clear();
+
+    if (keys.empty()) return results;
+
+    // Find the longest common prefix among the requested keys
+    common_prefix = FindLongestCommonPrefix(keys);
+    if (common_prefix.empty()) {
+        missing_keys = keys;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+        }
+        return results;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    std::shared_lock<std::shared_mutex> lock(prefix_cache_mutex_);
+    auto cache_it = prefix_cache_.find(common_prefix);
+    if (cache_it == prefix_cache_.end()) {
+        // Cache miss on exact prefix; also try shorter prefixes
+        for (auto it = prefix_cache_.begin(); it != prefix_cache_.end(); ++it) {
+            if (common_prefix.starts_with(it->first) &&
+                now - it->second.cached_at < kPrefixCacheTTL) {
+                cache_it = it;
+                break;
+            }
+        }
+        if (cache_it == prefix_cache_.end()) {
+            missing_keys = keys;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+            }
+            return results;
+        }
+    }
+
+    // Check TTL
+    if (now - cache_it->second.cached_at >= kPrefixCacheTTL) {
+        missing_keys = keys;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+        }
+        return results;
+    }
+
+    const auto &cached_map = cache_it->second.results;
+    for (const auto &key : keys) {
+        auto map_it = cached_map.find(key);
+        if (map_it != cached_map.end()) {
+            // Convert GetReplicaListResponse to QueryResult
+            const auto &cached_resp = map_it->second;
+            auto lease_timeout =
+                now + std::chrono::milliseconds(cached_resp.lease_ttl_ms);
+            results.emplace_back(QueryResult(
+                std::vector<Replica::Descriptor>(cached_resp.replicas),
+                lease_timeout));
+        } else {
+            results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+            missing_keys.push_back(key);
+        }
+    }
+
+    return results;
+}
+
+void RealClient::InvalidatePrefixCache(const std::string &key) {
+    std::unique_lock<std::shared_mutex> lock(prefix_cache_mutex_);
+    auto it = prefix_cache_.begin();
+    while (it != prefix_cache_.end()) {
+        if (key.starts_with(it->first)) {
+            it = prefix_cache_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void RealClient::CachePrefixResults(
+    const std::string &prefix,
+    const std::vector<std::string> &keys,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &results) {
+    if (keys.empty() || results.empty()) return;
+    if (keys.size() != results.size()) return;
+
+    const auto now = std::chrono::steady_clock::now();
+
+    std::unique_lock<std::shared_mutex> lock(prefix_cache_mutex_);
+    auto &entry = prefix_cache_[prefix];
+    entry.cached_at = now;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i].has_value()) {
+            const auto &qr = results[i].value();
+            // Store as GetReplicaListResponse (copyable) instead of QueryResult.
+            // Compute remaining lease TTL from the query result's lease timeout.
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(qr.lease_timeout - now);
+            GetReplicaListResponse resp;
+            resp.replicas = qr.replicas;
+            resp.lease_ttl_ms = remaining.count() > 0
+                ? static_cast<uint64_t>(remaining.count()) : 0;
+            entry.results.emplace(keys[i], std::move(resp));
+        }
+    }
+}
+
+void RealClient::InvalidatePrefixCache(
+    const std::vector<std::string> &keys) {
+    for (const auto &key : keys) {
+        InvalidatePrefixCache(key);
+    }
+}
+
 }  // namespace mooncake

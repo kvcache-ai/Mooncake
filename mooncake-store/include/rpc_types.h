@@ -56,6 +56,15 @@ struct CachedQueryResultResponse {
 YLT_REFL(CachedQueryResultResponse, success, value, error);
 
 /**
+ * @brief Response structure for BatchGetReplicaListByPrefix operation
+ */
+struct BatchGetReplicaListByPrefixResponse {
+    std::vector<std::string> keys;
+    std::vector<GetReplicaListResponse> replica_list;
+};
+YLT_REFL(BatchGetReplicaListByPrefixResponse, keys, replica_list);
+
+/**
  * @brief Response structure for GetStorageConfig operation
  */
 struct GetStorageConfigResponse {

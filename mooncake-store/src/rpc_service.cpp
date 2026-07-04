@@ -230,19 +230,25 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     return results;
 }
 
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-WrappedMasterService::BatchGetReplicaListForAdmin(
-    const std::vector<std::string>& keys, const std::string& tenant_id) {
-    return master_service_.BatchGetReplicaListForAdmin(keys, tenant_id);
-}
+tl::expected<BatchGetReplicaListByPrefixResponse, ErrorCode>
+WrappedMasterService::BatchGetReplicaListByPrefix(
+    const std::string& prefix, int max_count, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchGetReplicaListByPrefix");
+    timer.LogRequest("prefix=", prefix, ", max_count=", max_count,
+                     ", tenant_id=", tenant_id);
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        max_count);
 
-tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
-                                             const std::string& tenant_id) {
-    return execute_rpc(
-        "GetReplicaListForAdmin",
-        [&] { return master_service_.GetReplicaListForAdmin(key, tenant_id); },
-        [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+    auto result = master_service_.BatchGetReplicaListByPrefix(prefix, max_count,
+                                                               tenant_id);
+
+    if (!result.has_value()) {
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(1);
+    }
+
+    timer.LogResponse("keys=",
+                      result.has_value() ? result.value().keys.size() : 0);
+    return result;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -1283,6 +1289,9 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetReplicaListByPrefix>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

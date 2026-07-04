@@ -63,6 +63,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListByPrefix> {
+    static constexpr const char* value = "BatchGetReplicaListByPrefix";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -553,6 +558,21 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
                                    GetReplicaListResponse>(
         object_keys.size(), object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<BatchGetReplicaListByPrefixResponse, ErrorCode>
+MasterClient::BatchGetReplicaListByPrefix(const std::string& prefix,
+    int max_count, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaListByPrefix");
+    timer.LogRequest("prefix=", prefix, ", max_count=", max_count,
+                     ", tenant_id=", tenant_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::BatchGetReplicaListByPrefix,
+                              BatchGetReplicaListByPrefixResponse>(
+        prefix, max_count, tenant_id);
+
+    timer.LogResponseExpected(result);
     return result;
 }
 

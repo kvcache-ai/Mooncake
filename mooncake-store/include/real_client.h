@@ -932,6 +932,38 @@ class RealClient : public PyClient {
     void ReleaseAllMountedSegmentRecords();
     void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
     void ReleaseAllAllocatedSegmentRecords();
+
+    // Prefix-based cache for batch query results
+    struct PrefixCacheEntry {
+        std::unordered_map<std::string, GetReplicaListResponse> results;
+        std::chrono::steady_clock::time_point cached_at;
+    };
+    mutable std::shared_mutex prefix_cache_mutex_;
+    std::unordered_map<std::string, PrefixCacheEntry> prefix_cache_
+        GUARDED_BY(prefix_cache_mutex_);
+    static constexpr auto kPrefixCacheTTL = std::chrono::seconds(5);
+
+    // Look up prefix cache for a batch of keys. Returns cached results for keys
+    // that share a common prefix found in cache. missing_keys receives the keys
+    // not found in cache. common_prefix receives the longest common prefix of
+    // all keys (empty if no common prefix).
+    // The returned QueryResult objects use start_time as the lease base.
+    std::vector<tl::expected<QueryResult, ErrorCode>>
+    LookupPrefixCache(const std::vector<std::string> &keys,
+                      std::vector<std::string> &missing_keys,
+                      std::string &common_prefix) const;
+
+    // Invalidate prefix cache entries that could cover the given key.
+    void InvalidatePrefixCache(const std::string &key);
+
+    // Cache fresh batch query results under the given prefix with explicit
+    // key-to-result mapping. The results are stored as GetReplicaListResponse.
+    void CachePrefixResults(
+        const std::string &prefix, const std::vector<std::string> &keys,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &results);
+
+    // Invalidate prefix cache entries that could cover the given keys.
+    void InvalidatePrefixCache(const std::vector<std::string> &keys);
 };
 
 }  // namespace mooncake

@@ -67,9 +67,6 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
 }  // namespace test
-namespace benchmarks {
-class BatchEvictBench;
-}  // namespace benchmarks
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -90,7 +87,6 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
-    friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
     friend class MasterSnapshotManager;  // Allow access to internal state for
                                          // snapshot
@@ -337,13 +333,18 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
-     * @brief Read-only single-key replica list query for admin use.
-     * Unlike GetReplicaList, this does not grant leases, trigger
-     * promotion, or update cache-hit metrics.
+     * @brief Batch query replica lists by key prefix. Returns all keys matching
+     * the prefix along with their replica lists, up to max_count results.
+     * Read-only; does not modify lease or perform promotion.
+     * @param prefix The key prefix to match.
+     * @param max_count Maximum number of results to return.
+     * @param tenant_id Tenant scope.
+     * @return Matching keys + their replica lists on success, ErrorCode on
+     * failure.
      */
-    auto GetReplicaListForAdmin(const std::string& key,
-                                const std::string& tenant_id)
-        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+    tl::expected<BatchGetReplicaListByPrefixResponse, ErrorCode>
+    BatchGetReplicaListByPrefix(const std::string& prefix, int max_count,
+                                const std::string& tenant_id);
 
     /**
      * @brief Get replica lists for a batch of objects.
@@ -351,15 +352,6 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id);
-
-    /**
-     * @brief Read-only batch replica list query for admin use.
-     * Unlike BatchGetReplicaList, this does not grant leases, trigger
-     * promotion, or update cache-hit metrics.
-     */
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
-                                const std::string& tenant_id);
 
     /**
      * @brief Start a put operation for an object
