@@ -7406,34 +7406,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
+    const long remaining_evict_num =
+        std::ceil(total_eviction_base * evict_ratio_target) - evicted_count;
     // First pass: evict candidates with no soft pin
-    if (!candidates.empty()) {
-        long ideal_evict_num =
-            std::ceil(total_eviction_base * evict_ratio_target) - evicted_count;
-        long evict_num = std::min(ideal_evict_num, (long)candidates.size());
+    if (!candidates.empty() && remaining_evict_num > 0) {
+        long evict_num =
+            std::min(remaining_evict_num, (long)candidates.size());
 
-        if (evict_num <= 0) {
-            evict_num = 0;
-        } else {
-            std::nth_element(candidates.begin(),
-                             candidates.begin() + (evict_num - 1),
-                             candidates.end(),
-                             [](const Candidate& a, const Candidate& b) {
-                                 return a.adjusted_age > b.adjusted_age;
-                             });
-        }
-        auto target_adjusted_age =
-            evict_num > 0 ? candidates[evict_num - 1].adjusted_age
-                          : std::numeric_limits<int64_t>::max();
+        std::nth_element(candidates.begin(),
+                         candidates.begin() + (evict_num - 1),
+                         candidates.end(),
+                         [](const Candidate& a, const Candidate& b) {
+                             return a.adjusted_age > b.adjusted_age;
+                         });
+        auto target_adjusted_age = candidates[evict_num - 1].adjusted_age;
 
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
         long evicted_this_pass = 0;
         for (auto& c : candidates) {
-            if (evict_num <= 0 ||
-                (evicted_this_pass >= evict_num &&
-                 c.adjusted_age < target_adjusted_age)) {
+            if (evicted_this_pass >= evict_num &&
+                c.adjusted_age < target_adjusted_age) {
                 no_pin_objects.push_back(c.adjusted_age);
                 continue;
             }
