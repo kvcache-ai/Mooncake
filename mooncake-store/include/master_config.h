@@ -28,9 +28,10 @@ struct ObjectTypeEvictionPolicy {
 
 inline void ValidateObjectTypeEvictionPolicy(
     const ObjectTypeEvictionPolicy& policy) {
-    if (!std::isfinite(policy.budget_ratio) || policy.budget_ratio < 0.0) {
+    if (!std::isfinite(policy.budget_ratio) || policy.budget_ratio < 0.0 ||
+        policy.budget_ratio > 1.0) {
         throw std::invalid_argument(
-            "budget_ratio must be finite and non-negative");
+            "budget_ratio must be finite and between 0.0 and 1.0");
     }
 }
 

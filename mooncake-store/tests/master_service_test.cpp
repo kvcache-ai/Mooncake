@@ -6961,6 +6961,10 @@ TEST_F(MasterServiceTest, ObjectTypeEvictionPolicyRejectsInvalidBuilderInput) {
             ObjectDataType::KVCACHE,
             ObjectTypeEvictionPolicy{std::numeric_limits<double>::infinity()}),
         std::invalid_argument);
+
+    EXPECT_THROW(builder.set_object_type_eviction_policy(
+                     ObjectDataType::KVCACHE, ObjectTypeEvictionPolicy{1.1}),
+                 std::invalid_argument);
 }
 
 TEST_F(MasterServiceTest,
@@ -6976,6 +6980,10 @@ TEST_F(MasterServiceTest,
 
     config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
         ObjectTypeEvictionPolicy{std::numeric_limits<double>::infinity()};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{1.1};
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 }
 
