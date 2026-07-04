@@ -7198,13 +7198,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
+    std::vector<std::vector<int64_t>> local_soft_pin(num_threads);
+
     std::vector<std::array<long, UINT8_MAX + 1>> local_per_type_eviction_base(
         num_threads);
     std::vector<std::array<uint64_t, UINT8_MAX + 1>> local_per_type_used_bytes(
         num_threads);
     for (auto& counts : local_per_type_eviction_base) counts.fill(0);
     for (auto& used_bytes : local_per_type_used_bytes) used_bytes.fill(0);
-    std::vector<std::vector<int64_t>> local_soft_pin(num_threads);
 
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
