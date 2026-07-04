@@ -7328,8 +7328,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             MasterMetricManager::instance().get_total_mem_capacity();
         for (size_t data_type_idx = 0;
              data_type_idx < per_type_used_bytes.size(); ++data_type_idx) {
-            const uint64_t type_used_bytes =
-                per_type_used_bytes[data_type_idx];
+            const uint64_t type_used_bytes = per_type_used_bytes[data_type_idx];
             const double budget_ratio =
                 object_type_budget_ratios_[data_type_idx];
             const double type_budget_bytes =
@@ -7346,23 +7345,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 budget_ratio;
             const double type_evict_ratio =
                 std::min(evict_ratio_target, over_budget_ratio);
-            long type_evict_num =
-                std::ceil(per_type_eviction_base[data_type_idx] *
-                          type_evict_ratio);
+            long type_evict_num = std::ceil(
+                per_type_eviction_base[data_type_idx] * type_evict_ratio);
             type_evict_num =
                 std::min(type_evict_num, (long)type_candidate_indices.size());
             if (type_evict_num <= 0) {
                 continue;
             }
 
-            std::nth_element(type_candidate_indices.begin(),
-                             type_candidate_indices.begin() +
-                                 (type_evict_num - 1),
-                             type_candidate_indices.end(),
-                             [&](size_t a, size_t b) {
-                                 return candidates[a].adjusted_age >
-                                        candidates[b].adjusted_age;
-                             });
+            std::nth_element(
+                type_candidate_indices.begin(),
+                type_candidate_indices.begin() + (type_evict_num - 1),
+                type_candidate_indices.end(), [&](size_t a, size_t b) {
+                    return candidates[a].adjusted_age >
+                           candidates[b].adjusted_age;
+                });
             auto target_adjusted_age =
                 candidates[type_candidate_indices[type_evict_num - 1]]
                     .adjusted_age;
@@ -7409,17 +7406,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
         long ideal_evict_num =
-            std::ceil(total_eviction_base * evict_ratio_target) -
-            evicted_count;
+            std::ceil(total_eviction_base * evict_ratio_target) - evicted_count;
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
         if (evict_num > 0) {
-            std::nth_element(candidates.begin(),
-                             candidates.begin() + (evict_num - 1),
-                             candidates.end(),
-                             [](const Candidate& a, const Candidate& b) {
-                                 return a.adjusted_age > b.adjusted_age;
-                             });
+            std::nth_element(
+                candidates.begin(), candidates.begin() + (evict_num - 1),
+                candidates.end(), [](const Candidate& a, const Candidate& b) {
+                    return a.adjusted_age > b.adjusted_age;
+                });
             auto target_adjusted_age = candidates[evict_num - 1].adjusted_age;
 
             // Treat evict_num as a minimum: if re-validation skips a candidate,

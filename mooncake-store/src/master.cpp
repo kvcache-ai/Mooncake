@@ -9,7 +9,7 @@
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <limits>
-#include <memory>   // For std::unique_ptr
+#include <memory>  // For std::unique_ptr
 #include <string>
 #include <thread>  // For std::thread
 #include <json/json.h>
@@ -438,8 +438,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
     for (uint16_t type_id = 0; type_id <= UINT8_MAX; ++type_id) {
-        const auto data_type =
-            static_cast<mooncake::ObjectDataType>(static_cast<uint8_t>(type_id));
+        const auto data_type = static_cast<mooncake::ObjectDataType>(
+            static_cast<uint8_t>(type_id));
         const std::string type_key = std::to_string(type_id);
 
         double reuse_scale = 0.0;
@@ -448,9 +448,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                                    type_key + ".reuse_scale",
                                &reuse_scale)) {
             if (reuse_scale <= 0.0) {
-                LOG(FATAL)
-                    << "object_type_eviction_score_policies." << type_key
-                    << ".reuse_scale must be greater than 0";
+                LOG(FATAL) << "object_type_eviction_score_policies." << type_key
+                           << ".reuse_scale must be greater than 0";
             }
             master_config.object_type_eviction_score_policies[data_type]
                 .reuse_scale = reuse_scale;
@@ -466,10 +465,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         }
 
         double budget_ratio = 0.0;
-        if (TryGetDoubleConfig(default_config,
-                               "object_type_eviction_policies." + type_key +
-                                   ".budget_ratio",
-                               &budget_ratio)) {
+        if (TryGetDoubleConfig(
+                default_config,
+                "object_type_eviction_policies." + type_key + ".budget_ratio",
+                &budget_ratio)) {
             if (budget_ratio < 0.0) {
                 LOG(FATAL) << "object_type_eviction_policies." << type_key
                            << ".budget_ratio must be non-negative";
