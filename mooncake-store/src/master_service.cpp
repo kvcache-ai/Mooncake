@@ -7198,10 +7198,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
-    std::vector<std::array<long, UINT8_MAX + 1>>
-        local_per_type_eviction_base(num_threads);
-    std::vector<std::array<uint64_t, UINT8_MAX + 1>>
-        local_per_type_used_bytes(num_threads);
+    std::vector<std::array<long, UINT8_MAX + 1>> local_per_type_eviction_base(
+        num_threads);
+    std::vector<std::array<uint64_t, UINT8_MAX + 1>> local_per_type_used_bytes(
+        num_threads);
     for (auto& counts : local_per_type_eviction_base) counts.fill(0);
     for (auto& used_bytes : local_per_type_used_bytes) used_bytes.fill(0);
     std::vector<std::vector<int64_t>> local_soft_pin(num_threads);
@@ -7282,8 +7282,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     std::vector<Candidate> candidates;
-    std::array<std::vector<size_t>, UINT8_MAX + 1>
-        per_type_candidate_indices;
+    std::array<std::vector<size_t>, UINT8_MAX + 1> per_type_candidate_indices;
     {
         size_t total = 0;
         for (auto& v : local_candidates) total += v.size();
@@ -7292,8 +7291,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     for (auto& v : local_candidates) {
         for (auto& candidate : v) {
             const size_t candidate_idx = candidates.size();
-            const auto data_type_idx =
-                static_cast<size_t>(candidate.data_type);
+            const auto data_type_idx = static_cast<size_t>(candidate.data_type);
             per_type_candidate_indices[data_type_idx].push_back(candidate_idx);
             candidates.push_back(std::move(candidate));
         }
@@ -7413,55 +7411,61 @@ void MasterService::BatchEvict(double evict_ratio_target,
             std::ceil(total_eviction_base * evict_ratio_target) - evicted_count;
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
-        if (evict_num > 0) {
-            std::nth_element(
-                candidates.begin(), candidates.begin() + (evict_num - 1),
-                candidates.end(), [](const Candidate& a, const Candidate& b) {
-                    return a.adjusted_age > b.adjusted_age;
-                });
-            auto target_adjusted_age = candidates[evict_num - 1].adjusted_age;
+        if (evict_num <= 0) {
+            evict_num = 0;
+        } else {
+            std::nth_element(candidates.begin(),
+                             candidates.begin() + (evict_num - 1),
+                             candidates.end(),
+                             [](const Candidate& a, const Candidate& b) {
+                                 return a.adjusted_age > b.adjusted_age;
+                             });
+        }
+        auto target_adjusted_age =
+            evict_num > 0 ? candidates[evict_num - 1].adjusted_age
+                          : std::numeric_limits<int64_t>::max();
 
-            // Treat evict_num as a minimum: if re-validation skips a candidate,
-            // continue trying the next one so actual evicted count reaches
-            // evict_num. This matches the old per-shard over-eviction behavior.
-            long evicted_this_pass = 0;
-            for (auto& c : candidates) {
-                if (evicted_this_pass >= evict_num &&
-                    c.adjusted_age < target_adjusted_age) {
+        // Treat evict_num as a minimum: if re-validation skips a candidate,
+        // continue trying the next one so actual evicted count reaches
+        // evict_num. This matches the old per-shard over-eviction behavior.
+        long evicted_this_pass = 0;
+        for (auto& c : candidates) {
+            if (evict_num <= 0 ||
+                (evicted_this_pass >= evict_num &&
+                 c.adjusted_age < target_adjusted_age)) {
+                no_pin_objects.push_back(c.adjusted_age);
+                continue;
+            }
+            {
+                MetadataShardAccessorRW shard(this, c.shard_idx);
+                auto tenant_it = shard->tenants.find(c.tenant_id);
+                if (tenant_it == shard->tenants.end()) continue;
+                auto& tenant_state = tenant_it->second;
+                auto it = tenant_state.metadata.find(c.key);
+                if (it == tenant_state.metadata.end()) continue;
+                // Re-validate: state may have changed since Phase 1
+                if (!it->second.IsLeaseExpired(now) ||
+                    it->second.IsSoftPinned(now) ||
+                    !can_evict_replicas(it->second)) {
                     no_pin_objects.push_back(c.adjusted_age);
                     continue;
                 }
-                {
-                    MetadataShardAccessorRW shard(this, c.shard_idx);
-                    auto tenant_it = shard->tenants.find(c.tenant_id);
-                    if (tenant_it == shard->tenants.end()) continue;
-                    auto& tenant_state = tenant_it->second;
-                    auto it = tenant_state.metadata.find(c.key);
-                    if (it == tenant_state.metadata.end()) continue;
-                    // Re-validate: state may have changed since Phase 1
-                    if (!it->second.IsLeaseExpired(now) ||
-                        it->second.IsSoftPinned(now) ||
-                        !can_evict_replicas(it->second)) {
-                        no_pin_objects.push_back(c.adjusted_age);
-                        continue;
-                    }
-                    auto evict_result = try_evict_group_or_object(
-                        c.tenant_id, c.key, it->second, shard, tenant_state,
-                        deferred_replicas,
-                        /*allow_soft_pinned=*/false);
-                    total_freed_size += evict_result.freed_bytes;
-                    if (!it->second.IsValid()) {
-                        EraseMetadata(tenant_state, it, c.tenant_id,
-                                      QuotaEraseMode::kFull, &shard);
-                    }
-                    if (tenant_state.Empty()) {
-                        shard->tenants.erase(tenant_it);
-                    }
-                    evicted_count += evict_result.evicted_objects;
-                    evicted_this_pass += evict_result.evicted_objects;
+                auto evict_result = try_evict_group_or_object(
+                    c.tenant_id, c.key, it->second, shard, tenant_state,
+                    deferred_replicas,
+                    /*allow_soft_pinned=*/false);
+                total_freed_size += evict_result.freed_bytes;
+                if (!it->second.IsValid()) {
+                    EraseMetadata(tenant_state, it, c.tenant_id,
+                                  QuotaEraseMode::kFull, &shard);
                 }
-                deferred_replicas.clear();
+                if (tenant_state.Empty()) {
+                    shard->tenants.erase(tenant_it);
+                }
+                evicted_count += evict_result.evicted_objects;
+                evicted_this_pass += evict_result.evicted_objects;
             }
+            deferred_replicas.clear();
         }
     }
 
