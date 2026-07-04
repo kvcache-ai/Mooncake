@@ -30,8 +30,13 @@ enum class AutoGidCandidateClass {
     kNetworkRoutable = 0,
     kNoNetworkRoutable = 1,
     kNetworkDegraded = 2,
-    kNoNetworkDegraded = 3,
-    kFallbackNonzero = 4,
+    // A network-backed link-local GID is not routable across subnets, so it
+    // must rank strictly below any network-backed IPv4 GID (even a degraded /
+    // RFC1918 one). On routed RoCEv2 fabrics the only usable cross-node GID is
+    // the IPv4 one; picking link-local here breaks the RTR handshake.
+    kNetworkLinkLocal = 3,
+    kNoNetworkDegraded = 4,
+    kFallbackNonzero = 5,
 };
 
 enum class AutoGidRetryAction {
@@ -74,6 +79,8 @@ inline const char* autoGidCandidateClassToString(
             return "no-network-routable";
         case AutoGidCandidateClass::kNetworkDegraded:
             return "network-degraded";
+        case AutoGidCandidateClass::kNetworkLinkLocal:
+            return "network-link-local";
         case AutoGidCandidateClass::kNoNetworkDegraded:
             return "no-network-degraded";
         case AutoGidCandidateClass::kFallbackNonzero:
@@ -103,8 +110,14 @@ inline std::optional<AutoGidCandidateClass> classifyAutoGidCandidate(
     const bool is_degraded = is_overlay || is_link_local;
 
     if (candidate.has_network_device) {
-        return is_degraded ? AutoGidCandidateClass::kNetworkDegraded
-                           : AutoGidCandidateClass::kNetworkRoutable;
+        // A non-routable link-local GID must never outrank a network-backed
+        // IPv4 GID, even one flagged as degraded/overlay (e.g. an RFC1918
+        // 10.0.0.0/8 address that a routed RoCEv2 fabric legitimately uses).
+        if (is_link_local) {
+            return AutoGidCandidateClass::kNetworkLinkLocal;
+        }
+        return is_overlay ? AutoGidCandidateClass::kNetworkDegraded
+                          : AutoGidCandidateClass::kNetworkRoutable;
     }
 
     return is_degraded ? AutoGidCandidateClass::kNoNetworkDegraded
@@ -120,12 +133,14 @@ inline int autoGidCandidateClassPriority(
             return 1;
         case AutoGidCandidateClass::kNetworkDegraded:
             return 2;
-        case AutoGidCandidateClass::kNoNetworkDegraded:
+        case AutoGidCandidateClass::kNetworkLinkLocal:
             return 3;
-        case AutoGidCandidateClass::kFallbackNonzero:
+        case AutoGidCandidateClass::kNoNetworkDegraded:
             return 4;
+        case AutoGidCandidateClass::kFallbackNonzero:
+            return 5;
     }
-    return 5;
+    return 6;
 }
 
 inline std::vector<AutoGidSelection> rankAutoGidCandidates(
