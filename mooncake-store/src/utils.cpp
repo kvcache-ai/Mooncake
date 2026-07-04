@@ -340,8 +340,8 @@ void *allocate_buffer_numa_segments(size_t total_size,
     if (ptr == MAP_FAILED) {
         LOG(ERROR) << "mmap failed (hugepage="
                    << ((flags & MAP_HUGETLB) ? "yes" : "no")
-                   << "), size=" << map_size << ", errno=" << errno
-                   << " (" << strerror(errno) << ")";
+                   << "), size=" << map_size << ", errno=" << errno << " ("
+                   << strerror(errno) << ")";
         return nullptr;
     }
 
