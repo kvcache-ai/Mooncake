@@ -7138,6 +7138,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         size_t shard_idx;
         std::string tenant_id;
         std::string key;
+        ObjectDataType data_type;
         std::chrono::system_clock::time_point lease_timeout;
     };
 
@@ -7155,6 +7156,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
+    std::vector<std::array<long, UINT8_MAX + 1>>
+        local_per_type_eviction_base(num_threads);
+    std::vector<std::array<uint64_t, UINT8_MAX + 1>>
+        local_per_type_used_bytes(num_threads);
+    for (auto& counts : local_per_type_eviction_base) counts.fill(0);
+    for (auto& used_bytes : local_per_type_used_bytes) used_bytes.fill(0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
         local_soft_pin(num_threads);
 
@@ -7173,14 +7180,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     shard_metadata_count += tenant_state.metadata.size();
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
+                        const ObjectDataType data_type = it->second.data_type;
+                        const auto data_type_idx =
+                            static_cast<size_t>(data_type);
+                        const uint64_t charge =
+                            CompletedMemoryQuotaCharge(it->second);
+                        if (charge > 0) {
+                            auto& used_bytes =
+                                local_per_type_used_bytes[t][data_type_idx];
+                            used_bytes = SaturatingAdd(used_bytes, charge);
+                        }
                         if (it->second.IsHardPinned()) continue;
                         bool has_evictable = can_evict_replicas(it->second);
-                        if (has_evictable) shard_evictable_count++;
+                        if (has_evictable) {
+                            shard_evictable_count++;
+                            local_per_type_eviction_base[t][data_type_idx]++;
+                        }
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
                             local_candidates[t].push_back(
-                                {s, tenant_id, it->first,
+                                {s, tenant_id, it->first, data_type,
                                  it->second.lease_timeout});
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(
@@ -7199,18 +7219,40 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long total_eviction_base = 0;
     for (auto v : local_eviction_base) total_eviction_base += v;
 
+    std::array<long, UINT8_MAX + 1> per_type_eviction_base{};
+    for (const auto& local_counts : local_per_type_eviction_base) {
+        for (size_t i = 0; i < per_type_eviction_base.size(); ++i) {
+            per_type_eviction_base[i] += local_counts[i];
+        }
+    }
+
     long object_count = 0;
     for (auto v : local_object_count) object_count += v;
 
+    std::array<uint64_t, UINT8_MAX + 1> per_type_used_bytes{};
+    for (const auto& local_used_bytes : local_per_type_used_bytes) {
+        for (size_t i = 0; i < per_type_used_bytes.size(); ++i) {
+            per_type_used_bytes[i] =
+                SaturatingAdd(per_type_used_bytes[i], local_used_bytes[i]);
+        }
+    }
+
     std::vector<Candidate> candidates;
+    std::array<std::vector<size_t>, UINT8_MAX + 1>
+        per_type_candidate_indices;
     {
         size_t total = 0;
         for (auto& v : local_candidates) total += v.size();
         candidates.reserve(total);
     }
     for (auto& v : local_candidates) {
-        candidates.insert(candidates.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
+        for (auto& candidate : v) {
+            const size_t candidate_idx = candidates.size();
+            const auto data_type_idx =
+                static_cast<size_t>(candidate.data_type);
+            per_type_candidate_indices[data_type_idx].push_back(candidate_idx);
+            candidates.push_back(std::move(candidate));
+        }
     }
 
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
