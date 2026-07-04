@@ -460,6 +460,8 @@ MooncakeBackend::MooncakeBackend(
         ConnectionPoller::GetInstance().registerContext(connection_ctx_);
         connectionPollerRegistered_ = true;
         connection_ctx_->waitUntilAllConnected();
+        // After the legacy PG/bootstrap path makes all peers reachable, bring
+        // up the backend-owned ordered device collective runtime.
         maybeInitDeviceCollectiveRuntime();
     }
 

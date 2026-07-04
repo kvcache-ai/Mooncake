@@ -9,6 +9,9 @@
 
 namespace mooncake {
 
+// Store-key and metadata helpers shared by the backend-owned device collective
+// runtime bootstrap path. These helpers intentionally stay below any
+// collective-specific launch policy.
 std::string serverHostOnly(const std::string& server_name);
 
 std::string deviceCollectiveP2pKey(int backendIndex, int rank);

@@ -13,8 +13,8 @@ std::string serverHostOnly(const std::string& server_name) {
 }
 
 std::string deviceCollectiveP2pKey(int backendIndex, int rank) {
-    return "mooncake_pg_device_collective_p2p/" +
-           std::to_string(backendIndex) + "/" + std::to_string(rank);
+    return "mooncake_pg_device_collective_p2p/" + std::to_string(backendIndex) +
+           "/" + std::to_string(rank);
 }
 
 std::string deviceCollectiveRdmaKey(int backendIndex, int rank) {
