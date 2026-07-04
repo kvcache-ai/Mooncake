@@ -6909,11 +6909,10 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
 TEST_F(MasterServiceTest,
        ObjectTypeEvictionScorePolicyRejectsInvalidBuilderInput) {
     auto builder = MasterServiceConfig::builder();
-    EXPECT_THROW(
-        builder.set_object_type_eviction_score_policy(
-            ObjectDataType::KVCACHE,
-            ObjectTypeEvictionScorePolicy{1.0, -1.0, 0}),
-        std::invalid_argument);
+    EXPECT_THROW(builder.set_object_type_eviction_score_policy(
+                     ObjectDataType::KVCACHE,
+                     ObjectTypeEvictionScorePolicy{1.0, -1.0, 0}),
+                 std::invalid_argument);
 
     EXPECT_THROW(builder.set_object_type_eviction_score_policy(
                      ObjectDataType::KVCACHE,
@@ -6940,8 +6939,8 @@ TEST_F(MasterServiceTest,
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 
     config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
-        ObjectTypeEvictionScorePolicy{std::numeric_limits<double>::infinity(),
-                                      1.0, 0};
+        ObjectTypeEvictionScorePolicy{
+            std::numeric_limits<double>::infinity(), 1.0, 0};
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 }
 
