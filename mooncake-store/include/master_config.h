@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -19,6 +20,19 @@ struct ObjectTypeEvictionScorePolicy {
     double reuse_scale{1.0};
     double soft_pin_weight{1.0};
 };
+
+inline void ValidateObjectTypeEvictionScorePolicy(
+    const ObjectTypeEvictionScorePolicy& policy) {
+    if (!std::isfinite(policy.reuse_scale) || policy.reuse_scale <= 0.0) {
+        throw std::invalid_argument(
+            "reuse_scale must be finite and greater than 0");
+    }
+    if (!std::isfinite(policy.soft_pin_weight) ||
+        policy.soft_pin_weight < 0.0) {
+        throw std::invalid_argument(
+            "soft_pin_weight must be finite and non-negative");
+    }
+}
 
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
@@ -693,9 +707,7 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_object_type_eviction_score_policy(
         ObjectDataType data_type, ObjectTypeEvictionScorePolicy policy) {
-        if (policy.reuse_scale <= 0.0) {
-            throw std::invalid_argument("reuse_scale must be greater than 0");
-        }
+        ValidateObjectTypeEvictionScorePolicy(policy);
         object_type_eviction_score_policies_[data_type] = policy;
         return *this;
     }
