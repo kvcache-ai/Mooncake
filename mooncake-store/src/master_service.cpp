@@ -240,6 +240,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     object_type_reuse_scales_.fill(1.0);
     object_type_soft_pin_weights_.fill(1.0);
     object_type_eviction_graces_.fill(0);
+    object_type_budget_ratios_.fill(1.0);
     for (const auto& [data_type, policy] :
          config.object_type_eviction_score_policies) {
         ValidateObjectTypeEvictionScorePolicy(policy);
@@ -247,6 +248,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
         object_type_reuse_scales_[idx] = policy.reuse_scale;
         object_type_soft_pin_weights_[idx] = policy.soft_pin_weight;
         object_type_eviction_graces_[idx] = policy.eviction_grace;
+    }
+    for (const auto& [data_type, policy] :
+         config.object_type_eviction_policies) {
+        const auto idx = static_cast<uint8_t>(data_type);
+        object_type_budget_ratios_[idx] = policy.budget_ratio;
     }
 
     // Initialize HTTP metadata key prefix (read env var once at startup)
