@@ -6944,6 +6944,41 @@ TEST_F(MasterServiceTest,
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 }
 
+TEST_F(MasterServiceTest, ObjectTypeEvictionPolicyRejectsInvalidBuilderInput) {
+    auto builder = MasterServiceConfig::builder();
+    EXPECT_THROW(builder.set_object_type_eviction_policy(
+                     ObjectDataType::KVCACHE, ObjectTypeEvictionPolicy{-1.0}),
+                 std::invalid_argument);
+
+    EXPECT_THROW(
+        builder.set_object_type_eviction_policy(
+            ObjectDataType::KVCACHE,
+            ObjectTypeEvictionPolicy{std::numeric_limits<double>::quiet_NaN()}),
+        std::invalid_argument);
+
+    EXPECT_THROW(
+        builder.set_object_type_eviction_policy(
+            ObjectDataType::KVCACHE,
+            ObjectTypeEvictionPolicy{std::numeric_limits<double>::infinity()}),
+        std::invalid_argument);
+}
+
+TEST_F(MasterServiceTest,
+       ObjectTypeEvictionPolicyRejectsInvalidDirectConfigInput) {
+    auto config = MasterServiceConfig::builder().build();
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{-1.0};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{std::numeric_limits<double>::quiet_NaN()};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{std::numeric_limits<double>::infinity()};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+}
+
 TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {
     // Objects created without with_hard_pin should not be hard-pinned
     auto service_config =

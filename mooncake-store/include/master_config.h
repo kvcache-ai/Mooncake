@@ -26,6 +26,14 @@ struct ObjectTypeEvictionPolicy {
     double budget_ratio{1.0};
 };
 
+inline void ValidateObjectTypeEvictionPolicy(
+    const ObjectTypeEvictionPolicy& policy) {
+    if (!std::isfinite(policy.budget_ratio) || policy.budget_ratio < 0.0) {
+        throw std::invalid_argument(
+            "budget_ratio must be finite and non-negative");
+    }
+}
+
 inline void ValidateObjectTypeEvictionScorePolicy(
     const ObjectTypeEvictionScorePolicy& policy) {
     if (!std::isfinite(policy.reuse_scale) || policy.reuse_scale <= 0.0) {
@@ -742,9 +750,7 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_object_type_eviction_policy(
         ObjectDataType data_type, ObjectTypeEvictionPolicy policy) {
-        if (policy.budget_ratio < 0.0) {
-            throw std::invalid_argument("budget_ratio must be non-negative");
-        }
+        ValidateObjectTypeEvictionPolicy(policy);
         object_type_eviction_policies_[data_type] = policy;
         return *this;
     }

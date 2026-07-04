@@ -251,6 +251,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
     for (const auto& [data_type, policy] :
          config.object_type_eviction_policies) {
+        ValidateObjectTypeEvictionPolicy(policy);
         const auto idx = static_cast<uint8_t>(data_type);
         object_type_budget_ratios_[idx] = policy.budget_ratio;
     }
@@ -7326,79 +7327,82 @@ void MasterService::BatchEvict(double evict_ratio_target,
     if (!candidates.empty()) {
         const int64_t total_mem_capacity =
             MasterMetricManager::instance().get_total_mem_capacity();
-        for (size_t data_type_idx = 0;
-             data_type_idx < per_type_used_bytes.size(); ++data_type_idx) {
-            const uint64_t type_used_bytes = per_type_used_bytes[data_type_idx];
-            const double budget_ratio =
-                object_type_budget_ratios_[data_type_idx];
-            const double type_budget_bytes =
-                budget_ratio * static_cast<double>(total_mem_capacity);
-            if (static_cast<double>(type_used_bytes) <= type_budget_bytes) {
-                continue;
-            }
-
-            auto& type_candidate_indices =
-                per_type_candidate_indices[data_type_idx];
-            const double over_budget_ratio =
-                static_cast<double>(type_used_bytes) /
-                    static_cast<double>(total_mem_capacity) -
-                budget_ratio;
-            const double type_evict_ratio =
-                std::min(evict_ratio_target, over_budget_ratio);
-            long type_evict_num = std::ceil(
-                per_type_eviction_base[data_type_idx] * type_evict_ratio);
-            type_evict_num =
-                std::min(type_evict_num, (long)type_candidate_indices.size());
-            if (type_evict_num <= 0) {
-                continue;
-            }
-
-            std::nth_element(
-                type_candidate_indices.begin(),
-                type_candidate_indices.begin() + (type_evict_num - 1),
-                type_candidate_indices.end(), [&](size_t a, size_t b) {
-                    return candidates[a].adjusted_age >
-                           candidates[b].adjusted_age;
-                });
-            auto target_adjusted_age =
-                candidates[type_candidate_indices[type_evict_num - 1]]
-                    .adjusted_age;
-
-            long evicted_this_type = 0;
-            for (const auto candidate_idx : type_candidate_indices) {
-                const auto& c = candidates[candidate_idx];
-                if (evicted_this_type >= type_evict_num &&
-                    c.adjusted_age < target_adjusted_age) {
+        if (total_mem_capacity > 0) {
+            for (size_t data_type_idx = 0;
+                 data_type_idx < per_type_used_bytes.size(); ++data_type_idx) {
+                const uint64_t type_used_bytes =
+                    per_type_used_bytes[data_type_idx];
+                const double budget_ratio =
+                    object_type_budget_ratios_[data_type_idx];
+                const double type_budget_bytes =
+                    budget_ratio * static_cast<double>(total_mem_capacity);
+                if (static_cast<double>(type_used_bytes) <= type_budget_bytes) {
                     continue;
                 }
-                {
-                    MetadataShardAccessorRW shard(this, c.shard_idx);
-                    auto tenant_it = shard->tenants.find(c.tenant_id);
-                    if (tenant_it == shard->tenants.end()) continue;
-                    auto& tenant_state = tenant_it->second;
-                    auto it = tenant_state.metadata.find(c.key);
-                    if (it == tenant_state.metadata.end()) continue;
-                    if (!it->second.IsLeaseExpired(now) ||
-                        it->second.IsSoftPinned(now) ||
-                        !can_evict_replicas(it->second)) {
+
+                auto& type_candidate_indices =
+                    per_type_candidate_indices[data_type_idx];
+                const double over_budget_ratio =
+                    static_cast<double>(type_used_bytes) /
+                        static_cast<double>(total_mem_capacity) -
+                    budget_ratio;
+                const double type_evict_ratio =
+                    std::min(evict_ratio_target, over_budget_ratio);
+                long type_evict_num = std::ceil(
+                    per_type_eviction_base[data_type_idx] * type_evict_ratio);
+                type_evict_num = std::min(type_evict_num,
+                                          (long)type_candidate_indices.size());
+                if (type_evict_num <= 0) {
+                    continue;
+                }
+
+                std::nth_element(
+                    type_candidate_indices.begin(),
+                    type_candidate_indices.begin() + (type_evict_num - 1),
+                    type_candidate_indices.end(), [&](size_t a, size_t b) {
+                        return candidates[a].adjusted_age >
+                               candidates[b].adjusted_age;
+                    });
+                auto target_adjusted_age =
+                    candidates[type_candidate_indices[type_evict_num - 1]]
+                        .adjusted_age;
+
+                long evicted_this_type = 0;
+                for (const auto candidate_idx : type_candidate_indices) {
+                    const auto& c = candidates[candidate_idx];
+                    if (evicted_this_type >= type_evict_num &&
+                        c.adjusted_age < target_adjusted_age) {
                         continue;
                     }
-                    auto evict_result = try_evict_group_or_object(
-                        c.tenant_id, c.key, it->second, shard, tenant_state,
-                        deferred_replicas,
-                        /*allow_soft_pinned=*/false);
-                    total_freed_size += evict_result.freed_bytes;
-                    if (!it->second.IsValid()) {
-                        EraseMetadata(tenant_state, it, c.tenant_id,
-                                      QuotaEraseMode::kFull, &shard);
+                    {
+                        MetadataShardAccessorRW shard(this, c.shard_idx);
+                        auto tenant_it = shard->tenants.find(c.tenant_id);
+                        if (tenant_it == shard->tenants.end()) continue;
+                        auto& tenant_state = tenant_it->second;
+                        auto it = tenant_state.metadata.find(c.key);
+                        if (it == tenant_state.metadata.end()) continue;
+                        if (!it->second.IsLeaseExpired(now) ||
+                            it->second.IsSoftPinned(now) ||
+                            !can_evict_replicas(it->second)) {
+                            continue;
+                        }
+                        auto evict_result = try_evict_group_or_object(
+                            c.tenant_id, c.key, it->second, shard, tenant_state,
+                            deferred_replicas,
+                            /*allow_soft_pinned=*/false);
+                        total_freed_size += evict_result.freed_bytes;
+                        if (!it->second.IsValid()) {
+                            EraseMetadata(tenant_state, it, c.tenant_id,
+                                          QuotaEraseMode::kFull, &shard);
+                        }
+                        if (tenant_state.Empty()) {
+                            shard->tenants.erase(tenant_it);
+                        }
+                        evicted_count += evict_result.evicted_objects;
+                        evicted_this_type += evict_result.evicted_objects;
                     }
-                    if (tenant_state.Empty()) {
-                        shard->tenants.erase(tenant_it);
-                    }
-                    evicted_count += evict_result.evicted_objects;
-                    evicted_this_type += evict_result.evicted_objects;
+                    deferred_replicas.clear();
                 }
-                deferred_replicas.clear();
             }
         }
     }

@@ -469,9 +469,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                 default_config,
                 "object_type_eviction_policies." + type_key + ".budget_ratio",
                 &budget_ratio)) {
-            if (budget_ratio < 0.0) {
+            if (!std::isfinite(budget_ratio) || budget_ratio < 0.0) {
                 LOG(FATAL) << "object_type_eviction_policies." << type_key
-                           << ".budget_ratio must be non-negative";
+                           << ".budget_ratio must be finite and non-negative";
             }
             master_config.object_type_eviction_policies[data_type]
                 .budget_ratio = budget_ratio;
