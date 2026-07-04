@@ -19,6 +19,7 @@ class HttpMetadataServer;
 struct ObjectTypeEvictionScorePolicy {
     double reuse_scale{1.0};
     double soft_pin_weight{1.0};
+    int64_t eviction_grace{0};
 };
 
 inline void ValidateObjectTypeEvictionScorePolicy(

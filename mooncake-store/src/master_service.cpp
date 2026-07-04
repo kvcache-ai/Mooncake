@@ -239,12 +239,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offload_cap_ratio_(config.offload_cap_ratio) {
     object_type_reuse_scales_.fill(1.0);
     object_type_soft_pin_weights_.fill(1.0);
+    object_type_eviction_graces_.fill(0);
     for (const auto& [data_type, policy] :
          config.object_type_eviction_score_policies) {
         ValidateObjectTypeEvictionScorePolicy(policy);
         const auto idx = static_cast<uint8_t>(data_type);
         object_type_reuse_scales_[idx] = policy.reuse_scale;
         object_type_soft_pin_weights_[idx] = policy.soft_pin_weight;
+        object_type_eviction_graces_[idx] = policy.eviction_grace;
     }
 
     // Initialize HTTP metadata key prefix (read env var once at startup)
@@ -7160,11 +7162,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         const double reuse_scale = object_type_reuse_scales_[idx];
         const double weight =
             is_soft_pinned ? object_type_soft_pin_weights_[idx] : 1.0;
+        const int64_t eviction_grace = object_type_eviction_graces_[idx];
         auto expired_age =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 rank_reference_time - metadata.lease_timeout)
                 .count();
-        expired_age = std::max<int64_t>(expired_age, 0);
+        expired_age = std::max<int64_t>(expired_age - eviction_grace, 0);
         const double score = expired_age * weight / reuse_scale;
         if (!std::isfinite(score) ||
             score >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
