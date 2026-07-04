@@ -147,11 +147,11 @@ TEST_F(ObjectDataTypeTest, PutStartDefaultDataType) {
 // Verify all enum values can roundtrip through uint8_t cast
 TEST_F(ObjectDataTypeTest, EnumRoundtrip) {
     std::vector<ObjectDataType> all_types = {
-        ObjectDataType::UNKNOWN,  ObjectDataType::KVCACHE,
-        ObjectDataType::TENSOR,   ObjectDataType::WEIGHT,
-        ObjectDataType::SAMPLE,   ObjectDataType::ACTIVATION,
-        ObjectDataType::GRADIENT, ObjectDataType::OPTIMIZER_STATE,
-        ObjectDataType::METADATA, ObjectDataType::GENERAL,
+        ObjectDataType::UNKNOWN,      ObjectDataType::KVCACHE,
+        ObjectDataType::TENSOR,       ObjectDataType::WEIGHT,
+        ObjectDataType::SAMPLE,       ObjectDataType::ACTIVATION,
+        ObjectDataType::GRADIENT,     ObjectDataType::OPTIMIZER_STATE,
+        ObjectDataType::METADATA,     ObjectDataType::GENERAL,
         ObjectDataType::HIDDEN_STATE,
     };
 
