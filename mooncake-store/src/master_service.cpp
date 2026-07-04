@@ -7163,11 +7163,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         const double weight =
             is_soft_pinned ? object_type_soft_pin_weights_[idx] : 1.0;
         const int64_t eviction_grace = object_type_eviction_graces_[idx];
-        auto expired_age =
+        const auto expired_age = std::max<int64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 rank_reference_time - metadata.lease_timeout)
-                .count();
-        expired_age = std::max<int64_t>(expired_age - eviction_grace, 0);
+                    .count() -
+                eviction_grace,
+            0);
         const double score = expired_age * weight / reuse_scale;
         if (!std::isfinite(score) ||
             score >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
