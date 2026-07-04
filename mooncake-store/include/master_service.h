@@ -1536,6 +1536,7 @@ class MasterService {
     const bool allow_evict_soft_pinned_objects_;
     std::array<double, UINT8_MAX + 1> object_type_reuse_scales_;
     std::array<double, UINT8_MAX + 1> object_type_soft_pin_weights_;
+    std::array<int64_t, UINT8_MAX + 1> object_type_eviction_graces_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{

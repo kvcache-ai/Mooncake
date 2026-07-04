@@ -6911,19 +6911,20 @@ TEST_F(MasterServiceTest,
     auto builder = MasterServiceConfig::builder();
     EXPECT_THROW(
         builder.set_object_type_eviction_score_policy(
-            ObjectDataType::KVCACHE, ObjectTypeEvictionScorePolicy{1.0, -1.0}),
+            ObjectDataType::KVCACHE,
+            ObjectTypeEvictionScorePolicy{1.0, -1.0, 0}),
         std::invalid_argument);
 
     EXPECT_THROW(builder.set_object_type_eviction_score_policy(
                      ObjectDataType::KVCACHE,
                      ObjectTypeEvictionScorePolicy{
-                         std::numeric_limits<double>::quiet_NaN(), 1.0}),
+                         std::numeric_limits<double>::quiet_NaN(), 1.0, 0}),
                  std::invalid_argument);
 
     EXPECT_THROW(builder.set_object_type_eviction_score_policy(
                      ObjectDataType::KVCACHE,
                      ObjectTypeEvictionScorePolicy{
-                         1.0, std::numeric_limits<double>::infinity()}),
+                         1.0, std::numeric_limits<double>::infinity(), 0}),
                  std::invalid_argument);
 }
 
@@ -6931,16 +6932,16 @@ TEST_F(MasterServiceTest,
        ObjectTypeEvictionScorePolicyRejectsInvalidDirectConfigInput) {
     auto config = MasterServiceConfig::builder().build();
     config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
-        ObjectTypeEvictionScorePolicy{0.0, 1.0};
+        ObjectTypeEvictionScorePolicy{0.0, 1.0, 0};
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 
     config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
-        ObjectTypeEvictionScorePolicy{1.0, -1.0};
+        ObjectTypeEvictionScorePolicy{1.0, -1.0, 0};
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 
     config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
         ObjectTypeEvictionScorePolicy{std::numeric_limits<double>::infinity(),
-                                      1.0};
+                                      1.0, 0};
     EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 }
 
