@@ -1,7 +1,7 @@
 """Python-binding test for the L2->L1 promotion-on-hit feature.
 
 Mirror of ``test_offload_on_eviction.py``: that test asserts data flows
-DRAM -> SSD on eviction; this test asserts the reverse — once an object
+DRAM -> SSD on eviction; this test asserts the reverse - once an object
 exists only on LOCAL_DISK and a client reads it enough times to clear the
 admission threshold, the master enqueues a promotion task and the client's
 next heartbeat tick stages a fresh MEMORY replica.
@@ -45,7 +45,7 @@ default_kv_lease_ttl = int(
 )
 
 # Keep the segment small so we can overflow it cheaply in CI.
-# 32 MB — small enough that the 96 x 1 MB workload reliably overflows past
+# 32 MB - small enough that the 96 x 1 MB workload reliably overflows past
 # the eviction high watermark even with OffsetAllocator block padding.
 # Larger values (e.g. 64 MB) sometimes fit the full workload because the
 # allocator's effective capacity exceeds the nominal segment size.
@@ -73,7 +73,7 @@ def get_client(store):
         device_name,
         master_server_address,
         None,  # engine
-        True,  # enable_ssd_offload — required for FileStorage / LOCAL_DISK
+        True,  # enable_ssd_offload - required for FileStorage / LOCAL_DISK
     )
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
@@ -99,6 +99,53 @@ def _replica_types(descs, key):
         else:
             tags.append("UNKNOWN")
     return tags
+
+
+def _has_memory_replica(descs, key):
+    return "MEMORY" in _replica_types(descs, key)
+
+
+def _collect_cold_keys(descs, keys):
+    cold_keys = []
+    type_hist = {}
+    for key in keys:
+        types = _replica_types(descs, key)
+        hist_key = ",".join(sorted(set(types)))
+        type_hist[hist_key] = type_hist.get(hist_key, 0) + 1
+        if (
+            types
+            and all("MEMORY" not in t for t in types)
+            and any("LOCAL_DISK" in t for t in types)
+        ):
+            cold_keys.append(key)
+    return cold_keys, type_hist
+
+
+def _percentiles(samples, ps):
+    if not samples:
+        return {p: 0.0 for p in ps}
+    ordered = sorted(samples)
+    result = {}
+    for p in ps:
+        if len(ordered) == 1:
+            result[p] = ordered[0]
+            continue
+        rank = (len(ordered) - 1) * (p / 100.0)
+        lo = int(rank)
+        hi = min(lo + 1, len(ordered) - 1)
+        frac = rank - lo
+        result[p] = ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+    return result
+
+
+def _wait_until_memory_replica(store, key, timeout_seconds, poll_interval_seconds):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        descs = store.batch_get_replica_desc([key])
+        if _has_memory_replica(descs, key):
+            return True
+        time.sleep(poll_interval_seconds)
+    return False
 
 
 class TestPromotionOnHit(unittest.TestCase):
@@ -133,13 +180,13 @@ class TestPromotionOnHit(unittest.TestCase):
                 value = os.urandom(VALUE_SIZE)
                 retcode = self.store.put(key, value)
                 # NO_AVAILABLE_HANDLE-style failures (-200) under pressure
-                # are expected and not fatal — we just need *some* keys to
+                # are expected and not fatal - we just need *some* keys to
                 # successfully land on LOCAL_DISK.
                 if retcode == 0:
                     reference[key] = value
 
             self.assertGreater(
-                len(reference), 0, "No PUTs succeeded — cannot run promotion test"
+                len(reference), 0, "No PUTs succeeded - cannot run promotion test"
             )
 
             # Phase 2: wait long enough for offload heartbeat to flush the
@@ -164,14 +211,14 @@ class TestPromotionOnHit(unittest.TestCase):
 
             self.assertIsNotNone(
                 cold_key,
-                "No LOCAL_DISK-only key found after eviction — is "
+                "No LOCAL_DISK-only key found after eviction - is "
                 "offload_on_evict=true and the segment small enough to "
                 "overflow? master config / SEGMENT_SIZE_BYTES env may need "
                 "tuning. Histogram above shows the actual replica state.",
             )
 
             # Phase 3: clear the admission threshold via per-key reads.
-            # ``store.get`` goes through ``Client::Query`` → master's
+            # ``store.get`` goes through ``Client::Query`` -> master's
             # ``GetReplicaList``, so each call fires the promotion gate
             # once; 4 calls comfortably clear any reasonable admission
             # threshold. We also assert bit-exact bytes back, exercising
@@ -189,7 +236,7 @@ class TestPromotionOnHit(unittest.TestCase):
                     f"store.get on LOCAL_DISK-only key {cold_key} returned "
                     f"wrong/empty bytes (got len={len(got) if got else 0}, "
                     f"expected len={len(expected_bytes)}). The LOCAL_DISK "
-                    f"read path is broken — promotion cannot be tested.",
+                    f"read path is broken - promotion cannot be tested.",
                 )
 
             # Phase 4: wait for the master to enqueue the promotion task and
@@ -214,7 +261,7 @@ class TestPromotionOnHit(unittest.TestCase):
             # it does, no offload-RPC call is issued for this read.
             #
             # offload_rpc_read_count counts every invocation of
-            # batch_get_into_offload_object_internal — the single
+            # batch_get_into_offload_object_internal - the single
             # chokepoint for LOCAL_DISK reads served via peer offload-RPC.
             # We snapshot the counter, do a read, then assert the counter
             # didn't move. Bytes-back alone wouldn't distinguish MEMORY
@@ -313,14 +360,14 @@ class TestPromotionDoesNotFire(unittest.TestCase):
 
 @unittest.skipUnless(
     os.getenv("MC_BENCH_PROMOTION_LATENCY"),
-    "opt-in benchmark — set MC_BENCH_PROMOTION_LATENCY=1 to run. "
+    "opt-in benchmark - set MC_BENCH_PROMOTION_LATENCY=1 to run. "
     "Not part of CI; gives p50/p95/p99 latency comparison of LOCAL_DISK "
     "reads (pre-promotion) vs MEMORY reads (post-promotion).",
 )
 class BenchPromotionLatency(unittest.TestCase):
     """Ad-hoc latency benchmark for the L2->L1 promotion feature.
 
-    Runs the same overflow → eviction → promote workflow as
+    Runs the same overflow -> eviction -> promote workflow as
     ``TestPromotionOnHit`` but:
       - times every read with ``time.perf_counter``;
       - aborts the pre-promotion sample loop the moment a read serves
@@ -400,7 +447,7 @@ class BenchPromotionLatency(unittest.TestCase):
             self.assertGreater(
                 len(pre_latencies_ms),
                 1,
-                "collected <2 pre-promotion samples — promotion fired "
+                "collected <2 pre-promotion samples - promotion fired "
                 "before measurement could capture LOCAL_DISK latency. "
                 "Bump MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS or "
                 "lower LATENCY_SAMPLES.",
@@ -476,9 +523,202 @@ class BenchPromotionLatency(unittest.TestCase):
                 f"post-promotion p50 latency ({post[50]:.2f} ms) is not "
                 f"meaningfully lower than pre-promotion p50 "
                 f"({pre[50]:.2f} ms). Real-hardware speedup is typically "
-                f"10–50x; failing this 1.3x check means MEMORY likely "
+                f"10-50x; failing this 1.3x check means MEMORY likely "
                 f"isn't being preferred.",
             )
+        finally:
+            for key in keys:
+                try:
+                    self.store.remove(key)
+                except Exception:
+                    pass
+            time.sleep(default_kv_lease_ttl / 1000 + 0.5)
+
+
+@unittest.skipUnless(
+    os.getenv("MC_BENCH_PROMOTION_DRAIN"),
+    "opt-in benchmark - set MC_BENCH_PROMOTION_DRAIN=1 to run. "
+    "Measures how quickly a batch of LOCAL_DISK-only keys regain MEMORY "
+    "replicas after promotion admission fires.",
+)
+class BenchPromotionDrain(unittest.TestCase):
+    """Promotion backlog-drain benchmark for fair main-vs-PR comparison.
+
+    Assumes the master runs with ``--promotion_admission_threshold=2``:
+    the replica-descriptor scan used to discover LOCAL_DISK-only keys
+    provides the first hit, and the timed ``selected_keys`` query provides
+    the second hit that actually admits promotion.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.store = MooncakeDistributedStore()
+        get_client(cls.store)
+
+    def test_promotion_drain(self):
+        value_size = int(
+            os.getenv("PROMOTION_DRAIN_VALUE_SIZE_BYTES", str(1024 * 1024))
+        )
+        total_keys = int(os.getenv("PROMOTION_DRAIN_TOTAL_KEYS", "128"))
+        target_cold_keys = int(os.getenv("PROMOTION_DRAIN_TARGET_KEYS", "32"))
+        poll_interval_seconds = float(
+            os.getenv("PROMOTION_DRAIN_POLL_INTERVAL_SECONDS", "0.2")
+        )
+        timeout_seconds = float(
+            os.getenv(
+                "PROMOTION_DRAIN_TIMEOUT_SECONDS",
+                str(max(PROMOTION_WAIT_SECONDS * 3, 60)),
+            )
+        )
+        expected_admission_threshold = int(
+            os.getenv("PROMOTION_DRAIN_EXPECT_ADMISSION_THRESHOLD", "2")
+        )
+        post_read_samples = int(os.getenv("PROMOTION_DRAIN_POST_READ_SAMPLES", "64"))
+        fail_on_timeout = os.getenv("PROMOTION_DRAIN_FAIL_ON_TIMEOUT", "1") != "0"
+
+        timestamp = int(time.time())
+        keys = [f"bench_poh_drain_{i}_{timestamp}" for i in range(total_keys)]
+        reference = {}
+
+        try:
+            for key in keys:
+                value = os.urandom(value_size)
+                if self.store.put(key, value) == 0:
+                    reference[key] = value
+
+            self.assertGreater(
+                len(reference), 0, "No PUTs succeeded - cannot run drain benchmark"
+            )
+            self.assertEqual(
+                expected_admission_threshold,
+                2,
+                "BenchPromotionDrain assumes promotion_admission_threshold=2: "
+                "the cold-key discovery scan contributes hit #1 and the timed "
+                "selected-keys query contributes hit #2. Use "
+                "PROMOTION_DRAIN_EXPECT_ADMISSION_THRESHOLD=2 and run the "
+                "master with --promotion_admission_threshold=2 for fair data.",
+            )
+
+            time.sleep(PROMOTION_WAIT_SECONDS)
+
+            descs = self.store.batch_get_replica_desc(list(reference.keys()))
+            cold_keys, type_hist = _collect_cold_keys(descs, list(reference.keys()))
+            print(f"replica-type histogram after offload: {type_hist}")
+            self.assertGreater(
+                len(cold_keys),
+                0,
+                "No LOCAL_DISK-only key found after eviction/offload",
+            )
+
+            selected_keys = cold_keys[: min(target_cold_keys, len(cold_keys))]
+            self.assertGreaterEqual(
+                len(selected_keys),
+                1,
+                "Need at least one LOCAL_DISK-only key to measure promotion drain",
+            )
+
+            offload_reads_before = self.store.get_offload_rpc_read_count()
+            admission_t0 = time.perf_counter()
+            admission_descs = self.store.batch_get_replica_desc(selected_keys)
+            admission_t1 = time.perf_counter()
+            print(
+                "promotion admission batch_get_replica_desc: "
+                f"keys={len(selected_keys)}, "
+                f"elapsed_ms={(admission_t1 - admission_t0) * 1000.0:.2f}, "
+                f"assumed_threshold={expected_admission_threshold}"
+            )
+
+            for key in selected_keys:
+                self.assertIn(
+                    "LOCAL_DISK",
+                    _replica_types(admission_descs, key),
+                    f"selected key {key} lost LOCAL_DISK state before benchmark started",
+                )
+
+            start = admission_t0
+            promoted_at = {}
+            poll_count = 0
+            while len(promoted_at) < len(selected_keys):
+                elapsed = time.perf_counter() - start
+                if elapsed > timeout_seconds:
+                    break
+                poll_count += 1
+                descs_now = self.store.batch_get_replica_desc(selected_keys)
+                now = time.perf_counter()
+                for key in selected_keys:
+                    if key in promoted_at:
+                        continue
+                    if _has_memory_replica(descs_now, key):
+                        promoted_at[key] = now - start
+                if len(promoted_at) == len(selected_keys):
+                    break
+                time.sleep(poll_interval_seconds)
+
+            offload_reads_after = self.store.get_offload_rpc_read_count()
+            completed_all = len(promoted_at) == len(selected_keys)
+            completion_times = sorted(promoted_at.values())
+            observed_pcts = _percentiles(completion_times, [50, 95, 100])
+
+            post_latency_line = "skipped (not all selected keys promoted)"
+            if completed_all:
+                post_latencies_ms = []
+                sample_key = selected_keys[0]
+                expected = reference[sample_key]
+                post_offload_before = self.store.get_offload_rpc_read_count()
+                for _ in range(post_read_samples):
+                    t0 = time.perf_counter()
+                    got = self.store.get(sample_key)
+                    t1 = time.perf_counter()
+                    self.assertEqual(got, expected)
+                    post_latencies_ms.append((t1 - t0) * 1000.0)
+                post_offload_after = self.store.get_offload_rpc_read_count()
+                self.assertEqual(
+                    post_offload_after,
+                    post_offload_before,
+                    "Post-promotion reads still hit offload RPC path; MEMORY replica is not serving reads",
+                )
+                latency_pcts = _percentiles(post_latencies_ms, [50, 95, 99])
+                post_latency_line = (
+                    f"p50={latency_pcts[50]:.2f}, "
+                    f"p95={latency_pcts[95]:.2f}, p99={latency_pcts[99]:.2f}"
+                )
+
+            print()
+            print("=== promotion drain benchmark ===")
+            print(
+                f"selected_keys={len(selected_keys)} / cold_keys={len(cold_keys)} / "
+                f"total_successful_puts={len(reference)} / polls={poll_count} / "
+                f"promoted_before_timeout={len(promoted_at)}"
+            )
+            if completed_all:
+                time_to_all = completion_times[-1]
+                promoted_per_sec = (
+                    len(selected_keys) / time_to_all
+                    if time_to_all > 0
+                    else float("inf")
+                )
+                print(
+                    f"time_to_50pct_promoted={observed_pcts[50] * 1000.0:.2f} ms | "
+                    f"time_to_95pct_promoted={observed_pcts[95] * 1000.0:.2f} ms | "
+                    f"time_to_all_promoted={observed_pcts[100] * 1000.0:.2f} ms"
+                )
+                print(f"promoted_keys_per_sec={promoted_per_sec:.2f}")
+            else:
+                print(
+                    f"timed_out_before_all_promoted=yes | timeout_seconds={timeout_seconds:.2f} | "
+                    f"observed_time_to_last_promoted={observed_pcts[100] * 1000.0:.2f} ms"
+                )
+            print(f"post_promotion_read_latency_ms: {post_latency_line}")
+            print(
+                f"offload_rpc_reads_during_benchmark="
+                f"{offload_reads_after - offload_reads_before}"
+            )
+            if fail_on_timeout:
+                self.assertEqual(
+                    len(promoted_at),
+                    len(selected_keys),
+                    "Timed out waiting for all selected LOCAL_DISK-only keys to regain MEMORY replicas",
+                )
         finally:
             for key in keys:
                 try:
