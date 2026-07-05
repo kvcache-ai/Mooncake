@@ -174,7 +174,8 @@ Status MnnvlTransport::submitTransferTasks(
 
     // Get local segment for buffer lookup
     auto &segment_manager = metadata_->segmentManager();
-    SegmentDesc *local_segment = segment_manager.getLocal().get();
+    // Owning reference: keeps the snapshot alive while we read through it.
+    SegmentDescRef local_segment = segment_manager.getLocal();
     if (!local_segment)
         return Status::InternalError("Local segment not found" LOC_MARK);
 
@@ -553,9 +554,11 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     RWSpinlock::WriteGuard guard(relocate_lock_);
 
     BufferDesc *buffer;
+    // Owning reference: `buffer` is used after the lambda returns.
+    SegmentDescRef pin;
     auto &segment_manager = metadata_->segmentManager();
-    CHECK_STATUS(
-        segment_manager.withCachedSegment(target_id, [&](SegmentDesc *segment) {
+    CHECK_STATUS(segment_manager.withCachedSegment(
+        target_id, pin, [&](SegmentDesc *segment) {
             buffer = segment->findBuffer(dest_addr, length);
             if (!buffer || buffer->mnnvl_handle.empty())
                 return Status::NeedsRefreshCache(

@@ -40,6 +40,16 @@ target_include_directories(tent_coalesce_regions_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_coalesce_regions_test COMMAND tent_coalesce_regions_test)
 
+add_executable(segment_manager_test segment_manager_test.cpp)
+target_link_libraries(segment_manager_test PRIVATE gtest gtest_main
+                                                   tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(segment_manager_test PRIVATE asio_shared)
+endif()
+target_include_directories(segment_manager_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME segment_manager_test COMMAND segment_manager_test)
+
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
                                                  tent_link_group)

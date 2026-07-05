@@ -160,9 +160,12 @@ Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
     auto hixl_name = host_ip + ":" + std::to_string(port);
     local_hixl_name_ = hixl_name;
 
-    auto segment = metadata_->segmentManager().getLocal();
-    auto &detail = std::get<MemorySegmentDesc>(segment->detail);
-    detail.device_attrs["hixl_name"] = hixl_name;
+    CHECK_STATUS(metadata_->segmentManager().updateLocal(
+        [&](SegmentDesc &segment) -> Status {
+            auto &detail = std::get<MemorySegmentDesc>(segment.detail);
+            detail.device_attrs["hixl_name"] = hixl_name;
+            return Status::OK();
+        }));
 
     hixl_ = std::make_unique<hixl::Hixl>();
     if (!hixl_) return Status::InternalError("Create hixl failed.");
