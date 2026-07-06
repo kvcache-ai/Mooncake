@@ -1,0 +1,114 @@
+#include "ha/oplog/oplog_batch_types.h"
+
+#include <iomanip>
+#include <sstream>
+
+#include "ha/oplog/oplog_store.h"
+
+namespace mooncake {
+
+namespace {
+
+void SetReason(std::string* reason, const std::string& value) {
+    if (reason != nullptr) {
+        *reason = value;
+    }
+}
+
+std::string PrefixEnd(std::string prefix) {
+    for (int i = static_cast<int>(prefix.size()) - 1; i >= 0; --i) {
+        unsigned char c = static_cast<unsigned char>(prefix[i]);
+        if (c < 0xFF) {
+            prefix[i] = static_cast<char>(c + 1);
+            prefix.resize(i + 1);
+            return prefix;
+        }
+    }
+    return std::string(1, '\0');
+}
+
+std::string BatchPrefix(const std::string& cluster_id) {
+    return "/oplog/" + cluster_id + "/batches/";
+}
+
+}  // namespace
+
+bool ValidateOpLogBatchRecordShape(const OpLogBatchRecord& batch,
+                                   std::string* reason) {
+    if (reason != nullptr) {
+        reason->clear();
+    }
+    if (batch.schema_version == 0) {
+        SetReason(reason, "schema_version must be non-zero");
+        return false;
+    }
+    if (batch.entries.empty()) {
+        SetReason(reason, "batch entries must not be empty");
+        return false;
+    }
+    if (batch.first_seq != batch.entries.front().sequence_id) {
+        SetReason(reason, "first_seq does not match first entry sequence");
+        return false;
+    }
+    if (batch.last_seq != batch.entries.back().sequence_id) {
+        SetReason(reason, "last_seq does not match last entry sequence");
+        return false;
+    }
+    for (size_t i = 0; i < batch.entries.size(); ++i) {
+        const uint64_t expected = batch.first_seq + i;
+        if (batch.entries[i].sequence_id != expected) {
+            SetReason(reason, "entry sequences must be contiguous");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ValidateOpLogBatchClusterId(const std::string& cluster_id,
+                                 std::string* reason) {
+    std::string normalized = cluster_id;
+    if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
+        SetReason(reason, "invalid cluster_id");
+        return false;
+    }
+    if (reason != nullptr) {
+        reason->clear();
+    }
+    return true;
+}
+
+std::string FormatOpLogBatchId(uint64_t batch_id) {
+    std::ostringstream oss;
+    oss << std::setw(kOpLogBatchIdWidth) << std::setfill('0') << batch_id;
+    return oss.str();
+}
+
+std::string BuildBatchRecordKey(const std::string& cluster_id,
+                                uint64_t batch_id) {
+    std::string normalized = cluster_id;
+    if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
+        return {};
+    }
+    return BatchPrefix(normalized) + FormatOpLogBatchId(batch_id);
+}
+
+std::string BuildDurablePrefixKey(const std::string& cluster_id) {
+    std::string normalized = cluster_id;
+    if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
+        return {};
+    }
+    return "/oplog/" + normalized + "/durable_prefix";
+}
+
+BatchRecordRange BuildBatchRecordRange(const std::string& cluster_id,
+                                       uint64_t after_batch_id) {
+    std::string normalized = cluster_id;
+    if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
+        return {};
+    }
+    const std::string prefix = BatchPrefix(normalized);
+    return {.begin_key = prefix + FormatOpLogBatchId(after_batch_id + 1),
+            .end_key = PrefixEnd(prefix)};
+}
+
+}  // namespace mooncake

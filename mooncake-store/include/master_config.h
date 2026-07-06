@@ -59,6 +59,7 @@ struct MasterConfig {
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
 
     std::string cluster_id;
     std::string root_fs_dir;
@@ -191,6 +192,7 @@ class MasterServiceSupervisorConfig {
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -315,6 +317,7 @@ class MasterServiceSupervisorConfig {
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -471,6 +474,7 @@ class WrappedMasterServiceConfig {
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -561,6 +565,7 @@ class WrappedMasterServiceConfig {
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -673,6 +678,7 @@ class WrappedMasterServiceConfig {
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -739,6 +745,7 @@ class MasterServiceConfigBuilder {
     std::string oplog_store_type_;
     std::string oplog_store_root_dir_ = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms_ = 1000;
+    uint32_t oplog_batch_max_entries_ = 1024;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -877,6 +884,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_poll_interval_ms(int interval_ms) {
         oplog_poll_interval_ms_ = interval_ms;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
+        oplog_batch_max_entries_ = entries;
         return *this;
     }
 
@@ -1118,6 +1130,7 @@ class MasterServiceConfig {
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1202,6 +1215,7 @@ class MasterServiceConfig {
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -1270,6 +1284,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.oplog_store_type = oplog_store_type_;
     config.oplog_store_root_dir = oplog_store_root_dir_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
+    config.oplog_batch_max_entries = oplog_batch_max_entries_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;

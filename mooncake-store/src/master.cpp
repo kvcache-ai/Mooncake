@@ -290,6 +290,9 @@ DEFINE_string(oplog_store_root_dir, "/tmp/mooncake_oplog",
               "Root directory for localfs OpLog store.");
 DEFINE_int32(oplog_poll_interval_ms, 1000,
              "Poll interval for localfs OpLog store.");
+DEFINE_uint32(oplog_batch_max_entries, 1024,
+              "Maximum number of committed/reserved entries in the open "
+              "batch-record OpLog waiting batch.");
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
@@ -567,6 +570,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetInt32("oplog_poll_interval_ms",
                             &master_config.oplog_poll_interval_ms,
                             FLAGS_oplog_poll_interval_ms);
+    default_config.GetUInt32("oplog_batch_max_entries",
+                             &master_config.oplog_batch_max_entries,
+                             FLAGS_oplog_batch_max_entries);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
     default_config.GetInt64("global_file_segment_size",
@@ -992,6 +998,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_batch_max_entries", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_batch_max_entries = FLAGS_oplog_batch_max_entries;
     }
     if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
          !info.is_default) ||
