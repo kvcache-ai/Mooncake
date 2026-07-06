@@ -291,8 +291,8 @@ TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdReturnsErrorOnStatFailure) {
     const std::string cluster_path = test_dir_ + "/" + cluster_id_;
     fs::create_directories(cluster_path);
     std::error_code permission_error;
-    fs::permissions(cluster_path, fs::perms::none,
-                    fs::perm_options::replace, permission_error);
+    fs::permissions(cluster_path, fs::perms::none, fs::perm_options::replace,
+                    permission_error);
     ASSERT_FALSE(permission_error) << permission_error.message();
 
     uint64_t seq = 999;
