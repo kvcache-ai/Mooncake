@@ -247,5 +247,8 @@ class MooncakeConfig:
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
                 enable_ssd_offload=_parse_bool(os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
+                etcd_ca_file=os.getenv("MC_ETCD_CA_FILE", ""),
+                etcd_cert_file=os.getenv("MC_ETCD_CERT_FILE", ""),
+                etcd_key_file=os.getenv("MC_ETCD_KEY_FILE", ""),
             )
         return MooncakeConfig.from_file(config_file_path)

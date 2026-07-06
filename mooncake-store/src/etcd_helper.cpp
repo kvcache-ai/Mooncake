@@ -15,6 +15,7 @@ std::string EtcdHelper::etcd_ca_file_ = "";
 std::string EtcdHelper::etcd_cert_file_ = "";
 std::string EtcdHelper::etcd_key_file_ = "";
 
+#ifdef STORE_USE_ETCD
 void EtcdHelper::SetTLSConfig(const std::string& ca_file,
                               const std::string& cert_file,
                               const std::string& key_file) {
@@ -28,7 +29,6 @@ bool EtcdHelper::IsTLSConfigured() {
            !etcd_key_file_.empty();
 }
 
-#ifdef STORE_USE_ETCD
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
     // If TLS is globally configured, delegate to the TLS variant
