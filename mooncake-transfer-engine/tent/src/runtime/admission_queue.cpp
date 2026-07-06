@@ -14,6 +14,7 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <algorithm>
 #include <limits>
 #include <set>
 
@@ -185,10 +186,40 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     return Status::OK();
 }
 
+namespace {
+// Sort key for EDF: owners without a deadline (0) sort after all deadlined
+// owners, so they never jump ahead of a real deadline.
+inline uint64_t deadlineKey(uint64_t deadline_ns) {
+    return deadline_ns == 0 ? std::numeric_limits<uint64_t>::max()
+                            : deadline_ns;
+}
+}  // namespace
+
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     size_t max_owners, size_t max_bytes) {
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
+
+    // RFC #2519 step 2 (opt-in): reorder the dispatch queue earliest-deadline-
+    // first before selection. Owners without a deadline keep their relative
+    // FIFO order behind all deadlined owners (stable sort on the current fifo_
+    // sequence). Default (deadline_aware == false) leaves fifo_ untouched, so
+    // behavior is identical to strict FIFO. This only reorders *selection*
+    // within the existing capacity limits; it does not admit or reject.
+    if (limits_.deadline_aware) {
+        std::stable_sort(
+            fifo_.begin(), fifo_.end(), [this](QueueOwnerId a, QueueOwnerId b) {
+                auto ia = owners_.find(a);
+                auto ib = owners_.find(b);
+                uint64_t da = (ia == owners_.end())
+                                  ? std::numeric_limits<uint64_t>::max()
+                                  : deadlineKey(ia->second.request.deadline_ns);
+                uint64_t db = (ib == owners_.end())
+                                  ? std::numeric_limits<uint64_t>::max()
+                                  : deadlineKey(ib->second.request.deadline_ns);
+                return da < db;
+            });
+    }
 
     size_t used_owners = 0;
     size_t used_bytes = 0;

@@ -388,6 +388,76 @@ TEST(AdmissionQueueTest, AllowsBatchTokenReuseAfterRetire) {
     EXPECT_EQ(resolved_owner, 2u);
 }
 
+// --- RFC #2519 step 2: opt-in deadline-aware (EDF) dispatch ---------------
+
+QueueOwnerInput makeOwnerWithDeadline(size_t public_task_id, size_t length,
+                                      uint64_t deadline_ns) {
+    QueueOwnerInput owner = makeOwner(public_task_id, length);
+    owner.request.deadline_ns = deadline_ns;
+    return owner;
+}
+
+TEST(AdmissionQueueTest, DeadlineAwareDispatchesEarliestDeadlineFirst) {
+    QueueLimits limits{4, 4096, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    std::vector<QueueOwnerId> admitted_ids;
+
+    // Admitted in FIFO order 1,2,3 but with deadlines 300,100,200.
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3,
+                                  {makeOwnerWithDeadline(0, 16, 300),
+                                   makeOwnerWithDeadline(1, 16, 100),
+                                   makeOwnerWithDeadline(2, 16, 200)}),
+                       admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 3u);  // owner ids 1,2,3
+
+    auto picked = queue.pickForDispatch(3, 4096);
+    // EDF order: owner 2 (dl 100) < owner 3 (dl 200) < owner 1 (dl 300).
+    const std::vector<QueueOwnerId> expected{2, 3, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, DeadlineAwareKeepsUndeadlinedOwnersLast) {
+    QueueLimits limits{4, 4096, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    std::vector<QueueOwnerId> admitted_ids;
+
+    // owner 1: no deadline (0); owner 2: deadline 100; owner 3: no deadline.
+    auto status = queue.tryAdmit(makeSubmit(1, 3,
+                                            {makeOwnerWithDeadline(0, 16, 0),
+                                             makeOwnerWithDeadline(1, 16, 100),
+                                             makeOwnerWithDeadline(2, 16, 0)}),
+                                 admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(3, 4096);
+    // Deadlined owner 2 first; undeadlined 1,3 keep FIFO order behind it.
+    const std::vector<QueueOwnerId> expected{2, 1, 3};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, DeadlineUnawareKeepsStrictFifo) {
+    // Default (deadline_aware == false): FIFO regardless of deadlines.
+    LocalTransferAdmissionQueue queue({4, 4096, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3,
+                                  {makeOwnerWithDeadline(0, 16, 300),
+                                   makeOwnerWithDeadline(1, 16, 100),
+                                   makeOwnerWithDeadline(2, 16, 200)}),
+                       admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(3, 4096);
+    const std::vector<QueueOwnerId> expected{1, 2,
+                                             3};  // FIFO, deadlines ignored
+    EXPECT_EQ(picked, expected);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
