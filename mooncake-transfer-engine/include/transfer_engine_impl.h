@@ -356,6 +356,9 @@ class TransferEngineImpl {
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
+#ifdef USE_NCCL_DEVICE
+    device::NcclTransport* getOrCreateNcclTransport();
+#endif
 #endif
 
     bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
@@ -441,10 +444,13 @@ class TransferEngineImpl {
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
-    // Device transports (P2P + IBGDA) — lazily created, owned by this impl.
-    // Referenced by EP and future CPU-proxy paths.
+    // Device transports — lazily created and owned by this implementation.
+    // Referenced by EP and other device-initiated communication users.
     std::unique_ptr<device::P2pTransport> p2p_transport_;
     std::unique_ptr<device::RdmaTransport> rdma_transport_;
+#ifdef USE_NCCL_DEVICE
+    std::unique_ptr<device::NcclTransport> nccl_transport_;
+#endif
 #endif
 
 #ifdef WITH_METRICS
