@@ -675,6 +675,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
+| `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
 ```{note}
@@ -705,12 +706,14 @@ Or via a JSON config file. The service also exposes a lightweight HTTP API (on `
   "local_buffer_size": 268435456,
   "protocol": "tcp",
   "device_name": "",
-  "master_server_address": "127.0.0.1:50051"
+  "master_server_address": "127.0.0.1:50051",
+  "tenant_id": "default"
 }
 ```
 
 ```bash
 python -m mooncake.mooncake_store_service --config=<config_path> --port=8081
+python -m mooncake.mooncake_store_service --config=<config_path> -Dtenant_id=tenant-a
 ```
 
 ### Method C — Resource-owning Real Client (`mooncake_client`)
@@ -721,7 +724,8 @@ Run the `mooncake_client` binary as a standalone RPC process that owns storage r
 mooncake_client \
   --global_segment_size="4GB" \
   --master_server_address="127.0.0.1:50051" \
-  --metadata_server="http://127.0.0.1:8080/metadata"
+  --metadata_server="http://127.0.0.1:8080/metadata" \
+  --tenant_id="default"
 ```
 
 | Flag | Default | Description |
@@ -734,6 +738,7 @@ mooncake_client \
 | `--protocol` | `tcp` | Transfer protocol |
 | `--device_names` | empty | Transfer device name(s), comma-separated |
 | `--threads` | `1` | Client worker thread count |
+| `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 

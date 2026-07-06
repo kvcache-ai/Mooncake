@@ -45,6 +45,7 @@ export MOONCAKE_DEVICE="mlx5_0"
 export MOONCAKE_PROTOCOL="rdma"
 export MOONCAKE_DEVICE="auto-discovery"
 """
+
 import json
 import os
 from dataclasses import dataclass
@@ -55,13 +56,13 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 _SIZE_SUFFIXES = [
     ("kb", 1024),
-    ("mb", 1024 ** 2),
-    ("gb", 1024 ** 3),
-    ("tb", 1024 ** 4),
+    ("mb", 1024**2),
+    ("gb", 1024**3),
+    ("tb", 1024**4),
     ("k", 1024),
-    ("m", 1024 ** 2),
-    ("g", 1024 ** 3),
-    ("t", 1024 ** 4),
+    ("m", 1024**2),
+    ("g", 1024**3),
+    ("t", 1024**4),
     ("b", 1),
 ]
 
@@ -129,6 +130,7 @@ class MooncakeConfig:
         master_server_address (str): The address of the master server.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.
+        tenant_id (str): Tenant identifier. Default is "default".
 
     Example of configuration file:
         {
@@ -140,9 +142,10 @@ class MooncakeConfig:
             "device_name": "",
             "master_server_address": "localhost:8081",
             "enable_ssd_offload": true,
-            "ssd_offload_path": "/nvme/mooncake_offload"
+            "ssd_offload_path": "/nvme/mooncake_offload",
+            "tenant_id": "default"
         }
-        
+
         For RDMA:
         {
             "local_hostname": "node1",
@@ -153,9 +156,11 @@ class MooncakeConfig:
             "device_name": "mlx5_0",
             "master_server_address": "master:8081",
             "enable_ssd_offload": true,
-            "ssd_offload_path": "/nvme/mooncake_offload"
+            "ssd_offload_path": "/nvme/mooncake_offload",
+            "tenant_id": "default"
         }
     """
+
     local_hostname: str
     metadata_server: str
     global_segment_size: int
@@ -165,9 +170,10 @@ class MooncakeConfig:
     master_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
+    tenant_id: str = "default"
 
     @staticmethod
-    def from_file(file_path: str) -> 'MooncakeConfig':
+    def from_file(file_path: str) -> "MooncakeConfig":
         """Load the config from a JSON file."""
         with open(file_path) as fin:
             config = json.load(fin)
@@ -193,25 +199,32 @@ class MooncakeConfig:
             master_server_address=config.get("master_server_address"),
             enable_ssd_offload=_parse_bool(config.get("enable_ssd_offload", False)),
             ssd_offload_path=str(config.get("ssd_offload_path", "")),
+            tenant_id=str(config.get("tenant_id", "default")),
         )
 
     @staticmethod
-    def load_from_env() -> 'MooncakeConfig':
+    def load_from_env() -> "MooncakeConfig":
         """Load config from a file specified in the environment variable.
         export MOONCAKE_MASTER=10.13.3.232:50051
         export MOONCAKE_PROTOCOL="rdma"
         export MOONCAKE_DEVICE=""
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
-        config_file_path = os.getenv('MOONCAKE_CONFIG_PATH')
+        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
         if config_file_path is None:
             if not os.getenv("MOONCAKE_MASTER"):
-                raise ValueError("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.")
+                raise ValueError(
+                    "Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set."
+                )
             return MooncakeConfig(
                 local_hostname=os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
-                metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
+                metadata_server=os.getenv(
+                    "MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"
+                ),
                 global_segment_size=_parse_segment_size(
-                    os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
+                    os.getenv(
+                        "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
+                    )
                 ),
                 local_buffer_size=_parse_segment_size(
                     os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
@@ -219,7 +232,10 @@ class MooncakeConfig:
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
-                enable_ssd_offload=_parse_bool(os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")),
+                enable_ssd_offload=_parse_bool(
+                    os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")
+                ),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
+                tenant_id=os.getenv("MOONCAKE_TENANT_ID", "default"),
             )
         return MooncakeConfig.from_file(config_file_path)
