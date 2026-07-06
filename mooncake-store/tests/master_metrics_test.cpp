@@ -723,6 +723,31 @@ TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {
     ASSERT_EQ(metrics.get_put_start_failures(), put_start_failures_before + 1);
 }
 
+TEST_F(MasterMetricsTest, PromotionBudgetDiagnosticsAreExported) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t within_before = metrics.get_promotion_within_budget();
+    const int64_t late_before = metrics.get_promotion_late();
+
+    metrics.inc_promotion_within_budget(2);
+    metrics.inc_promotion_late(3);
+
+    EXPECT_EQ(metrics.get_promotion_within_budget(), within_before + 2);
+    EXPECT_EQ(metrics.get_promotion_late(), late_before + 3);
+
+    const std::string prometheus = metrics.serialize_metrics();
+    EXPECT_NE(prometheus.find("master_promotion_within_budget_total"),
+              std::string::npos);
+    EXPECT_NE(prometheus.find("master_promotion_late_total"),
+              std::string::npos);
+
+    const std::string summary = metrics.get_summary_string();
+    EXPECT_NE(summary.find("within_budget=" +
+                           std::to_string(within_before + 2)),
+              std::string::npos);
+    EXPECT_NE(summary.find("late=" + std::to_string(late_before + 3)),
+              std::string::npos);
+}
+
 TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
     auto& metrics = MasterMetricManager::instance();
 

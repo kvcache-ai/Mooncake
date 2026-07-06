@@ -1853,6 +1853,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_rejected_frequency_);
     serialize_metric(promotion_rejected_watermark_);
     serialize_metric(promotion_rejected_cap_);
+    serialize_metric(promotion_within_budget_);
+    serialize_metric(promotion_late_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
 
@@ -2498,6 +2500,8 @@ std::string MasterMetricManager::get_summary_string(
        << "expired=" << promotion_expired_.value() << ", "
        << "bytes=" << byte_size_to_string(promotion_completed_bytes_.value())
        << ", "
+       << "within_budget=" << promotion_within_budget_.value() << ", "
+       << "late=" << promotion_late_.value() << ", "
        << "rejected(freq/wm/cap)=" << promotion_rejected_frequency_.value()
        << "/" << promotion_rejected_watermark_.value() << "/"
        << promotion_rejected_cap_.value();
