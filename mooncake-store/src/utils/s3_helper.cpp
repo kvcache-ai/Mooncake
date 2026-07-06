@@ -5,6 +5,9 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/core/auth/AWSCredentials.h>
+#if __has_include(<aws/core/VersionConfig.h>)
+#include <aws/core/VersionConfig.h>
+#endif
 #include <aws/core/utils/memory/stl/AWSVector.h>
 #include <aws/s3/model/ListObjectsRequest.h>
 #include <aws/s3/model/DeleteObjectsRequest.h>
@@ -49,6 +52,11 @@ struct S3Env {
     std::string secret_key;
 
     bool use_virtual_addressing = true;
+
+    // When true, disable AWS SDK flexible checksums (CRC32 trailer) for
+    // compatibility with S3-compatible backends that don't support it.
+    // Set MOONCAKE_AWS_S3_DISABLE_FLEXIBLE_CHECKSUMS=false to re-enable.
+    bool disable_flexible_checksums = true;
 
     int64_t connect_timeout_ms = kDefaultS3ConnectTimeoutMs;
 
@@ -113,6 +121,9 @@ void S3Helper::InitAPI() {
     AssignBoolFromEnv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING",
                       s3_env.use_virtual_addressing);
 
+    AssignBoolFromEnv("MOONCAKE_AWS_S3_DISABLE_FLEXIBLE_CHECKSUMS",
+                      s3_env.disable_flexible_checksums);
+
     AssignTimeoutFromEnv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS",
                          kDefaultS3ConnectTimeoutMs, s3_env.connect_timeout_ms);
     AssignTimeoutFromEnv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS",
@@ -133,6 +144,43 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
     config.connectTimeoutMs = s3_env.connect_timeout_ms;
     config.requestTimeoutMs = s3_env.request_timeout_ms;
     config.scheme = Aws::Http::Scheme::HTTPS;
+
+    // Disable flexible checksums (CRC32 via chunked trailer) for maximum
+    // compatibility with S3-compatible object stores.
+    //
+    // Background: AWS C++ SDK >= 1.11.x defaults requestChecksumCalculation to
+    // WHEN_SUPPORTED, which appends CRC32/CRC32C checksums using the
+    // "aws-chunked" Transfer-Encoding trailer extension. This is part of the
+    // AWS "Flexible Checksums" feature (2022+).
+    //
+    // Problem: Many S3-compatible backends do NOT support trailing checksums:
+    //   - Baidu BCE Object Storage (returns BadDigest / BadDigestSHA256)
+    //   - Some MinIO versions (< RELEASE.2023-02-17)
+    //   - Ceph RGW (depending on version/config)
+    //   - Cloudflare R2, Wasabi, etc. (varying support)
+    //
+    // Fix: Set to WHEN_REQUIRED so checksums are only sent when the specific
+    // S3 operation mandates them (e.g. DeleteObjects with Content-MD5).
+    // This is equivalent to:
+    //   - boto3: config=Config(request_checksum_calculation='when_required')
+    //   - AWS CLI: AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED
+    //
+    // Note: Data integrity is still ensured by HTTPS (TLS) and
+    // Content-MD5 on operations that require it.
+    //
+    // To re-enable flexible checksums (e.g. for AWS S3 with strict validation):
+    //   export MOONCAKE_AWS_S3_DISABLE_FLEXIBLE_CHECKSUMS=false
+#if defined(AWS_SDK_VERSION_MAJOR) && \
+    (AWS_SDK_VERSION_MAJOR > 1 || \
+     (AWS_SDK_VERSION_MAJOR == 1 && defined(AWS_SDK_VERSION_MINOR) && \
+      AWS_SDK_VERSION_MINOR >= 11))
+    if (s3_env.disable_flexible_checksums) {
+        config.checksumConfig.requestChecksumCalculation =
+            Aws::Client::RequestChecksumCalculation::WHEN_REQUIRED;
+        config.checksumConfig.responseChecksumValidation =
+            Aws::Client::ResponseChecksumValidation::WHEN_REQUIRED;
+    }
+#endif
 
     if (!region.empty()) {
         config.region = region;
