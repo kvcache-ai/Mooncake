@@ -225,6 +225,13 @@ DEFINE_uint32(promotion_max_per_heartbeat, 1,
               "SSD-read + RDMA-write on the client; serializing them avoids "
               "blocking past the client-liveness window. Default 1 is "
               "conservative.");
+DEFINE_uint32(promotion_max_budget_ms, 0,
+              "SLO-aware promotion scheduling: sort queued promotion tasks "
+              "by deadline (queue admission time + budget) and only return "
+              "tasks that have not yet exceeded the budget. 0 = disabled "
+              "(FIFO). "
+              "HiCache sets prefetch_timeout_base + per_ki_token*N; use "
+              "that value here so master promotes in SLO order.");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -482,6 +489,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_max_per_heartbeat",
                              &master_config.promotion_max_per_heartbeat,
                              FLAGS_promotion_max_per_heartbeat);
+    default_config.GetUInt32("promotion_max_budget_ms",
+                             &master_config.promotion_max_budget_ms,
+                             FLAGS_promotion_max_budget_ms);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -794,6 +804,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.promotion_max_per_heartbeat =
             FLAGS_promotion_max_per_heartbeat;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_max_budget_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_max_budget_ms = FLAGS_promotion_max_budget_ms;
     }
     // Clamp promotion_admission_threshold into the sketch counter's
     // representable range. The CountMinSketch uses 8-bit saturating

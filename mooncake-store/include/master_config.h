@@ -132,6 +132,10 @@ struct MasterConfig {
     // liveness window. Default 1 is conservative; small-object or RDMA-
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
+    // SLO-aware promotion budget (ms). 0 = disabled (FIFO).
+    // When set, tasks are sorted by deadline (queued_time + budget) and only
+    // tasks within budget are returned.
+    uint32_t promotion_max_budget_ms = 0;
 };
 
 class MasterServiceSupervisorConfig {
@@ -211,6 +215,7 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
 
     // Pod identity for K8s label-based routing
     std::string pod_name;
@@ -253,6 +258,7 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -403,6 +409,7 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -476,6 +483,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -573,6 +581,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -983,6 +992,7 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1052,6 +1062,7 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;

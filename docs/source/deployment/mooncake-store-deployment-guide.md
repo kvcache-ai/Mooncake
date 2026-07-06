@@ -191,7 +191,7 @@ mooncake_master \
 
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
 
-Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`.
+Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`. To keep promotion work aligned with an application-level SLO window, set `--promotion_max_budget_ms` to a positive value so the master prioritizes in-budget queued tasks and expires late queued tasks before they are handed to clients.
 
 ```bash
 mooncake_master \
@@ -199,6 +199,7 @@ mooncake_master \
   --offload_on_evict=true \
   --promotion_on_hit=true \
   --promotion_admission_threshold=2 \
+  --promotion_max_budget_ms=0 \
   --root_fs_dir=/mnt/ssd_cache \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
@@ -548,11 +549,12 @@ Flags for controlling data movement between DRAM and SSD.
 | `--promotion_on_hit` | `false` | Promote SSD-resident keys to DRAM on read hit |
 | `--promotion_admission_threshold` | `2` | Min CountMinSketch count to allow promotion (`1` = disable gating) |
 | `--promotion_max_per_heartbeat` | `1` | Max promotion tasks handed to a single client per heartbeat. Each task is a synchronous SSD-read + RDMA-write on the client; serializing them avoids blocking past the client-liveness window |
+| `--promotion_max_budget_ms` | `0` | SLO-aware promotion queue budget in milliseconds. `0` keeps FIFO behavior; a positive value sorts queued tasks by deadline and expires tasks that have already missed the budget before they are handed to clients |
 | `--promotion_queue_limit` | `50000` | Max in-flight promotion tasks |
 | `--quota_bytes` | `0` (90% of capacity) | Storage quota in bytes |
 | `--enable_disk_eviction` | `true` | Enable disk eviction |
 
-Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued.
+Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued. Keep `--promotion_max_budget_ms=0` for the original FIFO queue behavior; set it to a positive SLO budget when late SSD-to-DRAM promotions should be expired instead of consuming client work after their useful window has passed.
 
 When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at most `offloading_queue_limit * offload_cap_ratio` objects for SSD offload (default: `50000 * 0.5 = 25000`); objects exceeding this cap fall back to force-evict (discard) if `--offload_force_evict=true`, otherwise they remain in memory. For SSD-heavy workloads where NVMe bandwidth is underutilized while the KV-cache hit rate suffers, raise both `--offloading_queue_limit` and `--offload_cap_ratio` so more objects per cycle are actually persisted to SSD instead of discarded. Example: `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` yields a per-cycle cap of `400000` (vs the default `25000`).
 

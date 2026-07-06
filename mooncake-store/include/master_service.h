@@ -60,6 +60,7 @@ class SnapshotChildProcessTest;
 // standing up a full snapshot catalog + child-process harness, and
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
+class PromotionBudgetBench;
 class MasterServiceTenantQuotaTest;
 }  // namespace test
 
@@ -82,6 +83,7 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class test::PromotionBudgetBench;
     friend class test::MasterServiceTenantQuotaTest;
 
    public:
@@ -1533,6 +1535,12 @@ class MasterService {
      */
     void TryPushPromotionQueue(const ObjectIdentity& object_id);
 
+    // Treat a promotion task that has missed its SLO budget as expired. This
+    // releases the source LOCAL_DISK refcnt, any staged MEMORY replica/quota,
+    // and the global in-flight slot while keeping the object metadata itself.
+    bool ExpirePromotionTaskForBudget(const ObjectIdentity& object_id)
+        NO_THREAD_SAFETY_ANALYSIS;
+
     // Erase any in-flight PromotionTask for `key`, abort any staged promotion
     // quota reservation, and decrement the cluster-wide in-flight counter. Safe
     // no-op if no task exists.
@@ -1936,6 +1944,7 @@ class MasterService {
     uint32_t promotion_admission_threshold_{2};
     uint32_t promotion_queue_limit_{50000};
     uint32_t promotion_max_per_heartbeat_{1};
+    uint32_t promotion_max_budget_ms_{0};  // SLO-aware budget, 0=disabled
     // Global in-flight task counter, checked against promotion_queue_limit_
     // as the gate cap. Promotion specifically targets skewed
     // access (hot keys re-accessed after eviction), so the global counter
