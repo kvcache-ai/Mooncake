@@ -1336,7 +1336,7 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     }
     // case 2: pure mnnvl
     if (transport_list_[MNNVL] && transport_list_[NVLINK]) {
-        auto& xport = transport_list_[RDMA];
+        auto& xport = transport_list_[MNNVL];
         auto& caps = xport->capabilities();
         if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CPU &&
             !caps.dram_to_dram) {
