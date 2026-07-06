@@ -79,6 +79,9 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     const std::string endpoint = MakeIpcEndpoint();
     const std::string object_key =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_k";
+    const std::string group_id =
+        "sglang-hicache:"
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     KvEventConfig config;
     config.enabled = true;
@@ -100,7 +103,7 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     // Allow SUB connect before first publish propagates.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    publisher.PublishStored(object_key, "cpu", "tenant-a");
+    publisher.PublishStored(object_key, "cpu", "tenant-a", group_id);
 
     std::vector<std::string> frames;
     ASSERT_TRUE(ReceiveZmqMultipart(sub, frames)) << zmq_strerror(zmq_errno());
@@ -122,6 +125,7 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     ASSERT_EQ(event.type, msgpack::type::MAP);
 
     bool has_object_key = false;
+    bool has_group_id = false;
     bool has_empty_seq_hashes = false;
     std::string event_type;
     std::string backend_id;
@@ -136,6 +140,10 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
             EXPECT_EQ(std::string(val.via.str.ptr, val.via.str.size),
                       object_key);
             has_object_key = true;
+        } else if (field == "group_id") {
+            ASSERT_EQ(val.type, msgpack::type::STR);
+            EXPECT_EQ(std::string(val.via.str.ptr, val.via.str.size), group_id);
+            has_group_id = true;
         } else if (field == "seq_hashes") {
             ASSERT_EQ(val.type, msgpack::type::ARRAY);
             EXPECT_EQ(val.via.array.size, 0u);
@@ -156,6 +164,7 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     EXPECT_EQ(backend_id, "mooncake-test");
     EXPECT_EQ(tenant_id, "tenant-a");
     EXPECT_TRUE(has_object_key);
+    EXPECT_TRUE(has_group_id);
     EXPECT_TRUE(has_empty_seq_hashes);
 
     // Wait for async worker to finish publishing.

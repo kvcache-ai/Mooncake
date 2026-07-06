@@ -32,10 +32,12 @@ class KvEventPublisher {
     // Non-blocking enqueue into a bounded queue; drops oldest when full.
     // tenant_id empty defaults to "default" on the wire.
     void PublishStored(const std::string& object_key, const std::string& medium,
-                       const std::string& tenant_id = "");
+                       const std::string& tenant_id = "",
+                       const std::string& group_id = "");
     void PublishRemoved(const std::string& object_key,
                         const std::string& medium,
-                        const std::string& tenant_id = "");
+                        const std::string& tenant_id = "",
+                        const std::string& group_id = "");
 
     struct Stats {
         uint64_t published_batches{0};
@@ -58,6 +60,7 @@ class KvEventPublisher {
         std::string object_key;
         std::string medium;
         std::string tenant_id;
+        std::string group_id;
     };
 
     void Enqueue(PendingEvent event);
@@ -95,9 +98,9 @@ class KvEventPublisher {
     bool enabled() const { return false; }
 
     void PublishStored(const std::string&, const std::string&,
-                       const std::string& = "") {}
+                       const std::string& = "", const std::string& = "") {}
     void PublishRemoved(const std::string&, const std::string&,
-                        const std::string& = "") {}
+                        const std::string& = "", const std::string& = "") {}
 
     struct Stats {
         uint64_t published_batches{0};
