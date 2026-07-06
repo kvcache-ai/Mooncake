@@ -46,6 +46,7 @@ struct MnnvlSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
+    int stream_device_id = -1;
     // Completion events created in startTransfer (one per submit). Destroyed by
     // the destructor (RAII); Slab<T>::deallocate() invokes ~MnnvlSubBatch()
     // before reusing the storage, so this runs on every free.

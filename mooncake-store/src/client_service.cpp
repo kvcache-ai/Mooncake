@@ -35,7 +35,7 @@
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"

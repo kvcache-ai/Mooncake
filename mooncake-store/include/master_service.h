@@ -324,11 +324,29 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Read-only single-key replica list query for admin use.
+     * Unlike GetReplicaList, this does not grant leases, trigger
+     * promotion, or update cache-hit metrics.
+     */
+    auto GetReplicaListForAdmin(const std::string& key,
+                                const std::string& tenant_id)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
      * @brief Get replica lists for a batch of objects.
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id);
+
+    /**
+     * @brief Read-only batch replica list query for admin use.
+     * Unlike BatchGetReplicaList, this does not grant leases, trigger
+     * promotion, or update cache-hit metrics.
+     */
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
 
     /**
      * @brief Start a put operation for an object

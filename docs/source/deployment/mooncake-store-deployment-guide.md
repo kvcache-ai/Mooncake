@@ -278,7 +278,17 @@ mooncake_master \
   --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
 ```
 
-The v1 connector is a writable YAML file. The file must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
+You can also store the same YAML policy in etcd when Mooncake Store is built with `STORE_USE_ETCD=ON`:
+
+```bash
+mooncake_master \
+  --enable_multi_tenants=true \
+  --cluster_id=mooncake_cluster \
+  --tenant_quota_connector_type=etcd \
+  --tenant_quota_connector_uri=127.0.0.1:2379
+```
+
+The etcd connector stores the policy at `mooncake-store/<cluster_id>/tenant_quota_policy`. If the key does not exist, the master starts with an empty policy so the first tenant policy can be created through the admin API. It shares the process-wide store etcd client used by HA/oplog, so if HA or oplog also uses etcd, `tenant_quota_connector_uri` must match those etcd endpoints. The policy must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
 
 ```yaml
 version: 1
@@ -475,8 +485,8 @@ mooncake_master \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
-| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type |
-| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path |
+| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type: `file` or `etcd` when built with `STORE_USE_ETCD=ON` |
+| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path; for `etcd`, the endpoints string |
 
 ### High Availability
 
@@ -665,6 +675,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
+| `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
 ```{note}
@@ -695,12 +706,14 @@ Or via a JSON config file. The service also exposes a lightweight HTTP API (on `
   "local_buffer_size": 268435456,
   "protocol": "tcp",
   "device_name": "",
-  "master_server_address": "127.0.0.1:50051"
+  "master_server_address": "127.0.0.1:50051",
+  "tenant_id": "default"
 }
 ```
 
 ```bash
 python -m mooncake.mooncake_store_service --config=<config_path> --port=8081
+python -m mooncake.mooncake_store_service --config=<config_path> -Dtenant_id=tenant-a
 ```
 
 ### Method C — Resource-owning Real Client (`mooncake_client`)
@@ -711,7 +724,8 @@ Run the `mooncake_client` binary as a standalone RPC process that owns storage r
 mooncake_client \
   --global_segment_size="4GB" \
   --master_server_address="127.0.0.1:50051" \
-  --metadata_server="http://127.0.0.1:8080/metadata"
+  --metadata_server="http://127.0.0.1:8080/metadata" \
+  --tenant_id="default"
 ```
 
 | Flag | Default | Description |
@@ -724,6 +738,7 @@ mooncake_client \
 | `--protocol` | `tcp` | Transfer protocol |
 | `--device_names` | empty | Transfer device name(s), comma-separated |
 | `--threads` | `1` | Client worker thread count |
+| `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 

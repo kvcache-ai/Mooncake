@@ -13,7 +13,7 @@
 
 #include "file_interface.h"
 #include "mutex.h"
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "types.h"
 
 namespace mooncake {

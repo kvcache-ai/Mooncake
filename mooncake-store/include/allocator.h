@@ -7,7 +7,7 @@
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;

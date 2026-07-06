@@ -129,6 +129,7 @@ class MooncakeConfig:
         master_server_address (str): The address of the master server.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.
+        tenant_id (str): Tenant identifier. Default is "default".
 
     Example of configuration file:
         {
@@ -140,7 +141,8 @@ class MooncakeConfig:
             "device_name": "",
             "master_server_address": "localhost:8081",
             "enable_ssd_offload": true,
-            "ssd_offload_path": "/nvme/mooncake_offload"
+            "ssd_offload_path": "/nvme/mooncake_offload",
+            "tenant_id": "default"
         }
         
         For RDMA:
@@ -153,7 +155,8 @@ class MooncakeConfig:
             "device_name": "mlx5_0",
             "master_server_address": "master:8081",
             "enable_ssd_offload": true,
-            "ssd_offload_path": "/nvme/mooncake_offload"
+            "ssd_offload_path": "/nvme/mooncake_offload",
+            "tenant_id": "default"
         }
     """
     local_hostname: str
@@ -165,6 +168,7 @@ class MooncakeConfig:
     master_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
+    tenant_id: str = "default"
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
@@ -179,6 +183,8 @@ class MooncakeConfig:
         for field in required_fields:
             if field not in config:
                 raise ValueError(f"Missing required config field: {field}")
+        ssd_offload_path = config.get("ssd_offload_path")
+        tenant_id = config.get("tenant_id")
         return MooncakeConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
@@ -192,7 +198,8 @@ class MooncakeConfig:
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
             enable_ssd_offload=_parse_bool(config.get("enable_ssd_offload", False)),
-            ssd_offload_path=str(config.get("ssd_offload_path", "")),
+            ssd_offload_path=str(ssd_offload_path) if ssd_offload_path is not None else "",
+            tenant_id=str(tenant_id) if tenant_id is not None else "default",
         )
 
     @staticmethod
@@ -221,5 +228,6 @@ class MooncakeConfig:
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
                 enable_ssd_offload=_parse_bool(os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
+                tenant_id=os.getenv("MOONCAKE_TENANT_ID", "default"),
             )
         return MooncakeConfig.from_file(config_file_path)

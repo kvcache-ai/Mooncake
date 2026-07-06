@@ -265,14 +265,16 @@ std::string getMachineID() {
 
 Status TransferEngineImpl::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    segment->name = local_segment_name_;
-    segment->type = SegmentType::Memory;
-    segment->machine_id = getMachineID();
-    segment->rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
-    auto& detail = std::get<MemorySegmentDesc>(segment->detail);
-    detail.topology = *(topology_.get());
-    local_segment_tracker_ = std::make_unique<SegmentTracker>(segment);
+    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        segment.name = local_segment_name_;
+        segment.type = SegmentType::Memory;
+        segment.machine_id = getMachineID();
+        segment.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
+        auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+        detail.topology = *(topology_.get());
+        return Status::OK();
+    }));
+    local_segment_tracker_ = std::make_unique<SegmentTracker>(manager);
     return manager.synchronizeLocal();
 }
 
@@ -430,10 +432,13 @@ Status TransferEngineImpl::deconstruct() {
     staging_proxy_.reset();
 
     if (local_segment_tracker_) {
-        local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
+        local_segment_tracker_->forEach([&](const BufferDesc& desc) -> Status {
+            // Snapshot entries are immutable; transports may scrub fields of
+            // their deregistration argument, so hand them a copy.
+            BufferDesc copy = desc;
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 if (transport_list_[type])
-                    transport_list_[type]->removeMemoryBuffer(desc);
+                    transport_list_[type]->removeMemoryBuffer(copy);
             }
             return Status::OK();
         });
@@ -514,9 +519,10 @@ Status TransferEngineImpl::closeSegment(SegmentID handle) {
 }
 
 Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
-    SegmentDesc* desc = nullptr;
+    // Owning reference: keeps the snapshot alive while we read through it.
+    SegmentDescRef desc;
     if (handle == LOCAL_SEGMENT_ID) {
-        desc = metadata_->segmentManager().getLocal().get();
+        desc = metadata_->segmentManager().getLocal();
     } else {
         CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, handle));
     }
@@ -645,6 +651,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
+    if (transport_list_[TPU]) result.push_back(TPU);
     return result;
 }
 
@@ -877,7 +884,12 @@ class TransferEngineImpl::BatchRef {
 };
 
 static bool isGpuType(MemoryType t) {
-    return t == MTYPE_CUDA || t == MTYPE_ROCM;
+    // TPU HBM behaves like a GPU that lacks NIC access: it is a device-side
+    // memory that can only reach the network by staging through host DRAM.
+    // Treating it as a "gpu type" makes the capability checks route its
+    // device<->host hop to TpuTransport (gpu_to_dram / dram_to_gpu) while
+    // leaving gpu_to_gpu unsatisfiable, which forces host-DRAM staging.
+    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU;
 }
 
 static bool checkAvailability(const std::shared_ptr<Transport>& xport,
@@ -905,6 +917,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
     if (type == "rocm") return MTYPE_ROCM;
+    if (type == "tpu") return MTYPE_TPU;
     return MTYPE_UNKNOWN;
 }
 
@@ -929,9 +942,10 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
-    SegmentDesc* desc;
+    // Owning reference: keeps the snapshot alive while we read through it.
+    SegmentDescRef desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
-        desc = metadata_->segmentManager().getLocal().get();
+        desc = metadata_->segmentManager().getLocal();
     } else {
         auto status = metadata_->segmentManager().getRemoteCached(
             desc, request.target_id);
@@ -964,7 +978,11 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                 auto remote_mtype =
                     getTypeEnum(LocationParser(entry->location).type());
                 for (auto type : entry->transports) {
-                    if ((type == NVLINK || type == SHM) && !same_machine)
+                    // NVLINK/SHM are same-machine only; TPU is a
+                    // local-stage-only executor and must never carry a remote
+                    // hop.
+                    if ((type == NVLINK || type == SHM || type == TPU) &&
+                        !same_machine)
                         continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
@@ -1042,6 +1060,8 @@ static const char* transportTypeName(TransportType type) {
             return "AscendDirect";
         case SUNRISE_LINK:
             return "SUNRISE_LINK";
+        case TPU:
+            return "TPU";
     }
     return "UNKNOWN";
 }
@@ -1212,7 +1232,8 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     // Group requests by target_id so withCachedSegment fires at most once per
     // peer.
     std::vector<RequestBoundaryInfo> boundaries(requests.size());
-    auto* local_desc = metadata->segmentManager().getLocal().get();
+    // Owning reference: keeps the snapshot alive while we read through it.
+    auto local_desc = metadata->segmentManager().getLocal();
 
     if (local_desc) {
         for (size_t i = 0; i < requests.size(); ++i) {
@@ -1272,8 +1293,10 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
 
     SegmentDesc* desc = nullptr;
     BufferDesc* entry = nullptr;
+    // Owning reference: `entry` is used after the lambda returns.
+    SegmentDescRef pin;
     auto status = metadata_->segmentManager().withCachedSegment(
-        request.target_id, [&](SegmentDesc* segment) {
+        request.target_id, pin, [&](SegmentDesc* segment) {
             desc = segment;
             entry = desc->findBuffer(request.target_offset, request.length);
             if (!entry)
@@ -1313,7 +1336,7 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     }
     // case 2: pure mnnvl
     if (transport_list_[MNNVL] && transport_list_[NVLINK]) {
-        auto& xport = transport_list_[RDMA];
+        auto& xport = transport_list_[MNNVL];
         auto& caps = xport->capabilities();
         if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CPU &&
             !caps.dram_to_dram) {
@@ -1326,6 +1349,34 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
             policy.push_back("");  // no local stage
             policy.push_back(desc->getMemory().topology.findNearMem(
                 remote, Topology::MEM_CUDA));
+        }
+    }
+    // case 3: TPU. HBM is not NIC-addressable, so any hop touching TPU memory
+    // is staged through host DRAM: TpuTransport performs the local HBM<->host
+    // copy (via the PJRT adapter) and the host<->host hop is carried by
+    // whatever host-DRAM network transport is present. TPU deployments (e.g.
+    // cloud TPU VMs) are typically TCP/multi-NIC rather than RDMA, so we gate
+    // on either; the cross stage itself is routed by capability (dram_to_dram),
+    // so TCP is selected when RDMA is absent. We also require TpuTransport (the
+    // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
+    // An empty stage location means "no staging needed on that side".
+    if (transport_list_[TPU] &&
+        (transport_list_[RDMA] || transport_list_[TCP])) {
+        if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
+            policy.clear();
+            policy.push_back(server_addr);
+            policy.push_back(topology_->findNearMem(local));
+            policy.push_back(desc->getMemory().topology.findNearMem(remote));
+        } else if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_CPU) {
+            policy.clear();
+            policy.push_back(server_addr);
+            policy.push_back(topology_->findNearMem(local));
+            policy.push_back("");  // remote already host DRAM
+        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_TPU) {
+            policy.clear();
+            policy.push_back(server_addr);
+            policy.push_back("");  // local already host DRAM
+            policy.push_back(desc->getMemory().topology.findNearMem(remote));
         }
     }
 }
