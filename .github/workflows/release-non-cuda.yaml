@@ -9,7 +9,6 @@ jobs:
   # manylinux2_28 for the toolchain only (USE_CUDA=OFF); keeps the glibc floor
   # aligned with the CUDA wheels.
   build:
-    if: ${{ !contains(github.ref_name, '-') }}
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       runner: ubuntu-22.04
@@ -25,6 +24,9 @@ jobs:
   publish-release:
     if: ${{ !contains(github.ref_name, '-') }}
     needs: build
+    permissions:
+      contents: write
+      id-token: write
     uses: ./.github/workflows/_publish-wheel.yaml
     with:
       artifact-pattern: 'mooncake-wheel-non-cuda*'

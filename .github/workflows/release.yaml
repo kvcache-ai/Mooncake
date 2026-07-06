@@ -37,8 +37,10 @@ jobs:
       artifact-prefix: mooncake-wheel-arm64
 
   publish-release:
-    if: ${{ !contains(github.ref_name, '-') }}
     needs: [build, build-arm64]
+    permissions:
+      contents: write
+      id-token: write
     uses: ./.github/workflows/_publish-wheel.yaml
     with:
       artifact-pattern: 'mooncake-wheel*'
