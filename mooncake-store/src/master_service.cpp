@@ -377,6 +377,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     promotion_admission_threshold_ = config.promotion_admission_threshold;
     promotion_queue_limit_ = config.promotion_queue_limit;
     promotion_max_per_heartbeat_ = config.promotion_max_per_heartbeat;
+    promotion_max_budget_ms_ = config.promotion_max_budget_ms;
     // Clamp to >=1: 0 would make PromotionObjectHeartbeat return an empty
     // batch every call, silently disabling promotion delivery.
     if (promotion_max_per_heartbeat_ == 0) {
@@ -406,7 +407,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << promotion_admission_threshold_
                   << ", queue_limit=" << promotion_queue_limit_
                   << ", max_per_heartbeat=" << promotion_max_per_heartbeat_
-                  << ")";
+                  << ", max_budget_ms=" << promotion_max_budget_ms_ << ")";
     }
 
     eviction_running_ = true;
@@ -5205,7 +5206,8 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
             .key = object_id.user_key,
             .size = static_cast<int64_t>(source_replica.get_descriptor()
                                              .get_local_disk_descriptor()
-                                             .object_size)});
+                                             .object_size),
+            .queued_time = std::chrono::steady_clock::now()});
     if (!res.second) {
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
@@ -5316,31 +5318,148 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     VLOG(1) << "promotion_queued key=" << key << " size=" << object_size;
 }
 
+bool MasterService::ExpirePromotionTaskForBudget(
+    const ObjectIdentity& object_id) {
+    const size_t shard_idx =
+        getMetadataShardIndex(object_id.tenant_id, object_id.user_key);
+    MetadataShardAccessorRW shard(this, shard_idx);
+    auto tenant_it = shard->tenants.find(object_id.tenant_id);
+    if (tenant_it == shard->tenants.end()) {
+        return false;
+    }
+    auto& tenant_state = tenant_it->second;
+    auto task_it = tenant_state.promotion_tasks.find(object_id.user_key);
+    if (task_it == tenant_state.promotion_tasks.end()) {
+        return false;
+    }
+
+    auto metadata_it = tenant_state.metadata.find(object_id.user_key);
+    if (metadata_it != tenant_state.metadata.end()) {
+        auto* source =
+            metadata_it->second.GetReplicaByID(task_it->second.source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+        if (task_it->second.alloc_id != 0) {
+            const ReplicaID alloc_id = task_it->second.alloc_id;
+            EraseReplicasWithCacheTotalAccounting(
+                metadata_it->second, [alloc_id](const Replica& replica) {
+                    return replica.id() == alloc_id;
+                });
+        }
+    }
+
+    AbortTenantQuota(object_id.tenant_id,
+                     task_it->second.reserved_quota_charge_bytes);
+    task_it->second.reserved_quota_charge_bytes = 0;
+    tenant_state.promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().dec_promotion_in_flight();
+    MasterMetricManager::instance().inc_promotion_expired();
+    MasterMetricManager::instance().inc_promotion_late();
+    LOG(WARNING) << "Promotion task exceeded budget for key: "
+                 << object_id.user_key << " tenant=" << object_id.tenant_id;
+
+    if (tenant_state.Empty()) {
+        shard->tenants.erase(tenant_it);
+    }
+    return true;
+}
+
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    // Return at most promotion_max_per_heartbeat_ tasks. Each task does
-    // a synchronous SSD read + RDMA write on the client side; allowing
-    // more than one per heartbeat risks blocking past the client-
-    // liveness window and the master marking the client dead. The rest
-    // stay queued in promotion_objects for subsequent heartbeats. The
-    // cap must live here (server side) rather than on the client so
-    // leftover work isn't silently dropped.
-    auto& src = local_disk_segment_it->second->promotion_objects;
     std::vector<PromotionTaskItem> result;
-    while (result.size() < promotion_max_per_heartbeat_ && !src.empty()) {
-        auto node = src.extract(src.begin());
-        result.push_back(std::move(node.mapped()));
+    std::vector<ObjectIdentity> expired_tasks;
+
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+        if (local_disk_segment_it == client_local_disk_segment.end()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        // Return at most promotion_max_per_heartbeat_ tasks. Each task does
+        // a synchronous SSD read + RDMA write on the client side; allowing
+        // more than one per heartbeat risks blocking past the client-
+        // liveness window and the master marking the client dead. The rest
+        // stay queued in promotion_objects for subsequent heartbeats. The
+        // cap must live here (server side) rather than on the client so
+        // leftover work isn't silently dropped.
+        auto& src = local_disk_segment_it->second->promotion_objects;
+
+        if (promotion_max_budget_ms_ == 0) {
+            while (result.size() < promotion_max_per_heartbeat_ &&
+                   !src.empty()) {
+                auto node = src.extract(src.begin());
+                result.push_back(std::move(node.mapped()));
+            }
+        } else {
+            struct Candidate {
+                std::string storage_key;
+                PromotionTaskItem task_item;
+                int64_t remaining_ms;
+            };
+
+            const auto now = std::chrono::steady_clock::now();
+            std::vector<Candidate> candidates;
+            std::vector<std::string> expired_storage_keys;
+
+            for (const auto& [storage_key, task_item] : src) {
+                const auto elapsed_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - task_item.queued_time)
+                        .count();
+                const int64_t remaining_ms =
+                    static_cast<int64_t>(promotion_max_budget_ms_) - elapsed_ms;
+                if (remaining_ms < 0) {
+                    expired_storage_keys.push_back(storage_key);
+                    expired_tasks.push_back(
+                        ObjectIdentity{task_item.tenant_id, task_item.key});
+                    continue;
+                }
+                candidates.push_back(
+                    Candidate{storage_key, task_item, remaining_ms});
+            }
+
+            for (const auto& storage_key : expired_storage_keys) {
+                src.erase(storage_key);
+            }
+
+            std::sort(
+                candidates.begin(), candidates.end(),
+                [](const Candidate& a, const Candidate& b) {
+                    if (a.remaining_ms != b.remaining_ms) {
+                        return a.remaining_ms < b.remaining_ms;
+                    }
+                    if (a.task_item.queued_time != b.task_item.queued_time) {
+                        return a.task_item.queued_time <
+                               b.task_item.queued_time;
+                    }
+                    return a.storage_key < b.storage_key;
+                });
+
+            for (const auto& candidate : candidates) {
+                if (result.size() >= promotion_max_per_heartbeat_) {
+                    break;
+                }
+                auto node = src.extract(candidate.storage_key);
+                if (node.empty()) {
+                    continue;
+                }
+                result.push_back(std::move(node.mapped()));
+                MasterMetricManager::instance().inc_promotion_within_budget();
+            }
+        }
     }
+
+    for (const auto& object_id : expired_tasks) {
+        (void)ExpirePromotionTaskForBudget(object_id);
+    }
+
     return result;
 }
 

@@ -374,6 +374,11 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_rejected_cap_total",
           "Promotion attempts rejected because promotion_in_flight was at "
           "promotion_queue_limit"),
+      promotion_within_budget_(
+          "master_promotion_within_budget_total",
+          "Promotion tasks that were processed within their SLO budget window"),
+      promotion_late_("master_promotion_late_total",
+                      "Promotion tasks that exceeded their SLO budget window"),
       tenant_quota_reject_total_(
           "mooncake_tenant_quota_reject_total",
           "Total number of tenant quota admission rejects",
@@ -482,6 +487,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_rejected_frequency_.inc(0);
     promotion_rejected_watermark_.inc(0);
     promotion_rejected_cap_.inc(0);
+    promotion_within_budget_.inc(0);
+    promotion_late_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
@@ -1145,6 +1152,12 @@ void MasterMetricManager::inc_promotion_rejected_watermark(int64_t val) {
 void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
     promotion_rejected_cap_.inc(val);
 }
+void MasterMetricManager::inc_promotion_within_budget(int64_t val) {
+    promotion_within_budget_.inc(val);
+}
+void MasterMetricManager::inc_promotion_late(int64_t val) {
+    promotion_late_.inc(val);
+}
 
 void MasterMetricManager::inc_tenant_quota_reject(const std::string& tenant_id,
                                                   const std::string& reason,
@@ -1539,6 +1552,12 @@ int64_t MasterMetricManager::get_promotion_rejected_watermark() {
 }
 int64_t MasterMetricManager::get_promotion_rejected_cap() {
     return promotion_rejected_cap_.value();
+}
+int64_t MasterMetricManager::get_promotion_within_budget() {
+    return promotion_within_budget_.value();
+}
+int64_t MasterMetricManager::get_promotion_late() {
+    return promotion_late_.value();
 }
 
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics

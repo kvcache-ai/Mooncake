@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -294,6 +295,7 @@ struct PromotionTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    std::chrono::steady_clock::time_point queued_time;
 
     bool operator==(const PromotionTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&

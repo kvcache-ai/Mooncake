@@ -54,6 +54,28 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_admission_threshold_;
     }
 
+    static bool SetPromotionQueuedTimeForTesting(
+        MasterService* service, const UUID& client_id, const std::string& key,
+        std::chrono::steady_clock::time_point queued_time,
+        const std::string& tenant_id = "default") {
+        auto local_disk_segment_access =
+            service->segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto holder_it = client_local_disk_segment.find(client_id);
+        if (holder_it == client_local_disk_segment.end()) {
+            return false;
+        }
+        MutexLocker locker(&holder_it->second->offloading_mutex_);
+        auto task_it = holder_it->second->promotion_objects.find(
+            MakeTenantScopedStorageKey(tenant_id, key));
+        if (task_it == holder_it->second->promotion_objects.end()) {
+            return false;
+        }
+        task_it->second.queued_time = queued_time;
+        return true;
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     std::string WriteTenantQuotaPolicyFile(
@@ -2237,6 +2259,143 @@ TEST_F(PromotionOnHitTest, MaxPerHeartbeatKnobControlsBatchSize) {
     auto third = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(third.has_value());
     EXPECT_EQ(third->size(), 0u);
+
+    service->RemoveAll();
+}
+
+// With promotion_max_budget_ms enabled, the master returns tasks whose
+// deadlines are closest first while still honoring promotion_max_per_heartbeat.
+TEST_F(PromotionOnHitTest, BudgetModeOrdersByClosestDeadlineAndRespectsCap) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;
+    config.promotion_max_budget_ms = 5000;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    auto enqueue = [&](const std::string& key) {
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
+                                           seg.segment_name));
+        auto r = service->GetReplicaList(key, "default");
+        ASSERT_TRUE(r.has_value());
+    };
+
+    enqueue("budget_old");
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    enqueue("budget_mid");
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    enqueue("budget_new");
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t within_pre = mm.get_promotion_within_budget();
+    const int64_t late_pre = mm.get_promotion_late();
+
+    auto first = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first->size(), 2u);
+    EXPECT_EQ((*first)[0].key, "budget_old");
+    EXPECT_EQ((*first)[1].key, "budget_mid");
+
+    auto second = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_EQ(second->size(), 1u);
+    EXPECT_EQ((*second)[0].key, "budget_new");
+
+    EXPECT_EQ(mm.get_promotion_within_budget() - within_pre, 3);
+    EXPECT_EQ(mm.get_promotion_late() - late_pre, 0);
+
+    service->RemoveAll();
+}
+
+// If several tasks fall into the same millisecond budget bucket, heartbeat
+// should not depend on unordered_map iteration order.
+TEST_F(PromotionOnHitTest, BudgetModeUsesDeterministicTieBreaker) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 3;
+    config.promotion_max_budget_ms = 5000;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    for (const auto& key : {"tie_b", "tie_c", "tie_a"}) {
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
+                                           seg.segment_name));
+        auto r = service->GetReplicaList(key, "default");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    const auto same_queued_time =
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
+    ASSERT_TRUE(SetPromotionQueuedTimeForTesting(service.get(), seg.client_id,
+                                                 "tie_a", same_queued_time));
+    ASSERT_TRUE(SetPromotionQueuedTimeForTesting(service.get(), seg.client_id,
+                                                 "tie_b", same_queued_time));
+    ASSERT_TRUE(SetPromotionQueuedTimeForTesting(service.get(), seg.client_id,
+                                                 "tie_c", same_queued_time));
+
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    ASSERT_EQ(heartbeat->size(), 3u);
+    EXPECT_EQ((*heartbeat)[0].key, "tie_a");
+    EXPECT_EQ((*heartbeat)[1].key, "tie_b");
+    EXPECT_EQ((*heartbeat)[2].key, "tie_c");
+
+    service->RemoveAll();
+}
+
+// A queued task that has already missed its budget should be removed from the
+// per-client queue and from the per-shard PromotionTask map so it does not pin
+// promotion_in_flight or block future promotion attempts for the same key.
+TEST_F(PromotionOnHitTest, BudgetModeExpiresLateTaskAndReleasesSlot) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;
+    config.promotion_max_budget_ms = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+    const int64_t expired_pre = mm.get_promotion_expired();
+    const int64_t late_pre = mm.get_promotion_late();
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "budget_late",
+                                       1024, seg.segment_name));
+    {
+        auto r = service->GetReplicaList("budget_late", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(mm.get_promotion_in_flight(), in_flight_pre + 1);
+    EXPECT_EQ(mm.get_promotion_admitted() - admitted_pre, 1);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_TRUE(heartbeat->empty());
+    EXPECT_EQ(mm.get_promotion_late() - late_pre, 1);
+    EXPECT_EQ(mm.get_promotion_expired() - expired_pre, 1);
+    EXPECT_EQ(mm.get_promotion_in_flight(), in_flight_pre);
+
+    {
+        auto r = service->GetReplicaList("budget_late", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(mm.get_promotion_in_flight(), in_flight_pre + 1)
+        << "expired budget task should not pin the dedup/in-flight slot";
 
     service->RemoveAll();
 }
