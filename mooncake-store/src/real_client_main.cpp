@@ -18,6 +18,7 @@ DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of threads for client service");
+DEFINE_string(tenant_id, "default", "Tenant identifier");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(start_offload_rpc_server, true,
             "Expose TCP RPC for disk-tier reads "
@@ -112,7 +113,8 @@ int main(int argc, char *argv[]) {
         FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
         nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-        FLAGS_port, FLAGS_enable_offload, FLAGS_start_offload_rpc_server);
+        FLAGS_port, FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
+        FLAGS_tenant_id);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
