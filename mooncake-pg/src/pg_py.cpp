@@ -5,6 +5,8 @@
 #include <torch/python.h>
 #include <torch/torch.h>
 
+#include <cstdlib>
+#include <glog/logging.h>
 #include <mutex>
 
 #include "control_plane/agent_host.h"
@@ -13,8 +15,30 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-// Process-level context — definition in mooncake_backend.h.
+// Process-level context -- definition in mooncake_backend.h.
 static MooncakeProcessContext g_ctx;
+
+MooncakeProcessContext::MooncakeProcessContext() {
+    if (const char* val =
+            std::getenv("MOONCAKE_PG_FAULT_RECONCILIATION_WINDOW_US")) {
+        try {
+            fault_reconciliation_window_us = std::stoll(val);
+        } catch (...) {
+            LOG(WARNING)
+                << "Invalid MOONCAKE_PG_FAULT_RECONCILIATION_WINDOW_US: " << val
+                << ", using default " << fault_reconciliation_window_us
+                << " us";
+        }
+    }
+}
+
+MooncakeProcessContext::~MooncakeProcessContext() {
+    // Shutdown AgentHost first so any queued unregisterGroup RPCs are drained
+    // before RpcClient is torn down.
+    if (agent_host) agent_host->shutdown();
+    // Shutdown CoordinatorHost second so rank 0 fails pending proposals.
+    if (coordinator_host) coordinator_host->shutdown();
+}
 
 static std::once_flag g_init_control_plane_once;
 
@@ -30,6 +54,11 @@ static void requireMacaHostTransport() {
 static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
                                    int rank, int max_world_size) {
     std::call_once(g_init_control_plane_once, [&] {
+        g_ctx.max_world_size = max_world_size;
+
+        LOG(INFO) << "initControlPlane BEGIN rank=" << rank
+                  << " store_ptr=" << store.get();
+
         // Ordering constraint: AgentHost::start() sends registerAgent
         // immediately, which includes LinkManager's localServerName() and
         // getWarmupRecvAddr().  These must be non-empty, so the engine and
@@ -42,22 +71,19 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
             g_ctx.engine_initialized = true;
         }
         if (!g_ctx.link_manager.isInitialized()) {
-            g_ctx.link_manager.init(static_cast<GlobalRank>(rank),
-                                    max_world_size, g_ctx.engine);
+            g_ctx.link_manager.init(rank, max_world_size, g_ctx.engine);
         }
 
-        // Rank 0 hosts the Coordinator in-process.  It must start BEFORE
-        // AgentHost so the coordinator_addr key is in the Store when
-        // AgentHost::start() reads it.
+        // Rank 0 hosts the Coordinator in-process.
         if (rank == 0) {
             g_ctx.coordinator_host = std::make_unique<CoordinatorHost>(
-                store, g_ctx.host_ip, max_world_size);
+                store, g_ctx.host_ip, max_world_size,
+                g_ctx.fault_reconciliation_window_us);
             g_ctx.coordinator_host->start();
         }
 
         g_ctx.agent_host = std::make_unique<AgentHost>(
-            store, g_ctx.host_ip, static_cast<GlobalRank>(rank), max_world_size,
-            g_ctx.link_manager);
+            store, g_ctx.host_ip, rank, max_world_size, g_ctx.link_manager);
         g_ctx.agent_host->start();
     });
     return *g_ctx.agent_host;
@@ -68,13 +94,10 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     int rank = distBackendOpts.group_rank;
-    int size = distBackendOpts.group_size;
-    int max_size = (backendOptions && backendOptions->maxWorldSize_ > 0)
-                       ? backendOptions->maxWorldSize_
-                       : size;
-    auto& host = initControlPlane(distBackendOpts.store, rank, max_size);
-    return c10::make_intrusive<MooncakeBackend>(
+    auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
+    auto backend = c10::make_intrusive<MooncakeBackend>(
         std::move(distBackendOpts), std::move(backendOptions), host, g_ctx);
+    return backend;
 }
 
 c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
@@ -82,14 +105,11 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     int rank = distBackendOpts.group_rank;
-    int size = distBackendOpts.group_size;
-    int max_size = (backendOptions && backendOptions->maxWorldSize_ > 0)
-                       ? backendOptions->maxWorldSize_
-                       : size;
-    auto& host = initControlPlane(distBackendOpts.store, rank, max_size);
-    return c10::make_intrusive<MooncakeBackend>(std::move(distBackendOpts),
-                                                std::move(backendOptions), host,
-                                                g_ctx, true);
+    auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
+    auto backend = c10::make_intrusive<MooncakeBackend>(
+        std::move(distBackendOpts), std::move(backendOptions), host, g_ctx,
+        true);
+    return backend;
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {
@@ -157,7 +177,7 @@ void deactivateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
                     const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    auto resp = mooncakeBackend->deactivateRank(ranks);
+    auto resp = mooncakeBackend->deactivateRanks(ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
         throw std::runtime_error("deactivate_rank rejected: " +
                                  resp.reject_reason);
@@ -168,7 +188,7 @@ void activateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
                   const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    auto resp = mooncakeBackend->activateRank(ranks);
+    auto resp = mooncakeBackend->activateRanks(ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
         throw std::runtime_error("activate_rank rejected: " +
                                  resp.reject_reason);
@@ -178,34 +198,61 @@ void activateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
 void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    if (!mooncakeBackend) {
+        throw std::runtime_error(
+            "join_group: backend is null (C++ object was destroyed)");
+    }
     mooncakeBackend->joinGroup();
 }
 
-at::Tensor getFailedRanks(c10::intrusive_ptr<c10d::Work> work) {
+at::Tensor getFailedRanksHint(c10::intrusive_ptr<c10d::Work> work) {
     if (auto* w = dynamic_cast<MooncakeWorkCuda*>(work.get())) {
-        return w->getFailedRanks();
+        return w->getFailedRanksHint();
     }
     if (auto* w = dynamic_cast<MooncakeWorkCpu*>(work.get())) {
-        return w->getFailedRanks();
+        return w->getFailedRanksHint();
     }
     if (auto* w = dynamic_cast<MooncakeP2PWork*>(work.get())) {
-        return w->getFailedRanks();
+        return w->getFailedRanksHint();
     }
     return at::Tensor();
 }
 
+bool getLocalSuccess(c10::intrusive_ptr<c10d::Work> work) {
+    if (auto* w = dynamic_cast<MooncakeWorkCuda*>(work.get())) {
+        return w->getLocalSuccess();
+    }
+    if (auto* w = dynamic_cast<MooncakeWorkCpu*>(work.get())) {
+        return w->getLocalSuccess();
+    }
+    if (auto* w = dynamic_cast<MooncakeP2PWork*>(work.get())) {
+        return w->getLocalSuccess();
+    }
+    return false;
+}
+
+int64_t getCurrentEpoch(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return static_cast<int64_t>(mooncakeBackend->getCurrentEpoch());
+}
+
 /// Python-facing wrapper that extracts the raw TransferEngine* from a
-/// mooncake.engine.TransferEngine Python object and passes it to
-/// MooncakeBackend::setExternalEngine().  The caller must ensure the
+/// mooncake.engine.TransferEngine Python object and makes it the process-wide
+/// engine for all MooncakeBackend instances.  The caller must ensure the
 /// TransferEnginePy object outlives all MooncakeBackend instances.
 void setTransferEnginePy(pybind11::object engine_obj) {
     if (engine_obj.is_none()) {
         g_ctx.external_engine = nullptr;
+        g_ctx.engine = g_ctx.owned_engine.get();
+        g_ctx.engine_initialized = false;
         return;
     }
     auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
     uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
     g_ctx.external_engine = reinterpret_cast<TransferEngine*>(ptr);
+    g_ctx.engine = g_ctx.external_engine;
+    g_ctx.engine_initialized = true;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -220,6 +267,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "set_p2p_timeout_us", [](int64_t us) { g_ctx.p2p_timeout_us = us; },
         py::arg("us"), "Set the default P2P transfer timeout (microseconds).");
+    m.def(
+        "set_fault_reconciliation_window_us",
+        [](int64_t us) { g_ctx.fault_reconciliation_window_us = us; },
+        py::arg("us"),
+        "Set the coordinator fault reconciliation window (microseconds).");
     m.def("set_device_filter", [](std::vector<std::string> filters) {
         if (g_ctx.engine) g_ctx.engine->setWhitelistFilters(std::move(filters));
     });
@@ -239,7 +291,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deactivate_rank", &deactivateRank, py::arg("backend"),
           py::arg("ranks"));
     m.def("join_group", &joinGroup);
-    m.def("get_failed_ranks", &getFailedRanks, py::arg("work"));
+    m.def("get_failed_ranks_hint", &getFailedRanksHint, py::arg("work"));
+    m.def("get_local_success", &getLocalSuccess, py::arg("work"),
+          "Return True iff all locally-attempted peers succeeded in this "
+          "operation.");
+    m.def("get_current_epoch", &getCurrentEpoch, py::arg("backend"),
+          "Get the current GroupView epoch (monotonically increasing on "
+          "membership changes).");
+
+    m.def(
+        "sync_after_failure",
+        [](c10::intrusive_ptr<c10d::ProcessGroup> backend) {
+            auto mooncakeBackend =
+                c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+            SyncAfterFailureResponse resp = mooncakeBackend->syncAfterFailure();
+            py::dict result;
+            result["status"] = static_cast<uint8_t>(resp.status);
+            result["new_epoch"] = resp.new_epoch;
+            result["reject_reason"] = resp.reject_reason;
+            return result;
+        },
+        py::arg("backend"),
+        "Notify the Coordinator of a detected failure and block until a "
+        "membership decision has been made and the Agent has locally applied "
+        "the resulting ViewUpdate.  After this returns, get_peer_state() "
+        "reflects the Coordinator's authoritative decision.  Returns a dict "
+        "with keys: status (0=decision_applied, 1=no_change, 2=rejected), "
+        "new_epoch, reject_reason.");
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
@@ -248,9 +326,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
              py::arg("is_extension"))
         .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
-             py::arg("is_extension"), py::arg("max_world_size"))
+             py::arg("is_extension"), py::arg("max_group_size"))
         .def(py::init<at::Tensor, bool, int, bool>(), py::arg("active_ranks"),
-             py::arg("is_extension"), py::arg("max_world_size"),
+             py::arg("is_extension"), py::arg("max_group_size"),
              py::arg("auto_deactivate_on_failure"));
 }
 

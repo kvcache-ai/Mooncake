@@ -389,14 +389,75 @@ def wait_until(
     raise TimeoutError(f"timed out waiting for {description}")
 
 
-def wait_for_spawn_context(ctx, timeout_s: float) -> None:
-    """Wait for spawn context with timeout; force kill if hung."""
+def _describe_signal(signum: int) -> str:
+    """Return a human-readable description for a signal number."""
+    names = {
+        signal.SIGSEGV: "SIGSEGV (segmentation fault)",
+        signal.SIGABRT: "SIGABRT (abort)",
+        signal.SIGBUS: "SIGBUS (bus error)",
+        signal.SIGFPE: "SIGFPE (floating-point exception)",
+        signal.SIGILL: "SIGILL (illegal instruction)",
+        signal.SIGTERM: "SIGTERM (terminated)",
+        signal.SIGKILL: "SIGKILL (killed)",
+        signal.SIGQUIT: "SIGQUIT (quit)",
+    }
+    return names.get(signum, f"signal {signum}")
+
+
+def _capture_signal_deaths(ctx, result_map) -> None:
+    """Inspect process exit codes and record any signal-killed processes.
+
+    A negative exit code N means the process was killed by signal -N.
+    We only record a signal death when the worker did NOT already report
+    a result — otherwise we would overwrite a more specific error (e.g., an
+    AssertionError from a survivor) that happened before the crash.
+    """
+    for rank_idx, process in enumerate(ctx.processes):
+        # ProcessContext in torch.multiprocessing.spawn wraps a
+        # multiprocessing.Process.  The exitcode attribute name varies
+        # across PyTorch versions; try the public attribute first, then
+        # fall back to the internal _process.exitcode.
+        exitcode = getattr(process, "exitcode", None)
+        if exitcode is None:
+            wrapped = getattr(process, "_process", None)
+            if wrapped is not None:
+                exitcode = getattr(wrapped, "exitcode", None)
+
+        if exitcode is not None and exitcode < 0:
+            # Only fill in missing results; don't overwrite existing ones
+            if rank_idx in result_map:
+                continue
+            signum = -exitcode
+            description = _describe_signal(signum)
+            record_rank_error(
+                result_map,
+                rank_idx,
+                RuntimeError(
+                    f"Rank {rank_idx} was killed by {description}. "
+                    f"This usually indicates a native crash (segfault, abort, etc.). "
+                    f"Check core dumps (ulimit -c) or run under a debugger."
+                ),
+            )
+
+
+def wait_for_spawn_context(
+    ctx,
+    timeout_s: float,
+    result_map=None,
+) -> None:
+    """Wait for spawn context with timeout; force kill if hung.
+
+    When *result_map* is provided, process exit codes are inspected and
+    any signal-killed ranks are recorded in the map before returning.
+    """
     deadline = time.monotonic() + timeout_s
 
     # Phase 1: Normal wait
     while time.monotonic() < deadline:
         if not any(p.is_alive() for p in ctx.processes):
             # All processes exited (success or failure)
+            if result_map is not None:
+                _capture_signal_deaths(ctx, result_map)
             return
         time.sleep(0.1)
 
@@ -429,6 +490,9 @@ def wait_for_spawn_context(ctx, timeout_s: float) -> None:
         if not any(p.is_alive() for p in ctx.processes):
             break
         time.sleep(0.1)
+
+    if result_map is not None:
+        _capture_signal_deaths(ctx, result_map)
 
     raise AssertionError(f"Spawn timed out after {timeout_s} seconds")
 
@@ -478,7 +542,7 @@ def spawn_and_collect(
                     nprocs=actual_nprocs,
                     join=False,
                 )
-                wait_for_spawn_context(ctx, timeout_s)
+                wait_for_spawn_context(ctx, timeout_s, result_map=result_map)
 
         return collect_rank_results(result_map, actual_nprocs)
 
@@ -515,6 +579,78 @@ class MultiProcessTestCase(unittest.TestCase):
                     f"rank {row.get('rank', '?')} failed with "
                     f"{row.get('error_type', 'UnknownError')}: {row.get('error', '')}"
                 )
+
+    def assert_no_errors(
+        self,
+        rows: list[dict],
+        *,
+        allow_missing: set[int] | None = None,
+        allow_error_types: set[str] | None = None,
+    ) -> None:
+        """Fail with a detailed report if any rank reported an error or died.
+
+        Unlike assert_all_ok which fails on the first error, this collects ALL
+        errors across ALL ranks and reports them together so you can see the
+        full failure picture (crashes, assertion failures, timeouts) at once.
+
+        *allow_missing*: set of rank indices whose absence is expected
+        (e.g. ``{1}`` for intentionally-killed rank 1).  These ranks are
+        allowed to be missing from the result set without triggering a failure.
+
+        *allow_error_types*: set of error type names (e.g. ``{"MissingResult"}``)
+        that should not trigger a failure.  Use sparingly — prefer fixing the
+        root cause.
+        """
+        failures: list[str] = []
+        allowed_ranks = allow_missing or set()
+        allowed_types = allow_error_types or set()
+
+        for row in rows:
+            rank = row.get("rank", "?")
+            ok = row.get("ok", False)
+
+            if ok:
+                continue  # healthy rank
+
+            error_type = row.get("error_type", "UnknownError")
+            error_msg = row.get("error", "")
+
+            # Allow intentional missing ranks
+            if isinstance(rank, int) and rank in allowed_ranks:
+                continue
+            if error_type in allowed_types:
+                continue
+
+            failures.append(
+                f"  rank {rank}: {error_type}"
+                + (f" — {error_msg}" if error_msg else "")
+            )
+
+        if not failures:
+            return  # all clean
+
+        # Build a summary that includes the healthy ranks for context
+        healthy = [r for r in rows if r.get("ok", False)]
+        healthy_ranks = sorted(r.get("rank", "?") for r in healthy)
+        failed_ranks = sorted(
+            r.get("rank", "?")
+            for r in rows
+            if not r.get("ok", False)
+            and (not isinstance(r.get("rank"), int) or r.get("rank") not in allowed_ranks)
+            and r.get("error_type", "UnknownError") not in allowed_types
+        )
+
+        report = [
+            f"\n{'='*60}",
+            f"RANK ERROR REPORT ({len(failures)} failure(s))",
+            f"{'='*60}",
+            f"Healthy ranks: {healthy_ranks or '(none)'}",
+            f"Failed ranks: {failed_ranks or '(none)'}",
+            f"{'-'*60}",
+            "Failures:",
+        ] + failures + [f"{'='*60}"]
+
+        self.fail("\n".join(report))
 
 
 class BackendMultiProcessTestCase(MultiProcessTestCase):
@@ -600,7 +736,7 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
                     nprocs=actual_nprocs,
                     join=False,
                 )
-                wait_for_spawn_context(ctx, resolved_timeout)
+                wait_for_spawn_context(ctx, resolved_timeout, result_map=result_map)
 
             return collect_rank_results(result_map, actual_nprocs)
 

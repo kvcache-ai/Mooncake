@@ -1,10 +1,11 @@
 #ifndef MOONCAKE_PG_AGENT_H
 #define MOONCAKE_PG_AGENT_H
 
-#include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include "rpc.h"
 
@@ -15,92 +16,90 @@ class AgentStateMachine {
    public:
     AgentStateMachine(GlobalRank rank, int max_world_size);
 
-    void registerGroup(const GroupDeclaration& declaration);
+    void registerGroup(const GroupView& group, bool auto_deactivate);
     void unregisterGroup(GroupId group_id);
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);
     AgentApplyResult handleViewUpdate(const ViewUpdatePush& push);
-    AgentApplyResult applyGroupView(GroupId group_id, const GroupView& view);
-    AgentApplyResult handleLinkStateChanged(GlobalRank peer, bool connected);
+    AgentApplyResult handleLinkStateChange(GlobalRank peer, bool connected);
 
     HeartbeatRequest buildHeartbeat() const;
 
-    AgentApplyResult applyRegisterResponse(const RegisterResponse& resp);
+    AgentApplyResult applyRegisterAgentResponse(
+        const RegisterAgentResponse& resp);
     AgentApplyResult prepareCleanSlateRegister();
-    AgentApplyResult markOffline();
 
     void setAgentSessionEpoch(uint64_t epoch) {
         agent_session_epoch_.store(epoch, std::memory_order_release);
     }
 
-    AgentApplyResult processTransferObservation(
+    std::optional<TransferObservationReport> processTransferObservation(
         const TransferObservationEvent& event);
 
-    GroupView getGroupView(GroupId group_id) const;
-    const GroupDescriptor* getGroupDescriptor(GroupId group_id) const;
+    // Merge `next` into `acc` for peers where next.attempted_ranks is set.
+    // Later observations override earlier ones for the same peer.
+    void mergeObservationEvent(TransferObservationEvent& acc,
+                               const TransferObservationEvent& next);
 
-    enum class CoordinatorConnection { Connected, Registering, Disconnected };
+    GroupView getGroupView(GroupId group_id) const;
+
+    enum class CoordinatorConnection {
+        Connected,
+        AgentRegistering,
+        Disconnected
+    };
     CoordinatorConnection getCoordinatorConnection() const {
         return coordinator_connection_;
     }
-    void setCoordinatorConnected() {
-        coordinator_connection_ = CoordinatorConnection::Connected;
-    }
-    void setCoordinatorRegistering() {
-        coordinator_connection_ = CoordinatorConnection::Registering;
-    }
-    void setCoordinatorDisconnected() {
-        coordinator_connection_ = CoordinatorConnection::Disconnected;
+    void setCoordinatorConnection(CoordinatorConnection state) {
+        coordinator_connection_ = state;
     }
 
     uint64_t getAgentSessionEpoch() const {
         return agent_session_epoch_.load(std::memory_order_acquire);
     }
 
+    // Thread-safe: may be called from any thread.
+    RankState getRankState(GlobalRank rank) const {
+        return static_cast<RankState>(
+            global_rank_states_[rank].load(std::memory_order_acquire));
+    }
+
+    // Thread-safe: rank is active in the given group per the Coordinator view.
+    bool isRankActive(GroupId group_id, InGroupRank rank) const;
+
+    // Best-effort local estimate: Healthy && isMember && hasEndpoint.
+    bool maybeActivatable(GroupId group_id, InGroupRank rank) const;
+
    private:
     GlobalRank rank_;
     int max_world_size_;
 
-    RankState rank_state_ = RankState::OFFLINE;
-    // Monotonically incremented on (re-)registration.  Written only from
-    // the executor thread; read from caller threads (proposeActivate / etc.)
-    // via the atomic accessors above.
+    RankState rank_state_ = RankState::Offline;
     std::atomic<uint64_t> agent_session_epoch_{0};
 
-    struct GroupEntry {
-        GroupDescriptor descriptor;
-        GroupView view;
-        bool auto_deactivate = true;
-    };
-    std::unordered_map<GroupId, GroupEntry> groups_;
+    std::unordered_map<GroupId, GroupView> groups_;
 
-    std::array<RankState, kMaxNumRanks> global_rank_states_{};
+    std::vector<std::atomic<uint8_t>> global_rank_states_;
+    std::vector<bool> link_connected_;
+    std::vector<bool> last_reported_peer_status_;
+    std::vector<std::optional<RankConnectionMetadata>> rank_connections_;
 
-    // Physical link state from LinkManager events (LinkUp/LinkDown).
-    std::array<bool, kMaxNumRanks> link_connected_{};
+    std::unordered_map<GroupId, std::vector<std::atomic<bool>>>
+        maybe_activatable_;
 
-    // Last peer reachability status reported to the Coordinator.
-    // Updated by processTransferObservation when a transfer observation
-    // differs from the last reported value (both success and failure
-    // transitions trigger an immediate reportTransferObservation RPC).
-    std::array<bool, kMaxNumRanks> last_reported_peer_status_{};
-
-    // Snapshot of Coordinator-authoritative rank states, published to
-    // LinkManager for worker-facing isRankReady() queries.
-    std::array<uint8_t, kMaxNumRanks> rank_state_snapshot_{};
-
-    std::array<std::optional<RankConnectionMetadata>, kMaxNumRanks>
-        rank_connections_;
+    std::unordered_map<GroupId, std::vector<std::atomic<bool>>> group_active_;
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;
 
     bool rankInRange(GlobalRank rank) const {
-        return rank >= 0 && rank < max_world_size_;
+        return 0 <= rank && rank < max_world_size_;
     }
 
-    void syncRankStateSnapshot(AgentApplyResult& effects);
+    void updateMaybeActivatable(GroupId group_id, InGroupRank rank);
+    void updateActive(GroupId group_id, InGroupRank rank);
 };
 
 }  // namespace mooncake

@@ -1,10 +1,12 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <array>
 #include <vector>
 #include <mooncake_worker.cuh>
 #include <work_handles.h>
@@ -17,21 +19,16 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
-#include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
 #include "control_plane/link_manager.h"
 
 namespace mooncake {
 
-// =========================================================================
-// MooncakeProcessContext — process-level container.
-//
-// Owned by pg_py.cpp (file-scope static).  Config fields can be set by Python
-// setters BEFORE the first backend is created.  engine is eagerly allocated
-// so that set_device_filter works pre-init.  engine->init() and agent_host
-// are lazily initialised on the first createMooncakeBackend() call.
-// =========================================================================
+class AgentInterface;
+class AgentHost;
 
+// MooncakeProcessContext -- process-level container.
+// Owned by pg_py.cpp (file-scope static).
 struct MooncakeProcessContext {
     // === Configuration (Python setters may modify before first backend) ===
     TransferEngine* external_engine = nullptr;
@@ -39,6 +36,7 @@ struct MooncakeProcessContext {
     size_t collective_timeout_us =
         100000;                        // 100 ms (kDefaultCollectiveTimeoutUs)
     int64_t p2p_timeout_us = 3000000;  // 3 s (kDefaultP2PTimeoutUs)
+    int64_t fault_reconciliation_window_us = 50000;  // 50 ms
 
     // === Runtime ===
     // Eagerly created so set_device_filter works before init_process_group.
@@ -47,7 +45,7 @@ struct MooncakeProcessContext {
         std::make_unique<TransferEngine>(true);
     TransferEngine* engine = owned_engine.get();
     bool engine_initialized = false;
-    int next_group_id = 0;
+    int max_world_size = 0;
 
     // === Process-level subsystems (no more singletons) ===
     LinkManager link_manager;
@@ -60,7 +58,8 @@ struct MooncakeProcessContext {
 
     std::unique_ptr<AgentHost> agent_host;
 
-    MooncakeProcessContext() = default;
+    MooncakeProcessContext();
+    ~MooncakeProcessContext();
 
     // Non-copyable, non-movable: engine pointer points to either owned_engine
     // or external_engine, and would dangle after a move.
@@ -119,15 +118,15 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
             : activeRanks_{activeRanks}, isExtension_{isExtension} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
-                               int maxWorldSize)
+                               int maxGroupSize)
             : activeRanks_{activeRanks},
               isExtension_{isExtension},
-              maxWorldSize_{maxWorldSize} {}
+              maxGroupSize_{maxGroupSize} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
-                               int maxWorldSize, bool autoDeactivateOnFailure)
+                               int maxGroupSize, bool autoDeactivateOnFailure)
             : activeRanks_{activeRanks},
               isExtension_{isExtension},
-              maxWorldSize_{maxWorldSize},
+              maxGroupSize_{maxGroupSize},
               autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
 
         ~MooncakeBackendOptions() override = default;
@@ -137,7 +136,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // Optional upper bound for connection polling / reserved rank slots.
         // When > 0, the backend may pre-size internal rank metadata to this
         // value (while PyTorch's group_size() remains unchanged).
-        int maxWorldSize_ = -1;
+        int maxGroupSize_ = -1;
 
         // Controls whether PG automatically deactivates failed ranks on
         // timeout or operation failure.
@@ -147,10 +146,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // When set to false, PG only reports failures through per-operation
         // failedRanks, while leaving the active rank unchanged so that the
         // caller can decide whether and how to handle the failure.
-        //
-        // Note that the upper layer is responsible for maintaining active rank
-        // consistency. Any automatic deactivation in PG is local to the current
-        // rank only; no cross-rank synchronization is performed implicitly.
         bool autoDeactivateOnFailure_ = true;
     };
 
@@ -175,7 +170,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
+    int getSize() const override { return meta_ ? meta_->size : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -264,7 +259,11 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
-    int getNumSyncedRanks() { return meta_ ? meta_->activeSize : 0; }
+    int getNumSyncedRanks() {
+        if (!meta_ || !meta_->activeRanks) return 0;
+        return std::count(meta_->activeRanks, meta_->activeRanks + meta_->size,
+                          true);
+    }
 
     void extendGroupSizeTo(int size);
 
@@ -273,39 +272,44 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void recoverRanks(const std::vector<int>& ranks);
 
     // alias to recoverRanks
-    ProposeViewUpdateResponse activateRank(const std::vector<int>& ranks);
+    ProposeViewUpdateResponse activateRanks(const std::vector<int>& ranks);
 
-    ProposeViewUpdateResponse deactivateRank(const std::vector<int>& ranks);
+    ProposeViewUpdateResponse deactivateRanks(const std::vector<int>& ranks);
 
     void joinGroup();
-
-    // ---- New methods for Agent/Host integration ----
 
     // Atomically update the worker-visible group view (descriptor + members).
     // Called by AgentHost from the executor thread when a ViewUpdatePush
     // is received from the Coordinator.
-    void applyViewChange(const GroupDescriptor& descriptor,
-                         const GroupView& view);
+    void applyViewUpdate(const GroupView& view);
 
-    // Called by AgentHost when a TE link to `peer` goes down.
+    /// Returns the current GroupView epoch (monotonically increasing).
+    /// Safe to call from any thread. Epoch starts at 0 (bootstrap) and
+    /// increments on membership changes, auto-deactivation, and recovery.
+    uint64_t getCurrentEpoch() const {
+        return meta_ ? meta_->epoch.load(std::memory_order_acquire) : 0;
+    }
+
+    // Called by AgentHost when a TE link to `peer` (InGroupRank) goes down.
     // Resets the per-backend P2PProxy state for the affected peer.
-    void onPeerLinkReset(GlobalRank peer);
+    void onPeerLinkReset(InGroupRank peer);
 
-    // Mark this backend's view as stale (called when Agent goes OFFLINE).
-    void markViewStale();
+    /// Sync-after-failure: notify the Coordinator of a detected failure and
+    /// block until a membership decision has been made and the Agent has
+    /// ACKed the resulting ViewUpdate.
+    SyncAfterFailureResponse syncAfterFailure();
 
     // Sync the activeRanksTensor on CPU/GPU from the current GroupView.
     void syncActiveRanksTensor();
 
-    // Free meta_->activeRanks and reset device pointers.
-    void destroyMeta();
-
-    // Build a GroupEndpointMetadata for this backend's current local endpoint.
-    // Called by AgentHost after (re-)registration to re-publish endpoints.
     GroupEndpointPublication buildEndpointMetadata() const;
 
+    // Guard: checks that the rank is Healthy (always) and, for collectives,
+    // that it is active in this group.  Called at the top of every operation.
+    void prepareOp(c10d::OpType op) const;
+
     const GroupEndpointInfo& getLocalEndpointInfo() const {
-        return meta_->segmentInfos[meta_->globalRank];
+        return meta_->segmentInfos[meta_->rank];
     }
     AgentInterface& getAgent() { return agent_; }
     MooncakeProcessContext& getProcessContext() { return ctx_; }
@@ -325,7 +329,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     bool isShutdown_{false};
     int max_group_size_ =
         0;  // per-group capacity (max active members for this group)
-    std::string localServerName_;
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than

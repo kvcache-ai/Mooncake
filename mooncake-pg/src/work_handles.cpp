@@ -7,25 +7,56 @@
 
 namespace mooncake {
 
-FailedRanks FailedRanks::allocate(int n, bool isCpu) {
+FailedRanksHint FailedRanksHint::allocate(int n, bool isCpu) {
     if (isCpu) {
-        return {torch::zeros({n}, torch::kInt32), nullptr};
+        return {torch::zeros({n}, torch::kInt32), nullptr,
+                torch::zeros({n}, torch::kInt32), nullptr};
     }
-    int* host_ptr = nullptr;
-    int* dev_ptr = nullptr;
-    cudaError_t err =
-        cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
-    TORCH_CHECK(err == cudaSuccess,
-                "cudaHostAlloc failed: ", cudaGetErrorString(err));
-    err = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_ptr), host_ptr,
-                                   0);
-    TORCH_CHECK(err == cudaSuccess,
-                "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
-    std::memset(host_ptr, 0, n * sizeof(int));
-    auto deleter = [](void* ptr) { cudaFreeHost(ptr); };
-    auto t = torch::from_blob(host_ptr, {n}, deleter,
-                              torch::TensorOptions().dtype(torch::kInt32));
-    return {t, dev_ptr};
+    auto alloc_mapped = [n](at::Tensor& tensor, int*& host_ptr, int*& dev_ptr) {
+        cudaError_t err =
+            cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaHostAlloc failed: ", cudaGetErrorString(err));
+        err = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_ptr),
+                                       host_ptr, 0);
+        TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ",
+                    cudaGetErrorString(err));
+        std::memset(host_ptr, 0, n * sizeof(int));
+        auto deleter = [](void* ptr) { cudaFreeHost(ptr); };
+        tensor = torch::from_blob(host_ptr, {n}, deleter,
+                                  torch::TensorOptions().dtype(torch::kInt32));
+    };
+
+    at::Tensor failed_tensor;
+    int* failed_host = nullptr;
+    int* failed_dev = nullptr;
+    alloc_mapped(failed_tensor, failed_host, failed_dev);
+
+    at::Tensor attempted_tensor;
+    int* attempted_host = nullptr;
+    int* attempted_dev = nullptr;
+    alloc_mapped(attempted_tensor, attempted_host, attempted_dev);
+
+    return {failed_tensor, failed_dev, attempted_tensor, attempted_dev};
+}
+
+bool MooncakeWorkCpu::wait(std::chrono::milliseconds timeout) {
+    future_->wait();
+    bool ok = future_->completed() && !future_->hasError();
+    if (ok) {
+        bool all_ok = true;
+        int* data = failedRanksHint_.data();
+        for (int i = 0; i < meta_->size; ++i) {
+            if (data[i] != 0) {
+                all_ok = false;
+                break;
+            }
+        }
+        failedRanksHint_.local_success = all_ok;
+    } else {
+        failedRanksHint_.local_success = false;
+    }
+    return ok;
 }
 
 bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
@@ -102,6 +133,18 @@ bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
     //    is completed (but will not block the CPU)."
     auto current_stream = at::cuda::getCurrentCUDAStream();
     event_->block(current_stream);
+
+    // Compute local_success: true iff no peer failed in this operation.
+    bool all_ok = true;
+    int* data = failedRanksHint_.data();
+    for (int i = 0; i < meta_->size; ++i) {
+        if (data[i] != 0) {
+            all_ok = false;
+            break;
+        }
+    }
+    failedRanksHint_.local_success = all_ok;
+
     return true;
 }
 
@@ -128,14 +171,18 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
     return waiter.wait_for(timeout, [this] { return event_->query(); });
 }
 
-at::Tensor MooncakeWorkCuda::getFailedRanks() const {
-    // Ensure the worker thread has completed the task and set failedRanksHost
-    // before returning the tensor.
+at::Tensor MooncakeWorkCuda::getFailedRanksHint() const {
+    // Ensure the worker thread has completed the task and set
+    // failedRanksHintHost before returning the tensor.
     if (event_ && at::cuda::currentStreamCaptureStatus() ==
                       c10::cuda::CaptureStatus::None) {
         event_->synchronize();
     }
-    return failedRanks_.tensor;
+    return failedRanksHint_.tensor;
+}
+
+bool MooncakeWorkCuda::getLocalSuccess() const {
+    return failedRanksHint_.local_success;
 }
 
 bool MooncakeP2PWork::isCompleted() {

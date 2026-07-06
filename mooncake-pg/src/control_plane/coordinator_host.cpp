@@ -1,5 +1,6 @@
 #include "control_plane/coordinator_host.h"
 
+#include <chrono>
 #include <glog/logging.h>
 
 #include "control_plane/rpc.h"
@@ -8,11 +9,9 @@
 
 namespace mooncake {
 
-// CoordinatorRpcServiceImpl
-
 void CoordinatorRpcServiceImpl::registerAgent(
-    coro_rpc::context<RegisterResponse> ctx, RegisterRequest req) {
-    host_.postRegister(std::move(ctx), std::move(req));
+    coro_rpc::context<RegisterAgentResponse> ctx, RegisterAgentRequest req) {
+    host_.postRegisterAgent(std::move(ctx), std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::heartbeat(
@@ -20,9 +19,13 @@ void CoordinatorRpcServiceImpl::heartbeat(
     host_.postHeartbeat(std::move(ctx), std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::declareGroup(
-    coro_rpc::context<DeclareGroupResponse> ctx, DeclareGroupRequest req) {
-    host_.postDeclareGroup(std::move(ctx), std::move(req));
+void CoordinatorRpcServiceImpl::registerGroup(
+    coro_rpc::context<RegisterGroupResponse> ctx, RegisterGroupRequest req) {
+    host_.postRegisterGroup(std::move(ctx), std::move(req));
+}
+
+void CoordinatorRpcServiceImpl::unregisterGroup(UnregisterGroupRequest req) {
+    host_.postUnregisterGroup(std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::proposeViewUpdate(
@@ -30,11 +33,15 @@ void CoordinatorRpcServiceImpl::proposeViewUpdate(
     ProposeViewUpdateRequest req) {
     host_.postProposeViewUpdate(std::move(ctx), std::move(req));
 }
-
 void CoordinatorRpcServiceImpl::publishEndpoint(
     coro_rpc::context<PublishEndpointResponse> ctx,
     PublishEndpointRequest req) {
     host_.postPublishEndpoint(std::move(ctx), std::move(req));
+}
+
+void CoordinatorRpcServiceImpl::reportLinkStateChange(
+    LinkStateChangeReport req) {
+    host_.postLinkStateChange(std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::reportTransferObservation(
@@ -42,40 +49,47 @@ void CoordinatorRpcServiceImpl::reportTransferObservation(
     host_.postTransferObservation(std::move(req));
 }
 
-// CoordinatorHost
+void CoordinatorRpcServiceImpl::syncAfterFailure(
+    coro_rpc::context<SyncAfterFailureResponse> ctx,
+    SyncAfterFailureRequest req) {
+    host_.postSyncAfterFailure(std::move(ctx), std::move(req));
+}
 
 CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
-                                 const std::string& host_ip, int max_world_size)
-    : state_machine_(max_world_size),
+                                 const std::string& host_ip, int max_world_size,
+                                 int64_t fault_reconciliation_window_us)
+    : state_machine_(max_world_size,
+                     std::chrono::microseconds(fault_reconciliation_window_us)),
       executor_("CoordinatorHost"),
       store_(std::move(store)),
       host_ip_(host_ip),
       max_world_size_(max_world_size),
       rpc_client_(std::make_unique<RpcClient>()) {}
 
-CoordinatorHost::~CoordinatorHost() { shutdown(); }
+CoordinatorHost::~CoordinatorHost() {}
 
 void CoordinatorHost::start() {
-    // Start RPC server.
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
-    rpc_server_->registerHandler<
-        &CoordinatorRpcService::registerAgent,
-        &CoordinatorRpcService::heartbeat, &CoordinatorRpcService::declareGroup,
-        &CoordinatorRpcService::proposeViewUpdate,
-        &CoordinatorRpcService::publishEndpoint,
-        &CoordinatorRpcService::reportTransferObservation>(rpc_impl_.get());
+    rpc_server_
+        ->registerHandler<&CoordinatorRpcService::registerAgent,
+                          &CoordinatorRpcService::heartbeat,
+                          &CoordinatorRpcService::registerGroup,
+                          &CoordinatorRpcService::unregisterGroup,
+                          &CoordinatorRpcService::proposeViewUpdate,
+                          &CoordinatorRpcService::publishEndpoint,
+                          &CoordinatorRpcService::reportLinkStateChange,
+                          &CoordinatorRpcService::reportTransferObservation,
+                          &CoordinatorRpcService::syncAfterFailure>(
+            rpc_impl_.get());
 
     rpc_server_->start();
 
-    // Write Coordinator address to Store for Agent discovery.
     std::string addr = rpc_server_->getListenAddr(host_ip_);
     store_->set("coordinator_addr", addr);
-    LOG(INFO) << "CoordinatorHost: published address " << addr;
 
-    // Set up periodic tick.
     executor_.setTickCallback([this]() {
-        auto result = state_machine_.checkTimeouts();
+        auto result = state_machine_.tick();
         runEffects(result.effects);
     });
 
@@ -83,30 +97,28 @@ void CoordinatorHost::start() {
 }
 
 void CoordinatorHost::shutdown() {
-    // 1. Stop RPC server  - no new requests accepted.
     if (rpc_server_) rpc_server_->shutdown();
-    // 2. Drain the executor  - all posted tasks complete.
     executor_.shutdown();
-    // 3. Fail any pending 2PC proposals so clients don't hang.
     for (auto& [propose_id, ctx] : pending_rpcs_) {
         ctx.response_msg(ProposeViewUpdateResponse{
             ViewUpdateStatus::Rejected, 0, {}, "coordinator shutting down"});
     }
     pending_rpcs_.clear();
+
+    for (auto& [sync_id, ctx] : pending_sync_ctxs_) {
+        ctx.response_msg(SyncAfterFailureResponse{
+            SyncAfterFailureStatus::Rejected, 0, "coordinator shutting down"});
+    }
+    pending_sync_ctxs_.clear();
 }
 
-void CoordinatorHost::postRegister(coro_rpc::context<RegisterResponse> ctx,
-                                   RegisterRequest req) {
-    LOG(INFO) << "CoordinatorHost: postRegister rank=" << req.rank
-              << " addr=" << req.agent_addr;
+void CoordinatorHost::postRegisterAgent(
+    coro_rpc::context<RegisterAgentResponse> ctx, RegisterAgentRequest req) {
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
-            LOG(INFO) << "CoordinatorHost: handling register rank=" << req.rank;
-            auto result = state_machine_.handleRegister(req);
-            LOG(INFO) << "CoordinatorHost: register rank=" << req.rank
-                      << " success=" << result.response.success;
-            ctx.response_msg(std::move(result.response));
-            runEffects(result.effects);
+            auto r = state_machine_.handleRegisterAgent(req);
+            runEffects(r.effects);
+            ctx.response_msg(std::move(r.response));
         });
 }
 
@@ -120,14 +132,21 @@ void CoordinatorHost::postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
         });
 }
 
-void CoordinatorHost::postDeclareGroup(
-    coro_rpc::context<DeclareGroupResponse> ctx, DeclareGroupRequest req) {
+void CoordinatorHost::postRegisterGroup(
+    coro_rpc::context<RegisterGroupResponse> ctx, RegisterGroupRequest req) {
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
-            auto result = state_machine_.handleDeclareGroup(req);
+            auto result = state_machine_.handleRegisterGroup(req);
             ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
         });
+}
+
+void CoordinatorHost::postUnregisterGroup(UnregisterGroupRequest req) {
+    executor_.post([this, req = std::move(req)]() {
+        auto result = state_machine_.handleUnregisterGroup(req);
+        runEffects(result.effects);
+    });
 }
 
 void CoordinatorHost::postProposeViewUpdate(
@@ -142,34 +161,12 @@ void CoordinatorHost::postProposeViewUpdate(
     });
 }
 
-void CoordinatorHost::postProposalAck(uint64_t propose_id, GlobalRank rank,
-                                      uint64_t epoch, bool applied) {
-    executor_.post([this, propose_id, rank, epoch, applied]() {
-        auto result =
-            state_machine_.handleProposalAck(propose_id, rank, epoch, applied);
-        runEffects(result.effects);
-    });
-}
-
-void CoordinatorHost::postBootstrapAck(GroupId group_id, GlobalRank rank,
-                                       uint64_t epoch) {
-    executor_.post([this, group_id, rank, epoch]() {
-        auto result = state_machine_.handleBootstrapAck(group_id, rank, epoch);
-        runEffects(result.effects);
-    });
-}
-
 void CoordinatorHost::postPublishEndpoint(
     coro_rpc::context<PublishEndpointResponse> ctx,
     PublishEndpointRequest req) {
-    LOG(INFO) << "CoordinatorHost: postPublishEndpoint rank=" << req.rank
-              << " epoch=" << req.agent_session_epoch
-              << " num_endpoints=" << req.endpoints.size();
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
             auto result = state_machine_.handlePublishEndpoint(req);
-            LOG(INFO) << "CoordinatorHost: publishEndpoint rank=" << req.rank
-                      << " success=" << result.response.success;
             ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
         });
@@ -182,36 +179,68 @@ void CoordinatorHost::postTransferObservation(TransferObservationReport req) {
     });
 }
 
+void CoordinatorHost::postLinkStateChange(LinkStateChangeReport req) {
+    executor_.post([this, req = std::move(req)]() {
+        auto result = state_machine_.handleLinkStateChange(req);
+        runEffects(result.effects);
+    });
+}
+
+void CoordinatorHost::postSyncAfterFailure(
+    coro_rpc::context<SyncAfterFailureResponse> ctx,
+    SyncAfterFailureRequest req) {
+    executor_.post(
+        [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
+            uint64_t sync_id = next_sync_id_++;
+            pending_sync_ctxs_.emplace(sync_id, std::move(ctx));
+            auto result = state_machine_.handleSyncAfterFailure(sync_id, req);
+            runEffects(result.effects);
+        });
+}
+
+void CoordinatorHost::postViewUpdateAck(GroupId group_id, GlobalRank rank,
+                                        uint64_t epoch, bool applied) {
+    executor_.post([this, group_id, rank, epoch, applied]() {
+        auto result =
+            state_machine_.handleViewUpdateAck(group_id, rank, epoch, applied);
+        runEffects(result.effects);
+    });
+}
+
 void CoordinatorHost::runEffects(
     const std::vector<CoordinatorEffect>& effects) {
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
-                [this](const PushEffect<RankStateUpdatePush>& e) {
-                    if (e.target.kind == EffectTarget::Kind::BroadcastOnline) {
-                        for (int i = 0; i < max_world_size_; ++i) {
-                            if (state_machine_.getRankState(i) !=
-                                RankState::OFFLINE) {
-                                pushToAgent(i, e.push);
-                            }
+                [this](const RankStateUpdatePush& e) {
+                    for (int i = 0; i < max_world_size_; ++i) {
+                        if (state_machine_.getRankState(i) !=
+                            RankState::Offline) {
+                            pushToAgent<&AgentRpcService::onRankStateUpdate>(i,
+                                                                             e);
                         }
-                    } else {
-                        pushToAgent(e.target.rank, e.push);
                     }
                 },
                 [this](const ViewUpdateEffect& e) { pushViewUpdate(e); },
-                [this](const ReplyViewUpdateEffect& e) {
+                [this](const ReplyProposalEffect& e) {
                     auto it = pending_rpcs_.find(e.propose_id);
                     if (it != pending_rpcs_.end()) {
                         it->second.response_msg(e.response);
                         pending_rpcs_.erase(it);
                     }
                 },
-                [this](const PushEffect<PeerJoinedPush>& e) {
+                [this](const ReplySyncEffect& e) {
+                    auto it = pending_sync_ctxs_.find(e.sync_id);
+                    if (it != pending_sync_ctxs_.end()) {
+                        it->second.response_msg(e.response);
+                        pending_sync_ctxs_.erase(it);
+                    }
+                },
+                [this](const PeerJoinedPush& e) {
                     for (int i = 0; i < max_world_size_; ++i) {
-                        if (i != e.push.rank && state_machine_.getRankState(
-                                                    i) != RankState::OFFLINE) {
-                            pushToAgent(i, e.push);
+                        if (i != e.rank && state_machine_.getRankState(i) !=
+                                               RankState::Offline) {
+                            pushToAgent<&AgentRpcService::onPeerJoined>(i, e);
                         }
                     }
                 },
@@ -220,56 +249,25 @@ void CoordinatorHost::runEffects(
     }
 }
 
-void CoordinatorHost::pushToAgent(GlobalRank rank,
-                                  const RankStateUpdatePush& msg) {
-    const auto& addr = state_machine_.getAgentAddr(rank);
-    if (addr.empty()) return;
-    rpc_client_->send<&AgentRpcService::onRankStateUpdate>(addr, msg);
-}
-
-void CoordinatorHost::pushToAgent(GlobalRank rank, const PeerJoinedPush& msg) {
-    const auto& addr = state_machine_.getAgentAddr(rank);
-    if (addr.empty()) return;
-    rpc_client_->send<&AgentRpcService::onPeerJoined>(addr, msg);
-}
-
 void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
-    ViewUpdatePush push{effect.view.group_id, effect.descriptor, effect.view};
+    ViewUpdatePush push{effect.view.group_id, effect.view};
     auto group_id = effect.view.group_id;
-    auto ack_route = effect.ack_route;  // capture for ACK routing
 
-    for (int i = 0; i < max_world_size_; ++i) {
+    for (int32_t i = 0; i < max_world_size_; ++i) {
+        const auto& member = effect.view.members[i];
+        if (member.status == GroupMemberStatus::None ||
+            member.status == GroupMemberStatus::Left) {
+            continue;
+        }
+
         const auto& addr = state_machine_.getAgentAddr(i);
-        if (state_machine_.getRankState(i) == RankState::OFFLINE ||
+        if (state_machine_.getRankState(i) == RankState::Offline ||
             addr.empty())
             continue;
 
-        // If required_acks is non-empty, only send to required ranks.
-        if (!effect.required_acks.empty()) {
-            bool required = std::find(effect.required_acks.begin(),
-                                      effect.required_acks.end(),
-                                      i) != effect.required_acks.end();
-            if (!required) continue;
-        }
-
-        // Use callAsync (not fire-and-forget send) to capture ACKs from
-        // agents.  Bootstrap ACKs always drive the bootstrap 2PC handler;
-        // proposal ACKs additionally drive the proposal 2PC handler.
         rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
-            addr, push,
-            [this, group_id, ack_route, rank = i](ViewUpdateAck ack) {
-                if (!ack.applied) return;
-                // 1. Drive Bootstrap 2PC (always safe; no-op if not in
-                // BootstrapSyncing).
-                postBootstrapAck(group_id, rank, ack.epoch);
-                // 2. Drive Proposal 2PC (only for proposal-originated pushes).
-                std::visit(overloaded{[](const BootstrapAckRoute&) {},
-                                      [&](const ProposalAckRoute& r) {
-                                          postProposalAck(r.propose_id, rank,
-                                                          ack.epoch,
-                                                          ack.applied);
-                                      }},
-                           ack_route);
+            addr, push, [this, group_id, rank = i](ViewUpdateAck ack) {
+                postViewUpdateAck(group_id, rank, ack.epoch, ack.applied);
             });
     }
 }

@@ -158,10 +158,12 @@ def _p2p_fault_detection_worker(
         w.wait()
     ctx.synchronize()
     for w in works:
-        failed_ranks = pg.get_failed_ranks(w)
+        assert pg.get_local_success(w), \
+            f"rank {ctx.rank} round 1: all P2P ops should succeed locally"
+        failed_ranks_hint = pg.get_failed_ranks_hint(w)
         assert (
-            failed_ranks.cpu().tolist() == [0] * ctx.world_size
-        ), f"rank {ctx.rank} round 1: failed_ranks={failed_ranks.cpu().tolist()}"
+            failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
+        ), f"rank {ctx.rank} round 1: failed_ranks_hint={failed_ranks_hint.cpu().tolist()}"
 
     if ctx.rank == BROKEN_RANK:
         ctx.record_result({"role": "broken"})
@@ -175,16 +177,19 @@ def _p2p_fault_detection_worker(
     for w in works:
         w.wait()
 
-    normal_failed_ranks = [0] * ctx.world_size
-    broken_peer_failed_ranks = [0] * ctx.world_size
-    broken_peer_failed_ranks[BROKEN_RANK] = 1
+    normal_failed_ranks_hint = [0] * ctx.world_size
+    broken_peer_failed_ranks_hint = [0] * ctx.world_size
+    broken_peer_failed_ranks_hint[BROKEN_RANK] = 1
     peers = [p for p in range(ctx.world_size) if p != ctx.rank]
     for w, peer in zip(works, [p for p in peers for _ in range(2)]):
-        failed_ranks = pg.get_failed_ranks(w)
+        failed_ranks_hint = pg.get_failed_ranks_hint(w)
         expected = (
-            broken_peer_failed_ranks if peer == BROKEN_RANK else normal_failed_ranks
+            broken_peer_failed_ranks_hint if peer == BROKEN_RANK else normal_failed_ranks_hint
         )
-        assert failed_ranks.cpu().tolist() == expected
+        assert failed_ranks_hint.cpu().tolist() == expected
+        if peer == BROKEN_RANK:
+            assert not pg.get_local_success(w), \
+                f"rank {ctx.rank} round 2: P2P with broken peer should fail locally"
 
     ctx.record_result({"role": "survivor"})
 
@@ -226,8 +231,10 @@ class _P2PMixin:
             broken_exited,
             world_size=3,
             nprocs=3,
-            timeout_s=60.0,
+            timeout_s=30.0,
         )
+
+        self.assert_no_errors(rows)
 
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         broken_rows = [r for r in rows if r.get("role") == "broken"]

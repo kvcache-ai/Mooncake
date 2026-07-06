@@ -16,7 +16,7 @@ namespace mooncake {
 
 // Agent -> Coordinator RPC messages
 
-struct RegisterRequest {
+struct RegisterAgentRequest {
     GlobalRank rank = kInvalidGlobalRank;
     std::string agent_addr;
     std::string te_server_name;
@@ -25,29 +25,26 @@ struct RegisterRequest {
 };
 
 // Process-level connection metadata for a remote rank.
-// Returned in RegisterResponse so the Agent can feed LinkManager.
+// Returned in RegisterAgentResponse so the Agent can feed LinkManager.
 struct RankConnectionMetadata {
     GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
     std::string agent_addr;
     std::string te_server_name;
     // Warmup region addresses for LinkManager handshake.
     uint64_t warmup_recv_addr = 0;
 };
 
-struct RegisterResponse {
+struct RegisterAgentResponse {
     bool success = false;
-    std::string error_msg;
-    std::vector<uint8_t> all_rank_states;
-    std::vector<GroupDescriptor> group_descriptors;
-    std::vector<GroupView> current_views;
+    std::string reject_reason;
+    std::vector<RankState> all_rank_states;
+    std::vector<GroupView> groups;
     std::vector<RankConnectionMetadata> rank_connections;
 };
 
 struct HeartbeatRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    std::vector<uint8_t> link_status;
 };
 
 struct HeartbeatResponse {
@@ -55,15 +52,14 @@ struct HeartbeatResponse {
     bool require_reregister = false;
 };
 
-struct DeclareGroupRequest {
+struct RegisterGroupRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    GroupDeclaration group;
+    GroupView group;
 };
 
-struct DeclareGroupResponse {
+struct RegisterGroupResponse {
     bool success = false;
-    GroupView current_view;
     std::string reject_reason;
 };
 
@@ -74,16 +70,16 @@ enum class ViewUpdateStatus : uint8_t {
 };
 
 struct ProposeViewUpdateRequest {
-    GroupId group_id = 0;
+    GroupId group_id;
     GlobalRank source_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     std::vector<GlobalRank> requested_ranks;  // ranks to activate/deactivate
-    bool is_activate = false;
+    bool is_activation = false;
 };
 
 struct ProposeViewUpdateResponse {
     ViewUpdateStatus status = ViewUpdateStatus::Rejected;
-    uint64_t new_epoch = kInvalidEpoch;
+    uint64_t new_epoch = 0;
     std::vector<GlobalRank> dropped_ranks;
     std::string reject_reason;
 };
@@ -92,8 +88,7 @@ struct ProposeViewUpdateResponse {
 // agent_session_epoch is NOT included here  - the Host fills it in the
 // enclosing PublishEndpointRequest before sending the RPC.
 struct GroupEndpointPublication {
-    GroupId group_id = 0;
-    uint64_t endpoint_epoch = kInvalidEpoch;
+    GroupId group_id;
     GroupEndpointInfo endpoint_info;
 };
 
@@ -108,13 +103,55 @@ struct PublishEndpointResponse {
     std::string reject_reason;
 };
 
+struct UnregisterGroupRequest {
+    GroupId group_id;
+    GlobalRank rank = kInvalidGlobalRank;
+    uint64_t agent_session_epoch = 0;
+};
+
 struct TransferObservationReport {
-    GroupId group_id = 0;
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     std::vector<uint8_t> attempted_ranks;
-    std::vector<uint8_t> failed_ranks;
+    std::vector<uint8_t> failed_ranks_hint;
     std::vector<uint8_t> succeeded_ranks;
+};
+
+// Agent -> Coordinator: per-peer link state change, triggered by LinkManager
+// LinkUp/LinkDown events.  This is event-driven (not periodic) so it cannot
+// overwrite transfer-observation data with a stale snapshot.
+struct LinkStateChangeReport {
+    GlobalRank reporter_rank = kInvalidGlobalRank;
+    GlobalRank peer = kInvalidGlobalRank;
+    bool is_up = false;
+    uint64_t agent_session_epoch = 0;
+};
+
+// Agent -> Coordinator: sync-after-failure RPC.  The caller has observed a
+// failure and wants the Coordinator to make a membership decision.  The request
+// may piggyback a transfer observation if one was pending locally; otherwise
+// the observation was already sent asynchronously.
+struct SyncAfterFailureRequest {
+    GroupId group_id;
+    GlobalRank reporter_rank = kInvalidGlobalRank;
+    uint64_t agent_session_epoch = 0;
+    uint64_t current_epoch = 0;  // Agent's local GroupView epoch at call time
+
+    // Piggybacked observation.
+    std::optional<TransferObservationReport> observation;
+};
+
+enum class SyncAfterFailureStatus : uint8_t {
+    DecisionApplied =
+        0,         // Decision made and applied (ViewUpdate ACKed by caller)
+    NoChange = 1,  // No pending decision, epoch matches, no window open
+    Rejected = 2,  // Invalid request (stale session, group not found, etc.)
+};
+
+struct SyncAfterFailureResponse {
+    SyncAfterFailureStatus status = SyncAfterFailureStatus::NoChange;
+    uint64_t new_epoch = 0;
+    std::string reject_reason;
 };
 
 // Coordinator -> Agent RPC messages
@@ -131,64 +168,43 @@ struct RankStateUpdatePush {
 };
 
 struct ViewUpdatePush {
-    GroupId group_id = 0;
-    GroupDescriptor descriptor;
+    GroupId group_id;
     GroupView view;
 };
 
 struct ViewUpdateAck {
     GlobalRank rank = kInvalidGlobalRank;
-    GroupId group_id = 0;
-    uint64_t epoch = kInvalidEpoch;
+    GroupId group_id;
+    uint64_t epoch = 0;
     bool applied = false;
     std::string error_msg;
 };
 
-// Effects produced by the Coordinator/Agent state machine
-
-struct EffectTarget {
-    enum class Kind { BroadcastOnline, Unicast } kind = Kind::BroadcastOnline;
-    GlobalRank rank = kInvalidGlobalRank;
-};
-
 // Coordinator effects
 
-template <typename Push>
-struct PushEffect {
-    EffectTarget target;
-    Push push;
-};
-
-// Route for ViewUpdate ACKs.  Bootstrap ACKs always go to the bootstrap 2PC
-// handler; proposal ACKs additionally go to the proposal 2PC handler and carry
-// the propose_id that originated the push.
-struct BootstrapAckRoute {};
-struct ProposalAckRoute {
-    uint64_t propose_id = 0;
-};
-using ViewUpdateAckRoute = std::variant<BootstrapAckRoute, ProposalAckRoute>;
-
+// ViewUpdateEffect tells the Host to push a view update to the group members.
+// Every online member receives the push via callAsync and ACKs back through
+// handleViewUpdateAck.  The State Machine matches ACKs to pending barriers
+// (proposal / bootstrap) and sync-after-failure waiters.
 struct ViewUpdateEffect {
-    GroupDescriptor descriptor;
     GroupView view;
-    std::vector<GlobalRank> required_acks;
-    ViewUpdateAckRoute ack_route = BootstrapAckRoute{};
 };
 
-struct ReplyViewUpdateEffect {
+struct ReplyProposalEffect {
     uint64_t propose_id = 0;
     ProposeViewUpdateResponse response;
 };
 
+struct ReplySyncEffect {
+    uint64_t sync_id = 0;
+    SyncAfterFailureResponse response;
+};
+
 using CoordinatorEffect =
-    std::variant<PushEffect<RankStateUpdatePush>, ViewUpdateEffect,
-                 ReplyViewUpdateEffect, PushEffect<PeerJoinedPush>>;
+    std::variant<RankStateUpdatePush, ViewUpdateEffect, ReplyProposalEffect,
+                 PeerJoinedPush, ReplySyncEffect>;
 
 // Agent effects
-
-struct SendTransferObservation {
-    TransferObservationReport request;
-};
 
 struct EnablePeerProbe {
     GlobalRank rank = kInvalidGlobalRank;
@@ -212,29 +228,33 @@ struct DisconnectAllLinks {};
 
 struct ClearAllPeerMetadata {};
 
-struct PublishRankStateSnapshot {
-    std::vector<uint8_t> states;
-};
-
 struct ApplyViewToBackend {
-    GroupId group_id = 0;
-    GroupDescriptor descriptor;
+    GroupId group_id;
     GroupView view;
-};
-
-struct MarkBackendViewStale {
-    GroupId group_id = 0;
 };
 
 struct NotifyTEUnreachable {
     GlobalRank peer = kInvalidGlobalRank;
 };
 
+struct RefreshPeerLink {
+    GlobalRank peer = kInvalidGlobalRank;
+};
+
+struct NotifyGroupReady {
+    GroupId group_id;
+};
+
+struct NotifyRanksActivated {
+    GroupId group_id;
+    std::vector<GlobalRank> ranks;
+};
+
 using AgentEffect =
-    std::variant<SendTransferObservation, EnablePeerProbe, DisconnectLink,
-                 StopReconnect, ClearPeerMetadata, DisconnectAllLinks,
-                 ClearAllPeerMetadata, PublishRankStateSnapshot,
-                 ApplyViewToBackend, MarkBackendViewStale, NotifyTEUnreachable>;
+    std::variant<EnablePeerProbe, DisconnectLink, StopReconnect,
+                 ClearPeerMetadata, DisconnectAllLinks, ClearAllPeerMetadata,
+                 ApplyViewToBackend, NotifyTEUnreachable, RefreshPeerLink,
+                 NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 
@@ -257,18 +277,23 @@ class CoordinatorRpcService {
    public:
     virtual ~CoordinatorRpcService() = default;
 
-    virtual void registerAgent(coro_rpc::context<RegisterResponse> ctx,
-                               RegisterRequest req) = 0;
+    virtual void registerAgent(coro_rpc::context<RegisterAgentResponse> ctx,
+                               RegisterAgentRequest req) = 0;
     virtual void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                            HeartbeatRequest req) = 0;
-    virtual void declareGroup(coro_rpc::context<DeclareGroupResponse> ctx,
-                              DeclareGroupRequest req) = 0;
+    virtual void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
+                               RegisterGroupRequest req) = 0;
+    virtual void unregisterGroup(UnregisterGroupRequest req) = 0;
     virtual void proposeViewUpdate(
         coro_rpc::context<ProposeViewUpdateResponse> ctx,
         ProposeViewUpdateRequest req) = 0;
     virtual void publishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                                  PublishEndpointRequest req) = 0;
+    virtual void reportLinkStateChange(LinkStateChangeReport req) = 0;
     virtual void reportTransferObservation(TransferObservationReport req) = 0;
+    virtual void syncAfterFailure(
+        coro_rpc::context<SyncAfterFailureResponse> ctx,
+        SyncAfterFailureRequest req) = 0;
 };
 
 class AgentRpcService {

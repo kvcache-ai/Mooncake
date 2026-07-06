@@ -18,12 +18,7 @@ namespace mooncake {
 // Generic single-threaded serialized executor.
 //
 // All tasks posted to this executor are processed sequentially on a single
-// dedicated thread.  The executor itself does no I/O and holds no locks
-// beyond the task queue  - it is purely a concurrency primitive.
-//
-// The optional tick callback fires after every batch of tasks (including
-// empty batches, thanks to the 50 ms wait timeout).  Hosts use this callback
-// for periodic work such as heartbeat timeout detection.
+// dedicated thread.
 //
 // Thread safety:
 //   - post() may be called from any thread.
@@ -31,18 +26,17 @@ namespace mooncake {
 class SerializedExecutor {
    public:
     SerializedExecutor() = default;
-    explicit SerializedExecutor(std::string /*name*/) {}
+    explicit SerializedExecutor(std::string name) : name_(std::move(name)) {}
 
     ~SerializedExecutor() { shutdown(); }
 
-    // Start the executor thread.  Idempotent  - second call is a no-op.
+    // Start the executor thread.
     void start() {
         if (running_.exchange(true, std::memory_order_acq_rel)) return;
         thread_ = std::thread([this] { loop(); });
     }
 
     // Gracefully stop the executor thread.  Blocks until the thread exits.
-    // Idempotent  - safe to call multiple times.
     //
     // Drains any tasks that were still in the queue when the loop exited so
     // that RPC contexts (held inside lambda captures) receive a response
@@ -64,13 +58,14 @@ class SerializedExecutor {
                 task();
             } catch (const std::exception& e) {
                 fprintf(stderr,
-                        "SerializedExecutor: unhandled exception in "
+                        "SerializedExecutor(%s): unhandled exception in "
                         "leftover task during shutdown: %s\n",
-                        e.what());
+                        name_.c_str(), e.what());
             } catch (...) {
                 fprintf(stderr,
-                        "SerializedExecutor: unhandled non-std exception "
-                        "in leftover task during shutdown\n");
+                        "SerializedExecutor(%s): unhandled non-std exception "
+                        "in leftover task during shutdown\n",
+                        name_.c_str());
             }
         }
     }
@@ -158,13 +153,15 @@ class SerializedExecutor {
                     // Log and swallow: a single bad task must not kill the
                     // loop.
                     fprintf(stderr,
-                            "SerializedExecutor: unhandled exception in "
+                            "SerializedExecutor(%s): unhandled exception in "
                             "task: %s\n",
-                            e.what());
+                            name_.c_str(), e.what());
                 } catch (...) {
-                    fprintf(stderr,
-                            "SerializedExecutor: unhandled non-std exception "
-                            "in task\n");
+                    fprintf(
+                        stderr,
+                        "SerializedExecutor(%s): unhandled non-std exception "
+                        "in task\n",
+                        name_.c_str());
                 }
             }
             if (tick_callback_) {
@@ -172,18 +169,21 @@ class SerializedExecutor {
                     tick_callback_();
                 } catch (const std::exception& e) {
                     fprintf(stderr,
-                            "SerializedExecutor: unhandled exception in "
+                            "SerializedExecutor(%s): unhandled exception in "
                             "tick callback: %s\n",
-                            e.what());
+                            name_.c_str(), e.what());
                 } catch (...) {
-                    fprintf(stderr,
-                            "SerializedExecutor: unhandled non-std exception "
-                            "in tick callback\n");
+                    fprintf(
+                        stderr,
+                        "SerializedExecutor(%s): unhandled non-std exception "
+                        "in tick callback\n",
+                        name_.c_str());
                 }
             }
         }
     }
 
+    std::string name_;
     std::thread thread_;
     std::atomic<bool> running_{false};
     std::mutex mutex_;

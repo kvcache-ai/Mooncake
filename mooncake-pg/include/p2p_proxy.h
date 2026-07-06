@@ -291,7 +291,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
-        int* failed_ranks_ = nullptr;
+        int* failed_ranks_hint_ = nullptr;
     };
 
     struct RecvOp {
@@ -300,7 +300,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
-        int* failed_ranks_ = nullptr;
+        int* failed_ranks_hint_ = nullptr;
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
@@ -409,7 +409,7 @@ class P2PProxy {
         // staging buffers.  When bytes_staged_ == total_bytes_ every chunk
         // has at least entered the Copy-In stage.
         uint64_t bytes_staged_ = 0;
-        int* failed_ranks_ = nullptr;
+        int* failed_ranks_hint_ = nullptr;
 
         std::chrono::steady_clock::time_point last_update_time_;
     };
@@ -452,7 +452,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
-        int* failed_ranks_ = nullptr;
+        int* failed_ranks_hint_ = nullptr;
         // Number of bytes for which a RecvPool chunk has been reserved and a
         // CreditSlot has been sent to the peer.  When bytes_credited_ ==
         // total_bytes_ the entire tensor has been offered to the sender.

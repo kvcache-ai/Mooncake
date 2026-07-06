@@ -146,6 +146,7 @@ if (WITH_EP)
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
+        "-DPython3_EXECUTABLE=${_Python3_EXECUTABLE}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
       COMMENT "Building Mooncake EP Python extension(s)"
       DEPENDS engine
@@ -163,6 +164,7 @@ if (WITH_EP)
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
+        "-DPython3_EXECUTABLE=${_Python3_EXECUTABLE}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
       DEPENDS engine mooncake_ep_ext

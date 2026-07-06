@@ -16,28 +16,45 @@ namespace mooncake {
 struct TransferGroupMeta;
 class MooncakeWorker;
 
-// Per-operation failedRanks buffer (non-copyable, movable)
+// Per-operation failedRanksHint / attemptedRanks buffer (non-copyable, movable)
 // CPU: owning tensor.
 // CUDA: pinned mapped memory (tensor owns the allocation via custom deleter;
 //       dev_ptr is the device-visible alias of the same buffer).
-struct FailedRanks {
+// local_success: true iff ALL attempted peers succeeded in this operation.
+//   Set by the Work handle on wait() completion.
+struct FailedRanksHint {
     at::Tensor tensor;
     int* dev_ptr = nullptr;  // CUDA only: device pointer for GPU kernel.
 
-    FailedRanks() = default;
-    FailedRanks(at::Tensor tensor_in, int* dev_ptr_in)
+    // CUDA only: bitmap of ranks that were attempted in this op.  Used by the
+    // control plane to distinguish "peer failed" from "peer not attempted".
+    at::Tensor attempted_tensor;
+    int* attempted_dev_ptr = nullptr;
+
+    // Set to true on wait() if no peer failed this operation locally.
+    bool local_success = false;
+
+    FailedRanksHint() = default;
+    FailedRanksHint(at::Tensor tensor_in, int* dev_ptr_in)
         : tensor(std::move(tensor_in)), dev_ptr(dev_ptr_in) {}
+    FailedRanksHint(at::Tensor tensor_in, int* dev_ptr_in,
+                    at::Tensor attempted_tensor_in, int* attempted_dev_ptr_in)
+        : tensor(std::move(tensor_in)),
+          dev_ptr(dev_ptr_in),
+          attempted_tensor(std::move(attempted_tensor_in)),
+          attempted_dev_ptr(attempted_dev_ptr_in) {}
 
-    FailedRanks(const FailedRanks&) = delete;
-    FailedRanks& operator=(const FailedRanks&) = delete;
+    FailedRanksHint(const FailedRanksHint&) = delete;
+    FailedRanksHint& operator=(const FailedRanksHint&) = delete;
 
-    FailedRanks(FailedRanks&& o) noexcept = default;
-    FailedRanks& operator=(FailedRanks&& o) noexcept = default;
-    ~FailedRanks() = default;
+    FailedRanksHint(FailedRanksHint&& o) noexcept = default;
+    FailedRanksHint& operator=(FailedRanksHint&& o) noexcept = default;
+    ~FailedRanksHint() = default;
 
     int* data() { return tensor.data_ptr<int>(); }
+    int* attemptedData() { return attempted_tensor.data_ptr<int>(); }
 
-    static FailedRanks allocate(int n, bool isCpu);
+    static FailedRanksHint allocate(int n, bool isCpu);
 };
 
 // Collective Work handles
@@ -46,25 +63,23 @@ class MooncakeWorkCpu : public ::c10d::Work {
     MooncakeWorkCpu(c10d::OpType opType,
                     c10::intrusive_ptr<c10::ivalue::Future> future,
                     std::shared_ptr<TransferGroupMeta> meta,
-                    FailedRanks failedRanks)
+                    FailedRanksHint failedRanksHint)
         : Work(-1, opType),
           future_(std::move(future)),
           meta_(std::move(meta)),
-          failedRanks_(std::move(failedRanks)) {}
+          failedRanksHint_(std::move(failedRanksHint)) {}
 
     bool isCompleted() override { return future_->completed(); }
 
-    bool wait(std::chrono::milliseconds timeout) override {
-        future_->wait();
-        return future_->completed() && !future_->hasError();
-    }
+    bool wait(std::chrono::milliseconds timeout) override;
 
-    at::Tensor getFailedRanks() const { return failedRanks_.tensor; }
+    at::Tensor getFailedRanksHint() const { return failedRanksHint_.tensor; }
+    bool getLocalSuccess() const { return failedRanksHint_.local_success; }
 
    private:
     c10::intrusive_ptr<c10::ivalue::Future> future_;
     std::shared_ptr<TransferGroupMeta> meta_;
-    FailedRanks failedRanks_;
+    FailedRanksHint failedRanksHint_;
 };
 
 struct CudaTaskSubmissionToken {
@@ -78,26 +93,27 @@ class MooncakeWorkCuda : public ::c10d::Work {
                      std::shared_ptr<TransferGroupMeta> meta,
                      const MooncakeWorker* worker,
                      std::vector<CudaTaskSubmissionToken> submitted_tasks,
-                     FailedRanks failedRanks)
+                     FailedRanksHint failedRanksHint)
         : Work(-1, opType),
           event_(std::move(event)),
           meta_(std::move(meta)),
           worker_(worker),
           submitted_tasks_(std::move(submitted_tasks)),
-          failedRanks_(std::move(failedRanks)) {}
+          failedRanksHint_(std::move(failedRanksHint)) {}
 
     bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override;
 
-    at::Tensor getFailedRanks() const;
+    at::Tensor getFailedRanksHint() const;
+    bool getLocalSuccess() const;
 
    protected:
     std::shared_ptr<torch::Event> event_;
     std::shared_ptr<TransferGroupMeta> meta_;
     const MooncakeWorker* worker_;
     std::vector<CudaTaskSubmissionToken> submitted_tasks_;
-    FailedRanks failedRanks_;
+    FailedRanksHint failedRanksHint_;
 };
 
 class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
@@ -112,19 +128,20 @@ class MooncakeP2PWork : public ::c10d::Work {
     enum class Status : uint8_t { kPending = 0, kSuccess = 1, kFailed = 2 };
 
     explicit MooncakeP2PWork(std::shared_ptr<std::atomic<Status>> status,
-                             FailedRanks failedRanks)
+                             FailedRanksHint failedRanksHint)
         : Work(-1, c10d::OpType::UNKNOWN),
           status_(status),
-          failedRanks_(std::move(failedRanks)) {}
+          failedRanksHint_(std::move(failedRanksHint)) {}
 
     bool isCompleted() override;
     bool isSuccess() const override;
     bool wait(std::chrono::milliseconds timeout) override;
-    at::Tensor getFailedRanks() const { return failedRanks_.tensor; }
+    at::Tensor getFailedRanksHint() const { return failedRanksHint_.tensor; }
+    bool getLocalSuccess() const { return isSuccess(); }
 
    private:
     std::shared_ptr<std::atomic<Status>> status_;
-    FailedRanks failedRanks_;
+    FailedRanksHint failedRanksHint_;
 };
 
 }  // namespace mooncake

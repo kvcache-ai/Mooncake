@@ -30,14 +30,25 @@ abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
-cxx_args = [abi_define, "-std=c++20", "-O0", "-g"]
+
+# Match the yalantinglibs configuration used by engine.so / store.so so that
+# header-only types like coro_io::socket_wrapper_t have the same layout across
+# all shared objects loaded in the same process.
+#
+# FIXME: This is fragile. PG is built via setup.py, independently of the main
+# CMake build, so it does not inherit yalantinglibs' compile definitions from
+# engine.so / store.so.  If any yalantinglibs feature macro (e.g. YLT_ENABLE_IBV,
+# etc.) diverges between the C++ targets and this file, template types
+# instantiated into both pg_*.so and store.so will have different layouts,
+#  leading to silent crashes. :(
+cxx_args = [abi_define, "-DYLT_ENABLE_IBV", "-std=c++20", "-O3", "-g0"]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
 use_maca = hasattr(torch.version, "maca") and torch.version.maca is not None
 
 if use_musa:
-    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1", "-DYLT_ENABLE_IBV"]
     cxx_args += musa_defines
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
@@ -53,6 +64,7 @@ else:
         cxx_args.append("-DUSE_MACA")
     device_args = [
         abi_define,
+        "-DYLT_ENABLE_IBV",
         "-std=c++20",
         "-Xcompiler",
         "-O3",
@@ -76,6 +88,7 @@ setup(
         CUDAExtension(
             name=module_name,
             include_dirs=[
+                os.path.join(current_dir, "../extern/yalantinglibs/include"),
                 os.path.join(current_dir, "include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
             ],
