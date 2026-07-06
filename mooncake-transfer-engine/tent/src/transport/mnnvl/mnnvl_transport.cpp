@@ -238,6 +238,7 @@ Status MnnvlTransport::submitTransferTasks(
                                                   stream_device));
         CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream,
                                                   stream_device));
+        mnnvl_batch->stream_device_id = stream_device;
     }
 
     startTransfer(new_tasks, mnnvl_batch);
@@ -312,11 +313,39 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
         return;
     }
 
+    // Save and set device to match the stream's device to ensure event
+    // creation and recording happen on the correct device (fix for #2722).
+    int saved_device = -1;
+    if (batch->stream_device_id >= 0) {
+        auto err = cudaGetDevice(&saved_device);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "MnnvlTransport: cudaGetDevice failed: "
+                       << cudaGetErrorString(err);
+            for (auto *task : tasks)
+                task->status_word = TransferStatusEnum::FAILED;
+            return;
+        }
+        if (saved_device != batch->stream_device_id) {
+            err = cudaSetDevice(batch->stream_device_id);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "MnnvlTransport: cudaSetDevice failed: "
+                           << cudaGetErrorString(err);
+                for (auto *task : tasks)
+                    task->status_word = TransferStatusEnum::FAILED;
+                return;
+            }
+        }
+    }
+
     cudaEvent_t event;
     auto event_err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     if (event_err != cudaSuccess) {
         LOG(ERROR) << "MnnvlTransport: cudaEventCreateWithFlags failed: "
                    << cudaGetErrorString(event_err);
+        // Restore device before returning
+        if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+            cudaSetDevice(saved_device);
+        }
         for (auto *task : tasks) task->status_word = TransferStatusEnum::FAILED;
         return;
     }
@@ -325,9 +354,19 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
         LOG(ERROR) << "MnnvlTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(record_err);
         cudaEventDestroy(event);
+        // Restore device before returning
+        if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+            cudaSetDevice(saved_device);
+        }
         for (auto *task : tasks) task->status_word = TransferStatusEnum::FAILED;
         return;
     }
+
+    // Restore original device
+    if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+        cudaSetDevice(saved_device);
+    }
+
     batch->completion_events.push_back(event);
     for (auto *task : tasks) task->completion_event = event;
 }
