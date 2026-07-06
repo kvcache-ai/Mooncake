@@ -47,6 +47,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
+    ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/master_snapshot_codec.cpp
@@ -63,6 +64,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/oplog/etcd_oplog_store.cpp
     ha/oplog/etcd_oplog_change_notifier.cpp
     ha/oplog/oplog_batch_codec.cpp
+    ha/oplog/oplog_batch_storage.cpp
     ha/oplog/oplog_batch_types.cpp
     ha/oplog/oplog_serializer.cpp
     ha/oplog/oplog_store_factory.cpp

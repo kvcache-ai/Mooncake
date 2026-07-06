@@ -107,6 +107,9 @@ BatchRecordRange BuildBatchRecordRange(const std::string& cluster_id,
         return {};
     }
     const std::string prefix = BatchPrefix(normalized);
+    if (after_batch_id == UINT64_MAX) {
+        return {.begin_key = PrefixEnd(prefix), .end_key = PrefixEnd(prefix)};
+    }
     return {.begin_key = prefix + FormatOpLogBatchId(after_batch_id + 1),
             .end_key = PrefixEnd(prefix)};
 }

@@ -193,6 +193,7 @@ add_ha_test(ha_backend_availability_test
             ha/leadership/ha_backend_availability_test.cpp)
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
+add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(

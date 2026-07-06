@@ -109,6 +109,11 @@ TEST(OpLogBatchKeyLayoutTest, BuildsBatchRangeBounds) {
     EXPECT_EQ("/oplog/clusterA/batches0", bounds.end_key);
 }
 
+TEST(OpLogBatchKeyLayoutTest, MaxBatchRangeIsEmpty) {
+    auto bounds = BuildBatchRecordRange("clusterA", UINT64_MAX);
+    EXPECT_EQ(bounds.begin_key, bounds.end_key);
+}
+
 TEST(OpLogBatchKeyLayoutTest, RejectsInvalidClusterId) {
     std::string reason;
     EXPECT_FALSE(ValidateOpLogBatchClusterId("bad/cluster", &reason));
