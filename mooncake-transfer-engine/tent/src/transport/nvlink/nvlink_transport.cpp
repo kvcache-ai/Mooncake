@@ -278,9 +278,19 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     // creation and recording happen on the correct device (fix for #2722).
     int saved_device = -1;
     if (batch->stream_device_id >= 0) {
-        CHECK_CUDA(cudaGetDevice(&saved_device));
+        auto err = cudaGetDevice(&saved_device);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "NVLinkTransport: cudaGetDevice failed: " << cudaGetErrorString(err);
+            for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+            return;
+        }
         if (saved_device != batch->stream_device_id) {
-            CHECK_CUDA(cudaSetDevice(batch->stream_device_id));
+            err = cudaSetDevice(batch->stream_device_id);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "NVLinkTransport: cudaSetDevice failed: " << cudaGetErrorString(err);
+                for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+                return;
+            }
         }
     }
 
@@ -311,7 +321,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
 
     // Restore original device
     if (saved_device >= 0 && saved_device != batch->stream_device_id) {
-        CHECK_CUDA(cudaSetDevice(saved_device));
+        cudaSetDevice(saved_device);
     }
 
     batch->completion_events.push_back(event);
