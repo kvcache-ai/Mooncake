@@ -4,13 +4,16 @@ on:
   push:
     tags:
       - 'v*'
-
-env:
-  CANN_VERSION: "9.0.0"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        type: string
 
 jobs:
   build:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
 
     strategy:
       max-parallel: 2
@@ -38,6 +41,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
 
       - name: Setup Python ${{ matrix.python-version }}
@@ -58,8 +62,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CANN_URL="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${{ env.CANN_VERSION }}/Ascend-cann-toolkit_${{ env.CANN_VERSION }}_linux-${{ matrix.cann_arch }}.run"
-          echo "Downloading CANN ${{ env.CANN_VERSION }} from ${CANN_URL}"
+          CANN_BASE_URL="https://ascend.devcloud.huaweicloud.com/cann/run/software"
+          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(?=/)' | sort -V | tail -1)
+          echo "Latest CANN version: ${CANN_VERSION}"
+          CANN_URL="${CANN_BASE_URL}/${CANN_VERSION}/${{ matrix.cann_arch }}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${{ matrix.cann_arch }}.run"
+          echo "Downloading CANN ${CANN_VERSION} from ${CANN_URL}"
           wget -q --show-progress -O /tmp/cann_toolkit.run "${CANN_URL}"
           chmod +x /tmp/cann_toolkit.run
           sudo /tmp/cann_toolkit.run --install --install-for-all --install-path=/usr/local/Ascend --quiet
@@ -148,7 +155,7 @@ jobs:
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi
@@ -160,6 +167,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -177,6 +186,7 @@ jobs:
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI

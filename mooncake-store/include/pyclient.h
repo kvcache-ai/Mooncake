@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
 #include "file_storage.h"

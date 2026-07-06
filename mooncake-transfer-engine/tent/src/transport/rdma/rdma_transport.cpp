@@ -198,6 +198,8 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
 
     params->verbose = conf->get("verbose", false);
+    params->log_slice_affinity =
+        conf->get("transports/rdma/log_slice_affinity", false);
     return Status::OK();
 }
 
@@ -541,22 +543,23 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
 
 Status RdmaTransport::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    assert(segment);
-    // Store RDMA server name for dual-NIC setups; when it differs from
-    // local_segment_name_ the peer will use it for NIC path construction.
-    if (rdma_server_name_ != local_segment_name_) {
-        segment->rdma_server_name = rdma_server_name_;
-    }
-    auto& detail = std::get<MemorySegmentDesc>(segment->detail);
-    for (auto& context : context_set_) {
-        if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
-        DeviceDesc device_desc;
-        device_desc.name = context->name();
-        device_desc.lid = context->lid();
-        device_desc.gid = context->gid();
-        detail.devices.push_back(device_desc);
-    }
+    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        // Store RDMA server name for dual-NIC setups; when it differs from
+        // local_segment_name_ the peer will use it for NIC path construction.
+        if (rdma_server_name_ != local_segment_name_) {
+            segment.rdma_server_name = rdma_server_name_;
+        }
+        auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+        for (auto& context : context_set_) {
+            if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
+            DeviceDesc device_desc;
+            device_desc.name = context->name();
+            device_desc.lid = context->lid();
+            device_desc.gid = context->gid();
+            detail.devices.push_back(device_desc);
+        }
+        return Status::OK();
+    }));
     return manager.synchronizeLocal();
 }
 
@@ -590,6 +593,10 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     }
     auto status = endpoint->accept(peer_desc, local_desc);
     if (!status.ok()) {
+        if (endpoint->status() == RdmaEndPoint::EP_DESTROYING ||
+            endpoint->status() == RdmaEndPoint::EP_DESTROYED) {
+            context->endpointStore()->remove(endpoint.get());
+        }
         LOG(ERROR) << status.ToString();
         local_desc.reply_msg = status.ToString();
         return -1;
@@ -600,13 +607,11 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                                                          int device_id) {
-    SegmentDesc* segment_desc = nullptr;
-    std::string rpc_server_addr, target_seg_name, target_dev_name;
+    std::string rpc_server_addr, target_seg_name, target_dev_name,
+        target_nic_path_name;
 
     auto status = metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc* segment) {
-            segment_desc = segment;
-
             if (segment->type != SegmentType::Memory) {
                 return Status::NeedsRefreshCache(
                     "Segment type is not Memory" LOC_MARK);
@@ -618,6 +623,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
             auto topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
             target_seg_name = segment->name;
+            target_nic_path_name = segment->nicPathServerName();
             target_dev_name = topo->getNicName(device_id);
             if (target_seg_name.empty() || target_dev_name.empty()) {
                 return Status::NeedsRefreshCache(
@@ -636,8 +642,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    std::string peer_name =
-        MakeNicPath(segment_desc->nicPathServerName(), target_dev_name);
+    std::string peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
@@ -710,20 +715,27 @@ int RdmaTransport::processNotifyCompletions() {
 
         // Process each completion
         for (int i = 0; i < completed; ++i) {
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                LOG(ERROR) << "Notification completion failed: " << wc[i].status
-                           << ", qp_num=" << wc[i].qp_num;
-                continue;
-            }
-
-            // Find endpoint by QP number
-            RdmaEndPoint* endpoint = nullptr;
+            // Find endpoint by QP number before interpreting errors. A flush
+            // completion after endpoint unpublication is expected during
+            // retirement and should not flood logs.
+            std::shared_ptr<RdmaEndPoint> endpoint;
             {
                 RWSpinlock::ReadGuard guard(notify_endpoint_map_lock_);
                 auto it = notify_qp_to_endpoint_.find(wc[i].qp_num);
                 if (it != notify_qp_to_endpoint_.end()) {
-                    endpoint = it->second;
+                    endpoint = it->second.lock();
                 }
+            }
+
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR &&
+                    (!endpoint ||
+                     endpoint->status() != RdmaEndPoint::EP_READY)) {
+                    continue;
+                }
+                LOG(ERROR) << "Notification completion failed: " << wc[i].status
+                           << ", qp_num=" << wc[i].qp_num;
+                continue;
             }
 
             if (!endpoint) {
@@ -745,7 +757,8 @@ int RdmaTransport::processNotifyCompletions() {
     return total_completions;
 }
 
-void RdmaTransport::registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint) {
+void RdmaTransport::registerNotifyQp(
+    uint32_t qp_num, const std::shared_ptr<RdmaEndPoint>& endpoint) {
     RWSpinlock::WriteGuard guard(notify_endpoint_map_lock_);
     notify_qp_to_endpoint_[qp_num] = endpoint;
 }

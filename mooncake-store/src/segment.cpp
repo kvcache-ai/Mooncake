@@ -3,6 +3,8 @@
 #include "master_metric_manager.h"
 #include "utils/zstd_util.h"
 
+#include <functional>
+
 namespace mooncake {
 namespace {
 
@@ -25,7 +27,87 @@ bool IsMsgpackInteger(const msgpack::object& object) {
            object.type == msgpack::type::NEGATIVE_INTEGER;
 }
 
+void AddHostSegment(HostSegmentIndex& index, const Segment& segment) {
+    if (!segment.host_id.empty()) {
+        index[segment.host_id][segment.name].insert(segment.id);
+    }
+}
+
+void RemoveHostSegment(HostSegmentIndex& index, const Segment& segment) {
+    if (segment.host_id.empty()) {
+        return;
+    }
+    auto host_it = index.find(segment.host_id);
+    if (host_it == index.end()) {
+        return;
+    }
+    auto name_it = host_it->second.find(segment.name);
+    if (name_it == host_it->second.end()) {
+        return;
+    }
+    name_it->second.erase(segment.id);
+    if (name_it->second.empty()) {
+        host_it->second.erase(name_it);
+    }
+    if (host_it->second.empty()) {
+        index.erase(host_it);
+    }
+}
+
+std::vector<std::string> BuildHostOrderedSegments(
+    const HostSegmentIndex& segments_by_host, const std::string& writer_host_id,
+    const std::string& key) {
+    std::vector<std::string> ordered_segments;
+    if (writer_host_id.empty() || segments_by_host.empty()) {
+        return ordered_segments;
+    }
+
+    auto start_it = segments_by_host.find(writer_host_id);
+    if (start_it == segments_by_host.end()) {
+        start_it = segments_by_host.lower_bound(writer_host_id);
+        if (start_it == segments_by_host.end()) {
+            start_it = segments_by_host.begin();
+        }
+    }
+
+    const size_t host_count = segments_by_host.size();
+    auto host_it = start_it;
+    for (size_t host_idx = 0; host_idx < host_count; ++host_idx) {
+        const auto& segments_by_name = host_it->second;
+        if (!segments_by_name.empty()) {
+            std::vector<std::string> host_segments;
+            host_segments.reserve(segments_by_name.size());
+            for (const auto& [name, segment_ids] : segments_by_name) {
+                if (!segment_ids.empty()) {
+                    host_segments.push_back(name);
+                }
+            }
+            const size_t start =
+                std::hash<std::string>{}(key) % host_segments.size();
+            for (size_t i = 0; i < host_segments.size(); ++i) {
+                ordered_segments.push_back(
+                    host_segments[(start + i) % host_segments.size()]);
+            }
+        }
+
+        ++host_it;
+        if (host_it == segments_by_host.end()) {
+            host_it = segments_by_host.begin();
+        }
+    }
+
+    return ordered_segments;
+}
+
 }  // namespace
+
+std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
+    const std::string& writer_host_id, const std::string& key) const {
+    if (segments_by_host_ == nullptr) {
+        return {};
+    }
+    return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
+}
 
 ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                                             const UUID& client_id) {
@@ -49,6 +131,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                 segment, SegmentStatus::OK, allocator};
             segment_manager_->client_by_name_[segment.name] = client_id;
             segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+            AddHostSegment(segment_manager_->segments_by_host_, segment);
 
             LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
                       << segment.name
@@ -130,6 +213,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         segment, SegmentStatus::OK, std::move(allocator)};
     segment_manager_->client_by_name_[segment.name] = client_id;
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+    AddHostSegment(segment_manager_->segments_by_host_, segment);
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
     return ErrorCode::OK;
@@ -207,6 +291,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
         segment_manager_->allocator_manager_.removeAllocator(segment.name,
                                                              allocator);
     }
+    RemoveHostSegment(segment_manager_->segments_by_host_, segment);
 
     // 2. Remove from mounted_segment
     mounted_segment.buf_allocator.reset();
@@ -252,6 +337,7 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
         segment_manager_->allocator_manager_.removeAllocator(segment.name,
                                                              allocator);
     }
+    RemoveHostSegment(segment_manager_->segments_by_host_, segment);
     // Set the segment status to GRACEFULLY_UNMOUNTING
     mounted_segment.status = SegmentStatus::GRACEFULLY_UNMOUNTING;
     return ErrorCode::OK;
@@ -286,6 +372,8 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
+        RemoveHostSegment(segment_manager_->segments_by_host_,
+                          segment->second.segment);
         auto segment_id_by_name_it =
             segment_manager_->segment_id_by_name_.find(segment_name);
         if (segment_id_by_name_it !=
@@ -373,6 +461,12 @@ ErrorCode ScopedSegmentAccess::GetAllSegments(
         all_segments.emplace_back(segment_pair.second.segment, client_id);
     }
     return ErrorCode::OK;
+}
+
+std::vector<std::string> ScopedSegmentAccess::GetHostOrderedSegments(
+    const std::string& writer_host_id, const std::string& key) const {
+    return BuildHostOrderedSegments(segment_manager_->segments_by_host_,
+                                    writer_host_id, key);
 }
 
 ErrorCode ScopedSegmentAccess::GetAllSegmentNames(
@@ -657,6 +751,7 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
     // Clear existing data
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
+    segment_manager_->segments_by_host_.clear();
 
     // Convert MessagePack map to regular map, use pointers for values to avoid
     // copying
@@ -864,6 +959,7 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
     // Rebuild segment indexes based on client_segments_ and mounted_segments_
     segment_manager_->client_by_name_.clear();
     segment_manager_->segment_id_by_name_.clear();
+    segment_manager_->segments_by_host_.clear();
     for (const auto& [client_id, segment_ids] :
          segment_manager_->client_segments_) {
         for (const auto& segment_id : segment_ids) {
@@ -873,6 +969,11 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                     client_id;
                 segment_manager_->segment_id_by_name_[it->second.segment.name] =
                     segment_id;
+                if (it->second.status == SegmentStatus::OK &&
+                    it->second.buf_allocator) {
+                    AddHostSegment(segment_manager_->segments_by_host_,
+                                   it->second.segment);
+                }
             }
         }
     }
@@ -1001,6 +1102,7 @@ void SegmentSerializer::Reset() {
     segment_manager_->client_segments_.clear();
     segment_manager_->client_by_name_.clear();
     segment_manager_->segment_id_by_name_.clear();
+    segment_manager_->segments_by_host_.clear();
     segment_manager_->client_local_disk_segment_.clear();
     segment_manager_->allocator_manager_ = AllocatorManager();
 }
@@ -1092,8 +1194,12 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
         HasAllocator(allocator_manager, name, allocator);
     if (should_be_allocatable && !is_allocatable && allocator) {
         allocator_manager.addAllocator(name, allocator);
+        AddHostSegment(segment_manager_->segments_by_host_,
+                       mounted_segment.segment);
     } else if (!should_be_allocatable && is_allocatable) {
         allocator_manager.removeAllocator(name, allocator);
+        RemoveHostSegment(segment_manager_->segments_by_host_,
+                          mounted_segment.segment);
     }
 
     mounted_segment.status = status;
@@ -1378,5 +1484,23 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
+}
+
+int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
+    const std::string& segment_name) const {
+    auto client_it = client_by_name_.find(segment_name);
+    if (client_it == client_by_name_.end()) return 0;
+    auto disk_it = client_local_disk_segment_.find(client_it->second);
+    if (disk_it == client_local_disk_segment_.end()) return 0;
+    return disk_it->second->ssd_total_capacity_bytes;
+}
+
+int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
+    const std::string& segment_name) const {
+    auto client_it = client_by_name_.find(segment_name);
+    if (client_it == client_by_name_.end()) return 0;
+    auto disk_it = client_local_disk_segment_.find(client_it->second);
+    if (disk_it == client_local_disk_segment_.end()) return 0;
+    return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
 }
 }  // namespace mooncake

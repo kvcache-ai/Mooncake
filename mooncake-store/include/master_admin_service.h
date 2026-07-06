@@ -51,6 +51,8 @@ class MasterAdminServer {
 
     std::string BuildMetricsText() const;
 
+    std::string BuildTenantQuotaMetricsText() const;
+
     std::string BuildMetricsSummaryText() const;
 
     std::shared_ptr<WrappedMasterService> GetActiveService() const;
@@ -93,6 +95,12 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleKvEventsStatus(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
+    void HandleGetTenantQuotas(coro_http::coro_http_request& req,
+                               coro_http::coro_http_response& resp);
+    void HandleUpsertTenantQuota(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
+    void HandleDeleteTenantQuota(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
 
     void RegisterHandler();
 

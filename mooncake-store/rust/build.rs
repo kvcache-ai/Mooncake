@@ -203,19 +203,26 @@ fn main() {
     // common/base library (contains mooncake::Status etc.)
     println!(
         "cargo:rustc-link-search=native={}",
-        build_dir.join("mooncake-transfer-engine/src/common/base").display()
+        build_dir
+            .join("mooncake-transfer-engine/src/common/base")
+            .display()
     );
 
     // CUDA runtime libraries (needed by transfer_engine RDMA transport).
     let cuda_home = env::var("CUDA_HOME")
         .or_else(|_| env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    println!("cargo:rustc-link-search=native={}/targets/x86_64-linux/lib", cuda_home);
+    println!(
+        "cargo:rustc-link-search=native={}/targets/x86_64-linux/lib",
+        cuda_home
+    );
 
     // cachelib_memory_allocator is a static library built alongside mooncake_store.
     println!(
         "cargo:rustc-link-search=native={}",
-        build_dir.join("mooncake-store/src/cachelib_memory_allocator").display()
+        build_dir
+            .join("mooncake-store/src/cachelib_memory_allocator")
+            .display()
     );
 
     println!("cargo:rustc-link-lib=mooncake_store");
@@ -231,16 +238,18 @@ fn main() {
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=glog");
     println!("cargo:rustc-link-lib=gflags");
-    println!("cargo:rustc-link-lib=numa");   // NUMA binding
-    println!("cargo:rustc-link-lib=curl");    // HTTP metadata plugin
+    println!("cargo:rustc-link-lib=numa"); // NUMA binding
+    println!("cargo:rustc-link-lib=curl"); // HTTP metadata plugin
     println!("cargo:rustc-link-lib=ibverbs"); // RDMA transport
+    println!("cargo:rustc-link-lib=yaml-cpp"); // tenant quota policy connector
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=xxhash");
 
     // -----------------------------------------------------------------------
     // Header path for bindgen
     // -----------------------------------------------------------------------
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let mut search_dirs = Vec::new();
 
     let explicit_lib_dir = env::var("MOONCAKE_STORE_LIB_DIR").ok().map(PathBuf::from);
@@ -339,6 +348,7 @@ fn main() {
         "numa",
         "ibverbs",
         "jsoncpp",
+        "yaml-cpp",
         "zstd",
         "m",
     ] {
@@ -364,8 +374,8 @@ fn main() {
         println!("cargo:rustc-link-lib=gcov");
     }
 
-    let include_dir = env::var("MOONCAKE_STORE_INCLUDE_DIR")
-        .unwrap_or_else(|_| "../include".to_string());
+    let include_dir =
+        env::var("MOONCAKE_STORE_INCLUDE_DIR").unwrap_or_else(|_| "../include".to_string());
 
     let header = format!("{include_dir}/store_c.h");
 

@@ -32,6 +32,7 @@
 #include "config.h"
 #include "cuda_alike.h"
 #include "environ.h"
+#include "hip_device_guard.h"
 #if defined(USE_HIP_DMABUF)
 #include <sys/utsname.h>
 
@@ -462,25 +463,9 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (hipAttr.type == hipMemoryTypeDevice) {
-        // Device memory + kernel support — export dmabuf fd and register.
-        // Pin to the owning device for the duration of the export calls.
-        struct HipDeviceGuard {
-            int prev_device = 0;
-            bool need_restore = false;
-            bool set_ok = false;
-            explicit HipDeviceGuard(int target_device) {
-                if (hipGetDevice(&prev_device) == hipSuccess) {
-                    need_restore = (prev_device != target_device);
-                }
-                set_ok = (hipSetDevice(target_device) == hipSuccess);
-            }
-            ~HipDeviceGuard() {
-                if (need_restore) {
-                    (void)hipSetDevice(prev_device);
-                }
-            }
-        } dev_guard(hipAttr.device);
-        if (!dev_guard.set_ok) {
+        // Pin to the owning device while exporting the dmabuf fd.
+        HipDeviceGuard dev_guard(hipAttr.device);
+        if (!dev_guard.set_ok()) {
             LOG(ERROR) << "Failed to set HIP device to " << hipAttr.device
                        << " for dmabuf export of " << (uintptr_t)addr;
             return ERR_CONTEXT;
@@ -760,9 +745,11 @@ static GidNetworkState autoGidStateFromSelection(
     const AutoGidSelection &selection) {
     switch (selection.candidate_class) {
         case AutoGidCandidateClass::kNetworkRoutable:
+        case AutoGidCandidateClass::kNetworkPrivateV4:
         case AutoGidCandidateClass::kNetworkDegraded:
             return GidNetworkState::GID_WITH_NETWORK;
         case AutoGidCandidateClass::kNoNetworkRoutable:
+        case AutoGidCandidateClass::kNoNetworkPrivateV4:
         case AutoGidCandidateClass::kNoNetworkDegraded:
         case AutoGidCandidateClass::kFallbackNonzero:
             return GidNetworkState::GID_WITHOUT_NETWORK;

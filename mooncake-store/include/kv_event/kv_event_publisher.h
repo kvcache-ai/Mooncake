@@ -29,7 +29,7 @@ class KvEventPublisher {
 
     bool enabled() const { return config_.enabled; }
 
-    // Non-blocking enqueue; never drops events (unbounded queue).
+    // Non-blocking enqueue into a bounded queue; drops oldest when full.
     // tenant_id empty defaults to "default" on the wire.
     void PublishStored(const std::string& object_key, const std::string& medium,
                        const std::string& tenant_id = "");

@@ -168,6 +168,13 @@ KvEventPublisher::Stats KvEventPublisher::GetStats() const {
 void KvEventPublisher::Enqueue(PendingEvent event) {
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (config_.queue_capacity > 0 &&
+            queue_.size() >= config_.queue_capacity) {
+            queue_.pop_front();
+            dropped_events_.fetch_add(1, std::memory_order_relaxed);
+            // Reserve a ZMQ sequence gap so consumers can detect loss.
+            next_zmq_sequence_.fetch_add(1, std::memory_order_relaxed);
+        }
         queue_.push_back(std::move(event));
     }
     queue_cv_.notify_one();
@@ -325,8 +332,6 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
             packer.pack("base_block_idx");
             packer.pack_nil();
         }
-
-        published_events_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Batch-level dp_rank; storage pool has no DP context (0).
@@ -345,23 +350,22 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     std::memcpy(zmq_msg_data(&payload_msg), payload_buffer.data(),
                 payload_buffer.size());
 
-    const int rc = zmq_sendmsg(zmq_socket_, &topic_msg, ZMQ_SNDMORE);
-    if (rc >= 0) {
-        if (zmq_sendmsg(zmq_socket_, &seq_msg, ZMQ_SNDMORE) >= 0) {
-            if (zmq_sendmsg(zmq_socket_, &payload_msg, 0) < 0) {
-                zmq_msg_close(&payload_msg);
-            }
-        } else {
-            zmq_msg_close(&seq_msg);
-            zmq_msg_close(&payload_msg);
-        }
-    } else {
-        zmq_msg_close(&seq_msg);
-        zmq_msg_close(&payload_msg);
-    }
-    zmq_msg_close(&topic_msg);
+    const int rc_topic = zmq_sendmsg(zmq_socket_, &topic_msg, ZMQ_SNDMORE);
+    const int rc_seq =
+        (rc_topic >= 0) ? zmq_sendmsg(zmq_socket_, &seq_msg, ZMQ_SNDMORE) : -1;
+    const int rc_payload =
+        (rc_seq >= 0) ? zmq_sendmsg(zmq_socket_, &payload_msg, 0) : -1;
 
-    published_batches_.fetch_add(1, std::memory_order_relaxed);
+    zmq_msg_close(&topic_msg);
+    zmq_msg_close(&seq_msg);
+    zmq_msg_close(&payload_msg);
+
+    if (rc_topic >= 0 && rc_seq >= 0 && rc_payload >= 0) {
+        published_batches_.fetch_add(1, std::memory_order_relaxed);
+        published_events_.fetch_add(encoded.size(), std::memory_order_relaxed);
+    } else {
+        dropped_events_.fetch_add(encoded.size(), std::memory_order_relaxed);
+    }
 }
 
 }  // namespace mooncake
