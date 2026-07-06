@@ -712,6 +712,44 @@ TEST(TransportSelectorTest, PolicyLinkLayerQoSOutOfRangeIgnored) {
     EXPECT_FALSE(r.traffic_class.has_value());
 }
 
+// An empty-string or non-string qp_pool is treated as unset (nullopt), so a
+// blank / mistyped config value never looks like an explicit pool.
+TEST(TransportSelectorTest, PolicyQpPoolEmptyOrNonStringIsUnset) {
+    auto conf = std::make_shared<Config>();
+    json empty_pool;
+    empty_pool["name"] = "empty-pool";
+    empty_pool["segment_type"] = "memory";
+    empty_pool["transports"] = {"rdma"};
+    empty_pool["qp_pool"] = "";  // empty -> unset
+    json bad_pool;
+    bad_pool["name"] = "bad-pool";
+    bad_pool["segment_type"] = "memory";
+    bad_pool["transports"] = {"rdma"};
+    bad_pool["qp_pool"] = 42;  // non-string -> ignored
+    conf->set("policy", json::array({empty_pool, bad_pool}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {RDMA};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    ctx.policy_name = "empty-pool";
+    EXPECT_FALSE(
+        selector.select(ctx, transports, /*index=*/0).qp_pool.has_value());
+    ctx.policy_name = "bad-pool";
+    EXPECT_FALSE(
+        selector.select(ctx, transports, /*index=*/0).qp_pool.has_value());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

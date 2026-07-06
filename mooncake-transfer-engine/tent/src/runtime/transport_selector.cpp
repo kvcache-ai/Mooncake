@@ -231,7 +231,15 @@ void TransportSelector::loadPolicies() {
         // compatibility, no effect yet.
         if (policy_json.contains("qp_pool")) {
             auto& qp = policy_json["qp_pool"];
-            if (qp.is_string()) policy.qp_pool = qp.get<std::string>();
+            if (!qp.is_string()) {
+                LOG(WARNING) << "Ignore qp_pool in policy " << policy.name
+                             << ", expected a string";
+            } else {
+                auto value = qp.get<std::string>();
+                // Treat an empty string the same as unset (use default pool)
+                // so a blank config value doesn't look like an explicit pool.
+                if (!value.empty()) policy.qp_pool = std::move(value);
+            }
         }
 
         policies_.push_back(std::move(policy));
