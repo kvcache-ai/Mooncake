@@ -60,6 +60,7 @@ class SnapshotChildProcessTest;
 // standing up a full snapshot catalog + child-process harness, and
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
+class PromotionBudgetBench;
 class MasterServiceTenantQuotaTest;
 }  // namespace test
 
@@ -82,6 +83,7 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class test::PromotionBudgetBench;
     friend class test::MasterServiceTenantQuotaTest;
 
    public:
