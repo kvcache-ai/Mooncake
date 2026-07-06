@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -223,7 +224,13 @@ ErrorCode LocalFsOpLogStore::ReadUint64FromFile(const std::string& filepath,
     std::string content;
     f >> content;
     try {
-        value = std::stoull(content);
+        size_t parsed_len = 0;
+        value = std::stoull(content, &parsed_len);
+        if (parsed_len != content.size()) {
+            LOG(ERROR) << "ReadUint64FromFile: trailing characters in "
+                       << filepath << ": " << content;
+            return ErrorCode::INTERNAL_ERROR;
+        }
     } catch (...) {
         LOG(ERROR) << "ReadUint64FromFile: invalid content in " << filepath
                    << ": " << content;
@@ -696,11 +703,22 @@ ErrorCode LocalFsOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
 
 ErrorCode LocalFsOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     std::string latest_path = LatestFilePath();
-    auto err = ReadUint64FromFile(latest_path, sequence_id);
-    if (err != ErrorCode::OK) {
-        // File doesn't exist yet — default to 0
+    std::error_code exists_error;
+    bool latest_exists = fs::exists(latest_path, exists_error);
+    if (exists_error) {
+        LOG(ERROR) << "GetLatestSequenceId: failed to stat " << latest_path
+                   << ": " << exists_error.message();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (!latest_exists) {
+        // File does not exist yet; default to 0
         sequence_id = 0;
         return ErrorCode::OK;
+    }
+
+    auto err = ReadUint64FromFile(latest_path, sequence_id);
+    if (err != ErrorCode::OK) {
+        return err;
     }
     return ErrorCode::OK;
 }

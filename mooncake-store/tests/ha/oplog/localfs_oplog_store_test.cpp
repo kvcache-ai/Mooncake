@@ -275,6 +275,34 @@ TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdFirstBoot) {
     EXPECT_EQ(0, seq);
 }
 
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdMissingFileDefaultsToZero) {
+    auto store = CreateReader();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    ASSERT_FALSE(fs::exists(latest_path));
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::OK, store->GetLatestSequenceId(seq));
+    EXPECT_EQ(0, seq);
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsTrailingGarbage) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "42junk";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsInvalidContent) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "not-a-number";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
 TEST_F(LocalFsOpLogStoreTest, GetMaxSequenceIdEmpty) {
     auto store = CreateWriter();
     uint64_t seq = 0;
@@ -361,6 +389,17 @@ TEST_F(LocalFsOpLogStoreTest, SnapshotRecordAndGet) {
     uint64_t seq = 0;
     EXPECT_EQ(ErrorCode::OK, store->GetSnapshotSequenceId("snap1", seq));
     EXPECT_EQ(42, seq);
+}
+
+TEST_F(LocalFsOpLogStoreTest, SnapshotSequenceRejectsTrailingGarbage) {
+    auto store = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, store->RecordSnapshotSequenceId("snap1", 42));
+    const std::string snapshot_path =
+        test_dir_ + "/" + cluster_id_ + "/snapshots/snap1";
+    std::ofstream(snapshot_path, std::ios::trunc) << "42junk";
+
+    uint64_t seq = 999;
+    EXPECT_NE(ErrorCode::OK, store->GetSnapshotSequenceId("snap1", seq));
 }
 
 TEST_F(LocalFsOpLogStoreTest, SnapshotNotFound) {
