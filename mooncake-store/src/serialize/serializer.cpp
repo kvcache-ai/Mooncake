@@ -1,8 +1,8 @@
 #include <iostream>
 #include <vector>
 
-#include "serialize/serializer.hpp"
-#include "offset_allocator/offset_allocator.hpp"
+#include "serialize/serializer.h"
+#include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "master_service.h"
 #include "utils/zstd_util.h"

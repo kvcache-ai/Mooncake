@@ -1,6 +1,6 @@
 #pragma once
 
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 
 namespace mooncake {
 

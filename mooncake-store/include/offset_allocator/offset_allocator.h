@@ -8,7 +8,7 @@
 #include <glog/logging.h>
 
 #include "mutex.h"
-#include "serialize/serializer.hpp"
+#include "serialize/serializer.h"
 
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;
