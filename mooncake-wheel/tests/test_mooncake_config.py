@@ -92,6 +92,13 @@ class TestMooncakeConfig(unittest.TestCase):
 
         self.assertEqual(config.tenant_id, "default")
 
+    def test_tenant_id_null_defaults(self):
+        """Test tenant_id defaults to default when explicitly null"""
+        self.write_config({**self.valid_config, "tenant_id": None})
+        config = MooncakeConfig.from_file(self.config_file)
+
+        self.assertEqual(config.tenant_id, "default")
+
     def test_enable_ssd_offload_string_values(self):
         """from_file must parse string booleans like load_from_env, and reject typos.
 
@@ -214,6 +221,10 @@ class TestMooncakeConfig(unittest.TestCase):
 
     def test_tenant_id_from_env(self):
         """Test loading tenant_id from MOONCAKE_TENANT_ID"""
+        previous_config_path = os.environ.pop("MOONCAKE_CONFIG_PATH", None)
+        previous_master = os.environ.pop("MOONCAKE_MASTER", None)
+        previous_tenant_id = os.environ.pop("MOONCAKE_TENANT_ID", None)
+
         os.environ["MOONCAKE_MASTER"] = self.valid_config["master_server_address"]
         os.environ["MOONCAKE_TENANT_ID"] = "tenant-from-env"
 
@@ -221,19 +232,33 @@ class TestMooncakeConfig(unittest.TestCase):
             config = MooncakeConfig.load_from_env()
             self.assertEqual(config.tenant_id, "tenant-from-env")
         finally:
-            del os.environ["MOONCAKE_MASTER"]
-            del os.environ["MOONCAKE_TENANT_ID"]
+            os.environ.pop("MOONCAKE_MASTER", None)
+            os.environ.pop("MOONCAKE_TENANT_ID", None)
+            if previous_config_path is not None:
+                os.environ["MOONCAKE_CONFIG_PATH"] = previous_config_path
+            if previous_master is not None:
+                os.environ["MOONCAKE_MASTER"] = previous_master
+            if previous_tenant_id is not None:
+                os.environ["MOONCAKE_TENANT_ID"] = previous_tenant_id
 
     def test_tenant_id_env_defaults(self):
         """Test tenant_id defaults to default when MOONCAKE_TENANT_ID is omitted"""
+        previous_config_path = os.environ.pop("MOONCAKE_CONFIG_PATH", None)
+        previous_master = os.environ.pop("MOONCAKE_MASTER", None)
         previous_tenant_id = os.environ.pop("MOONCAKE_TENANT_ID", None)
+
         os.environ["MOONCAKE_MASTER"] = self.valid_config["master_server_address"]
 
         try:
             config = MooncakeConfig.load_from_env()
             self.assertEqual(config.tenant_id, "default")
         finally:
-            del os.environ["MOONCAKE_MASTER"]
+            os.environ.pop("MOONCAKE_MASTER", None)
+            os.environ.pop("MOONCAKE_TENANT_ID", None)
+            if previous_config_path is not None:
+                os.environ["MOONCAKE_CONFIG_PATH"] = previous_config_path
+            if previous_master is not None:
+                os.environ["MOONCAKE_MASTER"] = previous_master
             if previous_tenant_id is not None:
                 os.environ["MOONCAKE_TENANT_ID"] = previous_tenant_id
 
