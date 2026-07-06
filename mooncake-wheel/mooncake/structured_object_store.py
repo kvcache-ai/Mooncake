@@ -2272,38 +2272,15 @@ def _should_encode_recursive_leaf(leaf: "_InferredLeaf") -> bool:
     }
 
 
-def _fallback_codec(values: list[Any]) -> str:
-    """Simple type-based codec selection (no recursive inference)."""
-    nn = [v for v in values if v is not None]
-    if not nn:
-        return "msgpack_ragged"
-    if _torch is not None and all(isinstance(v, _torch.Tensor) for v in nn):
-        return "ragged_tensor"
-    if all(isinstance(v, str) for v in nn):
-        return "utf8_ragged"
-    if all(isinstance(v, (bytes, bytearray, memoryview)) for v in nn):
-        return "bytes_ragged"
-    if all(isinstance(v, (bool, int, float, np.number)) for v in nn):
-        return "ndarray"
-    if all(isinstance(v, np.ndarray) for v in nn):
-        return "typed_ragged"
-    return "msgpack_ragged"
-
-
 def _encode_with_fallback(path: str, value: np.ndarray) -> "_EncodedStructuredLeaf":
-    """Encode using simple type-based fallback, with recursive expansion for structured rows."""
+    """Encode using type-based fallback (delegates to _leaf_decision), with recursive expansion for structured rows."""
     values = list(value)
     recursive = _encode_recursive_if_structured(path, values)
     if recursive is not None:
         return recursive
-    codec = _fallback_codec(values)
-    metadata: dict[str, Any] = {}
-    if codec == "ndarray":
-        # ndarray codec needs dtype in metadata — infer from values
-        nn = [v for v in values if v is not None]
-        arr = np.asarray(nn)
-        metadata["dtype"] = str(arr.dtype)
-    schema = FieldSchema(codec=codec, metadata=metadata)
+    decision = _leaf_decision(values)
+    metadata = dict(decision.metadata or {})
+    schema = FieldSchema(codec=decision.codec, metadata=metadata)
     return _encode_with_schema(path, value, schema)
 
 
@@ -4418,7 +4395,10 @@ class _MooncakePayloadTransport:
             raise RuntimeError(
                 f"get failed for {chunk['key']}: expected {chunk_bytes} bytes, got {len(data)}"
             )
-        destination[offset : offset + chunk_bytes] = data
+        if isinstance(destination, np.ndarray):
+            destination[offset : offset + chunk_bytes] = np.frombuffer(data, dtype=np.uint8)
+        else:
+            destination[offset : offset + chunk_bytes] = data
 
     def _read_chunks_with_pool_get_into(
         self,
@@ -4630,48 +4610,11 @@ class _MooncakePayloadTransport:
                         f"get_into failed for {chunks[0]['key']}: expected {expected_size}, got {read_size}"
                     )
                 return True
-        get_into_ranges = self._get_into_ranges
-        if not callable(get_into_ranges):
-            return False
-        fragments = _payload_range_fragments(
-            chunks, byte_offset, byte_length, destination_offset
+        return self._read_payload_ranges_into_raw_destination(
+            chunks,
+            base_ptr,
+            [(byte_offset, destination_offset, byte_length)],
         )
-        if not fragments:
-            return True
-        keys = [
-            key
-            for key, _chunk_size, _destination_offset, _source_offset, _size in fragments
-        ]
-        dst_offsets = [
-            [fragment_destination_offset]
-            for _key, _chunk_size, fragment_destination_offset, _source_offset, _size in fragments
-        ]
-        src_offsets = [
-            [source_offset]
-            for _key, _chunk_size, _destination_offset, source_offset, _size in fragments
-        ]
-        sizes = [
-            [size]
-            for _key, _chunk_size, _destination_offset, _source_offset, size in fragments
-        ]
-        results = get_into_ranges(
-            [base_ptr], [keys], [dst_offsets], [src_offsets], [sizes]
-        )
-        if len(results) != 1 or len(results[0]) != len(keys):
-            raise RuntimeError(
-                f"get_into_ranges returned invalid ranged result shape for {len(keys)} chunks"
-            )
-        for key, expected_sizes, actual_sizes in zip(keys, sizes, results[0]):
-            if len(actual_sizes) != len(expected_sizes):
-                raise RuntimeError(
-                    f"get_into_ranges returned invalid ranged fragment count for {key}"
-                )
-            for expected_size, actual_size in zip(expected_sizes, actual_sizes):
-                if actual_size != expected_size:
-                    raise RuntimeError(
-                        f"get_into_ranges failed for {key}: expected {expected_size}, got {actual_size}"
-                    )
-        return True
 
     def _copy_payload_range_into_destination(
         self,
@@ -4705,9 +4648,15 @@ class _MooncakePayloadTransport:
                     raise RuntimeError(
                         f"get failed for {key}: expected {chunk_size} bytes, got {len(data)}"
                     )
-                destination[
-                    fragment_destination_offset : fragment_destination_offset + size
-                ] = data[fragment_source_offset : fragment_source_offset + size]
+                source_slice = data[fragment_source_offset : fragment_source_offset + size]
+                if isinstance(destination, np.ndarray):
+                    destination[
+                        fragment_destination_offset : fragment_destination_offset + size
+                    ] = np.frombuffer(source_slice, dtype=np.uint8)
+                else:
+                    destination[
+                        fragment_destination_offset : fragment_destination_offset + size
+                    ] = source_slice
 
     def _copy_payload_range_into_bytearray(
         self,
