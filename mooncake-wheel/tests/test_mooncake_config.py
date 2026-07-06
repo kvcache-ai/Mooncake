@@ -28,7 +28,7 @@ class TestMooncakeConfig(unittest.TestCase):
             "device_name": "eth0",
             "enable_ssd_offload": True,
             "ssd_offload_path": "/nvme/mooncake_offload",
-            "tenant_id": "tenant-a",
+            "tenant_id": "tenant-a"
         }
 
     def tearDown(self):
@@ -36,7 +36,7 @@ class TestMooncakeConfig(unittest.TestCase):
 
     def write_config(self, config_data):
         """Write configuration to file"""
-        with open(self.config_file, "w") as f:
+        with open(self.config_file, 'w') as f:
             json.dump(config_data, f)
 
     def test_load_valid_config(self):
@@ -60,7 +60,7 @@ class TestMooncakeConfig(unittest.TestCase):
         minimal_config = {
             "local_hostname": "localhost",
             "metadata_server": "localhost:8080",
-            "master_server_address": "localhost:8081",
+            "master_server_address": "localhost:8081"
         }
         self.write_config(minimal_config)
         config = MooncakeConfig.from_file(self.config_file)
@@ -85,7 +85,7 @@ class TestMooncakeConfig(unittest.TestCase):
         minimal_config = {
             "local_hostname": "localhost",
             "metadata_server": "localhost:8080",
-            "master_server_address": "localhost:8081",
+            "master_server_address": "localhost:8081"
         }
         self.write_config(minimal_config)
         config = MooncakeConfig.from_file(self.config_file)
@@ -98,6 +98,13 @@ class TestMooncakeConfig(unittest.TestCase):
         config = MooncakeConfig.from_file(self.config_file)
 
         self.assertEqual(config.tenant_id, "default")
+
+    def test_ssd_offload_path_null_defaults(self):
+        """Test ssd_offload_path defaults to empty when explicitly null"""
+        self.write_config({**self.valid_config, "ssd_offload_path": None})
+        config = MooncakeConfig.from_file(self.config_file)
+
+        self.assertEqual(config.ssd_offload_path, "")
 
     def test_enable_ssd_offload_string_values(self):
         """from_file must parse string booleans like load_from_env, and reject typos.
@@ -146,78 +153,58 @@ class TestMooncakeConfig(unittest.TestCase):
 
                 with self.assertRaises(ValueError) as cm:
                     MooncakeConfig.from_file(self.config_file)
-                self.assertIn(
-                    f"Missing required config field: {field}", str(cm.exception)
-                )
+                self.assertIn(f"Missing required config field: {field}", str(cm.exception))
 
     def test_load_from_config_path_env(self):
         """Test loading configuration from environment variable MOONCAKE_CONFIG_PATH"""
         self.write_config(self.valid_config)
 
         # Set environment variable
-        os.environ["MOONCAKE_CONFIG_PATH"] = self.config_file
+        os.environ['MOONCAKE_CONFIG_PATH'] = self.config_file
 
         try:
             config = MooncakeConfig.load_from_env()
             self.assertEqual(config.local_hostname, "localhost")
         finally:
             # Clean up environment variable
-            del os.environ["MOONCAKE_CONFIG_PATH"]
+            del os.environ['MOONCAKE_CONFIG_PATH']
 
     def test_load_from_config_env(self):
         """Test loading configuration from environment variable MOONCAKE_MASTER"""
         # Set environment variable
-        os.environ["MOONCAKE_MASTER"] = self.valid_config["master_server_address"]
-        os.environ["LOCAL_HOSTNAME"] = self.valid_config["local_hostname"]
-        os.environ["MOONCAKE_TE_META_DATA_SERVER"] = self.valid_config[
-            "metadata_server"
-        ]
-        os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(
-            self.valid_config["global_segment_size"]
-        )
-        os.environ["MOONCAKE_PROTOCOL"] = self.valid_config["protocol"]
-        os.environ["MOONCAKE_DEVICE"] = self.valid_config["device_name"]
-        os.environ["MOONCAKE_OFFLOAD_ENABLED"] = str(
-            self.valid_config["enable_ssd_offload"]
-        )
-        os.environ["MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"] = self.valid_config[
-            "ssd_offload_path"
-        ]
-        os.environ["MOONCAKE_TENANT_ID"] = self.valid_config["tenant_id"]
+        os.environ['MOONCAKE_MASTER'] = self.valid_config["master_server_address"]
+        os.environ['LOCAL_HOSTNAME'] = self.valid_config["local_hostname"]
+        os.environ['MOONCAKE_TE_META_DATA_SERVER'] = self.valid_config["metadata_server"]
+        os.environ['MOONCAKE_GLOBAL_SEGMENT_SIZE'] = str(self.valid_config["global_segment_size"])
+        os.environ['MOONCAKE_PROTOCOL'] = self.valid_config["protocol"]
+        os.environ['MOONCAKE_DEVICE'] = self.valid_config["device_name"]
+        os.environ['MOONCAKE_OFFLOAD_ENABLED'] = str(self.valid_config["enable_ssd_offload"])
+        os.environ['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH'] = self.valid_config["ssd_offload_path"]
+        os.environ['MOONCAKE_TENANT_ID'] = self.valid_config["tenant_id"]
 
         try:
             config = MooncakeConfig.load_from_env()
-            self.assertEqual(
-                config.master_server_address, self.valid_config["master_server_address"]
-            )
-            self.assertEqual(
-                config.metadata_server, self.valid_config["metadata_server"]
-            )
+            self.assertEqual(config.master_server_address, self.valid_config["master_server_address"])
+            self.assertEqual(config.metadata_server, self.valid_config["metadata_server"])
             self.assertEqual(config.local_hostname, self.valid_config["local_hostname"])
-            self.assertEqual(
-                config.global_segment_size, self.valid_config["global_segment_size"]
-            )
+            self.assertEqual(config.global_segment_size, self.valid_config["global_segment_size"])
             self.assertEqual(config.protocol, self.valid_config["protocol"])
             self.assertEqual(config.device_name, self.valid_config["device_name"])
-            self.assertEqual(
-                config.enable_ssd_offload, self.valid_config["enable_ssd_offload"]
-            )
-            self.assertEqual(
-                config.ssd_offload_path, self.valid_config["ssd_offload_path"]
-            )
+            self.assertEqual(config.enable_ssd_offload, self.valid_config["enable_ssd_offload"])
+            self.assertEqual(config.ssd_offload_path, self.valid_config["ssd_offload_path"])
             self.assertEqual(config.tenant_id, self.valid_config["tenant_id"])
 
         finally:
             # Clean up environment variable
-            del os.environ["MOONCAKE_MASTER"]
-            del os.environ["LOCAL_HOSTNAME"]
-            del os.environ["MOONCAKE_TE_META_DATA_SERVER"]
-            del os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"]
-            del os.environ["MOONCAKE_PROTOCOL"]
-            del os.environ["MOONCAKE_DEVICE"]
-            del os.environ["MOONCAKE_OFFLOAD_ENABLED"]
-            del os.environ["MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"]
-            del os.environ["MOONCAKE_TENANT_ID"]
+            del os.environ['MOONCAKE_MASTER']
+            del os.environ['LOCAL_HOSTNAME']
+            del os.environ['MOONCAKE_TE_META_DATA_SERVER']
+            del os.environ['MOONCAKE_GLOBAL_SEGMENT_SIZE']
+            del os.environ['MOONCAKE_PROTOCOL']
+            del os.environ['MOONCAKE_DEVICE']
+            del os.environ['MOONCAKE_OFFLOAD_ENABLED']
+            del os.environ['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH']
+            del os.environ['MOONCAKE_TENANT_ID']
 
     def test_tenant_id_from_env(self):
         """Test loading tenant_id from MOONCAKE_TENANT_ID"""
@@ -266,10 +253,7 @@ class TestMooncakeConfig(unittest.TestCase):
         """Test loading configuration from environment variable when not set"""
         with self.assertRaises(ValueError) as cm:
             MooncakeConfig.load_from_env()
-        self.assertIn(
-            "Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.",
-            str(cm.exception),
-        )
+        self.assertIn("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.", str(cm.exception))
 
 
 class TestParseSegmentSize(unittest.TestCase):
@@ -291,20 +275,20 @@ class TestParseSegmentSize(unittest.TestCase):
         self.assertEqual(_parse_segment_size("1.5kb"), int(1.5 * 1024))
 
     def test_mb_suffix(self):
-        self.assertEqual(_parse_segment_size("1mb"), 1024**2)
-        self.assertEqual(_parse_segment_size("512MB"), 512 * 1024**2)
-        self.assertEqual(_parse_segment_size("1m"), 1024**2)
+        self.assertEqual(_parse_segment_size("1mb"), 1024 ** 2)
+        self.assertEqual(_parse_segment_size("512MB"), 512 * 1024 ** 2)
+        self.assertEqual(_parse_segment_size("1m"), 1024 ** 2)
 
     def test_gb_suffix(self):
-        self.assertEqual(_parse_segment_size("1gb"), 1024**3)
-        self.assertEqual(_parse_segment_size("3GB"), 3 * 1024**3)
-        self.assertEqual(_parse_segment_size("1g"), 1024**3)
-        self.assertEqual(_parse_segment_size("1.5gb"), int(1.5 * 1024**3))
+        self.assertEqual(_parse_segment_size("1gb"), 1024 ** 3)
+        self.assertEqual(_parse_segment_size("3GB"), 3 * 1024 ** 3)
+        self.assertEqual(_parse_segment_size("1g"), 1024 ** 3)
+        self.assertEqual(_parse_segment_size("1.5gb"), int(1.5 * 1024 ** 3))
 
     def test_tb_suffix(self):
-        self.assertEqual(_parse_segment_size("1tb"), 1024**4)
-        self.assertEqual(_parse_segment_size("1TB"), 1024**4)
-        self.assertEqual(_parse_segment_size("1t"), 1024**4)
+        self.assertEqual(_parse_segment_size("1tb"), 1024 ** 4)
+        self.assertEqual(_parse_segment_size("1TB"), 1024 ** 4)
+        self.assertEqual(_parse_segment_size("1t"), 1024 ** 4)
 
     def test_b_suffix(self):
         self.assertEqual(_parse_segment_size("4096b"), 4096)
@@ -331,8 +315,8 @@ class TestParseSegmentSize(unittest.TestCase):
             _parse_segment_size("abc")
 
     def test_whitespace_handling(self):
-        self.assertEqual(_parse_segment_size("  3 gb  "), 3 * 1024**3)
+        self.assertEqual(_parse_segment_size("  3 gb  "), 3 * 1024 ** 3)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
