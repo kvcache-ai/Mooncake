@@ -878,7 +878,7 @@ class MooncakeBundleTransfer:
                 self._bundle_store.read_payload_ranges_into_bytearray(
                     payload_spec, data, ranges
                 )
-                ctypes.memmove(destination.ptr, bytes(data), nbytes)
+                ctypes.memmove(destination.ptr, (ctypes.c_char * nbytes).from_buffer(data), nbytes)
             _ = destination.owner
             return target
         target = _resolve_ndarray_destination(name, destination, dtype_obj, output_shape)
@@ -1013,7 +1013,7 @@ class MooncakeBundleTransfer:
                 self._bundle_store.read_payload_ranges_into_bytearray(
                     payload_spec, data, ranges
                 )
-                return bytes(data)
+                return data
             array = np.empty(total_bytes // dtype.itemsize, dtype=dtype)
             self._bundle_store.read_payload_ranges_into_array(
                 payload_spec, array.view(np.uint8).reshape(-1), ranges
@@ -2413,7 +2413,7 @@ def _decode_structured_leaf(
         ]
     if codec == "json_ragged":
         return [
-            None if value is None else json.loads(value.decode("utf-8"))
+            None if value is None else json.loads(value)
             for value in _decode_bytes_like_values(payload, rows)
         ]
     raise ValueError(f"unknown structured non-tensor codec: {codec}")
@@ -2509,6 +2509,8 @@ def _decode_ragged_tensor_values(
         if raw.dtype != np_dtype:
             raw = np.frombuffer(raw, dtype=np_dtype)
         data = _torch.from_numpy(raw)
+        if data.dtype != torch_dtype:
+            data = data.view(torch_dtype)
     else:
         data = _torch.from_numpy(np.asarray(raw))
     offsets = payload["offsets"]
@@ -2778,8 +2780,7 @@ def _decode_typed_ragged_values(
     if _torch is not None and isinstance(raw, _torch.Tensor):
         data = raw.numpy()
     elif isinstance(raw, (bytes, bytearray, memoryview)):
-        buf = bytearray(raw) if isinstance(raw, (bytes, memoryview)) else raw
-        data = np.frombuffer(buf, dtype=np_dtype)
+        data = np.frombuffer(raw, dtype=np_dtype)
     elif isinstance(raw, np.ndarray):
         data = raw if raw.dtype == np_dtype else np.frombuffer(raw, dtype=np_dtype)
     else:
@@ -2920,12 +2921,13 @@ def _decode_bytes_like_values(
     offsets = payload["offsets"]
     nulls = payload["nulls"]
     encodings = (metadata or {}).get("media_encodings", [])
+    data_view = memoryview(data) if not isinstance(data, memoryview) else data
     values = []
     for row in range(rows):
         if bool(nulls[row]):
             values.append(None)
             continue
-        item = memoryview(data)[int(offsets[row]) : int(offsets[row + 1])]
+        item = data_view[int(offsets[row]) : int(offsets[row + 1])]
         encoding = encodings[row] if row < len(encodings) else None
         values.append(_decode_media_bytes(item, encoding))
     return values
@@ -2976,6 +2978,7 @@ def _decode_media_list_values(
     byte_offsets = payload["byte_offsets"]
     nulls = payload["nulls"]
     encodings = (metadata or {}).get("media_encodings", [])
+    data_view = memoryview(data) if not isinstance(data, memoryview) else data
     values = []
     for row in range(rows):
         if bool(nulls[row]):
@@ -2983,7 +2986,7 @@ def _decode_media_list_values(
             continue
         items = []
         for item_index in range(int(row_offsets[row]), int(row_offsets[row + 1])):
-            item = memoryview(data)[
+            item = data_view[
                 int(byte_offsets[item_index]) : int(byte_offsets[item_index + 1])
             ]
             encoding = encodings[item_index] if item_index < len(encodings) else None
