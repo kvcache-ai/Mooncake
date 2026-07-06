@@ -233,9 +233,8 @@ ErrorCode LocalFsOpLogStore::ReadUint64FromFile(const std::string& filepath,
         LOG(ERROR) << "ReadUint64FromFile: extra content in " << filepath;
         return ErrorCode::INTERNAL_ERROR;
     }
-    if (!std::all_of(content.begin(), content.end(), [](unsigned char c) {
-            return std::isdigit(c);
-        })) {
+    if (!std::all_of(content.begin(), content.end(),
+                     [](unsigned char c) { return std::isdigit(c); })) {
         LOG(ERROR) << "ReadUint64FromFile: invalid content in " << filepath
                    << ": " << content;
         return ErrorCode::INTERNAL_ERROR;
