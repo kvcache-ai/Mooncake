@@ -29,6 +29,11 @@ STRUCTURED_FIELD_SPECS_KEY = "__mooncake_structured_fields__"
 # infer dtype from).  The actual bytes stored are empty, so the dtype only
 # serves as a placeholder for metadata consistency between encoder and decoder.
 _RAGGED_TENSOR_DEFAULT_DTYPE = "torch.float32"
+_TYPED_RAGGED_DEFAULT_DTYPE = "float64"
+# Fallback field spec when a member has no stored encoding metadata (e.g. older
+# format or unknown field).  Treated as opaque bytes by the read path.
+_BYTES_FIELD_SPEC: dict[str, str] = {"encoding": "bytes"}
+_INFER_STRUCTURE_MAX_DEPTH = 32
 
 
 class BundleStore(Protocol):
@@ -812,7 +817,7 @@ class MooncakeBundleTransfer:
         metadata = _decode_structured_metadata(
             self._bundle_store.read_payload(manifest["meta"])
         )
-        field_spec = _structured_field_specs(metadata).get(member, {"encoding": "bytes"})
+        field_spec = _structured_field_specs(metadata).get(member, _BYTES_FIELD_SPEC)
         payload_spec = manifest["buffers"][member]
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "ndarray":
@@ -1695,7 +1700,7 @@ def _dataproto_manifest_view(
     for name, location in ref.field_index.items():
         metadata = stage_metadata[location.stage]
         field_specs = _structured_field_specs(metadata)
-        member_spec = dict(field_specs.get(location.member, {"encoding": "bytes"}))
+        member_spec = dict(field_specs.get(location.member, _BYTES_FIELD_SPEC))
         encoded = ref.encoded_non_tensor.get(name)
         if encoded is not None:
             member_spec = {
@@ -1704,7 +1709,7 @@ def _dataproto_manifest_view(
                 "metadata": encoded.get("metadata"),
                 "payload_members": dict(encoded["payload_members"]),
                 "payload_specs": {
-                    payload_name: dict(field_specs.get(member, {"encoding": "bytes"}))
+                    payload_name: dict(field_specs.get(member, _BYTES_FIELD_SPEC))
                     for payload_name, member in encoded["payload_members"].items()
                 },
             }
@@ -2698,13 +2703,8 @@ def _decode_ragged_tensor_dict_values(
 def _encode_typed_ragged_values(
     values: list[Any], dtype_hint: np.dtype[Any] | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if dtype_hint is None:
-        source_arrays = [np.asarray(value) for value in values if value is not None]
-        dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(np.int64)
-    else:
-        dtype = np.dtype(dtype_hint)
-    if dtype.hasobject:
-        raise ValueError("typed_ragged codec requires non-object dtype")
+    source_arrays = [np.asarray(value) for value in values if value is not None]
+    dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(_TYPED_RAGGED_DEFAULT_DTYPE)
     arrays = [
         np.asarray([], dtype=dtype)
         if value is None
@@ -2772,7 +2772,7 @@ def _decode_typed_ragged_values(
     payload: dict[str, Any], rows: int, metadata: Optional[Mapping[str, Any]] = None
 ) -> list[Any]:
     raw = payload["data"]
-    dtype_str = (metadata or {}).get("dtype", "float64")
+    dtype_str = (metadata or {}).get("dtype", _TYPED_RAGGED_DEFAULT_DTYPE)
     np_dtype = np.dtype(dtype_str)
     # data may arrive as torch.Tensor, bytes, or numpy (pool-backed or typed)
     if _torch is not None and isinstance(raw, _torch.Tensor):
@@ -3039,7 +3039,7 @@ class _StructuredObjectLayer:
         batch_eligible: list[tuple[str, Any]] = []
         non_batch: list[str] = []
         for name in selected:
-            fs = field_specs.get(name, {"encoding": "bytes"})
+            fs = field_specs.get(name, _BYTES_FIELD_SPEC)
             encoding = fs.get("encoding", "bytes")
             nbytes = int(buffers[name].get("bytes", 0))
             ms = member_slices.get(name)
@@ -3078,7 +3078,7 @@ class _StructuredObjectLayer:
             objects[name] = self._read_structured_member(
                 name=name,
                 payload_spec=buffers[name],
-                field_spec=field_specs.get(name, {"encoding": "bytes"}),
+                field_spec=field_specs.get(name, _BYTES_FIELD_SPEC),
                 member_slice=member_slices.get(name),
                 destination=destination_map.get(name),
             )
@@ -4979,7 +4979,7 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
                 "dtype": value.dtype,
                 "shape": list(value.shape),
             }, value
-        return {"encoding": "bytes"}, value
+        return _BYTES_FIELD_SPEC, value
     if _torch is not None and isinstance(value, _torch.Tensor):
         return _encode_torch_tensor_field(value)
     if isinstance(value, np.ndarray):
@@ -4989,7 +4989,7 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
             "dtype": array.dtype.str,
             "shape": list(array.shape),
         }, array.view(np.uint8).reshape(-1)
-    return {"encoding": "bytes"}, value
+    return _BYTES_FIELD_SPEC, value
 
 
 def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
@@ -5371,8 +5371,8 @@ def _infer_structure(
     *,
     depth: int = 0,
 ) -> None:
-    if depth > 32:
-        raise ValueError(f"infer_structure exceeded max depth 32 at {path!r}")
+    if depth > _INFER_STRUCTURE_MAX_DEPTH:
+        raise ValueError(f"infer_structure exceeded max depth {_INFER_STRUCTURE_MAX_DEPTH} at {path!r}")
     dict_keys = _try_expand_dict(values)
     if dict_keys is not None:
         row_mask = [isinstance(value, dict) for value in values]
