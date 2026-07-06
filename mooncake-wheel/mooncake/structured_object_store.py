@@ -808,9 +808,7 @@ class MooncakeBundleTransfer:
         metadata = _decode_structured_metadata(
             self._bundle_store.read_payload(manifest["meta"])
         )
-        field_spec = _structured_field_specs(metadata).get(
-            member, {"encoding": "bytes"}
-        )
+        field_spec = _structured_field_specs(metadata).get(member, {"encoding": "bytes"})
         payload_spec = manifest["buffers"][member]
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "ndarray":
@@ -840,9 +838,7 @@ class MooncakeBundleTransfer:
         dtype_obj = np.dtype(dtype)
         full_shape = tuple(int(dim) for dim in shape)
         if not full_shape:
-            raise ValueError(
-                "structured ndarray indexed read requires at least one dimension"
-            )
+            raise ValueError("structured ndarray indexed read requires at least one dimension")
         output_shape = (len(indices), *full_shape[1:])
         if isinstance(destination, _RawDestinationBuffer):
             nbytes = int(np.prod(output_shape, dtype=np.int64)) * dtype_obj.itemsize
@@ -859,9 +855,7 @@ class MooncakeBundleTransfer:
             )
             if not indices:
                 return target
-            row_width = dtype_obj.itemsize * int(
-                np.prod(full_shape[1:], dtype=np.int64)
-            )
+            row_width = dtype_obj.itemsize * int(np.prod(full_shape[1:], dtype=np.int64))
             ranges = [
                 (row * row_width, out * row_width, row_width)
                 for out, row in enumerate(indices)
@@ -878,9 +872,7 @@ class MooncakeBundleTransfer:
                 ctypes.memmove(destination.ptr, bytes(data), nbytes)
             _ = destination.owner
             return target
-        target = _resolve_ndarray_destination(
-            name, destination, dtype_obj, output_shape
-        )
+        target = _resolve_ndarray_destination(name, destination, dtype_obj, output_shape)
         if not indices:
             return target
         row_width = dtype_obj.itemsize * int(np.prod(full_shape[1:], dtype=np.int64))
@@ -910,24 +902,17 @@ class MooncakeBundleTransfer:
                 f"structured tensor field {name} is missing slice metadata"
             )
         if not shape:
-            raise ValueError(
-                "structured tensor indexed read requires at least one dimension"
-            )
+            raise ValueError("structured tensor indexed read requires at least one dimension")
         row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
         data_length = len(indices) * row_width
-        metadata = self._bundle_store.read_payload_range(
-            payload_spec, 0, metadata_bytes
-        )
+        metadata = self._bundle_store.read_payload_range(payload_spec, 0, metadata_bytes)
         sliced_metadata = _slice_tensor_metadata(
             metadata, (len(indices), *shape[1:]), data_length
         )
         if destination is not None:
-            if not isinstance(
-                destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)
-            ):
+            if not isinstance(destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)):
                 raise ValueError(
-                    f"structured tensor member {name} only supports tensor_object_buffer "
-                    "or raw_destination destinations"
+                    f"structured tensor member {name} only supports tensor_object_buffer or raw_destination destinations"
                 )
             expected_bytes = metadata_bytes + data_length
             if destination.size < expected_bytes:
@@ -971,10 +956,7 @@ class MooncakeBundleTransfer:
             self._bundle_store.read_payload_ranges_into_bytearray(
                 payload_spec,
                 data,
-                [
-                    (metadata_bytes + row * row_width, out * row_width, row_width)
-                    for out, row in enumerate(indices)
-                ],
+                [(metadata_bytes + row * row_width, out * row_width, row_width) for out, row in enumerate(indices)],
             )
         return _deserialize_tensor_payload(sliced_metadata + data)
 
@@ -1005,9 +987,7 @@ class MooncakeBundleTransfer:
                 )
             return np.dtype(dtype)
 
-        def read_member_indices(
-            payload_name: str, member_indices: Sequence[int]
-        ) -> Any:
+        def read_member_indices(payload_name: str, member_indices: Sequence[int]) -> Any:
             return self._read_dataproto_member_indices(
                 stage_ref, member(payload_name), member_indices, None
             )
@@ -1281,9 +1261,7 @@ class MooncakeBundleTransfer:
                 for key in ("missing_payload", "row_mask_payload", "lengths_payload"):
                     payload_name = node.get(key)
                     if payload_name is not None:
-                        recursive_payload[payload_name] = read_member(
-                            payload_name, start, end
-                        )
+                        recursive_payload[payload_name] = read_member(payload_name, start, end)
             for leaf in metadata.get("leaves", []):
                 leaf_payload_members = leaf["payload_members"]
                 flat_payload_members = {
@@ -1971,13 +1949,9 @@ def _coerce_dataproto_row_selection(
             count=_slice_length(member_slice, total_rows), member_slice=member_slice
         )
     if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes, bytearray)):
-        indices = tuple(
-            _normalize_dataproto_row_index(index, total_rows) for index in rows
-        )
+        indices = tuple(_normalize_dataproto_row_index(index, total_rows) for index in rows)
         return _DataProtoRowSelection(count=len(indices), indices=indices)
-    raise TypeError(
-        "DataProto rows must be a slice, StructuredMemberSlice, or row index sequence"
-    )
+    raise TypeError("DataProto rows must be a slice, StructuredMemberSlice, or row index sequence")
 
 
 def _normalize_dataproto_row_index(index: Any, total_rows: int) -> int:
@@ -1987,9 +1961,7 @@ def _normalize_dataproto_row_index(index: Any, total_rows: int) -> int:
     if normalized < 0:
         normalized += total_rows
     if normalized < 0 or normalized >= total_rows:
-        raise IndexError(
-            f"DataProto row index {index} out of range for {total_rows} rows"
-        )
+        raise IndexError(f"DataProto row index {index} out of range for {total_rows} rows")
     return normalized
 
 
@@ -3163,12 +3135,9 @@ class _StructuredObjectLayer:
                 name, payload_spec, field_spec, member_slice, destination
             )
         if destination is not None:
-            if not isinstance(
-                destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)
-            ):
+            if not isinstance(destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)):
                 raise ValueError(
-                    f"structured tensor member {name} only supports tensor_object_buffer "
-                    "or raw_destination destinations"
+                    f"structured tensor member {name} only supports tensor_object_buffer or raw_destination destinations"
                 )
             materialized = self._bundle_store.read_tensor_payload_into(
                 payload_spec, destination
@@ -3218,12 +3187,9 @@ class _StructuredObjectLayer:
             metadata, (end - start, *shape[1:]), data_length
         )
         if destination is not None:
-            if not isinstance(
-                destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)
-            ):
+            if not isinstance(destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)):
                 raise ValueError(
-                    f"structured tensor member {name} only supports tensor_object_buffer "
-                    "or raw_destination destinations"
+                    f"structured tensor member {name} only supports tensor_object_buffer or raw_destination destinations"
                 )
             expected_bytes = metadata_bytes + data_length
             if destination.size < expected_bytes:
@@ -3642,9 +3608,7 @@ class _BundleManifestStore:
     ) -> None:
         if not ranges:
             return
-        self._transport.read_payload_ranges_into_array(
-            payload_spec, destination, ranges
-        )
+        self._transport.read_payload_ranges_into_array(payload_spec, destination, ranges)
 
     def read_payload_ranges_into_bytearray(
         self,
@@ -3824,9 +3788,7 @@ class _BundleManifestStore:
         if not isinstance(buffer_object_ids, list) or not all(
             isinstance(item, str) for item in buffer_object_ids
         ):
-            raise ValueError(
-                "bundle manifest buffer_object_ids must be a list of strings"
-            )
+            raise ValueError("bundle manifest buffer_object_ids must be a list of strings")
         allowed_buffer_base_keys = [
             f"{self._key_prefix}/{buffer_object_id}"
             for buffer_object_id in buffer_object_ids
@@ -3837,9 +3799,7 @@ class _BundleManifestStore:
             self._is_allowed_cleanup_key(item, allowed_buffer_base_keys)
             for item in cleanup_keys
         ):
-            raise ValueError(
-                "bundle manifest cleanup_keys are outside the bundle namespace"
-            )
+            raise ValueError("bundle manifest cleanup_keys are outside the bundle namespace")
         buffers = manifest.get("buffers")
         if not isinstance(buffers, dict):
             raise ValueError("bundle manifest buffers must be a dict")
@@ -3865,9 +3825,7 @@ class _BundleManifestStore:
         payload_key = payload_spec.get("key")
         if not isinstance(payload_key, str) or (
             base_keys is not None
-            and not any(
-                payload_key.startswith(f"{base_key}/") for base_key in base_keys
-            )
+            and not any(payload_key.startswith(f"{base_key}/") for base_key in base_keys)
         ):
             raise ValueError("bundle payload key is outside the bundle namespace")
         expected_bytes = int(payload_spec.get("bytes", -1))
@@ -4543,9 +4501,7 @@ class _MooncakePayloadTransport:
         fragments = []
         for source_offset, destination_offset, byte_length in ranges:
             fragments.extend(
-                _payload_range_fragments(
-                    chunks, source_offset, byte_length, destination_offset
-                )
+                _payload_range_fragments(chunks, source_offset, byte_length, destination_offset)
             )
         if not fragments:
             return True
