@@ -57,6 +57,20 @@ target_link_libraries(
          glog
          ibverbs
          pthread)
+add_executable(promotion_budget_service_probe
+               promotion_budget_service_probe.cpp)
+target_include_directories(promotion_budget_service_probe
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(
+  promotion_budget_service_probe
+  PUBLIC mooncake_store
+         transfer_engine
+         cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB}
+         glog
+         gflags
+         ibverbs
+         pthread)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
