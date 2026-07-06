@@ -2,10 +2,12 @@
 import asyncio
 import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,9 +18,10 @@ except ModuleNotFoundError:
     web_module = types.ModuleType("aiohttp.web")
 
     class Response:
-        def __init__(self, status=200, text="", content_type=None):
+        def __init__(self, status=200, text="", body=None, content_type=None):
             self.status = status
             self.text = text
+            self.body = body
             self.content_type = content_type
 
     web_module.Response = Response
@@ -49,6 +52,11 @@ class FakeStore:
         self.unmount_failures = set()
         self.allocated_mount_calls = []
         self.free_unmount_calls = []
+        self.setup_calls = []
+
+    def setup(self, *args):
+        self.setup_calls.append(args)
+        return 0
 
     def mount_segment(self, path, size, offset, protocol, location):
         self.mount_calls.append((path, size, offset, protocol, location))
@@ -105,6 +113,64 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.service.mounted_segment_ids = []
         self.service.last_mount_info = {}
         self.service._state_lock = asyncio.Lock()
+
+    async def test_start_store_service_passes_tenant_id_to_setup(self):
+        fake_store = FakeStore()
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1024,
+            local_buffer_size=2048,
+            protocol="tcp",
+            device_name="",
+            master_server_address="127.0.0.1:50051",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="tenant-a",
+        )
+
+        with patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            return_value=fake_store,
+        ):
+            result = await self.service.start_store_service(max_wait_time=1)
+
+        self.assertTrue(result)
+        self.assertEqual(
+            fake_store.setup_calls,
+            [
+                (
+                    "localhost",
+                    "P2PHANDSHAKE",
+                    1024,
+                    2048,
+                    "tcp",
+                    "",
+                    "127.0.0.1:50051",
+                    None,
+                    False,
+                    "",
+                    "tenant-a",
+                )
+            ],
+        )
+
+    async def test_cli_config_can_override_tenant_id(self):
+        config = {
+            "local_hostname": "localhost",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server_address": "127.0.0.1:50051",
+            "tenant_id": "tenant-from-file",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(json.dumps(config))
+            service = MooncakeStoreService(
+                str(config_path), {"tenant_id": "tenant-from-cli"}
+            )
+
+        self.assertEqual(service.config.tenant_id, "tenant-from-cli")
 
     async def test_mount_shm_then_unmount_shm_api(self):
         mount_resp = await self.service.handle_mount_shm(
@@ -306,6 +372,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     # ==================== /api/get/{key} tests ====================
 
     async def test_handle_get_success(self):
+        self.fake_store.is_exist = lambda key: True
         self.fake_store.get = lambda key: b"payload_bytes"
         request = FakeRequest({})
         request.match_info = {"key": "my_key"}
@@ -314,7 +381,8 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.body, b"payload_bytes")
 
     async def test_handle_get_not_found(self):
-        self.fake_store.get = lambda key: None
+        self.fake_store.is_exist = lambda key: 0
+        self.fake_store.get = lambda key: b""
         request = FakeRequest({})
         request.match_info = {"key": "missing_key"}
         resp = await self.service.handle_get(request)
@@ -322,7 +390,28 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertIn("Key not found", body["error"])
 
+    async def test_handle_get_exist_check_failure(self):
+        self.fake_store.is_exist = lambda key: -1
+        self.fake_store.get = lambda key: b""
+        request = FakeRequest({})
+        request.match_info = {"key": "error_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertIn("Exist check failed", body["error"])
+
     async def test_handle_get_empty_bytes(self):
+        self.fake_store.is_exist = lambda key: True
+        self.fake_store.get = lambda key: b""
+        request = FakeRequest({})
+        request.match_info = {"key": "empty_value_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.body, b"")
+
+    async def test_handle_get_empty_bytes_rechecks_existence(self):
+        existence_results = iter([1, 0])
+        self.fake_store.is_exist = lambda key: next(existence_results)
         self.fake_store.get = lambda key: b""
         request = FakeRequest({})
         request.match_info = {"key": "empty_value_key"}
@@ -331,10 +420,21 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertIn("Key not found", body["error"])
 
+    async def test_handle_get_none_value_is_store_failure(self):
+        self.fake_store.is_exist = lambda key: True
+        self.fake_store.get = lambda key: None
+        request = FakeRequest({})
+        request.match_info = {"key": "empty_value_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertIn("GET operation failed", body["error"])
+
     async def test_handle_get_store_exception(self):
         def raise_error(key):
             raise RuntimeError("store crashed")
 
+        self.fake_store.is_exist = lambda key: True
         self.fake_store.get = raise_error
         request = FakeRequest({})
         request.match_info = {"key": "crash_key"}
@@ -374,6 +474,19 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 500)
         body = json.loads(resp.text)
         self.assertIn("exist check crashed", body["error"])
+
+    async def test_handle_exist_store_error(self):
+        # is_exist returns -1 when the store is unhealthy; this should surface
+        # as HTTP 500, not as HTTP 200 {"exists": true} (bool(-1) == True).
+        self.fake_store.is_exist = lambda key: -1
+        request = FakeRequest({})
+        request.match_info = {"key": "some_key"}
+        resp = await self.service.handle_exist(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        # Assert the specific message so this pins the exists < 0 branch rather
+        # than any 500 (the except path returns {"error": str(e)} too).
+        self.assertEqual(body["error"], "Exist check failed")
 
     # ==================== /api/remove/{key} tests ====================
 

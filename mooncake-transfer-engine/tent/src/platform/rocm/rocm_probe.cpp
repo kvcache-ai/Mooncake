@@ -15,6 +15,7 @@
 #include "tent/platform/rocm.h"
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
+#include "char_util.h"
 
 #include <glog/logging.h>
 #include <fstream>
@@ -24,7 +25,6 @@
 #include <utility>
 #include <vector>
 #include <hip/hip_runtime.h>
-#include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -182,7 +182,7 @@ static void discoverRocmTopology(std::vector<Topology::NicEntry>& nic_list,
         char pci_bus_id[20];
         snprintf(pci_bus_id, sizeof(pci_bus_id), "%04x:%02x:%02x.%x",
                  prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, 0);
-        for (char* ch = pci_bus_id; *ch; ch++) *ch = tolower(*ch);
+        for (char* ch = pci_bus_id; *ch; ch++) *ch = to_lower(*ch);
 
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;

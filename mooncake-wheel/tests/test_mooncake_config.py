@@ -27,7 +27,8 @@ class TestMooncakeConfig(unittest.TestCase):
             "protocol": "tcp",
             "device_name": "eth0",
             "enable_ssd_offload": True,
-            "ssd_offload_path": "/nvme/mooncake_offload"
+            "ssd_offload_path": "/nvme/mooncake_offload",
+            "tenant_id": "tenant-a"
         }
 
     def tearDown(self):
@@ -52,6 +53,7 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.device_name, "eth0")
         self.assertEqual(config.enable_ssd_offload, True)
         self.assertEqual(config.ssd_offload_path, "/nvme/mooncake_offload")
+        self.assertEqual(config.tenant_id, "tenant-a")
 
     def test_load_with_default_values(self):
         """Test loading configuration with default values"""
@@ -69,6 +71,77 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.device_name, "")
         self.assertEqual(config.enable_ssd_offload, False)
         self.assertEqual(config.ssd_offload_path, "")
+        self.assertEqual(config.tenant_id, "default")
+
+    def test_load_tenant_id_from_file(self):
+        """Test loading tenant_id from configuration file"""
+        self.write_config({**self.valid_config, "tenant_id": "tenant-from-file"})
+        config = MooncakeConfig.from_file(self.config_file)
+
+        self.assertEqual(config.tenant_id, "tenant-from-file")
+
+    def test_tenant_id_defaults(self):
+        """Test tenant_id defaults to default when omitted"""
+        minimal_config = {
+            "local_hostname": "localhost",
+            "metadata_server": "localhost:8080",
+            "master_server_address": "localhost:8081"
+        }
+        self.write_config(minimal_config)
+        config = MooncakeConfig.from_file(self.config_file)
+
+        self.assertEqual(config.tenant_id, "default")
+
+    def test_tenant_id_null_defaults(self):
+        """Test tenant_id defaults to default when explicitly null"""
+        self.write_config({**self.valid_config, "tenant_id": None})
+        config = MooncakeConfig.from_file(self.config_file)
+
+        self.assertEqual(config.tenant_id, "default")
+
+    def test_ssd_offload_path_null_defaults(self):
+        """Test ssd_offload_path defaults to empty when explicitly null"""
+        self.write_config({**self.valid_config, "ssd_offload_path": None})
+        config = MooncakeConfig.from_file(self.config_file)
+
+        self.assertEqual(config.ssd_offload_path, "")
+
+    def test_enable_ssd_offload_string_values(self):
+        """from_file must parse string booleans like load_from_env, and reject typos.
+
+        from_file used bool(value), so any non-empty string (including "false")
+        turned SSD offload on, disagreeing with load_from_env which parses the
+        string. _parse_bool now understands the common textual forms and raises
+        on anything unrecognized instead of silently defaulting to False.
+        """
+        required = {
+            "local_hostname": "localhost",
+            "metadata_server": "localhost:8080",
+            "master_server_address": "localhost:8081",
+        }
+        cases = [
+            ("false", False),
+            ("False", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            (True, True),
+            (False, False),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.write_config({**required, "enable_ssd_offload": raw})
+                config = MooncakeConfig.from_file(self.config_file)
+                self.assertEqual(config.enable_ssd_offload, expected)
+
+        # An unrecognized string is a config error, not a silent disable.
+        self.write_config({**required, "enable_ssd_offload": "notabool"})
+        with self.assertRaises(ValueError):
+            MooncakeConfig.from_file(self.config_file)
 
     def test_missing_required_field(self):
         """Test missing required field"""
@@ -107,6 +180,7 @@ class TestMooncakeConfig(unittest.TestCase):
         os.environ['MOONCAKE_DEVICE'] = self.valid_config["device_name"]
         os.environ['MOONCAKE_OFFLOAD_ENABLED'] = str(self.valid_config["enable_ssd_offload"])
         os.environ['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH'] = self.valid_config["ssd_offload_path"]
+        os.environ['MOONCAKE_TENANT_ID'] = self.valid_config["tenant_id"]
 
         try:
             config = MooncakeConfig.load_from_env()
@@ -118,6 +192,7 @@ class TestMooncakeConfig(unittest.TestCase):
             self.assertEqual(config.device_name, self.valid_config["device_name"])
             self.assertEqual(config.enable_ssd_offload, self.valid_config["enable_ssd_offload"])
             self.assertEqual(config.ssd_offload_path, self.valid_config["ssd_offload_path"])
+            self.assertEqual(config.tenant_id, self.valid_config["tenant_id"])
 
         finally:
             # Clean up environment variable
@@ -129,6 +204,50 @@ class TestMooncakeConfig(unittest.TestCase):
             del os.environ['MOONCAKE_DEVICE']
             del os.environ['MOONCAKE_OFFLOAD_ENABLED']
             del os.environ['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH']
+            del os.environ['MOONCAKE_TENANT_ID']
+
+    def test_tenant_id_from_env(self):
+        """Test loading tenant_id from MOONCAKE_TENANT_ID"""
+        previous_config_path = os.environ.pop("MOONCAKE_CONFIG_PATH", None)
+        previous_master = os.environ.pop("MOONCAKE_MASTER", None)
+        previous_tenant_id = os.environ.pop("MOONCAKE_TENANT_ID", None)
+
+        os.environ["MOONCAKE_MASTER"] = self.valid_config["master_server_address"]
+        os.environ["MOONCAKE_TENANT_ID"] = "tenant-from-env"
+
+        try:
+            config = MooncakeConfig.load_from_env()
+            self.assertEqual(config.tenant_id, "tenant-from-env")
+        finally:
+            os.environ.pop("MOONCAKE_MASTER", None)
+            os.environ.pop("MOONCAKE_TENANT_ID", None)
+            if previous_config_path is not None:
+                os.environ["MOONCAKE_CONFIG_PATH"] = previous_config_path
+            if previous_master is not None:
+                os.environ["MOONCAKE_MASTER"] = previous_master
+            if previous_tenant_id is not None:
+                os.environ["MOONCAKE_TENANT_ID"] = previous_tenant_id
+
+    def test_tenant_id_env_defaults(self):
+        """Test tenant_id defaults to default when MOONCAKE_TENANT_ID is omitted"""
+        previous_config_path = os.environ.pop("MOONCAKE_CONFIG_PATH", None)
+        previous_master = os.environ.pop("MOONCAKE_MASTER", None)
+        previous_tenant_id = os.environ.pop("MOONCAKE_TENANT_ID", None)
+
+        os.environ["MOONCAKE_MASTER"] = self.valid_config["master_server_address"]
+
+        try:
+            config = MooncakeConfig.load_from_env()
+            self.assertEqual(config.tenant_id, "default")
+        finally:
+            os.environ.pop("MOONCAKE_MASTER", None)
+            os.environ.pop("MOONCAKE_TENANT_ID", None)
+            if previous_config_path is not None:
+                os.environ["MOONCAKE_CONFIG_PATH"] = previous_config_path
+            if previous_master is not None:
+                os.environ["MOONCAKE_MASTER"] = previous_master
+            if previous_tenant_id is not None:
+                os.environ["MOONCAKE_TENANT_ID"] = previous_tenant_id
 
     def test_load_from_env_missing(self):
         """Test loading configuration from environment variable when not set"""

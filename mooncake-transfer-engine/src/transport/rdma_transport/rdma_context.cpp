@@ -32,6 +32,7 @@
 #include "config.h"
 #include "cuda_alike.h"
 #include "environ.h"
+#include "hip_device_guard.h"
 #if defined(USE_HIP_DMABUF)
 #include <sys/utsname.h>
 
@@ -794,9 +795,11 @@ static GidNetworkState autoGidStateFromSelection(
     const AutoGidSelection &selection) {
     switch (selection.candidate_class) {
         case AutoGidCandidateClass::kNetworkRoutable:
+        case AutoGidCandidateClass::kNetworkPrivateV4:
         case AutoGidCandidateClass::kNetworkDegraded:
             return GidNetworkState::GID_WITH_NETWORK;
         case AutoGidCandidateClass::kNoNetworkRoutable:
+        case AutoGidCandidateClass::kNoNetworkPrivateV4:
         case AutoGidCandidateClass::kNoNetworkDegraded:
         case AutoGidCandidateClass::kFallbackNonzero:
             return GidNetworkState::GID_WITHOUT_NETWORK;

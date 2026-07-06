@@ -194,18 +194,19 @@ bool ascend_is_store_memory(void *addr, size_t length) {
 }
 
 void ascend_free_memory(const std::string &protocol, void *ptr) {
-    // make sure ascend_use_fabric_mem do not change between malloc and free
-    if (globalConfig().ascend_use_fabric_mem) {
+    // Route by the per-allocation record, not the process-global fabric flag:
+    // ascend_use_fabric_mem can differ between alloc time and free time (it is
+    // a process-global toggled during TE init), so it cannot be trusted here.
+    // Only fabric/VMM allocations are recorded in g_vmm_alloc_records;
+    // everything else is a plain aclrtMallocHost buffer.
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
-        remove_store_memory_range(ptr);
-        std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-        auto it = g_vmm_alloc_records.find(ptr);
-        if (it == g_vmm_alloc_records.end()) {
-            LOG(INFO) << "Can not find record for va:" << ptr;
-            return;
-        }
+    std::unique_lock<std::mutex> lock(g_vmm_alloc_mutex);
+    auto it = g_vmm_alloc_records.find(ptr);
+    if (it != g_vmm_alloc_records.end()) {
         const AllocRecord alloc_record = it->second;
         g_vmm_alloc_records.erase(it);
+        lock.unlock();
+        remove_store_memory_range(ptr);
         if (!alloc_record.is_direct_alloc) {
             if (&adxl::AdxlEngine::FreeMem != nullptr) {
                 auto status = adxl::AdxlEngine::FreeMem(ptr);
@@ -231,9 +232,10 @@ void ascend_free_memory(const std::string &protocol, void *ptr) {
             LOG(ERROR) << "Failed to free physical mem: " << ptr;
             return;
         }
-#endif
         return;
     }
+    lock.unlock();
+#endif
 
     if (protocol == "ascend") {
         remove_store_memory_range(ptr);
