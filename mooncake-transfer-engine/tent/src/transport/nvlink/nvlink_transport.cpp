@@ -280,15 +280,19 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     if (batch->stream_device_id >= 0) {
         auto err = cudaGetDevice(&saved_device);
         if (err != cudaSuccess) {
-            LOG(ERROR) << "NVLinkTransport: cudaGetDevice failed: " << cudaGetErrorString(err);
-            for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+            LOG(ERROR) << "NVLinkTransport: cudaGetDevice failed: "
+                       << cudaGetErrorString(err);
+            for (auto* task : tasks)
+                task->status_word = TransferStatusEnum::FAILED;
             return;
         }
         if (saved_device != batch->stream_device_id) {
             err = cudaSetDevice(batch->stream_device_id);
             if (err != cudaSuccess) {
-                LOG(ERROR) << "NVLinkTransport: cudaSetDevice failed: " << cudaGetErrorString(err);
-                for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+                LOG(ERROR) << "NVLinkTransport: cudaSetDevice failed: "
+                           << cudaGetErrorString(err);
+                for (auto* task : tasks)
+                    task->status_word = TransferStatusEnum::FAILED;
                 return;
             }
         }
