@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -222,17 +223,27 @@ ErrorCode LocalFsOpLogStore::ReadUint64FromFile(const std::string& filepath,
         return ErrorCode::INTERNAL_ERROR;
     }
     std::string content;
-    f >> content;
-    try {
-        size_t parsed_len = 0;
-        value = std::stoull(content, &parsed_len);
-        if (parsed_len != content.size()) {
-            LOG(ERROR) << "ReadUint64FromFile: trailing characters in "
-                       << filepath << ": " << content;
-            return ErrorCode::INTERNAL_ERROR;
-        }
-    } catch (...) {
+    if (!(f >> content)) {
+        LOG(ERROR) << "ReadUint64FromFile: empty or unreadable file "
+                   << filepath;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    std::string extra;
+    if (f >> extra) {
+        LOG(ERROR) << "ReadUint64FromFile: extra content in " << filepath;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (!std::all_of(content.begin(), content.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        })) {
         LOG(ERROR) << "ReadUint64FromFile: invalid content in " << filepath
+                   << ": " << content;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    try {
+        value = std::stoull(content);
+    } catch (...) {
+        LOG(ERROR) << "ReadUint64FromFile: value out of range in " << filepath
                    << ": " << content;
         return ErrorCode::INTERNAL_ERROR;
     }

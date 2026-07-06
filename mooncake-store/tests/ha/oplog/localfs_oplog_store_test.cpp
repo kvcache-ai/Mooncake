@@ -303,6 +303,24 @@ TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsInvalidContent) {
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
 }
 
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsNegativeNumber) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "-42";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsMultipleTokens) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "42 43";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
 TEST_F(LocalFsOpLogStoreTest, GetMaxSequenceIdEmpty) {
     auto store = CreateWriter();
     uint64_t seq = 0;
