@@ -5399,14 +5399,15 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
             }
         } else {
             struct Candidate {
-                std::string storage_key;
-                PromotionTaskItem task_item;
+                const std::string* storage_key;
+                const PromotionTaskItem* task_item;
                 int64_t remaining_ms;
             };
 
             const auto now = std::chrono::steady_clock::now();
             std::vector<Candidate> candidates;
             std::vector<std::string> expired_storage_keys;
+            candidates.reserve(src.size());
 
             for (const auto& [storage_key, task_item] : src) {
                 const auto elapsed_ms =
@@ -5422,7 +5423,7 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                     continue;
                 }
                 candidates.push_back(
-                    Candidate{storage_key, task_item, remaining_ms});
+                    Candidate{&storage_key, &task_item, remaining_ms});
             }
 
             for (const auto& storage_key : expired_storage_keys) {
@@ -5435,18 +5436,18 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                     if (a.remaining_ms != b.remaining_ms) {
                         return a.remaining_ms < b.remaining_ms;
                     }
-                    if (a.task_item.queued_time != b.task_item.queued_time) {
-                        return a.task_item.queued_time <
-                               b.task_item.queued_time;
+                    if (a.task_item->queued_time != b.task_item->queued_time) {
+                        return a.task_item->queued_time <
+                               b.task_item->queued_time;
                     }
-                    return a.storage_key < b.storage_key;
+                    return *a.storage_key < *b.storage_key;
                 });
 
             for (const auto& candidate : candidates) {
                 if (result.size() >= promotion_max_per_heartbeat_) {
                     break;
                 }
-                auto node = src.extract(candidate.storage_key);
+                auto node = src.extract(*candidate.storage_key);
                 if (node.empty()) {
                     continue;
                 }
