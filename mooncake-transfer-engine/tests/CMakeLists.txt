@@ -244,6 +244,13 @@ target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME rdma_gid_probe_test COMMAND rdma_gid_probe_test)
 
+add_executable(multi_transport_locality_test
+               ${WORKSPACE}/multi_transport_locality_test.cpp)
+target_link_libraries(multi_transport_locality_test PUBLIC transfer_engine gtest
+                                                           gtest_main)
+add_test(NAME multi_transport_locality_test
+         COMMAND multi_transport_locality_test)
+
 add_executable(rdma_context_reprobe_test
                ${WORKSPACE}/rdma_context_reprobe_test.cpp)
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
