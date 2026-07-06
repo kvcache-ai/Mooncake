@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
 
 #include "ha/oplog/localfs_oplog_store.h"
 #include "ha/oplog/oplog_store_factory.h"
@@ -288,11 +289,18 @@ TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdMissingFileDefaultsToZero) {
 TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdReturnsErrorOnStatFailure) {
     auto store = CreateReader();
     const std::string cluster_path = test_dir_ + "/" + cluster_id_;
-    fs::remove_all(cluster_path);
-    std::ofstream(cluster_path) << "not a directory";
+    fs::create_directories(cluster_path);
+    std::error_code permission_error;
+    fs::permissions(cluster_path, fs::perms::none,
+                    fs::perm_options::replace, permission_error);
+    ASSERT_FALSE(permission_error) << permission_error.message();
 
     uint64_t seq = 999;
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+    auto err = store->GetLatestSequenceId(seq);
+
+    fs::permissions(cluster_path, fs::perms::owner_all,
+                    fs::perm_options::replace, permission_error);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 }
 
 TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsTrailingGarbage) {
