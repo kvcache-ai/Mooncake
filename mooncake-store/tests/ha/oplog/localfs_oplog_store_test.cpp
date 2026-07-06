@@ -285,6 +285,16 @@ TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdMissingFileDefaultsToZero) {
     EXPECT_EQ(0, seq);
 }
 
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdReturnsErrorOnStatFailure) {
+    auto store = CreateReader();
+    const std::string cluster_path = test_dir_ + "/" + cluster_id_;
+    fs::remove_all(cluster_path);
+    std::ofstream(cluster_path) << "not a directory";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
 TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsTrailingGarbage) {
     auto store = CreateWriter();
     const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
