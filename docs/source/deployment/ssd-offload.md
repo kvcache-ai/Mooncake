@@ -13,7 +13,7 @@ SSD offload requires the **Real Client** and supports two deployment modes:
 
 In both modes, all SSD reads and writes happen within the Real Client (embedded or standalone).
 
-The local filesystem-backed offload path does not use the master's `--root_fs_dir` option. Configure the local disk path on each Real Client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks offloaded objects as `LOCAL_DISK` replicas. `--root_fs_dir` belongs to the distributed filesystem-backed `DISK` replica path and requires the same mounted path on every client host.
+SSD offload does not use the master's `--root_fs_dir` option. Configure the local disk path on each Real Client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks offloaded objects as `LOCAL_DISK` replicas. `--root_fs_dir` is a legacy parameter from an older persistence path and may cause issues when used with `--enable_offload=true`.
 
 ## Startup Steps
 

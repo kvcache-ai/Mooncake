@@ -203,7 +203,7 @@ mooncake_master \
   --http_metadata_server_port=8080
 ```
 
-Do not set `--root_fs_dir` for the local filesystem-backed offload path. That path stores data through the real client's `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, and the master tracks those objects as `LOCAL_DISK` replicas. `--root_fs_dir` enables the distributed filesystem-backed `DISK` replica path and must only point to a filesystem path that is valid on every client host.
+Do not set `--root_fs_dir` with `--enable_offload=true`. `--root_fs_dir` is a legacy parameter from an older persistence path and may cause issues on the SSD offload path. Configure each real client's offload directory with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` instead.
 
 ---
 
@@ -545,7 +545,7 @@ Flags for controlling data movement between DRAM and SSD.
 
 Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued.
 
-For the local filesystem-backed offload path, configure the disk path on each real client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks these objects as `LOCAL_DISK` replicas. Do not use `--root_fs_dir` for a per-node filesystem path.
+For SSD offload, configure the disk path on each real client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks these objects as `LOCAL_DISK` replicas. Do not use the legacy `--root_fs_dir` parameter with `--enable_offload=true`.
 
 When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at most `offloading_queue_limit * offload_cap_ratio` objects for SSD offload (default: `50000 * 0.5 = 25000`); objects exceeding this cap fall back to force-evict (discard) if `--offload_force_evict=true`, otherwise they remain in memory. For SSD-heavy workloads where NVMe bandwidth is underutilized while the KV-cache hit rate suffers, raise both `--offloading_queue_limit` and `--offload_cap_ratio` so more objects per cycle are actually persisted to SSD instead of discarded. Example: `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` yields a per-cycle cap of `400000` (vs the default `25000`).
 
@@ -563,10 +563,10 @@ When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the maste
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root_fs_dir` | empty | DFS mount directory for multi-layer storage backend |
+| `--root_fs_dir` | empty | Legacy DFS persistence directory; do not use with SSD offload |
 | `--global_file_segment_size` | `INT64_MAX` (unlimited) | Max available space for DFS segments; default does not cap DFS usage |
 
-`--root_fs_dir` is for the distributed filesystem-backed `DISK` replica path. The configured path must be mounted consistently on every client host. It is separate from the local filesystem-backed offload path, which uses `LOCAL_DISK` replicas and client-side `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`.
+`--root_fs_dir` is a legacy persistence parameter and is expected to be replaced as the distributed filesystem path is refactored. For SSD offload, configure `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` on each real client instead.
 
 ### NoF (NVMe-oF SSD Pool)
 
