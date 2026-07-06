@@ -83,12 +83,28 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     params_ = params;
     endpoint_name_ = endpoint_name;
     inflight_slices_ = 0;
-    qp_list_.resize(params_->qp_mul_factor);
+
+    // Resolve the per-pool QP layout (see computeQpPoolSegments). Empty
+    // qp_pools (the default) keeps the historical single homogeneous run of
+    // qp_mul_factor data QPs; a non-empty config lays out one contiguous
+    // segment per pool. qp_pool_segments_ is read-only after construct().
+    QpPoolLayout layout =
+        computeQpPoolSegments(params_->qp_pools, params_->qp_mul_factor);
+    if (!layout.valid) {
+        LOG(ERROR) << "Invalid QP count " << layout.total_qp
+                   << " (qp_mul_factor=" << params_->qp_mul_factor
+                   << ", pools=" << params_->qp_pools.size() << ")";
+        return -1;
+    }
+    qp_pool_segments_ = std::move(layout.segments);
+    const int total_qp = layout.total_qp;
+
+    qp_list_.resize(total_qp);
     // Value-initialize the full array because cleanup may run after only a
     // prefix of QPs has been created.
-    wr_depth_list_ = new WrDepthBlock[params_->qp_mul_factor]();
+    wr_depth_list_ = new WrDepthBlock[total_qp]();
 
-    for (int i = 0; i < params_->qp_mul_factor; ++i) {
+    for (int i = 0; i < total_qp; ++i) {
         wr_depth_list_[i].value = 0;
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -648,6 +664,14 @@ int RdmaEndPoint::resetConnection(const std::string& reason) {
     return 0;
 }
 
+const QpPoolSegment* RdmaEndPoint::poolForQp(int qp_index) const {
+    for (const auto& seg : qp_pool_segments_) {
+        if (qp_index >= seg.begin && qp_index < seg.begin + seg.num_qp)
+            return &seg;
+    }
+    return nullptr;
+}
+
 int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
                               std::vector<uint32_t> peer_qp_num_list,
                               std::string* reply_msg) {
@@ -847,6 +871,19 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto& qp = qp_list_[qp_index];
 
+    // Resolve link-layer QoS for this QP. When it belongs to a pool that
+    // overrides SL/TC, use the pool's values; otherwise fall back to the global
+    // endpoint SL/TC (unchanged default behavior).
+    const QpPoolSegment* pool = poolForQp(qp_index);
+    const uint8_t qp_service_level =
+        (pool && pool->service_level >= 0)
+            ? static_cast<uint8_t>(pool->service_level)
+            : params_->service_level;
+    const uint8_t qp_traffic_class =
+        (pool && pool->traffic_class >= 0)
+            ? static_cast<uint8_t>(pool->traffic_class)
+            : params_->traffic_class;
+
     // RESET -> INIT
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -886,9 +923,9 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.ah_attr.grh.sgid_index = context().gidIndex();
     attr.ah_attr.grh.hop_limit = params_->hop_limit;
     attr.ah_attr.grh.flow_label = params_->flow_label;
-    attr.ah_attr.grh.traffic_class = params_->traffic_class;
+    attr.ah_attr.grh.traffic_class = qp_traffic_class;
     attr.ah_attr.dlid = peer_lid;
-    attr.ah_attr.sl = params_->service_level;
+    attr.ah_attr.sl = qp_service_level;
     attr.ah_attr.src_path_bits = params_->src_path_bits;
     attr.ah_attr.static_rate = params_->static_rate;
     attr.ah_attr.is_global = 1;

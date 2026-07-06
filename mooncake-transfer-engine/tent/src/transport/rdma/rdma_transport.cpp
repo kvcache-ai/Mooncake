@@ -37,6 +37,7 @@
 #include "tent/common/utils/string_builder.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
+#include "tent/thirdparty/nlohmann/json.h"
 
 #define SET_DEVICE(key, param) \
     param = conf->get("transports/rdma/device/" #key, param)
@@ -191,6 +192,41 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
         params->endpoint.path_mtu = IBV_MTU_1024;
     else
         params->endpoint.path_mtu = IBV_MTU_512;
+
+    // Optional per-pool QP layout (RFC #2568 step 2). Each entry defines a
+    // named pool with its own QP count and link-layer SL/TC;
+    // SelectionPolicy.qp_pool references these by name. Absent/empty => single
+    // default pool (unchanged). The pool SL/TC live here in the RDMA config,
+    // not in SelectionPolicy, to keep the link-layer QoS definition in the
+    // transport layer; policies only reference a pool by name.
+    params->endpoint.qp_pools.clear();
+    auto qp_pools_json =
+        conf->getArray<nlohmann::json>("transports/rdma/endpoint/qp_pools");
+    for (const auto& pool_json : qp_pools_json) {
+        if (!pool_json.is_object()) {
+            LOG(WARNING) << "Ignore non-object entry in qp_pools";
+            continue;
+        }
+        if (!pool_json.contains("name") || !pool_json["name"].is_string()) {
+            LOG(WARNING) << "Ignore qp_pool entry without a string 'name'";
+            continue;
+        }
+        QpPoolSegment seg;
+        seg.name = pool_json["name"].get<std::string>();
+        seg.num_qp = pool_json.value("num_qp", 0);
+        if (seg.num_qp <= 0) {
+            LOG(WARNING) << "Ignore qp_pool '" << seg.name
+                         << "' with non-positive num_qp " << seg.num_qp;
+            continue;
+        }
+        seg.service_level = pool_json.value("service_level", -1);
+        seg.traffic_class = pool_json.value("traffic_class", -1);
+        params->endpoint.qp_pools.push_back(std::move(seg));
+    }
+    if (!params->endpoint.qp_pools.empty()) {
+        LOG(INFO) << "Configured " << params->endpoint.qp_pools.size()
+                  << " QP pool(s) for per-class link-layer isolation";
+    }
 
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
     SET_WORKERS(block_size, params->workers.block_size);
