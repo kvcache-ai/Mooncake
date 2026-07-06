@@ -718,7 +718,17 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return 0;
     if (qp_index < 0) qp_index = 0;
-    qp_index %= qp_list_.size();
+    // Route to the QP pool this transfer asked for (RFC #2568 step 3). All
+    // slices in a list belong to one task, hence one pool; fold the worker-lane
+    // candidate into that pool's QP segment. Empty/unknown pool or no pools
+    // configured => unchanged global spray.
+    static const std::string kNoPool;
+    const std::string& pool_name =
+        (!slice_list.empty() && slice_list.front()->task)
+            ? slice_list.front()->task->qp_pool
+            : kNoPool;
+    qp_index = selectQpInPool(qp_pool_segments_, pool_name, qp_index,
+                              (int)qp_list_.size());
     // Check endpoint status before submitting
     if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());

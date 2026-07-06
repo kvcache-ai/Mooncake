@@ -109,6 +109,72 @@ TEST(QpPoolLayoutTest, SegmentsPartitionAllQpIndices) {
     EXPECT_EQ(pool_of(4), nullptr);
 }
 
+// --- selectQpInPool: the step-3 router (slice pool -> QP index)
+// ---------------
+
+// Helper: a two-pool layout kv=[0,4), ctrl=[4,6).
+static std::vector<QpPoolSegment> twoPools() {
+    auto layout = computeQpPoolSegments(
+        {{"kv", 4, 0, -1, -1}, {"ctrl", 2, 0, -1, -1}}, 6);
+    return layout.segments;
+}
+
+// Empty pool name => pass through, folded into the whole QP range. This is the
+// default (no pool selected) behavior — identical to the pre-step-3 spray.
+TEST(SelectQpInPoolTest, EmptyPoolNameSpraysAcrossAllQps) {
+    auto segs = twoPools();
+    EXPECT_EQ(selectQpInPool(segs, "", 0, 6), 0);
+    EXPECT_EQ(selectQpInPool(segs, "", 5, 6), 5);
+    EXPECT_EQ(selectQpInPool(segs, "", 7, 6), 1);  // 7 % 6
+}
+
+// No pools configured at all => also pass through (single default pool).
+TEST(SelectQpInPoolTest, NoSegmentsSpraysAcrossAllQps) {
+    std::vector<QpPoolSegment> none;
+    EXPECT_EQ(selectQpInPool(none, "kv", 3, 6), 3);
+    EXPECT_EQ(selectQpInPool(none, "", 8, 6), 2);  // 8 % 6
+}
+
+// A named pool folds the candidate into that pool's segment only.
+TEST(SelectQpInPoolTest, NamedPoolFoldsIntoItsSegment) {
+    auto segs = twoPools();  // kv=[0,4), ctrl=[4,6)
+    // kv: begin 0, num 4 -> indices 0..3
+    EXPECT_EQ(selectQpInPool(segs, "kv", 0, 6), 0);
+    EXPECT_EQ(selectQpInPool(segs, "kv", 3, 6), 3);
+    EXPECT_EQ(selectQpInPool(segs, "kv", 4, 6), 0);  // 4 % 4 -> begin+0
+    EXPECT_EQ(selectQpInPool(segs, "kv", 6, 6), 2);  // 6 % 4 -> begin+2
+    // ctrl: begin 4, num 2 -> indices 4..5
+    EXPECT_EQ(selectQpInPool(segs, "ctrl", 0, 6), 4);
+    EXPECT_EQ(selectQpInPool(segs, "ctrl", 1, 6), 5);
+    EXPECT_EQ(selectQpInPool(segs, "ctrl", 3, 6), 5);  // 3 % 2 -> begin+1
+}
+
+// Unknown pool name => fall back to the whole range (don't drop the transfer).
+TEST(SelectQpInPoolTest, UnknownPoolFallsBackToWholeRange) {
+    auto segs = twoPools();
+    EXPECT_EQ(selectQpInPool(segs, "nope", 5, 6), 5);
+    EXPECT_EQ(selectQpInPool(segs, "nope", 9, 6), 3);  // 9 % 6
+}
+
+// Negative candidate is clamped to 0 before folding.
+TEST(SelectQpInPoolTest, NegativeCandidateClampsToZero) {
+    auto segs = twoPools();
+    EXPECT_EQ(selectQpInPool(segs, "ctrl", -1, 6), 4);  // begin+0
+    EXPECT_EQ(selectQpInPool(segs, "", -1, 6), 0);
+}
+
+// Every result stays in [0, total_qp) regardless of pool/candidate.
+TEST(SelectQpInPoolTest, ResultAlwaysInRange) {
+    auto segs = twoPools();
+    for (int c = 0; c < 20; ++c) {
+        for (const char* name : {"", "kv", "ctrl", "nope"}) {
+            int idx = selectQpInPool(segs, name, c, 6);
+            EXPECT_GE(idx, 0);
+            EXPECT_LT(idx, 6);
+        }
+    }
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

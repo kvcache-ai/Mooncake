@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -50,6 +51,10 @@ using RdmaTaskStorage = Slab<RdmaTask>;
 struct RdmaTask {
     int num_slices;
     Request request;
+    // Named QP pool this task's slices should use (RFC #2568 step 3). Empty =
+    // no pool selected: slices spray across all data QPs as before. Resolved
+    // from SelectionResult.qp_pool at task creation.
+    std::string qp_pool;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     volatile int success_slices;

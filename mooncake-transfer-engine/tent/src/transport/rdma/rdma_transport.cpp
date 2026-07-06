@@ -437,6 +437,7 @@ Status RdmaTransport::submitTransferTasks(
         auto* task = RdmaTaskStorage::Get().allocate();
         rdma_batch->task_list.push_back(task);
         task->request = request;
+        task->qp_pool = rdma_batch->qp_pool;  // RFC #2568 step 3
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;

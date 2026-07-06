@@ -116,6 +116,27 @@ inline QpPoolLayout computeQpPoolSegments(
     return layout;
 }
 
+// Pure QP router used by RdmaEndPoint::submitSlices (RFC #2568 step 3). Given
+// the resolved segments, the pool a transfer asked for, and a caller-provided
+// candidate index (the worker lane), return the QP index the transfer should
+// use. When the pool is named and found, the candidate is folded into that
+// pool's [begin, begin+num_qp) span so the transfer only ever touches its
+// pool's QPs. When no pool is named, or the name is unknown, or no pools are
+// configured, the candidate passes through unchanged (default spray behavior).
+// total_qp must be > 0; the result is always in [0, total_qp).
+inline int selectQpInPool(const std::vector<QpPoolSegment>& segments,
+                          const std::string& pool_name, int candidate,
+                          int total_qp) {
+    if (candidate < 0) candidate = 0;
+    if (!pool_name.empty()) {
+        for (const auto& seg : segments) {
+            if (seg.name == pool_name && seg.num_qp > 0)
+                return seg.begin + (candidate % seg.num_qp);
+        }
+    }
+    return candidate % total_qp;
+}
+
 struct WorkerParams {
     int num_workers = 6;  // Derived from RdmaParams::num_lanes.
     int max_retry_count = 8;
