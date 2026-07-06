@@ -18,3 +18,68 @@ Mooncake:
 - **Managed pool buffer nodes** mainly provide DRAM space for storing objects.
 
 > Mooncake has open-sourced the Transfer Engine subsystem, and updates are forthcoming!
+
+## Disaggregated Serving Architecture
+
+Mooncake decomposes multimodal LLM serving into independently scalable stages — Encode–Prefill–Decode (EPD) separation, Prefill/Decode (PD) separation, Attention/Expert (AM) separation for MoE models, and RL disaggregation for post-training — all connected through the shared KVCache pool.
+
+```{mermaid}
+flowchart LR
+    User(["👤 User<br/>text + image"])
+
+    subgraph EPD["🖼️ EPD Separation · Encode"]
+        direction TB
+        VE["Vision Encoder"]
+        KV[("KV-Cache Pool")]
+        VE -- embeddings --> KV
+    end
+
+    subgraph PD["⚙️ PD Separation"]
+        direction TB
+        PF["Prefill<br/>KV → TP / DP"]
+        DEC["Decode<br/>autoregressive generation"]
+        PF -- KV cache --> DEC
+    end
+
+    subgraph AM["🧠 AM Separation · Attention ⇄ Expert"]
+        direction TB
+        ATT["Attention"]
+        EXP["Sparse Expert FFN"]
+        ATT <-->|activations| EXP
+    end
+
+    subgraph RLD["🔁 RL Disaggregation"]
+        direction TB
+        RM["RL Reward Model"]
+        FSP[("Flow Sample Pool")]
+        TR["Training Rollout"]
+        MW[("Model Warehouse")]
+        RM --> FSP
+        FSP <--> TR
+        TR -- checkpoints --> MW
+    end
+
+    ANS(["📝 Answers / Samples"])
+    UW["♻️ Update Weights"]
+
+    User -- prompt --> VE
+    KV -- prefix KV --> PF
+    DEC <-->|hidden states| AM
+    DEC -- tokens --> ANS
+    DEC -- rollouts --> TR
+    ANS -- rewards --> UW
+    MW -- new weights --> UW
+    UW -.->|weight sync| DEC
+
+    classDef enc fill:#DBEAFE,stroke:#3B82F6,stroke-width:1px,color:#1E3A8A;
+    classDef pd fill:#DCFCE7,stroke:#22C55E,stroke-width:1px,color:#14532D;
+    classDef am fill:#FFEDD5,stroke:#F97316,stroke-width:1px,color:#7C2D12;
+    classDef rl fill:#EDE9FE,stroke:#8B5CF6,stroke-width:1px,color:#4C1D95;
+    classDef io fill:#F1F5F9,stroke:#64748B,stroke-width:1px,color:#0F172A;
+
+    class VE,KV enc;
+    class PF,DEC pd;
+    class ATT,EXP am;
+    class RM,FSP,TR,MW rl;
+    class User,ANS,UW io;
+```

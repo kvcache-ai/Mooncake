@@ -81,75 +81,7 @@ Under real workloads, Mooncake’s innovative architecture enables Kimi to handl
 
 Mooncake is an infrastructure project for large-scale LLM inference and training. It features a KV cache-centric disaggregated architecture that separates prefill and decode clusters, while leveraging otherwise underutilized CPU, DRAM, and SSD resources in GPU clusters to build a disaggregated KV cache pool.
 
-Mooncake includes a high-performance Transfer Engine for low-latency data movement across heterogeneous networks and accelerators; Mooncake Store for distributed KV cache and model-weight management; and Mooncake EP & PG for elastic MoE serving. Deeply integrated with ecosystems such as SGLang and vLLM, Mooncake helps LLM systems improve cache reuse, reduce serving latency, and scale efficiently across multi-node clusters.
-
-<details>
-<summary>Disaggregated architecture (Mermaid view)</summary>
-
-The diagram below shows how Mooncake decomposes multimodal LLM serving into independently scalable stages — Encode–Prefill–Decode (EPD) separation, Prefill/Decode (PD) separation, Attention/Expert (AM) separation for MoE models, and RL disaggregation for post-training — all connected through the shared KVCache pool.
-
-```mermaid
-flowchart LR
-    User(["👤 User<br/>text + image"])
-
-    subgraph EPD["🖼️ EPD Separation · Encode"]
-        direction TB
-        VE["Vision Encoder"]
-        KV[("KV-Cache Pool")]
-        VE -- embeddings --> KV
-    end
-
-    subgraph PD["⚙️ PD Separation"]
-        direction TB
-        PF["Prefill<br/>KV → TP / DP"]
-        DEC["Decode<br/>autoregressive generation"]
-        PF -- KV cache --> DEC
-    end
-
-    subgraph AM["🧠 AM Separation · Attention ⇄ Expert"]
-        direction TB
-        ATT["Attention"]
-        EXP["Sparse Expert FFN"]
-        ATT <-->|activations| EXP
-    end
-
-    subgraph RLD["🔁 RL Disaggregation"]
-        direction TB
-        RM["RL Reward Model"]
-        FSP[("Flow Sample Pool")]
-        TR["Training Rollout"]
-        MW[("Model Warehouse")]
-        RM --> FSP
-        FSP <--> TR
-        TR -- checkpoints --> MW
-    end
-
-    ANS(["📝 Answers / Samples"])
-    UW["♻️ Update Weights"]
-
-    User -- prompt --> VE
-    KV -- prefix KV --> PF
-    DEC <-->|hidden states| AM
-    DEC -- tokens --> ANS
-    DEC -- rollouts --> TR
-    ANS -- rewards --> UW
-    MW -- new weights --> UW
-    UW -.->|weight sync| DEC
-
-    classDef enc fill:#DBEAFE,stroke:#3B82F6,stroke-width:1px,color:#1E3A8A;
-    classDef pd fill:#DCFCE7,stroke:#22C55E,stroke-width:1px,color:#14532D;
-    classDef am fill:#FFEDD5,stroke:#F97316,stroke-width:1px,color:#7C2D12;
-    classDef rl fill:#EDE9FE,stroke:#8B5CF6,stroke-width:1px,color:#4C1D95;
-    classDef io fill:#F1F5F9,stroke:#64748B,stroke-width:1px,color:#0F172A;
-
-    class VE,KV enc;
-    class PF,DEC pd;
-    class ATT,EXP am;
-    class RM,FSP,TR,MW rl;
-    class User,ANS,UW io;
-```
-
-</details>
+Mooncake includes a high-performance Transfer Engine for low-latency data movement across heterogeneous networks and accelerators; Mooncake Store for distributed KV cache and model-weight management; and Mooncake EP & PG for elastic MoE serving. Deeply integrated with ecosystems such as SGLang and vLLM, Mooncake helps LLM systems improve cache reuse, reduce serving latency, and scale efficiently across multi-node clusters. See the [disaggregated serving architecture](docs/source/design/architecture.md#disaggregated-serving-architecture) diagram in the documentation for a detailed view of EPD, PD, AM, and RL separation.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 
@@ -257,30 +189,14 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 
 </details>
 
-<h2 id="support-status">📊 Current Support Status</h2>
+<h2 id="supported-software">📊 Supported Software</h2>
 
-The table below summarizes how Mooncake's components are adopted across the LLM inference, middleware, and RL post-training ecosystem.
+Mooncake integrates with inference engines, middleware frameworks, and RL post-training systems across the LLM ecosystem. See the [ecosystem support matrix](docs/source/design/ecosystem-support.md) for component-level adoption details (Transfer, Store, EP/Torch Backend, Ckpt Engine).
 
-**Legend:** ✅ Supported &nbsp;·&nbsp; 🚧 Work in progress &nbsp;·&nbsp; ❌ Not supported &nbsp;·&nbsp; — Not applicable
-
-| <sub>Feature</sub> | <sub>Project</sub> | <sub>Type</sub> | <sub>Transfer</sub> | <sub>EP/Torch Backend</sub> | <sub>Store</sub> | <sub>Ckpt Engine</sub> |
-| --- | --- | --- | :---: | :---: | :---: | :---: |
-| <sub>**Inference**</sub> | <img src="https://github.com/vllm-project.png" width="16" height="16" alt="vLLM"/><br><sub>[vLLM V0](https://github.com/vllm-project/vllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>✅</sub> |
-| | <img src="https://github.com/vllm-project.png" width="16" height="16" alt="vLLM"/><br><sub>[vLLM V1 (Omni)](https://github.com/vllm-project/vllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>🚧</sub> | <sub>✅ (native / LMCache / Nixl)</sub> | <sub>❌</sub> |
-| | <img src="https://github.com/sgl-project.png" width="16" height="16" alt="SGLang"/><br><sub>[SGLang (Omni)](https://github.com/sgl-project/sglang)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>✅</sub> | <sub>✅</sub> | <sub>✅</sub> |
-| | <img src="https://github.com/InternLM.png" width="16" height="16" alt="LMDeploy"/><br><sub>[LMDeploy](https://github.com/InternLM/lmdeploy)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
-| | <img src="https://github.com/NVIDIA.png" width="16" height="16" alt="NVIDIA"/><br><sub>[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
-| | <img src="https://github.com/thu-pacman.png" width="16" height="16" alt="Chitu"/><br><sub>[Chitu](https://github.com/thu-pacman/chitu)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>❌</sub> | <sub>❌</sub> |
-| | <img src="https://github.com/jd-opensource.png" width="16" height="16" alt="xLLM"/><br><sub>[xLLM](https://github.com/jd-opensource/xllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
-| | <img src="https://github.com/alibaba.png" width="16" height="16" alt="Alibaba"/><br><sub>[RTP (Alibaba)](https://github.com/alibaba/rtp-llm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>❌</sub> |
-| <sub>**Middleware**</sub> | <img src="https://github.com/alibaba.png" width="16" height="16" alt="Alibaba"/><br><sub>[KVCM (Alibaba)](https://github.com/alibaba)</sub> | <sub>Middleware</sub> | <sub>✅</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
-| | <img src="https://github.com/antgroup.png" width="16" height="16" alt="Ant Group"/><br><sub>[TBase (Ant)](https://github.com/antgroup)</sub> | <sub>Middleware</sub> | <sub>✅</sub> | <sub>—</sub> | <sub>❌</sub> | <sub>—</sub> |
-| | <img src="https://github.com/ai-dynamo.png" width="16" height="16" alt="Dynamo"/><br><sub>[Dynamo](https://github.com/ai-dynamo/dynamo)</sub> | <sub>Framework</sub> | <sub>✅ (w/ Nixl)</sub> | <sub>❌</sub> | <sub>❌</sub> | <sub>❌</sub> |
-| | <img src="https://github.com/LMCache.png" width="16" height="16" alt="LMCache"/><br><sub>[LMCache](https://github.com/LMCache/LMCache)</sub> | <sub>Middleware</sub> | <sub>❌</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
-| | <img src="https://github.com/Ascend.png" width="16" height="16" alt="TransferQueue"/><br><sub>[TransferQueue](https://github.com/Ascend/TransferQueue)</sub> | <sub>Middleware</sub> | <sub>—</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
-| <sub>**RL Post-Training**</sub> | <img src="https://github.com/THUDM.png" width="16" height="16" alt="slime"/><br><sub>[Slime/Miles](https://github.com/THUDM/slime)</sub> | <sub>RL</sub> | <sub>🚧</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
-| | <img src="https://github.com/alibaba.png" width="16" height="16" alt="Alibaba"/><br><sub>[ROLL (Alibaba)](https://github.com/alibaba/ROLL)</sub> | <sub>RL</sub> | <sub>❌</sub> | <sub>—</sub> | <sub>✅</sub> | <sub>—</sub> |
-| | <img src="https://github.com/volcengine.png" width="16" height="16" alt="verl"/><br><sub>[Verl](https://github.com/volcengine/verl)</sub> | <sub>RL</sub> | <sub>❌</sub> | <sub>—</sub> | <sub>✅ (w/ TransferQueue)</sub> | <sub>—</sub> |
+| <a href="https://github.com/vllm-project/vllm"><img src="https://github.com/vllm-project.png" width="120" alt="vLLM"/></a> | <a href="https://github.com/sgl-project/sglang"><img src="https://github.com/sgl-project.png" width="120" alt="SGLang"/></a> | <a href="https://github.com/InternLM/lmdeploy"><img src="https://github.com/InternLM.png" width="120" alt="LMDeploy"/></a> | <a href="https://github.com/NVIDIA/TensorRT-LLM"><img src="https://github.com/NVIDIA.png" width="120" alt="TensorRT-LLM"/></a> | <a href="https://github.com/thu-pacman/chitu"><img src="https://github.com/thu-pacman.png" width="120" alt="Chitu"/></a> | <a href="https://github.com/jd-opensource/xllm"><img src="https://github.com/jd-opensource.png" width="120" alt="xLLM"/></a> |
+| --- | --- | --- | --- | --- | --- |
+| <a href="https://github.com/alibaba/rtp-llm"><img src="https://github.com/alibaba.png" width="120" alt="RTP"/></a> | <a href="https://github.com/alibaba"><img src="https://github.com/alibaba.png" width="120" alt="KVCM"/></a> | <a href="https://github.com/antgroup"><img src="https://github.com/antgroup.png" width="120" alt="TBase"/></a> | <a href="https://github.com/ai-dynamo/dynamo"><img src="https://github.com/ai-dynamo.png" width="120" alt="Dynamo"/></a> | <a href="https://github.com/LMCache/LMCache"><img src="https://github.com/LMCache.png" width="120" alt="LMCache"/></a> | <a href="https://github.com/Ascend/TransferQueue"><img src="https://github.com/Ascend.png" width="120" alt="TransferQueue"/></a> |
+| <a href="https://github.com/THUDM/slime"><img src="https://github.com/THUDM.png" width="120" alt="Slime"/></a> | <a href="https://github.com/alibaba/ROLL"><img src="https://github.com/alibaba.png" width="120" alt="ROLL"/></a> | <a href="https://github.com/volcengine/verl"><img src="https://github.com/volcengine.png" width="120" alt="Verl"/></a> | | | |
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
