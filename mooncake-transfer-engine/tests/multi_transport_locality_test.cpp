@@ -50,6 +50,34 @@ TEST(MultiTransportLocalityTest, HandlesMissingPort) {
     EXPECT_FALSE(isHipReachableTarget("node-b", "node-a:8000"));
 }
 
+TEST(MultiTransportLocalityTest, SegmentHostParsesIPv6) {
+    // Bracketed IPv6 with and without a port.
+    EXPECT_EQ(segmentHost("[2001:db8::1]:8000"), "2001:db8::1");
+    EXPECT_EQ(segmentHost("[2001:db8::1]"), "2001:db8::1");
+    EXPECT_EQ(segmentHost("[::1]:20000"), "::1");
+    // Bare IPv6 literal without a port: the whole string is the host.
+    EXPECT_EQ(segmentHost("2001:db8::1"), "2001:db8::1");
+    EXPECT_EQ(segmentHost("::1"), "::1");
+}
+
+TEST(MultiTransportLocalityTest, HipReachableForIPv6) {
+    // Same IPv6 host, different ports (bracketed) -> intra-node hip.
+    EXPECT_TRUE(
+        isHipReachableTarget("[2001:db8::1]:20000", "[2001:db8::1]:20001"));
+    // Bracketed-with-port vs bare literal for the same host must still match.
+    EXPECT_TRUE(isHipReachableTarget("[2001:db8::1]:20000", "2001:db8::1"));
+    // Different IPv6 hosts -> cross-node, fall back to rdma.
+    EXPECT_FALSE(
+        isHipReachableTarget("[2001:db8::1]:20000", "[2001:db8::2]:20000"));
+}
+
+TEST(MultiTransportLocalityTest, HostMatchIsCaseInsensitive) {
+    // Hostnames and IPv6 hex literals are case-insensitive.
+    EXPECT_TRUE(isHipReachableTarget("Node-A:8000", "node-a:9000"));
+    EXPECT_TRUE(
+        isHipReachableTarget("[2001:DB8::1]:8000", "[2001:db8::1]:9000"));
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

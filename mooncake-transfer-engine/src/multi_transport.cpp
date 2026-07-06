@@ -482,8 +482,8 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         // This makes the intra-node fast path (hip) and the cross-node path
         // (rdma) work automatically from a single multi-protocol segment,
         // without requiring the operator to set MC_DISABLE_HIP.
-        const bool hip_reachable = isHipReachableTarget(
-            target_segment_desc->name, local_server_name_);
+        const bool hip_reachable =
+            isHipReachableTarget(target_segment_desc->name, local_server_name_);
         std::string chosen;
         int chosen_priority = -1;
         for (const auto& buffer : target_segment_desc->buffers) {
@@ -557,12 +557,25 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
     }
 
     // hip GPU IPC cannot reach a remote host; downgrade an explicit hip
-    // preference to rdma for a cross-host target (mirrors the locality gate in
-    // selectTransport).
+    // preference to a cross-host-capable transport for a cross-host target
+    // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
     if (preferred_proto == "hip" &&
-        !isHipReachableTarget(target_segment_desc->name, local_server_name_) &&
-        std::find(protos.begin(), protos.end(), "rdma") != protos.end()) {
-        preferred_proto = "rdma";
+        !isHipReachableTarget(target_segment_desc->name, local_server_name_)) {
+        std::string fallback;
+        for (const char* candidate : {"rdma", "tcp"}) {
+            if (std::find(protos.begin(), protos.end(), candidate) !=
+                protos.end()) {
+                fallback = candidate;
+                break;
+            }
+        }
+        if (fallback.empty()) {
+            return Status::NotSupportedTransport(
+                "hip target is cross-host but segment " +
+                std::to_string(entry.target_id) +
+                " offers no cross-host transport (rdma/tcp)");
+        }
+        preferred_proto = fallback;
     }
 
 #ifdef USE_ASCEND_HETEROGENEOUS
