@@ -14,14 +14,16 @@
 
 #pragma once
 
-// EP DeviceTransport — platform-agnostic host-side abstraction for the two
-// communication paths used by the EP kernel:
+// EP DeviceTransport — host-side abstractions for device-initiated
+// communication paths:
 //
 //   P2pTransport   — intra-node GPU-initiated P2P (NVLink on CUDA, MTLink on
 //                    MUSA).  Manages IPC handle exchange and peer pointer
 //                    table.
 //   RdmaTransport  — inter-node GPU-initiated RDMA (IBGDA / mlx5gda).
 //                    Manages QP lifecycle, MR, and device context table.
+//   NcclTransport  — optional CUDA LSA / GIN backend. Manages NCCL host and
+//                    device communicators plus symmetric windows.
 //
 // EP code includes only this header and calls the abstract interface.
 // Platform-specific implementations live in device/ and are
@@ -34,6 +36,15 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#ifdef USE_NCCL_DEVICE
+#include <nccl.h>
+#include <nccl_device.h>
+
+#if NCCL_VERSION_CODE < 23000
+#error "USE_NCCL_DEVICE requires NCCL 2.30 or newer"
+#endif
+#endif
 
 namespace mooncake {
 namespace device {
@@ -149,8 +160,90 @@ class RdmaTransport {
     virtual int gidIndex() const = 0;
 };
 
+#ifdef USE_NCCL_DEVICE
 // ---------------------------------------------------------------------------
-// Factory functions — implemented in device_transport.cpp.
+// NcclTransport
+//
+// Owns an NCCL host communicator, its device communicator, and symmetric
+// windows used by NCCL LSA/GIN kernels. Communicator bootstrap and window
+// registration are collective; the caller supplies the control plane used to
+// exchange the unique ID and to order collectives.
+// ---------------------------------------------------------------------------
+struct NcclTransportConfig {
+    int rank = -1;
+    int num_ranks = 0;
+    int gin_context_count = 4;
+
+    // With GIN enabled, negative means two signals per requested context:
+    // one completion signal and one acknowledgement signal.
+    int gin_signal_count = -1;
+    int gin_counter_count = 0;
+    int world_gin_barrier_count = 0;
+    ncclGinConnectionType_t gin_connection_type = NCCL_GIN_CONNECTION_FULL;
+    bool lsa_multimem = false;
+    bool gin_exclusive_contexts = false;
+};
+
+struct NcclTransportProperties {
+    int runtime_version = 0;
+    int rank = -1;
+    int num_ranks = 0;
+    int cuda_device = -1;
+    bool device_api_supported = false;
+    ncclGinType_t gin_type = NCCL_GIN_TYPE_NONE;
+    int gin_connection_count = 0;
+    int gin_context_count = 0;
+    int gin_signal_count = 0;
+    int gin_counter_count = 0;
+};
+
+// Pass this object by value to kernels that use nccl_device.h.
+struct NcclDeviceContext {
+    ncclDevComm_t comm{};
+};
+
+class NcclTransport {
+   public:
+    virtual ~NcclTransport() = default;
+
+    // Generate the NCCL bootstrap ID on one rank. Exchange this int32_t blob
+    // through the caller's existing control plane before initialize().
+    virtual std::vector<int32_t> createUniqueId() = 0;
+
+    // Create the host and device communicators. Every rank must call this with
+    // the same unique ID and compatible config.
+    virtual int initialize(const NcclTransportConfig& config,
+                           const std::vector<int32_t>& unique_id) = 0;
+
+    // NCCL-compatible VMM allocation. Buffers registered in symmetric windows
+    // should normally come from this allocator.
+    virtual void* allocateBuffer(size_t bytes) = 0;
+    virtual int freeBuffer(void* ptr) = 0;
+
+    // Collectively register a symmetric window. Calls must occur in the same
+    // order on every rank. Deregistration is local after all device work and
+    // remote access to the window have completed.
+    virtual int registerWindow(
+        void* ptr, size_t bytes, ncclWindow_t* window,
+        int flags = NCCL_WIN_COLL_SYMMETRIC) = 0;
+    virtual int deregisterWindow(ncclWindow_t window) = 0;
+
+    // Snapshot passed by value to a CUDA kernel. The snapshot remains valid
+    // until shutdown() or destruction of the transport.
+    virtual NcclDeviceContext deviceContext() const = 0;
+
+    virtual ncclComm_t communicator() const = 0;
+    virtual const NcclTransportProperties& properties() const = 0;
+    virtual bool initialized() const = 0;
+
+    // Destroy windows and communicators. The caller must first ensure that no
+    // kernel can still access the device communicator or any registered window.
+    virtual int shutdown() = 0;
+};
+#endif
+
+// ---------------------------------------------------------------------------
+// Factory functions — implemented under src/transport/device/.
 // Returns nullptr if the transport is not available on this platform.
 // ---------------------------------------------------------------------------
 
@@ -163,6 +256,11 @@ std::unique_ptr<P2pTransport> createP2pDeviceTransport(int num_ranks);
 //   Non-empty = restrict discovery to these NICs, then pick the closest one.
 std::unique_ptr<RdmaTransport> createIbgdaDeviceTransport(
     const std::vector<std::string>& device_filter = {});
+
+#ifdef USE_NCCL_DEVICE
+// Create the CUDA-only NCCL LSA/GIN device transport.
+std::unique_ptr<NcclTransport> createNcclDeviceTransport();
+#endif
 
 }  // namespace device
 }  // namespace mooncake

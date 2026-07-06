@@ -482,6 +482,15 @@ device::RdmaTransport* TransferEngineImpl::getOrCreateRdmaTransport(
     }
     return rdma_transport_.get();
 }
+
+#ifdef USE_NCCL_DEVICE
+device::NcclTransport* TransferEngineImpl::getOrCreateNcclTransport() {
+    if (!nccl_transport_) {
+        nccl_transport_ = device::createNcclDeviceTransport();
+    }
+    return nccl_transport_.get();
+}
+#endif
 #endif
 
 int TransferEngineImpl::getRpcPort() {

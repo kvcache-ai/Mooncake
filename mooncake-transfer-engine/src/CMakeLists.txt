@@ -74,6 +74,11 @@ if(USE_CUDA)
   endif()
 endif()
 
+if(USE_NCCL_DEVICE)
+  target_link_libraries(transfer_engine PUBLIC NCCL::Device)
+  target_compile_definitions(transfer_engine PUBLIC USE_NCCL_DEVICE)
+endif()
+
 if(USE_MACA)
   if(NOT DEFINED MACA_RUNTIME_LIBS)
     set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)

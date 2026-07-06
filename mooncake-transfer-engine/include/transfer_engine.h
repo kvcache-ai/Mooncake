@@ -30,6 +30,9 @@ class TransferEngine;
 namespace device {
 class P2pTransport;
 class RdmaTransport;
+#ifdef USE_NCCL_DEVICE
+class NcclTransport;
+#endif
 }  // namespace device
 #endif
 using TransferRequest = Transport::TransferRequest;
@@ -165,13 +168,16 @@ class TransferEngine {
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
-    // Device transport accessors (P2P + IBGDA).  Lazily created on first
-    // call and owned by the TransferEngine.  These allow EP (and future
-    // CPU-proxy paths) to obtain device transports from an engine instance
+    // Device transport accessors. Lazily created on first call and owned by
+    // the TransferEngine. These allow EP (and future CPU-proxy paths) to
+    // obtain P2P, IBGDA, and optional NCCL transports from an engine instance
     // instead of calling the global factory functions directly.
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
+#ifdef USE_NCCL_DEVICE
+    device::NcclTransport* getOrCreateNcclTransport();
+#endif
 #endif
 
     /**
