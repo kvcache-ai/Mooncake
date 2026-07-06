@@ -25,6 +25,10 @@ MISSING_OBJECT_ERROR = (
     -704
 )  # Mooncake remove returns -704 for an already-missing object.
 STRUCTURED_FIELD_SPECS_KEY = "__mooncake_structured_fields__"
+# Default dtype for ragged tensor fields when all values are None (no data to
+# infer dtype from).  The actual bytes stored are empty, so the dtype only
+# serves as a placeholder for metadata consistency between encoder and decoder.
+_RAGGED_TENSOR_DEFAULT_DTYPE = "torch.float32"
 
 
 class BundleStore(Protocol):
@@ -2449,7 +2453,7 @@ def _encode_ragged_tensor_values(
             shapes[row, : tensor.dim()] = _torch.tensor(
                 list(tensor.shape), dtype=_torch.int64
             )
-    data_dtype = dtype or _torch.float32
+    data_dtype = dtype or _parse_torch_dtype(_RAGGED_TENSOR_DEFAULT_DTYPE)
     np_dtype = _torch_dtype_to_numpy(str(data_dtype))
     total_elems = int(offset)
     # Zero-copy: scatter-gather from original tensor memory, no concatenation
@@ -2488,7 +2492,7 @@ def _decode_ragged_tensor_values(
     if _torch is None:
         raise RuntimeError("torch is required to decode ragged tensor fields")
     raw = payload["data"]
-    dtype_str = (metadata or {}).get("dtype", "torch.float32")
+    dtype_str = (metadata or {}).get("dtype", _RAGGED_TENSOR_DEFAULT_DTYPE)
     torch_dtype = _parse_torch_dtype(dtype_str)
     if isinstance(raw, (bytes, bytearray, memoryview)):
         buf = bytearray(raw) if isinstance(raw, (bytes, memoryview)) else raw
