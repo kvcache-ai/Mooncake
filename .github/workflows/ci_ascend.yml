@@ -357,7 +357,7 @@ jobs:
 
     - name: Upload Test Logs
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: test-logs-${{ github.run_number }}
         path: |
