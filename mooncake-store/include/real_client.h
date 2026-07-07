@@ -955,10 +955,10 @@ class RealClient : public PyClient {
     // not found in cache. common_prefix receives the longest common prefix of
     // all keys (empty if no common prefix).
     // The returned QueryResult objects use start_time as the lease base.
-    std::vector<tl::expected<QueryResult, ErrorCode>>
-    LookupPrefixCache(const std::vector<std::string> &keys,
-                      std::vector<std::string> &missing_keys,
-                      std::string &common_prefix) const;
+    std::vector<tl::expected<QueryResult, ErrorCode>> LookupPrefixCache(
+        const std::vector<std::string> &keys,
+        std::vector<std::string> &missing_keys,
+        std::string &common_prefix) const;
 
     // Invalidate prefix cache entries that could cover the given key.
     void InvalidatePrefixCache(const std::string &key);

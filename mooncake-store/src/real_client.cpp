@@ -3049,10 +3049,8 @@ RealClient::batch_get_buffer_internal(
                     std::make_shared<BufferHandle>(
                         std::move(*op.buffer_handle));
             } else {
-                LOG(WARNING) << "BatchGet failed for key '"
-                             << valid_ops[i].key
-                             << "': "
-                             << toString(batch_get_results[i].error())
+                LOG(WARNING) << "BatchGet failed for key '" << valid_ops[i].key
+                             << "': " << toString(batch_get_results[i].error())
                              << " — will retry with fresh query";
                 retry_op_indices.push_back(i);
             }
@@ -3089,8 +3087,7 @@ RealClient::batch_get_buffer_internal(
                 if (!fresh_query[ri] ||
                     fresh_query[ri].value().replicas.empty()) {
                     LOG(ERROR)
-                        << "Retry query failed for key '" << op.key
-                        << "': "
+                        << "Retry query failed for key '" << op.key << "': "
                         << (fresh_query[ri]
                                 ? "empty replica list"
                                 : toString(fresh_query[ri].error()));
@@ -3101,8 +3098,8 @@ RealClient::batch_get_buffer_internal(
                 const auto *best =
                     SelectBestReplica(fresh_qr.replicas, local_endpoints);
                 if (!best) {
-                    LOG(ERROR) << "Retry: no usable replica for key '"
-                               << op.key << "'";
+                    LOG(ERROR) << "Retry: no usable replica for key '" << op.key
+                               << "'";
                     continue;
                 }
                 const auto replica = *best;
@@ -3116,25 +3113,22 @@ RealClient::batch_get_buffer_internal(
                 if (op.buffer_handle->size() < total_size) {
                     LOG(WARNING)
                         << "Retry: buffer too small for key '" << op.key
-                        << "' (have " << op.buffer_handle->size()
-                        << " need " << total_size << "), re-allocating";
-                    auto &allocator =
-                        client_buffer_allocator
-                            ? client_buffer_allocator
-                            : client_buffer_allocator_;
+                        << "' (have " << op.buffer_handle->size() << " need "
+                        << total_size << "), re-allocating";
+                    auto &allocator = client_buffer_allocator
+                                          ? client_buffer_allocator
+                                          : client_buffer_allocator_;
                     auto alloc_result = allocator->allocate(total_size);
                     if (!alloc_result) {
                         LOG(ERROR) << "Retry: re-alloc failed for key '"
                                    << op.key << "'";
                         continue;
                     }
-                    op.buffer_handle =
-                        std::make_unique<BufferHandle>(
-                            std::move(*alloc_result));
+                    op.buffer_handle = std::make_unique<BufferHandle>(
+                        std::move(*alloc_result));
                 }
                 op.slices.clear();
-                allocateSlices(op.slices, replica,
-                               op.buffer_handle->ptr());
+                allocateSlices(op.slices, replica, op.buffer_handle->ptr());
 
                 retry_batch_keys.push_back(op.key);
                 retry_batch_results.push_back(
@@ -3145,8 +3139,7 @@ RealClient::batch_get_buffer_internal(
 
             if (!retry_batch_keys.empty()) {
                 auto retry_results = client_->BatchGet(
-                    retry_batch_keys, retry_batch_results,
-                    retry_batch_slices);
+                    retry_batch_keys, retry_batch_results, retry_batch_slices);
 
                 size_t retry_success = 0;
                 for (size_t ri = 0; ri < retry_batch_keys.size(); ++ri) {
@@ -3160,13 +3153,13 @@ RealClient::batch_get_buffer_internal(
                     } else {
                         LOG(ERROR)
                             << "Retry BatchGet still failed for key '"
-                            << retry_batch_keys[ri] << "': "
-                            << toString(retry_results[ri].error());
+                            << retry_batch_keys[ri]
+                            << "': " << toString(retry_results[ri].error());
                     }
                 }
-                VLOG(1) << "Prefix cache stale-recovery: "
-                        << retry_keys.size() << " keys failed, "
-                        << retry_success << " recovered after re-query";
+                VLOG(1) << "Prefix cache stale-recovery: " << retry_keys.size()
+                        << " keys failed, " << retry_success
+                        << " recovered after re-query";
             }
         }
     }
@@ -4807,9 +4800,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 if (!fresh_query[ri] ||
                     fresh_query[ri].value().replicas.empty()) {
                     results[op.original_index] = tl::unexpected(
-                        fresh_query[ri]
-                            ? ErrorCode::INVALID_REPLICA
-                            : fresh_query[ri].error());
+                        fresh_query[ri] ? ErrorCode::INVALID_REPLICA
+                                        : fresh_query[ri].error());
                     continue;
                 }
 
@@ -4829,8 +4821,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     continue;
                 }
                 if (sizes[op.original_index] < total_size) {
-                    LOG(ERROR) << "Retry: buffer too small for key '" << op.key
-                               << "'";
+                    LOG(ERROR)
+                        << "Retry: buffer too small for key '" << op.key << "'";
                     results[op.original_index] =
                         tl::unexpected(ErrorCode::INVALID_PARAMS);
                     continue;
@@ -4838,8 +4830,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
                 // Rebuild slices with fresh replica info.
                 op.slices.clear();
-                allocateSlices(op.slices, replica,
-                               buffers[op.original_index]);
+                allocateSlices(op.slices, replica, buffers[op.original_index]);
 
                 retry_batch_keys.push_back(op.key);
                 retry_batch_results.push_back(
@@ -4850,8 +4841,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
             if (!retry_batch_keys.empty()) {
                 auto retry_results = client_->BatchGet(
-                    retry_batch_keys, retry_batch_results,
-                    retry_batch_slices);
+                    retry_batch_keys, retry_batch_results, retry_batch_slices);
 
                 size_t retry_success = 0;
                 for (size_t ri = 0; ri < retry_batch_keys.size(); ++ri) {
@@ -4862,9 +4852,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                         size_t op_idx = retry_to_op[ri];
                         results[op_idx] =
                             tl::unexpected(retry_results[ri].error());
-                        LOG(ERROR) << "Retry BatchGet still failed for key '"
-                                   << retry_batch_keys[ri] << "': "
-                                   << toString(retry_results[ri].error());
+                        LOG(ERROR)
+                            << "Retry BatchGet still failed for key '"
+                            << retry_batch_keys[ri]
+                            << "': " << toString(retry_results[ri].error());
                     }
                 }
                 VLOG(1) << "Prefix cache stale-recovery (get_into): "
@@ -6040,10 +6031,9 @@ std::string FindLongestCommonPrefix(const std::vector<std::string> &keys) {
 
 // --- Prefix cache helpers ---
 
-std::vector<tl::expected<QueryResult, ErrorCode>>
-RealClient::LookupPrefixCache(const std::vector<std::string> &keys,
-                              std::vector<std::string> &missing_keys,
-                              std::string &common_prefix) const {
+std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::LookupPrefixCache(
+    const std::vector<std::string> &keys,
+    std::vector<std::string> &missing_keys, std::string &common_prefix) const {
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(keys.size());
     missing_keys.clear();
@@ -6079,7 +6069,8 @@ RealClient::LookupPrefixCache(const std::vector<std::string> &keys,
                     << "\" keys=" << keys.size() << " hit=MISS";
             missing_keys = keys;
             for (size_t i = 0; i < keys.size(); ++i) {
-                results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+                results.emplace_back(
+                    tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
             }
             return results;
         }
@@ -6115,8 +6106,9 @@ RealClient::LookupPrefixCache(const std::vector<std::string> &keys,
         }
     }
 
-    const auto hit_type = (cached_count == keys.size()) ? "FULL" :
-                          (cached_count == 0) ? "NONE" : "PARTIAL";
+    const auto hit_type = (cached_count == keys.size()) ? "FULL"
+                          : (cached_count == 0)         ? "NONE"
+                                                        : "PARTIAL";
     VLOG(1) << "LookupPrefixCache: prefix=\"" << common_prefix
             << "\" keys=" << keys.size() << " cached=" << cached_count
             << " missing=" << missing_keys.size() << " hit=" << hit_type;
@@ -6140,8 +6132,7 @@ void RealClient::InvalidatePrefixCache(const std::string &key) {
             << "\" removed_entries=" << removed;
 }
 
-void RealClient::InvalidatePrefixCache(
-    const std::vector<std::string> &keys) {
+void RealClient::InvalidatePrefixCache(const std::vector<std::string> &keys) {
     for (const auto &key : keys) {
         InvalidatePrefixCache(key);
     }
@@ -6155,8 +6146,7 @@ void RealClient::ClearPrefixCache() {
 }
 
 void RealClient::CachePrefixResults(
-    const std::string &prefix,
-    const std::vector<std::string> &keys,
+    const std::string &prefix, const std::vector<std::string> &keys,
     const std::vector<tl::expected<QueryResult, ErrorCode>> &results) {
     if (keys.empty() || results.empty()) return;
     if (keys.size() != results.size()) return;
@@ -6167,33 +6157,33 @@ void RealClient::CachePrefixResults(
     auto &entry = prefix_cache_[prefix];
     entry.cached_at = now;
     const auto cache_ttl_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            PrefixCacheTTL())
+        std::chrono::duration_cast<std::chrono::milliseconds>(PrefixCacheTTL())
             .count();
     size_t stored = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (results[i].has_value()) {
             const auto &qr = results[i].value();
-            // Store as GetReplicaListResponse (copyable) instead of QueryResult.
-            // Compute remaining lease TTL from the query result's lease timeout.
-            const auto remaining = std::chrono::duration_cast<
-                std::chrono::milliseconds>(qr.lease_timeout - now);
+            // Store as GetReplicaListResponse (copyable) instead of
+            // QueryResult. Compute remaining lease TTL from the query result's
+            // lease timeout.
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    qr.lease_timeout - now);
             GetReplicaListResponse resp;
             resp.replicas = qr.replicas;
             resp.lease_ttl_ms = remaining.count() > 0
-                ? static_cast<uint64_t>(remaining.count()) : 0;
+                                    ? static_cast<uint64_t>(remaining.count())
+                                    : 0;
 
             // Warn if the lease will expire meaningfully before the
             // cache TTL.  Allow 100ms tolerance for clock skew between
             // master and client.
             if (resp.lease_ttl_ms > 0 &&
-                resp.lease_ttl_ms + 100 <
-                    static_cast<uint64_t>(cache_ttl_ms)) {
+                resp.lease_ttl_ms + 100 < static_cast<uint64_t>(cache_ttl_ms)) {
                 LOG_FIRST_N(WARNING, 10)
                     << "Prefix cache: lease TTL (" << resp.lease_ttl_ms
                     << "ms) for key \"" << keys[i]
-                    << "\" is shorter than cache TTL ("
-                    << cache_ttl_ms
+                    << "\" is shorter than cache TTL (" << cache_ttl_ms
                     << "ms). Cached replica info may become stale.";
             }
 
