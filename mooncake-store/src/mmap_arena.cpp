@@ -196,7 +196,7 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
     while (true) {
         size_t raw = alloc_cursor_.load(std::memory_order_relaxed);
 
-        if (base_addr > UINTPTR_MAX - raw) {
+        if (raw > UINTPTR_MAX - base_addr) {
             num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "Arena address overflow: base=" << pool_base
                        << ", raw=" << raw;
@@ -206,8 +206,7 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
         size_t aligned_addr_size;
         const uintptr_t raw_addr = base_addr + raw;
         if (!safe_align_up(static_cast<size_t>(raw_addr), effective_alignment,
-                           &aligned_addr_size) ||
-            aligned_addr_size < base_addr) {
+                           &aligned_addr_size)) {
             num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "Arena address alignment overflow: raw=" << raw
                        << ", base=" << pool_base
