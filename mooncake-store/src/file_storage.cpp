@@ -842,7 +842,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                        << offload_result.error();
             return offload_result;
         }
-
     }
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
