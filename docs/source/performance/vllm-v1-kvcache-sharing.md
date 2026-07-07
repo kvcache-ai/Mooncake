@@ -28,7 +28,7 @@ Experiment settings:
 * Number of sessions scaled with number of GPUs: 75 → 150 → 225 → 300 → 375
 * Parameters were chosen to roughly align with the original Codex workload and keep the total output/input ratio ~1.3%
 
-![KV Transfer Bandwidth (Actual)](../image/pd_scaling-2.png)
+![Scaling Performance across Multiple Nodes](../image/pd_scaling-2.png)
 
 To stress-test the datapath under cross-node traffic, we used round-robin routing. As a result, requests could be scheduled on different nodes across turns and often needed to fetch KV caches from a previous node.
 
