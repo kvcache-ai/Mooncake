@@ -458,6 +458,45 @@ TEST(AdmissionQueueTest, DeadlineUnawareKeepsStrictFifo) {
     EXPECT_EQ(picked, expected);
 }
 
+// fifo_ is kept EDF-ordered at admission time, so owners admitted across
+// *separate* tryAdmit calls (out of deadline order) must still dispatch EDF —
+// this exercises the ordered-insert path, not just a single sorted batch.
+TEST(AdmissionQueueTest, DeadlineAwareOrdersAcrossSeparateAdmits) {
+    QueueLimits limits{8, 4096, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    std::vector<QueueOwnerId> ids;
+
+    // Admit one at a time, deadlines arriving out of order: 300, 100, 200, 0.
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 300)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);  // owner 1
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 100)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);  // owner 2
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 200)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);  // owner 3
+    ASSERT_EQ(
+        queue.tryAdmit(makeSubmit(4, 1, {makeOwnerWithDeadline(0, 16, 0)}), ids)
+            .code(),
+        Status::Code::kOk);  // owner 4 (no deadline → last)
+
+    auto picked = queue.pickForDispatch(8, 4096);
+    // EDF: 100(owner2) < 200(owner3) < 300(owner1) < no-deadline(owner4).
+    const std::vector<QueueOwnerId> expected{2, 3, 1, 4};
+    EXPECT_EQ(picked, expected);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

@@ -24,6 +24,13 @@ namespace {
 
 using PublicTaskKey = std::pair<uint64_t, size_t>;
 
+// Sort key for EDF: owners without a deadline (0) sort after all deadlined
+// owners, so they never jump ahead of a real deadline.
+inline uint64_t deadlineKey(uint64_t deadline_ns) {
+    return deadline_ns == 0 ? std::numeric_limits<uint64_t>::max()
+                            : deadline_ns;
+}
+
 bool isSupportedTerminalStatus(TransferStatusEnum status) {
     return status == TransferStatusEnum::COMPLETED ||
            status == TransferStatusEnum::INVALID ||
@@ -175,7 +182,27 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         for (const auto derived_task_id : owner_input.derived_task_ids) {
             public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
         }
-        fifo_.push_back(owner_id);
+        // RFC #2519 step 2: keep fifo_ ordered on admission so pickForDispatch
+        // never has to re-sort. Default (deadline_aware == false) appends in
+        // strict FIFO. When deadline-aware, insert at the earliest-deadline-
+        // first position; upper_bound places a new owner *after* existing
+        // owners with the same deadline, preserving FIFO order among ties.
+        if (limits_.deadline_aware) {
+            const uint64_t key = deadlineKey(owner.request.deadline_ns);
+            auto pos = std::upper_bound(
+                fifo_.begin(), fifo_.end(), key,
+                [this](uint64_t k, QueueOwnerId id) {
+                    auto it = owners_.find(id);
+                    uint64_t d =
+                        (it == owners_.end())
+                            ? std::numeric_limits<uint64_t>::max()
+                            : deadlineKey(it->second.request.deadline_ns);
+                    return k < d;
+                });
+            fifo_.insert(pos, owner_id);
+        } else {
+            fifo_.push_back(owner_id);
+        }
         admitted_owner_ids.push_back(owner_id);
     }
 
@@ -186,40 +213,17 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     return Status::OK();
 }
 
-namespace {
-// Sort key for EDF: owners without a deadline (0) sort after all deadlined
-// owners, so they never jump ahead of a real deadline.
-inline uint64_t deadlineKey(uint64_t deadline_ns) {
-    return deadline_ns == 0 ? std::numeric_limits<uint64_t>::max()
-                            : deadline_ns;
-}
-}  // namespace
-
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     size_t max_owners, size_t max_bytes) {
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
 
-    // RFC #2519 step 2 (opt-in): reorder the dispatch queue earliest-deadline-
-    // first before selection. Owners without a deadline keep their relative
-    // FIFO order behind all deadlined owners (stable sort on the current fifo_
-    // sequence). Default (deadline_aware == false) leaves fifo_ untouched, so
-    // behavior is identical to strict FIFO. This only reorders *selection*
-    // within the existing capacity limits; it does not admit or reject.
-    if (limits_.deadline_aware) {
-        std::stable_sort(
-            fifo_.begin(), fifo_.end(), [this](QueueOwnerId a, QueueOwnerId b) {
-                auto ia = owners_.find(a);
-                auto ib = owners_.find(b);
-                uint64_t da = (ia == owners_.end())
-                                  ? std::numeric_limits<uint64_t>::max()
-                                  : deadlineKey(ia->second.request.deadline_ns);
-                uint64_t db = (ib == owners_.end())
-                                  ? std::numeric_limits<uint64_t>::max()
-                                  : deadlineKey(ib->second.request.deadline_ns);
-                return da < db;
-            });
-    }
+    // RFC #2519 step 2 (opt-in): earliest-deadline-first dispatch. When
+    // deadline_aware, fifo_ is kept EDF-ordered at admission time (see
+    // tryAdmit's ordered insert), so there is nothing to sort here — we just
+    // consume from the front. This keeps the hot dispatch path O(picked)
+    // instead of re-sorting the whole queue (up to max_outstanding_owners) on
+    // every call. Default (deadline_aware == false) is plain FIFO.
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
