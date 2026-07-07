@@ -2143,7 +2143,8 @@ class MasterService {
                           const ObjectMetadata& metadata,
                           const std::string& tenant_id);
     void PublishKvRemoved(const std::string& key, const std::string& medium,
-                          const std::string& tenant_id);
+                          const std::string& tenant_id,
+                          const std::string& group_id);
     void PublishKvRemovedAfterEvict(const std::string& key,
                                     uint64_t freed_bytes,
                                     const std::string& medium,

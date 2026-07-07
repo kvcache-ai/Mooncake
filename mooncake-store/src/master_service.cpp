@@ -7804,7 +7804,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 total_freed_size += metadata.size * erased;
                 shard_evicted_count++;
                 PublishKvRemovedAfterEvict(it->first, metadata.size * erased,
-                                         "disk", metadata, tenant_it->first);
+                                           "disk", metadata, tenant_it->first);
                 if (!metadata.IsValid()) {
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
                                        QuotaEraseMode::kFull, &shard);
@@ -9589,22 +9589,25 @@ void MasterService::PublishKvStored(const std::string& key,
     if (replica_type == ReplicaType::ALL) {
         medium = MediumForMetadata(metadata);
     }
-    kv_event_publisher_->PublishStored(key, medium, tenant_id);
+    kv_event_publisher_->PublishStored(key, medium, tenant_id,
+                                       metadata.group_id);
 }
 
 void MasterService::PublishKvRemoved(const std::string& key,
                                      const std::string& medium,
-                                     const std::string& tenant_id) {
+                                     const std::string& tenant_id,
+                                     const std::string& group_id) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    kv_event_publisher_->PublishRemoved(key, medium, tenant_id);
+    kv_event_publisher_->PublishRemoved(key, medium, tenant_id, group_id);
 }
 
 void MasterService::PublishKvRemoved(const std::string& key,
                                      const ObjectMetadata& metadata,
                                      const std::string& tenant_id) {
-    PublishKvRemoved(key, MediumForMetadata(metadata), tenant_id);
+    PublishKvRemoved(key, MediumForMetadata(metadata), tenant_id,
+                     metadata.group_id);
 }
 
 void MasterService::PublishKvRemovedAfterEvict(const std::string& key,

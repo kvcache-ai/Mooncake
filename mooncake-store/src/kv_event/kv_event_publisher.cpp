@@ -45,8 +45,8 @@ size_t ComputeEventMapSize(bool is_stored, bool emit_legacy,
                            bool emit_object_key) {
     // Base envelope: event_id, timestamp, event_type, model_name, block_size,
     // additional_salt, lora_name, tenant_id, backend_id, medium, dp_rank,
-    // seq_hashes.
-    constexpr size_t kBaseFields = 12;
+    // seq_hashes, group_id.
+    constexpr size_t kBaseFields = 13;
     size_t map_size = kBaseFields;
     if (emit_legacy) {
         map_size += 2;  // type, block_hashes
@@ -140,20 +140,24 @@ KvEventPublisher::~KvEventPublisher() {
 
 void KvEventPublisher::PublishStored(const std::string& object_key,
                                      const std::string& medium,
-                                     const std::string& tenant_id) {
+                                     const std::string& tenant_id,
+                                     const std::string& group_id) {
     if (!config_.enabled) {
         return;
     }
-    Enqueue(PendingEvent{EventKind::kStored, object_key, medium, tenant_id});
+    Enqueue(PendingEvent{EventKind::kStored, object_key, medium, tenant_id,
+                         group_id});
 }
 
 void KvEventPublisher::PublishRemoved(const std::string& object_key,
                                       const std::string& medium,
-                                      const std::string& tenant_id) {
+                                      const std::string& tenant_id,
+                                      const std::string& group_id) {
     if (!config_.enabled) {
         return;
     }
-    Enqueue(PendingEvent{EventKind::kRemoved, object_key, medium, tenant_id});
+    Enqueue(PendingEvent{EventKind::kRemoved, object_key, medium, tenant_id,
+                         group_id});
 }
 
 KvEventPublisher::Stats KvEventPublisher::GetStats() const {
@@ -288,6 +292,8 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         packer.pack(tenant_id);
         packer.pack("backend_id");
         packer.pack(config_.backend_id);
+        packer.pack("group_id");
+        PackOptionalString(packer, item.pending.group_id);
         packer.pack("medium");
         PackOptionalString(packer, item.pending.medium);
         packer.pack("dp_rank");
