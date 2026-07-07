@@ -6,7 +6,7 @@
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/utils/memory/stl/AWSVector.h>
-#include <aws/s3/model/ListObjectsRequest.h>
+#include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/DeleteObjectsRequest.h>
 #include <aws/s3/model/ObjectIdentifier.h>
 #include <aws/s3/model/Delete.h>
@@ -781,7 +781,7 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     const std::string &prefix, std::vector<std::string> &object_keys) {
     object_keys.clear();
 
-    Aws::S3::Model::ListObjectsRequest request;
+    Aws::S3::Model::ListObjectsV2Request request;
     request.WithBucket(bucket_);
     request.WithPrefix(prefix);
 
@@ -789,12 +789,18 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     // objects
     request.WithMaxKeys(1000);
 
+    // Use ListObjectsV2 + continuation token for pagination. The legacy
+    // ListObjects API only populates NextMarker when a delimiter is set; with
+    // no delimiter GetNextMarker() returns empty, so WithMarker("") restarts
+    // from the beginning and loops forever once the listing exceeds MaxKeys
+    // (#2735). ContinuationToken is always populated when the result is
+    // truncated, regardless of delimiter.
     bool done = false;
     while (!done) {
-        auto outcome = s3_client_.ListObjects(request);
+        auto outcome = s3_client_.ListObjectsV2(request);
         if (!outcome.IsSuccess()) {
             return tl::make_unexpected(fmt::format(
-                "ListObjects error: {}", outcome.GetError().GetMessage()));
+                "ListObjectsV2 error: {}", outcome.GetError().GetMessage()));
         }
 
         const auto &result = outcome.GetResult();
@@ -806,8 +812,8 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
 
         // Check if there are more objects to fetch
         if (result.GetIsTruncated()) {
-            // Set marker to get next page
-            request.WithMarker(result.GetNextMarker());
+            // Set continuation token to get next page
+            request.WithContinuationToken(result.GetNextContinuationToken());
         } else {
             done = true;
         }
