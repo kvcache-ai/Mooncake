@@ -30,6 +30,7 @@ class HygonGdsDeviceOps final : public GdsDeviceOps {
     void* Malloc(size_t) override { return nullptr; }
     void Free(void*) override {}
     void Memset(void*, int, size_t) override {}
+    void SetDevice(int) override {}
     void DeviceSynchronize() override {}
     int GetDevice() override { return -1; }
     void CopyDeviceToDevice(void*, const void*, size_t) override {}

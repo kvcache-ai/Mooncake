@@ -32,8 +32,8 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
         CUfileDescr_t desc{};
         desc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         desc.handle.fd = fd;
-        CUfileError_t r = cuFileHandleRegister(
-            reinterpret_cast<CUfileHandle_t*>(out), &desc);
+        CUfileError_t r =
+            cuFileHandleRegister(reinterpret_cast<CUfileHandle_t*>(out), &desc);
         return GdsDeviceError{static_cast<int>(r.err)};
     }
 
@@ -67,12 +67,15 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
         return (cudaMalloc(&ptr, size) == cudaSuccess) ? ptr : nullptr;
     }
 
-    void Free(void* ptr) override { if (ptr) cudaFree(ptr); }
+    void Free(void* ptr) override {
+        if (ptr) cudaFree(ptr);
+    }
 
     void Memset(void* ptr, int value, size_t size) override {
         cudaMemset(ptr, value, size);
     }
 
+    void SetDevice(int device_id) override { cudaSetDevice(device_id); }
     void DeviceSynchronize() override { cudaDeviceSynchronize(); }
 
     int GetDevice() override {
@@ -81,8 +84,7 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
         return dev;
     }
 
-    void CopyDeviceToDevice(void* dst, const void* src,
-                            size_t size) override {
+    void CopyDeviceToDevice(void* dst, const void* src, size_t size) override {
         cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
     }
 };

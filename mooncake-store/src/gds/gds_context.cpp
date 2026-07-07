@@ -25,6 +25,8 @@
 
 #ifdef USE_GDS_BACKEND
 #include "gds/gds_device_ops.h"
+#include <cuda_runtime.h>
+
 #include "device/accelerator_registry.h"
 #endif
 
@@ -131,6 +133,7 @@ tl::expected<void, ErrorCode> GdsContext::Init(
 bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 #ifdef USE_GDS_BACKEND
     // 1. Check device node via abstraction layer
+    if (!ops_) ops_ = CreateGdsDeviceOps();
     if (!ops_->ProbeDeviceNode()) {
         LOG(WARNING) << "GDS probe: device node not available";
         return false;
@@ -190,13 +193,12 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
         return false;
     }
 
-    // Allocate GPU buffer
+    // Allocate GPU buffer. Use cudaSetDevice directly — avoids any
+    // virtual dispatch on ops_ (which may not be fully constructed
+    // when called from a static initializer context).
     int probe_device = ops_->GetDevice();
     LOG(INFO) << "GDS probe: using GPU device " << probe_device;
-    auto probe_devices = device::GetAcceleratorRegistry().RegisteredDevices();
-    if (!probe_devices.empty()) {
-        probe_devices[0]->SetContext(probe_device);
-    }
+    cudaSetDevice(probe_device);
 
     cleanup.gpu_buf = ops_->Malloc(4096);
     if (!cleanup.gpu_buf) {
@@ -236,8 +238,8 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
     }
 
     std::vector<uint8_t> host(4096);
-    auto probe_runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
-    if (!probe_runtime.CopyToHost(host.data(), cleanup.gpu_buf, 4096)) {
+    if (cudaMemcpy(host.data(), cleanup.gpu_buf, 4096,
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
         LOG(WARNING) << "GDS probe: CopyDeviceToHost failed";
         return false;
     }
@@ -305,7 +307,7 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
         if (!s.ptr) return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
 
         auto wr_runtime =
-            device::GetAcceleratorRegistry().RuntimeAccelerators();
+            device::GetAcceleratorRegistry().RuntimeAccelerators(true);
         device::PointerInfo wr_info;
         const auto* wr_dev = wr_runtime.FindDeviceForPointer(s.ptr, &wr_info);
         if (wr_dev) {
@@ -322,13 +324,22 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
                         << " size=" << s.size;
             }
 
-            ssize_t w = ops_->Write(cfh, s.ptr, s.size,
-                                              static_cast<off_t>(vo));
+            ssize_t w = ops_->Write(cfh, s.ptr, s.size, static_cast<off_t>(vo));
             VLOG(1) << "[GDS WRITE] cuFileWrite DMA: size=" << s.size
                     << " offset=" << vo << " ret=" << w;
             if (w != static_cast<ssize_t>(s.size))
                 return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
         } else {
+            // Safety: verify this is truly CPU memory before pwrite.
+            // A GPU pointer passed to pwrite would segfault.
+            auto safety_rt =
+                device::GetAcceleratorRegistry().RuntimeAccelerators(true);
+            if (safety_rt.FindDeviceForPointer(s.ptr) != nullptr) {
+                LOG(ERROR) << "GDS WRITE: device pointer " << s.ptr
+                           << " not matched by main lookup but found"
+                           << " by safety check; refusing pwrite";
+                return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+            }
             VLOG(1) << "[GDS WRITE] pwrite fallback: size=" << s.size
                     << " offset=" << vo;
             if (::pwrite(gds_fd_, s.ptr, s.size, static_cast<off_t>(vo)) !=
@@ -376,7 +387,8 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
 
     GdsDeviceFileHandle cfh = cu_file_handle_;
     uint64_t vo = offset + RecordHeader::SIZE + hdr.key_len;
-    auto rd_runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    auto rd_runtime =
+        device::GetAcceleratorRegistry().RuntimeAccelerators(true);
     device::PointerInfo rd_info;
     const auto* rd_dev =
         rd_runtime.FindDeviceForPointer(dest_slice.ptr, &rd_info);
@@ -393,12 +405,21 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
         }
 
         ssize_t r = ops_->Read(cfh, dest_slice.ptr, dest_slice.size,
-                                         static_cast<off_t>(vo));
+                               static_cast<off_t>(vo));
         VLOG(1) << "[GDS READ] cuFileRead DMA: size=" << dest_slice.size
                 << " offset=" << vo << " ret=" << r;
         if (r != static_cast<ssize_t>(dest_slice.size))
             return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
     } else {
+        // Safety: verify this is truly CPU memory before pread.
+        auto safety_rt =
+            device::GetAcceleratorRegistry().RuntimeAccelerators(true);
+        if (safety_rt.FindDeviceForPointer(dest_slice.ptr) != nullptr) {
+            LOG(ERROR) << "GDS READ: device pointer " << dest_slice.ptr
+                       << " not matched by main lookup but found"
+                       << " by safety check; refusing pread";
+            return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+        }
         VLOG(1) << "[GDS READ] pread fallback: size=" << dest_slice.size
                 << " offset=" << vo;
         if (::pread(gds_fd_, dest_slice.ptr, dest_slice.size,
@@ -421,12 +442,21 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
 // ===================================================================
 void GdsContext::Shutdown() {
 #ifdef USE_GDS_BACKEND
-    // Release order: buffers -> handle -> fd
-    // (cuFile requires buffers deregistered before handle deregister)
-    for (auto& [ptr, _] : registered_buffers_) {
-        ops_->BufDeregister(ptr);
+    if (!ops_) {
+        // Init() was never called or failed before creating ops_.
+        enabled_ = false;
+        return;
     }
-    registered_buffers_.clear();
+
+    // Hold buf_mutex_ to prevent data race with EnsureBufferRegistered()
+    // if Shutdown() is called while an I/O thread is still running.
+    {
+        MutexLocker lock(&buf_mutex_);
+        for (auto& [ptr, _] : registered_buffers_) {
+            ops_->BufDeregister(ptr);
+        }
+        registered_buffers_.clear();
+    }
 
     if (cu_file_handle_) {
         ops_->FileHandleDeregister(cu_file_handle_);
@@ -456,7 +486,7 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
     auto it = registered_buffers_.find(gpu_ptr);
     if (it != registered_buffers_.end()) {
         if (it->second == size) return true;  // already registered, same size
-        ops_->BufDeregister(gpu_ptr);  // size changed, re-register
+        ops_->BufDeregister(gpu_ptr);         // size changed, re-register
         registered_buffers_.erase(it);
     }
 
@@ -476,7 +506,10 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
 }
 
 #ifdef USE_GDS_BACKEND
-bool GdsContext::IsGdsAvailable() { auto probe_ops = CreateGdsDeviceOps(); return probe_ops->ProbeDeviceNode(); }
+bool GdsContext::IsGdsAvailable() {
+    auto probe_ops = CreateGdsDeviceOps();
+    return probe_ops->ProbeDeviceNode();
+}
 #endif
 
 // ===================================================================
@@ -487,8 +520,6 @@ bool GdsContext::IsGdsAvailable() { auto probe_ops = CreateGdsDeviceOps(); retur
 tl::expected<void, ErrorCode> GdsContext::Init(const std::string&, uint64_t) {
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 }
-
-void GdsContext::Shutdown() {}
 
 bool GdsContext::ProbeGdsAvailable(const std::string&) { return false; }
 

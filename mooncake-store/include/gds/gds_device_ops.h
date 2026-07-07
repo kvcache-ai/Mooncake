@@ -80,7 +80,8 @@ class GdsDeviceOps {
     virtual void Free(void* ptr) = 0;
     virtual void Memset(void* ptr, int value, size_t size) = 0;
 
-    // GPU synchronization
+    // GPU context management
+    virtual void SetDevice(int device_id) = 0;
     virtual void DeviceSynchronize() = 0;
     virtual int GetDevice() = 0;
     virtual void CopyDeviceToDevice(void* dst, const void* src,

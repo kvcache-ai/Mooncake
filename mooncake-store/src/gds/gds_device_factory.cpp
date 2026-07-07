@@ -17,7 +17,6 @@ extern std::unique_ptr<GdsDeviceOps> CreateFallbackGdsDeviceOps();
 }  // namespace mooncake
 
 std::unique_ptr<mooncake::GdsDeviceOps> mooncake::CreateGdsDeviceOps() {
-
 #ifdef USE_GDS_NVIDIA
     auto ops = CreateNvidiaGdsDeviceOps();
     if (ops->ProbeDeviceNode()) {
