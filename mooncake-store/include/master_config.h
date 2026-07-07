@@ -67,8 +67,7 @@ struct MasterConfig {
     std::string redis_password;         // Redis AUTH password (empty = no auth)
     int redis_db_index = 0;             // Redis DB index
     int redis_master_view_ttl_sec = 5;  // Leader key TTL in seconds
-    int redis_heartbeat_interval_sec =
-        2;  // KeepLeader renewal interval (TTL/3)
+    int redis_heartbeat_interval_sec = 2;  // KeepLeader renewal interval
 };
 
 class MasterServiceSupervisorConfig {

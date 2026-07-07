@@ -10,7 +10,8 @@ RedisMasterViewHelper::RedisMasterViewHelper(const std::string& cluster_id,
                                              int db_index, int ttl_sec,
                                              int heartbeat_interval_sec)
     : redis_helper_(cluster_id, redis_endpoint, password, db_index, ttl_sec,
-                    heartbeat_interval_sec) {}
+                    heartbeat_interval_sec),
+      ttl_sec_(ttl_sec) {}
 
 ErrorCode RedisMasterViewHelper::Connect() { return redis_helper_.Connect(); }
 
@@ -30,6 +31,8 @@ void RedisMasterViewHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     (void)lease_id;
     redis_helper_.CancelKeepAlive();
 }
+
+int RedisMasterViewHelper::GetLeaderLeaseTTLSeconds() const { return ttl_sec_; }
 
 void RedisMasterViewHelper::CancelElection() { redis_helper_.CancelElection(); }
 

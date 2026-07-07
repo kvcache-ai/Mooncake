@@ -588,50 +588,52 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
 
-    // Validate election_backend value
-    if (master_config.election_backend != "etcd" &&
-        master_config.election_backend != "redis") {
-        LOG(FATAL) << "Invalid election_backend: "
-                   << master_config.election_backend
-                   << ". Must be 'etcd' or 'redis'";
-        return 1;
-    }
+    if (master_config.enable_ha) {
+        if (master_config.election_backend != "etcd" &&
+            master_config.election_backend != "redis") {
+            LOG(FATAL) << "Invalid election_backend: "
+                       << master_config.election_backend
+                       << ". Must be 'etcd' or 'redis'";
+            return 1;
+        }
+
+        if (master_config.election_backend == "etcd") {
+            if (master_config.etcd_endpoints.empty()) {
+                LOG(FATAL)
+                    << "Etcd endpoints must be set when enable_ha is true and "
+                       "election_backend is etcd";
+                return 1;
+            }
+        } else {
 #ifndef STORE_USE_REDIS
-    if (master_config.enable_ha && master_config.election_backend == "redis") {
-        LOG(FATAL) << "Redis election backend requested but STORE_USE_REDIS "
-                      "is not enabled at compile time";
-        return 1;
-    }
+            LOG(FATAL) << "Redis election backend requested but "
+                          "STORE_USE_REDIS is not enabled at compile time";
+            return 1;
 #endif
-    if (master_config.enable_ha && master_config.etcd_endpoints.empty() &&
-        master_config.election_backend != "redis") {
-        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true and "
-                      "election_backend is etcd";
-        return 1;
-    }
-    if (master_config.enable_ha && master_config.election_backend == "redis" &&
-        master_config.redis_endpoint.empty()) {
-        LOG(FATAL)
-            << "redis_endpoint must be set when election_backend is redis "
-               "and enable_ha is true";
-        return 1;
-    }
-    if (master_config.election_backend == "redis") {
-        if (master_config.redis_master_view_ttl_sec <= 0) {
-            LOG(FATAL) << "redis_master_view_ttl_sec must be greater than 0";
-            return 1;
-        }
-        if (master_config.redis_heartbeat_interval_sec <= 0) {
-            LOG(FATAL) << "redis_heartbeat_interval_sec must be greater than 0";
-            return 1;
-        }
-        if (master_config.redis_heartbeat_interval_sec >=
-            master_config.redis_master_view_ttl_sec) {
-            LOG(FATAL) << "redis_heartbeat_interval_sec ("
-                       << master_config.redis_heartbeat_interval_sec
-                       << ") must be less than redis_master_view_ttl_sec ("
-                       << master_config.redis_master_view_ttl_sec << ")";
-            return 1;
+            if (master_config.redis_endpoint.empty()) {
+                LOG(FATAL)
+                    << "redis_endpoint must be set when election_backend is "
+                       "redis and enable_ha is true";
+                return 1;
+            }
+            if (master_config.redis_master_view_ttl_sec <= 0) {
+                LOG(FATAL)
+                    << "redis_master_view_ttl_sec must be greater than 0";
+                return 1;
+            }
+            if (master_config.redis_heartbeat_interval_sec <= 0) {
+                LOG(FATAL)
+                    << "redis_heartbeat_interval_sec must be greater than 0";
+                return 1;
+            }
+            if (master_config.redis_heartbeat_interval_sec >=
+                master_config.redis_master_view_ttl_sec) {
+                LOG(FATAL) << "redis_heartbeat_interval_sec ("
+                           << master_config.redis_heartbeat_interval_sec
+                           << ") must be less than redis_master_view_ttl_sec ("
+                           << master_config.redis_master_view_ttl_sec << ")";
+                return 1;
+            }
         }
     }
     if (!master_config.enable_ha && !master_config.etcd_endpoints.empty()) {

@@ -63,6 +63,12 @@ class MasterViewHelper {
     virtual void CancelKeepAlive(EtcdLeaseId lease_id);
 
     /*
+     * @brief Get the leader lease TTL in seconds for the current election
+     *        backend.
+     */
+    virtual int GetLeaderLeaseTTLSeconds() const;
+
+    /*
      * @brief Get the current master view.
      * @param master: Output param, the ip:port address of the master.
      * @param version: Output param, the version of the master view.

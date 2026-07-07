@@ -97,7 +97,15 @@ void MasterViewHelper::KeepLeader(EtcdLeaseId lease_id) {
 }
 
 void MasterViewHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
-    EtcdHelper::CancelKeepAlive(lease_id);
+    auto ret = EtcdHelper::CancelKeepAlive(lease_id);
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to cancel etcd keep-alive, lease_id=" << lease_id
+                   << ", error=" << ret;
+    }
+}
+
+int MasterViewHelper::GetLeaderLeaseTTLSeconds() const {
+    return static_cast<int>(ETCD_MASTER_VIEW_LEASE_TTL);
 }
 
 ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
@@ -142,6 +150,10 @@ int MasterServiceSupervisor::Start() {
 
         auto mv_helper = CreateMasterViewHelper(config_);
         if (!mv_helper) {
+            LOG(ERROR) << "Failed to create leader election helper, backend="
+                       << (config_.election_backend == ElectionBackend::REDIS
+                               ? "redis"
+                               : "etcd");
             return -1;
         }
 
@@ -162,11 +174,8 @@ int MasterServiceSupervisor::Start() {
 
         // To prevent potential split-brain, wait long enough for the old leader
         // to retire.
-        const int waiting_time =
-            config_.election_backend == ElectionBackend::REDIS
-                ? config_.redis_master_view_ttl_sec
-                : static_cast<int>(ETCD_MASTER_VIEW_LEASE_TTL);
-        std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
+        std::this_thread::sleep_for(
+            std::chrono::seconds(mv_helper->GetLeaderLeaseTTLSeconds()));
 
         LOG(INFO) << "Starting master service...";
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {

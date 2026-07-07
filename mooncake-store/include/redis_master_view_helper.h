@@ -35,6 +35,8 @@ class RedisMasterViewHelper : public MasterViewHelper {
 
     void CancelKeepAlive(EtcdLeaseId lease_id) override;
 
+    int GetLeaderLeaseTTLSeconds() const override;
+
     void CancelElection();
 
     ErrorCode GetMasterView(std::string& master_address,
@@ -42,6 +44,7 @@ class RedisMasterViewHelper : public MasterViewHelper {
 
    private:
     RedisHelper redis_helper_;
+    int ttl_sec_;
 };
 #endif  // STORE_USE_REDIS
 

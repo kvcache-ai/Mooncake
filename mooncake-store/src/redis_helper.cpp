@@ -351,30 +351,25 @@ bool RedisHelper::WatchLeaderSubscribe() {
     // so redisGetReply returns at least once per second regardless
     // of whether a Pub/Sub message arrives, allowing the subscribe
     // loop to check leader_lost/cancel_election_ flags.
-    // Only create the polling thread if we have a valid connection.
-    std::thread polling_thread;
-    if (polling_ctx) {
-        polling_thread = std::thread([this, &leader_lost, polling_ctx]() {
-            auto interval = std::chrono::seconds(ttl_sec_);
-            while (!leader_lost && !cancel_election_) {
-                std::this_thread::sleep_for(interval);
-                if (leader_lost || cancel_election_) break;
+    std::thread polling_thread([this, &leader_lost, polling_ctx]() {
+        auto interval = std::chrono::seconds(ttl_sec_);
+        while (!leader_lost && !cancel_election_) {
+            std::this_thread::sleep_for(interval);
+            if (leader_lost || cancel_election_) break;
 
-                RedisReplyPtr r((redisReply*)redisCommand(
-                    polling_ctx, "GET %b", master_view_key_.data(),
-                    master_view_key_.size()));
-                if (!r) {
-                    LOG(WARNING)
-                        << "WatchLeaderSubscribe: polling GET failed "
-                           "(connection error), exiting polling thread";
-                    break;
-                }
-                if (r->type == REDIS_REPLY_NIL) {
-                    leader_lost = true;
-                }
+            RedisReplyPtr r((redisReply*)redisCommand(polling_ctx, "GET %b",
+                                                      master_view_key_.data(),
+                                                      master_view_key_.size()));
+            if (!r) {
+                LOG(WARNING) << "WatchLeaderSubscribe: polling GET failed "
+                                "(connection error), exiting polling thread";
+                break;
             }
-        });
-    }
+            if (r->type == REDIS_REPLY_NIL) {
+                leader_lost = true;
+            }
+        }
+    });
 
     // Subscribe loop: read messages until leader vacancy is detected.
     // redisGetReply returns at least every 1s (subscribe_ctx_ timeout)
