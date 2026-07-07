@@ -62,6 +62,9 @@ class KVBootstrapServer:
     async def _handle_metadata(self, request: web.Request):
         """Handle metadata requests."""
         key = request.query.get('key', '')
+        if not key.strip():
+            return web.Response(text='metadata key is required', status=400,
+                              content_type='application/json')
         
         if request.method == 'GET':
             return await self._handle_get(key)
