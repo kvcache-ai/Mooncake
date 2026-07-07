@@ -11,6 +11,7 @@ import sys
 import time
 import statistics
 import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Dict, Any
@@ -205,10 +206,25 @@ def get_max_page_id(requests: List[KVCacheRequest]) -> int:
     return max_id
 
 
+def parse_csv_floats(value: str) -> List[float]:
+    return [float(item.strip()) for item in value.split(',') if item.strip()]
+
+
+def wait_for_replay_time(req: KVCacheRequest, base_timestamp: float,
+                         start_time: float, replay_scale: float):
+    if replay_scale <= 0 or req.timestamp == 0:
+        return
+    target_time = start_time + max(0.0, req.timestamp - base_timestamp) / replay_scale
+    delay = target_time - time.perf_counter()
+    if delay > 0:
+        time.sleep(delay)
+
+
 def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                   max_requests: int = None, max_pages: int = None,
                   page_size_tokens: int = 512,
-                  fsync_mode: str = 'none', fsync_batch_size: int = 100) -> Dict:
+                  fsync_mode: str = 'none', fsync_batch_size: int = 100,
+                  threads: int = 1, replay_scale: float = 0.0) -> Dict:
     """Run benchmark
 
     Args:
@@ -220,6 +236,8 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         page_size_tokens: Tokens per page
         fsync_mode: When to fsync
         fsync_batch_size: Number of writes between fsync
+        threads: Benchmark client worker threads
+        replay_scale: Timestamp replay multiplier; 0 runs unpaced
 
     Returns:
         Benchmark results dictionary
@@ -229,6 +247,8 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
     print(f"Model: {model_config['name']}")
     print(f"Layers: {model_config['num_layers']}")
     print(f"Page size: {page_size_tokens} tokens")
+    print(f"Threads: {threads}")
+    print(f"Fast-forward: {replay_scale:g}x" if replay_scale > 0 else "Fast-forward: unpaced")
     print(f"{'='*80}")
 
     # Load trace
@@ -289,12 +309,13 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         fsync_batch_size=fsync_batch_size
     ) as benchmark:
         start_time = time.perf_counter()
+        completed = 0
         try:
-            for i, req in enumerate(requests):
-                benchmark.process_request(req)
-                # Print progress for each request
+            base_timestamp = requests[0].timestamp if requests else 0
+
+            def print_progress(done: int, req: KVCacheRequest):
                 elapsed = time.perf_counter() - start_time
-                qps = (i + 1) / elapsed if elapsed > 0 else 0
+                qps = done / elapsed if elapsed > 0 else 0
                 stats = benchmark.get_stats()
                 storage = stats.get('storage', {})
                 read_latency = storage.get('read', {}).get('avg_ms', 0)
@@ -305,11 +326,29 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                 write_time = storage.get('write', {}).get('time_s', 0)
                 read_mbps = read_mb / read_time if read_time > 0 else 0
                 write_mbps = write_mb / write_time if write_time > 0 else 0
-                print(f"  [{i+1:5d}/{len(requests)}] ids={len(req.hash_ids):3d} "
+                print(f"  [{done:5d}/{len(requests)}] ids={len(req.hash_ids):3d} "
                       f"tokens={req.input_length+req.output_length:6d} | "
                       f"QPS={qps:7.2f} | "
                       f"R={stats['read_pages']:6d} ({read_latency:6.2f}ms, {read_mbps:6.1f}MB/s) | "
                       f"W={stats['write_pages']:6d} ({write_latency:6.2f}ms, {write_mbps:6.1f}MB/s)")
+
+            if threads <= 1:
+                for req in requests:
+                    wait_for_replay_time(req, base_timestamp, start_time, replay_scale)
+                    benchmark.process_request(req)
+                    completed += 1
+                    print_progress(completed, req)
+            else:
+                with ThreadPoolExecutor(max_workers=threads) as executor:
+                    futures = []
+                    for req in requests:
+                        wait_for_replay_time(req, base_timestamp, start_time, replay_scale)
+                        futures.append(executor.submit(benchmark.process_request, req))
+                    future_to_req = dict(zip(futures, requests))
+                    for future in as_completed(futures):
+                        future.result()
+                        completed += 1
+                        print_progress(completed, future_to_req[future])
         except KeyboardInterrupt:
             print(f"\n\n{'='*80}")
             print(f"Interrupted! Showing partial results:")
@@ -318,11 +357,13 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
             stats = benchmark.get_stats()
             print_results([{
                 'trace_file': Path(trace_path).name,
-                'total_requests': i + 1,
+                'total_requests': completed,
                 'io_time_s': elapsed,
-                'requests_per_second': (i + 1) / elapsed if elapsed > 0 else 0,
+                'requests_per_second': completed / elapsed if elapsed > 0 else 0,
                 'model': model_config['name'],
                 'fsync_mode': fsync_mode,
+                'threads': threads,
+                'replay_scale': replay_scale,
                 **stats,
             }])
             sys.exit(0)
@@ -337,6 +378,8 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         'requests_per_second': len(requests) / elapsed if elapsed > 0 else 0,
         'model': model_config['name'],
         'fsync_mode': fsync_mode,
+        'threads': threads,
+        'replay_scale': replay_scale,
         **stats,
     }
 
@@ -357,6 +400,9 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
     # General info
     output.append(f"\n[General]")
     output.append(f"  Model:            {stats.get('model', 'N/A')}")
+    output.append(f"  Threads:          {stats.get('threads', 1)}")
+    replay_scale = stats.get('replay_scale', 0)
+    output.append(f"  Fast-forward:     {f'{replay_scale:g}x' if replay_scale else 'unpaced'}")
     output.append(f"  Requests:         {stats.get('total_requests', 0):,}")
     output.append(f"  Tokens:           {stats.get('total_tokens', 0):,}")
     output.append(f"  Total I/O Time:    {stats.get('io_time_s', 0):.3f} s")
@@ -438,6 +484,10 @@ def main():
                        default='none', help='When to fsync')
     parser.add_argument('--fsync-batch-size', type=int, default=100,
                        help='Number of writes between fsync')
+    parser.add_argument('--threads', type=int, default=1,
+                       help='Number of benchmark client worker threads')
+    parser.add_argument('--replay-scales', type=str, default='0',
+                       help='Comma-separated trace fast-forward speeds; 0 means unpaced')
 
     args = parser.parse_args()
 
@@ -447,6 +497,7 @@ def main():
 
     model_config = get_model_config(args.model)
     print(f"Model: {args.model} ({model_config['num_layers']} layers)")
+    replay_scales = parse_csv_floats(args.replay_scales)
 
     # Determine scenarios
     scenarios = ['conversation', 'synthetic', 'toolagent'] if args.scenario == 'all' else [args.scenario]
@@ -458,20 +509,27 @@ def main():
 
     # Run benchmarks
     results = []
+    use_scale_subdirs = len(replay_scales) > 1 or replay_scales[0] != 0
     for scenario in scenarios:
         trace_path = Path(args.trace_dir) / trace_files[scenario]
         if trace_path.exists():
-            result = run_benchmark(
-                str(trace_path),
-                str(Path(args.storage_dir) / scenario),
-                model_config,
-                args.max_requests,
-                args.max_pages,
-                args.page_size_tokens,
-                args.fsync_mode,
-                args.fsync_batch_size
-            )
-            results.append(result)
+            for replay_scale in replay_scales:
+                run_dir = Path(args.storage_dir) / scenario
+                if use_scale_subdirs:
+                    run_dir = run_dir / f"replay_{replay_scale:g}x"
+                result = run_benchmark(
+                    str(trace_path),
+                    str(run_dir),
+                    model_config,
+                    args.max_requests,
+                    args.max_pages,
+                    args.page_size_tokens,
+                    args.fsync_mode,
+                    args.fsync_batch_size,
+                    args.threads,
+                    replay_scale
+                )
+                results.append(result)
         else:
             print(f"Warning: Trace file not found: {trace_path}")
 

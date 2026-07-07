@@ -28,6 +28,38 @@ python benchmark.py --scenario conversation \
 | `--max-pages` | `2000` | Maximum number of pages (creates modulo mapping if trace is larger) |
 | `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always`, or `end` |
 | `--fsync-batch-size` | `100` | Number of writes between fsync in batch mode |
+| `--threads` | `1` | Number of benchmark client worker threads |
+| `--replay-scales` | `0` | Comma-separated trace fast-forward speeds; `0` means unpaced |
+
+### Replay Scale
+
+Use `--replay-scales` to run the same trace at different fast-forward speeds:
+
+```bash
+python benchmark.py --scenario toolagent \
+                    --trace-dir /path/to/Mooncake/FAST25-release/traces \
+                    --storage-dir /path/to/test/drive \
+                    --replay-scales 1,2,4,8
+```
+
+For example, `2` means 2x fast-forward and `8` means 8x fast-forward. `0`
+preserves the old unpaced behavior.
+
+### Client Threads
+
+Use `--threads` to add benchmark client worker threads:
+
+```bash
+python benchmark.py --scenario toolagent \
+                    --trace-dir /path/to/Mooncake/FAST25-release/traces \
+                    --storage-dir /path/to/test/drive \
+                    --threads 4
+```
+
+With `--threads > 1`, benchmark clients submit requests concurrently. This is
+useful for checking whether a single client thread under-drives the storage
+path. For strict trace-order read/write and hit-rate accounting, use
+`--threads 1`.
 
 ## Output Format
 
@@ -56,6 +88,8 @@ Fields:
 
 [General]
   Model:            glm5
+  Threads:          1
+  Fast-forward:     unpaced
   Requests:         12031
   Tokens:           123456789
   Total I/O Time:   245.123 s
