@@ -48,7 +48,7 @@ TEST(P2PStandbyMetadataStoreTest, Remove) {
     P2PStandbyMetadataStore store;
     StandbyObjectMetadata meta;
     meta.size = 100;
-    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100);
+    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100, 1);
 
     EXPECT_TRUE(store.Remove("key1"));
     EXPECT_FALSE(store.GetMetadata("key1").has_value());
@@ -58,7 +58,7 @@ TEST(P2PStandbyMetadataStoreTest, Remove) {
 TEST(P2PStandbyMetadataStoreTest, Exists) {
     P2PStandbyMetadataStore store;
     EXPECT_FALSE(store.Exists("key1"));
-    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100);
+    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100, 1);
     EXPECT_TRUE(store.Exists("key1"));
 }
 
@@ -66,9 +66,9 @@ TEST(P2PStandbyMetadataStoreTest, GetKeyCount) {
     P2PStandbyMetadataStore store;
     EXPECT_EQ(store.GetKeyCount(), 0u);
 
-    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100);
+    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100, 1);
     EXPECT_EQ(store.GetKeyCount(), 1u);
-    store.AddReplica("key2", MakeUUID(1, 0), MakeUUID(11, 0), 200);
+    store.AddReplica("key2", MakeUUID(1, 0), MakeUUID(11, 0), 200, 1);
     EXPECT_EQ(store.GetKeyCount(), 2u);
     store.Remove("key1");
     EXPECT_EQ(store.GetKeyCount(), 1u);
@@ -92,7 +92,7 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaAfterClientRegistered) {
 
     // Register client first, then add replica
     store.RegisterClient(client_id, "10.0.0.1", 50051, {});
-    store.AddReplica("key1", client_id, seg_id, 1024);
+    store.AddReplica("key1", client_id, seg_id, 1024, 1);
 
     auto it = store.GetObjects().find("key1");
     ASSERT_NE(it, store.GetObjects().end());
@@ -116,7 +116,7 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaPreservesSegmentExtra) {
     registered_extra.usage = 256;
     store.RegisterClient(client_id, "10.0.0.1", 50051, {seg});
 
-    store.AddReplica("key1", client_id, seg_id, 1024);
+    store.AddReplica("key1", client_id, seg_id, 1024, 1);
 
     auto* info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
@@ -134,12 +134,13 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaCreatesObject) {
     auto client_id = MakeUUID(1, 0);
     auto seg_id = MakeUUID(10, 0);
 
-    store.AddReplica("model-weights", client_id, seg_id, 4096);
+    store.AddReplica("model-weights", client_id, seg_id, 4096, 123);
 
     const auto& objects = store.GetObjects();
     ASSERT_EQ(objects.size(), 1u);
     auto it = objects.find("model-weights");
     ASSERT_NE(it, objects.end());
+    EXPECT_EQ(it->second.last_sequence_id, 123u);
     EXPECT_EQ(it->second.replicas.size(), 1u);
 }
 
@@ -150,11 +151,12 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaMultiple) {
     auto seg1 = MakeUUID(10, 0);
     auto seg2 = MakeUUID(11, 0);
 
-    store.AddReplica("key1", client1, seg1, 1024);
-    store.AddReplica("key1", client2, seg2, 2048);
+    store.AddReplica("key1", client1, seg1, 1024, 1);
+    store.AddReplica("key1", client2, seg2, 2048, 2);
 
     auto it = store.GetObjects().find("key1");
     ASSERT_NE(it, store.GetObjects().end());
+    EXPECT_EQ(it->second.last_sequence_id, 2u);
     EXPECT_EQ(it->second.replicas.size(), 2u);
 }
 
@@ -163,11 +165,12 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaDuplicateIgnored) {
     auto client = MakeUUID(1, 0);
     auto seg = MakeUUID(10, 0);
 
-    store.AddReplica("key1", client, seg, 1024);
-    store.AddReplica("key1", client, seg, 1024);
+    store.AddReplica("key1", client, seg, 1024, 1);
+    store.AddReplica("key1", client, seg, 1024, 2);
 
     auto it = store.GetObjects().find("key1");
     ASSERT_NE(it, store.GetObjects().end());
+    EXPECT_EQ(it->second.last_sequence_id, 2u);
     EXPECT_EQ(it->second.replicas.size(), 1u);
 }
 
@@ -178,8 +181,8 @@ TEST(P2PStandbyMetadataStoreTest, RemoveReplica) {
     auto seg1 = MakeUUID(10, 0);
     auto seg2 = MakeUUID(11, 0);
 
-    store.AddReplica("key1", client1, seg1, 1024);
-    store.AddReplica("key1", client2, seg2, 2048);
+    store.AddReplica("key1", client1, seg1, 1024, 1);
+    store.AddReplica("key1", client2, seg2, 2048, 1);
 
     // Remove one replica
     store.RemoveReplica("key1", client1, seg1);
@@ -194,7 +197,7 @@ TEST(P2PStandbyMetadataStoreTest, RemoveReplicaRemovesEmptyObject) {
     auto client = MakeUUID(1, 0);
     auto seg = MakeUUID(10, 0);
 
-    store.AddReplica("key1", client, seg, 1024);
+    store.AddReplica("key1", client, seg, 1024, 1);
     store.RemoveReplica("key1", client, seg);
 
     // Object with no replicas should be removed
@@ -290,7 +293,7 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesReplicaIPs) {
     auto seg_id = MakeUUID(10, 0);
 
     // Add replica BEFORE client is registered (ip/port unknown)
-    store.AddReplica("key1", client_id, seg_id, 1024);
+    store.AddReplica("key1", client_id, seg_id, 1024, 1);
 
     // Verify replica has empty ip/port (backfilling deferred to ExportMetadata)
     auto it = store.GetObjects().find("key1");
@@ -361,8 +364,8 @@ TEST(P2PStandbyMetadataStoreTest, UnRegisterClientCascadeDeletesReplicas) {
 
     store.RegisterClient(client_id, "10.0.0.1", 50051,
                          {MakeSegment(seg1, 1024), MakeSegment(seg2, 2048)});
-    store.AddReplica("key1", client_id, seg1, 1024);
-    store.AddReplica("key2", client_id, seg2, 2048);
+    store.AddReplica("key1", client_id, seg1, 1024, 1);
+    store.AddReplica("key2", client_id, seg2, 2048, 1);
     ASSERT_EQ(store.GetKeyCount(), 2u);
 
     store.UnRegisterClient(client_id);
@@ -380,9 +383,9 @@ TEST(P2PStandbyMetadataStoreTest, UnRegisterClientPreservesOtherClients) {
 
     store.RegisterClient(client1, "10.0.0.1", 50051, {MakeSegment(seg1, 1024)});
     store.RegisterClient(client2, "10.0.0.2", 50052, {MakeSegment(seg2, 2048)});
-    store.AddReplica("shared-key", client1, seg1, 1024);
-    store.AddReplica("shared-key", client2, seg2, 2048);
-    store.AddReplica("client1-only", client1, seg1, 512);
+    store.AddReplica("shared-key", client1, seg1, 1024, 1);
+    store.AddReplica("shared-key", client2, seg2, 2048, 1);
+    store.AddReplica("client1-only", client1, seg1, 512, 1);
 
     store.UnRegisterClient(client1);
 
@@ -454,7 +457,7 @@ TEST(P2PStandbyMetadataStoreTest, RemoveSegmentCascadeDeletesReplicas) {
     auto seg_id = MakeUUID(100, 0);
 
     // Add replica on this segment
-    store.AddReplica("key1", client_id, seg_id, 1024);
+    store.AddReplica("key1", client_id, seg_id, 1024, 1);
     ASSERT_EQ(store.GetObjects().size(), 1u);
 
     // Unmount the segment — should cascade delete replicas
@@ -471,8 +474,8 @@ TEST(P2PStandbyMetadataStoreTest, RemoveSegmentDoesNotAffectOtherSegments) {
     auto seg2 = MakeUUID(200, 0);
 
     // Add replicas on two different segments
-    store.AddReplica("key1", client_id, seg1, 1024);
-    store.AddReplica("key1", client_id, seg2, 2048);
+    store.AddReplica("key1", client_id, seg1, 1024, 1);
+    store.AddReplica("key1", client_id, seg2, 2048, 1);
 
     ASSERT_EQ(store.GetObjects().find("key1")->second.replicas.size(), 2u);
 
@@ -493,8 +496,8 @@ TEST(P2PStandbyMetadataStoreTest, RemoveAllMetadata) {
     auto client = MakeUUID(1, 0);
     auto seg = MakeUUID(10, 0);
 
-    store.AddReplica("key1", client, seg, 1024);
-    store.AddReplica("key2", client, seg, 2048);
+    store.AddReplica("key1", client, seg, 1024, 1);
+    store.AddReplica("key2", client, seg, 2048, 1);
     store.RegisterClient(client, "1.2.3.4", 50051, {MakeSegment(seg, 1024)});
 
     EXPECT_EQ(store.GetKeyCount(), 2u);
@@ -515,7 +518,7 @@ TEST(P2PStandbyMetadataStoreTest, ExportMetadata) {
     auto client = MakeUUID(1, 0);
     auto seg = MakeUUID(10, 0);
 
-    store.AddReplica("key1", client, seg, 1024);
+    store.AddReplica("key1", client, seg, 1024, 1);
     store.RegisterClient(client, "1.2.3.4", 50051, {MakeSegment(seg, 1024)});
 
     auto exported = store.ExportMetadata();
@@ -533,7 +536,7 @@ TEST(P2PStandbyMetadataStoreTest, ExportMetadataNoBackfillForUnknownClient) {
     auto seg_id = MakeUUID(10, 0);
 
     // Add replica but never register the client
-    store.AddReplica("key1", client_id, seg_id, 1024);
+    store.AddReplica("key1", client_id, seg_id, 1024, 1);
 
     auto exported = store.ExportMetadata();
     auto obj_it = exported.objects.find("key1");

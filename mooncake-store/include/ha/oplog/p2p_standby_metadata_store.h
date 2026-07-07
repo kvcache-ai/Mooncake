@@ -66,7 +66,7 @@ class P2PStandbyMetadataStore : public MetadataStore {
 
     /// Add a replica to an object. Creates the object if it doesn't exist.
     void AddReplica(const std::string& object_key, const UUID& client_id,
-                    const UUID& segment_id, size_t size);
+                    const UUID& segment_id, size_t size, uint64_t sequence_id);
 
     /// Remove a replica from an object. Removes the object if no replicas left.
     void RemoveReplica(const std::string& object_key, const UUID& client_id,

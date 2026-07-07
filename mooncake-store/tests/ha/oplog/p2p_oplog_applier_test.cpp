@@ -113,6 +113,7 @@ TEST(P2POpLogApplierTest, ApplyAddReplica) {
     ASSERT_EQ(objects.size(), 1u);
     EXPECT_NE(objects.find("model-weights"), objects.end());
     EXPECT_EQ(objects.at("model-weights").replicas.size(), 1u);
+    EXPECT_EQ(objects.at("model-weights").last_sequence_id, 1u);
 }
 
 TEST(P2POpLogApplierTest, ApplyRemoveReplica) {
@@ -148,7 +149,7 @@ TEST(P2POpLogApplierTest, ApplyRemove_DelegatesToBaseClass) {
 
     // Add P2P metadata first. PutMetadata is a compatibility no-op for
     // P2PStandbyMetadataStore.
-    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100);
+    store.AddReplica("key1", MakeUUID(1, 0), MakeUUID(10, 0), 100, 1);
     ASSERT_TRUE(store.GetMetadata("key1").has_value());
 
     // REMOVE should delegate to base class

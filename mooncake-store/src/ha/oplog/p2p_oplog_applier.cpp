@@ -124,7 +124,7 @@ bool P2POpLogApplier::ApplyAddReplica(const OpLogEntry& entry) {
     }
 
     p2p_store_->AddReplica(payload.object_key, payload.client_id,
-                           payload.segment_id, payload.size);
+                           payload.segment_id, payload.size, entry.sequence_id);
     return true;
 }
 
