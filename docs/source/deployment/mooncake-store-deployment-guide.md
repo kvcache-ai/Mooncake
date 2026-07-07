@@ -730,8 +730,8 @@ mooncake_client \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `0.0.0.0` | Client service bind host |
-| `--port` | `50052` | Client service listen port |
+| `--host` | `0.0.0.0` | Client service bind host. Accepts `ip:port` to specify the data plane port for TransferEngine |
+| `--port` | `50052` | Client RPC listen port (dummy↔real client control plane) |
 | `--global_segment_size` | `4 GB` | Global segment size contributed by the client |
 | `--master_server_address` | `127.0.0.1:50051` | Master service address |
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Transfer Engine metadata service |

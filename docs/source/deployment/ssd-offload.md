@@ -92,7 +92,7 @@ store.setup_dummy(
 |------|---------|-------------|
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Metadata server connection string |
 | `--master_server_address` | `127.0.0.1:50051` | Master address |
-| `--host` | `0.0.0.0` | This machine's externally reachable IP |
+| `--host` | `0.0.0.0` | This machine's externally reachable IP. Accepts `ip:port` to specify the data plane port for TransferEngine |
 | `--port` | `50052` | Real client RPC listening port |
 | `--device_names` | ` ` | NIC name(s), e.g. `eth0` or `mlx5_0` |
 | `--protocol` | `tcp` | Transport protocol: `tcp` or `rdma` |
