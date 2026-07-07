@@ -21,12 +21,25 @@
 
 namespace mooncake {
 namespace tent {
-ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
-                           size_t chunk_count)
-    : chunk_size_(chunk_size), chunk_count_(chunk_count), impl_(impl) {
+ProxyManager::ProxyManager(TransferEngineImpl* impl,
+                           size_t max_queued_tasks_per_shard)
+    : ProxyManager(impl, max_queued_tasks_per_shard, true) {}
+
+std::unique_ptr<ProxyManager> ProxyManager::createForTest(
+    TransferEngineImpl* impl, size_t max_queued_tasks_per_shard) {
+    return std::unique_ptr<ProxyManager>(
+        new ProxyManager(impl, max_queued_tasks_per_shard, false));
+}
+
+ProxyManager::ProxyManager(TransferEngineImpl* impl,
+                           size_t max_queued_tasks_per_shard,
+                           bool start_workers)
+    : max_queued_tasks_per_shard_(max_queued_tasks_per_shard), impl_(impl) {
     running_ = true;
-    for (size_t i = 0; i < kShards; ++i) {
-        shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
+    if (start_workers) {
+        for (size_t i = 0; i < kShards; ++i) {
+            shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
+        }
     }
 }
 
@@ -36,27 +49,70 @@ Status ProxyManager::deconstruct() {
     running_ = false;
     for (size_t i = 0; i < kShards; ++i) {
         shards_[i].cv.notify_all();
-        shards_[i].thread.join();
+        if (shards_[i].thread.joinable()) shards_[i].thread.join();
     }
-    for (auto entry : stage_buffers_) {
+
+    std::unordered_map<std::string, StageBuffers> stage_buffers;
+    {
+        std::lock_guard<std::mutex> lk(stage_buffers_mu_);
+        stage_buffers = std::move(stage_buffers_);
+    }
+    for (auto& entry : stage_buffers) {
         impl_->unregisterLocalMemory(entry.second.chunks);
         impl_->freeLocalMemory(entry.second.chunks);
         delete[] entry.second.bitmap;
     }
-    stage_buffers_.clear();
     return Status::OK();
 }
 
-BatchID ProxyManager::submitCrossStage(const Request& request,
-                                       uint64_t local_stage_buffer,
-                                       uint64_t remote_stage_buffer,
-                                       uint64_t chunk_length) {
+Request ProxyManager::makeCrossStageRequest(const Request& request,
+                                            uint64_t local_stage_buffer,
+                                            uint64_t remote_stage_buffer,
+                                            uint64_t chunk_length) {
     Request inter_stage;
     inter_stage.opcode = request.opcode;
     inter_stage.source = (void*)local_stage_buffer;
     inter_stage.length = chunk_length;
     inter_stage.target_id = request.target_id;
     inter_stage.target_offset = remote_stage_buffer;
+    inter_stage.priority = request.priority;
+    return inter_stage;
+}
+
+Request ProxyManager::makeLocalStageRequest(const Request& request,
+                                            uint64_t local_stage_buffer,
+                                            uint64_t chunk_length,
+                                            uint64_t offset) {
+    Request local_stage;
+    local_stage.opcode = request.opcode;
+    local_stage.source = (uint8_t*)request.source + offset;
+    local_stage.length = chunk_length;
+    local_stage.target_id = LOCAL_SEGMENT_ID;
+    local_stage.target_offset = local_stage_buffer;
+    local_stage.priority = request.priority;
+    return local_stage;
+}
+
+Request ProxyManager::makeRemoteStageRequest(const Request& request,
+                                             uint64_t remote_stage_buffer,
+                                             uint64_t chunk_length,
+                                             uint64_t offset) {
+    Request remote_stage;
+    remote_stage.opcode = request.opcode;
+    remote_stage.source = (void*)remote_stage_buffer;
+    remote_stage.length = chunk_length;
+    remote_stage.target_id = LOCAL_SEGMENT_ID;
+    remote_stage.target_offset = request.target_offset + offset;
+    remote_stage.priority = request.priority;
+    return remote_stage;
+}
+
+BatchID ProxyManager::submitCrossStage(const Request& request,
+                                       uint64_t local_stage_buffer,
+                                       uint64_t remote_stage_buffer,
+                                       uint64_t chunk_length) {
+    auto inter_stage = makeCrossStageRequest(request, local_stage_buffer,
+                                             remote_stage_buffer, chunk_length);
     auto batch = impl_->allocateBatch(1);
     auto status = impl_->submitStagingTransfer(batch, {inter_stage});
     if (!status.ok()) {
@@ -71,12 +127,8 @@ BatchID ProxyManager::submitCrossStage(const Request& request,
 BatchID ProxyManager::submitLocalStage(const Request& request,
                                        uint64_t local_stage_buffer,
                                        uint64_t chunk_length, uint64_t offset) {
-    Request local_stage;
-    local_stage.opcode = request.opcode;
-    local_stage.source = (uint8_t*)request.source + offset;
-    local_stage.length = chunk_length;
-    local_stage.target_id = LOCAL_SEGMENT_ID;
-    local_stage.target_offset = local_stage_buffer;
+    auto local_stage = makeLocalStageRequest(request, local_stage_buffer,
+                                             chunk_length, offset);
     auto batch = impl_->allocateBatch(1);
     auto status = impl_->submitStagingTransfer(batch, {local_stage});
     if (!status.ok()) {
@@ -101,12 +153,8 @@ Status ProxyManager::waitRemoteStage(const std::string& server_addr,
                                      const Request& request,
                                      uint64_t remote_stage_buffer,
                                      uint64_t chunk_length, uint64_t offset) {
-    Request remote_stage;
-    remote_stage.opcode = request.opcode;
-    remote_stage.source = (void*)remote_stage_buffer;
-    remote_stage.length = chunk_length;
-    remote_stage.target_id = LOCAL_SEGMENT_ID;
-    remote_stage.target_offset = request.target_offset + offset;
+    auto remote_stage = makeRemoteStageRequest(request, remote_stage_buffer,
+                                               chunk_length, offset);
     return ControlClient::delegate(server_addr, remote_stage);
 }
 
@@ -115,12 +163,8 @@ void ProxyManager::submitRemoteStage(const std::string& server_addr,
                                      uint64_t remote_stage_buffer,
                                      uint64_t chunk_length, uint64_t offset,
                                      std::future<Status>& handle) {
-    Request remote_stage;
-    remote_stage.opcode = request.opcode;
-    remote_stage.source = (void*)remote_stage_buffer;
-    remote_stage.length = chunk_length;
-    remote_stage.target_id = LOCAL_SEGMENT_ID;
-    remote_stage.target_offset = request.target_offset + offset;
+    auto remote_stage = makeRemoteStageRequest(request, remote_stage_buffer,
+                                               chunk_length, offset);
     handle = delegate_pool_.enqueue([server_addr, remote_stage]() {
         return ControlClient::delegate(server_addr, remote_stage);
     });
@@ -138,16 +182,26 @@ Status ProxyManager::waitCrossStage(const Request& request,
 
 Status ProxyManager::submit(TaskInfo* task, BatchID batch,
                             const std::vector<std::string>& params) {
+    if (!task || batch == 0) {
+        return Status::InvalidArgument("invalid staging task" LOC_MARK);
+    }
     StagingTask staging_task;
     staging_task.native = task;
     staging_task.batch = batch;
     staging_task.params = params;
-    task->staging_status = PENDING;
     static std::atomic<size_t> next_queue_index(0);
-    thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
+    const size_t id =
+        next_queue_index.fetch_add(1, std::memory_order_relaxed) % kShards;
     {
         std::lock_guard<std::mutex> lk(shards_[id].mu);
+        if (max_queued_tasks_per_shard_ > 0 &&
+            shards_[id].queued_tasks >= max_queued_tasks_per_shard_) {
+            return Status::TooManyRequests(
+                "staging proxy shard queue is full" LOC_MARK);
+        }
         shards_[id].queue.push(staging_task);
+        ++shards_[id].queued_tasks;
+        task->staging_status = PENDING;
     }
     shards_[id].cv.notify_one();
     return Status::OK();
@@ -165,38 +219,38 @@ Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
 struct StageBufferCache {
     StageBufferCache(ProxyManager& mgr) : mgr(mgr) {}
 
-    uint64_t allocateLocal(const std::string& location, int idx = 0) {
+    Status allocateLocal(const std::string& location, uint64_t& addr,
+                         int idx = 0) {
         auto key = location + "-" + std::to_string(idx);
         if (local_stage_buffers.count(key)) {
-            return local_stage_buffers[key];
+            addr = local_stage_buffers[key];
+            return Status::OK();
         }
-        uint64_t addr = 0;
         auto status = mgr.pinStageBuffer(location, addr);
         if (!status.ok()) {
-            LOG(FATAL) << "Failed to pin local stage buffer: " << status
-                       << ", location " << location;
-            return 0;
+            addr = 0;
+            return status;
         }
         local_stage_buffers[key] = addr;
-        return addr;
+        return Status::OK();
     }
 
-    uint64_t allocateRemote(const std::string& server_addr,
-                            const std::string& location, int idx = 0) {
+    Status allocateRemote(const std::string& server_addr,
+                          const std::string& location, uint64_t& addr,
+                          int idx = 0) {
         auto key = location + "-" + std::to_string(idx);
         if (remote_stage_buffers[server_addr].count(key)) {
-            return remote_stage_buffers[server_addr][key];
+            addr = remote_stage_buffers[server_addr][key];
+            return Status::OK();
         }
-        uint64_t addr = 0;
         auto status =
             ControlClient::pinStageBuffer(server_addr, location, addr);
         if (!status.ok()) {
-            LOG(FATAL) << "Failed to pin remote stage buffer: " << status
-                       << ", location " << location;
-            return 0;
+            addr = 0;
+            return status;
         }
         remote_stage_buffers[server_addr][key] = addr;
-        return addr;
+        return Status::OK();
     }
 
     void reset() {
@@ -236,6 +290,7 @@ void ProxyManager::runner(size_t id) {
 
             task = shard.queue.front();
             shard.queue.pop();
+            --shard.queued_tasks;
         }
 
         if (!task.native) continue;
@@ -254,14 +309,13 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
-    const size_t kStageBuffers =
-        std::min(chunk_count_, static_cast<size_t>(16));
+    const size_t kStageBuffers = std::min(kChunkCount, static_cast<size_t>(16));
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
     if (local_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
-            local_stage_buffer[i] =
-                cache->allocateLocal(task.params[1], static_cast<int>(i));
+            CHECK_STATUS(cache->allocateLocal(
+                task.params[1], local_stage_buffer[i], static_cast<int>(i)));
             if (local_stage_buffer[i] == 0)
                 return Status::InternalError(
                     "Failed to pin local stage buffer");
@@ -269,8 +323,9 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     }
     if (remote_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
-            remote_stage_buffer[i] = cache->allocateRemote(
-                server_addr, task.params[2], static_cast<int>(i));
+            CHECK_STATUS(cache->allocateRemote(server_addr, task.params[2],
+                                               remote_stage_buffer[i],
+                                               static_cast<int>(i)));
             if (remote_stage_buffer[i] == 0)
                 return Status::InternalError(
                     "Failed to pin remote stage buffer");
@@ -302,10 +357,10 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     std::unordered_set<uint64_t> local_locked;
     std::unordered_set<uint64_t> remote_locked;
 
-    for (size_t offset = 0; offset < request.length; offset += chunk_size_) {
+    for (size_t offset = 0; offset < request.length; offset += kChunkSize) {
         size_t id = chunks.size();
         Chunk chunk{offset,
-                    std::min(chunk_size_, request.length - offset),
+                    std::min(kChunkSize, request.length - offset),
                     local_staging ? local_stage_buffer[id % kStageBuffers]
                                   : (uint64_t)request.source + offset,
                     remote_staging ? remote_stage_buffer[id % kStageBuffers]
@@ -506,19 +561,19 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
     bool remote_staging = !task.params[2].empty();
 
     if (local_staging) {
-        local_stage_buffer = cache->allocateLocal(task.params[1]);
+        CHECK_STATUS(cache->allocateLocal(task.params[1], local_stage_buffer));
         if (local_stage_buffer == 0)
             return Status::InternalError("Failed to pin local stage buffer");
     }
     if (remote_staging) {
-        remote_stage_buffer =
-            cache->allocateRemote(server_addr, task.params[2]);
+        CHECK_STATUS(cache->allocateRemote(server_addr, task.params[2],
+                                           remote_stage_buffer));
         if (remote_stage_buffer == 0)
             return Status::InternalError("Failed to pin remote stage buffer");
     }
 
-    for (size_t offset = 0; offset < request.length; offset += chunk_size_) {
-        size_t chunk_length = std::min(chunk_size_, request.length - offset);
+    for (size_t offset = 0; offset < request.length; offset += kChunkSize) {
+        size_t chunk_length = std::min(kChunkSize, request.length - offset);
 
         if (!local_staging)
             local_stage_buffer = (uint64_t)request.source + offset;
@@ -560,21 +615,22 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
     return Status::OK();
 }
 
-Status ProxyManager::allocateStageBuffers(const std::string& location) {
+Status ProxyManager::allocateStageBuffersLocked(const std::string& location) {
     if (stage_buffers_.count(location)) return Status::OK();
     StageBuffers buf;
-    auto total_size = chunk_size_ * chunk_count_;
+    auto total_size = kChunkSize * kChunkCount;
     CHECK_STATUS(
         impl_->allocateLocalMemory(&buf.chunks, total_size, location, true));
     CHECK_STATUS(impl_->registerLocalMemory(buf.chunks, total_size));
-    buf.bitmap = new std::atomic_flag[chunk_count_];
-    for (size_t i = 0; i < chunk_count_; ++i)
+    buf.bitmap = new std::atomic_flag[kChunkCount];
+    for (size_t i = 0; i < kChunkCount; ++i)
         buf.bitmap[i].clear(std::memory_order_relaxed);
     stage_buffers_[location] = std::move(buf);
     return Status::OK();
 }
 
 Status ProxyManager::freeStageBuffers(const std::string& location) {
+    std::lock_guard<std::mutex> lk(stage_buffers_mu_);
     auto it = stage_buffers_.find(location);
     if (it == stage_buffers_.end())
         return Status::InvalidArgument("Stage buffer not allocated" LOC_MARK);
@@ -587,17 +643,18 @@ Status ProxyManager::freeStageBuffers(const std::string& location) {
 
 Status ProxyManager::pinStageBuffer(const std::string& location,
                                     uint64_t& addr) {
+    std::lock_guard<std::mutex> lk(stage_buffers_mu_);
     auto it = stage_buffers_.find(location);
     if (it == stage_buffers_.end()) {
-        CHECK_STATUS(allocateStageBuffers(location));
+        CHECK_STATUS(allocateStageBuffersLocked(location));
         it = stage_buffers_.find(location);
     }
 
     auto& buf = it->second;
-    for (size_t i = 0; i < chunk_count_; ++i) {
+    for (size_t i = 0; i < kChunkCount; ++i) {
         if (!buf.bitmap[i].test_and_set(std::memory_order_acquire)) {
             addr = reinterpret_cast<uint64_t>(static_cast<char*>(buf.chunks) +
-                                              i * chunk_size_);
+                                              i * kChunkSize);
             return Status::OK();
         }
     }
@@ -605,12 +662,13 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
 }
 
 Status ProxyManager::unpinStageBuffer(uint64_t addr) {
+    std::lock_guard<std::mutex> lk(stage_buffers_mu_);
     for (auto& [location, buf] : stage_buffers_) {
         auto base = reinterpret_cast<uint64_t>(buf.chunks);
-        auto end = base + chunk_size_ * chunk_count_;
+        auto end = base + kChunkSize * kChunkCount;
         if (addr >= base && addr < end) {
-            size_t index = (addr - base) / chunk_size_;
-            if (index >= chunk_count_)
+            size_t index = (addr - base) / kChunkSize;
+            if (index >= kChunkCount)
                 return Status::InvalidArgument("Invalid buffer index");
             buf.bitmap[index].clear(std::memory_order_release);
             return Status::OK();
