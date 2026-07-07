@@ -42,10 +42,6 @@ class EmptyCallback : public XChannelCallback {
 BarexTransport::BarexTransport() {}
 
 BarexTransport::~BarexTransport() {
-#ifdef CONFIG_USE_BATCH_DESC_SET
-    for (auto &entry : batch_desc_set_) delete entry.second;
-    batch_desc_set_.clear();
-#endif
     for (auto ctx : client_context_list_) {
         std::vector<XChannel *> chs = ctx->getAllChannel();
         for (auto ch : chs) {

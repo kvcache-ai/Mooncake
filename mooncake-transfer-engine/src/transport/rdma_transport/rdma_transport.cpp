@@ -93,10 +93,6 @@ RdmaTransport::RdmaTransport() {
 }
 
 RdmaTransport::~RdmaTransport() {
-#ifdef CONFIG_USE_BATCH_DESC_SET
-    for (auto &entry : batch_desc_set_) delete entry.second;
-    batch_desc_set_.clear();
-#endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
     context_list_.clear();
