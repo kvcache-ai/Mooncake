@@ -770,6 +770,7 @@ fn build_runtime(
         use_hugepage: None,
         hugepage_size_bytes: None,
         timeouts: None,
+        cold_tier_targets: None,
     };
     Ok(CompatRuntimeArgs {
         setup,

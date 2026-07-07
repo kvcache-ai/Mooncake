@@ -514,6 +514,13 @@ pub trait RouteDirectory: Send + Sync {
             .map(|key| self.get_version_floor(observer, key))
             .collect()
     }
+
+    /// Best-effort flush of locally-held authority routes to peer authorities.
+    ///
+    /// Called during graceful shutdown to ensure routes are not lost if
+    /// async mirror messages were dropped (channel-full scenarios).
+    /// The default implementation is a no-op.
+    fn flush_pending_route_mirrors(&self) {}
 }
 
 pub trait PlacementStrategy: Send + Sync {

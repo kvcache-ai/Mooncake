@@ -12,7 +12,9 @@ use mooncake_store_core::{
 use tracing::{debug, trace, warn};
 
 use crate::control::{RouteControlAuthorityClient, RouteControlTransport};
-use crate::mesh::async_mirror::{maybe_mark_authority_suspect, AsyncRouteMirrorWorker};
+use crate::mesh::async_mirror::{
+    maybe_mark_authority_suspect, mirror_secondary_batch, AsyncRouteMirrorWorker,
+};
 use crate::mesh::read_repair::{
     compute_backfill_requests, merge_fresher_route, merge_route_listing, set_repair_observation,
     RouteAuthorityObservation, RouteReadRepairState,
@@ -20,9 +22,9 @@ use crate::mesh::read_repair::{
 use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
     authority_get_many, authority_get_version_floor, authority_get_version_floors,
-    authority_is_local, authority_list_reuse_candidates, authority_list_routes_by_replica_owner,
-    authority_list_routes_in_scope, local_authority_service, register_local_authority,
-    unregister_local_authority,
+    authority_is_local, authority_list_reuse_candidates, authority_list_routes,
+    authority_list_routes_by_replica_owner, authority_list_routes_in_scope,
+    local_authority_service, register_local_authority, unregister_local_authority,
 };
 use crate::mesh::selection::{
     authority_candidates, ranked_authorities, ranked_top_authorities,
@@ -1259,6 +1261,67 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             }
         }
         floors
+    }
+
+    fn flush_pending_route_mirrors(&self) {
+        let routes = match authority_list_routes(&self.namespace, &self.local_stable_id) {
+            Ok(routes) => routes,
+            Err(error) => {
+                warn!(error = %error, "flush_pending_route_mirrors: failed to list local routes");
+                return;
+            }
+        };
+        if routes.is_empty() {
+            return;
+        }
+        let requests: Vec<RouteCasRequest> = routes
+            .into_iter()
+            .map(|route| RouteCasRequest {
+                key: route.key.clone(),
+                expected: None,
+                next: Some(route),
+            })
+            .collect();
+
+        let peers = match self
+            .membership
+            .live_clients(false, "flush_pending_route_mirrors")
+        {
+            Ok(peers) => peers,
+            Err(error) => {
+                warn!(error = %error, "flush_pending_route_mirrors: failed to list peers");
+                return;
+            }
+        };
+
+        let peer_count = peers
+            .iter()
+            .filter(|p| {
+                p.runtime.stable_id != self.local_stable_id
+                    && p.endpoints.labels.get("route").map(String::as_str) == Some("true")
+            })
+            .count();
+        debug!(
+            local_routes = requests.len(),
+            peers = peer_count,
+            "flushing local authority routes to peer authorities"
+        );
+
+        for peer in &peers {
+            if peer.runtime.stable_id == self.local_stable_id {
+                continue;
+            }
+            if peer.endpoints.labels.get("route").map(String::as_str) != Some("true") {
+                continue;
+            }
+            mirror_secondary_batch(
+                &self.namespace,
+                self.authority_client.as_ref(),
+                self.membership.as_ref(),
+                peer,
+                &requests,
+            );
+        }
     }
 }
 

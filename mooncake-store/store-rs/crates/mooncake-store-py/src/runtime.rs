@@ -103,6 +103,10 @@ impl CompatRuntimeArgs {
             .route_control(self.route_control)
             .route_topk(plan.route_topk);
 
+        if !plan.cold_tier_targets.is_empty() {
+            builder = builder.cold_tier_targets(plan.cold_tier_targets);
+        }
+
         for (key, value) in plan.labels {
             builder = builder.label(key, value);
         }
@@ -263,6 +267,7 @@ mod tests {
                 use_hugepage: None,
                 hugepage_size_bytes: None,
                 timeouts: None,
+                cold_tier_targets: None,
             },
             local_segment_name: None,
             initial_state: ClientLifecycleState::Active,
