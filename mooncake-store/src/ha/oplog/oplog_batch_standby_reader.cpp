@@ -38,6 +38,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         return result;
     }
     for (const auto& batch : batches) {
+        if (batch.batch_id != last_applied_batch_id_ + 1) {
+            result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            return result;
+        }
         for (const auto& entry : batch.entries) {
             if (entry.sequence_id > prefix.last_seq) {
                 break;

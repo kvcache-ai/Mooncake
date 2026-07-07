@@ -185,8 +185,9 @@ uint32_t OpLogManager::ComputePrefixHash(const std::string& key) {
 }
 
 bool OpLogManager::VerifyChecksum(const OpLogEntry& entry) {
-    uint32_t computed = ComputeChecksum(entry.payload);
-    return computed == entry.checksum;
+    return ComputeChecksum(entry.payload) == entry.checksum &&
+           (entry.prefix_hash == 0 ||
+            ComputePrefixHash(entry.object_key) == entry.prefix_hash);
 }
 
 bool OpLogManager::ValidateEntrySize(const OpLogEntry& entry,

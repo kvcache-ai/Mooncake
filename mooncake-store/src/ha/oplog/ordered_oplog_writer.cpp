@@ -18,6 +18,12 @@ struct OrderedOpLogWriter::Impl {
         if (this->config.max_entries_per_batch == 0) {
             this->config.max_entries_per_batch = 1;
         }
+        if (this->config.initial_durable_prefix.last_seq == UINT64_MAX ||
+            this->config.initial_durable_prefix.batch_id == UINT64_MAX) {
+            accepting = false;
+            last_error = ErrorCode::INVALID_PARAMS;
+            return;
+        }
         next_sequence_id = this->config.initial_durable_prefix.last_seq + 1;
     }
 
@@ -28,6 +34,7 @@ struct OrderedOpLogWriter::Impl {
     bool accepting{true};
     bool running{false};
     bool stop_requested{false};
+    bool callback_stop_requested{false};
     ErrorCode last_error{ErrorCode::OK};
     uint64_t next_reservation_id{1};
     uint64_t next_sequence_id{1};
@@ -147,6 +154,7 @@ void OrderedOpLogWriter::Start() {
         return;
     }
     impl_->stop_requested = false;
+    impl_->callback_stop_requested = false;
     impl_->running = true;
     impl_->callback_thread = std::thread([this] {
         while (true) {
@@ -154,10 +162,11 @@ void OrderedOpLogWriter::Start() {
             {
                 std::unique_lock<std::mutex> lock(impl_->mutex);
                 impl_->cv.wait(lock, [&] {
-                    return impl_->stop_requested ||
+                    return impl_->callback_stop_requested ||
                            !impl_->callback_entries.empty();
                 });
-                if (impl_->stop_requested && impl_->callback_entries.empty()) {
+                if (impl_->callback_stop_requested &&
+                    impl_->callback_entries.empty()) {
                     return;
                 }
                 callback_entry = std::move(impl_->callback_entries.front());
@@ -248,6 +257,11 @@ void OrderedOpLogWriter::Stop() {
     if (impl_->writer_thread.joinable()) {
         impl_->writer_thread.join();
     }
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->callback_stop_requested = true;
+    }
+    impl_->cv.notify_all();
     if (impl_->callback_thread.joinable()) {
         impl_->callback_thread.join();
     }

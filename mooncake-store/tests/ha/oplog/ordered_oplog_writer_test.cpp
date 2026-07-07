@@ -194,6 +194,25 @@ TEST(OrderedOpLogWriterAdmissionTest,
     EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, third.error());
 }
 
+TEST(OrderedOpLogWriterAdmissionTest,
+     ReserveFailsWhenInitialDurablePrefixCannotAdvance) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{
+            .max_entries_per_batch = 2,
+            .initial_durable_prefix = {.batch_id = 1, .last_seq = UINT64_MAX}},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    auto reservation = writer.Reserve();
+
+    ASSERT_FALSE(reservation.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, reservation.error());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, writer.LastError());
+}
+
 TEST(OrderedOpLogWriterAdmissionTest, MoveAssigningReservationReleasesOldSlot) {
     FakeBatchWriter storage;
     OrderedOpLogWriter writer(
@@ -659,6 +678,35 @@ TEST(OrderedOpLogWriterCallbackTest,
         EXPECT_EQ((std::vector<uint64_t>{1, 2}), callback_sequences);
     }
     writer.Stop();
+}
+
+TEST(OrderedOpLogWriterCallbackTest,
+     StopDrainsCallbacksFromInflightSuccessfulWrite) {
+    FakeBatchWriter storage;
+    storage.BlockWrites();
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 4},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    std::atomic<int> callbacks{0};
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [&](const auto&) { ++callbacks; })
+                    .has_value());
+    ASSERT_TRUE(storage.WaitForBlockedWrite());
+
+    std::thread stopper([&] { writer.Stop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    storage.UnblockWrites();
+    stopper.join();
+
+    EXPECT_EQ(1, callbacks.load());
 }
 
 TEST(OrderedOpLogWriterCallbackTest, SlowCallbackDoesNotPreventNextBatchWrite) {

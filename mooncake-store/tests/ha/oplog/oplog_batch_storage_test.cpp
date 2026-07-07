@@ -166,6 +166,17 @@ TEST(OpLogBatchStorageTest, NormalizesClusterIdWhenReadingLegacyLatest) {
     EXPECT_EQ(42u, prefix.last_seq);
 }
 
+TEST(OpLogBatchStorageTest, InitDurablePrefixFailsClosedWhenBatchesExist) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+}
+
 TEST(OpLogBatchStorageTest, RejectsInvalidClusterId) {
     FakeHaKvBackend backend;
     OpLogBatchStorage storage("bad/cluster", backend);
@@ -250,6 +261,22 @@ TEST(OpLogBatchStorageTest, CompareFailureDoesNotWriteBatchOrAdvancePrefix) {
     ASSERT_TRUE(DecodeDurablePrefix(encoded_prefix, &prefix));
     EXPECT_EQ(2u, prefix.batch_id);
     EXPECT_EQ(6u, prefix.last_seq);
+}
+
+TEST(OpLogBatchStorageTest, CompareFailureIsOkWhenTargetBatchAlreadyDurable) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 5})));
+    auto batch = MakeBatch(/*batch_id=*/2, /*first_seq=*/4, /*count=*/2);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000002",
+                          EncodeOpLogBatchRecord(batch)));
+    backend.FailNextTxn(ErrorCode::ETCD_TRANSACTION_FAIL);
+    OpLogBatchStorage storage("clusterA", backend);
+
+    EXPECT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(
+                                 batch, {.batch_id = 1, .last_seq = 3}));
 }
 
 TEST(OpLogBatchStorageTest, RejectsSkippedBatchId) {
@@ -347,6 +374,45 @@ TEST(OpLogBatchStorageTest, ReadBatchesAfterReturnsOrderedBatches) {
     std::vector<OpLogBatchRecord> batches;
     EXPECT_EQ(ErrorCode::OK, storage.ReadBatchesAfter(/*after_batch_id=*/0,
                                                       /*limit=*/10, batches));
+
+    ASSERT_EQ(2u, batches.size());
+    EXPECT_EQ(1u, batches[0].batch_id);
+    EXPECT_EQ(2u, batches[1].batch_id);
+}
+
+TEST(OpLogBatchStorageTest, ReadBatchesAfterSkipsNonBatchKeysInRange) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/sidecar", "not a batch"));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    std::vector<OpLogBatchRecord> batches;
+    EXPECT_EQ(ErrorCode::OK, storage.ReadBatchesAfter(/*after_batch_id=*/0,
+                                                      /*limit=*/10, batches));
+
+    ASSERT_EQ(1u, batches.size());
+    EXPECT_EQ(1u, batches[0].batch_id);
+}
+
+TEST(OpLogBatchStorageTest, ReadBatchesAfterLimitCountsOnlyBatchKeys) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000002",
+                          EncodeOpLogBatchRecord(MakeBatch(2, 2, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001.meta",
+                          "sidecar"));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    std::vector<OpLogBatchRecord> batches;
+    EXPECT_EQ(ErrorCode::OK, storage.ReadBatchesAfter(/*after_batch_id=*/0,
+                                                      /*limit=*/2, batches));
 
     ASSERT_EQ(2u, batches.size());
     EXPECT_EQ(1u, batches[0].batch_id);

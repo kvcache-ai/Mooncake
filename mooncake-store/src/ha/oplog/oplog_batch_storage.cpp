@@ -20,6 +20,44 @@ ErrorCode ParseLatestSequenceId(const std::string& value, uint64_t& out) {
     return ErrorCode::OK;
 }
 
+bool SameBatchRecord(const OpLogBatchRecord& lhs, const OpLogBatchRecord& rhs) {
+    if (lhs.schema_version != rhs.schema_version ||
+        lhs.batch_id != rhs.batch_id || lhs.first_seq != rhs.first_seq ||
+        lhs.last_seq != rhs.last_seq ||
+        lhs.entries.size() != rhs.entries.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.entries.size(); ++i) {
+        const auto& a = lhs.entries[i];
+        const auto& b = rhs.entries[i];
+        if (a.sequence_id != b.sequence_id ||
+            a.timestamp_ms != b.timestamp_ms || a.op_type != b.op_type ||
+            a.tenant_id != b.tenant_id || a.object_key != b.object_key ||
+            a.payload != b.payload || a.checksum != b.checksum ||
+            a.prefix_hash != b.prefix_hash) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TryParseBatchIdFromKey(const std::string& key, uint64_t& batch_id) {
+    const size_t slash = key.rfind('/');
+    if (slash == std::string::npos || key.size() - slash - 1 != 20) {
+        return false;
+    }
+    const std::string_view suffix(key.data() + slash + 1, 20);
+    for (char c : suffix) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    auto result =
+        std::from_chars(suffix.data(), suffix.data() + suffix.size(), batch_id);
+    return result.ec == std::errc() &&
+           result.ptr == suffix.data() + suffix.size();
+}
+
 }  // namespace
 
 OpLogBatchStorage::OpLogBatchStorage(std::string cluster_id,
@@ -42,6 +80,18 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
     }
     if (!backend_.SupportsTxn()) {
         return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto batch_range = BuildBatchRecordRange(cluster_id_, 0);
+    std::vector<KvPair> existing_batches;
+    err = backend_.Range(batch_range.begin_key, batch_range.end_key,
+                         /*limit=*/1, existing_batches);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (!existing_batches.empty()) {
+        LOG(ERROR) << "Durable prefix is missing but OpLog batch records exist";
+        return ErrorCode::INTERNAL_ERROR;
     }
 
     uint64_t latest_seq = 0;
@@ -135,7 +185,23 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
         {.key = durable_key,
          .value = EncodeDurablePrefix(
              {.batch_id = batch.batch_id, .last_seq = batch.last_seq})});
-    return backend_.Txn(txn);
+    ErrorCode err = backend_.Txn(txn);
+    if (err != ErrorCode::ETCD_TRANSACTION_FAIL) {
+        return err;
+    }
+
+    DurablePrefix current_prefix;
+    if (ReadDurablePrefix(current_prefix) != ErrorCode::OK ||
+        current_prefix.batch_id != batch.batch_id ||
+        current_prefix.last_seq != batch.last_seq) {
+        return err;
+    }
+    OpLogBatchRecord current_batch;
+    if (ReadBatch(batch.batch_id, current_batch) != ErrorCode::OK ||
+        !SameBatchRecord(batch, current_batch)) {
+        return err;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
@@ -166,12 +232,17 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     }
     auto range = BuildBatchRecordRange(cluster_id_, after_batch_id);
     std::vector<KvPair> kvs;
-    ErrorCode err = backend_.Range(range.begin_key, range.end_key, limit, kvs);
+    ErrorCode err =
+        backend_.Range(range.begin_key, range.end_key, /*limit=*/0, kvs);
     if (err != ErrorCode::OK) {
         return err;
     }
     batches.reserve(kvs.size());
     for (const auto& kv : kvs) {
+        uint64_t key_batch_id = 0;
+        if (!TryParseBatchIdFromKey(kv.key, key_batch_id)) {
+            continue;
+        }
         OpLogBatchRecord batch;
         std::string reason;
         if (!DecodeOpLogBatchRecord(kv.value, &batch, &reason)) {
@@ -179,7 +250,14 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
                        << kv.key << ": " << reason;
             return ErrorCode::INTERNAL_ERROR;
         }
+        if (batch.batch_id != key_batch_id) {
+            LOG(ERROR) << "OpLog batch id does not match key at key=" << kv.key;
+            return ErrorCode::INTERNAL_ERROR;
+        }
         batches.push_back(std::move(batch));
+        if (limit != 0 && batches.size() >= limit) {
+            break;
+        }
     }
     return ErrorCode::OK;
 }

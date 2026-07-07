@@ -143,6 +143,22 @@ TEST_F(OpLogManagerTest, TestVerifyChecksum) {
     EXPECT_FALSE(OpLogManager::VerifyChecksum(entry));
 }
 
+TEST_F(OpLogManagerTest, VerifyChecksumRejectsTamperedKey) {
+    OpLogEntry entry =
+        M().AllocateEntry(OpType::PUT_END, "key", "payload-data");
+    entry.object_key = "tampered-key";
+
+    EXPECT_FALSE(OpLogManager::VerifyChecksum(entry));
+}
+
+TEST_F(OpLogManagerTest, VerifyChecksumAllowsLegacyMissingPrefixHash) {
+    OpLogEntry entry =
+        M().AllocateEntry(OpType::PUT_END, "key", "payload-data");
+    entry.prefix_hash = 0;
+
+    EXPECT_TRUE(OpLogManager::VerifyChecksum(entry));
+}
+
 // ========== 2.1.3 Size validation tests ==========
 
 TEST_F(OpLogManagerTest, TestValidateEntrySize_Valid) {
