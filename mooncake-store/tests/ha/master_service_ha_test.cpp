@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <memory>
 #include <string>
@@ -18,6 +19,7 @@
 #include "ha/oplog/mock_oplog_store.h"
 #include "ha/oplog/mock_metadata_store.h"
 #include "ha/oplog/oplog_batch_codec.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "types.h"
@@ -292,6 +294,27 @@ class MasterServiceHATest : public ::testing::Test {
         return service.oplog_manager_.GetLastSequenceId();
     }
 
+    static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
+        MasterService& service, OpType type, const std::string& tenant_id,
+        const std::string& key, const std::string& payload) {
+        return service.AppendOpLogVisibleBeforeDurable(type, tenant_id, key,
+                                                       payload);
+    }
+
+    static tl::expected<OpLogEntry, ErrorCode> AppendWaitDurableForTesting(
+        MasterService& service, OpType type, const std::string& tenant_id,
+        const std::string& key, const std::string& payload) {
+        return service.AppendOpLogAndWaitDurable(type, tenant_id, key, payload);
+    }
+
+    static tl::expected<OpLogEntry, ErrorCode> AppendFinalizeForTesting(
+        MasterService& service, OpType type, const std::string& tenant_id,
+        const std::string& key, const std::string& payload,
+        MasterService::DurableFinalizeCallback callback) {
+        return service.AppendOpLogWithDurableFinalize(
+            type, tenant_id, key, payload, std::move(callback));
+    }
+
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
@@ -322,6 +345,88 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(0u, prefix.batch_id);
     EXPECT_EQ(42u, prefix.last_seq);
     EXPECT_EQ(42u, LastOpLogSequenceForTesting(service));
+}
+
+TEST_F(MasterServiceHATest, BatchRecordSubmissionHelpersUseOrderedWriter) {
+    const std::string cluster_id = "test_batch_record_helpers_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto visible = AppendVisibleForTesting(service, OpType::PUT_END, "tenant",
+                                           "visible_key", "visible_payload");
+    ASSERT_TRUE(visible.has_value());
+    EXPECT_EQ(1u, visible.value());
+
+    auto durable = AppendWaitDurableForTesting(
+        service, OpType::PUT_END, "tenant", "wait_key", "wait_payload");
+    ASSERT_TRUE(durable.has_value());
+    EXPECT_EQ(2u, durable->sequence_id);
+    EXPECT_EQ("wait_key", durable->object_key);
+
+    std::promise<OpLogEntry> finalized_promise;
+    auto finalized_future = finalized_promise.get_future();
+    auto finalized = AppendFinalizeForTesting(
+        service, OpType::REMOVE, "tenant", "remove_key", {},
+        [&finalized_promise](const OpLogEntry& durable_entry) {
+            finalized_promise.set_value(durable_entry);
+        });
+    ASSERT_TRUE(finalized.has_value());
+    EXPECT_EQ(3u, finalized->sequence_id);
+
+    ASSERT_EQ(std::future_status::ready,
+              finalized_future.wait_for(std::chrono::seconds(5)));
+    OpLogEntry finalized_entry = finalized_future.get();
+    EXPECT_EQ(3u, finalized_entry.sequence_id);
+    EXPECT_EQ(OpType::REMOVE, finalized_entry.op_type);
+    EXPECT_EQ("remove_key", finalized_entry.object_key);
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(3u, prefix.batch_id);
+    EXPECT_EQ(3u, prefix.last_seq);
+}
+
+TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    MasterService service(service_config);
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service.SetOpLogStoreForTesting(mock_store);
+
+    auto visible = AppendVisibleForTesting(service, OpType::PUT_END, "tenant",
+                                           "visible_key", "visible_payload");
+    ASSERT_TRUE(visible.has_value());
+    EXPECT_EQ(1u, visible.value());
+
+    auto durable = AppendWaitDurableForTesting(
+        service, OpType::PUT_END, "tenant", "wait_key", "wait_payload");
+    ASSERT_TRUE(durable.has_value());
+    EXPECT_EQ(2u, durable->sequence_id);
+
+    bool finalized = false;
+    auto finalized_entry = AppendFinalizeForTesting(
+        service, OpType::REMOVE, "tenant", "remove_key", {},
+        [&finalized](const OpLogEntry& durable_entry) {
+            finalized = true;
+            EXPECT_EQ(3u, durable_entry.sequence_id);
+            EXPECT_EQ("remove_key", durable_entry.object_key);
+        });
+    ASSERT_TRUE(finalized_entry.has_value());
+    EXPECT_TRUE(finalized);
+    EXPECT_EQ(3u, finalized_entry->sequence_id);
+    EXPECT_EQ(3u, mock_store->EntryCount());
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbySnapshotClearsInvalidEndpoints) {

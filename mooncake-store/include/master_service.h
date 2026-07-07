@@ -117,6 +117,8 @@ class MasterService {
    public:
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
+    using DurableFinalizeCallback =
+        std::function<void(const OpLogEntry& durable_entry)>;
 
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -2051,6 +2053,7 @@ class MasterService {
 
     const std::string ha_backend_connstring_;
     const uint32_t oplog_batch_max_entries_;
+    const bool use_batch_oplog_;
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
@@ -2271,6 +2274,15 @@ class MasterService {
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
+    tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
+    tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndWaitDurable(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
+    tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload, DurableFinalizeCallback callback);
     ErrorCode PersistOpLogEntryWithSyncRetries(const OpLogEntry& entry) const;
 
     // Invalid endpoints from standby that don't exist locally

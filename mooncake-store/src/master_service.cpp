@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <random>
 #include <shared_mutex>
@@ -199,6 +200,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
+      use_batch_oplog_(!config.oplog_store_type.empty() &&
+                       ParseOpLogStoreType(config.oplog_store_type) ==
+                           OpLogStoreType::ETCD_BATCH_RECORD),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
@@ -448,7 +452,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     VLOG(1) << "action=start_job_dispatch_thread";
 
     if (enable_ha_ && !cluster_id_.empty()) {
-        if (configured_oplog_store_type == OpLogStoreType::ETCD_BATCH_RECORD) {
+        if (use_batch_oplog_) {
 #ifdef STORE_USE_ETCD
             auto backend = std::make_shared<EtcdHaKvBackend>();
             ErrorCode err = InitializeBatchOpLogWriter(std::move(backend));
@@ -10168,6 +10172,87 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     ordered_oplog_writer_ = std::move(writer);
     oplog_manager_.SetInitialSequenceId(durable_prefix.last_seq);
     return ErrorCode::OK;
+}
+
+tl::expected<uint64_t, ErrorCode>
+MasterService::AppendOpLogVisibleBeforeDurable(OpType type,
+                                               const std::string& tenant_id,
+                                               const std::string& key,
+                                               const std::string& payload) {
+    if (!use_batch_oplog_) {
+        return oplog_manager_.Append(type, tenant_id, key, payload);
+    }
+    if (!ordered_oplog_writer_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto reservation = ordered_oplog_writer_->Reserve();
+    if (!reservation) {
+        return tl::unexpected(reservation.error());
+    }
+    OpLogEntry entry =
+        oplog_manager_.AllocateEntry(type, tenant_id, key, payload);
+    auto pending = ordered_oplog_writer_->Commit(std::move(reservation.value()),
+                                                 std::move(entry), nullptr);
+    if (!pending) {
+        return tl::unexpected(pending.error());
+    }
+    return pending.value().sequence_id();
+}
+
+tl::expected<OpLogEntry, ErrorCode> MasterService::AppendOpLogAndWaitDurable(
+    OpType type, const std::string& tenant_id, const std::string& key,
+    const std::string& payload) {
+    if (!use_batch_oplog_) {
+        return AppendOpLogAndNotifyDurableOrAbort(type, tenant_id, key,
+                                                  payload);
+    }
+
+    auto promise = std::make_shared<std::promise<OpLogEntry>>();
+    auto future = promise->get_future();
+    auto queued = AppendOpLogWithDurableFinalize(
+        type, tenant_id, key, payload,
+        [promise](const OpLogEntry& durable_entry) {
+            promise->set_value(durable_entry);
+        });
+    if (!queued) {
+        return tl::unexpected(queued.error());
+    }
+    return future.get();
+}
+
+tl::expected<OpLogEntry, ErrorCode>
+MasterService::AppendOpLogWithDurableFinalize(
+    OpType type, const std::string& tenant_id, const std::string& key,
+    const std::string& payload, DurableFinalizeCallback callback) {
+    if (!use_batch_oplog_) {
+        auto entry =
+            AppendOpLogAndNotifyDurableOrAbort(type, tenant_id, key, payload);
+        if (!entry) {
+            return tl::unexpected(entry.error());
+        }
+        if (callback) {
+            callback(entry.value());
+        }
+        return entry.value();
+    }
+    if (!ordered_oplog_writer_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto reservation = ordered_oplog_writer_->Reserve();
+    if (!reservation) {
+        return tl::unexpected(reservation.error());
+    }
+    OpLogEntry entry =
+        oplog_manager_.AllocateEntry(type, tenant_id, key, payload);
+    auto pending = ordered_oplog_writer_->Commit(std::move(reservation.value()),
+                                                 entry, std::move(callback));
+    if (!pending) {
+        return tl::unexpected(pending.error());
+    }
+    entry.sequence_id = pending.value().sequence_id();
+    return entry;
 }
 
 void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
