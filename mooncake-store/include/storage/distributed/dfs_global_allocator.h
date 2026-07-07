@@ -63,6 +63,7 @@ class DfsGlobalAllocator {
         struct AllocationRecord {
             std::string key;
             std::shared_ptr<OffsetAllocationHandle> handle;
+            uint64_t bytes = 0;
         };
 
         std::shared_mutex handle_mutex;
@@ -74,10 +75,12 @@ class DfsGlobalAllocator {
 
         struct PendingFree {
             std::shared_ptr<OffsetAllocationHandle> handle;
+            uint64_t bytes = 0;
             std::chrono::steady_clock::time_point when;
         };
         std::mutex pending_mutex;
         std::deque<PendingFree> pending_free;
+        uint64_t pending_free_bytes = 0;
     };
 
     static constexpr size_t kNumKeyStripes = 65536;
@@ -88,6 +91,13 @@ class DfsGlobalAllocator {
     }
 
     void ProcessPendingFrees(int shard_idx);
+    void QueuePendingFree(ShardState& shard,
+                          const std::shared_ptr<OffsetAllocationHandle>& handle,
+                          uint64_t bytes,
+                          std::chrono::steady_clock::time_point when);
+    void CleanupExpiredPendingFrees(ShardState& shard,
+                                    std::chrono::steady_clock::time_point now);
+    double EffectiveUsage(ShardState& shard);
     std::vector<EvictedKey> EvictFromShard(int shard_idx);
     void EvictionMonitor();
     int SelectShard(const std::string& key) const;

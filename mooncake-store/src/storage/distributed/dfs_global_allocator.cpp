@@ -123,14 +123,20 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
     std::unique_lock handle_lock(shard.handle_mutex);
     ProcessPendingFrees(shard_idx);
 
+    const uint64_t free_before =
+        shard.allocator->storageReport().totalFreeSpace;
     auto handle = shard.allocator->allocate(aligned_size + alignment_ - 1);
     if (!handle) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    const uint64_t free_after = shard.allocator->storageReport().totalFreeSpace;
+    const uint64_t reserved_bytes =
+        free_before > free_after ? free_before - free_after : handle->size();
 
     uint64_t raw_offset = handle->address();
     uint64_t alloc_offset = AlignSize(raw_offset);
     auto alloc_handle =
         std::make_shared<OffsetAllocationHandle>(std::move(*handle));
-    shard.offset_to_handle[alloc_offset] = {key, std::move(alloc_handle)};
+    shard.offset_to_handle[alloc_offset] = {key, std::move(alloc_handle),
+                                            reserved_bytes};
     handle_lock.unlock();
 
     return DistributedFSDescriptor{
@@ -162,12 +168,9 @@ void DfsGlobalAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
     if (it == shard.offset_to_handle.end()) return;
     if (it->second.key != key) return;
 
-    {
-        std::lock_guard pending_lock(shard.pending_mutex);
-        shard.pending_free.push_back(
-            {it->second.handle,
-             std::chrono::steady_clock::now() + deferred_free_duration_});
-    }
+    QueuePendingFree(
+        shard, it->second.handle, it->second.bytes,
+        std::chrono::steady_clock::now() + deferred_free_duration_);
     shard.offset_to_handle.erase(it);
 }
 
@@ -215,12 +218,56 @@ std::string DfsGlobalAllocator::FormatShardIdx(int idx, int shard_count) {
 
 void DfsGlobalAllocator::ProcessPendingFrees(int shard_idx) {
     auto& shard = *shards_[shard_idx];
+    CleanupExpiredPendingFrees(shard, std::chrono::steady_clock::now());
+}
+
+void DfsGlobalAllocator::QueuePendingFree(
+    ShardState& shard, const std::shared_ptr<OffsetAllocationHandle>& handle,
+    uint64_t bytes, std::chrono::steady_clock::time_point when) {
+    if (!handle) return;
     std::lock_guard pending_lock(shard.pending_mutex);
-    auto now = std::chrono::steady_clock::now();
+    if (bytes == 0) bytes = handle->size();
+    shard.pending_free.push_back({handle, bytes, when});
+    shard.pending_free_bytes += bytes;
+}
+
+void DfsGlobalAllocator::CleanupExpiredPendingFrees(
+    ShardState& shard, std::chrono::steady_clock::time_point now) {
+    std::lock_guard pending_lock(shard.pending_mutex);
     while (!shard.pending_free.empty() &&
            shard.pending_free.front().when <= now) {
+        const uint64_t bytes = shard.pending_free.front().bytes;
         shard.pending_free.pop_front();
+        if (bytes > shard.pending_free_bytes) {
+            shard.pending_free_bytes = 0;
+        } else {
+            shard.pending_free_bytes -= bytes;
+        }
     }
+}
+
+double DfsGlobalAllocator::EffectiveUsage(ShardState& shard) {
+    uint64_t physical_free = 0;
+    {
+        std::shared_lock lock(shard.handle_mutex);
+        auto report = shard.allocator->storageReport();
+        physical_free = report.totalFreeSpace;
+    }
+
+    uint64_t pending_free_bytes = 0;
+    {
+        std::lock_guard pending_lock(shard.pending_mutex);
+        pending_free_bytes = shard.pending_free_bytes;
+    }
+
+    const uint64_t capped_physical_free =
+        std::min<uint64_t>(physical_free, shard.capacity);
+    const uint64_t remaining_capacity = shard.capacity - capped_physical_free;
+    const uint64_t effective_free =
+        capped_physical_free + std::min(pending_free_bytes, remaining_capacity);
+    if (shard.capacity == 0) return 0.0;
+    return 1.0 - static_cast<double>(effective_free) /
+                     static_cast<double>(shard.capacity);
 }
 
 std::vector<DfsGlobalAllocator::EvictedKey> DfsGlobalAllocator::EvictFromShard(
@@ -229,10 +276,7 @@ std::vector<DfsGlobalAllocator::EvictedKey> DfsGlobalAllocator::EvictFromShard(
     auto& shard = *shards_[shard_idx];
 
     {
-        std::shared_lock lock(shard.handle_mutex);
-        auto report = shard.allocator->storageReport();
-        double usage = 1.0 - static_cast<double>(report.totalFreeSpace) /
-                                 static_cast<double>(shard.capacity);
+        const double usage = EffectiveUsage(shard);
         if (usage < eviction_high_watermark_) return evicted;
     }
 
@@ -258,38 +302,25 @@ std::vector<DfsGlobalAllocator::EvictedKey> DfsGlobalAllocator::EvictFromShard(
             if (it->second.key != evict_key) {
                 continue;
             }
-            {
-                std::lock_guard pending_lock(shard.pending_mutex);
-                shard.pending_free.push_back(
-                    {it->second.handle, std::chrono::steady_clock::now() +
-                                            deferred_free_duration_});
-            }
+            QueuePendingFree(
+                shard, it->second.handle, it->second.bytes,
+                std::chrono::steady_clock::now() + deferred_free_duration_);
             shard.offset_to_handle.erase(it);
         }
 
         evicted.push_back({evict_key, shard_idx, evict_offset});
 
-        {
-            std::shared_lock lock(shard.handle_mutex);
-            auto report = shard.allocator->storageReport();
-            double usage = 1.0 - static_cast<double>(report.totalFreeSpace) /
-                                     static_cast<double>(shard.capacity);
-            if (usage < eviction_low_watermark_) break;
-        }
+        const double usage = EffectiveUsage(shard);
+        if (usage < eviction_low_watermark_) break;
     }
     return evicted;
 }
 
 void DfsGlobalAllocator::EvictionMonitor() {
     while (running_.load(std::memory_order_acquire)) {
+        const auto now = std::chrono::steady_clock::now();
         for (int i = 0; i < shard_count_; ++i) {
-            auto& shard = *shards_[i];
-            std::lock_guard pending_lock(shard.pending_mutex);
-            auto now = std::chrono::steady_clock::now();
-            while (!shard.pending_free.empty() &&
-                   shard.pending_free.front().when <= now) {
-                shard.pending_free.pop_front();
-            }
+            CleanupExpiredPendingFrees(*shards_[i], now);
         }
 
         if (eviction_enabled_) {

@@ -361,6 +361,37 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     EXPECT_TRUE(after_evict.has_value());
 }
 
+TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "30");
+    TempDir tmp("dfs_pending_watermark");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 32 * 1024, 4096));
+
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+    }
+
+    auto evicted = alloc.EvictIfNeeded();
+    ASSERT_EQ(evicted.size(), 2);
+    EXPECT_EQ(evicted[0].key, "k0");
+    EXPECT_EQ(evicted[1].key, "k1");
+
+    auto repeated = alloc.EvictIfNeeded();
+    EXPECT_TRUE(repeated.empty());
+
+    auto before_release = alloc.Allocate("k_before_release", 100);
+    EXPECT_FALSE(before_release.has_value());
+    EXPECT_EQ(before_release.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
 TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     EnvGuard env;
     ConfigurePosixDfs(env);
