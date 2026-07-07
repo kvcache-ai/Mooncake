@@ -499,7 +499,8 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
     SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
-    LOCAL_FIRST            // Prefer local host before ordered remote fallback
+    LOCAL_FIRST,           // Prefer local host before ordered remote fallback
+    FRAGMENTATION_AWARE    // Fragmentation-aware allocation
 };
 
 /**
