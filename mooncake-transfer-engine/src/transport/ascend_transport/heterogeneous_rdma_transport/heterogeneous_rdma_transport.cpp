@@ -25,7 +25,11 @@ HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() {
     transfer_queue_cv_.notify_one();
     block_queue_cv_.notify_one();
     transfer_thread_.join();
-    aclrtSetDevice(logic_device_id_);
+    if (int ret = aclrtSetDevice(logic_device_id_)) {
+        LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice failed in "
+                      "destructor, ret: "
+                   << ret;
+    }
     if (stream_copy_created_) {
         aclrtDestroyStream(stream_copy_);
     }
