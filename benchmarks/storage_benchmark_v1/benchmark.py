@@ -214,7 +214,7 @@ def wait_for_replay_time(req: KVCacheRequest, base_timestamp: float,
                          start_time: float, replay_scale: float):
     if replay_scale <= 0 or req.timestamp == 0:
         return
-    target_time = start_time + max(0.0, req.timestamp - base_timestamp) / replay_scale
+    target_time = start_time + max(0.0, req.timestamp - base_timestamp) / (1000.0 * replay_scale)
     delay = target_time - time.perf_counter()
     if delay > 0:
         time.sleep(delay)
