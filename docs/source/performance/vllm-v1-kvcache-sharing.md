@@ -12,7 +12,7 @@ Setup: Kimi-2.5 NVFP4 model on GB200 nodes with PD disaggregation
 
 In this experiment, the model was deployed with a 1P1D configuration across 12 GPUs in total.
 
-![KV Transfer Bandwidth (Actual)](../image/pd_compare_mooncake_vs_nixl-2.png)
+![Throughput and Latency Comparison on Agentic Traces](../image/pd_compare_mooncake_vs_nixl-2.png)
 
 The distributed KV cache pool improves vLLM throughput by 3.8x and reduces P50 TTFT and E2E latency by 46x and 8.6x, respectively. These gains are driven by a dramatic increase in cache hit rate: from 1.7%, where only the system prompt is cached, to 92.2%, where nearly the entire prefix is cached.
 
