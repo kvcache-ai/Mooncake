@@ -64,6 +64,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
     int ret = aclrtSetDevice(deviceLogicId);
     if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtSetDevice error, ret: " << ret;
+        return;
     }
 
     ret = aclrtCreateStream(&stream);
@@ -241,6 +242,7 @@ void HcclTransport::acceptLoop(int deviceLogicId) {
     int ret = aclrtSetDevice(deviceLogicId);
     if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtSetDevice failed ret: " << ret;
+        return;
     }
     while (running_) {
         ret = transportMemAccept(&local_rank_info_);
