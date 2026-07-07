@@ -175,6 +175,38 @@ TEST(SelectQpInPoolTest, ResultAlwaysInRange) {
     }
 }
 
+// A pool with a non-positive num_qp would create an empty/negative QP span and
+// break the router, so the whole layout is rejected (falls back to default).
+TEST(QpPoolLayoutTest, PoolWithZeroQpIsInvalid) {
+    std::vector<QpPoolSegment> pools;
+    QpPoolSegment ok;
+    ok.name = "kv";
+    ok.num_qp = 4;
+    pools.push_back(ok);
+    QpPoolSegment bad;
+    bad.name = "ctrl";
+    bad.num_qp = 0;  // invalid
+    pools.push_back(bad);
+
+    auto layout = computeQpPoolSegments(pools, 6);
+    EXPECT_FALSE(layout.valid);
+    EXPECT_EQ(layout.total_qp, 0);
+    EXPECT_TRUE(layout.segments.empty());
+}
+
+TEST(QpPoolLayoutTest, PoolWithNegativeQpIsInvalid) {
+    std::vector<QpPoolSegment> pools;
+    QpPoolSegment bad;
+    bad.name = "kv";
+    bad.num_qp = -1;  // invalid
+    pools.push_back(bad);
+
+    auto layout = computeQpPoolSegments(pools, 6);
+    EXPECT_FALSE(layout.valid);
+    EXPECT_EQ(layout.total_qp, 0);
+    EXPECT_TRUE(layout.segments.empty());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

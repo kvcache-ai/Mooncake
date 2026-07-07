@@ -106,6 +106,16 @@ inline QpPoolLayout computeQpPoolSegments(
         layout.total_qp = qp_mul_factor;
     } else {
         for (const auto& pool : pools) {
+            // Every pool must claim at least one QP; a non-positive num_qp
+            // would produce an empty/negative [begin, begin+num_qp) span and
+            // break the router. Reject the whole layout so the caller falls
+            // back to the default single-pool behavior.
+            if (pool.num_qp <= 0) {
+                layout.segments.clear();
+                layout.total_qp = 0;
+                layout.valid = false;
+                return layout;
+            }
             QpPoolSegment seg = pool;
             seg.begin = layout.total_qp;
             layout.segments.push_back(seg);
