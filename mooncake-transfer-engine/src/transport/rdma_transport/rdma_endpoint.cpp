@@ -561,6 +561,13 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 resetConnection("failed to send ready ACK");
                 return ack_ret;
             }
+            if (!connected()) {
+                LOG(WARNING) << "Discarding RDMA ready ACK because endpoint "
+                             << "is no longer connected: " << toString();
+                ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+                ready_to_send_.store(false, std::memory_order_relaxed);
+                return ERR_ENDPOINT;
+            }
             ready_wait_start_ts_.store(0, std::memory_order_relaxed);
             ready_to_send_.store(true, std::memory_order_relaxed);
             return 0;
