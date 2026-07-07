@@ -1,5 +1,5 @@
 # Benchmark performance
-Mooncake leverages the `MooncakeStoreConnector` in vLLM V1 to enable a distributed KV cache pool, supporting cross-instance sharing and reuse of KV caches. Furthermore, by configuring vLLM's `MultiConnector` alongside the `MooncakeConnector`, users can implement prefill-decode (PD) disaggregation.
+Mooncake leverages the `MooncakeStoreConnector` in vLLM V1 to enable a distributed KV cache pool, supporting cross-instance sharing and reuse of KV caches. Furthermore, vLLM's `MultiConnector` can be configured to orchestrate both the `MooncakeConnector` (for peer-to-peer KV transfer) and the `MooncakeStoreConnector` (for the shared pool), enabling prefill-decode (PD) disaggregation.
 
 We thank the vLLM team, particularly the Inferact team, for conducting the performance evaluation. The results are presented below.
 
