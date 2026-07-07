@@ -943,8 +943,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 // skip the extra StorageBackend — it would compete with
                 // OffsetAllocator for disk space on the same drive and
                 // its eviction queue is always empty (no writes go through it).
-                const char* gds_env = std::getenv("MOONCAKE_ENABLE_GDS");
-                if (!gds_env || strcmp(gds_env, "1") != 0) {
+                bool enable_gds = GetEnvOr<bool>("MOONCAKE_ENABLE_GDS", false);
+                if (!enable_gds) {
                     client->PrepareStorageBackend(storage_root_dir, fs_subdir,
                                                   config.enable_disk_eviction,
                                                   config.quota_bytes);

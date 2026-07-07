@@ -86,6 +86,8 @@ class GdsDeviceOps {
     virtual int GetDevice() = 0;
     virtual void CopyDeviceToDevice(void* dst, const void* src,
                                     size_t size) = 0;
+    // D2H copy for probe verification (one-time, not hot path)
+    virtual void CopyDeviceToHost(void* dst, const void* src, size_t size) = 0;
 };
 
 // ── Factory ──

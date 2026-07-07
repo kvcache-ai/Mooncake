@@ -25,8 +25,6 @@
 
 #ifdef USE_GDS_BACKEND
 #include "gds/gds_device_ops.h"
-#include <cuda_runtime.h>
-
 #include "device/accelerator_registry.h"
 #endif
 
@@ -238,11 +236,7 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
     }
 
     std::vector<uint8_t> host(4096);
-    if (cudaMemcpy(host.data(), cleanup.gpu_buf, 4096,
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-        LOG(WARNING) << "GDS probe: CopyDeviceToHost failed";
-        return false;
-    }
+    ops_->CopyDeviceToHost(host.data(), cleanup.gpu_buf, 4096);
     ops_->DeviceSynchronize();
 
     for (size_t i = 0; i < 4096; ++i) {

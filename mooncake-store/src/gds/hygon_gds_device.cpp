@@ -34,6 +34,7 @@ class HygonGdsDeviceOps final : public GdsDeviceOps {
     void DeviceSynchronize() override {}
     int GetDevice() override { return -1; }
     void CopyDeviceToDevice(void*, const void*, size_t) override {}
+    void CopyDeviceToHost(void*, const void*, size_t) override {}
 };
 
 }  // namespace
