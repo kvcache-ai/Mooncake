@@ -79,6 +79,11 @@ class RedisHelper {
     void CancelKeepAlive();
 
     /**
+     * @brief Cancel any in-progress ElectLeader/WatchLeader call.
+     */
+    void CancelElection();
+
+    /**
      * @brief Get current leader's address and version from Redis.
      * @param master_address Output: leader address.
      * @param version Output: leader epoch.

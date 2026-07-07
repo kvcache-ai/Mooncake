@@ -2,6 +2,9 @@
 #include "etcd_helper.h"
 #include "centralized_rpc_service.h"
 #include "p2p_rpc_service.h"
+#ifdef STORE_USE_REDIS
+#include "redis_master_view_helper.h"
+#endif
 
 namespace mooncake {
 
@@ -20,6 +23,8 @@ MasterViewHelper::MasterViewHelper() {
     master_view_key_ = "mooncake-store/" + cluster_id + "master_view";
     LOG(INFO) << "Master view key: " << master_view_key_;
 }
+
+MasterViewHelper::~MasterViewHelper() = default;
 
 ErrorCode MasterViewHelper::ConnectToEtcd(const std::string& etcd_endpoints) {
     return EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
@@ -91,6 +96,18 @@ void MasterViewHelper::KeepLeader(EtcdLeaseId lease_id) {
     EtcdHelper::KeepAlive(lease_id);
 }
 
+void MasterViewHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
+    auto ret = EtcdHelper::CancelKeepAlive(lease_id);
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to cancel etcd keep-alive, lease_id=" << lease_id
+                   << ", error=" << ret;
+    }
+}
+
+int MasterViewHelper::GetLeaderLeaseTTLSeconds() const {
+    return static_cast<int>(ETCD_MASTER_VIEW_LEASE_TTL);
+}
+
 ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
                                           ViewVersionId& version) {
     auto err_code =
@@ -125,32 +142,40 @@ int MasterServiceSupervisor::Start() {
             server.init_ibv();
         }
 
-        LOG(INFO) << "Init leader election helper...";
-        MasterViewHelper mv_helper;
-        if (mv_helper.ConnectToEtcd(config_.etcd_endpoints) != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to etcd endpoints: "
-                       << config_.etcd_endpoints;
+        LOG(INFO) << "Init leader election helper (backend="
+                  << (config_.election_backend == ElectionBackend::REDIS
+                          ? "redis"
+                          : "etcd")
+                  << ")...";
+
+        auto mv_helper = CreateMasterViewHelper(config_);
+        if (!mv_helper) {
+            LOG(ERROR) << "Failed to create leader election helper, backend="
+                       << (config_.election_backend == ElectionBackend::REDIS
+                               ? "redis"
+                               : "etcd");
             return -1;
         }
+
         LOG(INFO) << "Trying to elect self as leader...";
         EtcdLeaseId lease_id = 0;
         // view_version will be updated by ElectLeader and then used in
         // WrappedMasterService
         ViewVersionId view_version = 0;
-        mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
+        mv_helper->ElectLeader(config_.local_hostname, view_version, lease_id);
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
-            std::thread([&server, &mv_helper, lease_id]() {
-                mv_helper.KeepLeader(lease_id);
+            std::thread([&server, mv_helper = mv_helper.get(), lease_id]() {
+                mv_helper->KeepLeader(lease_id);
                 LOG(INFO) << "Trying to stop server...";
                 server.stop();
             });
 
         // To prevent potential split-brain, wait long enough for the old leader
         // to retire.
-        const int waiting_time = ETCD_MASTER_VIEW_LEASE_TTL;
-        std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
+        std::this_thread::sleep_for(
+            std::chrono::seconds(mv_helper->GetLeaderLeaseTTLSeconds()));
 
         LOG(INFO) << "Starting master service...";
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
@@ -170,13 +195,7 @@ int MasterServiceSupervisor::Start() {
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
-            auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
-            if (etcd_err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to cancel keep leader alive: "
-                           << etcd_err;
-            }
-            // Even if CancelKeepAlive fails, the keep alive context are closed.
-            // We can safely join the keep leader thread.
+            mv_helper->CancelKeepAlive(lease_id);
             keep_leader_thread.join();
             return -1;
         }
@@ -186,9 +205,8 @@ int MasterServiceSupervisor::Start() {
 
         // If the server is closed due to internal errors, we need to manually
         // stop keep leader alive.
-        auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
-        // The error here is predicatable, no need to log it as ERROR.
-        LOG(INFO) << "Cancel keep leader alive: " << etcd_err;
+        mv_helper->CancelKeepAlive(lease_id);
+        LOG(INFO) << "Cancel keep leader alive requested";
         keep_leader_thread.join();
     }
     return 0;
@@ -198,6 +216,38 @@ MasterServiceSupervisor::~MasterServiceSupervisor() {
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+}
+
+std::unique_ptr<MasterViewHelper> CreateMasterViewHelper(
+    const MasterServiceSupervisorConfig& config) {
+    if (config.election_backend == ElectionBackend::REDIS) {
+#ifdef STORE_USE_REDIS
+        auto helper = std::make_unique<RedisMasterViewHelper>(
+            config.cluster_id, config.redis_endpoint, config.redis_password,
+            config.redis_db_index, config.redis_master_view_ttl_sec,
+            config.redis_heartbeat_interval_sec);
+        auto rc = helper->Connect();
+        if (rc != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to Redis at: "
+                       << config.redis_endpoint;
+            return nullptr;
+        }
+        return helper;
+#else
+        LOG(ERROR) << "Redis election backend requested but STORE_USE_REDIS "
+                      "is not enabled at compile time";
+        return nullptr;
+#endif
+    }
+
+    // Default: etcd backend
+    auto helper = std::make_unique<MasterViewHelper>();
+    if (helper->ConnectToEtcd(config.etcd_endpoints) != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect to etcd endpoints: "
+                   << config.etcd_endpoints;
+        return nullptr;
+    }
+    return helper;
 }
 
 }  // namespace mooncake

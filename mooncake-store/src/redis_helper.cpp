@@ -40,7 +40,7 @@ RedisHelper::RedisHelper(const std::string& cluster_id,
 }
 
 RedisHelper::~RedisHelper() {
-    cancel_election_ = true;
+    CancelElection();
     CancelKeepAlive();
     if (subscribe_ctx_) {
         redisFree(subscribe_ctx_);
@@ -338,7 +338,12 @@ bool RedisHelper::WatchLeaderSubscribe() {
     redisContext* polling_ctx = CreateConnection();
     if (!polling_ctx) {
         LOG(WARNING) << "WatchLeaderSubscribe: failed to create polling "
-                        "connection; relying on subscribe loop only";
+                        "connection; falling back to pure polling";
+        RedisReplyPtr unsub((redisReply*)redisCommand(
+            subscribe_ctx_, "UNSUBSCRIBE %b", leader_event_channel_.data(),
+            leader_event_channel_.size()));
+        DrainSubscribeContext();
+        return false;
     }
 
     // Polling thread: check if key still exists periodically.
@@ -346,30 +351,25 @@ bool RedisHelper::WatchLeaderSubscribe() {
     // so redisGetReply returns at least once per second regardless
     // of whether a Pub/Sub message arrives, allowing the subscribe
     // loop to check leader_lost/cancel_election_ flags.
-    // Only create the polling thread if we have a valid connection.
-    std::thread polling_thread;
-    if (polling_ctx) {
-        polling_thread = std::thread([this, &leader_lost, polling_ctx]() {
-            auto interval = std::chrono::seconds(ttl_sec_);
-            while (!leader_lost && !cancel_election_) {
-                std::this_thread::sleep_for(interval);
-                if (leader_lost || cancel_election_) break;
+    std::thread polling_thread([this, &leader_lost, polling_ctx]() {
+        auto interval = std::chrono::seconds(ttl_sec_);
+        while (!leader_lost && !cancel_election_) {
+            std::this_thread::sleep_for(interval);
+            if (leader_lost || cancel_election_) break;
 
-                RedisReplyPtr r((redisReply*)redisCommand(
-                    polling_ctx, "GET %b", master_view_key_.data(),
-                    master_view_key_.size()));
-                if (!r) {
-                    LOG(WARNING)
-                        << "WatchLeaderSubscribe: polling GET failed "
-                           "(connection error), exiting polling thread";
-                    break;
-                }
-                if (r->type == REDIS_REPLY_NIL) {
-                    leader_lost = true;
-                }
+            RedisReplyPtr r((redisReply*)redisCommand(polling_ctx, "GET %b",
+                                                      master_view_key_.data(),
+                                                      master_view_key_.size()));
+            if (!r) {
+                LOG(WARNING) << "WatchLeaderSubscribe: polling GET failed "
+                                "(connection error), exiting polling thread";
+                break;
             }
-        });
-    }
+            if (r->type == REDIS_REPLY_NIL) {
+                leader_lost = true;
+            }
+        }
+    });
 
     // Subscribe loop: read messages until leader vacancy is detected.
     // redisGetReply returns at least every 1s (subscribe_ctx_ timeout)
@@ -574,6 +574,8 @@ void RedisHelper::CancelKeepAlive() {
     cancel_keep_alive_ = true;
     keep_alive_running_ = false;
 }
+
+void RedisHelper::CancelElection() { cancel_election_ = true; }
 
 // ============================================================
 // GetMasterView

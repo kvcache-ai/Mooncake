@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 
@@ -10,15 +11,48 @@
 
 #ifdef STORE_USE_REDIS
 #include "redis_helper.h"
+#include "redis_master_view_helper.h"
 #include <hiredis/hiredis.h>
 
 namespace mooncake {
 namespace testing {
 
 DEFINE_string(redis_endpoint, "127.0.0.1:6379",
-              "Redis endpoint for helper test");
+              "Redis endpoint for Redis test");
 DEFINE_int32(redis_ttl_sec, 2, "Short TTL for testing fast key expiration");
-DEFINE_string(cluster_id, "test_helper", "Cluster ID for Redis helper test");
+DEFINE_string(cluster_id, "test_helper", "Cluster ID for Redis test");
+
+// ============================================================
+// Helper: clean up Redis keys between tests
+// ============================================================
+
+static void CleanupRedisKeys() {
+    std::string host = "127.0.0.1";
+    int port = 6379;
+    auto colon_pos = FLAGS_redis_endpoint.rfind(':');
+    if (colon_pos != std::string::npos) {
+        host = FLAGS_redis_endpoint.substr(0, colon_pos);
+        port = std::stoi(FLAGS_redis_endpoint.substr(colon_pos + 1));
+    }
+    redisContext* ctx = redisConnect(host.c_str(), port);
+    if (ctx && !ctx->err) {
+        std::string master_view_key =
+            "mooncake:{" + FLAGS_cluster_id + "/}master_view";
+        std::string master_epoch_key =
+            "mooncake:{" + FLAGS_cluster_id + "/}master_epoch";
+        redisReply* r = (redisReply*)redisCommand(
+            ctx, "DEL %b %b", master_view_key.data(), master_view_key.size(),
+            master_epoch_key.data(), master_epoch_key.size());
+        if (r) freeReplyObject(r);
+        redisFree(ctx);
+    } else {
+        if (ctx) redisFree(ctx);
+    }
+}
+
+// ============================================================
+// RedisHelperTest — direct RedisHelper API tests
+// ============================================================
 
 class RedisHelperTest : public ::testing::Test {
    protected:
@@ -31,41 +65,8 @@ class RedisHelperTest : public ::testing::Test {
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
     void SetUp() override { CleanupRedisKeys(); }
-
     void TearDown() override { CleanupRedisKeys(); }
-
-   private:
-    // Delete both master_view and master_epoch keys directly.
-    // master_epoch has no TTL (INCR key), so it persists across tests
-    // and would block subsequent ElectLeader calls if not cleaned up.
-    // Both SetUp and TearDown call this to ensure isolation even if a
-    // test's KeepLeader thread is still renewing the key at exit.
-    static void CleanupRedisKeys() {
-        std::string host = "127.0.0.1";
-        int port = 6379;
-        auto colon_pos = FLAGS_redis_endpoint.rfind(':');
-        if (colon_pos != std::string::npos) {
-            host = FLAGS_redis_endpoint.substr(0, colon_pos);
-            port = std::stoi(FLAGS_redis_endpoint.substr(colon_pos + 1));
-        }
-        redisContext* ctx = redisConnect(host.c_str(), port);
-        if (ctx && !ctx->err) {
-            std::string master_view_key =
-                "mooncake:{" + FLAGS_cluster_id + "/}master_view";
-            std::string master_epoch_key =
-                "mooncake:{" + FLAGS_cluster_id + "/}master_epoch";
-            RedisReplyPtr r((redisReply*)redisCommand(
-                ctx, "DEL %b %b", master_view_key.data(),
-                master_view_key.size(), master_epoch_key.data(),
-                master_epoch_key.size()));
-            redisFree(ctx);
-        } else {
-            if (ctx) redisFree(ctx);
-        }
-    }
 };
-
-// === Test 1: Connect ===
 
 TEST_F(RedisHelperTest, Connect) {
     RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
@@ -176,11 +177,22 @@ TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
     ViewVersionId second_version = 0;
     int second_lease = 0;
 
+    // Use a future with timeout to prevent blocking forever if the
+    // Redis key does not expire as expected.
+    std::promise<void> done;
+    auto future = done.get_future();
     std::thread elect_thread([&]() {
         second.ElectLeader("10.0.0.5:50051", second_version, second_lease);
+        done.set_value();
     });
 
-    // Should complete within short_ttl * 3 seconds
+    // short_ttl=1, key should expire in ~2s; allow 10s safety margin
+    if (future.wait_for(std::chrono::seconds(10)) !=
+        std::future_status::ready) {
+        second.CancelElection();
+        elect_thread.join();
+        FAIL() << "Timed out waiting for Redis leader election";
+    }
     elect_thread.join();
     ASSERT_GT(second_version, 0);
     // Epoch should be strictly increasing
@@ -533,10 +545,7 @@ TEST_F(RedisHelperTest, ReconnectAfterConnectionLoss) {
 
 // === Test 19: ElectLeader detects cancel via WatchLeader ===
 // Covers: redis_helper.cpp:171-179 (election_ctx_ null → retry)
-// ElectLeader's while(true) loop doesn't check cancel_requested_ directly,
-// but WatchLeader does. We create a scenario where ElectLeader enters
-// WatchLeader (which can be cancelled), covering the connect-retry path
-// at lines 171-179 along the way.
+// ElectLeader can be cancelled while waiting in WatchLeader.
 
 TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
     const int short_ttl = 2;
@@ -564,14 +573,14 @@ TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
 
     // Wait for second to enter WatchLeader
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    second.CancelKeepAlive();
-
-    // Cancel first so key expires, allowing second to win
-    first.CancelKeepAlive();
-    first_keep.join();
+    second.CancelElection();
     elect_thread.join();
 
-    ASSERT_GT(second_version, first_version);
+    // Clean up the first leader.
+    first.CancelKeepAlive();
+    first_keep.join();
+
+    ASSERT_EQ(0, second_version);
 }
 
 // === Test 20: Subscribe loop processes message ===
@@ -615,6 +624,149 @@ TEST_F(RedisHelperTest, SubscribeReceivesVacantMessage) {
     ASSERT_GT(second_version, first_version);
 }
 
+// ============================================================
+// RedisElectionTest — MasterViewHelper integration tests
+// ============================================================
+
+#ifdef STORE_USE_REDIS
+
+class RedisElectionTest : public ::testing::Test {
+   protected:
+    void SetUp() override { CleanupRedisKeys(); }
+    void TearDown() override { CleanupRedisKeys(); }
+};
+
+// === Test 8: MasterViewHelper ElectLeader + GetMasterView ===
+
+TEST_F(RedisElectionTest, ElectAndGetMasterView) {
+    RedisMasterViewHelper mv_helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "",
+                                    0, FLAGS_redis_ttl_sec, 1);
+    ASSERT_EQ(ErrorCode::OK, mv_helper.Connect());
+
+    std::string master_address = "10.0.0.10:50051";
+    ViewVersionId version = 0;
+    EtcdLeaseId lease_id = 0;
+
+    mv_helper.ElectLeader(master_address, version, lease_id);
+    ASSERT_GT(version, 0);
+    ASSERT_GT(lease_id, 0);
+
+    std::string got_address;
+    ViewVersionId got_version = 0;
+    ASSERT_EQ(ErrorCode::OK, mv_helper.GetMasterView(got_address, got_version));
+    ASSERT_EQ(got_address, master_address);
+    ASSERT_EQ(got_version, version);
+}
+
+// === Test 9: MasterViewHelper KeepLeader ===
+
+TEST_F(RedisElectionTest, KeepLeaderRenewsTTL) {
+    RedisMasterViewHelper mv_helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "",
+                                    0, FLAGS_redis_ttl_sec, 1);
+    ASSERT_EQ(ErrorCode::OK, mv_helper.Connect());
+
+    std::string master_address = "10.0.0.11:50051";
+    ViewVersionId version = 0;
+    EtcdLeaseId lease_id = 0;
+
+    mv_helper.ElectLeader(master_address, version, lease_id);
+
+    std::thread keep_alive_thread([&]() { mv_helper.KeepLeader(lease_id); });
+    std::this_thread::sleep_for(std::chrono::seconds(FLAGS_redis_ttl_sec * 3));
+
+    std::string got_address;
+    ViewVersionId got_version = 0;
+    EXPECT_EQ(ErrorCode::OK, mv_helper.GetMasterView(got_address, got_version));
+    EXPECT_EQ(got_address, master_address);
+
+    mv_helper.CancelKeepAlive(lease_id);
+    keep_alive_thread.join();
+}
+
+// === Test 10: MasterViewHelper key expiry ===
+
+TEST_F(RedisElectionTest, KeyExpiresAfterKeepLeaderStops) {
+    const int short_ttl = 1;
+    RedisMasterViewHelper mv_helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "",
+                                    0, short_ttl, 1);
+    ASSERT_EQ(ErrorCode::OK, mv_helper.Connect());
+
+    std::string master_address = "10.0.0.12:50051";
+    ViewVersionId version = 0;
+    EtcdLeaseId lease_id = 0;
+
+    mv_helper.ElectLeader(master_address, version, lease_id);
+
+    // Don't start KeepLeader — let the key expire naturally
+    std::this_thread::sleep_for(std::chrono::seconds(short_ttl * 3));
+
+    RedisMasterViewHelper reader(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
+                                 short_ttl, 1);
+    ASSERT_EQ(ErrorCode::OK, reader.Connect());
+    std::string got_address;
+    ViewVersionId got_version = 0;
+    EXPECT_NE(ErrorCode::OK, reader.GetMasterView(got_address, got_version));
+}
+
+// === Test 11: MasterViewHelper ElectLeader waits for key expiry ===
+
+TEST_F(RedisElectionTest, ElectLeaderWaitsForKeyExpiry) {
+    const int short_ttl = 1;
+
+    RedisMasterViewHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
+                                short_ttl, 1);
+    ASSERT_EQ(ErrorCode::OK, first.Connect());
+    ViewVersionId first_version = 0;
+    EtcdLeaseId first_lease = 0;
+    first.ElectLeader("10.0.0.13:50051", first_version, first_lease);
+
+    RedisMasterViewHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
+                                 short_ttl, 1);
+    ASSERT_EQ(ErrorCode::OK, second.Connect());
+    ViewVersionId second_version = 0;
+    EtcdLeaseId second_lease = 0;
+
+    // Use a future with timeout to prevent blocking forever if the
+    // Redis key does not expire as expected.
+    std::promise<void> done;
+    auto future = done.get_future();
+    std::thread elect_thread([&]() {
+        second.ElectLeader("10.0.0.14:50051", second_version, second_lease);
+        done.set_value();
+    });
+
+    // short_ttl=1, key should expire in ~2s; allow 10s safety margin
+    if (future.wait_for(std::chrono::seconds(10)) !=
+        std::future_status::ready) {
+        second.CancelElection();
+        elect_thread.join();
+        FAIL() << "Timed out waiting for Redis master view election";
+    }
+    elect_thread.join();
+    ASSERT_GT(second_version, 0);
+    ASSERT_GT(second_version, first_version);
+}
+
+// === Test 12: MasterViewHelper epoch monotonicity ===
+
+TEST_F(RedisElectionTest, EpochMonotonicallyIncreases) {
+    const int short_ttl = 1;
+    RedisMasterViewHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
+                                 short_ttl, 1);
+    ASSERT_EQ(ErrorCode::OK, helper.Connect());
+
+    ViewVersionId prev_epoch = 0;
+    for (int i = 0; i < 3; i++) {
+        ViewVersionId version = 0;
+        EtcdLeaseId lease_id = 0;
+        helper.ElectLeader("10.0.0.15:50051", version, lease_id);
+        ASSERT_GT(version, prev_epoch);
+        prev_epoch = version;
+        std::this_thread::sleep_for(std::chrono::seconds(short_ttl * 3));
+    }
+}
+
+#endif  // STORE_USE_REDIS
 }  // namespace testing
 }  // namespace mooncake
 
