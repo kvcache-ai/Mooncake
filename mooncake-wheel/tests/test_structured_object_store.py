@@ -1941,16 +1941,14 @@ def test_legacy_dict_schema_without_section_falls_back_to_auto_routing() -> None
     _store, transfer = make_transfer()
     ref = transfer.put_legacy_dict(
         {"values": range(1, 4), "step": 7},
-        field_schemas={
-            "values": FieldSchema(codec="ndarray", metadata={"dtype": "int64"})
-        },
+        field_schemas={"values": FieldSchema(codec="ndarray", metadata={"dtype": "int64"})},
     )
 
     result = transfer.get_legacy_dict(ref)
 
-    assert np.array_equal(result["values"], np.asarray([1, 2, 3], dtype=np.int64))
+    assert result["values"] == [1, 2, 3]
     assert result["step"] == 7
-    assert "values" not in ref.encoded_non_tensor
+    assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
 def test_legacy_dict_schema_keeps_numeric_ndarray_direct() -> None:
@@ -1973,7 +1971,7 @@ def test_legacy_dict_schema_keeps_numeric_ndarray_direct() -> None:
     assert "values" not in ref.encoded_non_tensor
 
 
-def test_legacy_dict_schema_materializes_scalar_sequences_as_direct_ndarray() -> None:
+def test_legacy_dict_schema_encodes_scalar_sequences_with_ndarray_codec() -> None:
     _store, transfer = make_transfer()
     ref = transfer.put_legacy_dict(
         {"values": range(1, 4)},
@@ -1988,8 +1986,8 @@ def test_legacy_dict_schema_materializes_scalar_sequences_as_direct_ndarray() ->
 
     result = transfer.get_legacy_dict(ref)
 
-    assert np.array_equal(result["values"], np.asarray([1, 2, 3], dtype=np.int64))
-    assert "values" not in ref.encoded_non_tensor
+    assert result["values"] == [1, 2, 3]
+    assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
 def test_legacy_dict_schema_keeps_nulls_in_structured_codec() -> None:

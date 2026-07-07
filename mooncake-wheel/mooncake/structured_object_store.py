@@ -1894,8 +1894,6 @@ def _schema_prefers_direct_numeric_ndarray(
         return False
     if isinstance(value, np.ndarray):
         return value.dtype != object or all(item is not None for item in value)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return all(item is not None for item in value)
     return False
 
 
