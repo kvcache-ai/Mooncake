@@ -37,14 +37,7 @@ echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
 cd test_env
-TORCH_SPEC=${MOONCAKE_TEST_TORCH_SPEC:-torch==2.11.0}
-if [ -n "${MOONCAKE_TEST_TORCH_INDEX_URL:-}" ]; then
-    pip install "$TORCH_SPEC" numpy \
-        --index-url "$MOONCAKE_TEST_TORCH_INDEX_URL" \
-        --extra-index-url https://pypi.org/simple
-else
-    pip install "$TORCH_SPEC" numpy
-fi
+pip install torch==2.11.0 numpy
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
