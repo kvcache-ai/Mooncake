@@ -233,6 +233,7 @@ impl PyMooncakeDistributedStore {
                 use_hugepage,
                 hugepage_size_bytes: hugepage_size,
                 timeouts: None,
+                cold_tier_targets: None,
             },
             local_segment_name,
             initial_state,

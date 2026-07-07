@@ -6,6 +6,9 @@ use mooncake_metadata::{
     resolve_redis_auth, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
     RedisMetadataBackend, RedisMetadataConfig,
 };
+#[cfg(test)]
+use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
+use mooncake_store_client::{ColdTierTargetConfig, ColdTierTargetSpec};
 use mooncake_store_core::{MetadataBackend, Result, StoreError};
 use mooncake_transport::{ClassicEngineConfig, ClassicTransportProtocol, TentEngineConfig};
 use url::Url;
@@ -27,6 +30,7 @@ const DUMMY_RPC_TIMEOUT_ENV: &str = "MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS";
 const EVICTION_HIGH_WATERMARK_ENV: &str = "MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT";
 const EVICTION_LOW_WATERMARK_ENV: &str = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT";
 const CLASSIC_GID_INDEX_ENV: &str = "MC_STORE_RS_GID_INDEX";
+const COLD_TIER_TARGETS_ENV: &str = "MC_STORE_RS_COLD_TIER_TARGETS";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompatTimeoutCliOverrides {
@@ -167,6 +171,7 @@ pub struct CompatBuildPlan {
     pub lease_ttl_ms: u64,
     pub use_hugepage: Option<bool>,
     pub hugepage_size_bytes: Option<usize>,
+    pub cold_tier_targets: Vec<ColdTierTargetConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +210,7 @@ pub struct CompatSetupArgs {
     pub use_hugepage: Option<bool>,
     pub hugepage_size_bytes: Option<usize>,
     pub timeouts: Option<CompatTimeoutConfig>,
+    pub cold_tier_targets: Option<Vec<ColdTierTargetSpec>>,
 }
 
 impl CompatSetupArgs {
@@ -234,12 +240,17 @@ impl CompatSetupArgs {
             use_hugepage,
             hugepage_size_bytes,
             timeouts,
+            cold_tier_targets,
         } = self;
 
         let keyspace = keyspace.map(MetadataKeyspace::new).unwrap_or_default();
         let stable_id = stable_id.unwrap_or_else(|| format!("py-store-{}", now_ms()));
         let transport_backend = resolve_transport_backend(transport_backend.as_deref())?;
         let timeouts = timeouts.unwrap_or_else(CompatTimeoutConfig::from_env);
+        let cold_tier_targets = resolve_cold_tier_target_config(
+            cold_tier_targets,
+            std::env::var(COLD_TIER_TARGETS_ENV).ok(),
+        )?;
         if metadata_url.trim().is_empty() {
             return Err(StoreError::Metadata(
                 "metadata_url (setup arg7) is required: pass a redis:// or etcd:// URL for the Store-RS metadata backend".to_string(),
@@ -322,8 +333,29 @@ impl CompatSetupArgs {
             lease_ttl_ms,
             use_hugepage,
             hugepage_size_bytes,
+            cold_tier_targets,
         })
     }
+}
+
+fn resolve_cold_tier_target_config(
+    explicit: Option<Vec<ColdTierTargetSpec>>,
+    env_json: Option<String>,
+) -> Result<Vec<ColdTierTargetConfig>> {
+    let specs = match (explicit, env_json) {
+        (Some(specs), _) => specs,
+        (None, Some(env_json)) => serde_json::from_str::<Vec<ColdTierTargetSpec>>(&env_json)
+            .map_err(|error| {
+                StoreError::InvalidState(format!(
+                    "failed to parse {COLD_TIER_TARGETS_ENV}: {error}"
+                ))
+            })?,
+        (None, None) => return Ok(Vec::new()),
+    };
+    specs
+        .into_iter()
+        .map(ColdTierTargetConfig::try_from)
+        .collect()
 }
 
 fn resolve_optional_u8_env_override(explicit: Option<u8>, env_name: &str) -> Result<Option<u8>> {
@@ -738,6 +770,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         }
     }
 
@@ -898,6 +931,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         }
         .build();
         let error = match result {
@@ -1046,6 +1080,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         })
         .expect("build plan should succeed");
         assert_eq!(
@@ -1083,6 +1118,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         });
         let error = match result {
             Ok(_) => panic!("build plan should reject storage=true without storage bytes"),
@@ -1118,6 +1154,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         });
         let error = match result {
             Ok(_) => panic!("build plan should reject route_topk < 2"),
@@ -1153,6 +1190,7 @@ mod tests {
             use_hugepage: Some(true),
             hugepage_size_bytes: Some(2 * 1024 * 1024),
             timeouts: None,
+            cold_tier_targets: None,
         })
         .expect("compat build plan should succeed");
 
@@ -1209,6 +1247,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         })
         .expect("classic plan should build");
 
@@ -1253,6 +1292,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         })
         .expect("rw-only plan should build");
 
@@ -1291,6 +1331,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         })
         .expect("rw-only explicit-route plan should build");
 
@@ -1357,6 +1398,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
+            cold_tier_targets: None,
         });
         let error = match result {
             Ok(_) => panic!("missing metadata_url must fail"),
@@ -1474,5 +1516,89 @@ mod tests {
                 .registration_timeout_for_bytes(500 * 1024 * 1024 * 1024_u64),
             Duration::from_secs(7)
         );
+    }
+
+    #[test]
+    fn resolve_cold_tier_target_config_prefers_explicit_specs() {
+        let config = resolve_cold_tier_target_config(
+            Some(vec![ColdTierTargetSpec {
+                cold_tier_id: "ssd-a".to_string(),
+                kind: ColdTierKind::Ssd,
+                directory: Some(std::path::PathBuf::from("/tmp/ssd-a")),
+                uuid: None,
+                ssd_engine: None,
+                capacity_override_bytes: Some(4096),
+                tags: vec!["fast".to_string()],
+            }]),
+            Some(
+                r#"[{"cold_tier_id":"ignored","kind":"ssd","directory":"/tmp/ignored"}]"#
+                    .to_string(),
+            ),
+        )
+        .expect("explicit specs should resolve");
+        assert_eq!(config.len(), 1);
+        assert_eq!(config[0].cold_tier_id, "ssd-a");
+        assert_eq!(config[0].kind, ColdTierKind::Ssd);
+        assert_eq!(config[0].ssd_engine, ColdTierSsdEngine::LocalDir);
+        assert_eq!(config[0].capacity_override_bytes, Some(4096));
+        assert_eq!(config[0].tags, vec!["fast".to_string()]);
+    }
+
+    #[test]
+    fn resolve_cold_tier_target_config_reads_env_json() {
+        let config = resolve_cold_tier_target_config(
+            None,
+            Some(r#"[{"cold_tier_id":"ssd-a","kind":"ssd","directory":"/tmp/ssd-a"}]"#.to_string()),
+        )
+        .expect("env json should parse");
+        assert_eq!(config.len(), 1);
+        assert_eq!(config[0].cold_tier_id, "ssd-a");
+        assert_eq!(config[0].kind, ColdTierKind::Ssd);
+        assert_eq!(config[0].ssd_engine, ColdTierSsdEngine::LocalDir);
+    }
+
+    #[test]
+    fn resolve_cold_tier_target_config_reads_ssd_engine() {
+        let config = resolve_cold_tier_target_config(
+            None,
+            Some(
+                r#"[{"cold_tier_id":"ssd-a","kind":"ssd","directory":"/tmp/ssd-a","ssd_engine":"extent_store"}]"#
+                    .to_string(),
+            ),
+        )
+        .expect("env json should parse ssd engine");
+        assert_eq!(config[0].kind, ColdTierKind::Ssd);
+        assert_eq!(config[0].ssd_engine, ColdTierSsdEngine::ExtentStore);
+    }
+
+    #[test]
+    fn resolve_cold_tier_target_config_accepts_multiple_specs() {
+        let config = resolve_cold_tier_target_config(
+            None,
+            Some(
+                r#"[
+                    {"cold_tier_id":"a","kind":"ssd","directory":"/tmp/a"},
+                    {"cold_tier_id":"b","kind":"ssd","directory":"/tmp/b"}
+                ]"#
+                .to_string(),
+            ),
+        )
+        .expect("multiple targets should resolve");
+        assert_eq!(config.len(), 2);
+        assert_eq!(config[0].cold_tier_id, "a");
+        assert_eq!(config[1].cold_tier_id, "b");
+    }
+
+    #[test]
+    fn resolve_cold_tier_target_config_returns_empty_when_both_none() {
+        let config =
+            resolve_cold_tier_target_config(None, None).expect("no input should return empty vec");
+        assert!(config.is_empty());
+    }
+
+    #[test]
+    fn resolve_cold_tier_target_config_rejects_invalid_json() {
+        let result = resolve_cold_tier_target_config(None, Some("not json".to_string()));
+        assert!(result.is_err());
     }
 }

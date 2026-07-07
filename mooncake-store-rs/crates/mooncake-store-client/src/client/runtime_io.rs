@@ -1888,6 +1888,7 @@ impl StoreClient {
 
             let remaining = self.remaining_live_segments()?;
             if remaining.is_empty() {
+                self.route_directory.flush_pending_route_mirrors();
                 return Ok(migrated);
             }
 

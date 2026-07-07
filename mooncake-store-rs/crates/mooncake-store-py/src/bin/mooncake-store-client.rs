@@ -20,7 +20,7 @@ use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
-    RouteControlMode,
+    ColdTierKind, ColdTierSsdEngine, ColdTierTargetSpec, RouteControlMode,
 };
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
@@ -196,6 +196,52 @@ struct RunArgs {
     route_control: RouteControlArg,
     #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_RS_DRAIN_ON_EXIT")]
     drain_on_exit: bool,
+
+    // -- Cold tier bootstrap --
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_TARGETS",
+        help = "Cold tier targets as JSON array of ColdTierTargetSpec objects"
+    )]
+    cold_tier_targets_json: Option<String>,
+    #[arg(long, help = "Bootstrap cold tier device ID")]
+    cold_tier_id: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Bootstrap cold tier device kind (ssd or nfs); used with --cold-tier-id"
+    )]
+    cold_tier_kind: Option<ColdTierKindArg>,
+    #[arg(long, help = "Bootstrap cold tier directory path")]
+    cold_tier_directory: Option<String>,
+    #[arg(long, help = "Bootstrap cold tier device UUID")]
+    cold_tier_uuid: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "SSD engine (local-dir or extent-store); default: local-dir"
+    )]
+    cold_tier_ssd_engine: Option<ColdTierSsdEngineArg>,
+    #[arg(
+        long,
+        use_value_delimiter = true,
+        help = "Bootstrap cold tier device tags (comma-separated)"
+    )]
+    cold_tier_tags: Vec<String>,
+    #[arg(long, help = "Bootstrap cold tier device capacity override in bytes")]
+    cold_tier_capacity_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ColdTierKindArg {
+    Ssd,
+    Nfs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ColdTierSsdEngineArg {
+    LocalDir,
+    ExtentStore,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -709,6 +755,17 @@ fn validate_args(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     if args.route_topk < 2 {
         return Err("--route-topk must be greater than or equal to 2".into());
     }
+    if args.cold_tier_id.is_some()
+        && args.cold_tier_directory.is_none()
+        && args.cold_tier_uuid.is_none()
+    {
+        return Err(
+            "--cold-tier-id requires either --cold-tier-directory or --cold-tier-uuid".into(),
+        );
+    }
+    if args.cold_tier_directory.is_some() && args.cold_tier_uuid.is_some() {
+        return Err("--cold-tier-directory and --cold-tier-uuid are mutually exclusive".into());
+    }
     Ok(())
 }
 
@@ -818,11 +875,50 @@ fn build_runtime_args(
             use_hugepage: explicit_hugepage_setting(args),
             hugepage_size_bytes: args.hugepage_size,
             timeouts: Some(timeouts),
+            cold_tier_targets: build_cold_tier_specs(args),
         },
         local_segment_name: args.local_segment_name.clone(),
         initial_state: startup_initial_state(requested_initial_state(args)),
         route_control: args.route_control.into(),
     }
+}
+
+/// Build cold tier target specs from CLI flags.
+///
+/// Priority: `--cold-tier-targets-json` (full JSON) > individual `--cold-tier-*` flags.
+/// The JSON env var (`MC_STORE_RS_COLD_TIER_TARGETS`) is handled downstream by
+/// `resolve_cold_tier_target_config` in config.rs, so we only pass explicit CLI input here.
+fn build_cold_tier_specs(args: &RunArgs) -> Option<Vec<ColdTierTargetSpec>> {
+    if let Some(ref json) = args.cold_tier_targets_json {
+        let specs: Vec<ColdTierTargetSpec> = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("--cold-tier-targets-json is not valid JSON: {e}"));
+        return Some(specs);
+    }
+
+    let cold_tier_id = args.cold_tier_id.as_deref()?;
+    let kind = match args.cold_tier_kind {
+        Some(ColdTierKindArg::Ssd) => ColdTierKind::Ssd,
+        Some(ColdTierKindArg::Nfs) => ColdTierKind::Nfs,
+        None => ColdTierKind::Ssd,
+    };
+    let ssd_engine = args.cold_tier_ssd_engine.map(|e| match e {
+        ColdTierSsdEngineArg::LocalDir => ColdTierSsdEngine::LocalDir,
+        ColdTierSsdEngineArg::ExtentStore => ColdTierSsdEngine::ExtentStore,
+    });
+
+    let spec = ColdTierTargetSpec {
+        cold_tier_id: cold_tier_id.to_string(),
+        kind,
+        directory: args
+            .cold_tier_directory
+            .as_ref()
+            .map(std::path::PathBuf::from),
+        uuid: args.cold_tier_uuid.clone(),
+        ssd_engine,
+        capacity_override_bytes: args.cold_tier_capacity_bytes,
+        tags: args.cold_tier_tags.clone(),
+    };
+    Some(vec![spec])
 }
 
 fn metrics_port_label(metrics_addr: Option<&str>) -> Option<String> {
@@ -1085,15 +1181,20 @@ mod tests {
 
     use _store_rs::runtime::CompatTimeoutConfig;
 
+    use std::path::PathBuf;
+
+    use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
+
     use super::{
-        build_runtime_args, compat_warnings, drained_message, dummy_worker_scope,
-        effective_heartbeat_interval, emit_compat_warnings, fetch_http_body,
+        build_cold_tier_specs, build_runtime_args, compat_warnings, drained_message,
+        dummy_worker_scope, effective_heartbeat_interval, emit_compat_warnings, fetch_http_body,
         heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, normalize_trace_filter, now_ms,
         parse_cli_from, parse_falsey_env_bool, parse_hugepage_size_arg, parse_label,
         parse_route_control_arg, parse_transport_backend_arg, requested_initial_state,
         resolve_timeout_config, should_activate_after_ready, start_metrics_if_needed,
-        started_message, startup_initial_state, stopped_message, validate_args, Command,
-        HeartbeatLoopState, InitialStateArg, RouteControlArg, RunArgs, TransportBackendArg,
+        started_message, startup_initial_state, stopped_message, validate_args, ColdTierKindArg,
+        ColdTierSsdEngineArg, Command, HeartbeatLoopState, InitialStateArg, RouteControlArg,
+        RunArgs, TransportBackendArg,
     };
     use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
 
@@ -1144,6 +1245,14 @@ mod tests {
             trace_filter: None,
             route_control: RouteControlArg::EmbeddedWrh,
             drain_on_exit: false,
+            cold_tier_targets_json: None,
+            cold_tier_id: None,
+            cold_tier_kind: None,
+            cold_tier_directory: None,
+            cold_tier_uuid: None,
+            cold_tier_ssd_engine: None,
+            cold_tier_tags: vec![],
+            cold_tier_capacity_bytes: None,
         }
     }
 
@@ -1950,5 +2059,110 @@ mod tests {
             stopped_message("node-a"),
             "mooncake-store-client stopped stable_id=node-a"
         );
+    }
+
+    #[test]
+    fn build_cold_tier_specs_maps_individual_flags() {
+        let mut args = sample_args();
+        args.cold_tier_id = Some("ssd-a".to_string());
+        args.cold_tier_kind = Some(ColdTierKindArg::Ssd);
+        args.cold_tier_directory = Some("/tmp/ssd-a".to_string());
+        args.cold_tier_ssd_engine = Some(ColdTierSsdEngineArg::ExtentStore);
+        args.cold_tier_tags = vec!["fast".to_string(), "local".to_string()];
+        args.cold_tier_capacity_bytes = Some(4096);
+
+        let specs = build_cold_tier_specs(&args).expect("cold tier flags should produce specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].cold_tier_id, "ssd-a");
+        assert_eq!(specs[0].kind, ColdTierKind::Ssd);
+        assert_eq!(specs[0].directory, Some(PathBuf::from("/tmp/ssd-a")));
+        assert_eq!(specs[0].uuid, None);
+        assert_eq!(specs[0].ssd_engine, Some(ColdTierSsdEngine::ExtentStore));
+        assert_eq!(specs[0].capacity_override_bytes, Some(4096));
+        assert_eq!(specs[0].tags, vec!["fast".to_string(), "local".to_string()]);
+    }
+
+    #[test]
+    fn build_cold_tier_specs_maps_json_with_multiple_targets() {
+        let mut args = sample_args();
+        args.cold_tier_targets_json = Some(
+            r#"[
+                {"cold_tier_id":"ssd-a","kind":"ssd","directory":"/tmp/ssd-a"},
+                {"cold_tier_id":"ssd-b","kind":"ssd","directory":"/tmp/ssd-b"}
+            ]"#
+            .to_string(),
+        );
+
+        let specs = build_cold_tier_specs(&args).expect("cold tier json should produce specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].cold_tier_id, "ssd-a");
+        assert_eq!(specs[1].cold_tier_id, "ssd-b");
+        assert_eq!(specs[0].directory, Some(PathBuf::from("/tmp/ssd-a")));
+        assert_eq!(specs[1].directory, Some(PathBuf::from("/tmp/ssd-b")));
+    }
+
+    #[test]
+    fn build_cold_tier_specs_json_takes_priority_over_individual_flags() {
+        let mut args = sample_args();
+        args.cold_tier_targets_json = Some(
+            r#"[{"cold_tier_id":"from-json","kind":"nfs","directory":"/mnt/nfs"}]"#.to_string(),
+        );
+        args.cold_tier_id = Some("from-flag".to_string());
+        args.cold_tier_directory = Some("/tmp/flag".to_string());
+
+        let specs = build_cold_tier_specs(&args).expect("json should take priority");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].cold_tier_id, "from-json");
+        assert_eq!(specs[0].kind, ColdTierKind::Nfs);
+    }
+
+    #[test]
+    fn build_cold_tier_specs_returns_none_when_no_flags() {
+        let args = sample_args();
+        assert!(build_cold_tier_specs(&args).is_none());
+    }
+
+    #[test]
+    fn build_runtime_args_maps_cold_tier_flags_into_setup() {
+        let mut args = sample_args();
+        args.cold_tier_id = Some("ssd-a".to_string());
+        args.cold_tier_kind = Some(ColdTierKindArg::Ssd);
+        args.cold_tier_directory = Some("/tmp/ssd-a".to_string());
+        args.cold_tier_ssd_engine = Some(ColdTierSsdEngineArg::ExtentStore);
+        args.cold_tier_tags = vec!["fast".to_string()];
+        args.cold_tier_capacity_bytes = Some(4096);
+
+        let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
+        let targets = runtime_args
+            .setup
+            .cold_tier_targets
+            .expect("cold tier flags should flow into setup args");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].cold_tier_id, "ssd-a");
+        assert_eq!(targets[0].kind, ColdTierKind::Ssd);
+        assert_eq!(targets[0].directory, Some(PathBuf::from("/tmp/ssd-a")));
+        assert_eq!(targets[0].ssd_engine, Some(ColdTierSsdEngine::ExtentStore));
+        assert_eq!(targets[0].capacity_override_bytes, Some(4096));
+        assert_eq!(targets[0].tags, vec!["fast".to_string()]);
+    }
+
+    #[test]
+    fn validate_args_rejects_cold_tier_id_without_target() {
+        let mut args = sample_args();
+        args.cold_tier_id = Some("ssd-a".to_string());
+
+        let error = validate_args(&args).expect_err("cold-tier-id without target should fail");
+        assert!(error.to_string().contains("--cold-tier-directory"));
+    }
+
+    #[test]
+    fn validate_args_rejects_conflicting_cold_tier_targets() {
+        let mut args = sample_args();
+        args.cold_tier_id = Some("ssd-a".to_string());
+        args.cold_tier_directory = Some("/tmp/ssd-a".to_string());
+        args.cold_tier_uuid = Some("uuid-123".to_string());
+
+        let error = validate_args(&args).expect_err("directory+uuid should conflict");
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 }
