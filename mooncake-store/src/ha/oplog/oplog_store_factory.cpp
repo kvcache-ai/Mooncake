@@ -45,6 +45,10 @@ std::unique_ptr<OpLogStore> OpLogStoreFactory::Create(
             }
             return store;
         }
+        case OpLogStoreType::ETCD_BATCH_RECORD:
+            LOG(ERROR) << "OpLogStoreFactory: batch-record mode does not use "
+                          "legacy OpLogStore";
+            return nullptr;
         default:
             LOG(ERROR) << "OpLogStoreFactory: unknown store type";
             return nullptr;

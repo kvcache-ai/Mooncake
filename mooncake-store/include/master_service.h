@@ -63,7 +63,10 @@ class EtcdOpLogStore;
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+class HaKvBackend;
 class HttpMetadataServer;
+class OpLogBatchStorage;
+class OrderedOpLogWriter;
 struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
@@ -141,6 +144,8 @@ class MasterService {
      *        any HA OpLog operations.
      */
     void SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
+    ErrorCode SetBatchOpLogBackendForTesting(
+        std::shared_ptr<HaKvBackend> backend);
 
     /**
      * @brief Override retry behavior for OpLog persist in tests.
@@ -2045,6 +2050,7 @@ class MasterService {
     const std::string ha_backend_type_;
 
     const std::string ha_backend_connstring_;
+    const uint32_t oplog_batch_max_entries_;
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
@@ -2241,6 +2247,9 @@ class MasterService {
     // OpLog publishing
     std::shared_ptr<OpLogStore> oplog_store_;
     OpLogManager oplog_manager_;
+    std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
+    std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
+    std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
 
     // OpLog publishing helpers
     void AppendOpLogAndNotify(OpType type, const std::string& key,
@@ -2261,6 +2270,7 @@ class MasterService {
         const std::vector<Replica::Descriptor>& replicas,
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
+    ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
     ErrorCode PersistOpLogEntryWithSyncRetries(const OpLogEntry& entry) const;
 
     // Invalid endpoints from standby that don't exist locally

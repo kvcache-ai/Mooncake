@@ -9,16 +9,73 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <unistd.h>
 
+#include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/mock_oplog_store.h"
 #include "ha/oplog/mock_metadata_store.h"
+#include "ha/oplog/oplog_batch_codec.h"
+#include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "types.h"
 
 namespace mooncake::test {
+
+class FakeBatchHaKvBackend : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        auto it = kvs_.find(std::string(key));
+        if (it == kvs_.end()) {
+            return ErrorCode::ETCD_KEY_NOT_EXIST;
+        }
+        value = it->second;
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Put(std::string_view key, std::string_view value) override {
+        kvs_[std::string(key)] = std::string(value);
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs) override {
+        kvs.clear();
+        for (auto it = kvs_.lower_bound(std::string(begin_key));
+             it != kvs_.end() && it->first < end_key; ++it) {
+            kvs.push_back({.key = it->first, .value = it->second});
+            if (limit != 0 && kvs.size() >= limit) {
+                break;
+            }
+        }
+        return ErrorCode::OK;
+    }
+
+    bool SupportsTxn() const override { return true; }
+
+    ErrorCode Txn(const KvTxn& txn) override {
+        for (const auto& compare : txn.compares) {
+            auto it = kvs_.find(compare.key);
+            if (compare.kind == KvCompareKind::kKeyNotExists) {
+                if (it != kvs_.end()) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
+            } else if (it == kvs_.end() ||
+                       it->second != compare.expected_value) {
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
+            }
+        }
+        for (const auto& put : txn.puts) {
+            kvs_[put.key] = put.value;
+        }
+        return ErrorCode::OK;
+    }
+
+   private:
+    std::map<std::string, std::string> kvs_;
+};
 
 class MasterServiceHATest : public ::testing::Test {
    protected:
@@ -231,9 +288,41 @@ class MasterServiceHATest : public ::testing::Test {
                      .holder_id = holder_id});
     }
 
+    static uint64_t LastOpLogSequenceForTesting(const MasterService& service) {
+        return service.oplog_manager_.GetLastSequenceId();
+    }
+
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
+
+TEST_F(MasterServiceHATest,
+       BatchRecordWriterInitMigratesLegacyLatestAndSetsSequence) {
+    const std::string cluster_id = "test_batch_record_init_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put("/oplog/" + cluster_id + "/latest", "42"));
+
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(8)
+                              .build();
+    MasterService service(service_config);
+
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    std::string encoded_prefix;
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Get(BuildDurablePrefixKey(cluster_id), encoded_prefix));
+    DurablePrefix prefix;
+    ASSERT_TRUE(DecodeDurablePrefix(encoded_prefix, &prefix));
+    EXPECT_EQ(0u, prefix.batch_id);
+    EXPECT_EQ(42u, prefix.last_seq);
+    EXPECT_EQ(42u, LastOpLogSequenceForTesting(service));
+}
 
 TEST_F(MasterServiceHATest, RestoreFromStandbySnapshotClearsInvalidEndpoints) {
     auto service_config = MasterServiceConfig::builder()

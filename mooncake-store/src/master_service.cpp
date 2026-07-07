@@ -34,8 +34,11 @@
 #endif
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/oplog/etcd_oplog_store.h"
 #endif
+#include "ha/oplog/oplog_batch_storage.h"
+#include "ha/oplog/ordered_oplog_writer.h"
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -195,6 +198,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_offload_(config.enable_offload),
       ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
+      oplog_batch_max_entries_(config.oplog_batch_max_entries),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
@@ -405,6 +409,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
 
+    const OpLogStoreType configured_oplog_store_type =
+        config.oplog_store_type.empty()
+            ? kDefaultOpLogStoreType
+            : ParseOpLogStoreType(config.oplog_store_type);
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -439,23 +448,37 @@ MasterService::MasterService(const MasterServiceConfig& config)
     VLOG(1) << "action=start_job_dispatch_thread";
 
     if (enable_ha_ && !cluster_id_.empty()) {
-        auto store = OpLogStoreFactory::Create(
-            config.oplog_store_type.empty()
-                ? kDefaultOpLogStoreType
-                : ParseOpLogStoreType(config.oplog_store_type),
-            cluster_id_, OpLogStoreRole::WRITER, config.oplog_store_root_dir,
-            config.oplog_poll_interval_ms);
-        if (store) {
-            auto unique_store = std::move(store);
-            std::shared_ptr<OpLogStore> shared_store(std::move(unique_store));
-            oplog_store_ = shared_store;
-            oplog_manager_.SetOpLogStore(oplog_store_);
-            uint64_t max_seq = 0;
-            if (oplog_store_->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
-                oplog_manager_.SetInitialSequenceId(max_seq);
+        if (configured_oplog_store_type == OpLogStoreType::ETCD_BATCH_RECORD) {
+#ifdef STORE_USE_ETCD
+            auto backend = std::make_shared<EtcdHaKvBackend>();
+            ErrorCode err = InitializeBatchOpLogWriter(std::move(backend));
+            if (err != ErrorCode::OK) {
+                LOG(WARNING)
+                    << "failed to create HA batch-record OpLog writer, err="
+                    << static_cast<int>(err);
             }
+#else
+            LOG(WARNING) << "failed to create HA batch-record OpLog writer: "
+                            "ETCD support not compiled in";
+#endif
         } else {
-            LOG(WARNING) << "failed to create HA OpLog writer";
+            auto store = OpLogStoreFactory::Create(
+                configured_oplog_store_type, cluster_id_,
+                OpLogStoreRole::WRITER, config.oplog_store_root_dir,
+                config.oplog_poll_interval_ms);
+            if (store) {
+                auto unique_store = std::move(store);
+                std::shared_ptr<OpLogStore> shared_store(
+                    std::move(unique_store));
+                oplog_store_ = shared_store;
+                oplog_manager_.SetOpLogStore(oplog_store_);
+                uint64_t max_seq = 0;
+                if (oplog_store_->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
+                    oplog_manager_.SetInitialSequenceId(max_seq);
+                }
+            } else {
+                LOG(WARNING) << "failed to create HA OpLog writer";
+            }
         }
     }
 
@@ -548,6 +571,10 @@ MasterService::CreateSnapshotCatalogStore() {
 }
 
 MasterService::~MasterService() {
+    if (ordered_oplog_writer_) {
+        ordered_oplog_writer_->Stop();
+    }
+
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
@@ -607,6 +634,11 @@ MasterService::~MasterService() {
 void MasterService::SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store) {
     oplog_store_ = std::move(store);
     oplog_manager_.SetOpLogStore(oplog_store_);
+}
+
+ErrorCode MasterService::SetBatchOpLogBackendForTesting(
+    std::shared_ptr<HaKvBackend> backend) {
+    return InitializeBatchOpLogWriter(std::move(backend));
 }
 
 void MasterService::SetOpLogRetryConfigForTesting(uint32_t max_attempts,
@@ -10098,6 +10130,44 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.data_type = data_type;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
+}
+
+ErrorCode MasterService::InitializeBatchOpLogWriter(
+    std::shared_ptr<HaKvBackend> backend) {
+    if (!backend || !backend->SupportsTxn()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto storage = std::make_unique<OpLogBatchStorage>(cluster_id_, *backend);
+    DurablePrefix durable_prefix;
+    ErrorCode err = storage->InitDurablePrefix(durable_prefix);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    OrderedOpLogWriterConfig writer_config;
+    writer_config.max_entries_per_batch = oplog_batch_max_entries_;
+    writer_config.initial_durable_prefix = durable_prefix;
+    OpLogBatchStorage* storage_ptr = storage.get();
+    auto writer = std::make_unique<OrderedOpLogWriter>(
+        writer_config, [storage_ptr](const OpLogBatchRecord& batch,
+                                     const DurablePrefix& expected_prefix) {
+            return storage_ptr->WriteBatchAndAdvancePrefix(batch,
+                                                           expected_prefix);
+        });
+    if (!writer->IsAccepting()) {
+        return writer->LastError();
+    }
+    writer->Start();
+
+    if (ordered_oplog_writer_) {
+        ordered_oplog_writer_->Stop();
+    }
+    batch_oplog_kv_backend_ = std::move(backend);
+    batch_oplog_storage_ = std::move(storage);
+    ordered_oplog_writer_ = std::move(writer);
+    oplog_manager_.SetInitialSequenceId(durable_prefix.last_seq);
+    return ErrorCode::OK;
 }
 
 void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,

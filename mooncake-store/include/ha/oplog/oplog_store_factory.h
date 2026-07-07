@@ -17,6 +17,7 @@ enum class OpLogStoreRole {
 
 enum class OpLogStoreType {
     ETCD,
+    ETCD_BATCH_RECORD,
     LOCAL_FS,
 };
 
@@ -40,6 +41,9 @@ inline OpLogStoreType ParseOpLogStoreType(const std::string& type_str) {
     if (lower == "etcd") {
         return OpLogStoreType::ETCD;
     }
+    if (lower == "etcd_batch_record" || lower == "etcd-batch-record") {
+        return OpLogStoreType::ETCD_BATCH_RECORD;
+    }
     return kDefaultOpLogStoreType;
 }
 
@@ -47,6 +51,8 @@ inline std::string OpLogStoreTypeToString(OpLogStoreType type) {
     switch (type) {
         case OpLogStoreType::LOCAL_FS:
             return "localfs";
+        case OpLogStoreType::ETCD_BATCH_RECORD:
+            return "etcd_batch_record";
         case OpLogStoreType::ETCD:
         default:
             return "etcd";
