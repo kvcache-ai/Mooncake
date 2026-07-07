@@ -106,6 +106,7 @@ endif()
 if(WITH_STORE)
   pybind11_add_module(
     store
+    NO_EXTRAS
     ${SOURCES}
     ${CACHE_ALLOCATOR_SOURCES}
     store/store_py.cpp
