@@ -325,8 +325,40 @@ The shared metadata backend, for example etcd
 Each other's TENT RPC server address
 The selected UB device, for example bonding_dev_0
 ```
+### 6.2 Start A Shared etcd Metadata Backend
 
-### 6.2 Recommended Config Files
+The dual-node test requires both nodes to use the same TENT metadata backend. If `metadata_type` is set to `etcd`, start one etcd instance on either Node A or a third reachable node before running the test.
+
+Example on Node A:
+
+```bash
+etcd \
+  --name mooncake-ub-test \
+  --data-dir /tmp/mooncake-ub-etcd \
+  --listen-client-urls http://0.0.0.0:11451 \
+  --advertise-client-urls http://NODE_A_IP:11451 \
+  --listen-peer-urls http://127.0.0.1:11452 \
+  --initial-advertise-peer-urls http://127.0.0.1:11452 \
+  --initial-cluster mooncake-ub-test=http://127.0.0.1:11452 \
+  --initial-cluster-state new
+```
+
+Both Node A and Node B should use the same metadata server address:
+
+```json
+"metadata_type": "etcd",
+"metadata_servers": "NODE_A_IP:11451"
+```
+
+Do not use `127.0.0.1:11451` in the config unless both the server and client run on the same host. In a two-node test, `127.0.0.1` on Node B points to Node B itself, not to the etcd instance on Node A.
+
+Before running the test, verify connectivity from both nodes:
+
+```bash
+curl http://NODE_A_IP:11451/version
+```
+
+### 6.3 Recommended Config Files
 
 The test binary has a built-in UB-only config, but real two-node testing should use explicit config files.
 
@@ -408,7 +440,7 @@ Notes:
 5. For stable cross-node tests, etcd is easier to reason about than p2p metadata.
 ```
 
-### 6.3 Run The Test
+### 6.4 Run The Test
 
 On Node A:
 
@@ -449,7 +481,7 @@ Client: test PASSED
 
 `--operation=read` only executes the read path and does not verify a known pattern.
 
-### 6.4 What The Integration Test Covers
+### 6.5 What The Integration Test Covers
 
 The dual-node integration test validates:
 
