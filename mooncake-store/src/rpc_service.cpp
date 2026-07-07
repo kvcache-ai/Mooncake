@@ -230,6 +230,21 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     return results;
 }
 
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaListForAdmin(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    return master_service_.BatchGetReplicaListForAdmin(keys, tenant_id);
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
+                                             const std::string& tenant_id) {
+    return execute_rpc(
+        "GetReplicaListForAdmin",
+        [&] { return master_service_.GetReplicaListForAdmin(key, tenant_id); },
+        [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
@@ -1100,28 +1115,7 @@ WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
     if (!master_service_.IsTenantQuotaEnabled()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    auto before = master_service_.GetTenantQuotaSnapshot(tenant_id);
-    if (!before.has_value()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
     return master_service_.DeleteTenantQuotaPolicy(tenant_id);
-}
-
-tl::expected<uint64_t, ErrorCode>
-WrappedMasterService::GetDefaultTenantQuotaPolicy() {
-    if (!master_service_.IsTenantQuotaEnabled()) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-    return master_service_.GetDefaultTenantQuotaPolicy();
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::SetDefaultTenantQuotaPolicy(
-    uint64_t requested_quota_bytes) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-    master_service_.SetDefaultTenantQuotaPolicy(requested_quota_bytes);
-    return {};
 }
 
 tl::expected<uint64_t, ErrorCode>

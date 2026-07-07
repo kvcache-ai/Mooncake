@@ -264,7 +264,7 @@ DEFINE_string(memory_allocator, "offset",
 DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl | "
-    "ssd_free_ratio_first");
+    "ssd_free_ratio_first | local_first");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -296,14 +296,12 @@ DEFINE_bool(enable_disk_eviction, true,
 DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
-DEFINE_bool(enable_tenant_quota, false,
-            "Enable per-tenant memory quota admission");
-DEFINE_uint64(default_tenant_quota_bytes, 0,
-              "Default requested per-tenant memory quota in bytes "
-              "(0 is allowed; inherited tenants share remaining capacity)");
-DEFINE_uint64(tenant_quota_pool_capacity_bytes, 0,
-              "Capacity used to compute effective tenant quotas "
-              "(0 = mounted memory capacity)");
+DEFINE_bool(enable_multi_tenants, false,
+            "Enable strict multi-tenant namespace and quota admission");
+DEFINE_string(tenant_quota_connector_type, "file",
+              "Tenant quota policy connector type");
+DEFINE_string(tenant_quota_connector_uri, "",
+              "Tenant quota policy connector URI");
 
 // Snapshot related configuration flags (migrated from global_flags)
 DEFINE_string(snapshot_backup_dir, "",
@@ -531,15 +529,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
-    default_config.GetBool("enable_tenant_quota",
-                           &master_config.enable_tenant_quota,
-                           FLAGS_enable_tenant_quota);
-    default_config.GetUInt64("default_tenant_quota_bytes",
-                             &master_config.default_tenant_quota_bytes,
-                             FLAGS_default_tenant_quota_bytes);
-    default_config.GetUInt64("tenant_quota_pool_capacity_bytes",
-                             &master_config.tenant_quota_pool_capacity_bytes,
-                             FLAGS_tenant_quota_pool_capacity_bytes);
+    default_config.GetBool("enable_multi_tenants",
+                           &master_config.enable_multi_tenants,
+                           FLAGS_enable_multi_tenants);
+    default_config.GetString("tenant_quota_connector_type",
+                             &master_config.tenant_quota_connector_type,
+                             FLAGS_tenant_quota_connector_type);
+    default_config.GetString("tenant_quota_connector_uri",
+                             &master_config.tenant_quota_connector_uri,
+                             FLAGS_tenant_quota_connector_uri);
 
     default_config.GetString("snapshot_backup_dir",
                              &master_config.snapshot_backup_dir,
@@ -934,23 +932,22 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
     }
-    if ((google::GetCommandLineFlagInfo("enable_tenant_quota", &info) &&
+    if ((google::GetCommandLineFlagInfo("enable_multi_tenants", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.enable_tenant_quota = FLAGS_enable_tenant_quota;
+        master_config.enable_multi_tenants = FLAGS_enable_multi_tenants;
     }
-    if ((google::GetCommandLineFlagInfo("default_tenant_quota_bytes", &info) &&
+    if ((google::GetCommandLineFlagInfo("tenant_quota_connector_type", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.default_tenant_quota_bytes =
-            FLAGS_default_tenant_quota_bytes;
+        master_config.tenant_quota_connector_type =
+            FLAGS_tenant_quota_connector_type;
     }
-    if ((google::GetCommandLineFlagInfo("tenant_quota_pool_capacity_bytes",
-                                        &info) &&
+    if ((google::GetCommandLineFlagInfo("tenant_quota_connector_uri", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.tenant_quota_pool_capacity_bytes =
-            FLAGS_tenant_quota_pool_capacity_bytes;
+        master_config.tenant_quota_connector_uri =
+            FLAGS_tenant_quota_connector_uri;
     }
     if ((google::GetCommandLineFlagInfo("max_total_finished_tasks", &info) &&
          !info.is_default) ||

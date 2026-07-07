@@ -66,6 +66,17 @@ static void rememberAutoGidSelection(
     }
 }
 
+static std::string qpListToString(const std::vector<uint32_t> &qp_num) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < qp_num.size(); ++i) {
+        if (i) oss << ",";
+        oss << qp_num[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
@@ -406,13 +417,32 @@ int RdmaEndPoint::setupConnectionsByActive() {
         // `peer_qp_num_list_` with `peer_desc.qp_num`, since a failed RPC may
         // result in an invalid `peer_desc.qp_num`.
         //
-        // If the RPC is failed, even if the state is CONNECTED, (which means
-        // it is handled by setupConnectionsByPassive in another thread during
-        // the RPC, or "simultaneous open"), we should resetConnection to be
-        // safe. Because we're not sure whether the peer needs a connection
-        // re-establishment. (We don't know `peer_desc.qp_num`)
+        // If the RPC failed but simultaneous-open passive setup has already
+        // made this endpoint CONNECTED with the same local QPs used by this
+        // RPC, reuse that connection. Otherwise reset because
+        // `peer_desc.qp_num` is invalid and we cannot safely infer the peer
+        // state.
         if (rc) {
             RWSpinlock::WriteGuard write_guard(lock_);
+            if (connected()) {
+                auto current_qp_num = qpNum();
+                if (current_qp_num == local_desc.qp_num) {
+                    LOG(WARNING)
+                        << "Active handshake RPC failed, but simultaneous-open "
+                           "passive setup already connected this endpoint. "
+                           "Reusing existing connection. rc="
+                        << rc << ", local_desc.qp_num="
+                        << qpListToString(local_desc.qp_num)
+                        << ", current_qp_num=" << qpListToString(current_qp_num)
+                        << ", endpoint=" << toString();
+                    return 0;
+                }
+            }
+
+            LOG(ERROR) << "Active handshake RPC failed; resetting endpoint. rc="
+                       << rc << ", local_desc.qp_num="
+                       << qpListToString(local_desc.qp_num)
+                       << ", endpoint=" << toString();
             resetConnection("handshake RPC failure");
             return rc;
         }

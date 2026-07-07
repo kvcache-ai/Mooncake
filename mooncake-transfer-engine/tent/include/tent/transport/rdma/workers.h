@@ -76,10 +76,14 @@ class Workers {
 
    private:
     struct RouteHint {
+        // Owning reference to the segment snapshot; keeps all raw pointers
+        // below valid for the lifetime of this hint.
+        SegmentDescRef pin;
         SegmentDesc *segment;
         BufferDesc *buffer;
         const Topology::MemEntry *topo_entry;
         const Topology *topo;
+        std::string location;
     };
 
     Status getRouteHint(RouteHint &hint, SegmentID segment_id, uint64_t addr,
@@ -213,6 +217,9 @@ class Workers {
     uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
 
     std::unique_ptr<DeviceSelector> device_selector_;
+    // File contents loaded once from workers.rail_topo_path and shared by all
+    // per-worker/per-peer RailMonitor instances.
+    std::string rail_topo_json_;
     bool always_tier1_ = false;
 };
 }  // namespace tent

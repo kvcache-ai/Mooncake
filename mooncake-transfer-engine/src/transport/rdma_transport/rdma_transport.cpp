@@ -41,6 +41,17 @@ namespace mooncake {
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
+static std::string resolveBufferLocation(
+    const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
+    std::string location = buffer.name;
+    SegmentsLocationInfo seg_info;
+    if (parseSegmentsLocation(buffer.name, seg_info)) {
+        location = resolveSegmentsLocation(seg_info, buffer.length,
+                                           offset - buffer.addr);
+    }
+    return location;
+}
+
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
 // 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
 static int getIbRelaxedOrderingMode() {
@@ -561,6 +572,7 @@ Status RdmaTransport::submitTransferTask(
             slice->source_addr = (char *)request.source + offset;
             slice->length =
                 merge_final_slice ? request.length - offset : kBlockSize;
+            slice->source_location.clear();
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
@@ -617,6 +629,11 @@ Status RdmaTransport::submitTransferTask(
                 }
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
+                if (globalConfig().log_rdma_slice_affinity) {
+                    slice->source_location = resolveBufferLocation(
+                        local_segment_desc->buffers[buffer_id],
+                        reinterpret_cast<uint64_t>(slice->source_addr));
+                }
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
@@ -760,6 +777,17 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
          ++buffer_id) {
         const auto &buffer = buffers[buffer_id];
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        // The RDMA transport must only bind buffers registered under the rdma
+        // protocol. Device (hip) buffers alias the same GPU addresses but carry
+        // no lkey/rkey, so picking one yields an empty-lkey out-of-bounds read
+        // in the submit path. The !empty() guard leaves legacy single-protocol
+        // descriptors (empty protocol field) unaffected.
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
+
         // Check if offset is within buffer range
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {
@@ -783,6 +811,39 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                        kWildcardLocation, retry_count)
                                  : desc->topology.selectDevice(
                                        kWildcardLocation, hint, retry_count);
+        if (device_id >= 0) return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
+                                          size_t length,
+                                          std::string_view local_hca,
+                                          int &buffer_id, int &device_id,
+                                          int retry_count) {
+    if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
+    const auto &buffers = desc->buffers;
+    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
+         ++buffer_id) {
+        const auto &buffer = buffers[buffer_id];
+
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
+
+        if (offset < buffer.addr || length > buffer.length ||
+            offset - buffer.addr > buffer.length - length) {
+            continue;
+        }
+
+        const auto location = resolveBufferLocation(buffer, offset);
+        device_id = desc->topology.selectDeviceByLocalHca(location, local_hca,
+                                                          retry_count);
+        if (device_id >= 0) return 0;
+        device_id = desc->topology.selectDeviceByLocalHca(
+            kWildcardLocation, local_hca, retry_count);
         if (device_id >= 0) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;

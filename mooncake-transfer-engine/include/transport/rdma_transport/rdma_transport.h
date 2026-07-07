@@ -130,6 +130,10 @@ class RdmaTransport : public Transport {
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
                             int &device_id, int retry_cnt = 0);
+    static int selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
+                                      size_t length, std::string_view local_hca,
+                                      int &buffer_id, int &device_id,
+                                      int retry_cnt = 0);
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;

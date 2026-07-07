@@ -1,6 +1,6 @@
 // client_local_hot_cache_test.cpp
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "replica.h"

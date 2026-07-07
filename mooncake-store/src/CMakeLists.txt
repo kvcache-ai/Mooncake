@@ -17,6 +17,7 @@ set(MOONCAKE_STORE_SOURCES
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp
+    tenant_quota_policy_store.cpp
     rpc_service.cpp
     master_admin_service.cpp
     offset_allocator.cpp
@@ -25,11 +26,19 @@ set(MOONCAKE_STORE_SOURCES
     aligned_client_buffer.cpp
     real_client.cpp
     dummy_client.cpp
+    uds_transport.cpp
     shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
     storage/distributed/distributed_storage_backend.cpp
+    device/accelerator_device.cpp
+    device/accelerator_registry.cpp
+    device/runtime_accelerator.cpp
+    device/cuda_like_accelerator_device.cpp
+    device/hip_accelerator_device.cpp
+    device/ascend_accelerator_device.cpp
+    device/sunrise_accelerator_device.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -258,6 +267,7 @@ target_link_libraries(
          gflags::gflags
          ${EXTRA_LIBS}
          ${SPDK_STATIC_LIBS}
+         yaml-cpp
          asio_shared
   PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
@@ -301,6 +311,9 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
+if(USE_SUNRISE)
+  target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
+endif()
 
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
@@ -329,7 +342,8 @@ endif()
 # USE_CUDA may be OFF even when GPU pointers are present (e.g.
 # WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart). Each
 # detected toolkit gets both link libraries AND compile definitions, so that
-# gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
+# AcceleratorDevice implementations and pinned_buffer_pool.h pick the correct
+# backend.
 #
 # NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
 # Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
@@ -366,4 +380,14 @@ if(USE_ASCEND
   target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
   target_link_libraries(mooncake_client PRIVATE ascendcl)
 endif()
+
+if(USE_SUNRISE)
+    target_link_libraries(mooncake_store PRIVATE
+        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+    target_link_libraries(mooncake_client PRIVATE
+        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
+
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
