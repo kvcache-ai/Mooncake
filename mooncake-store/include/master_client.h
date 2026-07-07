@@ -191,18 +191,6 @@ class MasterClient {
                         const std::string& tenant_id);
 
     /**
-     * @brief Batch query replica lists by key prefix.
-     * @param prefix The key prefix to match.
-     * @param max_count Maximum number of results to return.
-     * @param tenant_id Tenant scope.
-     * @return Matching keys + their replica lists on success, ErrorCode on
-     * failure.
-     */
-    [[nodiscard]] tl::expected<BatchGetReplicaListByPrefixResponse, ErrorCode>
-    BatchGetReplicaListByPrefix(const std::string& prefix, int max_count,
-                                const std::string& tenant_id);
-
-    /**
      * @brief Starts a put operation
      * @param key Object key
      * @param slice_lengths Vector of slice lengths

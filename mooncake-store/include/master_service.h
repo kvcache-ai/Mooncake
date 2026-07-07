@@ -333,20 +333,6 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
-     * @brief Batch query replica lists by key prefix. Returns all keys matching
-     * the prefix along with their replica lists, up to max_count results.
-     * Read-only; does not modify lease or perform promotion.
-     * @param prefix The key prefix to match.
-     * @param max_count Maximum number of results to return.
-     * @param tenant_id Tenant scope.
-     * @return Matching keys + their replica lists on success, ErrorCode on
-     * failure.
-     */
-    tl::expected<BatchGetReplicaListByPrefixResponse, ErrorCode>
-    BatchGetReplicaListByPrefix(const std::string& prefix, int max_count,
-                                const std::string& tenant_id);
-
-    /**
      * @brief Get replica lists for a batch of objects.
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>

@@ -66,10 +66,6 @@ class WrappedMasterService {
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
 
-    tl::expected<BatchGetReplicaListByPrefixResponse, ErrorCode>
-    BatchGetReplicaListByPrefix(const std::string& prefix, int max_count,
-                                const std::string& tenant_id = "default");
-
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,

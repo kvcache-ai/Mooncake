@@ -2718,55 +2718,6 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     return results;
 }
 
-tl::expected<BatchGetReplicaListByPrefixResponse, ErrorCode>
-MasterService::BatchGetReplicaListByPrefix(const std::string& prefix,
-    int max_count, const std::string& tenant_id) {
-    if (max_count <= 0) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    BatchGetReplicaListByPrefixResponse response;
-    const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
-
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (size_t i = 0; i < kNumShards; ++i) {
-        MetadataShardAccessorRO shard(this, i);
-        auto tenant_it = shard->tenants.find(normalized_tenant);
-        if (tenant_it == shard->tenants.end()) {
-            continue;
-        }
-        for (const auto& [key, metadata] : tenant_it->second.metadata) {
-            if (!key.starts_with(prefix)) {
-                continue;
-            }
-            if (!metadata.IsValid()) {
-                continue;
-            }
-
-            std::vector<Replica::Descriptor> replica_list;
-            metadata.VisitReplicas(
-                &Replica::fn_is_completed,
-                [&replica_list](const Replica& replica) {
-                    replica_list.emplace_back(replica.get_descriptor());
-                });
-
-            if (replica_list.empty()) {
-                continue;
-            }
-
-            response.keys.push_back(key);
-            response.replica_list.emplace_back(
-                std::move(replica_list), default_kv_lease_ttl_);
-
-            if (static_cast<int>(response.keys.size()) >= max_count) {
-                return response;
-            }
-        }
-    }
-
-    return response;
-}
-
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,

@@ -941,7 +941,14 @@ class RealClient : public PyClient {
     mutable std::shared_mutex prefix_cache_mutex_;
     std::unordered_map<std::string, PrefixCacheEntry> prefix_cache_
         GUARDED_BY(prefix_cache_mutex_);
-    static constexpr auto kPrefixCacheTTL = std::chrono::seconds(5);
+
+    // Configurable cache TTL, controlled by MC_STORE_PREFIX_CACHE_TTL_SEC
+    // environment variable (default 5 seconds).
+    static std::chrono::seconds PrefixCacheTTL();
+
+    // Escape hatch: set MC_STORE_DISABLE_PREFIX_CACHE=1 to disable the
+    // prefix cache entirely at runtime without restarting.
+    static bool IsPrefixCacheEnabled();
 
     // Look up prefix cache for a batch of keys. Returns cached results for keys
     // that share a common prefix found in cache. missing_keys receives the keys
@@ -956,14 +963,21 @@ class RealClient : public PyClient {
     // Invalidate prefix cache entries that could cover the given key.
     void InvalidatePrefixCache(const std::string &key);
 
+    // Invalidate prefix cache entries that could cover the given keys.
+    void InvalidatePrefixCache(const std::vector<std::string> &keys);
+
+    // Clear all prefix cache entries. Used by removeAll / removeByRegex
+    // where we cannot determine the exact set of affected keys.
+    void ClearPrefixCache();
+
     // Cache fresh batch query results under the given prefix with explicit
     // key-to-result mapping. The results are stored as GetReplicaListResponse.
+    // Each entry's lease TTL is preserved; if it is shorter than
+    // PrefixCacheTTL(), a WARNING is logged because the cache entry will
+    // outlive the lease.
     void CachePrefixResults(
         const std::string &prefix, const std::vector<std::string> &keys,
         const std::vector<tl::expected<QueryResult, ErrorCode>> &results);
-
-    // Invalidate prefix cache entries that could cover the given keys.
-    void InvalidatePrefixCache(const std::vector<std::string> &keys);
 };
 
 }  // namespace mooncake
