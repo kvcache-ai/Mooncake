@@ -43,7 +43,8 @@ class DfsGlobalAllocator {
 
     tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
         const std::string& key, uint64_t size);
-    void Free(uint64_t offset, uint64_t aligned_size, int shard_idx);
+    void Free(uint64_t offset, uint64_t aligned_size, int shard_idx,
+              const std::string& key);
     void UpdateAccess(const std::string& key, int shard_idx, uint64_t offset);
     std::vector<EvictedKey> EvictIfNeeded();
     void SetEvictCallback(
@@ -59,9 +60,13 @@ class DfsGlobalAllocator {
         uint64_t capacity = 0;
         std::shared_ptr<OffsetAllocator> allocator;
 
+        struct AllocationRecord {
+            std::string key;
+            std::shared_ptr<OffsetAllocationHandle> handle;
+        };
+
         std::shared_mutex handle_mutex;
-        std::unordered_map<uint64_t, std::shared_ptr<OffsetAllocationHandle>>
-            offset_to_handle;
+        std::unordered_map<uint64_t, AllocationRecord> offset_to_handle;
 
         std::mutex lru_mutex;
         std::list<std::pair<std::string, uint64_t>> lru_list;

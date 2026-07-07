@@ -297,7 +297,7 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EXPECT_LT(desc->shard_idx, 4);
     EXPECT_EQ(desc->offset % 4096, 0);
 
-    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx);
+    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx, "key1");
     auto desc2 = alloc.Allocate("key2", 100);
     EXPECT_TRUE(desc2.has_value());
 
@@ -325,7 +325,7 @@ TEST(DfsGlobalAllocatorTest, AllocateReservesAlignmentPadding) {
     EXPECT_FALSE(exhausted.has_value());
     EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx);
+    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx, "key1");
     auto after_free = alloc.Allocate("key3", 100);
     EXPECT_TRUE(after_free.has_value());
 }
@@ -361,6 +361,56 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     EXPECT_TRUE(after_evict.has_value());
 }
 
+TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_free_lru_reuse");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 8 * 1024, 4096));
+
+    auto desc_a = alloc.Allocate("A", 100);
+    ASSERT_TRUE(desc_a.has_value());
+    alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
+
+    alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
+
+    auto desc_b = alloc.Allocate("B", 100);
+    ASSERT_TRUE(desc_b.has_value());
+    ASSERT_EQ(desc_b->offset, desc_a->offset);
+    alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
+
+    auto evicted = alloc.EvictIfNeeded();
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted.front().key, "B");
+}
+
+TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_stale_free");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 8 * 1024, 4096));
+
+    auto desc_a = alloc.Allocate("A", 100);
+    ASSERT_TRUE(desc_a.has_value());
+    alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
+
+    alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
+
+    auto desc_b = alloc.Allocate("B", 100);
+    ASSERT_TRUE(desc_b.has_value());
+    ASSERT_EQ(desc_b->offset, desc_a->offset);
+    alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
+
+    alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
+
+    auto evicted = alloc.EvictIfNeeded();
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted.front().key, "B");
+}
+
 TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
     EnvGuard env;
     ConfigurePosixDfs(env);
@@ -380,7 +430,8 @@ TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
             if (desc.has_value()) {
                 success_count++;
                 alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
-                alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx);
+                alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx,
+                           key);
             } else {
                 fail_count++;
             }

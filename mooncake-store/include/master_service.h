@@ -1490,7 +1490,8 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
-    void FreeDfsReplicas(const std::vector<Replica>& replicas);
+    void FreeDfsReplicas(const std::string& key,
+                         const std::vector<Replica>& replicas);
     void RemoveDfsReplicaByOffset(const std::string& key, int shard_idx,
                                   uint64_t offset);
     void InitDfsAllocatorFromEnvironment();

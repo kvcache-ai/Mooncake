@@ -1743,7 +1743,7 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
-    FreeDfsReplicas(erased_replicas);
+    FreeDfsReplicas(metadata.user_key, erased_replicas);
     return erased_replicas.size();
 }
 
@@ -1797,7 +1797,7 @@ MasterService::EraseMetadata(
     ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
-    FreeDfsReplicas(metadata.GetAllReplicas());
+    FreeDfsReplicas(key, metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
@@ -3081,7 +3081,7 @@ auto MasterService::AllocateAndInsertMetadata(
                               config.with_soft_pin, config.with_hard_pin,
                               config.data_type, group_id, tenant_id, key));
     if (!inserted) {
-        FreeDfsReplicas(replicas);
+        FreeDfsReplicas(key, replicas);
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -3218,7 +3218,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     auto replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!replicas.empty()) {
-                        FreeDfsReplicas(replicas);
+                        FreeDfsReplicas(key, replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(replicas),
@@ -3760,7 +3760,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!processing_replicas.empty()) {
-                        FreeDfsReplicas(processing_replicas);
+                        FreeDfsReplicas(key, processing_replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(processing_replicas),
@@ -3886,7 +3886,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
-                    FreeDfsReplicas(old_replicas);
+                    FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
                     discarded_replicas_.emplace_back(
                         std::move(old_replicas),
@@ -4561,7 +4561,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             return replica.id() == source_id;
         });
     if (!source_replica.empty()) {
-        FreeDfsReplicas(source_replica);
+        FreeDfsReplicas(key, source_replica);
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(
             std::move(source_replica),
@@ -4964,12 +4964,14 @@ bool MasterService::CleanupStaleHandles(
     return !metadata.IsValid();
 }
 
-void MasterService::FreeDfsReplicas(const std::vector<Replica>& replicas) {
+void MasterService::FreeDfsReplicas(const std::string& key,
+                                    const std::vector<Replica>& replicas) {
     if (!dfs_allocator_) return;
     for (const auto& replica : replicas) {
         if (!replica.is_dfs_replica()) continue;
         const auto& desc = replica.get_dfs_descriptor();
-        dfs_allocator_->Free(desc.offset, desc.aligned_size, desc.shard_idx);
+        dfs_allocator_->Free(desc.offset, desc.aligned_size, desc.shard_idx,
+                             key);
     }
 }
 
@@ -5999,7 +6001,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 auto replicas =
                     metadata.PopReplicas(&Replica::fn_is_processing);
                 if (!replicas.empty()) {
-                    FreeDfsReplicas(replicas);
+                    FreeDfsReplicas(*key_it, replicas);
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
@@ -6047,7 +6049,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     return it != replica_ids.end();
                 });
             if (!replicas.empty()) {
-                FreeDfsReplicas(replicas);
+                FreeDfsReplicas(task_it->first, replicas);
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {

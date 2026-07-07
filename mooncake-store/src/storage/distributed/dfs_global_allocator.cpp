@@ -130,7 +130,7 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
     uint64_t alloc_offset = AlignSize(raw_offset);
     auto alloc_handle =
         std::make_shared<OffsetAllocationHandle>(std::move(*handle));
-    shard.offset_to_handle[alloc_offset] = std::move(alloc_handle);
+    shard.offset_to_handle[alloc_offset] = {key, std::move(alloc_handle)};
     handle_lock.unlock();
 
     return DistributedFSDescriptor{
@@ -144,19 +144,28 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
 }
 
 void DfsGlobalAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
-                              int shard_idx) {
+                              int shard_idx, const std::string& key) {
     if (!initialized_.load(std::memory_order_acquire)) return;
     if (shard_idx < 0 || shard_idx >= shard_count_) return;
 
     auto& shard = *shards_[shard_idx];
+    std::lock_guard lru_lock(shard.lru_mutex);
     std::lock_guard handle_lock(shard.handle_mutex);
+
+    auto lru_it = shard.lru_index.find(key);
+    if (lru_it != shard.lru_index.end() && lru_it->second->second == offset) {
+        shard.lru_list.erase(lru_it->second);
+        shard.lru_index.erase(lru_it);
+    }
+
     auto it = shard.offset_to_handle.find(offset);
     if (it == shard.offset_to_handle.end()) return;
+    if (it->second.key != key) return;
 
     {
         std::lock_guard pending_lock(shard.pending_mutex);
         shard.pending_free.push_back(
-            {it->second,
+            {it->second.handle,
              std::chrono::steady_clock::now() + deferred_free_duration_});
     }
     shard.offset_to_handle.erase(it);
@@ -246,11 +255,14 @@ std::vector<DfsGlobalAllocator::EvictedKey> DfsGlobalAllocator::EvictFromShard(
             if (it == shard.offset_to_handle.end()) {
                 continue;
             }
+            if (it->second.key != evict_key) {
+                continue;
+            }
             {
                 std::lock_guard pending_lock(shard.pending_mutex);
                 shard.pending_free.push_back(
-                    {it->second, std::chrono::steady_clock::now() +
-                                     deferred_free_duration_});
+                    {it->second.handle, std::chrono::steady_clock::now() +
+                                            deferred_free_duration_});
             }
             shard.offset_to_handle.erase(it);
         }
