@@ -81,7 +81,6 @@ RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
       has_connected_(false),
-      ready_to_send_(false),
       ready_wait_start_ts_(0),
       wr_depth_list_(nullptr),
       active_(true),
@@ -136,7 +135,6 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         }
     }
 
-    ready_to_send_.store(false, std::memory_order_relaxed);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
     status_.store(UNCONNECTED, std::memory_order_relaxed);
     return 0;
@@ -166,7 +164,6 @@ int RdmaEndPoint::reconstruct() {
 
     // Reconstruct with same parameters as original construction
     status_.store(INITIALIZING, std::memory_order_relaxed);
-    ready_to_send_.store(false, std::memory_order_relaxed);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
     active_ = true;
 
@@ -232,7 +229,6 @@ void RdmaEndPoint::beginDestroyLocked() {
     active_ = false;
     inactive_time_ = getCurrentTimeInNano();
     status_.store(DESTROYING, std::memory_order_release);
-    ready_to_send_.store(false, std::memory_order_relaxed);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
     // Transition QPs to ERR state so hardware flushes all inflight WRs to CQ.
@@ -341,7 +337,6 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 doSetupConnection(context_.gid(), context_.lid(), qpNum());
             if (ret == 0) {
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
-                ready_to_send_.store(true, std::memory_order_relaxed);
             }
             return ret;
         }
@@ -460,11 +455,19 @@ int RdmaEndPoint::setupConnectionsByActive() {
             // active RPC confirms that the peer's passive QPs are ready.
             if (connected()) {
                 if (peer_qp_num_list_ == peer_desc.qp_num) {
-                    should_send_ready_ack = true;
-                    ready_ack_desc = local_desc;
-                    LOG(INFO)
-                        << "Received same peer QP numbers, sending RDMA ready "
-                           "ACK.";
+                    if (peer_desc.ready_ack_supported) {
+                        should_send_ready_ack = true;
+                        ready_ack_desc = local_desc;
+                        LOG(INFO) << "Received same peer QP numbers, sending "
+                                     "RDMA ready ACK.";
+                    } else {
+                        ready_wait_start_ts_.store(0,
+                                                   std::memory_order_relaxed);
+                        status_.store(CONNECTED, std::memory_order_relaxed);
+                        LOG(INFO) << "Peer does not support RDMA ready ACK, "
+                                     "reusing connection.";
+                        return 0;
+                    }
                 } else {
                     // This mismatch scenario should be rare. It may occur when
                     // a peer first sends us an Active RPC and establishes a
@@ -505,10 +508,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 int ret = ERR_DEVICE_NOT_FOUND;
                 std::string failure_message;
                 SetupConnectionFailureInfo failure_info;
+                auto connected_status = peer_desc.ready_ack_supported
+                                            ? CONNECTED_WAIT_READY_ACK
+                                            : CONNECTED;
                 if (!peer_desc.local_gid.empty()) {
-                    ret = doSetupConnection(
-                        peer_desc.local_gid, peer_desc.local_lid,
-                        peer_desc.qp_num, &failure_message, &failure_info);
+                    ret = doSetupConnection(peer_desc.local_gid,
+                                            peer_desc.local_lid,
+                                            peer_desc.qp_num, connected_status,
+                                            &failure_message, &failure_info);
                 } else {
                     auto segment_desc =
                         context_.engine().meta()->getSegmentDescByName(
@@ -518,7 +525,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
                             if (nic.name == peer_nic_name) {
                                 ret = doSetupConnection(
                                     nic.gid, nic.lid, peer_desc.qp_num,
-                                    &failure_message, &failure_info);
+                                    connected_status, &failure_message,
+                                    &failure_info);
                                 break;
                             }
                         }
@@ -526,8 +534,15 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 }
 
                 if (ret == 0) {
-                    should_send_ready_ack = true;
-                    ready_ack_desc = local_desc;
+                    if (peer_desc.ready_ack_supported) {
+                        should_send_ready_ack = true;
+                        ready_ack_desc = local_desc;
+                    } else {
+                        ready_wait_start_ts_.store(0,
+                                                   std::memory_order_relaxed);
+                        status_.store(CONNECTED, std::memory_order_relaxed);
+                        return 0;
+                    }
                 } else {
                     if (shouldAttemptAutoGidHandshakeRetry(
                             context_.autoGidSelectionEnabled(),
@@ -595,11 +610,10 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 LOG(WARNING) << "Discarding RDMA ready ACK because endpoint "
                              << "is no longer connected: " << toString();
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
-                ready_to_send_.store(false, std::memory_order_relaxed);
                 return ERR_ENDPOINT;
             }
             ready_wait_start_ts_.store(0, std::memory_order_relaxed);
-            ready_to_send_.store(true, std::memory_order_relaxed);
+            status_.store(CONNECTED, std::memory_order_relaxed);
             return 0;
         }
     }
@@ -622,7 +636,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                    local_desc);
             if (peer_desc.ready_ack || !peer_desc.ready_ack_supported) {
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
-                ready_to_send_.store(true, std::memory_order_relaxed);
+                status_.store(CONNECTED, std::memory_order_relaxed);
                 if (peer_desc.ready_ack) {
                     LOG(INFO) << "Received RDMA ready ACK.";
                 } else {
@@ -682,16 +696,21 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                      local_gid_selection);
 
             SetupConnectionFailureInfo failure_info;
+            auto connected_status = peer_desc.ready_ack_supported
+                                        ? CONNECTED_WAIT_READY_ACK
+                                        : CONNECTED;
             int ret = doSetupConnection(peer_gid, peer_lid, peer_desc.qp_num,
-                                        &local_desc.reply_msg, &failure_info);
+                                        connected_status, &local_desc.reply_msg,
+                                        &failure_info);
             if (ret == 0) {
                 if (peer_desc.ready_ack_supported) {
                     ready_wait_start_ts_.store(getCurrentTimeInNano(),
                                                std::memory_order_relaxed);
-                    ready_to_send_.store(false, std::memory_order_relaxed);
+                    status_.store(CONNECTED_WAIT_READY_ACK,
+                                  std::memory_order_relaxed);
                 } else {
                     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
-                    ready_to_send_.store(true, std::memory_order_relaxed);
+                    status_.store(CONNECTED, std::memory_order_relaxed);
                 }
                 return 0;
             }
@@ -752,7 +771,6 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     }
     local_desc.reply_msg =
         "Peer nic not found in that server: " + peer_nic_path_;
-    ready_to_send_.store(false, std::memory_order_relaxed);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
     status_.store(UNCONNECTED, std::memory_order_relaxed);
     LOG(ERROR) << local_desc.reply_msg;
@@ -766,8 +784,7 @@ void RdmaEndPoint::disconnect() {
 
 int RdmaEndPoint::disconnectUnlocked() {
     auto curr_status = status_.load(std::memory_order_acquire);
-    if (curr_status != CONNECTED && curr_status != CONNECTING) return 0;
-    ready_to_send_.store(false, std::memory_order_relaxed);
+    if (!isConnectedStatus(curr_status) && curr_status != CONNECTING) return 0;
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
     if (!has_connected_) {
@@ -806,8 +823,7 @@ int RdmaEndPoint::disconnectUnlocked() {
 
 int RdmaEndPoint::resetConnection(const std::string &reason) {
     auto curr_status = status_.load(std::memory_order_acquire);
-    if (curr_status != CONNECTING && curr_status != CONNECTED) return 0;
-    ready_to_send_.store(false, std::memory_order_relaxed);
+    if (curr_status != CONNECTING && !isConnectedStatus(curr_status)) return 0;
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
     if (!has_connected_) {
@@ -829,8 +845,7 @@ int RdmaEndPoint::resetConnection(const std::string &reason) {
 }
 
 bool RdmaEndPoint::readyAckTimedOut() const {
-    if (!connected() || ready_to_send_.load(std::memory_order_relaxed))
-        return false;
+    if (status() != CONNECTED_WAIT_READY_ACK) return false;
     uint64_t start_ts = ready_wait_start_ts_.load(std::memory_order_relaxed);
     return start_ts != 0 &&
            getCurrentTimeInNano() - start_ts > kReadyAckTimeoutNano;
@@ -862,6 +877,9 @@ const std::string RdmaEndPoint::toString() const {
     if (status == CONNECTED)
         return "EndPoint: local " + context_.nicPath() + ", peer " +
                peer_nic_path_;
+    else if (status == CONNECTED_WAIT_READY_ACK)
+        return "EndPoint: local " + context_.nicPath() + ", peer " +
+               peer_nic_path_ + " (waiting ready ACK)";
     else if (status == DESTROYING)
         return "EndPoint: local " + context_.nicPath() + ", peer " +
                peer_nic_path_ + " (destroying)";
@@ -875,8 +893,7 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED ||
-        !ready_to_send_.load(std::memory_order_relaxed)) {
+    if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED) {
         for (auto &slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();
         return 0;
@@ -1014,6 +1031,7 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
+                                    Status connected_status,
                                     std::string *reply_msg,
                                     SetupConnectionFailureInfo *failure_info) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
@@ -1053,7 +1071,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
 
     peer_qp_num_list_ = std::move(peer_qp_num_list);
     has_connected_ = true;
-    status_.store(CONNECTED, std::memory_order_relaxed);
+    status_.store(connected_status, std::memory_order_relaxed);
     return 0;
 }
 

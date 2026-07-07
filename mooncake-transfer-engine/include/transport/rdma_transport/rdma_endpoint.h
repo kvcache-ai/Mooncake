@@ -22,6 +22,8 @@
 
 namespace mooncake {
 
+class RdmaEndPointTestPeer;
+
 // RdmaEndPoint represents all QP connections between the local NIC1 (identified
 // by its RdmaContext) and the remote NIC2 (identified by peer_nic_path).
 // 1. After construct, resources are allocated without specifying the peers.
@@ -32,7 +34,9 @@ namespace mooncake {
 //      which can be obtained from RdmaContext::nicPath() on the remote side
 //    - Remote side calls the setupConnectionsByPassive() function in its RPC
 //    service.
-//   After above steps, the RdmaEndPoint state is set to CONNECTED
+//   After above steps, the RdmaEndPoint state is set to CONNECTED. With RDMA
+//   ready ACK enabled, QPs first enter CONNECTED_WAIT_READY_ACK after reaching
+//   RTS and become CONNECTED only after the ready-ACK phase completes.
 //
 // If the user initiates a disconnect() call or an error is detected internally,
 // the connection is closed and the RdmaEndPoint state is set to UNCONNECTED.
@@ -43,10 +47,13 @@ class RdmaEndPoint {
         INITIALIZING,
         UNCONNECTED,
         CONNECTING,
+        CONNECTED_WAIT_READY_ACK,
         CONNECTED,
         DESTROYING,
         DESTROYED,
     };
+
+    friend class RdmaEndPointTestPeer;
 
    public:
     RdmaEndPoint(RdmaContext &context);
@@ -90,15 +97,11 @@ class RdmaEndPoint {
     }
 
    public:
-    bool connected() const {
-        return status_.load(std::memory_order_relaxed) == CONNECTED;
-    }
+    bool connected() const { return isConnectedStatus(status()); }
 
-    // CONNECTED only means local QPs have reached RTS. A passive endpoint must
-    // still confirm the peer has completed its active setup before posting WRs.
-    bool readyToSend() const {
-        return connected() && ready_to_send_.load(std::memory_order_relaxed);
-    }
+    // CONNECTED_WAIT_READY_ACK means local QPs have reached RTS but the RDMA
+    // ready-ACK phase has not completed yet. Only CONNECTED can post WRs.
+    bool readyToSend() const { return status() == CONNECTED; }
 
     bool readyAckTimedOut() const;
 
@@ -162,10 +165,17 @@ class RdmaEndPoint {
         int sys_errno = 0;
     };
 
+    Status status() const { return status_.load(std::memory_order_relaxed); }
+
+    static bool isConnectedStatus(Status status) {
+        return status == CONNECTED_WAIT_READY_ACK || status == CONNECTED;
+    }
+
     std::vector<uint32_t> qpNum() const;
 
     int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
+                          Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
@@ -202,7 +212,6 @@ class RdmaEndPoint {
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
     bool has_connected_;
-    std::atomic<bool> ready_to_send_;
     std::atomic<uint64_t> ready_wait_start_ts_;
 
     volatile int *wr_depth_list_;
