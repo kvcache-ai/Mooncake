@@ -23,6 +23,7 @@ bool isCpuMemory(void *addr) {
 HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() {
     running_ = false;
     transfer_queue_cv_.notify_one();
+    block_queue_cv_.notify_one();
     transfer_thread_.join();
     aclrtSetDevice(logic_device_id_);
     if (stream_copy_created_) {
@@ -41,6 +42,7 @@ void HeterogeneousRdmaTransport::transferLoop() {
     if (ret) {
         LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice error, ret: "
                    << ret;
+        return;
     }
 
     bool stream_d2h_created = false;
