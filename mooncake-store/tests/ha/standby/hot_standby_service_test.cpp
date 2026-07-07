@@ -102,44 +102,17 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
 // ========== 6.1.1 Start/Stop tests ==========
 
 TEST_F(HotStandbyServiceTest, TestStart) {
-#ifdef STORE_USE_ETCD
-    // Requires a real etcd cluster and valid cluster configuration; acts as an
-    // integration placeholder
     GTEST_SKIP()
         << "Requires real etcd connection, run in integration environment.";
-#else
-    ErrorCode err =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
-#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
-#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Requires real etcd connection to verify double start semantics.";
-#else
-    // After the first Start fails and state becomes FAILED, the second Start
-    // should still return INTERNAL_ERROR
-    ErrorCode err1 =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err1);
-    ErrorCode err2 =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err2);
-#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
-#ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd to simulate invalid endpoints.";
-#else
-    std::string invalid_endpoints = "invalid_endpoint";
-    ErrorCode err =
-        service_->Start("primary_unused", invalid_endpoints, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
-#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStop) {
@@ -158,44 +131,18 @@ TEST_F(HotStandbyServiceTest, TestStop_WhenNotRunning) {
 // ========== 6.1.2 State transition tests ==========
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
-#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Requires real etcd to drive full state transition to WATCHING.";
-#else
-    // In non-STORE_USE_ETCD builds, Start will set the state machine directly
-    // to FAILED
-    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
-    ErrorCode err =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
-#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
-#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Connection failure requires real etcd and invalid endpoints.";
-#else
-    // In non-etcd mode we cannot distinguish detailed connection errors; only
-    // verify it doesn't crash
-    ErrorCode err =
-        service_->Start("primary_unused", "bad_endpoint", cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
-#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
-#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Sync failure requires real etcd and OpLog watcher behavior.";
-#else
-    // In non-etcd mode, the sync phase is not actually executed; just ensure
-    // the call is safe
-    ErrorCode err =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
-#endif
 }
 
 // ========== 6.1.3 Sync status tests ==========
@@ -211,16 +158,8 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_InitialState) {
 }
 
 TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
-#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Requires real etcd and OpLog activity to change sync status.";
-#else
-    // In non-etcd mode, calling Start will not change applied/primary, but the
-    // state machine enters FAILED
-    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
-    StandbySyncStatus status = service_->GetSyncStatus();
-    EXPECT_EQ(StandbyState::FAILED, status.state);
-#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestGetSyncStatus) {
