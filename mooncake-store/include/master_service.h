@@ -63,6 +63,9 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
 }  // namespace test
+namespace benchmarks {
+class BatchEvictBench;
+}  // namespace benchmarks
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -83,6 +86,7 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
 
    public:

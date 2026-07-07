@@ -1485,6 +1485,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             prepared.submit_time;  // Record start time for latency tracking
         task.type = owner.route.transport;
         task.device_mask = owner.route.device_mask;
+        if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1534,6 +1535,8 @@ Status TransferEngineImpl::commitPreparedSubmit(
             // this batch should have the same policy)
             sub_batch->device_mask =
                 batch->task_list[task_id_list[type][0]].device_mask;
+            sub_batch->qp_pool =
+                batch->task_list[task_id_list[type][0]].qp_pool;
         }
 
         auto status = transport->submitTransferTasks(
@@ -1596,6 +1599,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.type = UNSPEC;
         task.sub_task_id = -1;
         task.device_mask = owner.route.device_mask;
+        if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
         task.derived = task_plan.task_id != owner.owner_task_id;
     }
 
@@ -1674,6 +1678,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto route = resolveTransport(task.request, 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
+    if (route.qp_pool) task.qp_pool = *route.qp_pool;
     if (task.type == UNSPEC) {
         return finishQueuedOwner(owner_id, FAILED);
     }
@@ -1702,7 +1707,10 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto& transport = transport_list_[task.type];
     if (!transport) return finishQueuedOwner(owner_id, FAILED);
     auto& sub_batch = batch->sub_batch[task.type];
-    if (task.type == RDMA) sub_batch->device_mask = task.device_mask;
+    if (task.type == RDMA) {
+        sub_batch->device_mask = task.device_mask;
+        sub_batch->qp_pool = task.qp_pool;
+    }
     task.sub_task_id = sub_batch->size();
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
