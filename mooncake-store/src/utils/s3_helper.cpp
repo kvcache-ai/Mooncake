@@ -85,16 +85,6 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
     config.requestTimeoutMs = env.GetAwsRequestTimeoutMs();
     config.scheme = env.GetAwsUseHttps() ? Aws::Http::Scheme::HTTPS
                                          : Aws::Http::Scheme::HTTP;
-    if (auto request_checksum =
-            ParseChecksumMode<Aws::Client::RequestChecksumCalculation>(
-                env.GetAwsRequestChecksumCalculation())) {
-        config.checksumConfig.requestChecksumCalculation = *request_checksum;
-    }
-    if (auto response_checksum =
-            ParseChecksumMode<Aws::Client::ResponseChecksumValidation>(
-                env.GetAwsResponseChecksumValidation())) {
-        config.checksumConfig.responseChecksumValidation = *response_checksum;
-    }
 
     if (!region.empty()) {
         config.region = region;

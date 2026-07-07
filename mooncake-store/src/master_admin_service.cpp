@@ -998,7 +998,7 @@ void MasterAdminServer::HandleBatchQueryKeys(
             return;
         }
 
-        auto results = service->BatchGetReplicaListForAdmin(keys, "default");
+        auto results = service->BatchGetReplicaList(keys, "default");
         const size_t n = std::min(keys.size(), results.size());
         HttpBatchQueryKeysResponse payload;
         payload.success = true;
@@ -1048,7 +1048,7 @@ void MasterAdminServer::HandleBatchQueryKeys(
         }
 
         if (results.size() != keys.size()) {
-            LOG(WARNING) << "BatchGetReplicaListForAdmin size mismatch: keys="
+            LOG(WARNING) << "BatchGetReplicaList size mismatch: keys="
                          << keys.size() << " results=" << results.size();
         }
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
