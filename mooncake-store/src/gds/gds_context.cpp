@@ -499,39 +499,13 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
 #endif
 }
 
-#ifdef USE_GDS_BACKEND
 bool GdsContext::IsGdsAvailable() {
+#ifdef USE_GDS_BACKEND
     auto probe_ops = CreateGdsDeviceOps();
     return probe_ops->ProbeDeviceNode();
-}
+#else
+    return false;
 #endif
-
-// ===================================================================
-// USE_GDS_BACKEND=OFF stub implementations
-// ===================================================================
-#ifndef USE_GDS_BACKEND
-
-tl::expected<void, ErrorCode> GdsContext::Init(const std::string&, uint64_t) {
-    return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 }
-
-bool GdsContext::ProbeGdsAvailable(const std::string&) { return false; }
-
-tl::expected<void, ErrorCode> GdsContext::WriteRecord(const std::string&,
-                                                      const std::vector<Slice>&,
-                                                      uint64_t) {
-    return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
-}
-
-tl::expected<void, ErrorCode> GdsContext::ReadRecord(const std::string&, Slice&,
-                                                     uint64_t, uint32_t) {
-    return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
-}
-
-bool GdsContext::EnsureBufferRegistered(void*, size_t) { return false; }
-
-bool GdsContext::IsGdsAvailable() { return false; }
-
-#endif  // !USE_GDS_BACKEND
 
 }  // namespace mooncake
