@@ -1274,14 +1274,27 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         if routes.is_empty() {
             return;
         }
+        // After drain, routes that still list the local runtime as a replica owner
+        // are stale secondary copies — the CAS migration happened on the primary
+        // authority but the async mirror back was dropped.  Skip them to avoid
+        // overwriting correctly-migrated state on peers.
         let requests: Vec<RouteCasRequest> = routes
             .into_iter()
+            .filter(|route| {
+                !route
+                    .replicas
+                    .iter()
+                    .any(|r| r.owner.stable_id == self.local_stable_id)
+            })
             .map(|route| RouteCasRequest {
                 key: route.key.clone(),
                 expected: None,
                 next: Some(route),
             })
             .collect();
+        if requests.is_empty() {
+            return;
+        }
 
         let peers = match self
             .membership
