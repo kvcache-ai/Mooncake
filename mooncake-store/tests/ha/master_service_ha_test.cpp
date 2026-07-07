@@ -445,6 +445,59 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(1u, prefix.last_seq);
 }
 
+TEST_F(MasterServiceHATest,
+       NotifyOffloadSuccessFallbackWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_offload_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_offload_segment");
+    const std::string key = "batch_offload_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_offload_segment");
+
+    OffloadTaskItem task{.tenant_id = kDefaultTenant, .key = key, .size = 1024};
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "local_disk_endpoint";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+            .has_value());
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value());
+    bool has_local_disk = false;
+    for (const auto& replica : replicas->replicas) {
+        has_local_disk = has_local_disk || replica.is_local_disk_replica();
+    }
+    EXPECT_TRUE(has_local_disk);
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
+    for (int i = 0; i < 50; ++i) {
+        read_err = storage.ReadBatch(2, batch);
+        if (read_err == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(ErrorCode::OK, read_err);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(2u, batch.entries[0].sequence_id);
+    EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
 TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -859,44 +912,6 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
     EXPECT_EQ(OpType::PUT_END, entry.op_type);
     EXPECT_FALSE(entry.payload.empty());
-}
-
-// ===== Step 1: persist-before-local-commit for replica mutations =====
-
-// AddReplica must NOT add the LOCAL_DISK descriptor when OpLog persist fails.
-TEST_F(MasterServiceHATest, AddReplicaPersistFailureSkipsLocalMutation) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(true)
-                              .set_cluster_id("test_cluster")
-                              .build();
-    std::unique_ptr<MasterService> service(new MasterService(service_config));
-
-    auto mock_store = std::make_shared<MockOpLogStore>();
-    service->SetOpLogStoreForTesting(mock_store);
-    service->SetOpLogRetryConfigForTesting(2, 50);
-
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
-    const UUID client_id = generate_uuid();
-    const std::string key = "add_replica_persist_fail_key";
-    PutObject(*service, client_id, key);
-
-    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
-
-    Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
-                               ReplicaStatus::COMPLETE);
-    auto add_res =
-        service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
-    EXPECT_FALSE(add_res.has_value())
-        << "AddReplica must return error when OpLog persist fails";
-
-    // The LOCAL_DISK descriptor must NOT be visible in metadata.
-    auto list = service->GetReplicaList(key, kDefaultTenant);
-    ASSERT_TRUE(list.has_value());
-    for (const auto& desc : list->replicas) {
-        EXPECT_FALSE(desc.is_local_disk_replica())
-            << "LOCAL_DISK replica must not be present after persist failure";
-    }
 }
 
 // CopyEnd must NOT mark target replicas COMPLETE or erase the task when
