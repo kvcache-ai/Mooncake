@@ -1,0 +1,184 @@
+name: _build-wheel
+
+# Shared build for one wheel variant (matrixed over Python version), used by the
+# Release and Pre-Release workflows so both build identically.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        required: true
+      container:
+        # x86 builds run in manylinux2_28 so the wheel's libstdc++/glibc floor
+        # stays low enough to import on RHEL/Rocky/Alma 8+. '' = bare runner.
+        type: string
+        default: ''
+      python-versions:
+        type: string
+        default: '["3.10", "3.11", "3.12", "3.13"]'
+      cuda:
+        # none | container | sbsa-12.8 | sbsa-13.0
+        type: string
+        default: none
+      cmake-args:
+        # Space-separated -D flags. No semicolons; use ep-torch-versions for those.
+        type: string
+        required: true
+      cmake-generator:
+        type: string
+        default: ''
+      ep-torch-versions:
+        type: string
+        default: ''
+      build-with-ep:
+        type: string
+        default: '0'
+      variant-flag:
+        # build_wheel.sh variant set to 1, e.g. CU13_BUILD, NON_CUDA_BUILD
+        type: string
+        default: ''
+      torch-cuda-arch-list:
+        type: string
+        default: ''
+      build-nvlink-allocator:
+        type: boolean
+        default: false
+      artifact-prefix:
+        type: string
+        required: true
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    env:
+      BUILD_WITH_EP: ${{ inputs.build-with-ep }}
+      TORCH_CUDA_ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
+      CMAKE_ARGS: ${{ inputs.cmake-args }}
+      CMAKE_GEN: ${{ inputs.cmake-generator }}
+      EP_TORCH_VERSIONS_INPUT: ${{ inputs.ep-torch-versions }}
+      VARIANT_FLAG: ${{ inputs.variant-flag }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git (container runs as root)
+        if: ${{ inputs.container != '' }}
+        run: git config --global --add safe.directory '*'
+
+      - name: Set version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Select Python ${{ matrix.python-version }} from manylinux image
+        if: ${{ inputs.container != '' }}
+        run: |
+          PYV_NODOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
+          PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Set up Python ${{ matrix.python-version }}
+        if: ${{ inputs.container == '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free up disk space
+        if: ${{ inputs.container == '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/lib/android
+          df -h
+
+      - name: Install CUDA Toolkit (arm64 SBSA)
+        if: ${{ startsWith(inputs.cuda, 'sbsa-') }}
+        run: |
+          ver="${{ inputs.cuda }}"; ver="${ver#sbsa-}"
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y "cuda-toolkit-${ver/./-}"
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          /usr/local/cuda/bin/nvcc --version
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure project
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+          if [ -n "$SUDO" ] && command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -y || true
+          fi
+          $SUDO bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          gen=(); [ -n "$CMAKE_GEN" ] && gen=(-G "$CMAKE_GEN")
+          ep=(); [ -n "$EP_TORCH_VERSIONS_INPUT" ] && ep=(-DEP_TORCH_VERSIONS="$EP_TORCH_VERSIONS_INPUT")
+          mkdir -p build && cd build
+          # shellcheck disable=SC2086
+          cmake "${gen[@]}" .. $CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
+
+      - name: Build project
+        run: |
+          for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"
+          done
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
+          cd build
+          cmake --build . -j"$(nproc)"
+          $SUDO cmake --install .
+
+      - name: Build nvlink_allocator.so
+        if: ${{ inputs.build-nvlink-allocator }}
+        run: |
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          if [ -d /usr/local/cuda/lib64/stubs ]; then
+            export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}
+            export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
+          fi
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+
+      - name: Run sccache stat for check
+        if: ${{ env.SCCACHE_PATH != '' }}
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Generate Python version tag
+        id: pytag
+        run: echo "tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+
+      - name: Build Python wheel
+        run: |
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          variant=()
+          [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
+          env "${variant[@]}" \
+            PYTHON_VERSION="${{ matrix.python-version }}" \
+            OUTPUT_DIR="dist-py${{ steps.pytag.outputs.tag }}" \
+            ./scripts/build_wheel.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-py${{ steps.pytag.outputs.tag }}
+          path: mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl

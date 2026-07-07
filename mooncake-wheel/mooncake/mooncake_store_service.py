@@ -131,7 +131,8 @@ class MooncakeStoreService:
                     self.config.master_server_address,
                     None,
                     self.config.enable_ssd_offload,
-                    self.config.ssd_offload_path
+                    self.config.ssd_offload_path,
+                    self.config.tenant_id
                 )
 
                 if ret != 0:
@@ -550,9 +551,16 @@ class MooncakeStoreService:
             key = request.match_info['key']
             exists = self.store.is_exist(key)
 
+            if exists < 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({'error': 'Exist check failed'}),
+                    content_type='application/json'
+                )
+
             return web.Response(
                 status=200,
-                text=json.dumps({'exists': bool(exists)}),
+                text=json.dumps({'exists': exists > 0}),
                 content_type='application/json'
             )
         except Exception as e:

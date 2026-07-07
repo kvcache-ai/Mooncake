@@ -56,10 +56,10 @@ class TransferMetadata {
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
-        // EFA's libfabric provider returns 64-bit MR keys (fi_mr_key()), so
+        // EFA/CXI's libfabric provider returns 64-bit MR keys (fi_mr_key()), so
         // these must be 64-bit wide to avoid truncation. RDMA verbs keys are
-        // 32-bit and the non-EFA path keeps them as such.
-#ifdef USE_EFA
+        // 32-bit and the non-EFA/CXI path keeps them as such.
+#if defined(USE_EFA) || defined(USE_CXI)
         using mr_key_t = uint64_t;
 #else
         using mr_key_t = uint32_t;
@@ -152,6 +152,9 @@ class TransferMetadata {
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
+#endif
+#ifdef USE_CXI
+        std::string cxi_addr;
 #endif
     };
 

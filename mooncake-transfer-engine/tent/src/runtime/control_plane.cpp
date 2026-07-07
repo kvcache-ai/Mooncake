@@ -249,7 +249,7 @@ void ControlService::onSendData(const std::string_view& request,
         return;
     }
     XferDataDesc* desc = (XferDataDesc*)request.data();
-    auto local_desc = manager_->getLocal().get();
+    auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 
@@ -273,7 +273,7 @@ void ControlService::onRecvData(const std::string_view& request,
         return;
     }
     XferDataDesc* desc = (XferDataDesc*)request.data();
-    auto local_desc = manager_->getLocal().get();
+    auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 

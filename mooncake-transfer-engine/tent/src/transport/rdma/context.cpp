@@ -443,7 +443,11 @@ int RdmaContext::disable() {
         LOG(WARNING) << "RDMA context " << name() << " has been deconstructed";
         return 0;
     }
-    endpoint_store_->clear();
+    if (endpoint_store_->clear()) {
+        LOG(ERROR) << "Failed to destroy all endpoints for context " << name()
+                   << "; preserving CQ, PD and device resources for retry";
+        return -1;
+    }
 
     for (auto& entry : mr_set_) {
         int ret = verbs_.ibv_dereg_mr(entry);

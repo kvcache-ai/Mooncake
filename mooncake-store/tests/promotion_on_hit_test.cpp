@@ -9,11 +9,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
+#include "tenant_quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -32,7 +38,13 @@ class PromotionOnHitTest : public ::testing::Test {
         FLAGS_logtostderr = true;
     }
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {
+        for (const auto& path : policy_files_) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+        google::ShutdownGoogleLogging();
+    }
 
     // Friend access to MasterService::promotion_admission_threshold_, which
     // is otherwise private. PromotionOnHitTest is friended; TEST_F-generated
@@ -43,6 +55,21 @@ class PromotionOnHitTest : public ::testing::Test {
     }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
+
+    std::string WriteTenantQuotaPolicyFile(
+        const std::map<std::string, uint64_t>& tenant_quotas) {
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas = tenant_quotas;
+        auto path =
+            std::filesystem::temp_directory_path() /
+            ("mooncake_promotion_tenant_policy_" + std::to_string(::getpid()) +
+             "_" + std::to_string(next_policy_file_++) + ".yaml");
+        std::ofstream out(path);
+        out << FormatTenantQuotaPolicyYaml(snapshot);
+        out.close();
+        policy_files_.push_back(path.string());
+        return path.string();
+    }
 
     Segment MakeSegment(std::string name, size_t base, size_t size) const {
         Segment segment;
@@ -116,6 +143,9 @@ class PromotionOnHitTest : public ::testing::Test {
         EXPECT_TRUE(mount_ld.has_value());
         return client_id;
     }
+
+    std::vector<std::string> policy_files_;
+    size_t next_policy_file_ = 0;
 };
 
 // Sanity: with promotion disabled, no path mutates promotion_objects.
@@ -249,6 +279,91 @@ TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
     EXPECT_EQ(pending->size(), 2u);
     EXPECT_EQ(CountPromotionTask(*pending, single_key), 1u);
     EXPECT_EQ(CountPromotionTask(*pending, batch_key), 1u);
+
+    service->RemoveAll();
+}
+
+// The read-only admin batch query must NOT trigger promotion-on-hit, even for a
+// LOCAL_DISK-only key. Contrast with BatchGetReplicaListPromotesLocalDiskOnly
+// Object above, where the client-facing BatchGetReplicaList admits the key for
+// promotion.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListForAdminDoesNotPromoteLocalDiskOnlyObject) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "test_segment_admin",
+                              kDefaultSegmentBase, seg_size);
+
+    const std::string key = "k_batch_admin_no_promote";
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, key, 1024,
+                                       ctx.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+
+    auto result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
+    ASSERT_EQ(result.size(), 1u);
+    ASSERT_TRUE(result[0].has_value());
+    ASSERT_EQ(result[0]->replicas.size(), 1u);
+    EXPECT_TRUE(result[0]->replicas[0].is_local_disk_replica());
+
+    // No promotion admitted or enqueued by the read-only admin path.
+    EXPECT_EQ(mm.get_promotion_admitted() - admitted_pre, 0);
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);
+    auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 0u);
+    EXPECT_EQ(CountPromotionTask(*pending, key), 0u);
+
+    service->RemoveAll();
+}
+
+// The read-only admin batch query must NOT update the store-observed cache-hit
+// counters. Contrast with the client-facing BatchGetReplicaList, which bumps
+// the memory-cache-hit counter for a MEMORY replica.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListForAdminDoesNotUpdateCacheHitMetrics) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "metrics_segment", kDefaultSegmentBase,
+                              seg_size);
+
+    const std::string key = "k_admin_no_metric";
+    PutObject(*service, ctx.client_id, key, 1024);
+
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+    auto mem_hits = []() {
+        auto stats = MasterMetricManager::instance().calculate_cache_stats();
+        return stats[CacheHitStat::MEMORY_HITS];
+    };
+
+    const double before_admin = mem_hits();
+
+    // Read-only admin query must leave the memory-cache-hit counter untouched.
+    auto admin_result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
+    ASSERT_EQ(admin_result.size(), 1u);
+    ASSERT_TRUE(admin_result[0].has_value());
+    EXPECT_EQ(mem_hits(), before_admin);
+
+    // The client-facing path does bump it, proving the assertion above is
+    // meaningful rather than a counter that never moves.
+    (void)service->BatchGetReplicaList(std::vector<std::string>{key},
+                                       "default");
+    EXPECT_GT(mem_hits(), before_admin);
 
     service->RemoveAll();
 }
@@ -2035,17 +2150,21 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
 TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 2;
     config.default_kv_lease_ttl = 2000;
+    const std::string key = "shared_hot_key";
+    const std::string tenant_a = "tenant_promotion_a";
+    const std::string tenant_b = "tenant_promotion_b";
+    config.tenant_quota_connector_uri = WriteTenantQuotaPolicyFile(
+        {{tenant_a, 64 * 1024 * 1024}, {tenant_b, 64 * 1024 * 1024}});
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg =
         PrepareSegment(*service, "seg_tenant", kDefaultSegmentBase, seg_size);
-    const std::string key = "shared_hot_key";
-    const std::string tenant_a = "tenant_promotion_a";
-    const std::string tenant_b = "tenant_promotion_b";
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
                                        seg.segment_name, tenant_a));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,

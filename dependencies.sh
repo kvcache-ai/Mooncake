@@ -136,6 +136,8 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt-get update
     check_success "Failed to update package lists"
 elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
+    yum install -y dnf-plugins-core epel-release || true
+    yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
     yum clean all
     yum makecache
     check_success "Failed to update package lists"
@@ -191,21 +193,22 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      wget \
                      rdma-core-devel \
                      glog-devel \
+                     gflags-devel \
                      gtest-devel \
                      jsoncpp-devel \
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost-devel \
+                     boost1.78-devel \
                      openssl-devel \
-                     grpc-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
-                     grpc-plugins \
                      libcurl-devel \
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
+                     msgpack-devel \
+                     libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \
                      patchelf  \
