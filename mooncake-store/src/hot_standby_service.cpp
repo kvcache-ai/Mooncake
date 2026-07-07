@@ -6,8 +6,10 @@
 #include <thread>
 
 #include "etcd_helper.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha_metric_manager.h"
 #include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_batch_standby_reader.h"
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_replicator.h"
 #include "ha/oplog/oplog_store_factory.h"
@@ -417,6 +419,11 @@ void HotStandbyService::SetCatchUpOpLogStoreForTesting(
     catch_up_oplog_store_for_testing_ = std::move(store);
 }
 
+void HotStandbyService::SetCatchUpBatchKvBackendForTesting(
+    std::shared_ptr<HaKvBackend> backend) {
+    catch_up_batch_kv_backend_for_testing_ = std::move(backend);
+}
+
 void HotStandbyService::OnWatcherEvent(StandbyEvent event) {
     state_machine_.ProcessEvent(event);
 }
@@ -552,6 +559,22 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         return ErrorCode::INTERNAL_ERROR;
     }
 
+    bool used_batch_records = false;
+    if (catch_up_batch_kv_backend_for_testing_) {
+        ErrorCode batch_err = FinalCatchUpBatchRecordsLocked(
+            *catch_up_batch_kv_backend_for_testing_, used_batch_records);
+        if (used_batch_records || batch_err != ErrorCode::OK) {
+            return batch_err;
+        }
+    } else if (config_.oplog_store_type == OpLogStoreType::ETCD) {
+        EtcdHaKvBackend batch_backend;
+        ErrorCode batch_err =
+            FinalCatchUpBatchRecordsLocked(batch_backend, used_batch_records);
+        if (used_batch_records || batch_err != ErrorCode::OK) {
+            return batch_err;
+        }
+    }
+
     std::shared_ptr<OpLogStore> catch_up_store;
     if (catch_up_oplog_store_for_testing_) {
         catch_up_store = catch_up_oplog_store_for_testing_;
@@ -633,6 +656,25 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
               << ", durable_max=" << durable_max_seq
               << ", total_applied=" << total_applied
               << ", batches=" << batch_count;
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
+    HaKvBackend& backend, bool& used_batch_records) {
+    used_batch_records = false;
+    OpLogBatchStandbyReader reader(cluster_id_, backend, *oplog_applier_);
+    auto result = reader.PollOnce();
+    if (result.used_legacy_path) {
+        return ErrorCode::OK;
+    }
+    used_batch_records = true;
+    if (result.error != ErrorCode::OK) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    if (GetLocalLastAppliedSequenceIdLocked() <
+        result.durable_prefix.last_seq) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
     return ErrorCode::OK;
 }
 

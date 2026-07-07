@@ -65,6 +65,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/oplog/etcd_oplog_change_notifier.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp
+    ha/oplog/oplog_batch_standby_reader.cpp
     ha/oplog/oplog_batch_types.cpp
     ha/oplog/ordered_oplog_writer.cpp
     ha/oplog/oplog_serializer.cpp

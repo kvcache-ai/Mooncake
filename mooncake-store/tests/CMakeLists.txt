@@ -220,6 +220,8 @@ add_ha_test(etcd_oplog_store_test ha/oplog/etcd_oplog_store_test.cpp)
 add_ha_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
 add_ha_test(oplog_serializer_test ha/oplog/oplog_serializer_test.cpp)
 add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
+add_ha_test(oplog_batch_standby_reader_test
+            ha/oplog/oplog_batch_standby_reader_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
 add_ha_test(localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
 add_ha_test(ha_recovery_test ha/oplog/ha_recovery_test.cpp)

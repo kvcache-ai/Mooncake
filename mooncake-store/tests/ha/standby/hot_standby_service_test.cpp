@@ -4,13 +4,17 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include <xxhash.h>
 
 #include "master_service.h"
+#include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/mock_oplog_store.h"
@@ -558,6 +562,62 @@ std::string MakeValidPayload(uint64_t client_id_first = 1,
     return std::string(result.begin(), result.end());
 }
 
+class FakeHaKvBackend : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        if (get_error_ != ErrorCode::OK) {
+            return get_error_;
+        }
+        auto it = values_.find(std::string(key));
+        if (it == values_.end()) {
+            return ErrorCode::ETCD_KEY_NOT_EXIST;
+        }
+        value = it->second;
+        return ErrorCode::OK;
+    }
+    ErrorCode Put(std::string_view key, std::string_view value) override {
+        values_[std::string(key)] = std::string(value);
+        return ErrorCode::OK;
+    }
+    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs) override {
+        if (range_error_ != ErrorCode::OK) {
+            return range_error_;
+        }
+        kvs.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin_key && key < end_key) {
+                kvs.push_back({.key = key, .value = value});
+                if (kvs.size() >= limit) break;
+            }
+        }
+        return ErrorCode::OK;
+    }
+    bool SupportsTxn() const override { return true; }
+    ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
+    void SetGetError(ErrorCode err) { get_error_ = err; }
+    void SetRangeError(ErrorCode err) { range_error_ = err; }
+
+   private:
+    std::map<std::string, std::string> values_;
+    ErrorCode get_error_{ErrorCode::OK};
+    ErrorCode range_error_{ErrorCode::OK};
+};
+
+OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
+                           uint64_t last_seq) {
+    OpLogBatchRecord batch;
+    batch.batch_id = batch_id;
+    batch.first_seq = first_seq;
+    batch.last_seq = last_seq;
+    for (uint64_t seq = first_seq; seq <= last_seq; ++seq) {
+        batch.entries.push_back(MakeEntry(seq, OpType::PUT_END,
+                                          "batch_key_" + std::to_string(seq),
+                                          MakeValidPayload()));
+    }
+    return batch;
+}
+
 }  // namespace
 
 class PromotionCatchUpTest : public HotStandbyServiceTest {
@@ -565,6 +625,7 @@ class PromotionCatchUpTest : public HotStandbyServiceTest {
     void SetUp() override {
         HotStandbyServiceTest::SetUp();
         config_.enable_oplog_following = true;
+        config_.oplog_store_type = OpLogStoreType::LOCAL_FS;
         config_.fail_closed_on_incomplete_catch_up = true;
         config_.fail_closed_on_unresolved_gaps = true;
 
@@ -713,6 +774,69 @@ TEST_F(PromotionCatchUpTest, PromoteAppliesSameFailClosedChecks) {
     applier->AddSkippedGapForTesting(999);
 
     ErrorCode promote_err = service_->Promote();
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
+    mock_store_->SetForceReadEmpty(true);
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::OK, promote_err);
+    EXPECT_EQ(2u, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, FailsPromotionWhenDurablePrefixUnreadable) {
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    batch_backend->SetGetError(ErrorCode::PERSISTENT_FAIL);
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, FailsPromotionWhenTargetBatchUnreadable) {
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    batch_backend->SetRangeError(ErrorCode::PERSISTENT_FAIL);
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
     EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }

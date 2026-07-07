@@ -26,6 +26,7 @@ namespace mooncake {
 // Forward declarations
 class MasterService;
 class ReplicationStream;
+class HaKvBackend;
 
 /**
  * @brief Configuration for HotStandbyService
@@ -198,6 +199,14 @@ class HotStandbyService {
     void SetCatchUpOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
 
     /**
+     * @brief Test seam: when set, promotion final catch-up first tries
+     *        batch-record durable prefix/batches from this backend. If no
+     *        durable prefix exists, legacy catch-up remains unchanged.
+     */
+    void SetCatchUpBatchKvBackendForTesting(
+        std::shared_ptr<HaKvBackend> backend);
+
+    /**
      * @brief Test seam: returns the internal OpLogApplier so tests can seed
      *        gaps via AddMissingGapForTesting / AddSkippedGapForTesting.
      */
@@ -231,6 +240,8 @@ class HotStandbyService {
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     void ResolvePromotionGapsLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
+    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
+                                             bool& used_batch_records);
 
     // Legacy best-effort variant of FinalCatchUpForPromotionLocked, only
     // used when config_.fail_closed_on_incomplete_catch_up == false.
@@ -321,6 +332,7 @@ class HotStandbyService {
     std::unique_ptr<OpLogReplicator> oplog_replicator_;
 
     std::shared_ptr<OpLogStore> catch_up_oplog_store_for_testing_;
+    std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 
     // Configuration for OpLog sync
     std::string oplog_endpoints_;
