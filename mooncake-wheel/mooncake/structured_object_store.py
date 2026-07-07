@@ -11,10 +11,8 @@ from typing import Any, Literal, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 
-try:
-    import mooncake.store as _mooncake_store
-except Exception:  # pragma: no cover - depends on built extension
-    _mooncake_store = None  # type: ignore[assignment]
+_mooncake_store: Any | None = None
+_mooncake_store_loaded = False
 
 import msgpack as _msgpack
 
@@ -34,6 +32,18 @@ _TYPED_RAGGED_DEFAULT_DTYPE = "float64"
 # format or unknown field).  Treated as opaque bytes by the read path.
 _BYTES_FIELD_SPEC: dict[str, str] = {"encoding": "bytes"}
 _INFER_MAX_DEPTH = 32
+
+
+def _get_mooncake_store() -> Any | None:
+    global _mooncake_store, _mooncake_store_loaded
+    if not _mooncake_store_loaded:
+        try:
+            import mooncake.store as store
+        except Exception:  # pragma: no cover - depends on built extension
+            store = None  # type: ignore[assignment]
+        _mooncake_store = store
+        _mooncake_store_loaded = True
+    return _mooncake_store
 _INFER_MAX_STRUCT_KEYS = 64
 _INFER_MAX_LIST_LEN = 8
 
@@ -57,12 +67,15 @@ class BundleTransferPolicy:
 
 @dataclass(frozen=True)
 class FieldSchema:
-    """Schema hint for a non_tensor_batch field, bypassing runtime inference.
+    """Schema hint for structured DataProto fields.
 
-    When provided to put_dataproto via field_schemas, the field will be encoded
-    using the specified codec without running any sample-based inference.
+    ``metadata["section"]`` may declare where a field belongs:
+    ``"batch"``, ``"non_tensor_batch"``, or ``"meta_info"``.  For
+    non_tensor_batch fields, ``codec`` selects the structured non-tensor encoder
+    without running sample-based inference.
 
     Supported codec values:
+      - "auto": use existing runtime codec inference for this non_tensor_batch field
       - "ragged_tensor_dict": list[dict[str, Tensor] | None]
       - "ragged_tensor": list[Tensor | None]
       - "typed_ragged": list[ndarray | list | None]
@@ -1382,7 +1395,7 @@ class MooncakeBundleTransfer:
         """Store a legacy rollout dict as a structured object."""
         return self._put_stage(
             None,
-            _legacy_dict_to_envelope(data),
+            _legacy_dict_to_envelope(data, field_schemas=field_schemas),
             namespace=namespace,
             partition=partition,
             stage=stage,
@@ -1496,9 +1509,7 @@ class MooncakeBundleTransfer:
         field_schemas: Optional[dict[str, FieldSchema]] = None,
     ) -> MooncakeDataProtoRef:
         batch, non_tensor_batch, meta_info = _split_dataproto_like(data)
-        _validate_dataproto_schema_sections(
-            batch, non_tensor_batch, meta_info, field_schemas
-        )
+        _validate_dataproto_schema_sections(batch, non_tensor_batch, meta_info, field_schemas)
         batch_size = _dataproto_batch_size(batch, non_tensor_batch)
         if ref is not None and batch_size != ref.batch_size:
             raise ValueError(
@@ -1517,14 +1528,14 @@ class MooncakeBundleTransfer:
             field_updates[name] = StructuredFieldLocation(stage, member, "batch")
         encoded_updates: dict[str, Any] = {}
         for name, value in non_tensor_batch.items():
-            if _should_encode_non_tensor_field(value):
-                schema = field_schemas.get(name) if field_schemas else None
+            schema = field_schemas.get(name) if field_schemas else None
+            if _should_encode_non_tensor_field(value) or _schema_requires_non_tensor_encoding(value, schema):
+                encode_value = _coerce_non_tensor_value_for_encoding(name, value)
+                path = f"non_tensor_batch.{name}"
                 if schema is not None:
-                    encoded = _encode_with_schema(
-                        f"non_tensor_batch.{name}", value, schema
-                    )
+                    encoded = _encode_with_schema_or_fallback(path, encode_value, schema)
                 else:
-                    encoded = _encode_with_fallback(f"non_tensor_batch.{name}", value)
+                    encoded = _encode_with_fallback(path, encode_value)
                 payload_members: dict[str, str] = {}
                 for payload_name, payload_value in encoded.payload.items():
                     member = f"non_tensor_batch.{name}.{payload_name}"
@@ -1715,36 +1726,106 @@ def _dataproto_manifest_view(
     }
 
 
-LEGACY_DICT_META_FIELDS = frozenset(
-    {
-        "raw_reward",
-        "total_lengths",
-        "global_batch_sizes",
-        "num_microbatches",
-        "micro_batch_indices",
-    }
-)
+_DATAPROTO_SCHEMA_SECTIONS = frozenset({"batch", "non_tensor_batch", "meta_info"})
 
 
-def _legacy_dict_to_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
+def _schema_section(name: str, schema: FieldSchema) -> str | None:
+    section = schema.metadata.get("section")
+    if section is None:
+        return None
+    if section not in _DATAPROTO_SCHEMA_SECTIONS:
+        raise ValueError(
+            f"FieldSchema for {name!r} metadata['section'] must be one of "
+            f"{sorted(_DATAPROTO_SCHEMA_SECTIONS)}"
+        )
+    return section
+
+
+def _schema_ndarray_dtype(schema: FieldSchema) -> np.dtype[Any] | None:
+    dtype_name = schema.metadata.get("dtype")
+    if dtype_name is None:
+        return None
+    try:
+        dtype = np.dtype(dtype_name)
+    except (TypeError, ValueError):
+        return None
+    if dtype.kind not in "biufc":
+        return None
+    return dtype
+
+
+def _validate_dataproto_schema_sections(
+    batch: Mapping[str, Any],
+    non_tensor_batch: Mapping[str, Any],
+    meta_info: Mapping[str, Any],
+    field_schemas: Optional[Mapping[str, FieldSchema]],
+) -> None:
+    if not field_schemas:
+        return
+    for section, fields in (
+        ("batch", batch),
+        ("non_tensor_batch", non_tensor_batch),
+        ("meta_info", meta_info),
+    ):
+        for name in fields:
+            schema = field_schemas.get(name)
+            if schema is None:
+                continue
+            declared = _schema_section(name, schema)
+            if declared is None:
+                continue
+            if declared != section:
+                raise ValueError(
+                    f"FieldSchema for {name!r} declares section {declared!r}, "
+                    f"but data contains it in {section!r}"
+                )
+
+
+def _legacy_dict_to_envelope(
+    data: Mapping[str, Any],
+    field_schemas: Optional[Mapping[str, FieldSchema]] = None,
+) -> dict[str, Any]:
     if not isinstance(data, Mapping):
         raise TypeError("legacy rollout data must be a mapping")
-    partition = data.get("partition")
-    if not isinstance(partition, list):
-        raise ValueError("legacy rollout data must contain a list 'partition' field")
-    row_count = len(partition)
+    if field_schemas:
+        return _legacy_dict_to_envelope_with_schema(data, field_schemas)
+    return _legacy_dict_to_envelope_auto(data)
+
+
+def _legacy_dict_to_envelope_with_schema(
+    data: Mapping[str, Any], field_schemas: Mapping[str, FieldSchema]
+) -> dict[str, Any]:
+    schema_row_count = _legacy_schema_row_count(data, field_schemas)
+    row_count = schema_row_count
+    if row_count == 0:
+        schema_meta_fields = {
+            name
+            for name, schema in field_schemas.items()
+            if name in data and _schema_section(name, schema) == "meta_info"
+        }
+        row_count = _legacy_auto_row_count(data, exclude=schema_meta_fields)
     batch: dict[str, Any] = {}
     non_tensor_batch: dict[str, Any] = {}
     meta_info: dict[str, Any] = {}
     for key, value in data.items():
-        if key in LEGACY_DICT_META_FIELDS:
-            meta_info[key] = value
-        elif _is_row_aligned_dense_field(value, row_count):
+        schema = field_schemas.get(key)
+        section = None if schema is None else _schema_section(key, schema)
+        if section is None:
+            if _is_row_aligned_dense_field(value, row_count):
+                batch[key] = value
+            elif schema_row_count == 0 and _is_row_aligned_sequence(value, row_count):
+                non_tensor_batch[key] = _coerce_legacy_non_tensor_field(
+                    key, value, row_count, schema
+                )
+            else:
+                meta_info[key] = value
+            continue
+        if section == "batch":
             batch[key] = value
-        elif isinstance(value, list) and len(value) == row_count:
-            array = np.empty(row_count, dtype=object)
-            array[:] = value
-            non_tensor_batch[key] = array
+        elif section == "non_tensor_batch":
+            non_tensor_batch[key] = _coerce_legacy_non_tensor_field(
+                key, value, row_count, schema
+            )
         else:
             meta_info[key] = value
     return {
@@ -1752,6 +1833,123 @@ def _legacy_dict_to_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
         "non_tensor_batch": non_tensor_batch,
         "meta_info": meta_info,
     }
+
+
+def _legacy_schema_row_count(
+    data: Mapping[str, Any], field_schemas: Mapping[str, FieldSchema]
+) -> int:
+    sizes = {
+        _field_len(name, data[name])
+        for name, schema in field_schemas.items()
+        if name in data and _schema_section(name, schema) in {"batch", "non_tensor_batch"}
+    }
+    if not sizes:
+        return 0
+    if len(sizes) != 1:
+        raise ValueError(f"legacy rollout fields have inconsistent batch sizes: {sorted(sizes)}")
+    return sizes.pop()
+
+
+def _field_len(name: str, value: Any) -> int:
+    try:
+        return len(value)
+    except TypeError as error:
+        raise ValueError(f"legacy row-aligned field {name!r} must be sized") from error
+
+
+def _coerce_legacy_non_tensor_field(
+    name: str, value: Any, row_count: int, schema: Optional[FieldSchema] = None
+) -> Any:
+    if isinstance(value, np.ndarray):
+        if len(value) != row_count:
+            raise ValueError(
+                f"legacy non_tensor_batch field {name!r} has batch size {len(value)}, expected {row_count}"
+            )
+        if _schema_prefers_direct_numeric_ndarray(schema, value):
+            return np.asarray(value, dtype=_schema_ndarray_dtype(schema))
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if len(value) != row_count:
+            raise ValueError(
+                f"legacy non_tensor_batch field {name!r} has batch size {len(value)}, expected {row_count}"
+            )
+        if _schema_prefers_direct_numeric_ndarray(schema, value):
+            # Scalar sequences and range objects have no contiguous backing buffer.
+            # When the actual values contain no nulls, materialize the typed ndarray
+            # once and then use the direct ndarray storage path instead of structured
+            # scalar encoding with an extra null bitmap.
+            return np.asarray(list(value), dtype=_schema_ndarray_dtype(schema))
+        array = np.empty(row_count, dtype=object)
+        array[:] = list(value)
+        return array
+    raise TypeError(
+        f"legacy non_tensor_batch field {name!r} must be an ndarray or non-string sequence"
+    )
+
+
+def _schema_prefers_direct_numeric_ndarray(
+    schema: Optional[FieldSchema], value: Any
+) -> bool:
+    if schema is None or schema.codec != "ndarray" or _schema_ndarray_dtype(schema) is None:
+        return False
+    if isinstance(value, np.ndarray):
+        return value.dtype != object or all(item is not None for item in value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return all(item is not None for item in value)
+    return False
+
+
+def _legacy_dict_to_envelope_auto(data: Mapping[str, Any]) -> dict[str, Any]:
+    row_count = _legacy_auto_row_count(data)
+    batch: dict[str, Any] = {}
+    non_tensor_batch: dict[str, Any] = {}
+    meta_info: dict[str, Any] = {}
+    for key, value in data.items():
+        if _is_row_aligned_dense_field(value, row_count):
+            batch[key] = value
+        elif _is_row_aligned_sequence(value, row_count):
+            non_tensor_batch[key] = _coerce_legacy_non_tensor_field(key, value, row_count)
+        else:
+            meta_info[key] = value
+    return {
+        "batch": batch,
+        "non_tensor_batch": non_tensor_batch,
+        "meta_info": meta_info,
+    }
+
+
+def _legacy_auto_row_count(
+    data: Mapping[str, Any], exclude: set[str] | frozenset[str] = frozenset()
+) -> int:
+    sizes = {
+        len(value)
+        for key, value in data.items()
+        if key not in exclude and _is_sized_row_candidate(value)
+    }
+    if not sizes:
+        return 0
+    if len(sizes) != 1:
+        raise ValueError(
+            f"legacy rollout fields have ambiguous batch sizes: {sorted(sizes)}; "
+            "pass FieldSchema metadata['section'] for list-valued metadata fields"
+        )
+    return sizes.pop()
+
+
+def _is_sized_row_candidate(value: Any) -> bool:
+    if _torch is not None and isinstance(value, _torch.Tensor):
+        return value.ndim > 0
+    if isinstance(value, np.ndarray):
+        return value.ndim > 0
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _is_row_aligned_sequence(value: Any, row_count: int) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        and len(value) == row_count
+    )
 
 
 def _envelope_to_legacy_dict(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -1964,105 +2162,31 @@ def _select_mapping(
     return {key: value[key] for key in keys if key in value}
 
 
-_DATAPROTO_SCHEMA_SECTIONS = frozenset({"batch", "non_tensor_batch", "meta_info"})
-_FIELD_SCHEMA_CODECS = frozenset({
-    "auto", "ragged_tensor_dict", "ragged_tensor", "typed_ragged", "ndarray",
-    "bytes_ragged", "media_bytes", "media_list_ragged", "utf8_ragged",
-    "msgpack_ragged", "json_ragged",
-})
-_RAGGED_TENSOR_PAYLOAD_NAMES = frozenset({"data", "offsets", "shapes", "ndims", "nulls"})
-
-
-def _schema_section(name: str, schema: FieldSchema) -> str | None:
-    section = schema.metadata.get("section")
-    if section is None:
-        return None
-    if section not in _DATAPROTO_SCHEMA_SECTIONS:
-        raise ValueError(
-            f"FieldSchema for {name!r} metadata['section'] must be one of "
-            f"{sorted(_DATAPROTO_SCHEMA_SECTIONS)}"
-        )
-    return section
-
-
-def _schema_for_section(
-    field_schemas: Optional[Mapping[str, FieldSchema]],
-    name: str,
-    section: str,
-) -> FieldSchema | None:
-    if not field_schemas:
-        return None
-    schema = field_schemas.get(name)
+def _schema_requires_non_tensor_encoding(
+    value: Any, schema: Optional[FieldSchema]
+) -> bool:
     if schema is None:
-        return None
-    declared = _schema_section(name, schema)
-    return schema if declared is None or declared == section else None
+        return False
+    if isinstance(value, np.ndarray) and value.dtype != object and schema.codec in {"auto", "ndarray"}:
+        # Numeric ndarrays should stay on the typed ndarray path: _encode_structured_field
+        # already records dtype/shape and materializes a contiguous byte view only when
+        # needed.  Routing through structured non-tensor codecs would add payload/null
+        # buffers without improving correctness or transfer locality.  For other
+        # explicit codecs, do not silently ignore the caller's schema.
+        return False
+    return True
 
 
-def _schema_ndarray_dtype(
-    schema: FieldSchema, *, required: bool = False
-) -> np.dtype[Any] | None:
-    dtype_name = schema.metadata.get("dtype")
-    if dtype_name is None:
-        if required:
-            raise ValueError("FieldSchema metadata['dtype'] is required")
-        return None
-    try:
-        dtype = np.dtype(dtype_name)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid FieldSchema metadata['dtype']: {dtype_name!r}") from exc
-    if dtype.kind not in "biufc":
-        raise ValueError(
-            f"FieldSchema metadata['dtype'] must be numeric or bool, got {dtype}"
-        )
-    return dtype
-
-
-def _validate_dataproto_schema_sections(
-    batch: Mapping[str, Any],
-    non_tensor_batch: Mapping[str, Any],
-    meta_info: Mapping[str, Any],
-    field_schemas: Optional[Mapping[str, FieldSchema]],
-) -> None:
-    if not field_schemas:
-        return
-    sections = {
-        "batch": batch,
-        "non_tensor_batch": non_tensor_batch,
-        "meta_info": meta_info,
-    }
-    actual_sections: dict[str, set[str]] = {}
-    for section, fields in sections.items():
-        for name in fields:
-            actual_sections.setdefault(name, set()).add(section)
-    for name, schema in field_schemas.items():
-        declared = _schema_section(name, schema)
-        if declared is None:
-            continue
-        actual = actual_sections.get(name)
-        if not actual or declared in actual:
-            continue
-        actual_text = ", ".join(repr(section) for section in sorted(actual))
-        raise ValueError(
-            f"FieldSchema for {name!r} declares section {declared!r}, "
-            f"but data contains it in {actual_text}"
-        )
-
-def _coerce_schema_non_tensor_value(name: str, value: Any) -> np.ndarray:
+def _coerce_non_tensor_value_for_encoding(name: str, value: Any) -> np.ndarray:
     if isinstance(value, np.ndarray):
         return value
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        result = np.empty(len(value), dtype=object)
-        result[:] = list(value)
-        return result
+        array = np.empty(len(value), dtype=object)
+        array[:] = list(value)
+        return array
     raise TypeError(
         f"non_tensor_batch field {name!r} with FieldSchema must be an ndarray or non-string sequence"
     )
-
-
-def _validate_schema_nullable(path: str, value: np.ndarray, schema: FieldSchema) -> None:
-    if not schema.nullable and any(item is None for item in value):
-        raise ValueError(f"FieldSchema for {path!r} is not nullable")
 
 
 def _should_encode_non_tensor_field(value: Any) -> bool:
@@ -2074,12 +2198,34 @@ def _should_encode_non_tensor_field(value: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_ENCODING_FALLBACK_ERRORS = (TypeError, ValueError, AttributeError, OverflowError)
+
+
+def _encode_with_schema_or_fallback(
+    path: str, value: np.ndarray, schema: FieldSchema
+) -> "_EncodedStructuredLeaf":
+    try:
+        return _encode_with_schema(path, value, schema)
+    except _ENCODING_FALLBACK_ERRORS:
+        if schema.codec == "auto":
+            raise
+        try:
+            return _encode_with_fallback(path, value)
+        except _ENCODING_FALLBACK_ERRORS as fallback_error:
+            raise ValueError(
+                f"unable to encode structured non-tensor field {path!r} with "
+                f"schema codec {schema.codec!r} or automatic fallback"
+            ) from fallback_error
+
+
 def _encode_with_schema(
     path: str, value: np.ndarray, schema: FieldSchema
 ) -> "_EncodedStructuredLeaf":
     """Encode a non_tensor_batch field using an explicit schema (no inference)."""
     values = list(value)
     codec = schema.codec
+    if codec == "auto":
+        return _encode_with_fallback(path, value)
     if codec == "ragged_tensor_dict":
         return _encode_ragged_tensor_dict_values(values, schema)
     if codec == "ragged_tensor":
@@ -2087,8 +2233,11 @@ def _encode_with_schema(
     elif codec == "typed_ragged":
         payload, metadata = _encode_typed_ragged_values(values)
     elif codec == "ndarray":
+        dtype = _schema_ndarray_dtype(schema)
+        if dtype is None:
+            return _encode_with_fallback(path, value)
         decision = _CodecDecision(
-            True, "ndarray", "schema", "numeric scalar", schema.metadata
+            True, "ndarray", "schema", "numeric scalar", {"dtype": str(dtype)}
         )
         payload, metadata = _encode_numeric_scalar_values(values, decision)
     elif codec == "bytes_ragged":
@@ -2182,7 +2331,10 @@ def _encode_recursive_if_structured(
             decision = _CodecDecision(True, "json_ragged", "all rows are null or missing", "json")
         encoded = _encode_with_schema(
             leaf.path,
-            np.asarray(codec_values, dtype=object),
+            np.asarray(
+                _normalize_values_for_fallback_codec(codec_values, decision.codec),
+                dtype=object,
+            ),
             FieldSchema(codec=decision.codec, metadata=decision.metadata),
         )
         leaf_payload_members: dict[str, str] = {}
@@ -2224,15 +2376,64 @@ def _should_encode_recursive_leaf(leaf: "_InferredLeaf") -> bool:
 
 
 def _encode_with_fallback(path: str, value: np.ndarray) -> "_EncodedStructuredLeaf":
-    """Encode using type-based fallback (delegates to _choose_leaf_codec), with recursive expansion for structured rows."""
+    """Encode using safe type-based fallbacks, with recursive expansion for structured rows."""
     values = list(value)
-    recursive = _encode_recursive_if_structured(path, values)
-    if recursive is not None:
-        return recursive
+    errors: list[str] = []
+    try:
+        recursive = _encode_recursive_if_structured(path, values)
+        if recursive is not None:
+            return recursive
+    except _ENCODING_FALLBACK_ERRORS as error:
+        errors.append(f"structured_recursive: {error}")
     decision = _choose_leaf_codec(values)
-    metadata = dict(decision.metadata or {})
-    schema = FieldSchema(codec=decision.codec, metadata=metadata)
-    return _encode_with_schema(path, value, schema)
+    codecs = [decision.codec]
+    for codec in _fallback_codec_chain(decision.codec):
+        if codec not in codecs:
+            codecs.append(codec)
+    for codec in codecs:
+        metadata = dict(decision.metadata or {}) if codec == decision.codec else {}
+        codec_values = _normalize_values_for_fallback_codec(values, codec)
+        codec_array = np.asarray(codec_values, dtype=object)
+        try:
+            return _encode_with_schema(path, codec_array, FieldSchema(codec=codec, metadata=metadata))
+        except _ENCODING_FALLBACK_ERRORS as error:
+            errors.append(f"{codec}: {error}")
+    raise ValueError(
+        f"unable to infer a safe codec for structured non-tensor field {path!r}; "
+        f"tried {errors}"
+    )
+
+
+def _fallback_codec_chain(codec: str) -> tuple[str, ...]:
+    if codec in {"bytes_ragged", "media_bytes", "media_list_ragged"}:
+        return ("msgpack_ragged", "json_ragged")
+    return ("msgpack_ragged", "json_ragged")
+
+
+def _normalize_values_for_fallback_codec(values: list[Any], codec: str) -> list[Any]:
+    if codec in {"msgpack_ragged", "json_ragged"}:
+        return [_normalize_structured_scalar(value) for value in values]
+    return values
+
+
+def _normalize_structured_scalar(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            # Object ndarrays do not have a stable contiguous typed representation.
+            # For generic fallbacks, materialize their Python shape once so msgpack/json
+            # can preserve the logical nested values instead of treating the object array
+            # as a numeric ragged buffer.
+            return _normalize_structured_scalar(value.tolist())
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {key: _normalize_structured_scalar(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_normalize_structured_scalar(item) for item in value]
+    if isinstance(value, list):
+        return [_normalize_structured_scalar(item) for item in value]
+    return value
 
 
 def _is_recursive_encoded_non_tensor(encoded: Mapping[str, Any]) -> bool:
@@ -2399,7 +2600,14 @@ def _encode_ragged_tensor_values(
         if value is None:
             tensors.append(None)
             continue
-        tensor = value.detach()
+        if isinstance(value, np.ndarray):
+            if value.dtype == object:
+                raise ValueError("ragged tensor codec requires numeric ndarray values")
+            if not value.flags.writeable:
+                value = value.copy()
+            tensor = _torch.as_tensor(value)
+        else:
+            tensor = value.detach()
         if tensor.device.type != "cpu" or not tensor.is_contiguous():
             tensor = tensor.cpu().contiguous()
         dtype = tensor.dtype if dtype is None else dtype
@@ -3032,8 +3240,10 @@ class _StructuredObjectLayer:
             non_batch.append(name)
 
         objects: dict[str, Any] = {}
-        # Try batched read (worthwhile when >=2 members)
-        if len(batch_eligible) > 1:
+        # Try pool-backed range read for every eligible ndarray member.  Even a
+        # single full-member read uses this path so the full-read case shares the
+        # same zero-copy/partial-read transport behavior.
+        if batch_eligible:
             names_for_batch = [name for name, _ in batch_eligible]
             plans_for_batch = [plan for _, plan in batch_eligible]
             batched = self._batch_read_ndarray_members(
@@ -3926,6 +4136,10 @@ class _MooncakePayloadTransport:
     def read_tensor_payload(self, payload_spec: Mapping[str, Any]) -> Any:
         get_tensor = getattr(self._store, "get_tensor", None)
         key = payload_spec["key"]
+        if payload_spec.get("kind") == "tensor":
+            if not callable(get_tensor):
+                raise RuntimeError("structured tensor payload does not support get_tensor")
+            return get_tensor(key)
         if callable(get_tensor):
             try:
                 return get_tensor(key)
@@ -4971,18 +5185,20 @@ def _tensor_payload_parts(value: _TensorPayload) -> tuple[bytes, int, int, Any]:
 
 
 def _has_tensor_codec_helpers() -> bool:
+    mooncake_store = _get_mooncake_store()
     return (
-        _mooncake_store is not None
-        and callable(getattr(_mooncake_store, "_serialize_tensor", None))
-        and callable(getattr(_mooncake_store, "_deserialize_tensor", None))
+        mooncake_store is not None
+        and callable(getattr(mooncake_store, "_serialize_tensor", None))
+        and callable(getattr(mooncake_store, "_deserialize_tensor", None))
     )
 
 
 def _tensor_metadata_size() -> int:
+    mooncake_store = _get_mooncake_store()
     helper = (
         None
-        if _mooncake_store is None
-        else getattr(_mooncake_store, "_tensor_metadata_size", None)
+        if mooncake_store is None
+        else getattr(mooncake_store, "_tensor_metadata_size", None)
     )
     if callable(helper):
         return int(helper())
@@ -5028,7 +5244,8 @@ def _deserialize_tensor_payload(payload: bytes) -> Any:
 
 
 def _tensor_codec_helper(name: str) -> Any:
-    helper = None if _mooncake_store is None else getattr(_mooncake_store, name, None)
+    mooncake_store = _get_mooncake_store()
+    helper = None if mooncake_store is None else getattr(mooncake_store, name, None)
     if not callable(helper):
         raise RuntimeError(
             "mooncake.store tensor serialization helpers are required for structured tensor fields"
@@ -5251,13 +5468,15 @@ def _choose_leaf_codec(values: list[Any]) -> _CodecDecision:
     if all(_is_media_list(value) for value in nn):
         return _CodecDecision(True, "media_list_ragged", "all rows are media lists", "media list")
     if all(isinstance(value, np.ndarray) for value in nn):
-        return _CodecDecision(
-            True,
-            "typed_ragged",
-            "all rows are ndarray",
-            "numeric sequence",
-            {"recursive_source": "ndarray"},
-        )
+        if all(np.issubdtype(value.dtype, np.number) for value in nn):
+            return _CodecDecision(
+                True,
+                "typed_ragged",
+                "all rows are numeric ndarray",
+                "numeric sequence",
+                {"recursive_source": "ndarray"},
+            )
+        return _CodecDecision(False, "msgpack_ragged", "object ndarray rows", "python object")
     if all(isinstance(value, (list, tuple)) for value in nn):
         try:
             dtypes = [np.asarray(value).dtype for value in nn]

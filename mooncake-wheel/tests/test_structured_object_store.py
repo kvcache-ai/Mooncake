@@ -3,12 +3,15 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import socket
 import threading
 import time
+import uuid
 
 import numpy as np
 import pytest
 
+import mooncake.structured_object_store as sos
 from mooncake.structured_object_store import (
     BundleTransferPolicy,
     FieldSchema,
@@ -16,6 +19,7 @@ from mooncake.structured_object_store import (
     RemoteBundleRef,
     StructuredObjectPayload,
     StructuredObjectReadSpec,
+    _legacy_dict_to_envelope,
     export_dataproto_ref,
     import_dataproto_ref,
     is_dataproto_ref_handle,
@@ -349,6 +353,24 @@ def make_transfer(
     return current_store, MooncakeBundleTransfer(current_store, **kwargs)
 
 
+def _master_server_addr() -> str:
+    return os.getenv("MASTER_SERVER", "127.0.0.1:50051")
+
+
+def _require_master_server() -> str:
+    master = _master_server_addr()
+    if master.startswith("etcd://"):
+        return master
+    host, sep, port = master.rpartition(":")
+    if not sep:
+        pytest.skip(f"Mooncake master address lacks port: {master}")
+    try:
+        with socket.create_connection((host, int(port)), timeout=1.0):
+            return master
+    except OSError as error:
+        pytest.skip(f"Mooncake master unavailable at {master}: {error}")
+
+
 def real_transfer(key_prefix: str) -> tuple[object, MooncakeBundleTransfer]:
     mooncake_store = pytest.importorskip("mooncake.store")
     store = mooncake_store.MooncakeDistributedStore()
@@ -359,11 +381,35 @@ def real_transfer(key_prefix: str) -> tuple[object, MooncakeBundleTransfer]:
         4 * 1024 * 1024,
         os.getenv("PROTOCOL", "tcp"),
         os.getenv("DEVICE_NAME", ""),
-        os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+        _require_master_server(),
     )
     if rc != 0:
         pytest.skip(f"MooncakeDistributedStore setup failed: {rc}")
-    return store, MooncakeBundleTransfer(store, key_prefix=key_prefix)
+    return store, MooncakeBundleTransfer(
+        store, key_prefix=f"{key_prefix}-{uuid.uuid4().hex}"
+    )
+
+
+def real_buffer_pool_transfer(key_prefix: str) -> tuple[object, object, MooncakeBundleTransfer]:
+    mooncake_store = pytest.importorskip("mooncake.store")
+    if not hasattr(mooncake_store, "BufferPool"):
+        pytest.skip("built mooncake.store lacks BufferPool")
+    store = mooncake_store.MooncakeDistributedStore()
+    rc = store.setup(
+        os.getenv("LOCAL_HOSTNAME", "localhost"),
+        os.getenv("MC_METADATA_SERVER", "P2PHANDSHAKE"),
+        16 * 1024 * 1024,
+        4 * 1024 * 1024,
+        os.getenv("PROTOCOL", "tcp"),
+        os.getenv("DEVICE_NAME", ""),
+        _require_master_server(),
+    )
+    if rc != 0:
+        pytest.skip(f"MooncakeDistributedStore setup failed: {rc}")
+    pool = mooncake_store.BufferPool(store, min_size_class=4096, alignment=4096)
+    return store, pool, MooncakeBundleTransfer(
+        store, key_prefix=f"{key_prefix}-{uuid.uuid4().hex}", buffer_pool=pool
+    )
 
 
 def structured_payload(
@@ -450,21 +496,31 @@ def test_put_object_torch_tensor_raw_fallback_roundtrip() -> None:
     assert torch.equal(result["tensor"], tensor)
     assert torch.equal(result["scalar"], scalar_tensor)
     assert torch.equal(result["bool_tensor"], bool_tensor)
-    assert store.batch_get_into_calls > 0
+    assert store.put_tensor_calls == 0
+    assert store.get_tensor_calls == 0
+    assert store.max_active_gets >= 1
 
 
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:
-    store, transfer = make_transfer()
+    _store, pool, transfer = real_buffer_pool_transfer("structured-full-read")
     array = np.arange(16, dtype=np.int32).reshape(4, 4)
     payload = structured_payload({"type": "example"}, array=array, raw=b"abc")
 
-    ref = transfer.put_structured_object(payload)
-    result = transfer.materialize(transfer.read_spec(ref))
+    ref = None
+    result = None
+    try:
+        ref = transfer.put_structured_object(payload)
+        result = transfer.materialize(transfer.read_spec(ref))
 
-    assert np.array_equal(result.objects["array"], array)
-    assert result.objects["raw"] == b"abc"
-    assert store.batch_get_into_calls > 0
-    assert store.registered == set()
+        assert np.array_equal(result.objects["array"], array)
+        assert bytes(result.objects["raw"]) == b"abc"
+        assert hasattr(result.objects["array"], "_mooncake_pool_owner")
+    finally:
+        if result is not None:
+            MooncakeBundleTransfer.release_result(result.objects)
+        if ref is not None:
+            transfer.remove_bundle(ref)
+        pool.close()
 
 
 def test_structured_object_payload_metadata_defaults_empty() -> None:
@@ -576,54 +632,75 @@ def test_structured_object_roundtrip() -> None:
 
 
 def test_structured_object_read_spec_select_members() -> None:
-    store, transfer = make_transfer()
+    _store, pool, transfer = real_buffer_pool_transfer("structured-select")
     array = np.arange(10, dtype=np.float32).reshape(2, 5)
     payload = structured_payload(weights=array, raw=b"payload")
 
-    ref = transfer.put_structured_object(payload)
-    spec = transfer.read_spec(ref).select_members(["weights"])
-    assert isinstance(spec, StructuredObjectReadSpec)
-    batch_get_into_calls = store.batch_get_into_calls
-    result = transfer.materialize(spec)
+    ref = None
+    result = None
+    try:
+        ref = transfer.put_structured_object(payload)
+        spec = transfer.read_spec(ref).select_members(["weights"])
+        assert isinstance(spec, StructuredObjectReadSpec)
+        result = transfer.materialize(spec)
 
-    assert list(result.objects) == ["weights"]
-    assert np.array_equal(result.objects["weights"], array)
-    assert store.get_into_calls > 0
-    assert store.get_into_ranges_calls == 0
-    assert store.batch_get_into_calls == batch_get_into_calls + 1
+        assert list(result.objects) == ["weights"]
+        assert np.array_equal(result.objects["weights"], array)
+        assert hasattr(result.objects["weights"], "_mooncake_pool_owner")
+    finally:
+        if result is not None:
+            MooncakeBundleTransfer.release_result(result.objects)
+        if ref is not None:
+            transfer.remove_bundle(ref)
+        pool.close()
 
 
 def test_structured_object_multichunk_ndarray_uses_range_gather() -> None:
-    store, transfer = make_transfer()
+    _store, pool, transfer = real_buffer_pool_transfer("structured-multichunk")
     array = np.arange(64, dtype=np.int16).reshape(8, 8)
     payload = structured_payload(weights=array)
 
-    ref = transfer.put_structured_object(payload, chunk_bytes=32)
-    batch_get_into_calls = store.batch_get_into_calls
-    result = transfer.materialize(transfer.read_spec(ref))
+    ref = None
+    result = None
+    try:
+        ref = transfer.put_structured_object(payload, chunk_bytes=32)
+        result = transfer.materialize(transfer.read_spec(ref))
 
-    assert np.array_equal(result.objects["weights"], array)
-    assert store.get_into_ranges_calls > 0
-    assert store.batch_get_into_calls == batch_get_into_calls + 1
+        assert np.array_equal(result.objects["weights"], array)
+        assert hasattr(result.objects["weights"], "_mooncake_pool_owner")
+    finally:
+        if result is not None:
+            MooncakeBundleTransfer.release_result(result.objects)
+        if ref is not None:
+            transfer.remove_bundle(ref)
+        pool.close()
 
 
 def test_structured_object_slice_member_uses_partial_range_reads() -> None:
-    store, transfer = make_transfer()
+    _store, pool, transfer = real_buffer_pool_transfer("structured-slice")
     array = np.arange(96, dtype=np.int16).reshape(12, 8)
     payload = structured_payload(weights=array, raw=b"payload")
 
-    ref = transfer.put_structured_object(payload, chunk_bytes=20)
-    spec = (
-        transfer.read_spec(ref)
-        .select_members(["weights"])
-        .slice_member("weights", axis=0, start=3, end=9)
-    )
-    before_range_reads = store.get_into_ranges_calls
-    result = transfer.materialize(spec)
+    ref = None
+    result = None
+    try:
+        ref = transfer.put_structured_object(payload, chunk_bytes=20)
+        spec = (
+            transfer.read_spec(ref)
+            .select_members(["weights"])
+            .slice_member("weights", axis=0, start=3, end=9)
+        )
+        result = transfer.materialize(spec)
 
-    assert np.array_equal(result.objects["weights"], array[3:9])
-    assert result.objects["weights"].shape == (6, 8)
-    assert store.get_into_ranges_calls == before_range_reads + 1
+        assert np.array_equal(result.objects["weights"], array[3:9])
+        assert result.objects["weights"].shape == (6, 8)
+        assert hasattr(result.objects["weights"], "_mooncake_pool_owner")
+    finally:
+        if result is not None:
+            MooncakeBundleTransfer.release_result(result.objects)
+        if ref is not None:
+            transfer.remove_bundle(ref)
+        pool.close()
 
 
 def test_structured_object_slice_member_falls_back_to_plain_get_reads() -> None:
@@ -647,18 +724,23 @@ def test_structured_object_slice_member_falls_back_to_plain_get_reads() -> None:
 
 
 def test_structured_object_materialize_into_reuses_destination() -> None:
-    store, transfer = make_transfer()
+    _store, pool, transfer = real_buffer_pool_transfer("structured-materialize-into")
     array = np.arange(96, dtype=np.float32).reshape(12, 8)
     payload = structured_payload(weights=array)
 
-    ref = transfer.put_structured_object(payload, chunk_bytes=40)
-    spec = transfer.read_spec(ref).slice_member("weights", axis=0, start=2, end=10)
-    destination = np.empty((8, 8), dtype=np.float32)
-    result = transfer.materialize_into(spec, destinations={"weights": destination})
+    ref = None
+    try:
+        ref = transfer.put_structured_object(payload, chunk_bytes=40)
+        spec = transfer.read_spec(ref).slice_member("weights", axis=0, start=2, end=10)
+        destination = np.empty((8, 8), dtype=np.float32)
+        result = transfer.materialize_into(spec, destinations={"weights": destination})
 
-    assert result.objects["weights"] is destination
-    assert np.array_equal(destination, array[2:10])
-    assert store.get_into_ranges_calls > 0
+        assert result.objects["weights"] is destination
+        assert np.array_equal(destination, array[2:10])
+    finally:
+        if ref is not None:
+            transfer.remove_bundle(ref)
+        pool.close()
 
 
 def test_structured_object_duplicate_destination_registration_is_tolerated() -> None:
@@ -680,7 +762,6 @@ def test_structured_object_duplicate_destination_registration_is_tolerated() -> 
 
     assert result.objects["weights"] is destination
     assert np.array_equal(destination, array[2:10])
-    assert store.get_into_ranges_calls > 0
     assert destination_ptr in store.registered
     store.unregister_buffer(destination_ptr)
 
@@ -698,7 +779,6 @@ def test_structured_object_slice_member_step_copy() -> None:
 
     assert np.array_equal(result.objects["weights"], array[1:12:3])
     assert result.objects["weights"].shape == array[1:12:3].shape
-    assert store.get_into_ranges_calls > 0
 
 
 def test_structured_object_invalid_slice_and_destination_raise() -> None:
@@ -804,17 +884,22 @@ def test_bundle_concurrent_put_and_read_spec_full_read() -> None:
     assert store.max_active_gets >= 1
 
 
-def test_bundle_batch_get_failure_unregisters_buffer() -> None:
+def test_bundle_without_buffer_pool_uses_plain_get_fallback() -> None:
     store, transfer = make_transfer(FailingBatchGetStore())
+    payload = bytes(range(64))
     ref = transfer.put_structured_object(
-        structured_payload(payload=bytes(range(64))),
+        structured_payload(payload=payload),
         chunk_bytes=8,
     )
     store.fail_key = ref.manifest["buffers"]["payload"]["chunks"][2]["key"]
 
-    with pytest.raises(RuntimeError, match="injected get failure"):
-        transfer.materialize(transfer.read_spec(ref))
+    result = transfer.materialize(transfer.read_spec(ref))
 
+    assert result.objects["payload"] == payload
+    assert store.max_active_gets >= 1
+    assert store.batch_get_into_calls == 0
+    assert store.get_into_calls == 0
+    assert store.get_into_ranges_calls == 0
     assert store.registered == set()
 
 
@@ -994,11 +1079,13 @@ def test_structured_object_direct_torch_tensor_materialize_into_uses_real_store(
         4 * 1024 * 1024,
         os.getenv("PROTOCOL", "tcp"),
         os.getenv("DEVICE_NAME", ""),
-        os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+        _require_master_server(),
     )
     if rc != 0:
         pytest.skip(f"MooncakeDistributedStore setup failed: {rc}")
-    transfer = MooncakeBundleTransfer(store, key_prefix="structured-test-direct")
+    transfer = MooncakeBundleTransfer(
+        store, key_prefix=f"structured-test-direct-{uuid.uuid4().hex}"
+    )
     tensor = torch.arange(12, dtype=torch.int64).reshape(3, 4)
     ref = transfer.put_structured_object(
         StructuredObjectPayload(buffers={"tensor": tensor})
@@ -1038,7 +1125,7 @@ def test_structured_object_torch_tensor_zero_copy_rejects_plain_tensor() -> None
         )
 
 
-def test_structured_object_torch_tensor_slice_uses_range_reads() -> None:
+def test_structured_object_torch_tensor_slice_falls_back_without_tensor_fast_path() -> None:
     torch = pytest.importorskip("torch")
     mooncake_store = pytest.importorskip("mooncake.store")
     if not hasattr(mooncake_store, "_serialize_tensor") or not hasattr(
@@ -1058,7 +1145,10 @@ def test_structured_object_torch_tensor_slice_uses_range_reads() -> None:
     )
 
     assert torch.equal(result.objects["tensor"], tensor[3:9])
-    assert store.get_into_ranges_calls >= 2
+    assert store.put_tensor_calls == 0
+    assert store.get_tensor_calls == 0
+    assert store.max_active_gets >= 1
+    assert store.get_into_ranges_calls == 0
 
 
 def test_structured_object_direct_torch_tensor_slice_uses_real_store_ranges() -> None:
@@ -1160,13 +1250,13 @@ def test_structured_object_torch_tensor_zero_copy_uses_real_buffer_pool() -> Non
         4 * 1024 * 1024,
         os.getenv("PROTOCOL", "tcp"),
         os.getenv("DEVICE_NAME", ""),
-        os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+        _require_master_server(),
     )
     if rc != 0:
         pytest.skip(f"MooncakeDistributedStore setup failed: {rc}")
     pool = mooncake_store.BufferPool(store, min_size_class=4096, alignment=4096)
     transfer = MooncakeBundleTransfer(
-        store, key_prefix="structured-test", buffer_pool=pool
+        store, key_prefix=f"structured-test-{uuid.uuid4().hex}", buffer_pool=pool
     )
     tensor = torch.arange(12, dtype=torch.int64).reshape(3, 4)
     metadata, data_ptr, tensor_nbytes, owner = mooncake_store._serialize_tensor(tensor)
@@ -1177,6 +1267,8 @@ def test_structured_object_torch_tensor_zero_copy_uses_real_buffer_pool() -> Non
     ctypes.memmove(lease.ptr + len(metadata), int(data_ptr), int(tensor_nbytes))
     view.release()
 
+    ref = None
+    result = None
     try:
         ref = transfer.put_structured_object(
             StructuredObjectPayload(
@@ -1192,6 +1284,10 @@ def test_structured_object_torch_tensor_zero_copy_uses_real_buffer_pool() -> Non
         assert torch.equal(result.objects["tensor"], tensor)
         _ = owner
     finally:
+        if result is not None:
+            MooncakeBundleTransfer.release_result(result.objects)
+        if ref is not None:
+            transfer.remove_bundle(ref)
         lease.release()
         pool.close()
 
@@ -1337,6 +1433,9 @@ def test_dataproto_helper_reads_rows_with_real_store_ranges() -> None:
         },
     )
     ref = transfer.put_dataproto(data)
+    pool = None
+    raw_array = None
+    raw_tensor = None
 
     try:
         sliced = transfer.get_dataproto(ref, rows=slice(2, 5))
@@ -1410,10 +1509,13 @@ def test_dataproto_helper_reads_rows_with_real_store_ranges() -> None:
             bytes(raw_tensor.buffer[:tensor_payload_bytes])
         )
         assert torch.equal(decoded_tensor, tensor[[4, 1, 3]])
-        raw_array.release()
-        raw_tensor.release()
-        pool.close()
     finally:
+        if raw_array is not None:
+            raw_array.release()
+        if raw_tensor is not None:
+            raw_tensor.release()
+        if pool is not None:
+            pool.close()
         transfer.cleanup_dataproto(ref)
 
 
@@ -1429,6 +1531,124 @@ def test_dataproto_helper_supports_dict_cls_and_reports_bad_cls() -> None:
     assert np.array_equal(result["batch"]["input_ids"], np.arange(4))
     with pytest.raises(TypeError, match="cannot be constructed"):
         transfer.get_dataproto(ref, data_cls=BadDataProto)
+
+
+def test_legacy_dict_uses_schema_sections_without_field_name_rules() -> None:
+    envelope = _legacy_dict_to_envelope(
+        {
+            "row_ids": range(0, 3),
+            "tokens": [[1, 2], [3], [4, 5, 6]],
+            "scores": [2, 1, 3],
+            "global_lengths": [8, 9, 10, 11],
+        },
+        field_schemas={
+            "row_ids": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            ),
+            "tokens": FieldSchema(
+                codec="typed_ragged",
+                nullable=False,
+                metadata={"section": "non_tensor_batch"},
+            ),
+            "scores": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            ),
+            "global_lengths": FieldSchema(
+                codec="auto",
+                nullable=False,
+                metadata={"section": "meta_info"},
+            ),
+        },
+    )
+
+    assert envelope["non_tensor_batch"]["row_ids"].tolist() == [0, 1, 2]
+    assert envelope["non_tensor_batch"]["tokens"].tolist() == [
+        [1, 2],
+        [3],
+        [4, 5, 6],
+    ]
+    assert envelope["non_tensor_batch"]["scores"].tolist() == [2, 1, 3]
+    assert envelope["meta_info"]["global_lengths"] == [8, 9, 10, 11]
+
+
+def test_legacy_dict_schema_allows_unmapped_fields_to_fall_back() -> None:
+    envelope = _legacy_dict_to_envelope(
+        {
+            "row_ids": range(0, 3),
+            "scores": np.asarray([2, 1, 3], dtype=np.int64),
+            "global_step": 7,
+        },
+        field_schemas={
+            "row_ids": FieldSchema(
+                codec="ndarray",
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            )
+        },
+    )
+
+    assert envelope["non_tensor_batch"]["row_ids"].tolist() == [0, 1, 2]
+    assert np.array_equal(envelope["batch"]["scores"], np.asarray([2, 1, 3]))
+    assert envelope["meta_info"] == {"global_step": 7}
+
+
+def test_legacy_dict_schema_keeps_unmapped_same_length_lists_as_meta() -> None:
+    envelope = _legacy_dict_to_envelope(
+        {
+            "row_ids": range(0, 3),
+            "metadata_list": ["a", "b", "c"],
+        },
+        field_schemas={
+            "row_ids": FieldSchema(
+                codec="ndarray",
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            )
+        },
+    )
+
+    assert envelope["non_tensor_batch"]["row_ids"].tolist() == [0, 1, 2]
+    assert envelope["meta_info"]["metadata_list"] == ["a", "b", "c"]
+
+
+def test_legacy_dict_schema_meta_lists_do_not_define_batch_size() -> None:
+    envelope = _legacy_dict_to_envelope(
+        {
+            "global_lengths": [8, 9, 10, 11],
+            "scores": np.asarray([2, 1, 3], dtype=np.int64),
+        },
+        field_schemas={
+            "global_lengths": FieldSchema(
+                codec="auto",
+                metadata={"section": "meta_info"},
+            )
+        },
+    )
+
+    assert np.array_equal(envelope["batch"]["scores"], np.asarray([2, 1, 3]))
+    assert envelope["meta_info"]["global_lengths"] == [8, 9, 10, 11]
+
+
+def test_legacy_dict_auto_mode_infers_unambiguous_row_fields() -> None:
+    envelope = _legacy_dict_to_envelope(
+        {
+            "row_ids": range(0, 3),
+            "tokens": [[1, 2], [3], [4, 5, 6]],
+            "scores": np.asarray([2, 1, 3], dtype=np.int64),
+            "global_step": 7,
+        }
+    )
+
+    assert np.array_equal(envelope["batch"]["scores"], np.asarray([2, 1, 3]))
+    assert envelope["non_tensor_batch"]["row_ids"].tolist() == [0, 1, 2]
+    assert envelope["non_tensor_batch"]["tokens"].tolist() == [
+        [1, 2],
+        [3],
+        [4, 5, 6],
+    ]
+    assert envelope["meta_info"] == {"global_step": 7}
 
 
 def test_dataproto_helper_accepts_legacy_dict_inputs() -> None:
@@ -1676,6 +1896,307 @@ def test_dataproto_helper_rejects_cross_section_field_name_collision() -> None:
                 "non_tensor_batch": {"uid": np.asarray(["a", "b", "c", "d"])},
             }
         )
+
+
+def test_dataproto_helper_validates_schema_section() -> None:
+    _store, transfer = make_transfer()
+
+    with pytest.raises(ValueError, match="declares section"):
+        transfer.put_dataproto(
+            {
+                "batch": {"tokens": np.arange(4)},
+                "non_tensor_batch": {},
+                "meta_info": {},
+            },
+            field_schemas={
+                "tokens": FieldSchema(
+                    codec="auto",
+                    nullable=False,
+                    metadata={"section": "non_tensor_batch"},
+                )
+            },
+        )
+
+
+def test_dataproto_helper_rejects_invalid_schema_section() -> None:
+    _store, transfer = make_transfer()
+
+    with pytest.raises(ValueError, match="metadata.*section.*must be one of"):
+        transfer.put_dataproto(
+            {
+                "batch": {"tokens": np.arange(4)},
+                "non_tensor_batch": {},
+                "meta_info": {},
+            },
+            field_schemas={
+                "tokens": FieldSchema(
+                    codec="auto",
+                    metadata={"section": "bad"},
+                )
+            },
+        )
+
+
+def test_legacy_dict_schema_without_section_falls_back_to_auto_routing() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": range(1, 4), "step": 7},
+        field_schemas={
+            "values": FieldSchema(codec="ndarray", metadata={"dtype": "int64"})
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert np.array_equal(result["values"], np.asarray([1, 2, 3], dtype=np.int64))
+    assert result["step"] == 7
+    assert "values" not in ref.encoded_non_tensor
+
+
+def test_legacy_dict_schema_keeps_numeric_ndarray_direct() -> None:
+    _store, transfer = make_transfer()
+    values = np.asarray([1, 2, 3], dtype=np.int64)
+    ref = transfer.put_legacy_dict(
+        {"values": values},
+        field_schemas={
+            "values": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert np.array_equal(result["values"], values)
+    assert "values" not in ref.encoded_non_tensor
+
+
+def test_legacy_dict_schema_materializes_scalar_sequences_as_direct_ndarray() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": range(1, 4)},
+        field_schemas={
+            "values": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert np.array_equal(result["values"], np.asarray([1, 2, 3], dtype=np.int64))
+    assert "values" not in ref.encoded_non_tensor
+
+
+def test_legacy_dict_schema_keeps_nulls_in_structured_codec() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": [1, None, 3]},
+        field_schemas={
+            "values": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["values"] == [1, None, 3]
+    assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
+
+
+def test_legacy_dict_schema_invalid_ndarray_dtype_falls_back() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": [1, 2, 3]},
+        field_schemas={
+            "values": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch", "dtype": "object"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["values"] == [1, 2, 3]
+    assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
+
+
+def test_legacy_dict_schema_missing_ndarray_dtype_falls_back_without_defaulting() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": [1, 2, 3]},
+        field_schemas={
+            "values": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["values"] == [1, 2, 3]
+    assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
+
+
+def test_legacy_dict_schema_malformed_ndarray_dtype_falls_back() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": [1, 2, 3]},
+        field_schemas={
+            "values": FieldSchema(
+                codec="ndarray",
+                nullable=False,
+                metadata={"section": "non_tensor_batch", "dtype": "not-a-dtype"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["values"] == [1, 2, 3]
+    assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
+
+
+def test_legacy_dict_auto_mode_treats_zero_dim_ndarray_as_meta() -> None:
+    envelope = _legacy_dict_to_envelope(
+        {"row_ids": range(0, 3), "scalar_meta": np.asarray(7)}
+    )
+
+    assert envelope["non_tensor_batch"]["row_ids"].tolist() == [0, 1, 2]
+    assert envelope["meta_info"]["scalar_meta"] == np.asarray(7)
+
+
+def test_legacy_dict_auto_mode_reports_ambiguous_list_metadata() -> None:
+    with pytest.raises(ValueError, match="pass FieldSchema"):
+        _legacy_dict_to_envelope({"row_ids": range(0, 3), "metadata_list": [1, 2]})
+
+
+def test_legacy_dict_schema_honors_explicit_non_ndarray_codec_for_numeric_ndarray() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": np.asarray([[1, 2], [3, 4]], dtype=np.int64)},
+        field_schemas={
+            "values": FieldSchema(
+                codec="typed_ragged",
+                nullable=False,
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+    )
+
+    assert ref.encoded_non_tensor["values"]["codec"] == "typed_ragged"
+
+
+def test_legacy_dict_schema_codec_mismatch_falls_back() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {"values": [1, 2, 3]},
+        field_schemas={
+            "values": FieldSchema(
+                codec="utf8_ragged",
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["values"] == [1, 2, 3]
+    assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
+
+
+def test_legacy_dict_schema_auto_codec_reuses_recursive_encoding() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {
+            "metadata": [
+                {"ids": [1, 2], "score": 0.5},
+                {"ids": [3], "score": 1.5},
+            ],
+            "step": 4,
+        },
+        field_schemas={
+            "metadata": FieldSchema(
+                codec="auto",
+                nullable=False,
+                metadata={"section": "non_tensor_batch"},
+            ),
+            "step": FieldSchema(
+                codec="auto",
+                nullable=False,
+                metadata={"section": "meta_info"},
+            ),
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["metadata"] == [
+        {"ids": [1, 2], "score": 0.5},
+        {"ids": [3], "score": 1.5},
+    ]
+    assert result["step"] == 4
+    assert "metadata" in ref.encoded_non_tensor
+
+
+def test_legacy_dict_schema_auto_codec_handles_object_ndarray_leaves() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_legacy_dict(
+        {
+            "metadata": [
+                {"values": np.asarray([{"x": 1}], dtype=object)},
+                {"values": np.asarray([{"x": 2}], dtype=object)},
+            ]
+        },
+        field_schemas={
+            "metadata": FieldSchema(
+                codec="auto",
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["metadata"] == [
+        {"values": [{"x": 1}]},
+        {"values": [{"x": 2}]},
+    ]
+    assert ref.encoded_non_tensor["metadata"]["codec"] == "msgpack_ragged"
+
+
+def test_legacy_dict_schema_auto_codec_falls_back_after_recursive_error(monkeypatch) -> None:
+    _store, transfer = make_transfer()
+
+    def fail_inference(*_args, **_kwargs):
+        raise ValueError("synthetic recursive failure")
+
+    monkeypatch.setattr(sos, "infer_structure", fail_inference)
+    ref = transfer.put_legacy_dict(
+        {"metadata": [{"x": 1}, {"x": 2}]},
+        field_schemas={
+            "metadata": FieldSchema(
+                codec="auto",
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+    )
+
+    result = transfer.get_legacy_dict(ref)
+
+    assert result["metadata"] == [{"x": 1}, {"x": 2}]
+    assert ref.encoded_non_tensor["metadata"]["codec"] == "msgpack_ragged"
 
 
 def test_dataproto_ref_handle_roundtrip_materializes_and_cleans_up() -> None:
@@ -2615,6 +3136,43 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     assert actual[1] is None
     assert torch.equal(actual[2], ragged[2])
     assert torch.equal(actual[3], ragged[3])
+
+
+def test_dataproto_helper_ragged_tensor_dict_accepts_numpy_arrays() -> None:
+    torch = pytest.importorskip("torch")
+    _store, transfer = make_transfer()
+    samples = np.asarray(
+        [
+            {
+                "pixel_values": np.arange(6, dtype=np.float32).reshape(2, 3),
+                "image_grid_thw": np.asarray([1, 2, 3], dtype=np.int64),
+            },
+            None,
+            {
+                "pixel_values": np.arange(12, dtype=np.float32).reshape(4, 3),
+                "image_grid_thw": np.asarray([1, 4, 3], dtype=np.int64),
+            },
+        ],
+        dtype=object,
+    )
+
+    ref = transfer.put_dataproto(
+        SimpleDataProto(non_tensor_batch={"multimodal_train_inputs": samples}),
+        field_schemas={
+            "multimodal_train_inputs": FieldSchema(
+                codec="ragged_tensor_dict", metadata={"section": "non_tensor_batch"}
+            )
+        },
+    )
+    actual = transfer.get_dataproto(ref)["non_tensor_batch"]["multimodal_train_inputs"]
+
+    assert ref.encoded_non_tensor["multimodal_train_inputs"]["codec"] == "ragged_tensor_dict"
+    assert torch.equal(actual[0]["pixel_values"], torch.as_tensor(samples[0]["pixel_values"]))
+    assert torch.equal(actual[0]["image_grid_thw"], torch.as_tensor(samples[0]["image_grid_thw"]))
+    assert actual[1] is None
+    assert torch.equal(actual[2]["pixel_values"], torch.as_tensor(samples[2]["pixel_values"]))
+    assert torch.equal(actual[2]["image_grid_thw"], torch.as_tensor(samples[2]["image_grid_thw"]))
+
 
 
 def _assert_tensor_object_equal(actual, expected) -> None:
