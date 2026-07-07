@@ -30,6 +30,7 @@ class HttpMetadataServerTest(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(response.status, 400)
+                self.assertEqual(response.content_type, "text/plain")
                 self.assertNotIn("", self.server.store)
 
     async def test_empty_metadata_key_is_rejected(self):
@@ -38,6 +39,7 @@ class HttpMetadataServerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 400)
+        self.assertEqual(response.content_type, "text/plain")
         self.assertNotIn("", self.server.store)
 
     async def test_blank_metadata_key_is_rejected(self):
@@ -46,7 +48,22 @@ class HttpMetadataServerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 400)
+        self.assertEqual(response.content_type, "text/plain")
         self.assertNotIn("   ", self.server.store)
+
+    async def test_metadata_key_is_stripped_before_operations(self):
+        put_response = await self.server._handle_metadata(
+            FakeRequest("PUT", key="  valid  ", body=b"value")
+        )
+        get_response = await self.server._handle_metadata(
+            FakeRequest("GET", key="  valid  ")
+        )
+
+        self.assertEqual(put_response.status, 200)
+        self.assertEqual(get_response.status, 200)
+        self.assertEqual(get_response.body, b"value")
+        self.assertIn("valid", self.server.store)
+        self.assertNotIn("  valid  ", self.server.store)
 
     async def test_valid_metadata_key_still_round_trips(self):
         put_response = await self.server._handle_metadata(
