@@ -269,7 +269,7 @@ static int encodeMultiProtocolSegmentDesc(
             bufferJSON["lkey"] = lkeyJSON;
         } else if (buffer.protocol == "tcp") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-        } else if (buffer.protocol == "hip") {
+        } else if (buffer.protocol == "hip" || buffer.protocol == "maca") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
         }
@@ -297,7 +297,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip") {
+                proto != "hip" && proto != "maca") {
                 is_multi_protocol = false;
                 break;
             }
@@ -305,7 +305,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma and hip may be combined.";
+                       << ". Only cxl, tcp, rdma, hip and maca may be "
+                          "combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -608,7 +609,7 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        } else if (buffer_protocol == "hip") {
+        } else if (buffer_protocol == "hip" || buffer_protocol == "maca") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
@@ -645,7 +646,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip") {
+                    proto != "hip" && proto != "maca") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -654,7 +655,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma and hip may be combined.";
+                    << ". Only cxl, tcp, rdma, hip and maca may be combined.";
                 return nullptr;
             }
         }

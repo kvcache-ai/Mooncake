@@ -22,8 +22,12 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <memory>
+#include <string>
+#include <unordered_map>
 
 #include "common.h"
 #include "common/serialization.h"
@@ -125,6 +129,316 @@ static int getDeviceFromPointer(void *ptr) {
     return -1;
 }
 
+enum class MacaCopyMode {
+    Sync,
+    NewStreamSync,
+    StreamSync,
+    Posted,
+};
+
+enum class MacaCallerSyncMode {
+    None,
+    Host,
+    Wait,
+};
+
+enum class MacaCopyApi {
+    Auto,
+    Default,
+    Peer,
+    BatchFlag,
+};
+
+struct CallerSync {
+    MacaCallerSyncMode mode;
+    cudaEvent_t event;
+};
+
+static MacaCopyMode copyMode() {
+    static const MacaCopyMode mode = [] {
+        const char *mode_env = std::getenv("MC_MACA_COPY_MODE");
+        if (mode_env) {
+            std::string mode(mode_env);
+            if (mode == "newstream_sync") return MacaCopyMode::NewStreamSync;
+            if (mode == "stream_sync") return MacaCopyMode::StreamSync;
+            if (mode == "posted") return MacaCopyMode::Posted;
+            if (mode == "sync") return MacaCopyMode::Sync;
+            LOG(WARNING) << "MacaTransport: unknown MC_MACA_COPY_MODE=" << mode
+                         << ", falling back to sync";
+            return MacaCopyMode::Sync;
+        }
+
+        const char *async_env = std::getenv("MC_MACA_ASYNC_COPY");
+        if (async_env) {
+            if (std::string(async_env) != "0") return MacaCopyMode::StreamSync;
+            return MacaCopyMode::Sync;
+        }
+        return MacaCopyMode::Posted;
+    }();
+    return mode;
+}
+
+static const char *copyModeName(MacaCopyMode mode) {
+    switch (mode) {
+        case MacaCopyMode::Sync:
+            return "sync";
+        case MacaCopyMode::NewStreamSync:
+            return "newstream_sync";
+        case MacaCopyMode::StreamSync:
+            return "stream_sync";
+        case MacaCopyMode::Posted:
+            return "posted";
+    }
+    return "unknown";
+}
+
+static MacaCallerSyncMode callerSyncMode() {
+    static const MacaCallerSyncMode mode = [] {
+        const char *env = std::getenv("MC_MACA_CALLER_SYNC");
+        if (!env) {
+            const char *legacy_env = std::getenv("MC_MACA_SYNC_CALLER_STREAM");
+            if (legacy_env && std::string(legacy_env) != "0")
+                return MacaCallerSyncMode::Wait;
+            return MacaCallerSyncMode::Host;
+        }
+
+        std::string value(env);
+        if (value == "none" || value == "0") return MacaCallerSyncMode::None;
+        if (value == "host") return MacaCallerSyncMode::Host;
+        if (value == "wait") return MacaCallerSyncMode::Wait;
+        LOG(WARNING) << "MacaTransport: unknown MC_MACA_CALLER_SYNC=" << value
+                     << ", falling back to host";
+        return MacaCallerSyncMode::Host;
+    }();
+    return mode;
+}
+
+static const char *callerSyncModeName(MacaCallerSyncMode mode) {
+    switch (mode) {
+        case MacaCallerSyncMode::None:
+            return "none";
+        case MacaCallerSyncMode::Host:
+            return "host";
+        case MacaCallerSyncMode::Wait:
+            return "wait";
+    }
+    return "unknown";
+}
+
+static MacaCopyApi copyApi() {
+    static const MacaCopyApi api = [] {
+        const char *env = std::getenv("MC_MACA_COPY_API");
+        if (!env) return MacaCopyApi::Auto;
+
+        std::string value(env);
+        if (value == "auto") return MacaCopyApi::Auto;
+        if (value == "default" || value == "0") return MacaCopyApi::Default;
+        if (value == "peer") return MacaCopyApi::Peer;
+        if (value == "batchflag" || value == "batch_flag" || value == "batch")
+            return MacaCopyApi::BatchFlag;
+        LOG(WARNING) << "MacaTransport: unknown MC_MACA_COPY_API=" << value
+                     << ", falling back to auto";
+        return MacaCopyApi::Auto;
+    }();
+    return api;
+}
+
+static const char *copyApiName(MacaCopyApi api) {
+    switch (api) {
+        case MacaCopyApi::Auto:
+            return "auto";
+        case MacaCopyApi::Default:
+            return "default";
+        case MacaCopyApi::Peer:
+            return "peer";
+        case MacaCopyApi::BatchFlag:
+            return "batchflag";
+    }
+    return "unknown";
+}
+
+static size_t batchFlagMinBytes() {
+    static const size_t min_bytes = [] {
+        constexpr size_t kDefaultMinBytes = 1024ULL * 1024ULL;
+        const char *env = std::getenv("MC_MACA_BATCHFLAG_MIN_BYTES");
+        if (!env) return kDefaultMinBytes;
+
+        char *end = nullptr;
+        unsigned long long value = std::strtoull(env, &end, 0);
+        if (end == env || *end != '\0') {
+            LOG(WARNING) << "MacaTransport: unknown "
+                            "MC_MACA_BATCHFLAG_MIN_BYTES="
+                         << env << ", falling back to " << kDefaultMinBytes;
+            return kDefaultMinBytes;
+        }
+        return static_cast<size_t>(value);
+    }();
+    return min_bytes;
+}
+
+static bool shouldUseBatchFlag(MacaCopyApi api, size_t length) {
+    if (api == MacaCopyApi::BatchFlag) return true;
+    if (api == MacaCopyApi::Auto) return length >= batchFlagMinBytes();
+    return false;
+}
+
+static MacaCopyApi asyncCopyApi(MacaCopyApi api) {
+    return api == MacaCopyApi::Peer ? MacaCopyApi::Peer : MacaCopyApi::Default;
+}
+
+class PerDeviceStreamPool {
+   public:
+    cudaStream_t getOrCreate(int device_id) {
+        auto iter = streams_.find(device_id);
+        if (iter != streams_.end()) return iter->second;
+
+        int original_device = -1;
+        cudaGetDevice(&original_device);
+        if (!checkCudaErrorReturn(cudaSetDevice(device_id),
+                                  "MacaTransport: failed to set device")) {
+            if (original_device >= 0) cudaSetDevice(original_device);
+            return nullptr;
+        }
+
+        cudaStream_t stream = nullptr;
+        cudaError_t err =
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (original_device >= 0) cudaSetDevice(original_device);
+        if (!checkCudaErrorReturn(
+                err, "MacaTransport: cudaStreamCreateWithFlags failed")) {
+            return nullptr;
+        }
+
+        streams_[device_id] = stream;
+        return stream;
+    }
+
+    ~PerDeviceStreamPool() {
+        int original_device = -1;
+        cudaGetDevice(&original_device);
+        for (auto &entry : streams_) {
+            cudaSetDevice(entry.first);
+            cudaStreamDestroy(entry.second);
+        }
+        if (original_device >= 0) cudaSetDevice(original_device);
+    }
+
+   private:
+    std::unordered_map<int, cudaStream_t> streams_;
+};
+
+static thread_local PerDeviceStreamPool thread_local_stream_pool;
+
+class PerDeviceEventPool {
+   public:
+    cudaEvent_t getOrCreate(int device_id) {
+        auto iter = events_.find(device_id);
+        if (iter != events_.end()) return iter->second;
+
+        int original_device = -1;
+        cudaGetDevice(&original_device);
+        if (!checkCudaErrorReturn(cudaSetDevice(device_id),
+                                  "MacaTransport: failed to set device")) {
+            if (original_device >= 0) cudaSetDevice(original_device);
+            return nullptr;
+        }
+
+        cudaEvent_t event = nullptr;
+        cudaError_t err =
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (original_device >= 0) cudaSetDevice(original_device);
+        if (!checkCudaErrorReturn(
+                err, "MacaTransport: cudaEventCreateWithFlags failed")) {
+            return nullptr;
+        }
+
+        events_[device_id] = event;
+        return event;
+    }
+
+    ~PerDeviceEventPool() {
+        int original_device = -1;
+        cudaGetDevice(&original_device);
+        for (auto &entry : events_) {
+            cudaSetDevice(entry.first);
+            cudaEventDestroy(entry.second);
+        }
+        if (original_device >= 0) cudaSetDevice(original_device);
+    }
+
+   private:
+    std::unordered_map<int, cudaEvent_t> events_;
+};
+
+static thread_local PerDeviceEventPool thread_local_event_pool;
+
+static Status prepareCallerSync(CallerSync &sync) {
+    sync.mode = callerSyncMode();
+    sync.event = nullptr;
+    if (sync.mode == MacaCallerSyncMode::None) return Status::OK();
+
+    int current_device = 0;
+    cudaGetDevice(&current_device);
+    cudaEvent_t event = thread_local_event_pool.getOrCreate(current_device);
+    if (!event) {
+        return Status::Context("MacaTransport: failed to create sync event");
+    }
+
+    cudaError_t err = cudaEventRecord(event, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "MacaTransport: cudaEventRecord failed: "
+                   << cudaGetErrorString(err);
+        return Status::Context("MacaTransport: cudaEventRecord failed");
+    }
+
+    sync.event = event;
+    if (sync.mode == MacaCallerSyncMode::Host) {
+        err = cudaEventSynchronize(event);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "MacaTransport: cudaEventSynchronize failed: "
+                       << cudaGetErrorString(err);
+            return Status::Context(
+                "MacaTransport: cudaEventSynchronize failed");
+        }
+    }
+    return Status::OK();
+}
+
+static void getCopyEndpoints(Transport::Slice *slice, void *&dst,
+                             const void *&src) {
+    dst = slice->local.dest_addr;
+    src = slice->source_addr;
+    if (slice->opcode == Transport::TransferRequest::READ) {
+        dst = slice->source_addr;
+        src = slice->local.dest_addr;
+    }
+}
+
+static cudaError_t submitMemcpyAsync(Transport::Slice *slice, MacaCopyApi api,
+                                     cudaStream_t stream) {
+    void *dst;
+    const void *src;
+    getCopyEndpoints(slice, dst, src);
+
+    if (api == MacaCopyApi::Peer) {
+        int dst_device = getDeviceFromPointer(dst);
+        int src_device = getDeviceFromPointer(const_cast<void *>(src));
+        if (dst_device >= 0 && src_device >= 0 && dst_device != src_device) {
+            return cudaMemcpyPeerAsync(dst, dst_device, src, src_device,
+                                       slice->length, stream);
+        }
+    }
+
+    return cudaMemcpyAsync(dst, src, slice->length, cudaMemcpyDefault, stream);
+}
+
+static cudaError_t submitBatchFlagAsync(std::vector<mcCopyFlag_t> &copy_batch,
+                                        cudaStream_t stream) {
+    if (copy_batch.empty()) return cudaSuccess;
+    return mcExtBatchCopyFlagAndWaitV2(copy_batch.data(), copy_batch.size(),
+                                       nullptr, 0, stream);
+}
+
 MacaTransport::MacaTransport() {
     int num_devices = getNumDevices();
     if (globalConfig().trace) {
@@ -163,10 +477,21 @@ int MacaTransport::install(std::string &local_server_name,
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
+    auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
+    if (old_desc) *desc = *old_desc;
+
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (desc->protocol.empty()) {
+        desc->protocol = "maca";
+    } else if (desc->protocol.find("maca") == std::string::npos) {
+        desc->protocol += ",maca";
+    }
+#else
     desc->protocol = "maca";
+#endif
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -204,6 +529,7 @@ Status MacaTransport::submitTransfer(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
 
         // Set correct device context before memcpy
@@ -242,6 +568,28 @@ Status MacaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
+    std::unordered_map<cudaStream_t, cudaError_t> stream_status_cache;
+    for (auto *slice : task.slice_list) {
+        if (slice && slice->status == Slice::POSTED) {
+            cudaStream_t stream = (cudaStream_t)slice->local.cuda_stream;
+            auto iter = stream_status_cache.find(stream);
+            cudaError_t err;
+            if (iter == stream_status_cache.end()) {
+                err = cudaStreamQuery(stream);
+                stream_status_cache[stream] = err;
+            } else {
+                err = iter->second;
+            }
+
+            if (err == cudaSuccess) {
+                slice->markSuccess();
+            } else if (err != cudaErrorNotReady) {
+                LOG(ERROR) << "MacaTransport: cudaStreamQuery failed: "
+                           << cudaGetErrorString(err);
+                slice->markFailed();
+            }
+        }
+    }
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -260,6 +608,300 @@ Status MacaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status MacaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    MacaCopyMode mode = copyMode();
+    static const bool logged_copy_mode = [mode] {
+        LOG(INFO) << "MacaTransport: copy mode " << copyModeName(mode);
+        return true;
+    }();
+    (void)logged_copy_mode;
+    MacaCallerSyncMode sync_mode = callerSyncMode();
+    static const bool logged_sync_mode = [sync_mode] {
+        LOG(INFO) << "MacaTransport: caller sync mode "
+                  << callerSyncModeName(sync_mode);
+        return true;
+    }();
+    (void)logged_sync_mode;
+    MacaCopyApi api = copyApi();
+    static const bool logged_copy_api = [api] {
+        LOG(INFO) << "MacaTransport: copy api " << copyApiName(api);
+        return true;
+    }();
+    (void)logged_copy_api;
+    static const bool logged_batchflag_threshold = [api] {
+        if (api == MacaCopyApi::Auto) {
+            LOG(INFO) << "MacaTransport: batchflag min bytes "
+                      << batchFlagMinBytes();
+        }
+        return true;
+    }();
+    (void)logged_batchflag_threshold;
+
+    if (mode != MacaCopyMode::Sync) {
+        CallerSync caller_sync;
+        Status sync_status = prepareCallerSync(caller_sync);
+        if (!sync_status.ok()) return sync_status;
+
+        struct DeviceStream {
+            int device_id;
+            cudaStream_t stream;
+            bool ok;
+            bool owned;
+            std::vector<mcCopyFlag_t> copy_batch;
+            std::vector<Slice *> batch_slices;
+        };
+        struct PendingCopy {
+            Slice *slice;
+            size_t stream_index;
+        };
+
+        std::vector<DeviceStream> streams;
+        std::unordered_map<int, size_t> stream_index_by_device;
+        std::vector<PendingCopy> pending_copies;
+        Status first_error = Status::OK();
+        bool has_batchflag_copies = false;
+
+        int original_device = -1;
+        cudaGetDevice(&original_device);
+        int active_copy_device = -1;
+
+        auto getStream = [&](int device_id, cudaStream_t &stream,
+                             size_t &stream_index) -> bool {
+            auto iter = stream_index_by_device.find(device_id);
+            if (iter != stream_index_by_device.end()) {
+                stream_index = iter->second;
+                stream = streams[stream_index].stream;
+                return true;
+            }
+
+            if (!checkCudaErrorReturn(cudaSetDevice(device_id),
+                                      "MacaTransport: failed to set device")) {
+                return false;
+            }
+
+            bool owned = mode == MacaCopyMode::NewStreamSync;
+            cudaStream_t new_stream = nullptr;
+            if (owned) {
+                if (!checkCudaErrorReturn(
+                        cudaStreamCreateWithFlags(&new_stream,
+                                                  cudaStreamNonBlocking),
+                        "MacaTransport: cudaStreamCreateWithFlags failed")) {
+                    return false;
+                }
+            } else {
+                new_stream = thread_local_stream_pool.getOrCreate(device_id);
+                if (!new_stream) return false;
+            }
+
+            if (caller_sync.mode == MacaCallerSyncMode::Wait &&
+                caller_sync.event) {
+                cudaError_t wait_err =
+                    cudaStreamWaitEvent(new_stream, caller_sync.event, 0);
+                if (wait_err != cudaSuccess) {
+                    LOG(ERROR) << "MacaTransport: cudaStreamWaitEvent failed: "
+                               << cudaGetErrorString(wait_err);
+                    if (owned) cudaStreamDestroy(new_stream);
+                    return false;
+                }
+            }
+
+            stream_index = streams.size();
+            streams.push_back({device_id, new_stream, true, owned, {}, {}});
+            stream_index_by_device[device_id] = stream_index;
+            stream = new_stream;
+            return true;
+        };
+
+        for (size_t index = 0; index < task_list.size(); ++index) {
+            assert(task_list[index]);
+            auto &task = *task_list[index];
+            assert(task.request);
+            auto &request = *task.request;
+            uint64_t dest_addr = request.target_offset;
+
+            task.total_bytes = request.length;
+            Slice *slice = getSliceCache().allocate();
+            slice->source_addr = (char *)request.source;
+            slice->length = request.length;
+            slice->opcode = request.opcode;
+            slice->task = &task;
+            slice->target_id = request.target_id;
+            slice->status = Slice::PENDING;
+            slice->ts =
+                globalConfig().slice_timeout > 0 ? getCurrentTimeInNano() : 0;
+            task.slice_list.push_back(slice);
+            __sync_fetch_and_add(&task.slice_count, 1);
+
+            if (request.target_id != LOCAL_SEGMENT_ID) {
+                int rc = relocateSharedMemoryAddress(dest_addr, request.length,
+                                                     request.target_id);
+                if (rc) {
+                    slice->local.dest_addr = nullptr;
+                    slice->markFailed();
+                    if (first_error.ok())
+                        first_error =
+                            Status::Memory("device memory not registered");
+                    continue;
+                }
+            }
+            slice->local.dest_addr = (char *)dest_addr;
+
+            int target_device = getDeviceFromPointer(request.source);
+            if (target_device < 0)
+                target_device = getDeviceFromPointer((void *)dest_addr);
+            if (target_device < 0) {
+                slice->markFailed();
+                if (first_error.ok())
+                    first_error =
+                        Status::InvalidArgument("Cannot infer MACA device");
+                continue;
+            }
+
+            cudaStream_t stream = nullptr;
+            size_t stream_index = 0;
+            if (!getStream(target_device, stream, stream_index)) {
+                slice->markFailed();
+                if (first_error.ok())
+                    first_error = Status::Memory(
+                        "MacaTransport: failed to create MACA stream");
+                continue;
+            }
+
+            if (active_copy_device != target_device) {
+                if (!checkCudaErrorReturn(
+                        cudaSetDevice(target_device),
+                        "MacaTransport: failed to set device")) {
+                    slice->markFailed();
+                    streams[stream_index].ok = false;
+                    if (first_error.ok())
+                        first_error = Status::Context(
+                            "MacaTransport: failed to set device");
+                    continue;
+                }
+                active_copy_device = target_device;
+            }
+
+            if (shouldUseBatchFlag(api, slice->length)) {
+                void *dst;
+                const void *src;
+                getCopyEndpoints(slice, dst, src);
+
+                mcCopyFlag_t copy;
+                std::memset(&copy, 0, sizeof(copy));
+                copy.dst = dst;
+                copy.src = src;
+                copy.engine = ParallelCopyEngineDefault;
+                copy.count = slice->length;
+                copy.waitNum = 0;
+                copy.writeNum = 0;
+
+                streams[stream_index].copy_batch.push_back(copy);
+                streams[stream_index].batch_slices.push_back(slice);
+                slice->local.cuda_stream = (void *)stream;
+                pending_copies.push_back({slice, stream_index});
+                has_batchflag_copies = true;
+                continue;
+            }
+
+            cudaError_t err =
+                submitMemcpyAsync(slice, asyncCopyApi(api), stream);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "MacaTransport: async copy failed: "
+                           << cudaGetErrorString(err);
+                slice->markFailed();
+                streams[stream_index].ok = false;
+                if (first_error.ok())
+                    first_error =
+                        Status::Memory("MacaTransport: async copy failed");
+            } else {
+                slice->local.cuda_stream = (void *)stream;
+                if (mode == MacaCopyMode::Posted) {
+                    slice->status = Slice::POSTED;
+                } else {
+                    pending_copies.push_back({slice, stream_index});
+                }
+            }
+        }
+
+        if (has_batchflag_copies) {
+            for (auto &entry : streams) {
+                if (entry.copy_batch.empty()) continue;
+                if (!checkCudaErrorReturn(
+                        cudaSetDevice(entry.device_id),
+                        "MacaTransport: failed to set device")) {
+                    entry.ok = false;
+                    continue;
+                }
+
+                cudaError_t err =
+                    submitBatchFlagAsync(entry.copy_batch, entry.stream);
+                if (err != cudaSuccess) {
+                    LOG(ERROR)
+                        << "MacaTransport: mcExtBatchCopyFlagAndWaitV2 failed: "
+                        << cudaGetErrorString(err);
+                    for (auto *slice : entry.batch_slices) {
+                        if (slice->status == Slice::PENDING) {
+                            slice->markFailed();
+                        }
+                    }
+                    if (first_error.ok())
+                        first_error =
+                            Status::Memory("MacaTransport: batch copy failed");
+                }
+            }
+
+            if (mode == MacaCopyMode::Posted) {
+                for (auto &entry : streams) {
+                    if (entry.copy_batch.empty()) continue;
+                    for (auto *slice : entry.batch_slices) {
+                        if (slice->status != Slice::PENDING) continue;
+                        if (entry.ok)
+                            slice->status = Slice::POSTED;
+                        else
+                            slice->markFailed();
+                    }
+                }
+            }
+        }
+
+        if (mode != MacaCopyMode::Posted) {
+            for (auto &entry : streams) {
+                if (!checkCudaErrorReturn(
+                        cudaSetDevice(entry.device_id),
+                        "MacaTransport: failed to set device")) {
+                    entry.ok = false;
+                    continue;
+                }
+                cudaError_t err = cudaStreamSynchronize(entry.stream);
+                if (err != cudaSuccess) {
+                    LOG(ERROR)
+                        << "MacaTransport: cudaStreamSynchronize failed: "
+                        << cudaGetErrorString(err);
+                    entry.ok = false;
+                    if (first_error.ok())
+                        first_error =
+                            Status::Memory("MacaTransport: stream sync failed");
+                }
+            }
+
+            for (auto &pending : pending_copies) {
+                if (pending.slice->status != Slice::PENDING) continue;
+                if (streams[pending.stream_index].ok)
+                    pending.slice->markSuccess();
+                else
+                    pending.slice->markFailed();
+            }
+        }
+
+        for (auto &entry : streams) {
+            if (entry.owned) {
+                cudaSetDevice(entry.device_id);
+                cudaStreamDestroy(entry.stream);
+            }
+        }
+        if (original_device >= 0) cudaSetDevice(original_device);
+        return first_error;
+    }
+
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
@@ -360,6 +1002,9 @@ int MacaTransport::registerLocalMemory(void *addr, size_t length,
     desc.length = alloc_size;
     desc.name = location;
     desc.shm_name = serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+#ifdef ENABLE_MULTI_PROTOCOL
+    desc.protocol = "maca";
+#endif
     int rc = metadata_->addLocalMemoryBuffer(desc, true);
     if (rc == 0) {
         registered_base_addrs_.insert((uint64_t)base_ptr);

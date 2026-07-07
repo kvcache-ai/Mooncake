@@ -470,6 +470,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
             if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
+            if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
             if (p == "tcp") return 1;
