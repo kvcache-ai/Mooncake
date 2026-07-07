@@ -14,10 +14,12 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 
 #include "config.h"
+#include "multi_transport_locality.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
@@ -58,6 +60,12 @@
 #endif
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
+#endif
+#ifdef USE_CXI
+#include "transport/cxi_transport/cxi_transport.h"
+#endif
+#ifdef USE_SUNRISE
+#include "transport/sunrise_link_transport/sunrise_link_transport.h"
 #endif
 #ifdef USE_UB
 #include "transport/kunpeng_transport/ub_transport.h"
@@ -167,6 +175,7 @@ Status MultiTransport::mp_submitTransfer(
         assert(transport);
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -380,6 +389,16 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new EfaTransport();
     }
 #endif
+#ifdef USE_CXI
+    else if (std::string(proto) == "cxi") {
+        transport = new CxiTransport();
+    }
+#endif
+#ifdef USE_SUNRISE
+    else if (std::string(proto) == "sunrise_link") {
+        transport = new SunriseLinkTransport();
+    }
+#endif
 
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto
@@ -422,6 +441,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     if (transport->install(local_server_name_, metadata_, topo)) {
+        delete transport;
         return nullptr;
     }
 
@@ -437,6 +457,72 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target
+    // buffers owned by different transports (the device KV pool via hip, the
+    // host aux/metadata buffers via rdma). Route each request to the transport
+    // that owns the buffer covering the target address. When a buffer is
+    // registered under more than one protocol (the device KV pool is registered
+    // by both rdma and hip), pick the highest-performance transport by a fixed
+    // priority instead of relying on buffer registration order.
+    if (proto.find(',') != std::string::npos) {
+        auto protocol_priority = [](const std::string& p) {
+            // hip is intra-node GPU-IPC only. On a cross-node request a
+            // hip+rdma segment must fall through to rdma; allow deployments
+            // that know they need the cross-node path to de-prioritize hip.
+            if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
+            if (p == "cxl") return 3;
+            if (p == "rdma") return 2;
+            if (p == "tcp") return 1;
+            return 0;
+        };
+        // hip transport uses GPU IPC, which cannot reach a GPU on another host.
+        // The device KV pool is registered under both rdma and hip, so a
+        // cross-host target must skip its hip buffers and fall back to rdma.
+        // This makes the intra-node fast path (hip) and the cross-node path
+        // (rdma) work automatically from a single multi-protocol segment,
+        // without requiring the operator to set MC_DISABLE_HIP.
+        const bool hip_reachable =
+            isHipReachableTarget(target_segment_desc->name, local_server_name_);
+        std::string chosen;
+        int chosen_priority = -1;
+        for (const auto& buffer : target_segment_desc->buffers) {
+            // CXL buffers locate via offset + cxl_base_addr; all other
+            // protocols use the absolute virtual address in buffer.addr.
+            uint64_t start =
+                (buffer.protocol == "cxl")
+                    ? buffer.offset + target_segment_desc->cxl_base_addr
+                    : buffer.addr;
+            if (entry.target_offset >= start &&
+                entry.target_offset < start + buffer.length) {
+                if (buffer.protocol == "hip" && !hip_reachable) continue;
+                int priority = protocol_priority(buffer.protocol);
+                if (priority > chosen_priority) {
+                    chosen = buffer.protocol;
+                    chosen_priority = priority;
+                }
+            }
+        }
+        if (chosen.empty()) {
+            return Status::InvalidArgument(
+                "No matching buffer for target offset in multi-protocol "
+                "segment " +
+                std::to_string(entry.target_id));
+        }
+        if (!transport_map_.count(chosen)) {
+            return Status::NotSupportedTransport("Transport " + chosen +
+                                                 " not installed");
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "MultiTransport::selectTransport route: target_id="
+                      << entry.target_id << " segment_protocol=\"" << proto
+                      << "\" hip_reachable=" << hip_reachable
+                      << " chosen=" << chosen;
+        }
+        transport = transport_map_[chosen].get();
+        return Status::OK();
+    }
+#endif
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
@@ -468,6 +554,28 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
     std::string item;
     while (std::getline(ss, item, ',')) {
         if (!item.empty()) protos.push_back(item);
+    }
+
+    // hip GPU IPC cannot reach a remote host; downgrade an explicit hip
+    // preference to a cross-host-capable transport for a cross-host target
+    // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
+    if (preferred_proto == "hip" &&
+        !isHipReachableTarget(target_segment_desc->name, local_server_name_)) {
+        std::string fallback;
+        for (const char* candidate : {"rdma", "tcp"}) {
+            if (std::find(protos.begin(), protos.end(), candidate) !=
+                protos.end()) {
+                fallback = candidate;
+                break;
+            }
+        }
+        if (fallback.empty()) {
+            return Status::NotSupportedTransport(
+                "hip target is cross-host but segment " +
+                std::to_string(entry.target_id) +
+                " offers no cross-host transport (rdma/tcp)");
+        }
+        preferred_proto = fallback;
     }
 
 #ifdef USE_ASCEND_HETEROGENEOUS

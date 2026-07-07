@@ -173,25 +173,31 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
 // ---------------------------------------------------------------------------
 
 TEST(TransportSelectorTest, TransportTypeNameMapping) {
+    EXPECT_EQ(TransportSelector::transportTypeName(UNSPEC), "unspec");
     EXPECT_EQ(TransportSelector::transportTypeName(RDMA), "rdma");
-    EXPECT_EQ(TransportSelector::transportTypeName(TCP), "tcp");
+    EXPECT_EQ(TransportSelector::transportTypeName(MNNVL), "mnnvl");
     EXPECT_EQ(TransportSelector::transportTypeName(SHM), "shm");
     EXPECT_EQ(TransportSelector::transportTypeName(NVLINK), "nvlink");
     EXPECT_EQ(TransportSelector::transportTypeName(GDS), "gds");
     EXPECT_EQ(TransportSelector::transportTypeName(IOURING), "io_uring");
+    EXPECT_EQ(TransportSelector::transportTypeName(TCP), "tcp");
     EXPECT_EQ(TransportSelector::transportTypeName(AscendDirect), "ascend");
-    EXPECT_EQ(TransportSelector::transportTypeName(MNNVL), "mnnvl");
+    EXPECT_EQ(TransportSelector::transportTypeName(SUNRISE_LINK),
+              "sunrise_link");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
+    EXPECT_EQ(TransportSelector::parseTransportType("unspec"), UNSPEC);
     EXPECT_EQ(TransportSelector::parseTransportType("rdma"), RDMA);
-    EXPECT_EQ(TransportSelector::parseTransportType("tcp"), TCP);
+    EXPECT_EQ(TransportSelector::parseTransportType("mnnvl"), MNNVL);
     EXPECT_EQ(TransportSelector::parseTransportType("shm"), SHM);
     EXPECT_EQ(TransportSelector::parseTransportType("nvlink"), NVLINK);
     EXPECT_EQ(TransportSelector::parseTransportType("gds"), GDS);
     EXPECT_EQ(TransportSelector::parseTransportType("io_uring"), IOURING);
+    EXPECT_EQ(TransportSelector::parseTransportType("tcp"), TCP);
     EXPECT_EQ(TransportSelector::parseTransportType("ascend"), AscendDirect);
-    EXPECT_EQ(TransportSelector::parseTransportType("mnnvl"), MNNVL);
+    EXPECT_EQ(TransportSelector::parseTransportType("sunrise_link"),
+              SUNRISE_LINK);
     EXPECT_EQ(TransportSelector::parseTransportType("unknown"), UNSPEC);
 }
 
@@ -539,6 +545,209 @@ TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     auto result = selector.select(ctx, transports);
     // With default policies, should use buffer_transports order (RDMA first)
     EXPECT_EQ(result.transport, RDMA);
+}
+
+// ---------------------------------------------------------------------------
+// hint: per-request transport_hint hook on select()
+// ---------------------------------------------------------------------------
+
+TEST(TransportSelectorTest, FailoverFromHintAdvancesByIndex) {
+    // Policy order [TCP, RDMA], hint=RDMA. Hint is prepended; failover by
+    // bumping transport_index walks past the hint into the rest of raw
+    // (with RDMA de-duped), so index=1 returns TCP — never returns RDMA
+    // again.
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {TCP, RDMA};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(
+        selector.select(ctx, transports, /*index=*/0, /*hint=*/RDMA).transport,
+        RDMA);
+    EXPECT_EQ(
+        selector.select(ctx, transports, /*index=*/1, /*hint=*/RDMA).transport,
+        TCP);
+    // Past the end -> UNSPEC.
+    EXPECT_EQ(
+        selector.select(ctx, transports, /*index=*/2, /*hint=*/RDMA).transport,
+        UNSPEC);
+}
+
+TEST(TransportSelectorTest, HintIsPrependedToCandidateList) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+
+    // Default-policy memory path uses buffer_transports order = [RDMA, TCP].
+    // hint=TCP must put TCP first, RDMA second.
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto r0 = selector.select(ctx, transports, /*index=*/0, /*hint=*/TCP);
+    EXPECT_EQ(r0.transport, TCP);
+    auto r1 = selector.select(ctx, transports, /*index=*/1, /*hint=*/TCP);
+    EXPECT_EQ(r1.transport, RDMA);
+}
+
+TEST(TransportSelectorTest, HintNotInMatchingPolicyReturnsUnspec) {
+    // Selector mode: the matching policy's transports list is the
+    // authorization whitelist. A hint that is not in it produces UNSPEC
+    // (downstream the engine turns this into task = FAILED).
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+
+    // Buffer is only registered with TCP. hint=RDMA must fail even though
+    // RDMA is installed and capable.
+    std::vector<TransportType> buffer_transports = {TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto r = selector.select(ctx, transports, /*index=*/0, /*hint=*/RDMA);
+    EXPECT_EQ(r.transport, UNSPEC);
+}
+
+// RFC #2519 / #2568 step 1: a policy's link-layer QoS (service_level /
+// traffic_class / qp_pool) is parsed from JSON and carried out via
+// SelectionResult. (Step 1 only plumbs the values; applying them at QP setup
+// is the per-class QP pool follow-up.)
+TEST(TransportSelectorTest, PolicyLinkLayerQoSIsParsedAndCarried) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "kv-critical";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"rdma"};
+    policy["service_level"] = 3;
+    policy["traffic_class"] = 96;
+    policy["qp_pool"] = "kv";
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.policy_name = "kv-critical";
+
+    auto r = selector.select(ctx, transports, /*index=*/0);
+    ASSERT_TRUE(r.service_level.has_value());
+    EXPECT_EQ(r.service_level.value(), 3);
+    ASSERT_TRUE(r.traffic_class.has_value());
+    EXPECT_EQ(r.traffic_class.value(), 96);
+    ASSERT_TRUE(r.qp_pool.has_value());
+    EXPECT_EQ(r.qp_pool.value(), "kv");
+}
+
+// Out-of-range SL/TC are ignored (left as nullopt) so a bad config never
+// changes selection behavior.
+TEST(TransportSelectorTest, PolicyLinkLayerQoSOutOfRangeIgnored) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "bad-qos";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"rdma"};
+    policy["service_level"] = 99;    // > 15, invalid
+    policy["traffic_class"] = 9999;  // > 255, invalid
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.policy_name = "bad-qos";
+
+    auto r = selector.select(ctx, transports, /*index=*/0);
+    EXPECT_FALSE(r.service_level.has_value());
+    EXPECT_FALSE(r.traffic_class.has_value());
+}
+
+// An empty-string or non-string qp_pool is treated as unset (nullopt), so a
+// blank / mistyped config value never looks like an explicit pool.
+TEST(TransportSelectorTest, PolicyQpPoolEmptyOrNonStringIsUnset) {
+    auto conf = std::make_shared<Config>();
+    json empty_pool;
+    empty_pool["name"] = "empty-pool";
+    empty_pool["segment_type"] = "memory";
+    empty_pool["transports"] = {"rdma"};
+    empty_pool["qp_pool"] = "";  // empty -> unset
+    json bad_pool;
+    bad_pool["name"] = "bad-pool";
+    bad_pool["segment_type"] = "memory";
+    bad_pool["transports"] = {"rdma"};
+    bad_pool["qp_pool"] = 42;  // non-string -> ignored
+    conf->set("policy", json::array({empty_pool, bad_pool}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {RDMA};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    ctx.policy_name = "empty-pool";
+    EXPECT_FALSE(
+        selector.select(ctx, transports, /*index=*/0).qp_pool.has_value());
+    ctx.policy_name = "bad-pool";
+    EXPECT_FALSE(
+        selector.select(ctx, transports, /*index=*/0).qp_pool.has_value());
 }
 
 }  // namespace

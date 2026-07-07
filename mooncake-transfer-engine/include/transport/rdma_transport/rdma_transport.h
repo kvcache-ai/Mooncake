@@ -36,11 +36,13 @@ namespace mooncake {
 class RdmaContext;
 class RdmaEndPoint;
 class TransferMetadata;
+class RdmaTransportTestPeer;
 class WorkerPool;
 
 class RdmaTransport : public Transport {
     friend class RdmaContext;
     friend class RdmaEndPoint;
+    friend class RdmaTransportTestPeer;
     friend class WorkerPool;
 
    public:
@@ -101,6 +103,9 @@ class RdmaTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
+    int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,
+                               const std::string &gid);
+
     int preTouchMemory(void *addr, size_t length);
 
    public:
@@ -125,6 +130,10 @@ class RdmaTransport : public Transport {
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
                             int &device_id, int retry_cnt = 0);
+    static int selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
+                                      size_t length, std::string_view local_hca,
+                                      int &buffer_id, int &device_id,
+                                      int retry_cnt = 0);
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
@@ -134,6 +143,7 @@ class RdmaTransport : public Transport {
     // "192.168.0.y:port") for NIC path construction, while
     // local_server_name_ keeps the TCP-reachable address for P2P routing.
     std::string rdma_server_name_;
+    std::mutex local_desc_lock_;
 };
 
 using TransferRequest = Transport::TransferRequest;

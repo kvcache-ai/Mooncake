@@ -24,6 +24,8 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <utility>
+#include <vector>
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
@@ -33,17 +35,13 @@
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 
 namespace mooncake {
-
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
 
 namespace {
 
@@ -280,12 +278,16 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr,
                      tenant_id),
       local_hostname_(local_hostname),
+      host_id_(ResolveMooncakeHostId(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
+    if (!host_id_.empty()) {
+        LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
+    }
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
@@ -384,26 +386,40 @@ Client::~Client() {
         }
     }
 
-    // Stop hot cache handler and hot cache
+    // Stop hot cache handler before unregistering/freeing its backing memory.
     hot_cache_handler_.reset();
+    UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
+}
+
+ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
+    ReplicateConfig client_cfg = config;
+    if (!host_id_.empty()) {
+        client_cfg.host_id = host_id_;
+    }
+    return client_cfg;
 }
 
 static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
-        int iv = std::stoi(ev_ad);
-        if (iv == 1) {
-            LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
-            return true;
-        } else if (iv == 0) {
-            LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
-            return false;
-        } else {
-            LOG(WARNING)
-                << "invalid MC_MS_AUTO_DISC value: " << ev_ad
-                << ", should be 0 or 1, using default: auto discovery not set";
+        try {
+            int iv = std::stoi(ev_ad);
+            if (iv == 1) {
+                LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
+                return true;
+            } else if (iv == 0) {
+                LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
+                return false;
+            }
+        } catch (const std::exception&) {
+            // A non-numeric or out-of-range value makes std::stoi throw; fall
+            // through to the warning below and use the default instead of
+            // letting the exception abort client initialization.
         }
+        LOG(WARNING)
+            << "invalid MC_MS_AUTO_DISC value: " << ev_ad
+            << ", should be 0 or 1, using default: auto discovery not set";
     }
     return std::nullopt;
 }
@@ -576,7 +592,14 @@ ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
 }
 
 void Client::LeaderMonitorThreadMain() {
-    constexpr auto kViewChangeTimeout = std::chrono::milliseconds(1000);
+    // WaitForViewChange now blocks on a backend watch and returns as soon as
+    // leadership actually changes, so this timeout no longer drives polling
+    // cadence -- it is only a periodic re-sync safety net that re-reads the
+    // current view in case a watch event was missed (e.g. a connection blip).
+    // Keeping it long (30s instead of 1s) collapses steady-state backend load
+    // from ~1 read/sec/client to ~1 read/30s/client without affecting failover
+    // responsiveness, which is driven by the watch.
+    constexpr auto kViewChangeTimeout = std::chrono::milliseconds(30000);
     constexpr auto kErrorRetryInterval = std::chrono::milliseconds(1000);
 
     while (leader_monitor_running_.load()) {
@@ -627,10 +650,23 @@ ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
+    // TEs created through the Store entry (Client::Create ->
+    // InitTransferEngine) are tagged so ascend_direct can resolve a per-role
+    // link config (e.g. Store=RoCE/D2H, P2P=HCCS/D2D). The flag only needs to
+    // be live while the ascend transport is installed below; reset it on every
+    // exit path. Assumes TE inits are serialized within the process.
+    struct StoreTeInitGuard {
+        ~StoreTeInitGuard() { globalConfig().ascend_store_te_init = false; }
+    } store_te_init_guard;
+    if (protocol == "ascend") {
+        globalConfig().ascend_store_te_init = true;
+    }
+
     // Check if using TENT mode - TENT handles transport configuration
-    // internally
-    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
-                    (std::getenv("MC_USE_TEV1") != nullptr);
+    // internally. Use the engine's own check rather than the raw env var:
+    // if Mooncake was built without USE_TENT, the env var has no effect on
+    // the TransferEngine, so the store must still install transports.
+    bool use_tent = transfer_engine_->isUsingTent();
 
     bool auto_discover = false;
     if (!use_tent) {
@@ -674,6 +710,15 @@ ErrorCode Client::InitTransferEngine(
             std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
         if (ascend_use_fabric_mem) {
             globalConfig().ascend_use_fabric_mem = true;
+        }
+    }
+    if (protocol == "sunrise_link") {
+        const char* sunrise_use_device_mem_env =
+            std::getenv("SUNRISE_USE_DEVICE_MEM");
+        if (sunrise_use_device_mem_env) {
+            globalConfig().sunrise_use_device_mem = true;
+            LOG(INFO) << "SUNRISE_USE_DEVICE_MEM enabled: segments will be "
+                      << "allocated in device memory via tangMalloc";
         }
     }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
@@ -750,7 +795,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem") {
+        } else if (protocol == "ascend" || protocol == "ubshmem" ||
+                   protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
@@ -785,6 +831,13 @@ ErrorCode Client::InitTransferEngine(
             if (!transport) {
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
+            }
+        } else if (protocol == "cxi") {
+            try {
+                transport = transfer_engine_->installTransport("cxi", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxi_transport_install_failed error_message=\""
+                           << e.what() << "\"";
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
@@ -1484,9 +1537,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
+    }
+
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
     }
 
     // Start put operation
@@ -1590,9 +1647,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
+    }
+
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
     }
 
     // Start upsert operation
@@ -1657,6 +1718,14 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    // Success-side invalidation: a concurrent read between the pre-upsert
+    // RemoveHotKey() and UpsertEnd could have read the old value and submitted
+    // an async hot-cache fill with a still-valid token. Invalidate again now
+    // that the new value is committed so that stale fill cannot publish.
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     return {};
 }
 
@@ -1664,7 +1733,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1823,6 +1892,13 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
 
+    if (hot_cache_) {
+        std::vector<std::string> hot_keys;
+        hot_keys.reserve(ops.size());
+        for (const auto& op : ops) hot_keys.emplace_back(op.key);
+        hot_cache_->RemoveHotKeys(hot_keys);
+    }
+
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
 
@@ -1881,6 +1957,13 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
+
+    if (hot_cache_) {
+        std::vector<std::string> hot_keys;
+        hot_keys.reserve(ops.size());
+        for (const auto& op : ops) hot_keys.emplace_back(op.key);
+        hot_cache_->RemoveHotKeys(hot_keys);
+    }
 
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
@@ -2260,7 +2343,9 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     }
 
     // Process successful operations
+    std::vector<std::string> finalized_keys;
     if (!successful_keys.empty()) {
+        finalized_keys.reserve(successful_keys.size());
         auto end_responses = master_client_.BatchUpsertEnd(successful_keys);
         if (end_responses.size() != successful_keys.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
@@ -2281,11 +2366,21 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                                          "BatchUpsertEnd failed");
                 } else {
                     ops[op_idx].SetSuccess();
+                    finalized_keys.emplace_back(successful_keys[i]);
                     VLOG(1) << "Successfully completed upsert for key "
                             << successful_keys[i];
                 }
             }
         }
+    }
+
+    // Success-side invalidation for finalized upserts only: a concurrent read
+    // between StartBatchUpsert()'s pre-invalidation and BatchUpsertEnd could
+    // have read the old value and submitted an async hot-cache fill with a
+    // still-valid token. Invalidate again now that the new values are
+    // committed so those stale fills cannot publish.
+    if (hot_cache_ && !finalized_keys.empty()) {
+        hot_cache_->RemoveHotKeys(finalized_keys);
     }
 
     // Process failed operations that need cleanup
@@ -2474,7 +2569,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2512,6 +2607,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpKeyGeneration(key);
+    }
+
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
@@ -2519,11 +2618,20 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (!result) {
         return tl::unexpected(result.error());
     }
+
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     return {};
 }
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+    }
+
     auto result = master_client_.RemoveByRegex(str, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveByRegex(str);
@@ -2531,20 +2639,50 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
     if (!result) {
         return tl::unexpected(result.error());
     }
+    if (result.value() > 0 && hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+        hot_cache_->RemoveHotKeysByRegex(str);
+    }
     return result.value();
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+    }
+
     auto result = master_client_.RemoveAll(force);
     if (result && storage_backend_) {
         storage_backend_->RemoveAll();
+    }
+    if (result && result.value() > 0 && hot_cache_) {
+        hot_cache_->RemoveAllHotKeys();
     }
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
-    return master_client_.BatchRemove(keys, force);
+    if (hot_cache_) {
+        hot_cache_->BumpKeyGenerations(keys);
+    }
+
+    auto results = master_client_.BatchRemove(keys, force);
+
+    if (hot_cache_) {
+        std::vector<std::string> removed_keys;
+        removed_keys.reserve(std::min(keys.size(), results.size()));
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i < results.size() && results[i].has_value()) {
+                removed_keys.emplace_back(keys[i]);
+            }
+        }
+        if (!removed_keys.empty()) {
+            hot_cache_->RemoveHotKeys(removed_keys);
+        }
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
@@ -2681,6 +2819,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
+        segment.host_id = host_id_;
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
@@ -3236,16 +3375,21 @@ void Client::PutToLocalFile(const std::string& key,
     // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
 
     for (const auto& slice : slices) {
-        int device_id = -1;
-        if (IsDevicePointer(slice.ptr, &device_id)) {
-            SetDevice(device_id);
+        device::PointerInfo info{};
+        auto* device =
+            runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+        if (device) {
+            device->SetContext(info.device_id);
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+            if (!device->Copy(buf.data, slice.ptr, slice.size,
+                              device::CopyDirection::kDeviceToHost)) {
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
-                pinned_buffer_pool_->Release(buf);
+                pinned_buffer_pool_->Release(std::move(buf));
                 // Must revoke to avoid phantom replica in master
                 auto revoke_result =
                     master_client_.PutRevoke(key, ReplicaType::DISK);
@@ -3256,7 +3400,7 @@ void Client::PutToLocalFile(const std::string& key,
                 return;
             }
             value.append(buf.data, slice.size);
-            pinned_buffer_pool_->Release(buf);
+            pinned_buffer_pool_->Release(std::move(buf));
         } else {
             value.append(static_cast<char*>(slice.ptr), slice.size);
         }
@@ -3867,6 +4011,11 @@ size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
 }
 
 ErrorCode Client::InitLocalHotCache() {
+    hot_cache_handler_.reset();
+    UnregisterLocalHotCacheMemory();
+    hot_cache_.reset();
+    admission_sketch_.reset();
+
     // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
     // set to a positive value; when enabled, default block size is 16MB and
     // thread_num is 2.
@@ -3877,9 +4026,6 @@ ErrorCode Client::InitLocalHotCache() {
     size_t total_cache = GetLocalHotCacheSizeFromEnv();
     if (total_cache == 0) {
         // Environment variable not set or invalid, disable cache
-        hot_cache_.reset();
-        hot_cache_handler_.reset();
-        admission_sketch_.reset();
         return ErrorCode::OK;
     }
 
@@ -3907,10 +4053,29 @@ ErrorCode Client::InitLocalHotCache() {
             admission_sketch_.reset();
             return ErrorCode::INVALID_PARAMS;
         }
+
+        int rc = transfer_engine_->registerLocalMemory(
+            hot_cache_->GetBaseAddress(), hot_cache_->GetTotalSize(),
+            kWildcardLocation, true, true);
+        if (rc != 0) {
+            LOG(ERROR)
+                << "Failed to register local hot cache memory with transfer "
+                   "engine, base="
+                << hot_cache_->GetBaseAddress()
+                << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+            hot_cache_.reset();
+            hot_cache_handler_.reset();
+            admission_sketch_.reset();
+            hot_cache_memory_registered_ = false;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        hot_cache_memory_registered_ = true;
+
         LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
                   << ", block size=" << block_size
                   << ", block amount=" << hot_cache_->GetCacheSize()
-                  << ", shm=" << (use_shm ? "on" : "off");
+                  << ", shm=" << (use_shm ? "on" : "off")
+                  << ", transfer engine registered=on";
         // Create async handler with 2 worker threads
         hot_cache_handler_ =
             std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
@@ -3937,6 +4102,27 @@ ErrorCode Client::InitLocalHotCache() {
         }
     }
     return ErrorCode::OK;
+}
+
+void Client::UnregisterLocalHotCacheMemory() {
+    if (!(hot_cache_ && hot_cache_memory_registered_)) {
+        return;
+    }
+    if (!transfer_engine_) {
+        hot_cache_memory_registered_ = false;
+        return;
+    }
+
+    int rc = transfer_engine_->unregisterLocalMemory(
+        hot_cache_->GetBaseAddress(), true);
+    if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+        LOG(ERROR)
+            << "Failed to unregister local hot cache memory from transfer "
+               "engine, base="
+            << hot_cache_->GetBaseAddress()
+            << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+    }
+    hot_cache_memory_registered_ = false;
 }
 
 void Client::ProcessSlicesAsync(const std::string& key,

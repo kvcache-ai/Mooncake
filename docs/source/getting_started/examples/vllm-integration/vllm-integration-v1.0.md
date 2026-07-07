@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # vLLM v1 backend Disaggregated Serving with MooncakeConnector
 
 ```{admonition} Archived

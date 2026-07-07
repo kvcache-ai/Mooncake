@@ -14,6 +14,8 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <transfer_engine.h>
 
+#include <ATen/cuda/CUDAContext.h>
+
 namespace mooncake {
 
 // Forward declaration – MooncakeP2PShim holds a non-owning pointer to

@@ -45,7 +45,6 @@ namespace mooncake {
 // roughly 24 million PTEs per NIC, but we use 22M as a conservative default.
 // With 4KB pages: 22M × 4KB ≈ 88GB per NIC.
 // With 2MB hugepages: 22M × 2MB ≈ 44TB per NIC (effectively unlimited).
-// Override via MC_EFA_MAX_PTE_ENTRIES environment variable.
 static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
 
 // Detect the kernel page size backing the memory at `addr` by reading
@@ -60,8 +59,12 @@ static size_t detectBufferPageSize(void* addr) {
     bool in_range = false;
 
     while (std::getline(smaps, line)) {
-        // VMA header: "start-end perms offset dev inode [pathname]"
-        if (!line.empty() && std::isxdigit(line[0])) {
+        // VMA header: "start-end perms offset dev inode [pathname]".
+        // Cast to unsigned char before std::isxdigit: passing a (possibly
+        // signed) char whose value is > 0x7F is UB, since the argument must be
+        // representable as unsigned char or equal EOF.
+        if (!line.empty() &&
+            std::isxdigit(static_cast<unsigned char>(line[0]))) {
             unsigned long start = 0, end = 0;
             if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
                 in_range = (target >= start && target < end);
@@ -77,20 +80,7 @@ static size_t detectBufferPageSize(void* addr) {
     return fallback;
 }
 
-static size_t getMaxPteEntries() {
-    static size_t cached = []() {
-        const char* env = std::getenv("MC_EFA_MAX_PTE_ENTRIES");
-        if (env) {
-            size_t val = std::stoull(env);
-            if (val > 0) {
-                LOG(INFO) << "MC_EFA_MAX_PTE_ENTRIES override: " << val;
-                return val;
-            }
-        }
-        return kDefaultMaxPteEntries;
-    }();
-    return cached;
-}
+static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
 EfaTransport::EfaTransport() {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
@@ -789,7 +779,17 @@ Status EfaTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask*> task_list;
-    for (auto& task : batch_desc.task_list) task_list.push_back(&task);
+    for (auto& request : entries) {
+        auto& task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest*>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 

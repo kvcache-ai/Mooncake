@@ -43,6 +43,9 @@ DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
 #endif
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
@@ -116,6 +119,13 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_allocate_memory(total_size, protocol);
+    }
+#endif
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_allocate_memory(
+            total_size, alignment,
+            mooncake::globalConfig().sunrise_use_device_mem);
     }
 #endif
 #if defined(USE_UB)
@@ -327,12 +337,21 @@ void *allocate_buffer_numa_segments(size_t total_size,
     size_t region_size = align_up(total_size / n, page_size);
     size_t map_size = region_size * n;
 
-    // reserve contiguous VMA, no physical pages yet
-    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // reserve contiguous VMA; use hugepages if page_size indicates so
+    unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (page_size == SZ_2MB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_2MB;
+    } else if (page_size == SZ_1GB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_1GB;
+    } else if (page_size != static_cast<size_t>(getpagesize())) {
+        flags |= MAP_HUGETLB;
+    }
+    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << map_size << ", errno=" << errno
-                   << " (" << strerror(errno) << ")";
+        LOG(ERROR) << "mmap failed (hugepage="
+                   << ((flags & MAP_HUGETLB) ? "yes" : "no")
+                   << "), size=" << map_size << ", errno=" << errno << " ("
+                   << strerror(errno) << ")";
         return nullptr;
     }
 
@@ -375,6 +394,11 @@ void free_memory(const std::string &protocol, void *ptr) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
+    }
+#endif
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_free_memory(ptr);
     }
 #endif
 #if defined(USE_UB)
@@ -549,6 +573,35 @@ int64_t time_gen() {
 std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     const char *env_val = std::getenv(name);
     return env_val ? std::string(env_val) : default_value;
+}
+
+std::string ResolveMooncakeHostId(const std::string &local_hostname) {
+    auto trim = [](std::string value) {
+        const auto begin = value.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) {
+            return std::string();
+        }
+        const auto end = value.find_last_not_of(" \t\r\n");
+        return value.substr(begin, end - begin + 1);
+    };
+
+    const std::string hostname = trim(local_hostname);
+    const std::string host_id = (hostname == "::1" || hostname == "::")
+                                    ? hostname
+                                    : trim(getHostNameWithoutPort(hostname));
+    if (host_id.empty()) {
+        return "";
+    }
+
+    std::string lower = host_id;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
+        lower == "::1" || lower == "[::1]" || lower == "::" ||
+        lower == "[::]") {
+        return "";
+    }
+    return host_id;
 }
 
 static std::string SanitizeKey(const std::string &key) {

@@ -18,10 +18,23 @@ namespace ha {
 
 namespace snapshot_catalog_store_detail {
 
-constexpr std::string_view kSnapshotRoot = "mooncake_master_snapshot/";
+constexpr std::string_view kSnapshotRootBase = "mooncake_master_snapshot";
 constexpr std::string_view kSnapshotLatest = "latest.txt";
 constexpr std::string_view kSnapshotManifest = "manifest.txt";
 constexpr std::string_view kSnapshotDescriptor = "descriptor.txt";
+
+/// Build the per-cluster snapshot root path.
+/// When cluster_id is non-empty: "mooncake_master_snapshot/{cluster_id}/"
+/// When cluster_id is empty:     "mooncake_master_snapshot/"
+inline std::string BuildSnapshotRoot(const std::string& cluster_id) {
+    std::string root(kSnapshotRootBase);
+    root += '/';
+    if (!cluster_id.empty()) {
+        root += cluster_id;
+        root += '/';
+    }
+    return root;
+}
 
 inline bool IsAsciiDigit(char ch) {
     return std::isdigit(static_cast<unsigned char>(ch)) != 0;
@@ -59,28 +72,33 @@ inline std::string TrimAsciiWhitespace(std::string value) {
     return value.substr(first, last - first + 1);
 }
 
-inline std::string BuildSnapshotPrefix(const SnapshotId& snapshot_id) {
-    return std::string(kSnapshotRoot) + snapshot_id + "/";
+inline std::string BuildSnapshotPrefix(const std::string& snapshot_root,
+                                       const SnapshotId& snapshot_id) {
+    return snapshot_root + snapshot_id + "/";
 }
 
-inline std::string BuildManifestKey(const SnapshotId& snapshot_id) {
-    return BuildSnapshotPrefix(snapshot_id) + std::string(kSnapshotManifest);
+inline std::string BuildManifestKey(const std::string& snapshot_root,
+                                    const SnapshotId& snapshot_id) {
+    return BuildSnapshotPrefix(snapshot_root, snapshot_id) +
+           std::string(kSnapshotManifest);
 }
 
-inline std::string BuildDescriptorKey(const SnapshotId& snapshot_id) {
-    return BuildSnapshotPrefix(snapshot_id) + std::string(kSnapshotDescriptor);
+inline std::string BuildDescriptorKey(const std::string& snapshot_root,
+                                      const SnapshotId& snapshot_id) {
+    return BuildSnapshotPrefix(snapshot_root, snapshot_id) +
+           std::string(kSnapshotDescriptor);
 }
 
-inline std::string BuildLatestKey() {
-    return std::string(kSnapshotRoot) + std::string(kSnapshotLatest);
+inline std::string BuildLatestKey(const std::string& snapshot_root) {
+    return snapshot_root + std::string(kSnapshotLatest);
 }
 
 inline SnapshotDescriptor MakeSnapshotDescriptor(
-    const SnapshotId& snapshot_id) {
+    const std::string& snapshot_root, const SnapshotId& snapshot_id) {
     SnapshotDescriptor descriptor;
     descriptor.snapshot_id = snapshot_id;
-    descriptor.manifest_key = BuildManifestKey(snapshot_id);
-    descriptor.object_prefix = BuildSnapshotPrefix(snapshot_id);
+    descriptor.manifest_key = BuildManifestKey(snapshot_root, snapshot_id);
+    descriptor.object_prefix = BuildSnapshotPrefix(snapshot_root, snapshot_id);
     return descriptor;
 }
 
@@ -100,7 +118,8 @@ inline std::string SerializeSnapshotDescriptor(
 }
 
 inline tl::expected<SnapshotDescriptor, ErrorCode>
-DeserializeSnapshotDescriptor(const SnapshotId& snapshot_id,
+DeserializeSnapshotDescriptor(const std::string& snapshot_root,
+                              const SnapshotId& snapshot_id,
                               std::string_view payload) {
     const auto first = payload.find('|');
     const auto second = first == std::string_view::npos
@@ -110,7 +129,8 @@ DeserializeSnapshotDescriptor(const SnapshotId& snapshot_id,
         return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
     }
 
-    SnapshotDescriptor descriptor = MakeSnapshotDescriptor(snapshot_id);
+    SnapshotDescriptor descriptor =
+        MakeSnapshotDescriptor(snapshot_root, snapshot_id);
     if (!ParseDecimal(payload.substr(0, first), descriptor.last_included_seq) ||
         !ParseDecimal(payload.substr(first + 1, second - first - 1),
                       descriptor.producer_view_version) ||
@@ -135,6 +155,9 @@ class SnapshotCatalogStore {
         size_t limit) = 0;
 
     virtual ErrorCode Delete(const SnapshotId& snapshot_id) = 0;
+
+    /// Returns the per-cluster snapshot root path used by this catalog store.
+    virtual const std::string& GetSnapshotRoot() const = 0;
 };
 
 }  // namespace ha

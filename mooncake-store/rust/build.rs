@@ -203,19 +203,26 @@ fn main() {
     // common/base library (contains mooncake::Status etc.)
     println!(
         "cargo:rustc-link-search=native={}",
-        build_dir.join("mooncake-transfer-engine/src/common/base").display()
+        build_dir
+            .join("mooncake-transfer-engine/src/common/base")
+            .display()
     );
 
     // CUDA runtime libraries (needed by transfer_engine RDMA transport).
     let cuda_home = env::var("CUDA_HOME")
         .or_else(|_| env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    println!("cargo:rustc-link-search=native={}/targets/x86_64-linux/lib", cuda_home);
+    println!(
+        "cargo:rustc-link-search=native={}/targets/x86_64-linux/lib",
+        cuda_home
+    );
 
     // cachelib_memory_allocator is a static library built alongside mooncake_store.
     println!(
         "cargo:rustc-link-search=native={}",
-        build_dir.join("mooncake-store/src/cachelib_memory_allocator").display()
+        build_dir
+            .join("mooncake-store/src/cachelib_memory_allocator")
+            .display()
     );
 
     println!("cargo:rustc-link-lib=mooncake_store");
@@ -231,16 +238,18 @@ fn main() {
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=glog");
     println!("cargo:rustc-link-lib=gflags");
-    println!("cargo:rustc-link-lib=numa");   // NUMA binding
-    println!("cargo:rustc-link-lib=curl");    // HTTP metadata plugin
+    println!("cargo:rustc-link-lib=numa"); // NUMA binding
+    println!("cargo:rustc-link-lib=curl"); // HTTP metadata plugin
     println!("cargo:rustc-link-lib=ibverbs"); // RDMA transport
+    println!("cargo:rustc-link-lib=yaml-cpp"); // tenant quota policy connector
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=xxhash");
 
     // -----------------------------------------------------------------------
     // Header path for bindgen
     // -----------------------------------------------------------------------
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let mut search_dirs = Vec::new();
 
     let explicit_lib_dir = env::var("MOONCAKE_STORE_LIB_DIR").ok().map(PathBuf::from);
@@ -287,21 +296,41 @@ fn main() {
     push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
     push_env_paths(&mut search_dirs, "LIBRARY_PATH");
 
-    let asan_runtime_so = compiler_runtime_library("libasan.so");
-    if let Some(path) = asan_runtime_so.as_ref() {
-        if let Some(parent) = path.parent() {
-            push_existing_dir(&mut search_dirs, parent.to_path_buf());
+    // Only link the AddressSanitizer runtime when explicitly requested via
+    // MOONCAKE_LINK_ASAN. Linking libasan whenever the toolchain merely *ships*
+    // it (gcc always does) pulls the ASan runtime into an otherwise
+    // non-sanitized build, even though a Release Mooncake has no `__asan_*`
+    // symbols. Any consumer that `dlopen()`s the resulting library then aborts
+    // at load with "ASan runtime does not come first in the initial library
+    // list", since a late-loaded plugin can never be first. Default to NOT
+    // linking it; sanitized builds opt in with `MOONCAKE_LINK_ASAN=1` (and run
+    // with `LD_PRELOAD=$(gcc -print-file-name=libasan.so)`).
+    let want_asan = env::var("MOONCAKE_LINK_ASAN")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(false);
+    let has_asan_runtime = if want_asan {
+        let asan_runtime_so = compiler_runtime_library("libasan.so");
+        if let Some(path) = asan_runtime_so.as_ref() {
+            if let Some(parent) = path.parent() {
+                push_existing_dir(&mut search_dirs, parent.to_path_buf());
+            }
         }
-    }
-    let has_asan_runtime = asan_runtime_so.is_some()
-        || add_compiler_runtime_search_dir(&mut search_dirs, "libasan.a");
+        asan_runtime_so.is_some() || add_compiler_runtime_search_dir(&mut search_dirs, "libasan.a")
+    } else {
+        false
+    };
     let has_gcov_runtime = add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.a")
         || add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.so");
 
     emit_link_searches(&search_dirs);
     emit_runtime_rpaths(&search_dirs);
 
-    if has_asan_runtime || has_library(&search_dirs, &["asan"]) {
+    if want_asan && (has_asan_runtime || has_library(&search_dirs, &["asan"])) {
         println!("cargo:rustc-link-lib=asan");
     }
 
@@ -319,6 +348,7 @@ fn main() {
         "numa",
         "ibverbs",
         "jsoncpp",
+        "yaml-cpp",
         "zstd",
         "m",
     ] {
@@ -331,6 +361,7 @@ fn main() {
         ("curl", &["curl"]),
         ("cuda", &["cuda"]),
         ("cudart", &["cudart"]),
+        ("mlx5", &["mlx5"]), // IBGDA device transport (mlx5 DevX) pulled into transfer_engine, CUDA-only
         ("uring", &["uring"]),
     ] {
         if has_library(&search_dirs, candidates) {
@@ -342,8 +373,8 @@ fn main() {
         println!("cargo:rustc-link-lib=gcov");
     }
 
-    let include_dir = env::var("MOONCAKE_STORE_INCLUDE_DIR")
-        .unwrap_or_else(|_| "../include".to_string());
+    let include_dir =
+        env::var("MOONCAKE_STORE_INCLUDE_DIR").unwrap_or_else(|_| "../include".to_string());
 
     let header = format!("{include_dir}/store_c.h");
 
@@ -355,6 +386,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=CXX");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_LINK_ASAN");
 
     let bindings = bindgen::Builder::default()
         .header(&header)

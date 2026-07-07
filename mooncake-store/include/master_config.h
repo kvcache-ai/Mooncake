@@ -11,6 +11,9 @@
 
 namespace mooncake {
 
+// Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
+class HttpMetadataServer;
+
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
     std::string_view etcd_endpoints) {
@@ -62,6 +65,15 @@ struct MasterConfig {
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
+    // Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*)
+    // when client heartbeat times out. Works in two modes: (1) co-located
+    // (enable_http_metadata_server=true) via in-process removal, or
+    // (2) separately-deployed metadata server via async HTTP DELETE.
+    bool enable_metadata_cleanup_on_timeout;
+
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
 
     uint64_t put_start_discard_timeout_sec;
     uint64_t put_start_release_timeout_sec;
@@ -69,6 +81,9 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
@@ -103,6 +118,8 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY so the next Get is fast.
@@ -160,6 +177,9 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -185,10 +205,24 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
+
+    // Metadata cleanup on client timeout. Resolved in main() (not from
+    // MasterConfig) and forwarded to the serving primary's
+    // WrappedMasterService. Co-located: in-process server pointer; separate:
+    // derived http(s) URL.
+    HttpMetadataServer* http_metadata_server = nullptr;
+    std::string http_metadata_remote_url;
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -213,6 +247,8 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -245,6 +281,9 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
@@ -266,6 +305,9 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        pod_name = config.pod_name;
+        pod_namespace = config.pod_namespace;
         validate();
     }
 
@@ -355,6 +397,8 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -371,6 +415,9 @@ class WrappedMasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -423,6 +470,8 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -436,6 +485,9 @@ class WrappedMasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -451,11 +503,17 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else if (config.allocation_strategy == "ssd_free_ratio_first") {
+            allocation_strategy_type =
+                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "local_first") {
+            allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
-                         << "Valid options are: random, free_ratio_first, cxl "
+                         << "Valid options are: random, free_ratio_first, cxl, "
+                            "ssd_free_ratio_first, local_first "
                             "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
@@ -509,6 +567,8 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -523,6 +583,9 @@ class WrappedMasterServiceConfig {
         memory_allocator = config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -584,6 +647,9 @@ class MasterServiceConfigBuilder {
         AllocationStrategyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
+    bool enable_multi_tenants_ = false;
+    std::string tenant_quota_connector_type_ = "file";
+    std::string tenant_quota_connector_uri_;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
@@ -722,6 +788,23 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allocation_strategy_type(
         AllocationStrategyType type) {
         allocation_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_multi_tenants(bool enable) {
+        enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_tenant_quota_connector_type(
+        const std::string& type) {
+        tenant_quota_connector_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_tenant_quota_connector_uri(
+        const std::string& uri) {
+        tenant_quota_connector_uri_ = uri;
         return *this;
     }
 
@@ -894,6 +977,8 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -910,6 +995,9 @@ class MasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -958,6 +1046,8 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -972,6 +1062,9 @@ class MasterServiceConfig {
         allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -1035,6 +1128,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_multi_tenants = enable_multi_tenants_;
+    config.tenant_quota_connector_type = tenant_quota_connector_type_;
+    config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
     config.enable_snapshot = enable_snapshot_;
     config.snapshot_backup_dir = snapshot_backup_dir_;

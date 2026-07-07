@@ -16,7 +16,8 @@ Thank you for your interest in contributing to Mooncake! Our community warmly we
 
 ### PR Title and Classification
 
-Use a prefixed PR title to indicate the type of changes. Please use one of the following:
+Use a prefixed PR title to indicate the type or module affected by the changes.
+Prefer one of the following documented prefixes:
 
 - ``[Bugfix]`` for bug fixes.
 - ``[CI/Build]`` for build or continuous integration improvements.
@@ -27,6 +28,11 @@ Use a prefixed PR title to indicate the type of changes. Please use one of the f
 - ``[TransferEngine]`` for changes in the ``mooncake-transfer-engine``.
 - ``[Misc]`` for PRs that do not fit the above categories. Please use this
   sparingly.
+
+The project history also contains common aliases and module prefixes. Use these
+when they better match the change scope: ``[Bug fix]``, ``[Build]``, ``[CI]``,
+``[Docs]``, ``[EP]``, ``[Feature]``, ``[MUSA]``, ``[PG]``, ``[TE]``,
+``[TENT]``, and ``[Wheel]``.
 
 ### RFC Discussion
 
@@ -50,7 +56,7 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 
 #### Setup
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 pre-commit install
 ```
 
@@ -70,7 +76,7 @@ git commit -m "chore: pre-commit autoupdate"
 
 If clang-format is missing, install it (Ubuntu example):
 ```bash
-sudo apt-get update && sudo apt-get install -y clang-format
+sudo apt-get update && sudo apt-get install -y clang-format-20
 ```
 
 You can temporarily skip hooks:

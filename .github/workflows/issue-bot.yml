@@ -1,0 +1,71 @@
+name: Issue Bot
+
+on:
+  issues:
+    types: [opened]
+  schedule:
+    # Daily at 03:00 UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  welcome-and-assign:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post welcome comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = [
+              `Thanks for opening this issue, @${issue.user.login}!`,
+              '',
+              '| Field | Value |',
+              '|-------|-------|',
+              `| **Issue** | #${issue.number} |`,
+              `| **GitHub user ID** | \`${issue.user.id}\` |`,
+              `| **Reporter** | @${issue.user.login} |`,
+              '',
+              'A maintainer will triage this when possible. To help us respond faster, please include:',
+              '',
+              '- Mooncake version or commit SHA',
+              '- Environment (OS, CUDA/driver, RDMA stack if relevant)',
+              '- Steps to reproduce and expected vs. actual behavior',
+              '',
+              `Useful links: [Documentation](https://kvcache-ai.github.io/Mooncake/) · [Contributing guide](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/CONTRIBUTING.md)`,
+              '',
+              '> This message was posted automatically by the issue bot.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body,
+            });
+
+  close-stale-issues:
+    if: github.event_name != 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close inactive issues (3+ months)
+        uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          days-before-stale: 90
+          days-before-close: 7
+          stale-issue-label: stale
+          close-issue-label: auto-closed
+          stale-issue-message: >
+            This issue has had no activity for 90 days and will be closed in 7 days
+            if there is no further activity. Please comment or react if it should
+            stay open.
+          close-issue-message: >
+            Closing due to 3 months of inactivity. If this is still relevant,
+            please comment and we can reopen.
+          exempt-issue-labels: pinned,keep-open,security
+          operations-per-run: 100

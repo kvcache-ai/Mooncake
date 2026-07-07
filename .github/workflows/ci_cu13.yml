@@ -52,10 +52,6 @@ jobs:
           core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
     - name: Install dependencies
       run: |
         sudo apt update -y
@@ -75,7 +71,7 @@ jobs:
           -DWITH_STORE=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_EP=ON \
-          -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0" \
+          -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1" \
           -DWITH_METRICS=ON \
           -DBUILD_UNIT_TESTS=OFF \
           -DBUILD_EXAMPLES=ON \
@@ -106,6 +102,11 @@ jobs:
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
+
+    - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Generate Python version tag
       id: generate_tag

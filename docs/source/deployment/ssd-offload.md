@@ -2,7 +2,9 @@
 
 ## Overview
 
-Mooncake Store supports offloading KV cache objects from distributed memory to local SSD. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from SSD.
+Mooncake Store supports offloading KV cache objects from distributed memory to a local filesystem path, typically backed by local SSDs. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from the local filesystem-backed offload path.
+
+For measured TTFT and throughput impact in multi-turn workloads, see [Mooncake SSD Offload Benchmark](../performance/ssd-offload-benchmark-results.md).
 
 SSD offload requires the **Real Client** and supports two deployment modes:
 
@@ -10,6 +12,8 @@ SSD offload requires the **Real Client** and supports two deployment modes:
 - **Mode B: Standalone Real Client + DummyClient** — a standalone `mooncake_client` process runs SSD offload, and the Python process connects via a DummyClient.
 
 In both modes, all SSD reads and writes happen within the Real Client (embedded or standalone).
+
+SSD offload does not use the master's `--root_fs_dir` option. Configure the local disk path on each Real Client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks offloaded objects as `LOCAL_DISK` replicas. `--root_fs_dir` is a legacy parameter from an older persistence path and may cause issues when used with `--enable_offload=true`.
 
 ## Startup Steps
 
@@ -131,7 +135,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
-| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `none` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 
 ### File-per-key backend settings
 

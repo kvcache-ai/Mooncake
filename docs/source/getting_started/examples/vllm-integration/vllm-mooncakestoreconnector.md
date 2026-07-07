@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Guide: vLLM MooncakeStoreConnector
 
 ```{admonition} Archived
@@ -116,7 +120,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     }'
 ```
 
-Proxy：
+Proxy:
 
 ```shell
 python examples/disaggregated/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py \

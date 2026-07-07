@@ -1,6 +1,6 @@
 # Quick Start: SGLang HiCache with Mooncake Backend
 
-Follow this streamlined workflow to get SGLang HiCache running with Mooncake as the L3 storage backend.
+Follow this streamlined workflow to get SGLang HiCache running with Mooncake as the L3 storage backend. In benchmarks, pre-populated Mooncake achieves **best TTFT** across all tiers, maintaining high cache hit rates as conversation rounds grow ([details](../../../performance/sglang-hicache-benchmark-results-v1)).
 
 > Need more background or tuning options? See the [Complete Guide](hicache-integration-v1.md).
 
