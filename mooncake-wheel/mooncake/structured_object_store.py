@@ -33,7 +33,9 @@ _TYPED_RAGGED_DEFAULT_DTYPE = "float64"
 # Fallback field spec when a member has no stored encoding metadata (e.g. older
 # format or unknown field).  Treated as opaque bytes by the read path.
 _BYTES_FIELD_SPEC: dict[str, str] = {"encoding": "bytes"}
-_INFER_STRUCTURE_MAX_DEPTH = 32
+_INFER_MAX_DEPTH = 32
+_INFER_MAX_STRUCT_KEYS = 64
+_INFER_MAX_LIST_LEN = 8
 
 
 class BundleStore(Protocol):
@@ -776,24 +778,20 @@ class MooncakeBundleTransfer:
                 stage_ref = ref.stage_refs[location.stage]
                 encoded = ref.encoded_non_tensor[name]
                 if row_indices is not None:
-                    payload, metadata = (
-                        self._read_structured_non_tensor_payload_indices(
-                            stage_ref,
-                            encoded,
-                            row_indices,
-                        )
+                    payload, metadata = self._read_structured_non_tensor_payload_indices(
+                        stage_ref,
+                        encoded,
+                        row_indices,
                     )
                     values = _decode_structured_non_tensor_encoded(
                         encoded, payload, output_rows, metadata
                     )
                 else:
-                    payload, metadata = (
-                        self._read_structured_non_tensor_payload_slice(
-                            stage_ref,
-                            encoded,
-                            row_slice,
-                            ref.batch_size,
-                        )
+                    payload, metadata = self._read_structured_non_tensor_payload_slice(
+                        stage_ref,
+                        encoded,
+                        row_slice,
+                        ref.batch_size,
                     )
                     values = _decode_structured_non_tensor_encoded(
                         encoded, payload, output_rows, metadata
@@ -855,13 +853,9 @@ class MooncakeBundleTransfer:
                 raise ValueError(
                     f"raw destination has {destination.size} bytes, expected at least {nbytes}"
                 )
-            target = (
-                np.ctypeslib.as_array(
-                    (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
-                )
-                .view(dtype_obj)
-                .reshape(output_shape)
-            )
+            target = np.ctypeslib.as_array(
+                (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
+            ).view(dtype_obj).reshape(output_shape)
             if not indices:
                 return target
             row_width = dtype_obj.itemsize * int(np.prod(full_shape[1:], dtype=np.int64))
@@ -938,10 +932,7 @@ class MooncakeBundleTransfer:
                     )
                     for out, row in enumerate(indices)
                 ]
-                if (
-                    isinstance(destination, _RawDestinationBuffer)
-                    and destination.pre_registered
-                ):
+                if isinstance(destination, _RawDestinationBuffer) and destination.pre_registered:
                     self._bundle_store.read_payload_ranges_into_raw_destination(
                         payload_spec, destination.ptr, ranges
                     )
@@ -1035,22 +1026,20 @@ class MooncakeBundleTransfer:
                     for name, global_name in leaf_payload_members.items()
                     if name != "missing"
                 }
-                leaf_payload, _leaf_metadata = (
-                    self._read_structured_non_tensor_payload_indices(
-                        stage_ref,
-                        {
-                            "codec": leaf["codec"],
-                            "metadata": leaf.get("metadata") or {},
-                            "payload_members": flat_payload_members,
-                        },
-                        indices,
-                    )
+                leaf_payload, _leaf_metadata = self._read_structured_non_tensor_payload_indices(
+                    stage_ref,
+                    {
+                        "codec": leaf["codec"],
+                        "metadata": leaf.get("metadata") or {},
+                        "payload_members": flat_payload_members,
+                    },
+                    indices,
                 )
                 leaf["metadata"] = _leaf_metadata
                 for name, value in leaf_payload.items():
                     recursive_payload[leaf_payload_members[name]] = value
-                recursive_payload[leaf_payload_members["missing"]] = (
-                    read_member_indices(leaf_payload_members["missing"], indices)
+                recursive_payload[leaf_payload_members["missing"]] = read_member_indices(
+                    leaf_payload_members["missing"], indices
                 )
             return recursive_payload, metadata
 
@@ -1142,13 +1131,7 @@ class MooncakeBundleTransfer:
                 "nulls": read_member_indices("nulls", indices),
             }, metadata
 
-        if codec in {
-            "media_bytes",
-            "bytes_ragged",
-            "utf8_ragged",
-            "msgpack_ragged",
-            "json_ragged",
-        }:
+        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "msgpack_ragged", "json_ragged"}:
             offsets = read_member_indices(
                 "offsets", [index for row in indices for index in (row, row + 1)]
             )
@@ -1186,9 +1169,7 @@ class MooncakeBundleTransfer:
             gathered_row_offsets = np.empty(len(indices) + 1, dtype=row_offsets.dtype)
             gathered_row_offsets[0] = 0
             for index, count in enumerate(item_counts):
-                gathered_row_offsets[index + 1] = (
-                    int(gathered_row_offsets[index]) + count
-                )
+                gathered_row_offsets[index + 1] = int(gathered_row_offsets[index]) + count
             boundary_indices = [
                 boundary
                 for begin, end in zip(item_begins, item_ends)
@@ -1278,17 +1259,15 @@ class MooncakeBundleTransfer:
                     for name, global_name in leaf_payload_members.items()
                     if name != "missing"
                 }
-                leaf_payload, _leaf_metadata = (
-                    self._read_structured_non_tensor_payload_slice(
-                        stage_ref,
-                        {
-                            "codec": leaf["codec"],
-                            "metadata": leaf.get("metadata") or {},
-                            "payload_members": flat_payload_members,
-                        },
-                        row_slice,
-                        total_rows,
-                    )
+                leaf_payload, _leaf_metadata = self._read_structured_non_tensor_payload_slice(
+                    stage_ref,
+                    {
+                        "codec": leaf["codec"],
+                        "metadata": leaf.get("metadata") or {},
+                        "payload_members": flat_payload_members,
+                    },
+                    row_slice,
+                    total_rows,
                 )
                 leaf["metadata"] = _leaf_metadata
                 for name, value in leaf_payload.items():
@@ -1340,13 +1319,7 @@ class MooncakeBundleTransfer:
                 "nulls": read_member("nulls", start, end),
             }, metadata
 
-        if codec in {
-            "media_bytes",
-            "bytes_ragged",
-            "utf8_ragged",
-            "msgpack_ragged",
-            "json_ragged",
-        }:
+        if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "msgpack_ragged", "json_ragged"}:
             offsets = read_member("offsets", start, end + 1)
             base = int(offsets[0])
             limit = int(offsets[-1])
@@ -1924,7 +1897,9 @@ def _resolve_dataproto_field_selection(
         ]
     else:
         batch_names = [] if batch_fields is None else list(batch_fields)
-        non_tensor_names = [] if non_tensor_fields is None else list(non_tensor_fields)
+        non_tensor_names = (
+            [] if non_tensor_fields is None else list(non_tensor_fields)
+        )
     _validate_dataproto_fields_exist(ref, [*batch_names, *non_tensor_names])
     return batch_names, non_tensor_names
 
@@ -2163,7 +2138,7 @@ def _encode_recursive_if_structured(
 ) -> "_EncodedStructuredLeaf | None":
     leaves: list[_InferredLeaf] = []
     nodes: list[_InferredNode] = []
-    _infer_structure(path, values, leaves, nodes)
+    infer_structure(path, values, leaves, nodes)
     if not nodes or not any(_should_encode_recursive_leaf(leaf) for leaf in leaves):
         return None
     payload: dict[str, Any] = {}
@@ -2175,20 +2150,20 @@ def _encode_recursive_if_structured(
             "node_type": node.node_type,
             "children": list(node.children),
         }
-        missing_name = f"node.{node_id}.missing"
-        payload[missing_name] = np.asarray(
+        missing_payload_name = f"node.{node_id}.missing"
+        payload[missing_payload_name] = np.asarray(
             [_lookup_structured_path(value, path, node.path) is MISSING for value in values],
             dtype=np.bool_,
         )
-        spec["missing_payload"] = missing_name
+        spec["missing_payload"] = missing_payload_name
         if node.row_mask is not None:
-            row_mask_name = f"node.{node_id}.row_mask"
-            payload[row_mask_name] = np.asarray(node.row_mask, dtype=np.bool_)
-            spec["row_mask_payload"] = row_mask_name
+            payload_name = f"node.{node_id}.row_mask"
+            payload[payload_name] = np.asarray(node.row_mask, dtype=np.bool_)
+            spec["row_mask_payload"] = payload_name
         if node.lengths is not None:
-            lengths_name = f"node.{node_id}.lengths"
-            payload[lengths_name] = np.asarray(node.lengths, dtype=np.int64)
-            spec["lengths_payload"] = lengths_name
+            payload_name = f"node.{node_id}.lengths"
+            payload[payload_name] = np.asarray(node.lengths, dtype=np.int64)
+            spec["lengths_payload"] = payload_name
         node_specs.append(spec)
 
     leaf_specs: list[dict[str, Any]] = []
@@ -2212,12 +2187,12 @@ def _encode_recursive_if_structured(
         )
         leaf_payload_members: dict[str, str] = {}
         for payload_name, payload_value in encoded.payload.items():
-            recursive_name = f"leaf.{leaf_id}.{payload_name}"
-            payload[recursive_name] = payload_value
-            leaf_payload_members[payload_name] = recursive_name
-        missing_name = f"leaf.{leaf_id}.missing"
-        payload[missing_name] = missing
-        leaf_payload_members["missing"] = missing_name
+            recursive_payload_name = f"leaf.{leaf_id}.{payload_name}"
+            payload[recursive_payload_name] = payload_value
+            leaf_payload_members[payload_name] = recursive_payload_name
+        missing_payload_name = f"leaf.{leaf_id}.missing"
+        payload[missing_payload_name] = missing
+        leaf_payload_members["missing"] = missing_payload_name
         leaf_specs.append(
             {
                 "id": leaf_id,
@@ -2245,21 +2220,16 @@ def _encode_recursive_if_structured(
 def _should_encode_recursive_leaf(leaf: "_InferredLeaf") -> bool:
     if leaf.decision.codec == "typed_ragged":
         return leaf.decision.metadata.get("recursive_source") == "ndarray"
-    return leaf.decision.codec in {
-        "ragged_tensor",
-        "bytes_ragged",
-        "media_bytes",
-        "media_list_ragged",
-    }
+    return leaf.decision.codec in {"ragged_tensor", "bytes_ragged", "media_bytes", "media_list_ragged"}
 
 
 def _encode_with_fallback(path: str, value: np.ndarray) -> "_EncodedStructuredLeaf":
-    """Encode using type-based fallback (delegates to _leaf_decision), with recursive expansion for structured rows."""
+    """Encode using type-based fallback (delegates to _choose_leaf_codec), with recursive expansion for structured rows."""
     values = list(value)
     recursive = _encode_recursive_if_structured(path, values)
     if recursive is not None:
         return recursive
-    decision = _leaf_decision(values)
+    decision = _choose_leaf_codec(values)
     metadata = dict(decision.metadata or {})
     schema = FieldSchema(codec=decision.codec, metadata=metadata)
     return _encode_with_schema(path, value, schema)
@@ -2288,7 +2258,7 @@ def _decode_structured_non_tensor_encoded(
 
 
 def _copy_recursive_metadata_for_leaf_updates(
-    metadata: Mapping[str, Any],
+    metadata: Mapping[str, Any]
 ) -> dict[str, Any]:
     copied = dict(metadata)
     copied["leaves"] = [dict(leaf) for leaf in metadata.get("leaves", [])]
@@ -2340,9 +2310,7 @@ def _reconstruct_structured_rows(
 ) -> list[Any]:
     values_by_path: dict[str, list[Any]] = dict(leaf_values)
     nodes = sorted(
-        metadata.get("nodes", []),
-        key=lambda node: _path_depth(node["path"]),
-        reverse=True,
+        metadata.get("nodes", []), key=lambda node: _path_depth(node["path"]), reverse=True
     )
     for node in nodes:
         missing_payload = node.get("missing_payload")
@@ -3187,9 +3155,7 @@ class _StructuredObjectLayer:
         row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
         data_offset = metadata_bytes + start * row_width
         data_length = (end - start) * row_width
-        metadata = self._bundle_store.read_payload_range(
-            payload_spec, 0, metadata_bytes
-        )
+        metadata = self._bundle_store.read_payload_range(payload_spec, 0, metadata_bytes)
         sliced_metadata = _slice_tensor_metadata(
             metadata, (end - start, *shape[1:]), data_length
         )
@@ -3204,10 +3170,7 @@ class _StructuredObjectLayer:
                     f"tensor destination has {destination.size} bytes, expected at least {expected_bytes}"
                 )
             ctypes.memmove(destination.ptr, sliced_metadata, metadata_bytes)
-            if (
-                isinstance(destination, _RawDestinationBuffer)
-                and destination.pre_registered
-            ):
+            if isinstance(destination, _RawDestinationBuffer) and destination.pre_registered:
                 self._bundle_store.read_payload_range_into_raw_destination(
                     payload_spec,
                     destination.ptr,
@@ -4508,7 +4471,9 @@ class _MooncakePayloadTransport:
         fragments = []
         for source_offset, destination_offset, byte_length in ranges:
             fragments.extend(
-                _payload_range_fragments(chunks, source_offset, byte_length, destination_offset)
+                _payload_range_fragments(
+                    chunks, source_offset, byte_length, destination_offset
+                )
             )
         if not fragments:
             return True
@@ -4683,26 +4648,20 @@ def _resolve_ndarray_destination(
                 f"raw destination has {destination.size} bytes, expected at least {nbytes}"
             )
         _ = destination.owner
-        return (
-            np.ctypeslib.as_array(
-                (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
-            )
-            .view(dtype)
-            .reshape(shape)
-        )
+        return np.ctypeslib.as_array(
+            (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
+        ).view(dtype).reshape(shape)
     if not isinstance(destination, np.ndarray):
         raise TypeError(
             f"structured ndarray field {name} destination must be a numpy.ndarray or raw_destination"
         )
     if destination.dtype != dtype:
         raise ValueError(
-            f"structured ndarray field {name} destination dtype mismatch: "
-            f"expected {dtype.str}, got {destination.dtype.str}"
+            f"structured ndarray field {name} destination dtype mismatch: expected {dtype.str}, got {destination.dtype.str}"
         )
     if tuple(destination.shape) != shape:
         raise ValueError(
-            f"structured ndarray field {name} destination shape mismatch: "
-            f"expected {shape}, got {tuple(destination.shape)}"
+            f"structured ndarray field {name} destination shape mismatch: expected {shape}, got {tuple(destination.shape)}"
         )
     if not destination.flags["C_CONTIGUOUS"]:
         raise ValueError(
@@ -5202,31 +5161,13 @@ def _parse_torch_dtype(dtype_str: str) -> Any:
     return dtype
 
 
-_TORCH_TO_NUMPY_DTYPE = {
-    "torch.float16": np.float16,
-    "torch.float32": np.float32,
-    "torch.float64": np.float64,
-    "torch.bfloat16": np.float16,  # numpy has no bfloat16, use float16 size
-    "torch.int8": np.int8,
-    "torch.int16": np.int16,
-    "torch.int32": np.int32,
-    "torch.int64": np.int64,
-    "torch.uint8": np.uint8,
-    "torch.bool": np.bool_,
-}
-
-
 def _torch_dtype_to_numpy(dtype_str: str) -> np.dtype:
     """Convert torch dtype string to numpy dtype for buffer interpretation."""
-    result = _TORCH_TO_NUMPY_DTYPE.get(dtype_str)
-    if result is not None:
-        return np.dtype(result)
-    # Fallback: strip 'torch.' prefix and try numpy
-    name = dtype_str.removeprefix("torch.")
-    try:
-        return np.dtype(name)
-    except TypeError:
-        return np.dtype(np.float32)
+    torch_dtype = _parse_torch_dtype(dtype_str)
+    # bfloat16 has no numpy equivalent; use float16 (same element size)
+    if torch_dtype == _torch.bfloat16:
+        return np.dtype(np.float16)
+    return _torch.empty(0, dtype=torch_dtype).numpy().dtype
 
 
 @dataclass
@@ -5291,7 +5232,7 @@ def _is_bytes_like(value: Any) -> bool:
 
 
 def _non_null(values: list[Any]) -> list[Any]:
-    return [value for value in values if value is not None and not isinstance(value, _Missing)]
+    return [v for v in values if v is not None and not isinstance(v, _Missing)]
 
 
 def _is_media_list(value: Any) -> bool:
@@ -5300,7 +5241,7 @@ def _is_media_list(value: Any) -> bool:
     )
 
 
-def _leaf_decision(values: list[Any]) -> _CodecDecision:
+def _choose_leaf_codec(values: list[Any]) -> _CodecDecision:
     nn = _non_null(values)
     if not nn:
         return _CodecDecision(False, "msgpack_ragged", "all rows are null", "msgpack")
@@ -5341,64 +5282,79 @@ def _leaf_decision(values: list[Any]) -> _CodecDecision:
 
 def _try_expand_dict(values: list[Any]) -> list[str] | None:
     nn = _non_null(values)
-    if not nn or not all(isinstance(value, dict) for value in nn):
+    if not nn or not all(isinstance(v, dict) for v in nn):
         return None
-    keys = {key for value in nn for key in value.keys()}
-    if not all(isinstance(key, str) for key in keys) or len(keys) > 64:
+    keys = {k for v in nn for k in v.keys()}
+    if not all(isinstance(k, str) for k in keys) or len(keys) > _INFER_MAX_STRUCT_KEYS:
         return None
     return sorted(keys)
 
 
 def _try_expand_list(values: list[Any]) -> tuple[int, list[int]] | None:
     nn = _non_null(values)
-    if not nn or not all(isinstance(value, (list, tuple)) for value in nn):
+    if not nn or not all(isinstance(v, (list, tuple)) for v in nn):
         return None
-    max_len = max(len(value) for value in nn)
-    if max_len > 8:
+    max_len = max(len(v) for v in nn)
+    if max_len > _INFER_MAX_LIST_LEN:
         return None
     if not all(
-        item is None or isinstance(item, (dict, list, tuple))
-        for value in nn
-        for item in value
+        item is None or isinstance(item, (dict, list, tuple)) for v in nn for item in v
     ):
         return None
-    lengths = [len(value) if isinstance(value, (list, tuple)) else 0 for value in values]
+    lengths = [len(v) if isinstance(v, (list, tuple)) else 0 for v in values]
     return max_len, lengths
 
 
-def _infer_structure(
+def infer_structure(
     path: str,
     values: list[Any],
     leaves: list[_InferredLeaf],
     nodes: list[_InferredNode],
     *,
-    depth: int = 0,
+    _depth: int = 0,
 ) -> None:
-    if depth > _INFER_STRUCTURE_MAX_DEPTH:
-        raise ValueError(f"infer_structure exceeded max depth {_INFER_STRUCTURE_MAX_DEPTH} at {path!r}")
+    """Recursively expand *values* into leaves and interior nodes.
+
+    *leaves* and *nodes* are output accumulators populated during recursion.
+    Absent dict keys are represented as ``MISSING`` in child columns
+    (distinct from ``None`` values).  Each interior node carries a
+    ``row_mask`` that records which rows had a real parent container.
+    """
+    if _depth > _INFER_MAX_DEPTH:
+        raise ValueError(
+            f"infer_structure exceeded max depth {_INFER_MAX_DEPTH} at {path!r}"
+        )
     dict_keys = _try_expand_dict(values)
     if dict_keys is not None:
-        row_mask = [isinstance(value, dict) for value in values]
+        row_mask = [isinstance(v, dict) for v in values]
         nodes.append(_InferredNode(path, "dict", dict_keys, row_mask=row_mask))
         for key in dict_keys:
-            child = [value.get(key, MISSING) if isinstance(value, dict) else None for value in values]
-            _infer_structure(f"{path}.{_escape_key(key)}", child, leaves, nodes, depth=depth + 1)
+            child = [
+                v.get(key, MISSING) if isinstance(v, dict) else None for v in values
+            ]
+            infer_structure(
+                f"{path}.{_escape_key(key)}", child, leaves, nodes, _depth=_depth + 1
+            )
         return
     list_result = _try_expand_list(values)
     if list_result is not None:
         max_len, lengths = list_result
-        row_mask = [isinstance(value, (list, tuple)) for value in values]
-        nodes.append(_InferredNode(path, "list", list(range(max_len)), lengths, row_mask=row_mask))
+        row_mask = [isinstance(v, (list, tuple)) for v in values]
+        nodes.append(
+            _InferredNode(
+                path, "list", list(range(max_len)), lengths, row_mask=row_mask
+            )
+        )
         for index in range(max_len):
             child = [
-                value[index]
-                if isinstance(value, (list, tuple)) and index < len(value)
-                else (MISSING if isinstance(value, (list, tuple)) else None)
-                for value in values
+                v[index]
+                if isinstance(v, (list, tuple)) and index < len(v)
+                else (MISSING if isinstance(v, (list, tuple)) else None)
+                for v in values
             ]
-            _infer_structure(f"{path}[{index}]", child, leaves, nodes, depth=depth + 1)
+            infer_structure(f"{path}[{index}]", child, leaves, nodes, _depth=_depth + 1)
         return
-    leaves.append(_InferredLeaf(path, values, _leaf_decision(values)))
+    leaves.append(_InferredLeaf(path, values, _choose_leaf_codec(values)))
 
 
 def _structured_path_tokens(path: str) -> list[Any]:

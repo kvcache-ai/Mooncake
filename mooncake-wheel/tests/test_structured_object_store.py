@@ -1091,7 +1091,11 @@ def test_structured_object_tensor_object_buffer_uses_put_tensor_from() -> None:
 
     ref = transfer.put_structured_object(
         StructuredObjectPayload(
-            buffers={"tensor": tensor_object_buffer(source_ptr, len(source.raw), source, batch_size=1)}
+            buffers={
+                "tensor": tensor_object_buffer(
+                    source_ptr, len(source.raw), source, batch_size=1
+                )
+            }
         ),
         policy=BundleTransferPolicy(copy_mode="zero_copy"),
     )
@@ -1111,7 +1115,11 @@ def test_structured_object_tensor_object_buffer_materialize_into_uses_ranges() -
 
     ref = transfer.put_structured_object(
         StructuredObjectPayload(
-            buffers={"tensor": tensor_object_buffer(source_ptr, len(source.raw), source, batch_size=1)}
+            buffers={
+                "tensor": tensor_object_buffer(
+                    source_ptr, len(source.raw), source, batch_size=1
+                )
+            }
         ),
         policy=BundleTransferPolicy(copy_mode="zero_copy"),
     )
@@ -1120,7 +1128,14 @@ def test_structured_object_tensor_object_buffer_materialize_into_uses_ranges() -
 
     result = transfer.materialize_into(
         transfer.read_spec(ref),
-        {"tensor": tensor_object_buffer(destination_ptr, len(destination.raw), destination, batch_size=1)},
+        {
+            "tensor": tensor_object_buffer(
+                destination_ptr,
+                len(destination.raw),
+                destination,
+                batch_size=1,
+            )
+        },
     )
 
     assert result.objects["tensor"].ptr == destination_ptr

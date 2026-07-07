@@ -273,8 +273,8 @@ class TestDistributedObjectStore(unittest.TestCase):
 from mooncake.structured_object_store import (
     MISSING,
     _escape_key,
-    _infer_structure,
-    _leaf_decision,
+    infer_structure,
+    _choose_leaf_codec,
 )
 
 
@@ -282,80 +282,80 @@ class TestCodecInference(unittest.TestCase):
 
     def test_tensor(self):
         import torch
-        d = _leaf_decision([torch.tensor([1, 2]), torch.tensor([3])])
+        d = _choose_leaf_codec([torch.tensor([1, 2]), torch.tensor([3])])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
     def test_tensor_mixed_dtype(self):
         import torch
-        d = _leaf_decision([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
+        d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
     def test_tensor_mixed_ndim(self):
         import torch
-        d = _leaf_decision([torch.tensor([1]), torch.tensor([[1, 2]])])
+        d = _choose_leaf_codec([torch.tensor([1]), torch.tensor([[1, 2]])])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
     def test_numeric_sequence(self):
-        d = _leaf_decision([[1, 2, 3], [4, 5]])
+        d = _choose_leaf_codec([[1, 2, 3], [4, 5]])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "typed_ragged")
 
     def test_bytes(self):
-        d = _leaf_decision([b"hello", b"world"])
+        d = _choose_leaf_codec([b"hello", b"world"])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "bytes_ragged")
 
     def test_text(self):
-        d = _leaf_decision(["hello", "world"])
+        d = _choose_leaf_codec(["hello", "world"])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "utf8_ragged")
 
     def test_json(self):
-        d = _leaf_decision([{"a": 1}, {"b": 2}])
+        d = _choose_leaf_codec([{"a": 1}, {"b": 2}])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "msgpack_ragged")
 
     def test_json_rejects_late_non_serializable(self):
         values = [{"ok": i} for i in range(200)] + [object()]
-        d = _leaf_decision(values)
+        d = _choose_leaf_codec(values)
         self.assertFalse(d.accepted)
 
     def test_scalar(self):
-        d = _leaf_decision([1, 2.0, 3])
+        d = _choose_leaf_codec([1, 2.0, 3])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ndarray")
 
     def test_fallback(self):
-        d = _leaf_decision([object(), object()])
+        d = _choose_leaf_codec([object(), object()])
         self.assertFalse(d.accepted)
         self.assertEqual(d.codec, "msgpack_ragged")
 
     def test_with_nulls(self):
-        d = _leaf_decision(["hello", None, "world"])
+        d = _choose_leaf_codec(["hello", None, "world"])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "utf8_ragged")
 
     def test_empty_values(self):
-        d = _leaf_decision([])
+        d = _choose_leaf_codec([])
         self.assertFalse(d.accepted)
 
     def test_all_none(self):
-        d = _leaf_decision([None, None, None])
+        d = _choose_leaf_codec([None, None, None])
         self.assertFalse(d.accepted)
 
     def test_infer_flat(self):
         leaves, nodes = [], []
-        _infer_structure("root", ["a", "b", "c"], leaves, nodes)
+        infer_structure("root", ["a", "b", "c"], leaves, nodes)
         self.assertEqual(len(leaves), 1)
         self.assertEqual(len(nodes), 0)
         self.assertEqual(leaves[0].decision.codec, "utf8_ragged")
 
     def test_infer_dict(self):
         leaves, nodes = [], []
-        _infer_structure("root", [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}], leaves, nodes)
+        infer_structure("root", [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}], leaves, nodes)
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0].node_type, "dict")
         self.assertEqual(sorted(nodes[0].children), ["x", "y"])
@@ -363,21 +363,21 @@ class TestCodecInference(unittest.TestCase):
 
     def test_infer_dict_with_none_rows(self):
         leaves, nodes = [], []
-        _infer_structure("r", [{"x": 1}, None, {"x": 3}], leaves, nodes)
+        infer_structure("r", [{"x": 1}, None, {"x": 3}], leaves, nodes)
         self.assertEqual(len(nodes), 1)
         self.assertEqual(len(leaves), 1)
         self.assertEqual(leaves[0].path, "r.x")
 
     def test_infer_nested(self):
         leaves, nodes = [], []
-        _infer_structure("r", [{"a": {"b": 1}}, {"a": {"b": 2}}], leaves, nodes)
+        infer_structure("r", [{"a": {"b": 1}}, {"a": {"b": 2}}], leaves, nodes)
         self.assertEqual(len(nodes), 2)
         self.assertEqual(leaves[0].path, "r.a.b")
         self.assertEqual(leaves[0].decision.codec, "ndarray")
 
     def test_infer_list(self):
         leaves, nodes = [], []
-        _infer_structure("r", [[{"k": 1}], [{"k": 2}]], leaves, nodes)
+        infer_structure("r", [[{"k": 1}], [{"k": 2}]], leaves, nodes)
         list_nodes = [n for n in nodes if n.node_type == "list"]
         self.assertEqual(len(list_nodes), 1)
         self.assertEqual(list_nodes[0].lengths, [1, 1])
@@ -388,13 +388,13 @@ class TestCodecInference(unittest.TestCase):
 
     def test_infer_list_with_none_items(self):
         leaves, nodes = [], []
-        _infer_structure("r", [[{"k": 1}, None], [{"k": 2}, None]], leaves, nodes)
+        infer_structure("r", [[{"k": 1}, None], [{"k": 2}, None]], leaves, nodes)
         list_nodes = [n for n in nodes if n.node_type == "list"]
         self.assertEqual(len(list_nodes), 1)
 
     def test_dict_missing_key_vs_none_value(self):
         leaves, nodes = [], []
-        _infer_structure("r", [{"x": None}, {"y": 2}, None], leaves, nodes)
+        infer_structure("r", [{"x": None}, {"y": 2}, None], leaves, nodes)
         self.assertIsNotNone(nodes[0].row_mask)
         self.assertEqual(nodes[0].row_mask, [True, True, False])
         x_leaf = next(leaf for leaf in leaves if leaf.path == "r.x")
@@ -406,7 +406,7 @@ class TestCodecInference(unittest.TestCase):
         import torch
 
         leaves, nodes = [], []
-        _infer_structure(
+        infer_structure(
             "r",
             [
                 {"tokens": torch.arange(2, dtype=torch.int64), "score": 1.0},
@@ -432,7 +432,7 @@ class TestCodecInference(unittest.TestCase):
             {"label": 3},
             {"tokens": None, "label": 4},
         ]
-        _infer_structure("r", rows, leaves, nodes)
+        infer_structure("r", rows, leaves, nodes)
         self.assertEqual(nodes[0].row_mask, [True, False, True, True])
         by_path = {leaf.path: leaf for leaf in leaves}
         tokens = by_path["r.tokens"]
@@ -450,7 +450,7 @@ class TestCodecInference(unittest.TestCase):
 
     def test_dict_with_dot_key(self):
         leaves, nodes = [], []
-        _infer_structure("r", [{"a.b": 1}, {"a.b": 2}], leaves, nodes)
+        infer_structure("r", [{"a.b": 1}, {"a.b": 2}], leaves, nodes)
         self.assertEqual(leaves[0].path, "r.a\\.b")
 
     def test_depth_limit(self):
@@ -458,7 +458,7 @@ class TestCodecInference(unittest.TestCase):
         for _ in range(40):
             deep = {"a": deep}
         with self.assertRaises(ValueError):
-            _infer_structure("r", [deep, deep], [], [])
+            infer_structure("r", [deep, deep], [], [])
 
 
 if __name__ == '__main__':
