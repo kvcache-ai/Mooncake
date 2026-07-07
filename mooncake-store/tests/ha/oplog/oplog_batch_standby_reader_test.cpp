@@ -37,7 +37,7 @@ class FakeHaKvBackend : public HaKvBackend {
         for (const auto& [key, value] : values_) {
             if (key >= begin_key && key < end_key) {
                 kvs.push_back({.key = key, .value = value});
-                if (kvs.size() >= limit) break;
+                if (limit != 0 && kvs.size() >= limit) break;
             }
         }
         return ErrorCode::OK;
