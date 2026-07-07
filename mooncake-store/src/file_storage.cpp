@@ -86,10 +86,6 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 
 }  // namespace
 
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
-
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
