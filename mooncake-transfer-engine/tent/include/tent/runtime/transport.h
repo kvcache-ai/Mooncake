@@ -55,6 +55,10 @@ class Transport {
         }
 
         uint64_t device_mask;  // Device mask for transport selection
+        // Named QP pool for this batch's transfers (RFC #2568 step 3). Empty =
+        // no pool (default spray). Carried like device_mask, from the matched
+        // SelectionPolicy down to each RdmaTask.
+        std::string qp_pool;
         BatchID progress_batch_id{0};
         std::function<void(BatchID)> notify_progress;
     };
