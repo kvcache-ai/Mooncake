@@ -198,7 +198,7 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
     // when called from a static initializer context).
     int probe_device = ops_->GetDevice();
     LOG(INFO) << "GDS probe: using GPU device " << probe_device;
-    cudaSetDevice(probe_device);
+    ops_->SetDevice(probe_device);
 
     cleanup.gpu_buf = ops_->Malloc(4096);
     if (!cleanup.gpu_buf) {

@@ -3777,8 +3777,14 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         }
     };
 
-    auto results = client_->BatchPut(keys, ordered_batched_slices, config,
-                                     std::move(gds_cb));
+    std::vector<tl::expected<void, ErrorCode>> results;
+    try {
+        results = client_->BatchPut(keys, ordered_batched_slices, config,
+                                    std::move(gds_cb));
+    } catch (...) {
+        notify_barrier->set_value(false);
+        throw;
+    }
 
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
@@ -5066,8 +5072,14 @@ RealClient::batch_put_from_multi_buffers_internal(
         }
     };
 
-    auto results =
-        client_->BatchPut(keys, batched_slices, config, std::move(gds_cb));
+    std::vector<tl::expected<void, ErrorCode>> results;
+    try {
+        results =
+            client_->BatchPut(keys, batched_slices, config, std::move(gds_cb));
+    } catch (...) {
+        notify_barrier->set_value(false);
+        throw;
+    }
 
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
