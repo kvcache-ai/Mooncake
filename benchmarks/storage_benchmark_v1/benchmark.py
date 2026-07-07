@@ -105,7 +105,8 @@ class StorageBenchmark:
             'read_pages': 0,
             'write_pages': 0,
             'page_hits': 0,
-            'request_latencies_ms': [],
+            'request_io_latencies_ms': [],
+            'request_wall_latencies_ms': [],
         }
 
     def process_request(self, req: KVCacheRequest) -> float:
@@ -120,13 +121,14 @@ class StorageBenchmark:
         self.stats['total_requests'] += 1
         self.stats['total_tokens'] += req.input_length + req.output_length
 
-        total_latency = 0.0
+        request_start = time.perf_counter()
+        io_latency_ms = 0.0
 
         # Process each access requirement from layout
         for access in self.layout.get_operations(req):
             if self.storage.exists(access.page_id):
                 # Page exists, perform READ
-                total_latency += self.storage.read(
+                io_latency_ms += self.storage.read(
                     access.page_id,
                     offset_in_page=access.offset_in_page,
                     length=access.length
@@ -135,39 +137,23 @@ class StorageBenchmark:
                 self.stats['page_hits'] += 1
             else:
                 # Page doesn't exist, perform WRITE
-                total_latency += self.storage.write(
+                io_latency_ms += self.storage.write(
                     access.page_id,
                     offset_in_page=access.offset_in_page,
                     length=access.length
                 )
                 self.stats['write_pages'] += 1
 
-        latency_ms = total_latency if total_latency > 0 else 0.0
-        if latency_ms > 0:
-            self.stats['request_latencies_ms'].append(latency_ms)
-        return latency_ms
+        wall_latency_ms = (time.perf_counter() - request_start) * 1000.0
+        self.stats['request_io_latencies_ms'].append(io_latency_ms)
+        self.stats['request_wall_latencies_ms'].append(wall_latency_ms)
+        return io_latency_ms
 
     def get_stats(self) -> Dict:
         """Get statistics"""
         storage_stats = self.storage.get_stats()
-        request_latencies = self.stats['request_latencies_ms']
-
-        if request_latencies:
-            sorted_latencies = sorted(request_latencies)
-            n = len(sorted_latencies)
-
-            def get_percentile(p: float) -> float:
-                idx = int(n * p)
-                return sorted_latencies[idx] if idx < n else sorted_latencies[-1]
-
-            latency_stats = {
-                'avg_ms': statistics.mean(request_latencies),
-                'p50_ms': sorted_latencies[n // 2],
-                'p95_ms': get_percentile(0.95),
-                'p99_ms': get_percentile(0.99),
-            }
-        else:
-            latency_stats = {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
+        request_io_latencies = self.stats['request_io_latencies_ms']
+        request_wall_latencies = self.stats['request_wall_latencies_ms']
 
         total_pages = self.stats['read_pages'] + self.stats['write_pages']
 
@@ -180,7 +166,8 @@ class StorageBenchmark:
             'page_hits': self.stats['page_hits'],
             'page_hit_rate': self.stats['read_pages'] / total_pages if total_pages > 0 else 0,
             'write_ratio': self.stats['write_pages'] / total_pages if total_pages > 0 else 0,
-            'latency': latency_stats,
+            'request_io_latency': latency_stats(request_io_latencies),
+            'request_wall_latency': latency_stats(request_wall_latencies),
             'storage': storage_stats,
         }
 
@@ -228,15 +215,20 @@ def latency_stats(values: List[float]) -> Dict[str, float]:
         return {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
 
     sorted_values = sorted(values)
-    n = len(sorted_values)
 
     def get_percentile(p: float) -> float:
-        idx = int(n * p)
-        return sorted_values[idx] if idx < n else sorted_values[-1]
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+        rank = (len(sorted_values) - 1) * p
+        lower = int(rank)
+        upper = min(lower + 1, len(sorted_values) - 1)
+        weight = rank - lower
+        return (sorted_values[lower] * (1.0 - weight) +
+                sorted_values[upper] * weight)
 
     return {
         'avg_ms': statistics.mean(values),
-        'p50_ms': sorted_values[n // 2],
+        'p50_ms': get_percentile(0.50),
         'p95_ms': get_percentile(0.95),
         'p99_ms': get_percentile(0.99),
     }
@@ -251,7 +243,12 @@ def snapshot_thread_stats(benchmark: StorageBenchmark) -> Dict[str, Any]:
         'read_pages': benchmark.stats['read_pages'],
         'write_pages': benchmark.stats['write_pages'],
         'page_hits': benchmark.stats['page_hits'],
-        'request_latencies_ms': list(benchmark.stats['request_latencies_ms']),
+        'request_io_latencies_ms': list(
+            benchmark.stats['request_io_latencies_ms']
+        ),
+        'request_wall_latencies_ms': list(
+            benchmark.stats['request_wall_latencies_ms']
+        ),
         'read_bytes': storage.stats['read_bytes'],
         'write_bytes': storage.stats['write_bytes'],
         'read_time_s': storage.stats['read_time_s'],
@@ -273,11 +270,13 @@ def aggregate_thread_stats(thread_stats: List[Dict[str, Any]]) -> Dict:
     page_hits = sum(s['page_hits'] for s in thread_stats)
     total_pages = read_pages + write_pages
 
-    request_latencies = []
+    request_io_latencies = []
+    request_wall_latencies = []
     read_latencies = []
     write_latencies = []
     for stats in thread_stats:
-        request_latencies.extend(stats['request_latencies_ms'])
+        request_io_latencies.extend(stats['request_io_latencies_ms'])
+        request_wall_latencies.extend(stats['request_wall_latencies_ms'])
         read_latencies.extend(stats['read_latencies_ms'])
         write_latencies.extend(stats['write_latencies_ms'])
 
@@ -295,7 +294,8 @@ def aggregate_thread_stats(thread_stats: List[Dict[str, Any]]) -> Dict:
         'page_hits': page_hits,
         'page_hit_rate': read_pages / total_pages if total_pages > 0 else 0,
         'write_ratio': write_pages / total_pages if total_pages > 0 else 0,
-        'latency': latency_stats(request_latencies),
+        'request_io_latency': latency_stats(request_io_latencies),
+        'request_wall_latency': latency_stats(request_wall_latencies),
         'storage': {
             'read': {
                 'count': read_pages,
@@ -345,9 +345,16 @@ def print_progress(done: int, total: int, start_time: float,
           f"{suffix}")
 
 
+def should_print_progress(done: int, total: int, progress_interval: int) -> bool:
+    if done >= total:
+        return True
+    return progress_interval > 0 and done % progress_interval == 0
+
+
 def run_single_thread(benchmark: StorageBenchmark,
                       requests: List[KVCacheRequest],
-                      replay_scale: float) -> Dict[str, Any]:
+                      replay_scale: float,
+                      progress_interval: int) -> Dict[str, Any]:
     start_time = time.perf_counter()
     base_timestamp = requests[0].timestamp if requests else 0
     completed = 0
@@ -356,8 +363,9 @@ def run_single_thread(benchmark: StorageBenchmark,
         wait_for_replay_time(req, base_timestamp, start_time, replay_scale)
         benchmark.process_request(req)
         completed += 1
-        print_progress(completed, len(requests), start_time,
-                       benchmark.get_stats(), req)
+        if should_print_progress(completed, len(requests), progress_interval):
+            print_progress(completed, len(requests), start_time,
+                           benchmark.get_stats(), req)
 
     return {
         'completed': completed,
@@ -406,7 +414,8 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                   max_requests: int = None, max_pages: int = None,
                   page_size_tokens: int = 512,
                   fsync_mode: str = 'none', fsync_batch_size: int = 100,
-                  threads: int = 1, replay_scale: float = 0.0) -> Dict:
+                  threads: int = 1, replay_scale: float = 0.0,
+                  progress_interval: int = 100) -> Dict:
     """Run benchmark
 
     Args:
@@ -420,6 +429,7 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         fsync_batch_size: Number of writes between fsync
         threads: Benchmark client worker threads
         replay_scale: Timestamp replay multiplier; 0 runs unpaced
+        progress_interval: Print progress every N requests; 0 disables progress
 
     Returns:
         Benchmark results dictionary
@@ -495,7 +505,8 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                 fsync_mode=fsync_mode,
                 fsync_batch_size=fsync_batch_size
             ) as benchmark:
-                result = run_single_thread(benchmark, requests, replay_scale)
+                result = run_single_thread(benchmark, requests, replay_scale,
+                                           progress_interval)
         else:
             with ExitStack() as stack:
                 benchmarks = [
@@ -559,6 +570,8 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
     storage = stats.get('storage', {})
     read_stats = storage.get('read', {})
     write_stats = storage.get('write', {})
+    request_wall = stats.get('request_wall_latency', {})
+    request_io = stats.get('request_io_latency', {})
 
     output = []
     output.append(f"\n[{title}]")
@@ -574,6 +587,19 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
     output.append(f"  Total I/O Time:    {stats.get('io_time_s', 0):.3f} s")
     output.append(f"  QPS:              {stats.get('requests_per_second', 0):.2f}")
     output.append(f"  Hit Rate:         {stats.get('page_hit_rate', 0):.2%}")
+
+    # Request Stats
+    output.append(f"\n[Request Wall Latency]")
+    output.append(f"  Avg:              {request_wall.get('avg_ms', 0):.3f} ms")
+    output.append(f"  P50:              {request_wall.get('p50_ms', 0):.3f} ms")
+    output.append(f"  P95:              {request_wall.get('p95_ms', 0):.3f} ms")
+    output.append(f"  P99:              {request_wall.get('p99_ms', 0):.3f} ms")
+
+    output.append(f"\n[Request Storage I/O Latency]")
+    output.append(f"  Avg:              {request_io.get('avg_ms', 0):.3f} ms")
+    output.append(f"  P50:              {request_io.get('p50_ms', 0):.3f} ms")
+    output.append(f"  P95:              {request_io.get('p95_ms', 0):.3f} ms")
+    output.append(f"  P99:              {request_io.get('p99_ms', 0):.3f} ms")
 
     # Read Stats
     output.append(f"\n[Read Operations]")
@@ -654,10 +680,14 @@ def main():
                        help='Number of benchmark client worker threads')
     parser.add_argument('--replay-scales', type=str, default='0',
                        help='Comma-separated trace fast-forward speeds; 0 means unpaced')
+    parser.add_argument('--progress-interval', type=int, default=100,
+                       help='Print progress every N requests; 0 disables per-request progress')
 
     args = parser.parse_args()
     if args.threads < 1:
         parser.error('--threads must be at least 1')
+    if args.progress_interval < 0:
+        parser.error('--progress-interval must be non-negative')
 
     print(f"\n{'='*80}")
     print(f"{'Mooncake KVCache Storage Benchmark':^80}")
@@ -699,7 +729,8 @@ def main():
                     args.fsync_mode,
                     args.fsync_batch_size,
                     args.threads,
-                    replay_scale
+                    replay_scale,
+                    args.progress_interval
                 )
                 results.append(result)
         else:

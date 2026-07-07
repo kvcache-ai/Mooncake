@@ -30,6 +30,7 @@ python benchmark.py --scenario conversation \
 | `--fsync-batch-size` | `100` | Number of writes between fsync in batch mode |
 | `--threads` | `1` | Number of benchmark client worker threads |
 | `--replay-scales` | `0` | Comma-separated trace fast-forward speeds; `0` means unpaced |
+| `--progress-interval` | `100` | Print progress every N requests; `0` disables per-request progress |
 
 ### Replay Scale
 
@@ -66,7 +67,8 @@ strict single-client trace-order read/write and hit-rate accounting, use
 
 ### Progress Output
 
-During execution, each request displays real-time statistics:
+During execution, progress is printed every `--progress-interval` requests and
+at the end of the run:
 
 ```
 [    10/12031] ids= 35 tokens= 18060 | QPS=   2.45 | R=    36 ( 22.01ms, 2435.2MB/s) | W=   963 ( 19.35ms, 2770.1MB/s)
@@ -97,6 +99,18 @@ Fields:
   QPS:              49.07
   Hit Rate:         3.25%
 
+[Request Wall Latency]
+  Avg:              20.912 ms
+  P50:              19.654 ms
+  P95:              28.123 ms
+  P99:              34.987 ms
+
+[Request Storage I/O Latency]
+  Avg:              20.312 ms
+  P50:              18.987 ms
+  P95:              27.456 ms
+  P99:              33.210 ms
+
 [Read Operations]
   Count:            390
   Data Volume:      20919.62 MB
@@ -124,6 +138,28 @@ Fields:
   Written Pages:    2000
   Sync Count:       0
 ```
+
+`Request Wall Latency` measures the benchmark client's wall-clock time spent
+processing a request after replay pacing. `Request Storage I/O Latency` is the
+sum of the request's page read/write latencies. Read/write operation latency is
+reported per page operation. Percentile values use linear interpolation.
+
+## Measurement Notes
+
+- The default `--fsync-mode none` measures page-cache-backed write behavior. It
+  does not represent durable write latency. Use `--fsync-mode always`, `batch`,
+  or `end` when persistence cost is part of the benchmark target.
+- `pread`/`pwrite` latency is measured from user space, so it can include page
+  cache effects, OS scheduling, and Python benchmark-client overhead. Treat the
+  reported latency as an observed storage-path latency, not raw device service
+  time.
+- With `--threads > 1`, each thread replays the full trace as an independent
+  benchmark client with its own storage file. This is a multi-client drive test,
+  not parallel execution of one trace stream.
+- For publication-quality numbers, use a fixed machine and storage device,
+  clear or isolate benchmark storage directories between runs, disable
+  per-request progress output with `--progress-interval 0`, and run multiple
+  trials before reporting stable statistics.
 
 ## Modulo Mapping
 
