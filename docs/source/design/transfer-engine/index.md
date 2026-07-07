@@ -471,6 +471,8 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
+- `MC_TE_FILTERS` Restrict which RDMA NICs the engine discovers and uses, as a comma-separated allow-list of device names (e.g. `mlx5_bond_0,mlx5_bond_1`). Only the listed NICs are kept; all others are ignored. Unset (default) discovers all NICs. This is the **same env var and semantics as the legacy Transfer Engine's device whitelist** (see below), so a single variable scopes NICs across both engines. Useful on multi-NIC / multi-NUMA hosts to keep the engine (and its rail selection) off NICs that are not routable to the peer.
+- `MC_TE_FILTERS_EXCLUDE` The deny-list counterpart of `MC_TE_FILTERS`: a comma-separated list of device names to exclude from discovery. Ignored if `MC_TE_FILTERS` is set (allow-list takes precedence). Unset (default) excludes nothing. (New; the legacy engine has an allow-list only.)
 - `MC_AUTO_GID_MAX_RETRIES` The maximum number of automatic local GID reprobe retries during classic RDMA handshake recovery. Default value 2. Set to 0 to disable automatic GID retry.
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
