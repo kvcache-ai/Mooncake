@@ -42,6 +42,13 @@ struct QueueLimits {
     size_t max_outstanding_bytes{0};
     size_t staging_owner_reserve{0};
     size_t staging_byte_reserve{0};
+    // Opt-in deadline-aware dispatch (RFC #2519 step 2). When false (default),
+    // pickForDispatch keeps strict FIFO order — unchanged behavior. When true,
+    // owners carrying a deadline (request.deadline_ns != 0) are dispatched
+    // earliest-deadline-first; owners without a deadline keep FIFO order behind
+    // them. This only reorders selection within the existing capacity limits;
+    // it does not admit/reject or otherwise change what gets dispatched.
+    bool deadline_aware{false};
 };
 
 struct QueueOwnerInput {
