@@ -56,9 +56,10 @@ python benchmark.py --scenario toolagent \
                     --threads 4
 ```
 
-With `--threads > 1`, benchmark clients submit requests concurrently. This is
-useful for checking whether a single client thread under-drives the storage
-path. For strict trace-order read/write and hit-rate accounting, use
+With `--threads > 1`, each benchmark client thread uses an independent storage
+file under `thread_N/data.bin`, similar to running multiple clients at the same
+time. Final results aggregate the per-thread counters and latency samples. For
+strict single-client trace-order read/write and hit-rate accounting, use
 `--threads 1`.
 
 ## Output Format
