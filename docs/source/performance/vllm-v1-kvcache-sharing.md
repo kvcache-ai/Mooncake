@@ -3,7 +3,7 @@ Mooncake leverages the `MooncakeStoreConnector` in vLLM V1 to enable a distribut
 
 ![Overall Performance](https://vllm.ai/blog-assets/figures/2026-05-06-mooncake-store/hero_vllm_mooncake.svg)
 
-We thank the vLLM team for conducting the performance evaluation. The results are presented below.
+We thank the vLLM team for conducting the performance evaluation. The detailed results are presented below.
 
 > The original blog is available at https://vllm.ai/blog/2026-05-06-mooncake-store.
 
