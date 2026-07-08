@@ -5416,11 +5416,12 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
 
             const auto now = std::chrono::steady_clock::now();
             std::vector<Candidate> selected;
-            std::vector<std::string> expired_storage_keys;
             selected.reserve(
                 std::min<size_t>(promotion_max_per_heartbeat_, src.size()));
 
-            for (const auto& [storage_key, task_item] : src) {
+            for (auto it = src.begin(); it != src.end();) {
+                const auto& storage_key = it->first;
+                const auto& task_item = it->second;
                 const auto elapsed_ms =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         now - task_item.queued_time)
@@ -5428,9 +5429,9 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                 const int64_t remaining_ms =
                     static_cast<int64_t>(promotion_max_budget_ms_) - elapsed_ms;
                 if (remaining_ms < 0) {
-                    expired_storage_keys.push_back(storage_key);
                     expired_tasks.push_back(
                         ObjectIdentity{task_item.tenant_id, task_item.key});
+                    it = src.erase(it);
                     continue;
                 }
                 Candidate candidate{&storage_key, &task_item, remaining_ms};
@@ -5445,10 +5446,7 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                     std::push_heap(selected.begin(), selected.end(),
                                    candidate_less);
                 }
-            }
-
-            for (const auto& storage_key : expired_storage_keys) {
-                src.erase(storage_key);
+                ++it;
             }
 
             std::sort(selected.begin(), selected.end(), candidate_less);
