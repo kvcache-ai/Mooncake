@@ -719,7 +719,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1" -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1;2.13.0" -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
@@ -787,7 +787,7 @@ jobs:
       run: |
         docker build -f docker/mooncake.Dockerfile \
           --build-arg PYTHON_VERSION=3.10 \
-          --build-arg EP_TORCH_VERSIONS="2.12.1" \
+          --build-arg EP_TORCH_VERSIONS="2.12.1;2.13.0" \
           -t mooncake:from-source .
 
   spell-check:
