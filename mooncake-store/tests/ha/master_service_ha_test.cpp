@@ -593,6 +593,48 @@ TEST_F(MasterServiceHATest, ExistKeyClassifiesRemovedReplicaStates) {
     EXPECT_FALSE(missing.value());
 }
 
+TEST_F(MasterServiceHATest, BatchExistKeyClassifiesRemovedReplicaStates) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(false)
+                              .build();
+    MasterService service(service_config);
+    auto mounted =
+        PrepareSimpleSegment(service, "batch_exist_readiness_segment");
+
+    const std::string complete_key = "batch_exist_readiness_complete_key";
+    PutObjectOnSegment(service, mounted.client_id, complete_key,
+                       "batch_exist_readiness_segment");
+
+    const std::string removed_key = "batch_exist_readiness_removed_key";
+    PutObjectOnSegment(service, mounted.client_id, removed_key,
+                       "batch_exist_readiness_segment");
+    MarkCompletedReplicasRemovedForTesting(service, kDefaultTenant,
+                                           removed_key);
+
+    const std::string processing_key = "batch_exist_readiness_processing_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service
+                    .PutStart(mounted.client_id, processing_key, kDefaultTenant,
+                              1024, config)
+                    .has_value());
+
+    auto results =
+        service.BatchExistKey({complete_key, removed_key, processing_key,
+                               "batch_exist_readiness_missing_key"},
+                              kDefaultTenant);
+    ASSERT_EQ(4u, results.size());
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_TRUE(results[0].value());
+    ASSERT_TRUE(results[1].has_value());
+    EXPECT_FALSE(results[1].value());
+    ASSERT_FALSE(results[2].has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, results[2].error());
+    ASSERT_TRUE(results[3].has_value());
+    EXPECT_FALSE(results[3].value());
+}
+
 TEST_F(MasterServiceHATest,
        BatchRecordWriterInitMigratesLegacyLatestAndSetsSequence) {
     const std::string cluster_id = "test_batch_record_init_cluster";

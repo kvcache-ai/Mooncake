@@ -2314,12 +2314,17 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             }
 
             const auto& metadata = it->second;
-            if (metadata.HasReplica(&Replica::fn_is_completed)) {
-                GrantLeaseForGroup(tenant_state, key, metadata);
-                results[i] = true;
-            } else {
+            auto readiness = ClassifyReplicaReadiness(&metadata);
+            if (!readiness) {
+                if (readiness.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                    results[i] = tl::make_unexpected(readiness.error());
+                    continue;
+                }
                 results[i] = false;
+                continue;
             }
+            GrantLeaseForGroup(tenant_state, key, metadata);
+            results[i] = true;
         }
     }
     return results;
