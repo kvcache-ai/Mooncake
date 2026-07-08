@@ -50,6 +50,32 @@ TEST(UtilsTest, StringToBool) {
     EXPECT_EQ(string_to_bool(""), std::nullopt);
 }
 
+TEST(UtilsTest, GetEnvOrParsesBoolStrings) {
+    constexpr const char* kEnvName = "MOONCAKE_TEST_GET_ENV_OR_BOOL";
+
+    unsetenv(kEnvName);
+    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, true));
+    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, false));
+
+    setenv(kEnvName, "false", 1);
+    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, true));
+
+    setenv(kEnvName, "true", 1);
+    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, false));
+
+    setenv(kEnvName, "0", 1);
+    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, true));
+
+    setenv(kEnvName, "1", 1);
+    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, false));
+
+    setenv(kEnvName, "invalid", 1);
+    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, true));
+    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, false));
+
+    unsetenv(kEnvName);
+}
+
 TEST(UtilsTest, IsPortAvailable) {
     // Find an available port
     int test_port = -1;

@@ -477,7 +477,7 @@ std::vector<int> getFreeTcpPorts(int count);
 
 int64_t time_gen();
 
-// Helper: Get numeric value from environment variable, fallback to default
+// Helper: Get value from environment variable, fallback to default
 template <typename T>
 T GetEnvOr(const char* name, T default_value) {
     const char* env_val = std::getenv(name);
@@ -485,7 +485,16 @@ T GetEnvOr(const char* name, T default_value) {
         return default_value;
     }
     try {
-        if constexpr (std::is_floating_point_v<T>) {
+        if constexpr (std::is_same_v<T, bool>) {
+            std::string value(env_val);
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::tolower(c));
+                           });
+            if (value == "true" || value == "1") return true;
+            if (value == "false" || value == "0") return false;
+            return default_value;
+        } else if constexpr (std::is_floating_point_v<T>) {
             return static_cast<T>(std::stod(env_val));
         } else {
             long long value = std::stoll(env_val);

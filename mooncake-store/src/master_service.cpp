@@ -3040,6 +3040,11 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     if (config.dfs_replica_num > 0) {
+        if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                       << ", error=dfs_allocator_not_initialized";
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
         auto alloc = dfs_allocator_->Allocate(key, value_length);
         if (!alloc) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key

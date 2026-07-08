@@ -327,8 +327,7 @@ void DfsGlobalAllocator::EvictionMonitor() {
         const auto now = std::chrono::steady_clock::now();
         for (int i = 0; i < shard_count_; ++i) {
             auto& shard = *shards_[i];
-            std::unique_lock<std::shared_mutex> handle_lock(
-                shard.handle_mutex);
+            std::unique_lock<std::shared_mutex> handle_lock(shard.handle_mutex);
             CleanupExpiredPendingFrees(shard, now);
         }
 
