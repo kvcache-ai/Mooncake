@@ -18,6 +18,7 @@
 
 #include <unistd.h>
 
+#include "hot_standby_service.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/mock_oplog_store.h"
 #include "ha/oplog/mock_metadata_store.h"
@@ -878,6 +879,63 @@ TEST_F(MasterServiceBatchRecordE2ETest, LegacyLatestCutoverThenBatchRecords) {
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(45u, applier.GetExpectedSequenceId());
     EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant, key));
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest, PromotionCatchesUpToDurablePrefix) {
+    const std::string cluster_id = "test_batch_record_e2e_promotion_catchup";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_e2e_promotion_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_e2e_promotion_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_e2e_promotion_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    const auto standby_dir = std::filesystem::temp_directory_path() /
+                             ("mooncake_batch_promotion_" +
+                              std::to_string(::getpid()) + "_" + cluster_id);
+    std::filesystem::create_directories(standby_dir);
+
+    HotStandbyConfig standby_config;
+    standby_config.enable_verification = false;
+    standby_config.max_replication_lag_entries = 1000;
+    standby_config.oplog_store_type = OpLogStoreType::LOCAL_FS;
+    standby_config.oplog_store_root_dir = standby_dir.string();
+    standby_config.oplog_poll_interval_ms = 50;
+    standby_config.fail_closed_on_incomplete_catch_up = true;
+    standby_config.fail_closed_on_unresolved_gaps = true;
+
+    HotStandbyService standby(standby_config);
+    standby.SetCatchUpBatchKvBackendForTesting(backend);
+    auto start_err = standby.Start("", "", cluster_id);
+    ASSERT_EQ(ErrorCode::OK, start_err);
+    ASSERT_EQ(StandbyState::WATCHING, standby.GetState());
+
+    StandbySnapshot snapshot;
+    ASSERT_EQ(ErrorCode::OK, standby.PromoteAndExportSnapshot(snapshot));
+    EXPECT_EQ(2u, snapshot.oplog_sequence_id);
+
+    bool found_key = false;
+    for (const auto& object : snapshot.objects) {
+        found_key = found_key || object.key == key;
+    }
+    EXPECT_TRUE(found_key);
+
+    std::error_code ec;
+    std::filesystem::remove_all(standby_dir, ec);
 }
 
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
