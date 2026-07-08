@@ -126,6 +126,75 @@ tl::expected<void, ErrorCode> GdsContext::Init(
 }
 
 // ===================================================================
+// GdsContext::InitClientDma()
+// Opens an existing data file for cuFile DMA. Used by vLLM in normal-mode
+// + GDS to obtain a cuFile handle on the shared kv_cache.data.
+// Does NOT posix_fallocate / O_TRUNC / I/O-probe — the file is owned by
+// store_service.
+// ===================================================================
+tl::expected<void, ErrorCode> GdsContext::InitClientDma(
+    const std::string& existing_file_path) {
+#ifdef USE_GDS_BACKEND
+    if (!ops_) ops_ = CreateGdsDeviceOps();
+    if (!ops_->ProbeDeviceNode()) {
+        LOG(WARNING) << "GDS InitClientDma: device node not available";
+        return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    }
+
+    // DriverOpen — per-context singleton (std::call_once).
+    // NOTE: this is a *separate* call_once from GdsContext::Init() /
+    // ProbeGdsAvailable(). If both are called in the same process,
+    // DriverOpen() may be invoked twice — this is harmless because
+    // cuFileDriverOpen() uses internal reference counting.
+    static std::once_flag driver_once_;
+    static bool driver_ok_ = false;
+    auto* raw_ops = ops_.get();
+    std::call_once(driver_once_, [raw_ops]() {
+        driver_ok_ = raw_ops->DriverOpen().IsOk();
+        if (!driver_ok_) LOG(WARNING) << "GDS InitClientDma: DriverOpen failed";
+    });
+    if (!driver_ok_) return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+
+    // Open the existing file — no O_CREAT, no O_TRUNC.
+    // Guard against double-init: if a previous Init() or InitClientDma()
+    // left gds_fd_ open, close it now to prevent fd leak.
+    if (gds_fd_ >= 0) {
+        LOG(WARNING) << "GDS InitClientDma: closing previous fd " << gds_fd_;
+        if (cu_file_handle_) {
+            ops_->FileHandleDeregister(cu_file_handle_);
+            cu_file_handle_ = nullptr;
+        }
+        ::close(gds_fd_);
+        gds_fd_ = -1;
+    }
+
+    // Open the existing file — no O_CREAT, no O_TRUNC.
+    gds_fd_ = ::open(existing_file_path.c_str(), O_CLOEXEC | O_RDWR);
+    if (gds_fd_ < 0) {
+        LOG(ERROR) << "GDS InitClientDma: cannot open " << existing_file_path
+                   << ": " << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    auto status = ops_->FileHandleRegister(&cu_file_handle_, gds_fd_);
+    if (status.IsErr()) {
+        LOG(ERROR) << "GDS InitClientDma: FileHandleRegister failed: err="
+                   << status.err;
+        ::close(gds_fd_);
+        gds_fd_ = -1;
+        return tl::make_unexpected(ErrorCode::GDS_HANDLE_REGISTER_FAIL);
+    }
+
+    enabled_ = true;
+    LOG(INFO) << "GDS InitClientDma: ready for DMA on " << existing_file_path;
+    return {};
+#else
+    (void)existing_file_path;
+    return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+#endif
+}
+
+// ===================================================================
 // GdsContext::ProbeGdsAvailable()
 // ===================================================================
 bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {

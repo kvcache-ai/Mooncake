@@ -905,6 +905,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::batch_reserve_offload_space>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::batch_complete_offload_space>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -939,9 +943,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // ── GDS-only initialization ──
     // When MOONCAKE_ENABLE_GDS=1 but enable_ssd_offload is NOT in config:
     // create a minimal file_storage_ for GPU DMA without the full SSD-offload
-    // role (no RPC server, no local memory registration). The RPC server is
-    // skipped via start_offload_rpc_server=false. RegisterLocalMemory is
-    // skipped because GDS DMA operates on GPU memory and NVMe only — it never
+    // role (no RegisterLocalMemory needed — GDS DMA operates on GPU memory
+    // and NVMe only). An offload RPC server (batch_get_offload_object) is
+    // still started so cross-instance DISK reads can reach this instance.
+    // RegisterLocalMemory is skipped because GDS DMA operates on GPU memory
+    // and NVMe only — it never
     // touches the local_buffer. MountLocalDiskSegment is still called so
     // NotifyOffloadSuccess can add DISK replicas under this client_id.
     if (!enable_ssd_offload && !file_storage_) {
@@ -966,8 +972,49 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                                  << " (GDS DMA will not be available)";
                     file_storage_.reset();
                 } else {
-                    LOG(INFO) << "GDS-only file_storage initialized "
-                              << "(DMA enabled, path=" << gds_path << ")";
+                    bool dma_ready = file_storage_->IsGdsEnabled();
+                    LOG(INFO)
+                        << "GDS-only file_storage initialized "
+                        << "(DMA " << (dma_ready ? "enabled" : "NOT available")
+                        << ", path=" << gds_path << ")";
+
+                    // Start offload RPC server so cross-instance DISK reads
+                    // (batch_get_offload_object) can reach this instance.
+                    if (start_offload_rpc_server && !offload_rpc_server_) {
+                        offload_rpc_server_ =
+                            std::make_unique<coro_rpc::coro_rpc_server>(
+                                1, 0, "0.0.0.0");
+                        offload_rpc_server_->register_handler<
+                            &RealClient::batch_get_offload_object>(this);
+                        offload_rpc_server_->register_handler<
+                            &RealClient::release_offload_buffer>(this);
+                        offload_rpc_server_->register_handler<
+                            &RealClient::batch_reserve_offload_space>(this);
+                        offload_rpc_server_->register_handler<
+                            &RealClient::batch_complete_offload_space>(this);
+                        offload_rpc_server_->async_start();
+                        auto err = offload_rpc_server_->get_errc();
+                        if (err) {
+                            LOG(ERROR)
+                                << "GDS-only: offload RPC server failed: "
+                                << err.message();
+                            offload_rpc_server_.reset();
+                        } else {
+                            offload_rpc_port_ = offload_rpc_server_->port();
+                            this->local_rpc_addr = buildHostNameWithPort(
+                                getHostNameWithoutPort(this->local_hostname),
+                                offload_rpc_port_);
+                            LOG(INFO) << "GDS-only: offload RPC server on port "
+                                      << offload_rpc_port_;
+                        }
+                    }
+
+                    // Discover store_service address for Reserve/Complete
+                    // RPC (normal-mode + GDS). Phase 1: env var.
+                    store_service_addr_ = GetEnvStringOr(
+                        "MOONCAKE_GDS_STORE_SERVICE_ADDR", "127.0.0.1:18092");
+                    LOG(INFO)
+                        << "GDS store_service_addr=" << store_service_addr_;
                 }
             } else {
                 LOG(WARNING) << "MOONCAKE_ENABLE_GDS=1 but no SSD path "
@@ -3684,6 +3731,100 @@ RealClient::batch_put_from_dummy_helper(
     return batch_put_from_internal(keys, buffers_result.value(), sizes, config);
 }
 
+// ===================================================================
+// batch_put_with_store_reservation -- normal-mode + GDS
+//
+// vLLM has GPU pointers and a GDS-only file_storage_ with cuFile
+// handle on the shared kv_cache.data. Store_service owns the
+// OffsetAllocator.  Flow: Reserve(RPC) -> DMA(WriteAtOffset) ->
+// Complete(RPC)  \-> BatchPut(RDMA, parallel)
+// ===================================================================
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_with_store_reservation(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<Slice>> &batched_slices,
+    const ReplicateConfig &config) {
+    auto mutable_slices = batched_slices;
+
+    if (store_service_addr_.empty()) {
+        LOG(ERROR) << "GDS normal-mode: store_service_addr_ not set. "
+                   << "Set MOONCAKE_GDS_STORE_SERVICE_ADDR env var.";
+        return client_->BatchPut(keys, mutable_slices, config);
+    }
+
+    std::vector<uint64_t> value_sizes;
+    value_sizes.reserve(keys.size());
+    for (const auto &slices : mutable_slices) {
+        uint64_t total = 0;
+        for (const auto &s : slices) total += s.size;
+        value_sizes.push_back(total);
+    }
+
+    BatchReserveOffloadSpaceRequest req(keys, value_sizes);
+    auto reserve_result = client_requester_->batch_reserve_offload_space(
+        store_service_addr_, req);
+    if (!reserve_result) {
+        LOG(ERROR) << "GDS: BatchReserveOffloadSpace RPC failed: "
+                   << reserve_result.error()
+                   << " -- falling back to non-GDS BatchPut";
+        return client_->BatchPut(keys, mutable_slices, config);
+    }
+    auto &resp = reserve_result.value();
+    std::unordered_set<size_t> failed_set(resp.failed_indices.begin(),
+                                          resp.failed_indices.end());
+
+    auto gds_promise =
+        std::make_shared<std::promise<tl::expected<size_t, ErrorCode>>>();
+    auto gds_future = gds_promise->get_future();
+    std::thread([this, keys, batched_slices, resp = std::move(resp),
+                 failed_set = std::move(failed_set), p = gds_promise]() {
+        try {
+            size_t written = 0;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (failed_set.count(i)) continue;
+                auto &r = resp.reservations[written];
+                auto wr = file_storage_->WriteAtOffset(
+                    keys[i], batched_slices[i], r.offset);
+                if (wr) ++written;
+            }
+            p->set_value(written);
+        } catch (...) {
+            p->set_exception(std::current_exception());
+        }
+    }).detach();
+
+    auto results = client_->BatchPut(keys, mutable_slices, config);
+
+    if (gds_future.valid()) {
+        auto st = gds_future.wait_for(std::chrono::seconds(120));
+        if (st == std::future_status::timeout) {
+            LOG(ERROR) << "GDS DMA timed out after 120s.";
+        } else {
+            try {
+                auto r = gds_future.get();
+                if (!r) LOG(WARNING) << "GDS DMA failed: " << r.error();
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "GDS DMA thread crashed: " << e.what();
+            }
+        }
+    }
+
+    std::vector<std::string> succeeded_keys;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!failed_set.count(i) && results[i].has_value())
+            succeeded_keys.push_back(keys[i]);
+    }
+    if (!succeeded_keys.empty()) {
+        BatchCompleteOffloadSpaceRequest complete_req(
+            std::move(succeeded_keys));
+        auto cr = client_requester_->batch_complete_offload_space(
+            store_service_addr_, complete_req);
+        if (!cr)
+            LOG(WARNING) << "GDS CompleteOffloadSpace failed: " << cr.error();
+    }
+    return results;
+}
+
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
@@ -3746,6 +3887,10 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     if (!gds_enabled) {
         return client_->BatchPut(keys, ordered_batched_slices, config);
     }
+    if (file_storage_->config_.gds_client_only) {
+        return batch_put_with_store_reservation(keys, ordered_batched_slices,
+                                                config);
+    }
 
     std::string tenant_id_str = client_ ? client_->tenant_id() : "default";
 
@@ -3789,19 +3934,27 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
                     [](const auto &r) { return r.has_value(); });
-    notify_barrier->set_value(
-        batch_put_ok);  // skip NotifyOffloadSuccess if BatchPut had failures
-                        // protects failed keys
+    // If any BatchPut key failed, the GDS thread skips
+    // NotifyOffloadSuccess via the barrier (checks batch_put_ok).
+    // This prevents orphan DISK replicas for failed keys.
+    notify_barrier->set_value(batch_put_ok);
 
     if (gds_future.valid()) {
-        try {
-            auto r = gds_future.get();
-            if (!r)
-                LOG(WARNING) << "GDS offload failed: " << r.error()
-                             << " (DISK replica lost; heartbeat will retry if "
-                                "offload is enabled)";
-        } catch (const std::exception &e) {
-            LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+        auto status = gds_future.wait_for(std::chrono::seconds(120));
+        if (status == std::future_status::timeout) {
+            LOG(ERROR) << "GDS offload timed out after 120s -- "
+                       << "cuFileWrite may be blocked on NVMe. "
+                       << "DISK replica lost; heartbeat will retry.";
+        } else {
+            try {
+                auto r = gds_future.get();
+                if (!r)
+                    LOG(WARNING) << "GDS offload failed: " << r.error()
+                                 << " (DISK replica lost; heartbeat will "
+                                    "retry if offload is enabled)";
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+            }
         }
     }
 
@@ -5043,6 +5196,9 @@ RealClient::batch_put_from_multi_buffers_internal(
     if (!gds_enabled) {
         return client_->BatchPut(keys, batched_slices, config);
     }
+    if (file_storage_->config_.gds_client_only) {
+        return batch_put_with_store_reservation(keys, batched_slices, config);
+    }
 
     std::string tenant_id_str = client_ ? client_->tenant_id() : "default";
 
@@ -5084,15 +5240,24 @@ RealClient::batch_put_from_multi_buffers_internal(
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
                     [](const auto &r) { return r.has_value(); });
-    notify_barrier->set_value(
-        batch_put_ok);  // skip NotifyOffloadSuccess if BatchPut had failures
-                        // protects failed keys
+    // If any BatchPut key failed, the GDS thread skips
+    // NotifyOffloadSuccess via the barrier (checks batch_put_ok).
+    // This prevents orphan DISK replicas for failed keys.
+    notify_barrier->set_value(batch_put_ok);
+
     if (gds_future.valid()) {
-        try {
-            auto r = gds_future.get();
-            if (!r) LOG(WARNING) << "GDS offload failed: " << r.error();
-        } catch (const std::exception &e) {
-            LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+        auto status = gds_future.wait_for(std::chrono::seconds(120));
+        if (status == std::future_status::timeout) {
+            LOG(ERROR) << "GDS offload timed out after 120s -- "
+                       << "cuFileWrite may be blocked on NVMe. "
+                       << "DISK replica lost; heartbeat will retry.";
+        } else {
+            try {
+                auto r = gds_future.get();
+                if (!r) LOG(WARNING) << "GDS offload failed: " << r.error();
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+            }
         }
     }
     return results;
@@ -5837,6 +6002,48 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     const UUID &task_id) {
     return client_->QueryTask(task_id);
 }
+// ===================================================================
+// GDS RPC handlers: batch_reserve_offload_space / batch_complete_offload_space
+// ===================================================================
+
+async_simple::coro::Lazy<
+    tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>>
+RealClient::batch_reserve_offload_space(
+    const BatchReserveOffloadSpaceRequest &req) {
+    if (!file_storage_) {
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto *fs = file_storage_.get();
+    auto try_result = co_await coro_io::post([fs, &req]() {
+        return fs->BatchReserveOffloadSpace(req.keys, req.value_sizes);
+    });
+    auto result = try_result.value();
+    if (!result) {
+        co_return tl::make_unexpected(result.error());
+    }
+    co_return std::move(result.value());
+}
+
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+RealClient::batch_complete_offload_space(
+    const BatchCompleteOffloadSpaceRequest &req) {
+    if (!file_storage_) {
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto *fs = file_storage_.get();
+    auto try_result = co_await coro_io::post(
+        [fs, &req]() { return fs->BatchCompleteOffloadSpace(req.keys); });
+    auto result = try_result.value();
+    if (!result) {
+        co_return tl::make_unexpected(result.error());
+    }
+    co_return tl::expected<void, ErrorCode>{};
+}
+
+// ===================================================================
+// batch_get_offload_object
+// ===================================================================
+
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
@@ -5973,6 +6180,20 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
             << client_addr << ", error is: " << result.error();
     }
     return result;
+}
+
+tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>
+ClientRequester::batch_reserve_offload_space(
+    const std::string &store_addr, const BatchReserveOffloadSpaceRequest &req) {
+    return invoke_rpc<&RealClient::batch_reserve_offload_space,
+                      BatchReserveOffloadSpaceResponse>(store_addr, req);
+}
+
+tl::expected<void, ErrorCode> ClientRequester::batch_complete_offload_space(
+    const std::string &store_addr,
+    const BatchCompleteOffloadSpaceRequest &req) {
+    return invoke_rpc<&RealClient::batch_complete_offload_space, void>(
+        store_addr, req);
 }
 
 void ClientRequester::release_offload_buffer(const std::string &client_addr,

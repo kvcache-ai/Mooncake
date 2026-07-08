@@ -273,4 +273,50 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+// ── GDS offload space reservation types ──
+
+struct OffloadSpaceReservation {
+    uint64_t offset;       // file offset for cuFile DMA write
+    uint32_t record_size;  // total record size (header + key + value)
+    uint32_t value_size;   // value portion size
+
+    OffloadSpaceReservation() : offset(0), record_size(0), value_size(0) {}
+    OffloadSpaceReservation(uint64_t off, uint32_t rsize, uint32_t vsize)
+        : offset(off), record_size(rsize), value_size(vsize) {}
+};
+YLT_REFL(OffloadSpaceReservation, offset, record_size, value_size);
+
+struct BatchReserveOffloadSpaceRequest {
+    std::vector<std::string> keys;
+    std::vector<uint64_t> value_sizes;
+
+    BatchReserveOffloadSpaceRequest() = default;
+    BatchReserveOffloadSpaceRequest(std::vector<std::string> k,
+                                    std::vector<uint64_t> s)
+        : keys(std::move(k)), value_sizes(std::move(s)) {}
+};
+YLT_REFL(BatchReserveOffloadSpaceRequest, keys, value_sizes);
+
+struct BatchReserveOffloadSpaceResponse {
+    // Per-key reservations (parallel arrays with keys in request).
+    std::vector<OffloadSpaceReservation> reservations;
+    // Indices of keys that failed allocation.
+    std::vector<int32_t> failed_indices;
+    // Absolute path to the shared data file for cuFile DMA open.
+    std::string data_file_path;
+
+    BatchReserveOffloadSpaceResponse() = default;
+};
+YLT_REFL(BatchReserveOffloadSpaceResponse, reservations, failed_indices,
+         data_file_path);
+
+struct BatchCompleteOffloadSpaceRequest {
+    std::vector<std::string> keys;  // keys whose DMA has completed
+
+    BatchCompleteOffloadSpaceRequest() = default;
+    explicit BatchCompleteOffloadSpaceRequest(std::vector<std::string> k)
+        : keys(std::move(k)) {}
+};
+YLT_REFL(BatchCompleteOffloadSpaceRequest, keys);
+
 }  // namespace mooncake

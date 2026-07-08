@@ -2747,6 +2747,130 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
 std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
 }
+tl::expected<OffloadSpaceReservation, ErrorCode>
+OffsetAllocatorStorageBackend::ReserveOffloadSpace(const std::string& key,
+                                                   uint32_t record_size,
+                                                   uint32_t value_size) {
+    if (record_size > UINT32_MAX || value_size > record_size)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+
+    auto allocation = allocator_->allocate(record_size);
+    if (!allocation) return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+
+    uint64_t offset = allocation->address();
+
+    auto& shard = shards_[ShardForKey(key)];
+    {
+        SharedMutexLocker locker(&shard.mutex);
+        // Refuse to overwrite an existing record: the old AllocationPtr
+        // would be destroyed, its offset recycled, and any in-flight DMA
+        // to the old offset would corrupt the new allocator assignment.
+        auto existing = shard.map.find(key);
+        if (existing != shard.map.end()) {
+            LOG(WARNING) << "ReserveOffloadSpace: key '" << key
+                         << "' already reserved (dirty="
+                         << existing->second.dirty_.load(
+                                std::memory_order_acquire)
+                         << "), refusing duplicate reservation";
+            // allocator_->allocate() is RAII: going out of scope frees it.
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        }
+        auto alloc_ptr = std::make_shared<RefCountedAllocationHandle>(
+            std::move(*allocation));
+        ObjectEntry entry(offset, record_size, value_size,
+                          std::move(alloc_ptr));
+        entry.dirty_.store(true, std::memory_order_release);
+        entry.quarantined_.store(false, std::memory_order_release);
+        entry.reserved_at =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        shard.map[key] = std::move(entry);
+    }
+
+    return OffloadSpaceReservation{offset, record_size, value_size};
+}
+
+void OffsetAllocatorStorageBackend::CompleteOffloadSpace(
+    const std::string& key) {
+    auto& shard = shards_[ShardForKey(key)];
+    SharedMutexLocker locker(&shard.mutex, shared_lock);
+    auto it = shard.map.find(key);
+    if (it != shard.map.end()) {
+        it->second.dirty_.store(false, std::memory_order_release);
+        it->second.quarantined_.store(false, std::memory_order_release);
+    }
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::WriteAtOffset(
+    const std::string& key, const std::vector<Slice>& slices, uint64_t offset) {
+    if (!gds_ctx_ || !gds_ctx_->enabled_) {
+        return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    }
+    // WriteRecord handles IsDevicePointer detection internally:
+    // GPU pointer -> cuFileWrite DMA, CPU pointer -> pwrite.
+    return gds_ctx_->WriteRecord(key, slices, offset);
+}
+void OffsetAllocatorStorageBackend::CleanupStaleDirtyRecords(
+    int64_t now_seconds) {
+    static constexpr int64_t kOverdirtyTimeoutSec = 120;
+    static constexpr int64_t kQuarantineTimeoutSec = 120;
+
+    for (size_t i = 0; i < kNumShards; ++i) {
+        auto& shard = shards_[i];
+
+        // Phase A — "overdirty": promote dirty to quarantine
+        {
+            SharedMutexLocker locker(&shard.mutex, shared_lock);
+            for (auto& [key, entry] : shard.map) {
+                if (entry.dirty_.load(std::memory_order_acquire) &&
+                    (now_seconds - entry.reserved_at) > kOverdirtyTimeoutSec) {
+                    bool expected = false;
+                    if (entry.quarantined_.compare_exchange_strong(
+                            expected, true, std::memory_order_acq_rel)) {
+                        // Won the CAS. Re-verify dirty_: if
+                        // CompleteOffloadSpace cleared it concurrently,
+                        // undo quarantine.
+                        if (!entry.dirty_.load(std::memory_order_acquire)) {
+                            entry.quarantined_.store(false,
+                                                     std::memory_order_release);
+                            continue;
+                        }
+                        entry.quarantined_at = now_seconds;
+                        LOG(WARNING)
+                            << "GDS dirty record quarantined: " << key
+                            << " (reserved "
+                            << (now_seconds - entry.reserved_at) << "s ago)";
+                    }
+                }
+            }
+        }
+
+        // Phase B — "zombie release": free quarantined records that
+        // have been in quarantine long enough (DMA is definitely dead).
+        {
+            SharedMutexLocker locker(&shard.mutex);
+            auto it = shard.map.begin();
+            while (it != shard.map.end()) {
+                auto& entry = it->second;
+                if (entry.dirty_.load(std::memory_order_acquire) &&
+                    entry.quarantined_.load(std::memory_order_acquire) &&
+                    (now_seconds - entry.quarantined_at) >
+                        kQuarantineTimeoutSec) {
+                    // Erasing the entry destroys AllocationPtr; RAII frees
+                    LOG(WARNING)
+                        << "GDS zombie offset released: key=" << it->first
+                        << " offset=" << entry.offset
+                        << " size=" << entry.total_size << " (quarantined "
+                        << (now_seconds - entry.quarantined_at) << "s ago)";
+                    it = shard.map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+}
 
 //-----------------------------------------------------------------------------
 
@@ -2782,9 +2906,17 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Get data file path
         data_file_path_ = GetDataFilePath();
 
-        // GDS Init (try first; falls back to StorageFile on failure)
+        // GDS Init
+        // gds_client_only (vLLM in normal-mode+GDS): open existing file
+        // for DMA only; store_service owns OffsetAllocator and the file.
+        // Normal mode: full Init with O_TRUNC + posix_fallocate.
         if (gds_ctx_) {
-            auto gds_init = gds_ctx_->Init(data_file_path_, capacity_);
+            tl::expected<void, ErrorCode> gds_init;
+            if (file_storage_config_.gds_client_only) {
+                gds_init = gds_ctx_->InitClientDma(data_file_path_);
+            } else {
+                gds_init = gds_ctx_->Init(data_file_path_, capacity_);
+            }
             if (!gds_init) {
                 LOG(WARNING) << "GDS init failed (err=" << gds_init.error()
                              << "), falling back to non-GDS I/O";
@@ -2794,7 +2926,10 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         }
 
         // StorageFile creation (only when GDS is not active)
-        if (!gds_ctx_ || !gds_ctx_->enabled_) {
+        // Also skip when gds_client_only: the file is owned by store_service,
+        // creating it here would O_TRUNC shared data.
+        if ((!gds_ctx_ || !gds_ctx_->enabled_) &&
+            !file_storage_config_.gds_client_only) {
             // RAII wrapper to ensure fd is closed on all error paths
             struct FdGuard {
                 int fd;
@@ -2850,11 +2985,15 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 
         }  // end if (!gds_ctx_)
 
-        // Create allocator with base=0, size=capacity
-        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
-        if (!allocator_) {
-            LOG(ERROR) << "Failed to create OffsetAllocator";
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        // Create allocator with base=0, size=capacity.
+        // Skip in gds_client_only mode: store_service owns the allocator.
+        if (!file_storage_config_.gds_client_only) {
+            allocator_ =
+                offset_allocator::OffsetAllocator::create(0, capacity_);
+            if (!allocator_) {
+                LOG(ERROR) << "Failed to create OffsetAllocator";
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
         }
 
         initialized_.store(true, std::memory_order_release);
@@ -3112,6 +3251,20 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
                        << ", expected: " << entry.value_size
                        << ", got: " << dest_slice.size;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // GDS dirty_ guard: if the record was reserved but DMA has not
+        // completed yet, skip it. Reading would return stale data
+        // regardless of I/O method (pread or cuFileRead).
+        if (entry.dirty_.load(std::memory_order_acquire)) {
+            if (entry.quarantined_.load(std::memory_order_acquire)) {
+                LOG(WARNING)
+                    << "Key " << key << " is quarantined (DMA presumed lost)";
+            }
+            LOG_FIRST_N(WARNING, 10)
+                << "Key " << key
+                << " is dirty (DMA in progress), skipping read";
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
 
         // Copy metadata and increment refcount on allocation
