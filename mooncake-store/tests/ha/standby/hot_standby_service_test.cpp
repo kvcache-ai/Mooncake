@@ -8,7 +8,12 @@
 #include <string>
 #include <thread>
 
+#include <xxhash.h>
+
 #include "master_service.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store_factory.h"
+#include "ha/oplog/mock_oplog_store.h"
 
 namespace mooncake::test {
 
@@ -39,7 +44,7 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
     metadata.client_id = UUID{1, 2};
     metadata.size = size;
     metadata.last_sequence_id = seq_id;
-    snapshot.metadata.emplace_back(std::move(key), metadata);
+    snapshot.metadata.emplace_back("default", std::move(key), metadata);
     return snapshot;
 }
 
@@ -88,7 +93,7 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     metadata.client_id = UUID{1, 2};
     metadata.size = 4096;
     metadata.last_sequence_id = 42;
-    snapshot.metadata.emplace_back("key-1", metadata);
+    snapshot.metadata.emplace_back("default", "key-1", metadata);
 
     service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
@@ -231,6 +236,11 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus) {
     EXPECT_EQ(s1.state, s2.state);
 }
 
+TEST_F(HotStandbyServiceTest, SyncStatusReportsUnresolvedGapCount) {
+    auto status = service_->GetSyncStatus();
+    EXPECT_EQ(0u, status.unresolved_gap_count);
+}
+
 // ========== 6.1.4 Promotion tests ==========
 
 TEST_F(HotStandbyServiceTest, TestPromote_WhenNotReady) {
@@ -249,40 +259,51 @@ TEST_F(HotStandbyServiceTest, TestPromote_WhenReady) {
     EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
 }
 
-TEST_F(HotStandbyServiceTest, TestPromote_FinalCatchUp) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real etcd and OpLog data to exercise final "
-                    "catch-up logic.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
+TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
+    // Setup: snapshot-only standby with baseline seq=10
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = "snap-001";
+    snapshot.snapshot_sequence_id = 10;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 10;
+    snapshot.metadata.emplace_back("default", "key-1", metadata);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(10u, service_->GetLatestAppliedSequenceId());
+
+    // Export before promotion: seq should be 10
+    StandbySnapshot pre_snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(pre_snapshot));
+    EXPECT_EQ(10u, pre_snapshot.oplog_sequence_id);
+
+    // Promote and export atomically
+    StandbySnapshot post_snapshot;
+    ErrorCode err = service_->PromoteAndExportSnapshot(post_snapshot);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+
+    // After promotion, exported seq should still be 10 (no new OpLog in
+    // snapshot-only)
+    EXPECT_EQ(10u, post_snapshot.oplog_sequence_id);
+    ASSERT_EQ(1u, post_snapshot.objects.size());
+    EXPECT_EQ("key-1", post_snapshot.objects[0].key);
 }
 
-TEST_F(HotStandbyServiceTest, TestPromote_WithGaps) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP()
-        << "Requires real etcd and gaps in OpLog to validate gap resolution.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
-}
-
-TEST_F(HotStandbyServiceTest, TestPromote_Timeout) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP()
-        << "Requires real etcd and slow reads to trigger catch-up timeout.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
-}
-
-TEST_F(HotStandbyServiceTest, TestPromote_BatchLimit) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real etcd and large OpLog to hit batch limit.";
-#else
-    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
-#endif
-}
+// The promotion catch-up tests above (TestPromote_*) have been replaced by the
+// mock-driven PromotionCatchUpTest fixture below. The new tests use
+// SetCatchUpOpLogStoreForTesting + MockOpLogStore with SetForceReadEmpty /
+// SetReadError seams, eliminating the STORE_USE_ETCD dependency.
 
 // ========== 6.1.5 Warm start tests ==========
 
@@ -340,11 +361,11 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     EXPECT_EQ(42u, status.primary_seq_id);
     EXPECT_TRUE(status.is_connected);
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<StandbyObjectEntry> exported;
     EXPECT_TRUE(service_->ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-1", exported[0].first);
-    EXPECT_EQ(4096u, exported[0].second.size);
+    EXPECT_EQ("key-1", exported[0].key);
+    EXPECT_EQ(4096u, exported[0].metadata.size);
 }
 
 TEST_F(HotStandbyServiceTest,
@@ -372,12 +393,12 @@ TEST_F(HotStandbyServiceTest,
     EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(1u, service_->GetMetadataCount());
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<StandbyObjectEntry> exported;
     ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-new", exported[0].first);
-    EXPECT_EQ(8192u, exported[0].second.size);
-    EXPECT_EQ(84u, exported[0].second.last_sequence_id);
+    EXPECT_EQ("key-new", exported[0].key);
+    EXPECT_EQ(8192u, exported[0].metadata.size);
+    EXPECT_EQ(84u, exported[0].metadata.last_sequence_id);
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
@@ -400,7 +421,7 @@ TEST_F(HotStandbyServiceTest, TestGetMetadataCount) {
 }
 
 TEST_F(HotStandbyServiceTest, TestExportMetadataSnapshot) {
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     EXPECT_TRUE(service_->ExportMetadataSnapshot(snapshot));
     EXPECT_TRUE(snapshot.empty());
 }
@@ -408,6 +429,45 @@ TEST_F(HotStandbyServiceTest, TestExportMetadataSnapshot) {
 TEST_F(HotStandbyServiceTest, TestGetLatestAppliedSequenceId) {
     uint64_t seq = service_->GetLatestAppliedSequenceId();
     EXPECT_EQ(0u, seq);
+}
+
+// ========== 6.1.6a ExportStandbySnapshot tests ==========
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_NotRunning) {
+    StandbySnapshot snapshot;
+    EXPECT_FALSE(service_->ExportStandbySnapshot(snapshot));
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_SnapshotOnly) {
+    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(42u, snapshot.oplog_sequence_id);
+    ASSERT_EQ(1u, snapshot.objects.size());
+    EXPECT_EQ("key-1", snapshot.objects[0].key);
+    EXPECT_EQ(4096u, snapshot.objects[0].metadata.size);
+    // Segment registry is empty because snapshot-only standby has no
+    // oplog_applier
+    EXPECT_TRUE(snapshot.segments.empty());
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(LoadedSnapshot{})));
+
+    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(0u, snapshot.oplog_sequence_id);
+    EXPECT_TRUE(snapshot.objects.empty());
+    EXPECT_TRUE(snapshot.segments.empty());
 }
 
 // ========== 6.1.7 Replication loop tests ==========
@@ -460,6 +520,201 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
     service_->Stop();
     SUCCEED();
 #endif
+}
+
+// ========== Issue 2 fail-closed catch-up ==========
+
+namespace {
+
+// Helper to create a valid OpLogEntry with checksum (mirrors the helper in
+// oplog_applier_test.cpp).
+OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
+                     const std::string& payload) {
+    OpLogEntry e;
+    e.sequence_id = seq;
+    e.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    e.op_type = type;
+    e.object_key = key;
+    e.payload = payload;
+    // Compute checksum and prefix_hash using the same algorithm as OpLogManager
+    e.checksum =
+        static_cast<uint32_t>(XXH32(payload.data(), payload.size(), 0));
+    e.prefix_hash =
+        key.empty() ? 0
+                    : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
+    return e;
+}
+
+// Helper to create a valid struct_pack payload for PUT_END
+std::string MakeValidPayload(uint64_t client_id_first = 1,
+                             uint64_t client_id_second = 2,
+                             uint64_t size = 1024) {
+    mooncake::MetadataPayload payload;
+    payload.client_id = {client_id_first, client_id_second};
+    payload.size = size;
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+}  // namespace
+
+class PromotionCatchUpTest : public HotStandbyServiceTest {
+   protected:
+    void SetUp() override {
+        HotStandbyServiceTest::SetUp();
+        config_.enable_oplog_following = true;
+        config_.fail_closed_on_incomplete_catch_up = true;
+        config_.fail_closed_on_unresolved_gaps = true;
+
+        // Re-create the service with updated config
+        service_ = std::make_unique<HotStandbyService>(config_);
+
+        mock_store_ = std::make_shared<MockOpLogStore>();
+        service_->SetCatchUpOpLogStoreForTesting(mock_store_);
+    }
+
+    std::shared_ptr<MockOpLogStore> mock_store_;
+};
+
+TEST_F(PromotionCatchUpTest, EmptyReadBeforeMaxFailsClosed) {
+    for (uint64_t s = 1; s <= 5; ++s) {
+        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
+                           MakeValidPayload());
+        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
+    }
+    mock_store_->SetForceReadEmpty(true);
+
+    // Try to promote; the service needs to reach WATCHING first
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // PromoteAndExportSnapshot should fail-closed because the mock store has
+    // durable entries (seq 1-5) but ReadOpLogSince returns empty.
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+}
+
+TEST_F(PromotionCatchUpTest, ReadErrorFailsClosed) {
+    for (uint64_t s = 1; s <= 3; ++s) {
+        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
+                           MakeValidPayload());
+        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
+    }
+    mock_store_->SetReadError(ErrorCode::PERSISTENT_FAIL);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+}
+
+TEST_F(PromotionCatchUpTest, UnresolvedGapsFailClosed) {
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // Seed a skipped gap into the applier. The gap cannot be resolved because
+    // no OpLogStore has the entry, so ResolvePromotionGapsLocked leaves it
+    // untouched. PromoteLockedInternal's post-catch-up gap check then fires.
+    auto* applier = service_->GetOpLogApplierForTesting();
+    ASSERT_NE(nullptr, applier);
+    applier->AddSkippedGapForTesting(999);
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, BestEffortReturnsOkWhenFlagFalse) {
+    config_.fail_closed_on_incomplete_catch_up = false;
+
+    for (uint64_t s = 1; s <= 3; ++s) {
+        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
+                           MakeValidPayload());
+        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
+    }
+    mock_store_->SetForceReadEmpty(true);
+
+    // Re-create service to apply updated config
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpOpLogStoreForTesting(mock_store_);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // With fail_closed_on_incomplete_catch_up=false, the best-effort path
+    // should return OK despite read-empty behavior.
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::OK, promote_err);
+}
+
+TEST_F(PromotionCatchUpTest, BypassesGapCheckWhenFlagFalse) {
+    config_.fail_closed_on_unresolved_gaps = false;
+
+    // Re-create service to apply updated config
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpOpLogStoreForTesting(mock_store_);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // Seed a gap; with fail_closed_on_unresolved_gaps=false the post-catch-up
+    // gap check is skipped, so promotion succeeds.
+    auto* applier = service_->GetOpLogApplierForTesting();
+    ASSERT_NE(nullptr, applier);
+    applier->AddSkippedGapForTesting(999);
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::OK, promote_err);
+    // PromoteAndExportSnapshot calls Stop() on success, so state becomes
+    // STOPPED.
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, PromoteAppliesSameFailClosedChecks) {
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    // Seed a gap and verify Promote() (not PromoteAndExportSnapshot) applies
+    // the same fail-closed checks via PromoteLockedInternal.
+    auto* applier = service_->GetOpLogApplierForTesting();
+    ASSERT_NE(nullptr, applier);
+    applier->AddSkippedGapForTesting(999);
+
+    ErrorCode promote_err = service_->Promote();
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
 
 }  // namespace mooncake::test

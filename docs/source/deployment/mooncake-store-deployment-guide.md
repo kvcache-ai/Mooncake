@@ -141,11 +141,13 @@ Runs a cluster of master instances coordinated through etcd. If the leader fails
 # Start each master instance with:
 mooncake_master \
   --enable_ha=true \
-  --etcd_endpoints="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --ha_backend_type=etcd \
+  --ha_backend_connstring="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --oplog_store_type=etcd \
   --rpc_address=10.0.0.1
 ```
 
-Each instance must specify its own reachable `--rpc_address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
+Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints` is still accepted as a backward-compatible alias for the etcd HA backend connection string when `--ha_backend_connstring` is empty. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
@@ -160,10 +162,12 @@ mooncake_master \
   --enable_ha=true \
   --ha_backend_type=redis \
   --ha_backend_connstring="redis://127.0.0.1:6379" \
+  --oplog_store_type=localfs \
+  --oplog_store_root_dir=/shared/mooncake_oplog \
   --rpc_address=10.0.0.1
 ```
 
-**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`.
+**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. Redis is used only for leader election here; choose an OpLog backend separately.
 
 
 ---
@@ -237,6 +241,141 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 
 ---
+
+## High Availability (HA)
+
+Mooncake Store supports a Primary-Standby HA model with OpLog-based replication. The active Primary serves all read/write traffic and publishes metadata mutations to an OpLog store. One or more Standby nodes replicate the OpLog to maintain an in-memory copy of the metadata and segment registry. When the Primary fails, a Standby can be promoted to become the new Primary.
+
+### HA Architecture
+
+```
++---------------+          OpLog Store          +---------------+
+|   Primary     |  (etcd / localfs)             |   Standby     |
+|               |  <----------------------------|               |
+|  OpLogManager |                               | OpLogApplier  |
+|  (Append)     |                               | (Apply)       |
+|               |                               |               |
+|  MasterService|                               | MetadataStore |
++---------------+                               +---------------+
+       ^                                                 |
+       |         Leadership Election                      |
+       +---------------- etcd/redis/k8s ------------------+
+```
+
+### HA Configuration
+
+HA uses two related but separate backends:
+
+- The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
+- The OpLog store persists metadata mutations so standby masters can catch up and later be promoted. Configure it with the OpLog parameters below.
+
+
+- `--oplog_store_type`: Backend for OpLog storage.
+  - `etcd`: Use etcd as the OpLog store (requires `STORE_USE_ETCD` at compile time).
+  - `localfs`: Use a filesystem path shared by the primary and standby masters.
+  - Empty string: Use the compile-time default (`etcd` when built with etcd support, otherwise `localfs`).
+- `--oplog_store_root_dir`: Root directory for the localfs OpLog store. Only used when `oplog_store_type=localfs`.
+- `--oplog_poll_interval_ms`: Polling interval in milliseconds for the localfs OpLog store.
+
+For snapshot-based standby bootstrap, also configure:
+
+- `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
+- `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
+- `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
+
+### Standby Bootstrap
+
+When a Standby starts, it follows this sequence:
+
+1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true`):
+   - Load the latest snapshot from the configured catalog and object store.
+   - Rebuild object metadata and segment state from the snapshot baseline.
+2. **OpLog Catch-up**:
+   - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
+   - Continuously poll/watch the OpLog store and apply new entries.
+
+Supported OpLog entry types:
+- `PUT_END`: Object write completion
+- `REMOVE`: Object removal
+- `PUT_REVOKE`: Object revocation
+- `BATCH_REMOVE`: Batch removal
+- `SEGMENT_MOUNT`: Segment mount event
+- `SEGMENT_UNMOUNT`: Segment unmount event
+
+### Promotion and Failover
+
+When the Primary fails, the Standby is promoted through the following steps:
+
+1. **Final Catch-up**: The Standby stops the OpLog replicator and performs a final catch-up of any remaining entries.
+2. **Export Context**: The Standby exports its current state as a `PromotionContext`, including:
+   - `applied_seq_id`: The latest applied OpLog sequence ID.
+   - `objects`: All object metadata from the in-memory store.
+   - `segments`: All segment registry entries.
+3. **Leadership Transition**: The Standby acquires leadership through the configured HA backend.
+4. **State Restoration**: The new Primary restores its state from the `PromotionContext`, populating metadata shards and the segment manager.
+5. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+
+### Example: HA Deployment with etcd
+
+Primary configuration (`primary.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
+cluster_id: "mooncake_cluster"
+oplog_store_type: "etcd"
+enable_snapshot: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50051
+```
+
+Standby configuration (`standby.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
+cluster_id: "mooncake_cluster"
+oplog_store_type: "etcd"
+enable_snapshot_restore: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50052
+```
+
+Environment variable for local snapshot storage:
+
+```bash
+export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
+```
+
+Start the cluster:
+
+```bash
+# Start Primary
+mooncake_master --config_path=primary.yaml
+
+# Start Standby
+mooncake_master --config_path=standby.yaml
+```
+
+### Example: HA Deployment with localfs OpLog (testing)
+
+For local testing, or for a build without etcd OpLog support, use the localfs OpLog store. The `oplog_store_root_dir` must be visible to both primary and standby processes:
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "http://localhost:2379"
+cluster_id: "test_cluster"
+oplog_store_type: "localfs"
+oplog_store_root_dir: "/tmp/mooncake_oplog"
+oplog_poll_interval_ms: 1000
+```
+
+> **Note:** The `localfs` OpLog store is suitable for testing and development. Production HA deployments should use `etcd`.
 
 ## Metrics Endpoints
 
@@ -497,8 +636,11 @@ mooncake_master \
 | `--enable_ha` | `false` | Enable HA mode |
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
-| `--etcd_endpoints` | empty | etcd endpoints, semicolon separated (when `--ha_backend_type=etcd`) |
+| `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
+| `--oplog_store_type` | empty | OpLog store type: `etcd`, `localfs`, or empty for compile-time default (`etcd` with etcd support, otherwise `localfs`) |
+| `--oplog_store_root_dir` | `/tmp/mooncake_oplog` | Root directory for localfs OpLog store; must be shared between primary and standby when using `localfs` |
+| `--oplog_poll_interval_ms` | `1000` | Poll interval in milliseconds for localfs OpLog store |
 
 ```{caution}
 Metadata Snapshot And Restore is experimental feature.

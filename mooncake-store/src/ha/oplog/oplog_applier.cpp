@@ -70,21 +70,19 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             }
         }
         if (was_skipped) {
-            if (entry.op_type == OpType::REMOVE ||
-                entry.op_type == OpType::PUT_REVOKE) {
-                // Safe: ensure we don't keep stale metadata.
-                if (entry.op_type == OpType::REMOVE) {
-                    ApplyRemove(entry);
-                } else {
-                    ApplyPutRevoke(entry);
-                }
+            if (entry.op_type == OpType::REMOVE) {
+                ApplyRemove(entry);
                 return true;
             }
-            // PUT_END (or others): discard to avoid resurrecting stale state.
-            if (entry.op_type == OpType::PUT_END) {
-                HAMetricManager::instance().inc_oplog_dropped_put_end();
+            if (entry.op_type == OpType::PUT_REVOKE) {
+                ApplyPutRevoke(entry);
+                return true;
             }
-            VLOG(1) << "OpLogApplier: discard late skipped entry, op_type="
+            if (entry.op_type == OpType::PUT_END) {
+                return ApplyPutEndIfNewer(entry);
+            }
+            VLOG(1) << "OpLogApplier: discard late skipped non-metadata entry, "
+                       "op_type="
                     << static_cast<int>(entry.op_type)
                     << ", sequence_id=" << entry.sequence_id
                     << ", key=" << entry.object_key;
@@ -127,6 +125,15 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             break;
         case OpType::REMOVE:
             ApplyRemove(entry);
+            break;
+        case OpType::SEGMENT_MOUNT:
+            ApplySegmentMount(entry);
+            break;
+        case OpType::SEGMENT_UNMOUNT:
+            ApplySegmentUnmount(entry);
+            break;
+        case OpType::SEGMENT_UPDATE:
+            ApplySegmentUpdate(entry);
             break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
@@ -275,6 +282,15 @@ size_t OpLogApplier::ProcessPendingEntries() {
             case OpType::REMOVE:
                 ApplyRemove(entry_copy);
                 break;
+            case OpType::SEGMENT_MOUNT:
+                ApplySegmentMount(entry_copy);
+                break;
+            case OpType::SEGMENT_UNMOUNT:
+                ApplySegmentUnmount(entry_copy);
+                break;
+            case OpType::SEGMENT_UPDATE:
+                ApplySegmentUpdate(entry_copy);
+                break;
             default:
                 LOG(ERROR)
                     << "OpLogApplier: unsupported op_type in pending entry";
@@ -387,8 +403,12 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
         }
         r.fetched++;
 
-        // Apply policy: only delete/revoke; drop PUT_END.
-        if (e.op_type == OpType::REMOVE) {
+        if (e.op_type == OpType::PUT_END) {
+            if (ApplyPutEndIfNewer(e)) {
+                r.applied_puts++;
+                successfully_processed.push_back(seq);
+            }
+        } else if (e.op_type == OpType::REMOVE) {
             ApplyRemove(e);
             r.applied_deletes++;
             successfully_processed.push_back(seq);
@@ -397,7 +417,6 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
             r.applied_deletes++;
             successfully_processed.push_back(seq);
         } else {
-            // PUT_END or others: mark as processed (dropped) so we don't retry.
             successfully_processed.push_back(seq);
         }
     }
@@ -413,6 +432,25 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
         }
     }
     return r;
+}
+
+size_t OpLogApplier::GetUnresolvedGapCount() const {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    return missing_sequence_ids_.size() + skipped_sequence_ids_.size();
+}
+
+bool OpLogApplier::HasUnresolvedGaps() const {
+    return GetUnresolvedGapCount() != 0;
+}
+
+void OpLogApplier::AddMissingGapForTesting(uint64_t seq) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    missing_sequence_ids_[seq] = std::chrono::steady_clock::now();
+}
+
+void OpLogApplier::AddSkippedGapForTesting(uint64_t seq) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    skipped_sequence_ids_[seq] = std::chrono::steady_clock::now();
 }
 
 bool OpLogApplier::CheckSequenceOrder(const OpLogEntry& entry) {
@@ -435,7 +473,8 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
                      << ", sequence_id=" << entry.sequence_id;
         StandbyObjectMetadata empty_metadata;
         empty_metadata.last_sequence_id = entry.sequence_id;
-        if (!metadata_store_->PutMetadata(entry.object_key, empty_metadata)) {
+        if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                          empty_metadata)) {
             LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="
                        << entry.object_key
                        << ", sequence_id=" << entry.sequence_id;
@@ -454,7 +493,8 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
         // Fallback to empty metadata if parsing fails
         StandbyObjectMetadata empty_metadata;
         empty_metadata.last_sequence_id = entry.sequence_id;
-        metadata_store_->PutMetadata(entry.object_key, empty_metadata);
+        metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                     empty_metadata);
         return;
     }
 
@@ -462,7 +502,8 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
     StandbyObjectMetadata metadata =
         payload.ToStandbyMetadata(entry.sequence_id);
 
-    if (!metadata_store_->PutMetadata(entry.object_key, metadata)) {
+    if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                      metadata)) {
         LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="
                    << entry.object_key << ", sequence_id=" << entry.sequence_id;
     } else {
@@ -473,12 +514,26 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
     }
 }
 
+bool OpLogApplier::ApplyPutEndIfNewer(const OpLogEntry& entry) {
+    auto existing =
+        metadata_store_->GetMetadata(entry.tenant_id, entry.object_key);
+    if (existing.has_value() &&
+        existing->last_sequence_id > entry.sequence_id) {
+        VLOG(1) << "OpLogApplier: skip stale PUT_END, key=" << entry.object_key
+                << ", entry_seq=" << entry.sequence_id
+                << ", existing_seq=" << existing->last_sequence_id;
+        return true;
+    }
+    ApplyPutEnd(entry);
+    return true;
+}
+
 void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
     // PUT_REVOKE means the object should be removed from metadata store
     // (but the key itself may still exist if there are other replicas).
     // Current implementation removes the entire key; if we later support
     // partial replica revocation this logic will need to be refined.
-    if (!metadata_store_->Remove(entry.object_key)) {
+    if (!metadata_store_->Remove(entry.tenant_id, entry.object_key)) {
         LOG(WARNING) << "OpLogApplier: failed to Remove key="
                      << entry.object_key
                      << " in PUT_REVOKE, sequence_id=" << entry.sequence_id
@@ -490,7 +545,7 @@ void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
 }
 
 void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
-    if (!metadata_store_->Remove(entry.object_key)) {
+    if (!metadata_store_->Remove(entry.tenant_id, entry.object_key)) {
         LOG(WARNING) << "OpLogApplier: failed to Remove key="
                      << entry.object_key
                      << ", sequence_id=" << entry.sequence_id
@@ -557,6 +612,66 @@ bool OpLogApplier::RequestMissingOpLog(uint64_t missing_seq_id) {
     }
 
     return true;
+}
+
+const StandbySegmentRegistry& OpLogApplier::GetSegmentRegistry() const {
+    return segment_registry_;
+}
+
+void OpLogApplier::LoadSegmentRegistry(
+    const std::vector<StandbySegmentInfo>& segments) {
+    segment_registry_.Clear();
+    for (const auto& seg : segments) {
+        segment_registry_.OnSegmentMount(seg);
+    }
+}
+
+void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
+    SegmentMountOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+        struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize SEGMENT_MOUNT payload for key "
+                   << entry.object_key;
+        return;
+    }
+    StandbySegmentInfo info;
+    info.segment_name = op.segment_name;
+    info.transport_endpoint = op.transport_endpoint;
+    info.capacity = op.capacity;
+    info.is_memory_segment = op.is_memory_segment;
+    info.file_path = op.file_path;
+    segment_registry_.OnSegmentMount(info);
+    HAMetricManager::instance().inc_oplog_applied_entries();
+}
+
+void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
+    SegmentUnmountOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+        struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize SEGMENT_UNMOUNT payload for key "
+                   << entry.object_key;
+        return;
+    }
+    segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+    HAMetricManager::instance().inc_oplog_applied_entries();
+}
+
+void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
+    SegmentUpdateOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+        struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize SEGMENT_UPDATE payload for key "
+                   << entry.object_key;
+        return;
+    }
+    StandbySegmentInfo info;
+    info.segment_name = op.segment_name;
+    info.transport_endpoint = op.transport_endpoint;
+    info.capacity = op.capacity;
+    info.is_memory_segment = op.is_memory_segment;
+    info.file_path = op.file_path;
+    segment_registry_.OnSegmentUpdate(info);
+    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 }  // namespace mooncake
