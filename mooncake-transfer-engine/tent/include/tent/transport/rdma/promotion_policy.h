@@ -54,8 +54,11 @@ inline PromotionDecision DecidePromotionHeadOnly(
     PromotionDecision d;
     if (enqueue_ts.empty()) return d;
     const uint64_t head = enqueue_ts.front();
-    const bool head_timed_out =
-        head > 0 && (current_ts - head) >= promotion_timeout_ns;
+    // Guard current_ts >= head before subtracting: both are unsigned, so a
+    // non-monotonic clock / race where current_ts < head would otherwise
+    // underflow and spuriously mark the entry timed out.
+    const bool head_timed_out = head > 0 && current_ts >= head &&
+                                (current_ts - head) >= promotion_timeout_ns;
     if (head_timed_out) {
         d.promote_indices.reserve(enqueue_ts.size());
         for (size_t i = 0; i < enqueue_ts.size(); ++i) {
@@ -75,7 +78,10 @@ inline PromotionDecision DecidePromotionPerEntry(
     PromotionDecision d;
     for (size_t i = 0; i < enqueue_ts.size(); ++i) {
         const uint64_t ts = enqueue_ts[i];
-        if (ts > 0 && (current_ts - ts) >= promotion_timeout_ns) {
+        // See DecidePromotionHeadOnly: guard against unsigned underflow when
+        // current_ts < ts.
+        if (ts > 0 && current_ts >= ts &&
+            (current_ts - ts) >= promotion_timeout_ns) {
             d.promote_indices.push_back(i);
         }
     }
