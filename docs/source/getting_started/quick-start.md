@@ -63,6 +63,7 @@ framework guides, not by calling Transfer Engine APIs directly:
 
 - [SGLang Integration Overview](examples/sglang-integration/index.md)
 - [vLLM Integration Overview](examples/vllm-integration/index.md)
+- [Ollama Integration Overview](examples/ollama-integration/index.md)
 
 ### Mooncake Store
 

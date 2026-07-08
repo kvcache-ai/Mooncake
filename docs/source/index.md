@@ -101,6 +101,7 @@ getting_started/quick-start
 deployment/mooncake-store-deployment-guide
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
+getting_started/examples/ollama-integration/index
 Mooncake x LMCache Integration<getting_started/examples/lmcache-integration>
 Mooncake x LMDeploy Integration<getting_started/examples/lmdeploy-integration-v0.9>
 :::
