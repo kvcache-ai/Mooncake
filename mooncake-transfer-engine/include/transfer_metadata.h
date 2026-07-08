@@ -150,7 +150,8 @@ class TransferMetadata {
 #endif
         std::vector<uint32_t> qp_num;
         bool ready_ack = false;
-        // Decode-only marker used to detect peers that understand ready_ack.
+        // Capability marker. Encoded only by transports that opt into
+        // ready_ack; decoded from field presence to detect peer support.
         bool ready_ack_supported = false;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
