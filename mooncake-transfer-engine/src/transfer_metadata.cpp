@@ -19,6 +19,8 @@
 #include <cassert>
 #include <set>
 #include <algorithm>
+#include <chrono>
+#include <exception>
 
 #include "common.h"
 #include "config.h"
@@ -161,6 +163,7 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
     }
     if (conn_string == P2PHANDSHAKE) {
         p2p_handshake_mode_ = true;
+        startMetadataRefreshPollingIfNeeded();
         return;
     }
     storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
@@ -169,9 +172,70 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
             << "Unable to create metadata storage plugin with conn string "
             << conn_string;
     }
+    startMetadataRefreshPollingIfNeeded();
 }
 
-TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
+TransferMetadata::~TransferMetadata() {
+    stopMetadataRefreshPollingThread();
+    handshake_plugin_.reset();
+    storage_plugin_.reset();
+}
+
+void TransferMetadata::startMetadataRefreshPollingIfNeeded() {
+    const auto &config = globalConfig();
+    if (!config.metacache || config.te_metadata_refresh_interval_seconds == 0) {
+        return;
+    }
+    if (!p2p_handshake_mode_ && !storage_plugin_) {
+        return;
+    }
+
+    const auto refresh_interval_seconds =
+        config.te_metadata_refresh_interval_seconds;
+    should_stop_metadata_refresh_thread_ = false;
+    metadata_refresh_thread_ = std::thread(
+        [this, refresh_interval_seconds]() {
+            metadataRefreshPollingLoop(refresh_interval_seconds);
+        });
+    LOG(INFO) << "TE metadata refresh polling enabled, interval_seconds="
+              << refresh_interval_seconds;
+}
+
+void TransferMetadata::stopMetadataRefreshPollingThread() {
+    should_stop_metadata_refresh_thread_ = true;
+    metadata_refresh_cv_.notify_all();
+    if (metadata_refresh_thread_.joinable()) {
+        metadata_refresh_thread_.join();
+    }
+}
+
+void TransferMetadata::metadataRefreshPollingLoop(
+    uint64_t refresh_interval_seconds) {
+    std::unique_lock<std::mutex> lock(metadata_refresh_mutex_);
+    while (!should_stop_metadata_refresh_thread_) {
+        if (metadata_refresh_cv_.wait_for(
+                lock, std::chrono::seconds(refresh_interval_seconds),
+                [this]() {
+                    return should_stop_metadata_refresh_thread_.load();
+                })) {
+            break;
+        }
+        lock.unlock();
+        try {
+            int ret = syncSegmentCache("");
+            if (ret) {
+                LOG(WARNING) << "TE metadata refresh polling failed, ret="
+                             << ret;
+            }
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Exception in TE metadata refresh polling: "
+                       << e.what();
+        } catch (...) {
+            LOG(ERROR) << "Unknown exception in TE metadata refresh polling";
+        }
+        lock.lock();
+    }
+}
 
 std::string TransferMetadata::getFullMetadataKey(
     const std::string &segment_name) const {
@@ -958,6 +1022,21 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     return result;
 }
 
+bool TransferMetadata::SegmentDesc::operator==(
+    const SegmentDesc &other) const {
+    // timestamp is intentionally excluded: metadata encoding may refresh it
+    // even when the operational descriptor is unchanged.
+    return name == other.name && protocol == other.protocol &&
+           devices == other.devices && topology == other.topology &&
+           buffers == other.buffers &&
+           nvmeof_buffers == other.nvmeof_buffers &&
+           cxl_name == other.cxl_name &&
+           cxl_base_addr == other.cxl_base_addr &&
+           rank_info == other.rank_info &&
+           tcp_data_port == other.tcp_data_port &&
+           rdma_server_name == other.rdma_server_name;
+}
+
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     // Collect segment names to sync first, then release lock before network I/O
     std::vector<std::string> names_to_sync;
@@ -971,25 +1050,73 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
         }
     }
 
+    size_t fetched_count = 0;
+    size_t failed_count = 0;
+    size_t updated_count = 0;
+    size_t unchanged_count = 0;
+    size_t skipped_count = 0;
+
     // Fetch updates without holding lock (may involve network I/O)
     std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
     for (const auto &name : names_to_sync) {
         auto segment_desc = getSegmentDesc(name);
         if (segment_desc) {
             updates.emplace_back(name, segment_desc);
+            ++fetched_count;
         } else {
+            ++failed_count;
             LOG(WARNING) << "segment " << name << " is now invalid";
         }
     }
 
-    // Apply updates with write lock
-    RWSpinlock::WriteGuard guard(segment_lock_);
-    for (const auto &[name, desc] : updates) {
-        auto it = segment_name_to_id_map_.find(name);
-        if (it != segment_name_to_id_map_.end()) {
-            segment_id_to_desc_map_[it->second] = desc;
+    {
+        // Apply updates with write lock
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        for (const auto &[name, desc] : updates) {
+            auto it = segment_name_to_id_map_.find(name);
+            if (it == segment_name_to_id_map_.end()) {
+                ++skipped_count;
+                continue;
+            }
+
+            const auto segment_id = it->second;
+            auto current_it = segment_id_to_desc_map_.find(segment_id);
+            const auto old_desc =
+                current_it == segment_id_to_desc_map_.end()
+                    ? nullptr
+                    : current_it->second;
+            bool changed = true;
+            if (old_desc) {
+                changed = *old_desc != *desc;
+            }
+
+            if (!changed) {
+                ++unchanged_count;
+                continue;
+            }
+
+            segment_id_to_desc_map_[segment_id] = desc;
+            ++updated_count;
+            LOG(WARNING) << "Segment cache descriptor changed, name=" << name
+                         << ", segment_id=" << segment_id;
+            if (old_desc) {
+                LOG(INFO) << "Old segment descriptor:";
+                old_desc->dump();
+            } else {
+                LOG(INFO) << "Old segment descriptor: <missing>";
+            }
+            LOG(INFO) << "New segment descriptor:";
+            desc->dump();
         }
     }
+    LOG(INFO) << "Segment cache sync finished, requested_segment="
+              << (segment_name.empty() ? "<all>" : segment_name)
+              << ", scanned=" << names_to_sync.size()
+              << ", fetched=" << fetched_count
+              << ", updated=" << updated_count
+              << ", unchanged=" << unchanged_count
+              << ", failed=" << failed_count
+              << ", skipped=" << skipped_count;
     return 0;
 }
 

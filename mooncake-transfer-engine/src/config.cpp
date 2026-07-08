@@ -317,6 +317,27 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.metacache = false;
     }
 
+    const char* te_metadata_refresh_interval_seconds =
+        std::getenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
+    if (te_metadata_refresh_interval_seconds) {
+        try {
+            int val = std::stoi(te_metadata_refresh_interval_seconds);
+            if (val >= 0) {
+                config.te_metadata_refresh_interval_seconds =
+                    static_cast<uint64_t>(val);
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_TE_METADATA_REFRESH_INTERVAL_SECONDS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING)
+                << "Invalid MC_TE_METADATA_REFRESH_INTERVAL_SECONDS environment "
+                   "value: "
+                << te_metadata_refresh_interval_seconds
+                << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
@@ -631,6 +652,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
+    LOG(INFO) << "te_metadata_refresh_interval_seconds = "
+              << config.te_metadata_refresh_interval_seconds;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {

@@ -19,9 +19,13 @@
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 
+#include "config.h"
 #include "transport/transport.h"
+#include "transfer_metadata_plugin.h"
 
 using namespace mooncake;
 
@@ -121,6 +125,114 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
     re = metadata_client->removeRpcMetaEntry("test_server");
     ASSERT_EQ(re, 0);
+}
+
+namespace {
+
+struct ScopedMetadataRefreshConfig {
+    uint64_t old_interval_seconds;
+    bool old_metacache;
+
+    ScopedMetadataRefreshConfig(uint64_t interval_seconds, bool metacache)
+        : old_interval_seconds(
+              globalConfig().te_metadata_refresh_interval_seconds),
+          old_metacache(globalConfig().metacache) {
+        globalConfig().te_metadata_refresh_interval_seconds = interval_seconds;
+        globalConfig().metacache = metacache;
+    }
+
+    ~ScopedMetadataRefreshConfig() {
+        globalConfig().te_metadata_refresh_interval_seconds =
+            old_interval_seconds;
+        globalConfig().metacache = old_metacache;
+    }
+};
+
+TransferMetadata::BufferDesc makeRdmaBufferDesc(uint64_t addr) {
+    TransferMetadata::BufferDesc buffer_desc;
+    buffer_desc.name = "buffer";
+    buffer_desc.addr = addr;
+    buffer_desc.length = 1024;
+    buffer_desc.lkey.push_back(1);
+    buffer_desc.rkey.push_back(2);
+    return buffer_desc;
+}
+
+std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
+    const std::string& name, uint64_t addr) {
+    auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment_desc->name = name;
+    segment_desc->protocol = "rdma";
+    segment_desc->tcp_data_port = 0;
+
+    TransferMetadata::DeviceDesc device_desc;
+    device_desc.name = "mlx5_0";
+    device_desc.lid = 1;
+    device_desc.gid = "00000000000000000000ffff7f000001";
+    segment_desc->devices.push_back(device_desc);
+
+    segment_desc->buffers.push_back(makeRdmaBufferDesc(addr));
+    return segment_desc;
+}
+
+}  // namespace
+
+TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kUpdatedAddr = 0x2000;
+
+    ScopedMetadataRefreshConfig restore(1, true);
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name =
+        "127.0.0.1:" + std::to_string(port);
+
+    ASSERT_EQ(server.addLocalSegment(
+                  LOCAL_SEGMENT_ID, remote_segment_name,
+                  makeRdmaSegmentDesc(remote_segment_name, kInitialAddr)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(client.addLocalSegment(
+                  LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                  makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+              0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id,
+              static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_TRUE(cached_desc);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    ASSERT_EQ(server.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(kInitialAddr), false),
+              0);
+    ASSERT_EQ(server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr),
+                                          false),
+              0);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+        cached_desc = client.getSegmentDescByID(segment_id);
+        ASSERT_TRUE(cached_desc);
+        if (!cached_desc->buffers.empty() &&
+            cached_desc->buffers[0].addr == kUpdatedAddr) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
 }
 
 }  // namespace mooncake
