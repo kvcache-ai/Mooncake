@@ -53,6 +53,14 @@ struct GdsContext {
     tl::expected<void, ErrorCode> Init(const std::string& data_file_path,
                                        uint64_t capacity);
 
+    // InitClientDma opens an *existing* data file for cuFile DMA I/O.
+    // Does NOT posix_fallocate / O_TRUNC / I/O-probe — the file is owned
+    // by store_service (which already did those steps).
+    // Used by vLLM in normal-mode + GDS to obtain a cuFile handle on the
+    // shared kv_cache.data for DMA writes.
+    tl::expected<void, ErrorCode> InitClientDma(
+        const std::string& existing_file_path);
+
     // Release: registered_buffers_ -> cu_file_handle_ -> gds_fd_
     // (cuFile requires buffers deregistered before handle deregister)
     void Shutdown();

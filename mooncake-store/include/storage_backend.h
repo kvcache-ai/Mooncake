@@ -16,6 +16,10 @@
 #include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
 
+namespace mooncake {
+struct OffloadSpaceReservation;
+}
+
 #include "gds/gds_context.h"  // GdsContext complete type (needed by any class with unique_ptr<GdsContext>)
 
 namespace mooncake {
@@ -319,6 +323,15 @@ class StorageBackendInterface {
     // Whether GDS is actually enabled on this instance
     // (true after Init() if probe passed).
     virtual bool IsGdsEnabled() const { return false; }
+
+    // Complete DMA write (default no-op; OffsetAllocator overrides).
+    virtual void CompleteOffloadSpace(const std::string& /*key*/) {}
+    // Return data file path (default empty; OffsetAllocator overrides).
+    virtual std::string GetDataFilePath() const { return {}; }
+
+    // Heartbeat-driven reclamation of stale dirty records.
+    // Only relevant for OffsetAllocatorStorageBackend; others are no-ops.
+    virtual void CleanupStaleDirtyRecords(int64_t /*now_seconds*/) {}
 
     FileStorageConfig file_storage_config_;
 };
@@ -1175,16 +1188,75 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
         // Refcounted handle keeps physical extent alive during reads
         AllocationPtr allocation;
+
+        // ── GDS two-phase commit (Part B) ──
+        // dirty_=true: offset reserved but DMA not yet complete.
+        // BatchLoad must skip dirty records (read would see stale data).
+        std::atomic<bool> dirty_{false};
+
+        // quarantined_=true: DMA presumed lost; offset pending reclamation.
+        // Set by heartbeat Phase A (overdirty), cleared by Phase B (zombie
+        // release via erase). See fix_patch.md §3.2 for the full protocol.
+        std::atomic<bool> quarantined_{false};
+
+        // Timestamps for heartbeat stale-dirty cleanup (monotonic seconds).
+        int64_t reserved_at{0};
+        int64_t quarantined_at{0};
+
+        ObjectEntry() : offset(0), total_size(0), value_size(0) {}
         ObjectEntry(uint64_t off, uint32_t total, uint32_t val,
                     AllocationPtr alloc_ptr)
             : offset(off),
               total_size(total),
               value_size(val),
               allocation(std::move(alloc_ptr)) {}
+        // Explicit move — std::atomic<bool> deletes implicit move.
+        ObjectEntry(ObjectEntry&& other) noexcept
+            : offset(other.offset),
+              total_size(other.total_size),
+              value_size(other.value_size),
+              allocation(std::move(other.allocation)),
+              reserved_at(other.reserved_at),
+              quarantined_at(other.quarantined_at) {
+            dirty_.store(other.dirty_.load(std::memory_order_acquire));
+            quarantined_.store(
+                other.quarantined_.load(std::memory_order_acquire));
+        }
+        ObjectEntry& operator=(ObjectEntry&& other) noexcept {
+            offset = other.offset;
+            total_size = other.total_size;
+            value_size = other.value_size;
+            allocation = std::move(other.allocation);
+            dirty_.store(other.dirty_.load(std::memory_order_acquire));
+            quarantined_.store(
+                other.quarantined_.load(std::memory_order_acquire));
+            reserved_at = other.reserved_at;
+            quarantined_at = other.quarantined_at;
+            return *this;
+        }
     };
 
+    // ── GDS two-phase commit (Part B) ──
+   public:
+    // Phase 1: allocate file space and insert metadata with dirty_=true.
+    // Returns the file offset for the caller to DMA-write into.
+    tl::expected<OffloadSpaceReservation, ErrorCode> ReserveOffloadSpace(
+        const std::string& key, uint32_t record_size, uint32_t value_size);
+
+    // Phase 2: caller completed DMA → clear dirty_ flag.
+    void CompleteOffloadSpace(const std::string& key) override;
+
+    // Write raw record data at a pre-allocated offset.
+    // Used by vLLM in normal-mode + GDS: offset was obtained from
+    // store_service via BatchReserveOffloadSpace RPC.
+    tl::expected<void, ErrorCode> WriteAtOffset(
+        const std::string& key, const std::vector<Slice>& slices,
+        uint64_t offset);
+
+    void CleanupStaleDirtyRecords(int64_t now_seconds) override;
+
     // Returns full path to data file: {storage_path_}/kv_cache.data
-    std::string GetDataFilePath() const;
+    std::string GetDataFilePath() const override;
 
     static constexpr size_t kNumShards =
         1024;  // Number of shards (must be power of 2 for bitwise optimization)

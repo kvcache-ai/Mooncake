@@ -17,6 +17,12 @@
 #include "file_storage.h"
 
 namespace mooncake {
+struct BatchReserveOffloadSpaceRequest;
+struct BatchReserveOffloadSpaceResponse;
+struct BatchCompleteOffloadSpaceRequest;
+}  // namespace mooncake
+
+namespace mooncake {
 
 #define MOONCAKE_SHM_NAME "mooncake_shm"
 
@@ -162,6 +168,16 @@ class ClientRequester {
      */
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
+
+    // GDS two-phase commit: request file offsets from store_service.
+    tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>
+    batch_reserve_offload_space(const std::string &store_addr,
+                                const BatchReserveOffloadSpaceRequest &req);
+
+    // GDS two-phase commit: notify store_service DMA is complete.
+    tl::expected<void, ErrorCode> batch_complete_offload_space(
+        const std::string &store_addr,
+        const BatchCompleteOffloadSpaceRequest &req);
 
    private:
     /**

@@ -611,6 +611,13 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr);
 
+    // Normal-mode + GDS: reserve offsets from store_service RPC,
+    // DMA write via WriteAtOffset, complete via RPC.
+    std::vector<tl::expected<void, ErrorCode>> batch_put_with_store_reservation(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<Slice>> &batched_slices,
+        const ReplicateConfig &config);
+
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
@@ -678,6 +685,13 @@ class RealClient : public PyClient {
         const std::string &segment_name = "") override;
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
+
+    async_simple::coro::Lazy<
+        tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>>
+    batch_reserve_offload_space(const BatchReserveOffloadSpaceRequest &req);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    batch_complete_offload_space(const BatchCompleteOffloadSpaceRequest &req);
 
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
@@ -881,6 +895,10 @@ class RealClient : public PyClient {
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
+
+    // store_service coro_rpc address for normal-mode GDS
+    // Reserve/Complete RPCs. Set via MOONCAKE_GDS_STORE_SERVICE_ADDR.
+    std::string store_service_addr_;
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();

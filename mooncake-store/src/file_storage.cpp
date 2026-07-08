@@ -322,6 +322,11 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                       << config_.heartbeat_interval_seconds << "s";
             while (heartbeat_running_.load()) {
                 Heartbeat();
+                auto now_s =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                storage_backend_->CleanupStaleDirtyRecords(now_s);
                 std::this_thread::sleep_for(
                     std::chrono::seconds(config_.heartbeat_interval_seconds));
             }
@@ -485,6 +490,74 @@ tl::expected<void, ErrorCode> FileStorage::DirectGdsBatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     return BatchLoad(batch_object);
 }
+
+// =====================================================================
+// GDS two-phase commit: store_service side
+// =====================================================================
+
+tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>
+FileStorage::BatchReserveOffloadSpace(
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& value_sizes) {
+    BatchReserveOffloadSpaceResponse resp;
+    resp.data_file_path = storage_backend_->GetDataFilePath();
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& key = keys[i];
+        uint64_t vsize = value_sizes[i];
+        if (vsize > UINT32_MAX) {
+            resp.failed_indices.push_back(static_cast<int32_t>(i));
+            continue;
+        }
+        // Compute record_size in uint64_t to avoid overflow:
+        // RecordHeader::SIZE(8) + key.size() + vsize can exceed 2^32-1
+        // when both key and value are near UINT32_MAX.
+        uint64_t record_size_64 = RecordHeader::SIZE + key.size() + vsize;
+        if (record_size_64 > UINT32_MAX) {
+            LOG(ERROR) << "BatchReserveOffloadSpace: record too large for key "
+                       << key << " (size=" << record_size_64 << ")";
+            resp.failed_indices.push_back(static_cast<int32_t>(i));
+            continue;
+        }
+        uint32_t record_size = static_cast<uint32_t>(record_size_64);
+
+        auto* oa = dynamic_cast<OffsetAllocatorStorageBackend*>(
+            storage_backend_.get());
+        if (!oa) {
+            resp.failed_indices.push_back(static_cast<int32_t>(i));
+            continue;
+        }
+        auto res = oa->ReserveOffloadSpace(key, record_size,
+                                           static_cast<uint32_t>(vsize));
+        if (!res) {
+            resp.failed_indices.push_back(static_cast<int32_t>(i));
+            continue;
+        }
+        resp.reservations.push_back(OffloadSpaceReservation{
+            res->offset, record_size, static_cast<uint32_t>(vsize)});
+    }
+    return resp;
+}
+
+tl::expected<void, ErrorCode> FileStorage::BatchCompleteOffloadSpace(
+    const std::vector<std::string>& keys) {
+    for (const auto& key : keys) storage_backend_->CompleteOffloadSpace(key);
+    return {};
+}
+
+std::string FileStorage::GetDataFilePath() const {
+    return storage_backend_->GetDataFilePath();
+}
+
+tl::expected<void, ErrorCode> FileStorage::WriteAtOffset(
+    const std::string& key, const std::vector<Slice>& slices, uint64_t offset) {
+    auto* oa =
+        dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
+    if (!oa) return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    return oa->WriteAtOffset(key, slices, offset);
+}
+
+// =====================================================================
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
