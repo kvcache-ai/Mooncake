@@ -19,15 +19,18 @@ ClientTestWrapper::~ClientTestWrapper() {
 }
 
 std::optional<std::shared_ptr<ClientTestWrapper>>
-ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
-                                       const std::string& metadata_connstring,
-                                       const std::string& protocol,
-                                       const std::string& device_name,
-                                       const std::string& master_server_entry,
-                                       size_t local_buffer_size) {
+ClientTestWrapper::CreateClientWrapper(
+    const std::string& hostname, const std::string& metadata_connstring,
+    const std::string& protocol, const std::string& device_name,
+    const std::string& master_server_entry, size_t local_buffer_size,
+    const std::string& redis_cluster_id, bool enable_http_server) {
     auto config = ClientConfigBuilder::build_centralized_real_client(
         hostname, metadata_connstring, protocol, device_name,
-        master_server_entry, 0, local_buffer_size);
+        master_server_entry, 0, local_buffer_size, nullptr, "", false, 9003,
+        enable_http_server);
+    if (!redis_cluster_id.empty()) {
+        config.redis_cluster_id = redis_cluster_id;
+    }
     auto client_opt = ClientService::Create(config);
 
     if (!client_opt.has_value()) {

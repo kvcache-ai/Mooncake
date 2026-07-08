@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "client_wrapper.h"
 #include "e2e_utils.h"
 #include "process_handler.h"
 #include "redis_master_view_helper.h"
@@ -22,20 +23,21 @@ DEFINE_string(redis_endpoint, "127.0.0.1:6379",
               "Redis endpoint for Redis master failover test");
 DEFINE_string(redis_cluster_id, "redis_chaos_test",
               "Redis cluster ID for Redis master failover test");
-DEFINE_int32(redis_master_view_ttl_sec, 2,
+DEFINE_int32(redis_master_view_ttl_sec, 5,
              "Redis master view TTL for Redis master failover test");
-DEFINE_int32(redis_heartbeat_interval_sec, 1,
+DEFINE_int32(redis_heartbeat_interval_sec, 2,
              "Redis heartbeat interval for Redis master failover test");
 
 constexpr int kMasterPortBase = 51051;
 constexpr int kMasterNum = 3;
+constexpr int kClientPortBase = 52051;
 
 namespace mooncake {
 namespace testing {
 
 namespace {
 
-void CleanupRedisKeys() {
+std::pair<std::string, int> ParseRedisEndpoint() {
     std::string host = "127.0.0.1";
     int port = 6379;
     auto colon_pos = FLAGS_redis_endpoint.rfind(':');
@@ -43,20 +45,52 @@ void CleanupRedisKeys() {
         host = FLAGS_redis_endpoint.substr(0, colon_pos);
         port = std::stoi(FLAGS_redis_endpoint.substr(colon_pos + 1));
     }
+    return {host, port};
+}
 
+std::string RedisClusterIdWithSlash() {
+    std::string cluster_id = FLAGS_redis_cluster_id;
+    if (!cluster_id.empty() && cluster_id.back() != '/') {
+        cluster_id += '/';
+    }
+    return cluster_id;
+}
+
+std::string MasterViewKey() {
+    return "mooncake:{" + RedisClusterIdWithSlash() + "}master_view";
+}
+
+std::string MasterEpochKey() {
+    return "mooncake:{" + RedisClusterIdWithSlash() + "}master_epoch";
+}
+
+bool DeleteRedisKey(const std::string& key) {
+    auto [host, port] = ParseRedisEndpoint();
+    redisContext* ctx = redisConnect(host.c_str(), port);
+    if (!ctx || ctx->err) {
+        if (ctx) redisFree(ctx);
+        return false;
+    }
+
+    redisReply* reply = static_cast<redisReply*>(
+        redisCommand(ctx, "DEL %b", key.data(), key.size()));
+    bool deleted =
+        reply && reply->type == REDIS_REPLY_INTEGER && reply->integer == 1;
+    if (reply) freeReplyObject(reply);
+    redisFree(ctx);
+    return deleted;
+}
+
+void CleanupRedisKeys() {
+    auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
     if (!ctx || ctx->err) {
         if (ctx) redisFree(ctx);
         return;
     }
 
-    std::string cluster_id = FLAGS_redis_cluster_id;
-    if (!cluster_id.empty() && cluster_id.back() != '/') {
-        cluster_id += '/';
-    }
-    std::string master_view_key = "mooncake:{" + cluster_id + "}master_view";
-    std::string master_epoch_key = "mooncake:{" + cluster_id + "}master_epoch";
-
+    std::string master_view_key = MasterViewKey();
+    std::string master_epoch_key = MasterEpochKey();
     redisReply* reply = static_cast<redisReply*>(redisCommand(
         ctx, "DEL %b %b", master_view_key.data(), master_view_key.size(),
         master_epoch_key.data(), master_epoch_key.size()));
@@ -99,6 +133,7 @@ class RedisChaosTest : public ::testing::Test {
         config.redis_heartbeat_interval_sec =
             FLAGS_redis_heartbeat_interval_sec;
         config.cluster_id = FLAGS_redis_cluster_id;
+        config.rpc_address = "127.0.0.1";
 
         for (int i = 0; i < kMasterNum; ++i) {
             masters_.emplace_back(std::make_unique<MasterProcessHandler>(
@@ -151,6 +186,61 @@ class RedisChaosTest : public ::testing::Test {
         return false;
     }
 
+    bool WaitForNewerView(ViewVersionId old_version, int& leader_index,
+                          ViewVersionId& version) {
+        auto timeout =
+            std::chrono::seconds(FLAGS_redis_master_view_ttl_sec * 8);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (WaitForLeader(leader_index, version, std::chrono::seconds(1)) &&
+                version > old_version) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void WaitForLeaderServiceReady() {
+        std::this_thread::sleep_for(
+            std::chrono::seconds(FLAGS_redis_master_view_ttl_sec + 1));
+    }
+
+    std::shared_ptr<ClientTestWrapper> CreateRedisClient(
+        int index, std::chrono::seconds timeout) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto client = ClientTestWrapper::CreateClientWrapper(
+                "0.0.0.0:" + std::to_string(kClientPortBase + index),
+                "P2PHANDSHAKE", "tcp", "", "redis://" + FLAGS_redis_endpoint,
+                /*local_buffer_size=*/1024 * 1024 * 128, FLAGS_redis_cluster_id,
+                /*enable_http_server=*/false);
+            if (client.has_value()) {
+                return client.value();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        return nullptr;
+    }
+
+    bool WaitForClientPutGet(ClientTestWrapper& client,
+                             const std::string& key_prefix,
+                             const std::string& value,
+                             std::chrono::seconds timeout) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        int attempt = 0;
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::string key = key_prefix + "_" + std::to_string(attempt++);
+            if (client.Put(key, value) == ErrorCode::OK) {
+                std::string got;
+                if (client.Get(key, got) == ErrorCode::OK && got == value) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        return false;
+    }
+
     std::vector<std::unique_ptr<MasterProcessHandler>> masters_;
     std::unique_ptr<RedisMasterViewHelper> master_view_helper_;
 };
@@ -170,6 +260,49 @@ TEST_F(RedisChaosTest, LeaderKilledFailover) {
         WaitForNewLeader(leader_index, version, new_leader_index, new_version));
     EXPECT_NE(new_leader_index, leader_index);
     EXPECT_GT(new_version, version);
+}
+
+TEST_F(RedisChaosTest, LeaderKeyDeletedTriggersReElection) {
+    int leader_index = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));
+    ASSERT_GE(leader_index, 0);
+    ASSERT_LT(leader_index, kMasterNum);
+
+    ASSERT_TRUE(DeleteRedisKey(MasterViewKey()));
+
+    int next_leader_index = -1;
+    ViewVersionId next_version = 0;
+    ASSERT_TRUE(WaitForNewerView(version, next_leader_index, next_version));
+    EXPECT_GE(next_leader_index, 0);
+    EXPECT_LT(next_leader_index, kMasterNum);
+    EXPECT_GT(next_version, version);
+}
+
+TEST_F(RedisChaosTest, ClientRedisDiscoverySurvivesLeaderFailover) {
+    int leader_index = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+
+    auto client = CreateRedisClient(/*index=*/0, std::chrono::seconds(30));
+    ASSERT_NE(client, nullptr);
+
+    void* buffer = nullptr;
+    ASSERT_EQ(client->Mount(1024 * 1024 * 16, buffer), ErrorCode::OK);
+    ASSERT_TRUE(WaitForClientPutGet(*client, "redis_failover_before", "value",
+                                    std::chrono::seconds(5)));
+
+    ASSERT_TRUE(masters_[leader_index]->kill());
+
+    int new_leader_index = -1;
+    ViewVersionId new_version = 0;
+    ASSERT_TRUE(
+        WaitForNewLeader(leader_index, version, new_leader_index, new_version));
+    WaitForLeaderServiceReady();
+
+    ASSERT_TRUE(WaitForClientPutGet(*client, "redis_failover_after", "value2",
+                                    std::chrono::seconds(60)));
 }
 
 }  // namespace testing
