@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <list>
@@ -114,6 +115,8 @@ class DfsGlobalAllocator {
     std::chrono::seconds deferred_free_duration_{30};
     std::chrono::seconds eviction_check_interval_{5};
     std::thread eviction_thread_;
+    std::mutex cv_mutex_;
+    std::condition_variable cv_;
     std::atomic<bool> running_{false};
     std::atomic<bool> initialized_{false};
     std::function<void(const std::string&, int, uint64_t)> on_evict_callback_;

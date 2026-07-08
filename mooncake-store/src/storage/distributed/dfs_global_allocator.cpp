@@ -16,7 +16,11 @@
 namespace mooncake {
 
 DfsGlobalAllocator::~DfsGlobalAllocator() {
-    running_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(cv_mutex_);
+        running_.store(false, std::memory_order_release);
+    }
+    cv_.notify_all();
     if (eviction_thread_.joinable()) eviction_thread_.join();
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
@@ -317,10 +321,15 @@ std::vector<DfsGlobalAllocator::EvictedKey> DfsGlobalAllocator::EvictFromShard(
 }
 
 void DfsGlobalAllocator::EvictionMonitor() {
+    std::unique_lock<std::mutex> lock(cv_mutex_);
     while (running_.load(std::memory_order_acquire)) {
+        lock.unlock();
         const auto now = std::chrono::steady_clock::now();
         for (int i = 0; i < shard_count_; ++i) {
-            CleanupExpiredPendingFrees(*shards_[i], now);
+            auto& shard = *shards_[i];
+            std::unique_lock<std::shared_mutex> handle_lock(
+                shard.handle_mutex);
+            CleanupExpiredPendingFrees(shard, now);
         }
 
         if (eviction_enabled_) {
@@ -331,7 +340,10 @@ void DfsGlobalAllocator::EvictionMonitor() {
                 }
             }
         }
-        std::this_thread::sleep_for(eviction_check_interval_);
+        lock.lock();
+        cv_.wait_for(lock, eviction_check_interval_, [this]() {
+            return !running_.load(std::memory_order_acquire);
+        });
     }
 }
 
