@@ -5214,7 +5214,33 @@ long MasterService::RemoveAll(bool force) {
                     auto mem_rep_count = it->second.CountReplicas(
                         &Replica::fn_is_memory_replica);
 
-                    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+                    if (enable_ha_ && use_batch_oplog_) {
+                        std::vector<ReplicaID> removed_ids;
+                        it->second.VisitReplicas(
+                            &Replica::fn_is_completed,
+                            [&removed_ids](Replica& replica) {
+                                removed_ids.push_back(replica.id());
+                                replica.mark_removed();
+                            });
+                        auto persist_result = AppendOpLogWithDurableFinalize(
+                            OpType::REMOVE, tenant_it->first, it->first, {},
+                            [this, removed_ids = std::move(removed_ids)](
+                                const OpLogEntry& durable_entry) {
+                                FinalizeRemovedReplicasAfterDurable(
+                                    durable_entry, removed_ids,
+                                    QuotaEraseMode::kFull);
+                            });
+                        if (!persist_result) {
+                            ++it;
+                            continue;
+                        }
+                        total_freed_size += it->second.size * mem_rep_count;
+                        ++it;
+                        removed_count++;
+                        continue;
+                    }
+
+                    if (enable_ha_ && oplog_store_) {
                         auto err = PersistRemoveForHA(
                             "RemoveAll", tenant_it->first, it->first);
                         if (!err) {
@@ -5268,7 +5294,33 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                 !tenant_state.replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
-                if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+                if (enable_ha_ && use_batch_oplog_) {
+                    std::vector<ReplicaID> removed_ids;
+                    it->second.VisitReplicas(
+                        &Replica::fn_is_completed,
+                        [&removed_ids](Replica& replica) {
+                            removed_ids.push_back(replica.id());
+                            replica.mark_removed();
+                        });
+                    auto persist_result = AppendOpLogWithDurableFinalize(
+                        OpType::REMOVE, normalized_tenant, it->first, {},
+                        [this, removed_ids = std::move(removed_ids)](
+                            const OpLogEntry& durable_entry) {
+                            FinalizeRemovedReplicasAfterDurable(
+                                durable_entry, removed_ids,
+                                QuotaEraseMode::kFull);
+                        });
+                    if (!persist_result) {
+                        ++it;
+                        continue;
+                    }
+                    total_freed_size += it->second.size * mem_rep_count;
+                    ++it;
+                    removed_count++;
+                    continue;
+                }
+
+                if (enable_ha_ && oplog_store_) {
                     auto err = PersistRemoveForHA("RemoveAll(tenant)",
                                                   normalized_tenant, it->first);
                     if (!err) {
