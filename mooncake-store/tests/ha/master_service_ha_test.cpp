@@ -837,6 +837,49 @@ TEST_F(MasterServiceBatchRecordE2ETest, StandbyAppliesPrimaryBatchRecords) {
     EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant, key));
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest, LegacyLatestCutoverThenBatchRecords) {
+    const std::string cluster_id = "test_batch_record_e2e_legacy_cutover";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put("/oplog/" + cluster_id + "/latest", "42"));
+
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_e2e_cutover_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(43u, batch.entries[0].sequence_id);
+
+    const std::string key = "batch_e2e_cutover_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_e2e_cutover_segment");
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(44u, batch.entries[0].sequence_id);
+
+    MockMetadataStore standby_metadata;
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    applier.Recover(42);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+
+    auto result = reader.PollOnce();
+    ASSERT_EQ(ErrorCode::OK, result.error);
+    EXPECT_FALSE(result.used_legacy_path);
+    EXPECT_EQ(2u, result.applied_entries);
+    EXPECT_EQ(45u, applier.GetExpectedSequenceId());
+    EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant, key));
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
