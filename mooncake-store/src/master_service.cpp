@@ -2239,20 +2239,22 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     }
 
     const auto& metadata = accessor.Get();
-    if (metadata.HasReplica(&Replica::fn_is_completed)) {
-        // Grant a lease to the object as it may be further used by the
-        // client.
-        auto* ts = accessor.GetTenantState();
-        if (ts) {
-            GrantLeaseForGroup(*ts, key, metadata);
-        } else {
-            metadata.GrantLease(default_kv_lease_ttl_,
-                                default_kv_soft_pin_ttl_);
+    auto readiness = ClassifyReplicaReadiness(&metadata);
+    if (!readiness) {
+        if (readiness.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            return false;
         }
-        return true;
+        return tl::make_unexpected(readiness.error());
     }
 
-    return false;  // If no complete replica is found, return false
+    // Grant a lease to the object as it may be further used by the client.
+    auto* ts = accessor.GetTenantState();
+    if (ts) {
+        GrantLeaseForGroup(*ts, key, metadata);
+    } else {
+        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    }
+    return true;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
