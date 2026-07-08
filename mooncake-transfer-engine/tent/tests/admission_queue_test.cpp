@@ -497,6 +497,104 @@ TEST(AdmissionQueueTest, DeadlineAwareOrdersAcrossSeparateAdmits) {
     EXPECT_EQ(picked, expected);
 }
 
+// --- RFC #2519 step 3: deadline-infeasible drop + degradation hook --------
+
+// Helper: build a queue with deadline_aware + a θ_local, a fixed bandwidth,
+// and a fixed "now" clock so MLU is deterministic.
+QueueLimits step3Limits(double theta_local) {
+    QueueLimits limits{4, 1 << 20, 0, 0};
+    limits.deadline_aware = true;
+    limits.mlu_local_threshold = theta_local;
+    return limits;
+}
+
+TEST(AdmissionQueueTest, Step3DropsInfeasibleAndKeepsFeasible) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    // Fixed now = 1e9 ns; bandwidth = 1e9 B/s (so 16 B takes 16 ns).
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    // owner 1: window = 10 ns → 16 B / 1e9 = 16 ns → MLU 1.6 ≥ 1.5 → DROP.
+    // owner 2: window = 1e6 ns → MLU ~1.6e-5 → feasible → dispatch.
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2,
+                   {makeOwnerWithDeadline(0, 16, 1'000'000'010),
+                    makeOwnerWithDeadline(1, 16, 2'000'000'000)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 2u);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+
+    const std::vector<QueueOwnerId> exp_pick{2};
+    const std::vector<QueueOwnerId> exp_drop{1};
+    EXPECT_EQ(picked, exp_pick);
+    EXPECT_EQ(dropped, exp_drop);
+    EXPECT_EQ(hook_calls, 1);
+    // Dropped owner is charged out of the outstanding accounting.
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.outstandingBytes(), 16u);
+}
+
+TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{2'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    // deadline 1e9 < now 2e9 → already past → dropped.
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'000)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    EXPECT_TRUE(picked.empty());
+    ASSERT_EQ(dropped.size(), 1u);
+    EXPECT_EQ(dropped[0], 1u);
+}
+
+TEST(AdmissionQueueTest, Step3DisabledWhenThresholdZero) {
+    // θ_local = 0 (default off): even a hopeless deadline is dispatched, and
+    // the dropped vector stays empty — behavior is pure step-2 EDF.
+    LocalTransferAdmissionQueue queue(step3Limits(0.0));
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'001)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_EQ(picked[0], 1u);
+    EXPECT_TRUE(dropped.empty());
+}
+
+TEST(AdmissionQueueTest, Step3NoDropWithoutBandwidthProvider) {
+    // Threshold set but no bandwidth provider → cannot predict → never drops.
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'001)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(dropped.empty());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
