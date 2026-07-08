@@ -26,7 +26,7 @@ class SnapshotCatalogStore;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
-}
+}  // namespace test
 
 #ifdef STORE_USE_ETCD
 class EtcdOpLogStore;
@@ -61,8 +61,8 @@ struct MasterSnapshotManagerOptions {
 class MasterSnapshotManager {
     friend class test::MasterServiceSnapshotTestBase;  // Allow test access to
                                                        // private methods
-    friend class test::SnapshotChildProcessTest;  // Allow test access to
-                                                  // private methods
+    friend class test::SnapshotChildProcessTest;       // Allow test access to
+                                                       // private methods
 
    public:
     MasterSnapshotManager(MasterService* master_service,
