@@ -232,7 +232,10 @@ run_single_test(){
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
     source "./$test_name"
-    
+
+    local log_dir="${BASE_DIR}/run/logs/$(basename "$test_name" .sh)"
+    setup_log_directory "$log_dir"
+
     local exit_code=0
     run_test "$@" || exit_code=1
     
