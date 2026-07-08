@@ -402,10 +402,9 @@ cleanup_test_env() {
 }
 
 # Wait until GPU memory on the local host drains below a threshold.
-# Used between test cases in run-all so a previous test's leftover GPU
-# memory does not cause the next test's server to OOM / get SIGKILLed.
+# Returns 0 once drained, 1 if it times out.
 wait_gpu_idle() {
-    local max_seconds=${1:-120}
+    local max_seconds=${1:-90}
     local threshold_mb=${2:-1024}
 
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -426,28 +425,48 @@ wait_gpu_idle() {
         sleep 3
         elapsed=$((elapsed + 3))
     done
-    echo "WARNING: GPU memory did not fully drain within ${max_seconds}s (max used ${max_used}MB)"
-    return 0
+    echo "GPU memory not drained within ${max_seconds}s (max used ${max_used}MB)"
+    return 1
 }
 
-# Between test cases in run-all the container is reused; kill any leftover
-# inference processes and wait for GPU memory to be released, on both the
-# local and (for double-machine runs) remote nodes. No container restart,
-# so wheel / ERDMA drivers are not reinstalled.
-drain_gpu_between_tests() {
-    local max_seconds=${1:-120}
-    echo "===== Draining GPU between test cases ====="
+# Force-kill every host process still holding GPU memory. This catches leftovers
+# that an in-container pkill cannot reach: processes reparented to the host
+# (orphans) or in a different PID namespace. Only GPU-holding PIDs are targeted.
+force_kill_gpu_procs() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    local pids
+    pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -cd '0-9\n' | grep -E '^[0-9]+$' | sort -u)
+    [ -z "$pids" ] && return 0
+    echo "Force-killing GPU-holding PIDs: $(echo $pids | tr '\n' ' ')"
+    for pid in $pids; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    sleep 3
+}
 
+# Fully clear GPU memory on the current node: graceful in-container kill first,
+# then host-level force-kill of any process still holding GPU memory.
+drain_gpu_local() {
     ${docker_exec} "pkill -9 -f 'sglang|vllm' 2>/dev/null; true" >/dev/null 2>&1 || true
-    wait_gpu_idle "$max_seconds"
+    if ! wait_gpu_idle 60; then
+        force_kill_gpu_procs
+        wait_gpu_idle 45 || echo "WARNING: GPU still occupied after force-kill (possible stuck/zombie process or GPU fault)"
+    fi
+}
+
+# Between test cases in run-all the container is reused; fully clear GPU memory
+# on both the local and (for double-machine runs) remote nodes. No container
+# restart, so wheel / ERDMA drivers are not reinstalled.
+drain_gpu_between_tests() {
+    echo "===== Draining GPU between test cases ====="
+    drain_gpu_local
 
     if [ -n "$REMOTE_IP" ]; then
         echo "Draining GPU on remote node $REMOTE_IP..."
         ${SSH_CMD} "$REMOTE_IP" "
             source ${REMOTE_TEST_DIR}/run/.shrc && \
             source ${REMOTE_TEST_DIR}/scripts/common.sh && \
-            ${docker_exec} \"pkill -9 -f 'sglang|vllm' 2>/dev/null; true\" >/dev/null 2>&1; \
-            wait_gpu_idle $max_seconds
+            drain_gpu_local
         " 2>/dev/null || true
     fi
 }
