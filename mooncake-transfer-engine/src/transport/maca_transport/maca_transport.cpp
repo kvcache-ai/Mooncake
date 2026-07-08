@@ -514,6 +514,8 @@ Status MacaTransport::submitTransfer(
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
+        task.batch_id = batch_id;
+        task.transport_ = this;
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
@@ -823,12 +825,30 @@ Status MacaTransport::submitTransferTask(
         }
 
         if (has_batchflag_copies) {
+            auto failBatchSlices = [](DeviceStream &entry) {
+                for (auto *slice : entry.batch_slices) {
+                    if (slice->status == Slice::PENDING) {
+                        slice->markFailed();
+                    }
+                }
+            };
             for (auto &entry : streams) {
                 if (entry.copy_batch.empty()) continue;
+                if (!entry.ok) {
+                    failBatchSlices(entry);
+                    if (first_error.ok())
+                        first_error =
+                            Status::Memory("MacaTransport: batch copy skipped");
+                    continue;
+                }
                 if (!checkCudaErrorReturn(
                         cudaSetDevice(entry.device_id),
                         "MacaTransport: failed to set device")) {
                     entry.ok = false;
+                    failBatchSlices(entry);
+                    if (first_error.ok())
+                        first_error = Status::Context(
+                            "MacaTransport: failed to set device");
                     continue;
                 }
 
@@ -838,11 +858,7 @@ Status MacaTransport::submitTransferTask(
                     LOG(ERROR)
                         << "MacaTransport: mcExtBatchCopyFlagAndWaitV2 failed: "
                         << cudaGetErrorString(err);
-                    for (auto *slice : entry.batch_slices) {
-                        if (slice->status == Slice::PENDING) {
-                            slice->markFailed();
-                        }
-                    }
+                    failBatchSlices(entry);
                     if (first_error.ok())
                         first_error =
                             Status::Memory("MacaTransport: batch copy failed");
