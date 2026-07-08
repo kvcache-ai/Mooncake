@@ -36,7 +36,7 @@ start_server()
 
     local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
     
-    local env_vars="CUDA_VISIBLE_DEVICES=0,1"
+    local env_vars="CUDA_VISIBLE_DEVICES=6,7"
     
     if ! launch_vllm_server "$model_name" "$host" "$port" "$vllm_server_log_path" "$kv_role" "$extra_args" "$env_vars"; then
         return 1
