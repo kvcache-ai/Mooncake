@@ -58,7 +58,7 @@ class PrefixCacheTest:
         self.replicate_config = self.store_mod.ReplicateConfig()
         self.replicate_config.replica_num = 1
         self.replicate_config.nof_replica_num = 0
-        print(f"SETUP_OK local_hostname=127.0.0.1:50071", flush=True)
+        print("SETUP_OK local_hostname=127.0.0.1:50071", flush=True)
 
     def test_correctness_and_speedup(self):
         """
@@ -115,13 +115,11 @@ class PrefixCacheTest:
 
             # Verify correctness
             for i, (key, buf, exp) in enumerate(zip(keys, results, expected)):
-                assert buf is not None, (
-                    f"NULL result for key {key} (warm iter {iteration})"
-                )
+                assert (
+                    buf is not None
+                ), f"NULL result for key {key} (warm iter {iteration})"
                 actual = bytes(buf)
-                assert actual == exp, (
-                    f"DATA_MISMATCH key={key} iter={iteration}"
-                )
+                assert actual == exp, f"DATA_MISMATCH key={key} iter={iteration}"
 
         warm_med_ms = median(warm_times) * 1000
         speedup = cold_ms / warm_med_ms if warm_med_ms > 0 else float("inf")
@@ -192,9 +190,7 @@ class PrefixCacheTest:
         )
 
         # Wait for TTL + 1 second
-        print(
-            f"WAITING {ttl_seconds + 1}s for cache TTL expiry...", flush=True
-        )
+        print(f"WAITING {ttl_seconds + 1}s for cache TTL expiry...", flush=True)
         time.sleep(ttl_seconds + 1)
 
         # After TTL expiry, should be cold again (slow)
@@ -311,9 +307,7 @@ class PrefixCacheTest:
         ]:
             for key, buf in zip(keys, results):
                 actual = bytes(buf)
-                assert actual == all_data[key], (
-                    f"DATA_MISMATCH for {key}"
-                )
+                assert actual == all_data[key], f"DATA_MISMATCH for {key}"
 
         # Group C: should be cold (not cached from A or B)
         group_c_keys = [k for k in all_data if k.startswith("t3-groupC")]
@@ -404,15 +398,13 @@ class PrefixCacheTest:
         for key, buf in zip(all_keys, results):
             assert buf is not None, f"NULL result for key {key}"
             actual = bytes(buf)
-            assert actual == all_values[key], (
-                f"DATA_MISMATCH for {key}"
-            )
+            assert actual == all_values[key], f"DATA_MISMATCH for {key}"
         print(f"VERIFY_OK mixed: all {len(all_keys)} keys correct", flush=True)
 
         # Warm call for ALL keys (now all should be cached)
         time.sleep(0.1)
         t0 = time.monotonic()
-        results2 = self.store.batch_get_buffer(all_keys)
+        _ = self.store.batch_get_buffer(all_keys)
         warm_mixed_ms = (time.monotonic() - t0) * 1000
         print(
             f"BATCH_GET_MIXED_WARM count={len(all_keys)} "
@@ -459,12 +451,8 @@ class PrefixCacheTest:
         # Run many batch_get iterations, verify all return same correct data
         for iteration in range(iterations):
             results = self.store.batch_get_buffer(keys)
-            for i, (key, buf, exp) in enumerate(
-                zip(keys, results, expected)
-            ):
-                assert buf is not None, (
-                    f"NULL result for key {key} iter={iteration}"
-                )
+            for i, (key, buf, exp) in enumerate(zip(keys, results, expected)):
+                assert buf is not None, f"NULL result for key {key} iter={iteration}"
                 actual = bytes(buf)
                 assert actual == exp, (
                     f"DATA_MISMATCH key={key} iter={iteration} "
@@ -530,9 +518,7 @@ class PrefixCacheTest:
         ret = self.store.remove(keys[changed_idx], force=True)
         assert ret == 0, f"remove failed for {keys[changed_idx]}"
         new_val = b"INVALIDATED-NEW-VALUE-" + b"X" * 100
-        ret = self.store.put(
-            keys[changed_idx], new_val, self.replicate_config
-        )
+        ret = self.store.put(keys[changed_idx], new_val, self.replicate_config)
         assert ret == 0, f"put(invalidate) failed for {keys[changed_idx]}"
         expected[changed_idx] = new_val
         print(f"REMOVE_PUT_INVALIDATE key={keys[changed_idx]}", flush=True)
