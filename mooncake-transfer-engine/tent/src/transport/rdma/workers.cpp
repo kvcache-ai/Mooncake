@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "tent/transport/rdma/bw_arbitration.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/shared_quota.h"
 #include "tent/common/utils/ip.h"
@@ -141,6 +142,11 @@ Workers::Workers(RdmaTransport* transport)
     priority_promotion_timeout_ns_ =
         conf->get("transports/rdma/priority_promotion_timeout_us", 10000) *
         1000ull;
+
+    // Opt-in deadline-aware bandwidth arbitration within a priority tier
+    // (RFC #2792). Default false = original FIFO order.
+    deadline_bw_arbitration_ =
+        conf->get("transports/rdma/deadline_bw_arbitration", false);
 
     // ============================================================
     // Global Slot Coordination (Multi-Process)
@@ -384,6 +390,37 @@ void Workers::asyncPostSend() {
                 }
             }
             continue;
+        }
+
+        // RFC #2792 (opt-in): these slices all contend for one NIC path
+        // (local NIC -> remote NIC). submitSlices posts as many as the QP
+        // budget allows and returns num_submitted; the rest wait for the next
+        // round. Ordering by deadline urgency here means a flow about to miss
+        // its deadline claims the shared NIC's QP slots ahead of looser flows.
+        // Default (deadline_bw_arbitration_ == false) leaves order untouched,
+        // so behavior is byte-identical to today's FIFO / equal split.
+        if (deadline_bw_arbitration_ && slices.size() > 1) {
+            const uint64_t now_ns = getCurrentTimeInNano();
+            const double bw_bps = device_selector_
+                                      ? device_selector_->getSchedulingParams()
+                                                .default_bandwidth_gbps *
+                                            1e9 / 8.0
+                                      : 0.0;
+            std::vector<ArbFlow> flows;
+            flows.reserve(slices.size());
+            for (const RdmaSlice* s : slices) {
+                if (s && s->task) {
+                    flows.push_back(ArbFlow{s->task->request.deadline_ns,
+                                            s->task->request.length});
+                } else {
+                    flows.push_back(ArbFlow{0, 0});
+                }
+            }
+            auto order = OrderByUrgency(flows, now_ns, bw_bps);
+            std::vector<RdmaSlice*> reordered;
+            reordered.reserve(slices.size());
+            for (size_t i : order) reordered.push_back(slices[i]);
+            slices.swap(reordered);
         }
 
         int num_submitted = endpoint->submitSlices(slices, tl_wid);

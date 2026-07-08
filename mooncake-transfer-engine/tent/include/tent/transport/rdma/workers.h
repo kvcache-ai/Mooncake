@@ -221,6 +221,9 @@ class Workers {
     // per-worker/per-peer RailMonitor instances.
     std::string rail_topo_json_;
     bool always_tier1_ = false;
+    // Opt-in deadline-aware bandwidth arbitration within a priority tier
+    // (RFC #2792). Default false = original FIFO order (equal bandwidth split).
+    bool deadline_bw_arbitration_ = false;
 };
 }  // namespace tent
 }  // namespace mooncake

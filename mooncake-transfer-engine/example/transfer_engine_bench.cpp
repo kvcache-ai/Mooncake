@@ -17,6 +17,8 @@
 #include <signal.h>
 #include <sys/time.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -107,6 +109,15 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
+DEFINE_uint64(deadline_us, 0,
+              "Per-request deadline in microseconds for 'tight' flows (0 = no "
+              "deadline). Used to study deadline-aware bandwidth arbitration "
+              "(RFC #2792).");
+DEFINE_int32(deadline_tight_threads, 0,
+             "Number of submission threads (0..threads-1) that tag their "
+             "requests with --deadline_us; remaining threads submit with no "
+             "deadline. Lets one measure tight-vs-loose flow throughput under "
+             "NIC contention.");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
@@ -291,6 +302,11 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
+// Per-thread batch counts, so tight-deadline vs loose flows can be compared
+// under NIC contention (RFC #2792 arbitration study). Sized at startup.
+std::vector<std::atomic<size_t>> per_thread_batch_count;
+// True for threads whose requests carry --deadline_us (the "tight" flows).
+std::vector<char> thread_is_tight;
 
 // Ensure each worker thread has a valid GPU context before issuing transfers.
 static inline void setWorkerDeviceIfNeeded() {
@@ -437,6 +453,8 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
     total_batch_count.fetch_add(batch_count);
+    if (thread_id < (int)per_thread_batch_count.size())
+        per_thread_batch_count[thread_id].fetch_add(batch_count);
     return Status::OK();
 }
 
@@ -546,6 +564,10 @@ int initiator() {
 
     std::vector<std::thread> workers(FLAGS_threads);
 
+    // Per-thread counters for the RFC #2792 arbitration study.
+    per_thread_batch_count = std::vector<std::atomic<size_t>>(FLAGS_threads);
+    thread_is_tight.assign(FLAGS_threads, 0);
+
     struct timeval start_tv, stop_tv;
     gettimeofday(&start_tv, nullptr);
 
@@ -569,6 +591,33 @@ int initiator() {
               << calculateRate(
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
+
+    // RFC #2792: break throughput down by tight (deadline-tagged) vs loose
+    // flows, so deadline-aware arbitration can be compared on vs off.
+    if (FLAGS_deadline_us > 0) {
+        size_t tight_batches = 0, loose_batches = 0;
+        int tight_threads = 0, loose_threads = 0;
+        for (int i = 0; i < FLAGS_threads; ++i) {
+            size_t c = per_thread_batch_count[i].load();
+            if (thread_is_tight[i]) {
+                tight_batches += c;
+                ++tight_threads;
+            } else {
+                loose_batches += c;
+                ++loose_threads;
+            }
+        }
+        auto bytes = [&](size_t b) {
+            return b * FLAGS_batch_size * FLAGS_block_size;
+        };
+        LOG(INFO) << "[RFC2792] tight flows (" << tight_threads
+                  << " threads, deadline=" << FLAGS_deadline_us
+                  << "us): throughput "
+                  << calculateRate(bytes(tight_batches), duration);
+        LOG(INFO) << "[RFC2792] loose flows (" << loose_threads
+                  << " threads, no deadline): throughput "
+                  << calculateRate(bytes(loose_batches), duration);
+    }
 
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
@@ -702,14 +751,31 @@ void initiatorWorker(mooncake::tent::TransferEngine* engine,
     }
     uint64_t remote_base = segment_info.buffers[buffer_index].base;
 
+    // This thread's requests are "tight" (deadline-tagged) when its id is in
+    // [0, deadline_tight_threads) and a deadline was configured (RFC #2792).
+    const bool tight =
+        FLAGS_deadline_us > 0 && thread_id < FLAGS_deadline_tight_threads;
+    if (thread_id < (int)thread_is_tight.size())
+        thread_is_tight[thread_id] = tight ? 1 : 0;
+
     size_t batch_count = 0;
     while (running) {
         auto batch_id = engine->allocateBatch(FLAGS_batch_size);
+        // Absolute deadline for this batch's requests (steady_clock ns), or 0.
+        uint64_t deadline_ns = 0;
+        if (tight) {
+            uint64_t now_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            deadline_ns = now_ns + FLAGS_deadline_us * 1000ull;
+        }
         std::vector<mooncake::tent::Request> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
             mooncake::tent::Request entry;
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
+            entry.deadline_ns = deadline_ns;
             entry.source = (uint8_t*)(addr) +
                            FLAGS_block_size * (i * FLAGS_threads + thread_id);
             entry.target_id = segment_id;
@@ -742,6 +808,8 @@ void initiatorWorker(mooncake::tent::TransferEngine* engine,
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
     total_batch_count.fetch_add(batch_count);
+    if (thread_id < (int)per_thread_batch_count.size())
+        per_thread_batch_count[thread_id].fetch_add(batch_count);
 }
 
 int initiator() {
@@ -776,6 +844,10 @@ int initiator() {
 
     std::vector<std::thread> workers(FLAGS_threads);
 
+    // Per-thread counters for the RFC #2792 arbitration study.
+    per_thread_batch_count = std::vector<std::atomic<size_t>>(FLAGS_threads);
+    thread_is_tight.assign(FLAGS_threads, 0);
+
     struct timeval start_tv, stop_tv;
     gettimeofday(&start_tv, nullptr);
 
@@ -799,6 +871,31 @@ int initiator() {
               << calculateRate(
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
+
+    // RFC #2792: throughput split by tight (deadline-tagged) vs loose flows.
+    if (FLAGS_deadline_us > 0) {
+        size_t tight_b = 0, loose_b = 0;
+        int tight_t = 0, loose_t = 0;
+        for (int i = 0; i < FLAGS_threads; ++i) {
+            size_t c = per_thread_batch_count[i].load();
+            if (thread_is_tight[i]) {
+                tight_b += c;
+                ++tight_t;
+            } else {
+                loose_b += c;
+                ++loose_t;
+            }
+        }
+        auto bytes = [&](size_t b) {
+            return b * FLAGS_batch_size * FLAGS_block_size;
+        };
+        LOG(INFO) << "[RFC2792] tight flows (" << tight_t
+                  << " threads, deadline=" << FLAGS_deadline_us
+                  << "us): " << calculateRate(bytes(tight_b), duration);
+        LOG(INFO) << "[RFC2792] loose flows (" << loose_t
+                  << " threads, no deadline): "
+                  << calculateRate(bytes(loose_b), duration);
+    }
 
     unregisterBuffers(engine.get(), addr);
     freeBuffers(addr);
