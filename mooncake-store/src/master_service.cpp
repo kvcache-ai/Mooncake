@@ -5425,7 +5425,30 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Remove object metadata
-            if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+            if (enable_ha_ && use_batch_oplog_) {
+                std::vector<ReplicaID> removed_ids;
+                metadata.VisitReplicas(&Replica::fn_is_completed,
+                                       [&removed_ids](Replica& replica) {
+                                           removed_ids.push_back(replica.id());
+                                           replica.mark_removed();
+                                       });
+                auto persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, normalized_tenant, key, {},
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+                if (!persist_result) {
+                    results[original_idx] =
+                        tl::make_unexpected(persist_result.error());
+                    continue;
+                }
+                results[original_idx] = {};
+                continue;
+            }
+
+            if (enable_ha_ && oplog_store_) {
                 auto err =
                     PersistRemoveForHA("BatchRemove", normalized_tenant, key);
                 if (!err) {

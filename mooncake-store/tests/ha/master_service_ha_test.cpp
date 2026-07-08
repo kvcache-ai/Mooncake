@@ -845,6 +845,62 @@ TEST_F(MasterServiceHATest, BatchRemoveWritesBatchRecordOpLog) {
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
 
+TEST_F(MasterServiceHATest, BatchRemoveFinalizesEachObjectAfterDurable) {
+    const std::string cluster_id = "test_batch_record_batch_remove_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_store_type("etcd_batch_record")
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted =
+        PrepareSimpleSegment(service, "batch_remove_finalize_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_remove_finalize_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_remove_finalize_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    backend->BlockTxn();
+    auto results = service.BatchRemove({key}, kDefaultTenant, /*force=*/true);
+    ASSERT_EQ(1u, results.size());
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string before_finalize_key = "before_batch_remove_finalize_key";
+    auto before_finalize = service.PutStart(
+        mounted.client_id, before_finalize_key, kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
+
+    if (!before_finalize.has_value()) {
+        const std::string after_finalize_key =
+            "after_batch_remove_finalize_key";
+        auto after_finalize =
+            service.PutStart(mounted.client_id, after_finalize_key,
+                             kDefaultTenant, 1024, config);
+        EXPECT_TRUE(after_finalize.has_value())
+            << toString(after_finalize.error());
+    }
+}
+
 TEST_F(MasterServiceHATest, RemoveAllWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_remove_all_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
