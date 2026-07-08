@@ -641,8 +641,7 @@ class FragmentationAwareAllocationStrategy : public RandomAllocationStrategy {
                           return a.score > b.score;
                       }
                       if (a.largest_free_region != b.largest_free_region) {
-                          return a.largest_free_region >
-                                 b.largest_free_region;
+                          return a.largest_free_region > b.largest_free_region;
                       }
                       if (a.free_ratio != b.free_ratio) {
                           return a.free_ratio > b.free_ratio;
@@ -734,9 +733,8 @@ class FragmentationAwareAllocationStrategy : public RandomAllocationStrategy {
             }
 
             const uint64_t capacity = static_cast<uint64_t>(alloc->capacity());
-            const uint64_t used =
-                std::min<uint64_t>(static_cast<uint64_t>(alloc->size()),
-                                   capacity);
+            const uint64_t used = std::min<uint64_t>(
+                static_cast<uint64_t>(alloc->size()), capacity);
             const uint64_t free = capacity - used;
             const uint64_t reported_largest =
                 static_cast<uint64_t>(alloc->getLargestFreeRegion());

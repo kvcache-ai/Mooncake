@@ -662,8 +662,7 @@ TEST_F(AllocationStrategyTest,
     auto fragmented = std::make_shared<OffsetBufferAllocator>(
         "fragmented", kSegmentBase, kSegmentSize, "fragmented");
     auto contiguous = std::make_shared<OffsetBufferAllocator>(
-        "contiguous", kSegmentBase + 0x10000000ULL, kSegmentSize,
-        "contiguous");
+        "contiguous", kSegmentBase + 0x10000000ULL, kSegmentSize, "contiguous");
 
     std::vector<std::unique_ptr<AllocatedBuffer>> fragmented_buffers;
     for (int i = 0; i < 4; ++i) {
@@ -692,8 +691,9 @@ TEST_F(AllocationStrategyTest,
 
     const auto desc = result->front().get_descriptor();
     ASSERT_TRUE(desc.is_memory_replica());
-    EXPECT_EQ(desc.get_memory_descriptor().buffer_descriptor.transport_endpoint_,
-              "contiguous");
+    EXPECT_EQ(
+        desc.get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "contiguous");
 }
 
 TEST_F(AllocationStrategyTest, FragmentationAwarePreservesPreferredSegment) {
@@ -717,8 +717,9 @@ TEST_F(AllocationStrategyTest, FragmentationAwarePreservesPreferredSegment) {
 
     const auto desc = result->front().get_descriptor();
     ASSERT_TRUE(desc.is_memory_replica());
-    EXPECT_EQ(desc.get_memory_descriptor().buffer_descriptor.transport_endpoint_,
-              "preferred");
+    EXPECT_EQ(
+        desc.get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "preferred");
 }
 
 // Test the performance comparison between strategies
