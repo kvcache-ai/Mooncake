@@ -189,12 +189,12 @@ device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
     const std::vector<std::string>& device_filter) {
     return impl_->getOrCreateRdmaTransport(device_filter);
 }
+#endif
 
 #ifdef USE_NCCL_DEVICE
 device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
     return impl_->getOrCreateNcclTransport();
 }
-#endif
 #endif
 
 bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
@@ -614,13 +614,13 @@ device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
     if (use_tent_) return nullptr;
     return impl_->getOrCreateRdmaTransport(device_filter);
 }
+#endif
 
 #ifdef USE_NCCL_DEVICE
 device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
     if (use_tent_) return nullptr;
     return impl_->getOrCreateNcclTransport();
 }
-#endif
 #endif
 
 bool TransferEngine::isTcpOnly() const {

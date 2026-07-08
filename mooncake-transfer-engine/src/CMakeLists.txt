@@ -75,7 +75,7 @@ if(USE_CUDA)
 endif()
 
 if(USE_NCCL_DEVICE)
-  target_link_libraries(transfer_engine PUBLIC NCCL::Device)
+  target_link_libraries(transfer_engine PUBLIC NCCL::nccl)
   target_compile_definitions(transfer_engine PUBLIC USE_NCCL_DEVICE)
 endif()
 

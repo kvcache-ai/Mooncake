@@ -25,16 +25,16 @@ class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
 };
+namespace device {
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
-namespace device {
 class P2pTransport;
 class RdmaTransport;
+#endif
 #ifdef USE_NCCL_DEVICE
 class NcclTransport;
 #endif
 }  // namespace device
-#endif
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -168,16 +168,14 @@ class TransferEngine {
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
-    // Device transport accessors. Lazily created on first call and owned by
-    // the TransferEngine. These allow EP (and future CPU-proxy paths) to
-    // obtain P2P, IBGDA, and optional NCCL transports from an engine instance
-    // instead of calling the global factory functions directly.
+    // Platform P2P/IBGDA transports are unavailable in CXI builds.
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
-#ifdef USE_NCCL_DEVICE
-    device::NcclTransport* getOrCreateNcclTransport();
 #endif
+#ifdef USE_NCCL_DEVICE
+    // NCCL is CUDA-only and independent of the host network transport.
+    device::NcclTransport* getOrCreateNcclTransport();
 #endif
 
     /**

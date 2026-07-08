@@ -119,7 +119,7 @@ if(USE_NCCL_DEVICE AND BUILD_NCCL_DEVICE_TRANSPORT_EXAMPLE)
   target_include_directories(nccl_device_transport_example PRIVATE
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_link_libraries(nccl_device_transport_example PRIVATE
-    transfer_engine NCCL::Device gflags::gflags glog::glog)
+    transfer_engine NCCL::nccl gflags::gflags glog::glog)
   target_compile_options(nccl_device_transport_example PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
   set_target_properties(nccl_device_transport_example PROPERTIES
