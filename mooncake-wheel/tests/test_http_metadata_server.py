@@ -30,7 +30,7 @@ class HttpMetadataServerTest(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(response.status, 400)
-                self.assertEqual(response.content_type, "text/plain")
+                self.assertEqual(response.content_type, "application/json")
                 self.assertNotIn("", self.server.store)
 
     async def test_empty_metadata_key_is_rejected(self):
@@ -39,7 +39,7 @@ class HttpMetadataServerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 400)
-        self.assertEqual(response.content_type, "text/plain")
+        self.assertEqual(response.content_type, "application/json")
         self.assertNotIn("", self.server.store)
 
     async def test_blank_metadata_key_is_rejected(self):
@@ -48,7 +48,7 @@ class HttpMetadataServerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 400)
-        self.assertEqual(response.content_type, "text/plain")
+        self.assertEqual(response.content_type, "application/json")
         self.assertNotIn("   ", self.server.store)
 
     async def test_metadata_key_is_stripped_before_operations(self):

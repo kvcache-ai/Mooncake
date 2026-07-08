@@ -64,7 +64,7 @@ class KVBootstrapServer:
         key = request.query.get('key', '').strip()
         if not key:
             return web.Response(text='metadata key is required', status=400,
-                              content_type='text/plain')
+                              content_type='application/json')
         
         if request.method == 'GET':
             return await self._handle_get(key)
