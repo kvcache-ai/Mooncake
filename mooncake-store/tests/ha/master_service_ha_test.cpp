@@ -23,6 +23,7 @@
 #include "ha/oplog/mock_metadata_store.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
+#include "ha/oplog/oplog_batch_standby_reader.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "types.h"
@@ -799,6 +800,41 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ASSERT_EQ(ErrorCode::OK,
               backend->Get("/oplog/" + cluster_id + "/latest", legacy_latest));
     EXPECT_EQ("42", legacy_latest);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest, StandbyAppliesPrimaryBatchRecords) {
+    const std::string cluster_id = "test_batch_record_e2e_standby_apply";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_e2e_standby_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_e2e_standby_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_e2e_standby_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    MockMetadataStore standby_metadata;
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+
+    auto result = reader.PollOnce();
+    ASSERT_EQ(ErrorCode::OK, result.error);
+    EXPECT_FALSE(result.used_legacy_path);
+    EXPECT_EQ(2u, result.applied_entries);
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant, key));
 }
 
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
