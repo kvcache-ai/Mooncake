@@ -754,6 +754,92 @@ TEST_F(MasterServiceHATest, RemoveAllWritesBatchRecordOpLog) {
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
 
+TEST_F(MasterServiceHATest, BatchReplicaClearAllWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_clear_all_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_clear_all_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_clear_all_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_clear_all_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    auto res = service.BatchReplicaClear({key}, mounted.client_id, "");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1u, res->size());
+    EXPECT_EQ(key, (*res)[0]);
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(3u, batch.entries[0].sequence_id);
+}
+
+TEST_F(MasterServiceHATest, BatchReplicaClearSegmentWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_clear_segment_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_clear_seg1");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_clear_segment_key";
+    PutObjectOnSegment(service, mounted.client_id, key, "batch_clear_seg1");
+    ReadBatchEventually(storage, 2, batch);
+
+    PrepareSimpleSegment(service, "batch_clear_seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 3, batch);
+
+    auto copy_start =
+        service.CopyStart(mounted.client_id, key, kDefaultTenant,
+                          "batch_clear_seg1", {"batch_clear_seg2"});
+    ASSERT_TRUE(copy_start.has_value());
+    auto copy_end = service.CopyEnd(mounted.client_id, key, kDefaultTenant);
+    ASSERT_TRUE(copy_end.has_value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    auto res =
+        service.BatchReplicaClear({key}, mounted.client_id, "batch_clear_seg1");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1u, res->size());
+    EXPECT_EQ(key, (*res)[0]);
+    ReadBatchEventually(storage, 4, batch);
+
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(4u, batch.entries[0].sequence_id);
+    EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
 TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)

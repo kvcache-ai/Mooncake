@@ -2641,10 +2641,10 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
-            if (enable_ha_ && oplog_store_) {
-                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                    OpType::REMOVE, normalized_tenant, key, {});
-                if (!persist_result) {
+            if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+                auto err = PersistRemoveForHA("BatchReplicaClear",
+                                              normalized_tenant, key);
+                if (!err) {
                     continue;
                 }
             }
@@ -2694,7 +2694,7 @@ auto MasterService::BatchReplicaClear(
                     return false;
                 });
 
-            if (enable_ha_ && oplog_store_) {
+            if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                 auto remaining = BuildRemainingReplicaDescriptors(
                     metadata, [&match_replica_on_segment](const Replica& r) {
                         return match_replica_on_segment(r);
@@ -2702,14 +2702,15 @@ auto MasterService::BatchReplicaClear(
 
                 tl::expected<OpLogEntry, ErrorCode> persist_result;
                 if (remaining.empty()) {
-                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                        OpType::REMOVE, normalized_tenant, key, {});
+                    persist_result = AppendOpLogWithDurableFinalize(
+                        OpType::REMOVE, normalized_tenant, key, {}, nullptr);
                 } else {
-                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    persist_result = AppendOpLogWithDurableFinalize(
                         OpType::PUT_END, normalized_tenant, key,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata.client_id, metadata.size, remaining,
-                            metadata.group_id, metadata.data_type));
+                            metadata.group_id, metadata.data_type),
+                        nullptr);
                 }
                 if (!persist_result) {
                     continue;
