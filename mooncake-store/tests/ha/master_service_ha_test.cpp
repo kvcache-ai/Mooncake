@@ -429,6 +429,8 @@ class MasterServiceHATest : public ::testing::Test {
     int next_policy_file_{0};
 };
 
+class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
+
 TEST_F(MasterServiceHATest, ClassifyReplicaReadinessCoversReplicaStates) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -709,6 +711,50 @@ TEST_F(MasterServiceHATest, BatchRecordSubmissionHelpersUseOrderedWriter) {
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
     EXPECT_EQ(3u, prefix.batch_id);
     EXPECT_EQ(3u, prefix.last_seq);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       PrimaryWritesBatchRecordAndDurablePrefix) {
+    const std::string cluster_id = "test_batch_record_e2e_primary";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_e2e_primary_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_MOUNT, batch.entries[0].op_type);
+    EXPECT_EQ(1u, batch.entries[0].sequence_id);
+
+    const std::string key = "batch_e2e_primary_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_e2e_primary_segment");
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(2u, batch.entries[0].sequence_id);
+    EXPECT_FALSE(batch.entries[0].payload.empty());
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(2u, prefix.last_seq);
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(1u, replicas->replicas.size());
+    EXPECT_TRUE(replicas->replicas.front().is_memory_replica());
 }
 
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
