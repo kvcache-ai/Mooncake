@@ -1831,6 +1831,7 @@ PYBIND11_MODULE(store, m) {
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("nof_replica_num", &ReplicateConfig::nof_replica_num)
+        .def_readwrite("dfs_replica_num", &ReplicateConfig::dfs_replica_num)
         .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
         .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
         .def_readwrite("preferred_segments",
