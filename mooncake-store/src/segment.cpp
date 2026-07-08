@@ -673,14 +673,15 @@ SegmentSerializer::Serialize() {
         packer.pack(UuidToString(client_uuid));
 
         // Serialize LocalDiskSegment: [enable_offloading, count, storage_key1,
-        // task1, storage_key2, task2, ...] Sort keys to ensure determinism.
+        // task1, storage_key2, task2, ..., ssd_total_capacity_bytes]
+        // Sort keys to ensure determinism.
         std::vector<std::string> sorted_keys;
         for (const auto& [key, _] : segment->offloading_objects) {
             sorted_keys.push_back(key);
         }
         std::sort(sorted_keys.begin(), sorted_keys.end());
 
-        packer.pack_array(2 + sorted_keys.size() * 2);
+        packer.pack_array(3 + sorted_keys.size() * 2);
         packer.pack(segment->enable_offloading);
         packer.pack(static_cast<uint64_t>(sorted_keys.size()));
 
@@ -692,6 +693,8 @@ SegmentSerializer::Serialize() {
             packer.pack(task.key);
             packer.pack(task.size);
         }
+
+        packer.pack(segment->ssd_total_capacity_bytes);
     }
 
     // Compress entire data
@@ -1013,7 +1016,7 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             }
 
             // Parse LocalDiskSegment array: [enable_offloading, count,
-            // storage_key1, task1, ...]
+            // storage_key1, task1, ..., ssd_total_capacity_bytes]
             if (client_value.type != msgpack::type::ARRAY ||
                 client_value.via.array.size < 2) {
                 return tl::unexpected(
@@ -1027,6 +1030,17 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
 
             auto segment =
                 std::make_shared<LocalDiskSegment>(enable_offloading);
+
+            // Backward compatibility: the last element (ssd_total_capacity_bytes)
+            // was added later. For old snapshots without this field, the
+            // capacity defaults to 0.
+            if (client_value.via.array.size > 2 + count * 2) {
+                size_t cap_idx = client_value.via.array.size - 1;
+                if (IsMsgpackInteger(client_value.via.array.ptr[cap_idx])) {
+                    segment->ssd_total_capacity_bytes =
+                        client_value.via.array.ptr[cap_idx].as<int64_t>();
+                }
+            }
 
             // Parse offloading_objects
             for (uint64_t k = 0; k < count; ++k) {
