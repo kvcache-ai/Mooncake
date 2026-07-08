@@ -416,6 +416,7 @@ setup_node_env() {
     fi
 
     local extra_args=""
+    extra_args="$extra_args -e NCCL_GIN_TYPE=0 "
     extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
     if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
         extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
