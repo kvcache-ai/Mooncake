@@ -401,6 +401,57 @@ cleanup_test_env() {
     echo "Cleanup completed"
 }
 
+# Wait until GPU memory on the local host drains below a threshold.
+# Used between test cases in run-all so a previous test's leftover GPU
+# memory does not cause the next test's server to OOM / get SIGKILLed.
+wait_gpu_idle() {
+    local max_seconds=${1:-120}
+    local threshold_mb=${2:-1024}
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "nvidia-smi not available, skipping GPU drain wait"
+        return 0
+    fi
+
+    echo "Waiting for GPU memory to drain (threshold ${threshold_mb}MB, timeout ${max_seconds}s)..."
+    local elapsed=0
+    local max_used=0
+    while [ $elapsed -lt $max_seconds ]; do
+        max_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -n 1)
+        [ -z "$max_used" ] && { echo "nvidia-smi query failed, skipping GPU drain wait"; return 0; }
+        if [ "$max_used" -le "$threshold_mb" ]; then
+            echo "GPU memory drained (max used ${max_used}MB)"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "WARNING: GPU memory did not fully drain within ${max_seconds}s (max used ${max_used}MB)"
+    return 0
+}
+
+# Between test cases in run-all the container is reused; kill any leftover
+# inference processes and wait for GPU memory to be released, on both the
+# local and (for double-machine runs) remote nodes. No container restart,
+# so wheel / ERDMA drivers are not reinstalled.
+drain_gpu_between_tests() {
+    local max_seconds=${1:-120}
+    echo "===== Draining GPU between test cases ====="
+
+    ${docker_exec} "pkill -9 -f 'sglang|vllm' 2>/dev/null; true" >/dev/null 2>&1 || true
+    wait_gpu_idle "$max_seconds"
+
+    if [ -n "$REMOTE_IP" ]; then
+        echo "Draining GPU on remote node $REMOTE_IP..."
+        ${SSH_CMD} "$REMOTE_IP" "
+            source ${REMOTE_TEST_DIR}/run/.shrc && \
+            source ${REMOTE_TEST_DIR}/scripts/common.sh && \
+            ${docker_exec} \"pkill -9 -f 'sglang|vllm' 2>/dev/null; true\" >/dev/null 2>&1; \
+            wait_gpu_idle $max_seconds
+        " 2>/dev/null || true
+    fi
+}
+
 setup_node_env() {
     local registry_addr=$1
     echo "===== Setting up docker environment ====="

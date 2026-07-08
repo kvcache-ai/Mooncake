@@ -285,6 +285,10 @@ run_all_tests(){
         fi
         
         [ $exit_code -ne 0 ] && all_passed=false
+
+        # Container is shared across cases in run-all; drain leftover GPU
+        # memory before the next case so it does not OOM / get SIGKILLed.
+        drain_gpu_between_tests
     done
     
     cleanup_test_env "double"
