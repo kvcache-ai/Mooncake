@@ -309,8 +309,8 @@ TEST_F(PromotionOnHitTest,
     const int64_t admitted_pre = mm.get_promotion_admitted();
     const int64_t in_flight_pre = mm.get_promotion_in_flight();
 
-    auto result =
-        service->BatchGetReplicaList(std::vector<std::string>{key}, "default");
+    auto result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
     ASSERT_EQ(result.size(), 1u);
     ASSERT_TRUE(result[0].has_value());
     ASSERT_EQ(result[0]->replicas.size(), 1u);
@@ -353,8 +353,8 @@ TEST_F(PromotionOnHitTest,
     const double before_admin = mem_hits();
 
     // Read-only admin query must leave the memory-cache-hit counter untouched.
-    auto admin_result =
-        service->BatchGetReplicaList(std::vector<std::string>{key}, "default");
+    auto admin_result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
     ASSERT_EQ(admin_result.size(), 1u);
     ASSERT_TRUE(admin_result[0].has_value());
     EXPECT_EQ(mem_hits(), before_admin);
