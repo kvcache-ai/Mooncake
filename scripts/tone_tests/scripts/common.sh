@@ -892,6 +892,19 @@ collect_and_validate_model_results() {
     fi
 }
 
+# Echo an offline env prefix when the given model already exists in the
+# container's HuggingFace cache, so servers use the local snapshot instead of
+# querying the hub (skips downloads and avoids hf-mirror 429 rate limiting).
+# Models are pre-cached under MODEL_CACHE (mounted at /root/.cache) on both nodes.
+hf_offline_prefix() {
+    local model_name=$1
+    [ -z "$model_name" ] && return 0
+    local cache_dir="models--$(echo "$model_name" | sed 's#/#--#g')"
+    if ${docker_exec} "ls /root/.cache/huggingface/hub/${cache_dir}/snapshots/*/config.json >/dev/null 2>&1"; then
+        echo "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
+    fi
+}
+
 launch_sglang_server() {
     local model_path=$1
     local host=$2
@@ -907,7 +920,8 @@ launch_sglang_server() {
         return 1
     fi
     
-    local sglang_cmd="${docker_exec} \"python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
+    local offline_prefix=$(hf_offline_prefix "$model_path")
+    local sglang_cmd="${docker_exec} \"${offline_prefix}python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
     if [ -n "$extra_args" ]; then
         sglang_cmd="${sglang_cmd} ${extra_args}"
     fi
@@ -957,6 +971,7 @@ launch_vllm_server() {
     if [ -n "$env_vars" ]; then
         env_prefix="${env_vars} "
     fi
+    env_prefix="${env_prefix}$(hf_offline_prefix "$model_path")"
     
     local vllm_cmd="${docker_exec} \"${env_prefix}python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
     
