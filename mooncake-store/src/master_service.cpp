@@ -7646,6 +7646,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto evict_replicas =
         [&, this](ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
+            if (use_batch_oplog_) {
+                return metadata.size *
+                       metadata.CountReplicas([](const Replica& replica) {
+                           return replica.is_memory_replica() &&
+                                  replica.status() == ReplicaStatus::REMOVED;
+                       });
+            }
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
             auto replicas = PopReplicasWithCacheTotalAccounting(
                 metadata, is_evictable_memory_replica);
@@ -7682,6 +7689,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             const TenantId& tenant_id, const std::string& key,
             ObjectMetadata& metadata, TenantState& tenant_state,
             std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
+        if (use_batch_oplog_) {
+            return evict_replicas(metadata, deferred_replicas);
+        }
         if (!offload_on_evict_) {
             // Original behavior
             return evict_replicas(metadata, deferred_replicas);
@@ -7747,7 +7757,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // sync with what was published.
     auto persist_evict_oplog_or_skip =
         [&, this](const TenantId& tenant_id, const std::string& key,
-                  const ObjectMetadata& metadata) -> bool {
+                  ObjectMetadata& metadata) -> bool {
         if (!enable_ha_ || (!oplog_store_ && !ordered_oplog_writer_)) {
             return true;
         }
@@ -7760,6 +7770,44 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 return r.is_memory_replica() && r.is_completed() &&
                        r.get_refcnt() == 0;
             });
+
+        if (use_batch_oplog_) {
+            std::vector<ReplicaID> removed_ids;
+            metadata.VisitReplicas(is_evictable_memory_replica,
+                                   [&removed_ids](Replica& replica) {
+                                       removed_ids.push_back(replica.id());
+                                       replica.mark_removed();
+                                   });
+            tl::expected<OpLogEntry, ErrorCode> persist_result;
+            if (remaining.empty()) {
+                persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, tenant_id.value(), key, {},
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            } else {
+                persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::PUT_END, tenant_id.value(), key,
+                    SerializeMetadataForOpLogFromReplicaDescriptors(
+                        metadata.client_id, metadata.size, remaining,
+                        metadata.group_id, metadata.data_type),
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            }
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "BatchEvict: OpLog persist failed for key=" << key
+                    << ", err=" << static_cast<int>(persist_result.error())
+                    << ", skipping eviction";
+                return false;
+            }
+            return true;
+        }
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
@@ -7846,10 +7894,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             result.freed_bytes += freed;
             if (freed > 0) {
                 result.evicted_objects++;
-                PublishKvRemovedAfterEvict(member_key, freed, "cpu",
-                                           member_metadata, tenant_id);
+                if (!use_batch_oplog_) {
+                    PublishKvRemovedAfterEvict(member_key, freed, "cpu",
+                                               member_metadata, tenant_id);
+                }
             }
-            if (member_key != key && !member_metadata.IsValid()) {
+            if (member_key != key && !use_batch_oplog_ &&
+                !member_metadata.IsValid()) {
                 EraseMetadata(tenant_state, member_it, tenant_id,
                               QuotaEraseMode::kFull, &shard);
             }
@@ -8005,11 +8056,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     deferred_replicas,
                     /*allow_soft_pinned=*/false);
                 total_freed_size += evict_result.freed_bytes;
-                if (!it->second.IsGrouped()) {
+                if (!use_batch_oplog_ && !it->second.IsGrouped()) {
                     PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
                                                "cpu", it->second, c.tenant_id);
                 }
-                if (!it->second.IsValid()) {
+                if (!use_batch_oplog_ && !it->second.IsValid()) {
                     EraseMetadata(tenant_state, it, c.tenant_id,
                                   QuotaEraseMode::kFull, &shard);
                 }
@@ -8069,12 +8120,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/false);
                                 total_freed_size += evict_result.freed_bytes;
-                                if (!it->second.IsGrouped()) {
+                                if (!use_batch_oplog_ &&
+                                    !it->second.IsGrouped()) {
                                     PublishKvRemovedAfterEvict(
                                         it->first, evict_result.freed_bytes,
                                         "cpu", it->second, tenant_it->first);
                                 }
-                                if (!it->second.IsValid()) {
+                                if (!use_batch_oplog_ &&
+                                    !it->second.IsValid()) {
                                     it = EraseMetadata(
                                         tenant_state, it, tenant_it->first,
                                         QuotaEraseMode::kFull, &shard);
@@ -8134,12 +8187,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/true);
                                 total_freed_size += evict_result.freed_bytes;
-                                if (!it->second.IsGrouped()) {
+                                if (!use_batch_oplog_ &&
+                                    !it->second.IsGrouped()) {
                                     PublishKvRemovedAfterEvict(
                                         it->first, evict_result.freed_bytes,
                                         "cpu", it->second, tenant_it->first);
                                 }
-                                if (!it->second.IsValid()) {
+                                if (!use_batch_oplog_ &&
+                                    !it->second.IsValid()) {
                                     it = EraseMetadata(
                                         tenant_state, it, tenant_it->first,
                                         QuotaEraseMode::kFull, &shard);
