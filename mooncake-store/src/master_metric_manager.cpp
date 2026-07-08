@@ -767,6 +767,10 @@ void MasterMetricManager::dec_total_file_capacity(int64_t val) {
     file_total_capacity_.dec(val);
 }
 
+void MasterMetricManager::reset_total_file_capacity() {
+    file_total_capacity_.reset();
+}
+
 void MasterMetricManager::set_dfs_capacity_unlimited(bool unlimited) {
     dfs_capacity_unlimited_ = unlimited;
 }
