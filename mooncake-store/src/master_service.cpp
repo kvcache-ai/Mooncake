@@ -2981,6 +2981,10 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
 
         if (replica_list.empty()) {
+            auto readiness = ClassifyReplicaReadiness(&metadata);
+            if (!readiness) {
+                return tl::make_unexpected(readiness.error());
+            }
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }

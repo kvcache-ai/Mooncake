@@ -472,6 +472,46 @@ TEST_F(MasterServiceHATest, ClassifyReplicaReadinessCoversReplicaStates) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, missing.error());
 }
 
+TEST_F(MasterServiceHATest, GetReplicaListClassifiesRemovedReplicaStates) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(false)
+                              .build();
+    MasterService service(service_config);
+    auto mounted = PrepareSimpleSegment(service, "get_readiness_segment");
+
+    const std::string complete_key = "get_readiness_complete_key";
+    PutObjectOnSegment(service, mounted.client_id, complete_key,
+                       "get_readiness_segment");
+    EXPECT_TRUE(
+        service.GetReplicaList(complete_key, kDefaultTenant).has_value());
+
+    const std::string removed_key = "get_readiness_removed_key";
+    PutObjectOnSegment(service, mounted.client_id, removed_key,
+                       "get_readiness_segment");
+    MarkCompletedReplicasRemovedForTesting(service, kDefaultTenant,
+                                           removed_key);
+    auto removed = service.GetReplicaList(removed_key, kDefaultTenant);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, removed.error());
+
+    const std::string processing_key = "get_readiness_processing_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service
+                    .PutStart(mounted.client_id, processing_key, kDefaultTenant,
+                              1024, config)
+                    .has_value());
+    auto processing = service.GetReplicaList(processing_key, kDefaultTenant);
+    ASSERT_FALSE(processing.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, processing.error());
+
+    auto missing =
+        service.GetReplicaList("get_readiness_missing_key", kDefaultTenant);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, missing.error());
+}
+
 TEST_F(MasterServiceHATest,
        BatchRecordWriterInitMigratesLegacyLatestAndSetsSequence) {
     const std::string cluster_id = "test_batch_record_init_cluster";
