@@ -113,6 +113,41 @@ class BlockingBatchHaKvBackend : public FakeBatchHaKvBackend {
     bool blocked_{false};
 };
 
+class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
+   public:
+    void SetTxnError(ErrorCode error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        txn_error_ = error;
+        txn_calls_ = 0;
+    }
+
+    bool WaitForTxnCalls(size_t count, std::chrono::milliseconds timeout =
+                                           std::chrono::milliseconds(1000)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return txn_calls_ >= count; });
+    }
+
+    ErrorCode Txn(const KvTxn& txn) override {
+        ErrorCode txn_error;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++txn_calls_;
+            txn_error = txn_error_;
+        }
+        cv_.notify_all();
+        if (txn_error != ErrorCode::OK) {
+            return txn_error;
+        }
+        return FakeBatchHaKvBackend::Txn(txn);
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    ErrorCode txn_error_{ErrorCode::OK};
+    size_t txn_calls_{0};
+};
+
 class MasterServiceHATest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -936,6 +971,41 @@ TEST_F(MasterServiceBatchRecordE2ETest, PromotionCatchesUpToDurablePrefix) {
 
     std::error_code ec;
     std::filesystem::remove_all(standby_dir, ec);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       BackendFailureStopsNewBatchReservations) {
+    const std::string cluster_id = "test_batch_record_e2e_backend_failure";
+    auto backend = std::make_shared<FailingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    backend->SetTxnError(ErrorCode::PERSISTENT_FAIL);
+    auto first = AppendVisibleForTesting(service, OpType::PUT_END,
+                                         kDefaultTenant, "failing_key", {});
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(backend->WaitForTxnCalls(1));
+
+    tl::expected<uint64_t, ErrorCode> second;
+    for (int i = 0; i < 100; ++i) {
+        second = AppendVisibleForTesting(service, OpType::PUT_END,
+                                         kDefaultTenant, "rejected_key", {});
+        if (!second.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, second.error());
+    backend->SetTxnError(ErrorCode::OK);
 }
 
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
