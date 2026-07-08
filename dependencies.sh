@@ -175,6 +175,7 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      liburing-dev \
                      libjemalloc-dev \
                      libmsgpack-dev \
+                     libzmq3-dev \
                      libzstd-dev \
                      libasio-dev \
                      libxxhash-dev \

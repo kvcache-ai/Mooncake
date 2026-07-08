@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <utility>
 #include <vector>
@@ -49,6 +50,14 @@ struct QueueLimits {
     // them. This only reorders selection within the existing capacity limits;
     // it does not admit/reject or otherwise change what gets dispatched.
     bool deadline_aware{false};
+    // Opt-in deadline-infeasible drop (RFC #2519 step 3). Local-decode MLU
+    // threshold θ_local. 0 (default) disables drop entirely — behavior is the
+    // step-2 EDF ordering (or FIFO). When > 0 (e.g. 1.5) and a bandwidth
+    // provider is set, an owner whose predicted MLU
+    // (= predicted_transfer_time / remaining_window) reaches this threshold is
+    // dropped instead of dispatched, and on_local_decode_suggested is raised so
+    // the caller can recompute locally. Requires deadline_aware = true.
+    double mlu_local_threshold{0.0};
 };
 
 struct QueueOwnerInput {
@@ -66,6 +75,23 @@ struct QueueSubmit {
     std::vector<QueueOwnerInput> owners;
 };
 
+// RFC #2519 step 3: degradation signal raised when a transfer is predicted to
+// miss its deadline and is dropped from dispatch. The bodies (compression /
+// local recompute) live in the upper layer (vLLM/SGLang); TENT only raises the
+// signal. No hook registered ⇒ the drop still happens but nothing is notified.
+struct DegradationHooks {
+    std::function<void(const Request&)> on_local_decode_suggested;
+};
+
+// Returns the predicted transfer bandwidth in bytes/second, or <= 0 if unknown
+// (in which case the drop decision is skipped). Injected by the owner so the
+// admission queue does not depend on the device-selection layer directly.
+using BandwidthProvider = std::function<double()>;
+
+// Returns "now" as a steady-clock timestamp in nanoseconds, matching the units
+// of Request.deadline_ns. Injectable so tests are deterministic.
+using NowProvider = std::function<uint64_t()>;
+
 // Runtime-private admission model. It is intentionally single-threaded; the
 // eventual TransferEngineImpl integration owns synchronization.
 class LocalTransferAdmissionQueue {
@@ -82,8 +108,21 @@ class LocalTransferAdmissionQueue {
     Status tryAdmit(const QueueSubmit& submit,
                     std::vector<QueueOwnerId>& admitted_owner_ids);
 
-    std::vector<QueueOwnerId> pickForDispatch(size_t max_owners,
-                                              size_t max_bytes);
+    // Returns the owners to dispatch. When step-3 drop is enabled
+    // (mlu_local_threshold > 0, deadline_aware, and a bandwidth provider set),
+    // owners predicted to miss their deadline are dropped: charged out of the
+    // outstanding accounting, marked terminal (CANCELED), appended to
+    // `dropped_owner_ids` (if non-null), and on_local_decode_suggested is
+    // raised. `dropped_owner_ids` is cleared on entry.
+    std::vector<QueueOwnerId> pickForDispatch(
+        size_t max_owners, size_t max_bytes,
+        std::vector<QueueOwnerId>* dropped_owner_ids = nullptr);
+
+    // Install the step-3 degradation policy inputs. Optional; without it the
+    // queue never drops (default behavior). now defaults to steady_clock.
+    void setDegradationPolicy(BandwidthProvider bandwidth_provider,
+                              DegradationHooks hooks,
+                              NowProvider now_provider = nullptr);
 
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
@@ -124,6 +163,11 @@ class LocalTransferAdmissionQueue {
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
     size_t outstanding_user_bytes_{0};
+
+    // RFC #2519 step 3 degradation policy (all optional / opt-in).
+    BandwidthProvider bandwidth_provider_;
+    DegradationHooks degradation_hooks_;
+    NowProvider now_provider_;
 };
 
 }  // namespace tent
