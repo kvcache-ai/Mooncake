@@ -5042,11 +5042,10 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    if (enable_ha_ && oplog_store_) {
-        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::REMOVE, object_id.tenant_id, key, {});
-        if (!persist_result) {
-            return tl::make_unexpected(persist_result.error());
+    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+        auto err = PersistRemoveForHA("Remove", object_id.tenant_id, key);
+        if (!err) {
+            return tl::make_unexpected(err.error());
         }
     }
     PublishKvRemoved(key, metadata, object_id.tenant_id);
@@ -5113,7 +5112,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
-                if (enable_ha_ && oplog_store_) {
+                if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                     auto err = PersistRemoveForHA("RemoveByRegex",
                                                   normalized_tenant, it->first);
                     if (!err) {
@@ -5157,7 +5156,7 @@ long MasterService::RemoveAll(bool force) {
                     auto mem_rep_count = it->second.CountReplicas(
                         &Replica::fn_is_memory_replica);
 
-                    if (enable_ha_ && oplog_store_) {
+                    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                         auto err = PersistRemoveForHA(
                             "RemoveAll", tenant_it->first, it->first);
                         if (!err) {
@@ -5211,7 +5210,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                 !tenant_state.replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
-                if (enable_ha_ && oplog_store_) {
+                if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                     auto err = PersistRemoveForHA("RemoveAll(tenant)",
                                                   normalized_tenant, it->first);
                     if (!err) {
@@ -5306,7 +5305,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 !it->second.HasReplica(
                     [](const Replica& r) { return !r.is_completed(); });
             if (would_invalidate) {
-                if (had_complete_replica && enable_ha_ && oplog_store_) {
+                if (had_complete_replica && enable_ha_ &&
+                    (oplog_store_ || ordered_oplog_writer_)) {
                     auto err = PersistRemoveForHA("BatchRemove(stale cleanup)",
                                                   normalized_tenant, key);
                     if (!err) {
@@ -5367,7 +5367,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Remove object metadata
-            if (enable_ha_ && oplog_store_) {
+            if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                 auto err =
                     PersistRemoveForHA("BatchRemove", normalized_tenant, key);
                 if (!err) {
@@ -10206,8 +10206,8 @@ tl::expected<OpLogEntry, ErrorCode> MasterService::AppendOpLogAndWaitDurable(
     OpType type, const std::string& tenant_id, const std::string& key,
     const std::string& payload) {
     if (!use_batch_oplog_) {
-        return AppendOpLogAndNotifyDurableOrAbort(type, tenant_id, key,
-                                                  payload);
+        return AppendOpLogAndNotifyDurableOrAbort(type, TenantId(tenant_id),
+                                                  key, payload);
     }
 
     auto promise = std::make_shared<std::promise<OpLogEntry>>();
@@ -10228,8 +10228,8 @@ MasterService::AppendOpLogWithDurableFinalize(
     OpType type, const std::string& tenant_id, const std::string& key,
     const std::string& payload, DurableFinalizeCallback callback) {
     if (!use_batch_oplog_) {
-        auto entry =
-            AppendOpLogAndNotifyDurableOrAbort(type, tenant_id, key, payload);
+        auto entry = AppendOpLogAndNotifyDurableOrAbort(
+            type, TenantId(tenant_id), key, payload);
         if (!entry) {
             return tl::unexpected(entry.error());
         }
@@ -10486,8 +10486,8 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
 
 tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     const char* why, const TenantId& tenant_id, const std::string& key) {
-    auto result =
-        AppendOpLogAndNotifyDurableOrAbort(OpType::REMOVE, tenant_id, key, {});
+    auto result = AppendOpLogWithDurableFinalize(
+        OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
     if (!result) {
         LOG(WARNING) << why << ": REMOVE persist failed for key=" << key
                      << ", err=" << static_cast<int>(result.error());
