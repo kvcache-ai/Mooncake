@@ -4850,7 +4850,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                         // Result already set to total_size above.
                     } else {
                         size_t op_idx = retry_to_op[ri];
-                        results[op_idx] =
+                        const auto &op = valid_operations[op_idx];
+                        results[op.original_index] =
                             tl::unexpected(retry_results[ri].error());
                         LOG(ERROR)
                             << "Retry BatchGet still failed for key '"
@@ -6065,7 +6066,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::LookupPrefixCache(
             }
         }
         if (cache_it == prefix_cache_.end()) {
-            VLOG(1) << "LookupPrefixCache: prefix=\"" << common_prefix
+            VLOG(1) << "LookupPrefixCache: prefix=\\" << common_prefix
                     << "\" keys=" << keys.size() << " hit=MISS";
             missing_keys = keys;
             for (size_t i = 0; i < keys.size(); ++i) {
@@ -6078,7 +6079,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::LookupPrefixCache(
 
     // Check TTL
     if (now - cache_it->second.cached_at >= PrefixCacheTTL()) {
-        VLOG(1) << "LookupPrefixCache: prefix=\"" << common_prefix
+        VLOG(1) << "LookupPrefixCache: prefix=\\" << common_prefix
                 << "\" keys=" << keys.size() << " hit=TTL_EXPIRED";
         missing_keys = keys;
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -6088,14 +6089,28 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::LookupPrefixCache(
     }
 
     const auto &cached_map = cache_it->second.results;
+    const auto cache_age_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - cache_it->second.cached_at)
+            .count();
     size_t cached_count = 0;
     for (const auto &key : keys) {
         auto map_it = cached_map.find(key);
         if (map_it != cached_map.end()) {
-            // Convert GetReplicaListResponse to QueryResult
+            // Convert GetReplicaListResponse to QueryResult.
+            // cached_resp.lease_ttl_ms stores remaining lease at cache time.
+            // Subtract cache age to prevent returning entries whose lease has
+            // already expired.
             const auto &cached_resp = map_it->second;
+            if (cached_resp.lease_ttl_ms <=
+                static_cast<uint64_t>(cache_age_ms)) {
+                results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+                missing_keys.push_back(key);
+                continue;
+            }
             auto lease_timeout =
-                now + std::chrono::milliseconds(cached_resp.lease_ttl_ms);
+                now + std::chrono::milliseconds(cached_resp.lease_ttl_ms -
+                                                cache_age_ms);
             results.emplace_back(QueryResult(
                 std::vector<Replica::Descriptor>(cached_resp.replicas),
                 lease_timeout));
@@ -6109,7 +6124,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::LookupPrefixCache(
     const auto hit_type = (cached_count == keys.size()) ? "FULL"
                           : (cached_count == 0)         ? "NONE"
                                                         : "PARTIAL";
-    VLOG(1) << "LookupPrefixCache: prefix=\"" << common_prefix
+    VLOG(1) << "LookupPrefixCache: prefix=\\" << common_prefix
             << "\" keys=" << keys.size() << " cached=" << cached_count
             << " missing=" << missing_keys.size() << " hit=" << hit_type;
 
@@ -6169,17 +6184,19 @@ void RealClient::CachePrefixResults(
             const auto remaining =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     qr.lease_timeout - now);
+            const auto remaining_ms = remaining.count();
+            if (remaining_ms <= 0) {
+                continue;
+            }
+
             GetReplicaListResponse resp;
             resp.replicas = qr.replicas;
-            resp.lease_ttl_ms = remaining.count() > 0
-                                    ? static_cast<uint64_t>(remaining.count())
-                                    : 0;
+            resp.lease_ttl_ms = static_cast<uint64_t>(remaining_ms);
 
             // Warn if the lease will expire meaningfully before the
             // cache TTL.  Allow 100ms tolerance for clock skew between
             // master and client.
-            if (resp.lease_ttl_ms > 0 &&
-                resp.lease_ttl_ms + 100 < static_cast<uint64_t>(cache_ttl_ms)) {
+            if (resp.lease_ttl_ms + 100 < static_cast<uint64_t>(cache_ttl_ms)) {
                 LOG_FIRST_N(WARNING, 10)
                     << "Prefix cache: lease TTL (" << resp.lease_ttl_ms
                     << "ms) for key \"" << keys[i]
@@ -6194,5 +6211,6 @@ void RealClient::CachePrefixResults(
     VLOG(1) << "CachePrefixResults: prefix=\"" << prefix
             << "\" stored=" << stored << "/" << keys.size();
 }
+
 
 }  // namespace mooncake
