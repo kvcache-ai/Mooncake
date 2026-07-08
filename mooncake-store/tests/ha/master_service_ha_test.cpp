@@ -757,6 +757,50 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_TRUE(replicas->replicas.front().is_memory_replica());
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       BatchRecordWritesDoNotUpdateLegacyLatest) {
+    const std::string cluster_id = "test_batch_record_e2e_legacy_latest";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put("/oplog/" + cluster_id + "/latest", "42"));
+
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted =
+        PrepareSimpleSegment(service, "batch_e2e_legacy_latest_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(43u, batch.entries[0].sequence_id);
+
+    const std::string key = "batch_e2e_legacy_latest_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_e2e_legacy_latest_segment");
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(44u, batch.entries[0].sequence_id);
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(44u, prefix.last_seq);
+
+    std::string legacy_latest;
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Get("/oplog/" + cluster_id + "/latest", legacy_latest));
+    EXPECT_EQ("42", legacy_latest);
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
