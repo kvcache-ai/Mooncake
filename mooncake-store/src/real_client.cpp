@@ -3779,10 +3779,11 @@ RealClient::batch_put_with_store_reservation(
     std::thread([this, keys, batched_slices, resp = std::move(resp),
                  failed_set = std::move(failed_set), p = gds_promise]() {
         try {
+            size_t reservation_idx = 0;
             size_t written = 0;
             for (size_t i = 0; i < keys.size(); ++i) {
                 if (failed_set.count(i)) continue;
-                auto &r = resp.reservations[written];
+                auto &r = resp.reservations[reservation_idx++];
                 auto wr = file_storage_->WriteAtOffset(
                     keys[i], batched_slices[i], r.offset);
                 if (wr) ++written;
