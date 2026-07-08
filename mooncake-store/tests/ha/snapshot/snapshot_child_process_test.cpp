@@ -253,7 +253,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
         MasterSnapshotManagerOptions options;
         options.enable_snapshot = true;
-        options.snapshot_interval_seconds = service_->snapshot_interval_seconds_;
+        options.snapshot_interval_seconds =
+            service_->snapshot_interval_seconds_;
         options.snapshot_child_timeout_seconds =
             service_->snapshot_child_timeout_seconds_;
         options.snapshot_retention_count = service_->snapshot_retention_count_;
