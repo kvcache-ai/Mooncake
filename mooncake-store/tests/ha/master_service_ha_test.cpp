@@ -1384,6 +1384,64 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
 }
+
+TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
+    const std::string cluster_id =
+        "test_batch_record_nof_evict_finalize_cluster";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    NoFSegment nof_segment = MakeNoFSegment("batch_nof_evict_finalize_segment",
+                                            "batch_nof_evict_finalize_endpoint",
+                                            kDefaultSegmentBase, 1024);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountNoFSegment(nof_segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.nof_replica_num = 1;
+    const std::string key = "batch_nof_evict_finalize_key";
+    ASSERT_TRUE(service.PutStart(client_id, key, kDefaultTenant, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, kDefaultTenant, ReplicaType::NOF_SSD)
+            .has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    backend->BlockTxn();
+    service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                       /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+
+    const std::string before_finalize_key =
+        "before_batch_nof_evict_finalize_key";
+    auto before_finalize = service.PutStart(client_id, before_finalize_key,
+                                            kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 2, batch);
+
+    if (!before_finalize.has_value()) {
+        const std::string after_finalize_key =
+            "after_batch_nof_evict_finalize_key";
+        auto after_finalize = service.PutStart(client_id, after_finalize_key,
+                                               kDefaultTenant, 1024, config);
+        EXPECT_TRUE(after_finalize.has_value())
+            << toString(after_finalize.error());
+    }
+}
 #endif
 
 TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {

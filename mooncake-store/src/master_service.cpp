@@ -8310,6 +8310,11 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     long object_count = 0;
     uint64_t total_freed_size = 0;
 
+    auto is_evictable_nof_replica = [](const Replica& replica) {
+        return replica.is_nof_replica() && replica.is_completed() &&
+               replica.get_refcnt() == 0;
+    };
+
     size_t start_idx = RandomIndex(metadata_shards_.size());
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
         MetadataShardAccessorRW shard(
@@ -8342,10 +8347,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
                 // Probe: any NoF replicas eligible for eviction?
                 const bool has_evictable_nof =
-                    metadata.HasReplica([](const Replica& r) {
-                        return r.is_nof_replica() && r.is_completed() &&
-                               r.get_refcnt() == 0;
-                    });
+                    metadata.HasReplica(is_evictable_nof_replica);
                 if (!has_evictable_nof) {
                     ++it;
                     continue;
@@ -8355,10 +8357,56 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 // Skip the key on persist failure.
                 if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                     auto remaining = BuildRemainingReplicaDescriptors(
-                        metadata, [](const Replica& r) {
-                            return r.is_nof_replica() && r.is_completed() &&
-                                   r.get_refcnt() == 0;
-                        });
+                        metadata, is_evictable_nof_replica);
+                    if (use_batch_oplog_) {
+                        std::vector<ReplicaID> removed_ids;
+                        metadata.VisitReplicas(
+                            is_evictable_nof_replica,
+                            [&removed_ids](Replica& replica) {
+                                removed_ids.push_back(replica.id());
+                                replica.mark_removed();
+                            });
+                        const size_t removed_count = removed_ids.size();
+                        tl::expected<OpLogEntry, ErrorCode> persist_result;
+                        if (remaining.empty()) {
+                            persist_result = AppendOpLogWithDurableFinalize(
+                                OpType::REMOVE, tenant_it->first, it->first, {},
+                                [this, removed_ids = std::move(removed_ids)](
+                                    const OpLogEntry& durable_entry) {
+                                    FinalizeRemovedReplicasAfterDurable(
+                                        durable_entry, removed_ids,
+                                        QuotaEraseMode::kFull);
+                                });
+                        } else {
+                            persist_result = AppendOpLogWithDurableFinalize(
+                                OpType::PUT_END, tenant_it->first, it->first,
+                                SerializeMetadataForOpLogFromReplicaDescriptors(
+                                    metadata.client_id, metadata.size,
+                                    remaining, metadata.group_id,
+                                    metadata.data_type),
+                                [this, removed_ids = std::move(removed_ids)](
+                                    const OpLogEntry& durable_entry) {
+                                    FinalizeRemovedReplicasAfterDurable(
+                                        durable_entry, removed_ids,
+                                        QuotaEraseMode::kFull);
+                                });
+                        }
+                        if (!persist_result) {
+                            LOG(WARNING)
+                                << "NoFBatchEvict: OpLog persist failed for "
+                                   "key="
+                                << it->first << ", err="
+                                << static_cast<int>(persist_result.error())
+                                << ", skipping eviction";
+                            ++it;
+                            continue;
+                        }
+                        total_freed_size += metadata.size * removed_count;
+                        shard_evicted_count++;
+                        ++it;
+                        continue;
+                    }
+
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (remaining.empty()) {
                         persist_result = AppendOpLogWithDurableFinalize(
@@ -8385,11 +8433,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 }
 
                 const size_t erased =
-                    metadata.EraseReplicas([](const Replica& replica) {
-                        return replica.is_nof_replica() &&
-                               replica.is_completed() &&
-                               replica.get_refcnt() == 0;
-                    });
+                    metadata.EraseReplicas(is_evictable_nof_replica);
                 if (erased == 0) {
                     ++it;
                     continue;
