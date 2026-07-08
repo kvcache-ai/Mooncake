@@ -211,13 +211,11 @@ if(USE_NCCL_DEVICE)
   if(NOT USE_CUDA)
     message(FATAL_ERROR "USE_NCCL_DEVICE requires USE_CUDA=ON")
   endif()
-  include(${CMAKE_CURRENT_LIST_DIR}/FindNCCLDevice.cmake)
-  if(NOT NCCLDevice_FOUND)
-    message(FATAL_ERROR
-      "USE_NCCL_DEVICE requires NCCL headers and libnccl. Set NCCL_ROOT to an NCCL 2.30+ installation.")
-  endif()
+  list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
+  find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
   add_compile_definitions(USE_NCCL_DEVICE NCCL_DEVICE_PERMIT_EXPERIMENTAL_CODE=1)
-  message(STATUS "NCCL DeviceTransport support is enabled")
+  message(STATUS
+    "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
 endif()
 
 if(USE_TPU)

@@ -32,19 +32,11 @@
 // The header intentionally avoids including cuda_alike.h so it can be included
 // from pure C++ translation units.  Implementations include cuda_alike.h.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
-
-#ifdef USE_NCCL_DEVICE
-#include <nccl.h>
-#include <nccl_device.h>
-
-#if NCCL_VERSION_CODE < 23000
-#error "USE_NCCL_DEVICE requires NCCL 2.30 or newer"
-#endif
-#endif
 
 namespace mooncake {
 namespace device {
@@ -166,24 +158,40 @@ class RdmaTransport {
 // ---------------------------------------------------------------------------
 // NcclTransport
 //
-// Owns an NCCL host communicator, its device communicator, and symmetric
-// windows used by NCCL LSA/GIN kernels. Communicator bootstrap and window
-// registration are collective; the caller supplies the control plane used to
-// exchange the unique ID and to order collectives.
+// Owns the native NCCL resources used to implement Mooncake's LSA/GIN device
+// operations. Native communicators and windows are intentionally private.
+// Communicator bootstrap and buffer registration are collective; the caller
+// supplies the control plane used to exchange the unique ID and to order
+// collectives.
 // ---------------------------------------------------------------------------
+enum class NcclGinBackend : uint8_t {
+    kNone = 0,
+    kProxy,
+    kGdaki,
+};
+
+enum class NcclDeviceRoute : uint8_t {
+    kUnavailable = 0,
+    kLocal,
+    kLsa,
+    kGin,
+};
+
 struct NcclTransportConfig {
     int rank = -1;
     int num_ranks = 0;
-    int gin_context_count = 4;
 
-    // With GIN enabled, negative means two signals per requested context:
-    // one completion signal and one acknowledgement signal.
-    int gin_signal_count = -1;
-    int gin_counter_count = 0;
-    int world_gin_barrier_count = 0;
-    ncclGinConnectionType_t gin_connection_type = NCCL_GIN_CONNECTION_FULL;
-    bool lsa_multimem = false;
+    // Mooncake currently supports either full world-team GIN connectivity or
+    // no GIN. Rail connectivity is intentionally deferred until Mooncake has
+    // a rail-team rank contract.
+    bool enable_gin = true;
+    int gin_context_count = 4;
     bool gin_exclusive_contexts = false;
+
+    // LSA barriers synchronize only the local LSA team. Cross-LSA/world
+    // synchronization remains the caller's responsibility.
+    int lsa_barrier_count = 0;
+    bool require_lsa_multimem = false;
 };
 
 struct NcclTransportProperties {
@@ -192,18 +200,58 @@ struct NcclTransportProperties {
     int num_ranks = 0;
     int cuda_device = -1;
     bool device_api_supported = false;
-    ncclGinType_t gin_type = NCCL_GIN_TYPE_NONE;
+    bool multimem_supported = false;
+    bool lsa_multimem_enabled = false;
+    int lsa_team_count = 0;
+    int lsa_barrier_count = 0;
+    bool gin_enabled = false;
+    NcclGinBackend gin_backend = NcclGinBackend::kNone;
     int gin_connection_count = 0;
     int gin_context_count = 0;
-    int gin_signal_count = 0;
-    int gin_counter_count = 0;
 };
 
-// Pass this object by value to kernels that use nccl_device.h.
-struct NcclDeviceContext {
-    ncclDevComm_t comm{};
+namespace detail {
+struct NcclDeviceContextAccess;
+}  // namespace detail
+
+class NcclDeviceTransportImpl;
+
+// Opaque token for one collectively registered symmetric buffer. The token
+// does not own the allocation; deregister it before freeing the buffer.
+class NcclBufferRegistration {
+   public:
+    bool valid() const { return id_ != 0; }
+
+   private:
+    uint64_t id_ = 0;
+
+    friend class NcclDeviceTransportImpl;
 };
 
+// Pass this small Mooncake context by value to kernels. Its native NCCL
+// communicator and registration table remain behind an opaque device pointer.
+class NcclDeviceContext {
+   public:
+    bool valid() const { return native_comm_ != nullptr; }
+
+   private:
+    const void* native_comm_ = nullptr;
+    const void* native_window_ = nullptr;
+    const void* local_base_ = nullptr;
+    size_t buffer_bytes_ = 0;
+    int rank_ = -1;
+    int num_ranks_ = 0;
+    int gin_context_count_ = 0;
+    int lsa_barrier_count_ = 0;
+    bool gin_enabled_ = false;
+    bool lsa_multimem_enabled_ = false;
+
+    friend class NcclDeviceTransportImpl;
+    friend struct detail::NcclDeviceContextAccess;
+};
+
+// Host calls on one transport instance are not thread-safe and must be
+// externally serialized, matching P2pTransport and RdmaTransport.
 class NcclTransport {
    public:
     virtual ~NcclTransport() = default;
@@ -217,29 +265,40 @@ class NcclTransport {
     virtual int initialize(const NcclTransportConfig& config,
                            const std::vector<int32_t>& unique_id) = 0;
 
-    // NCCL-compatible VMM allocation. Buffers registered in symmetric windows
-    // should normally come from this allocator.
+    // NCCL-compatible VMM allocation. These low-level methods are local; every
+    // rank must verify allocation success before entering registerBuffer().
     virtual void* allocateBuffer(size_t bytes) = 0;
     virtual int freeBuffer(void* ptr) = 0;
 
-    // Collectively register a symmetric window. Calls must occur in the same
+    // Collectively register a symmetric buffer. Calls must occur in the same
     // order on every rank. Deregistration is local after all device work and
-    // remote access to the window have completed.
-    virtual int registerWindow(
-        void* ptr, size_t bytes, ncclWindow_t* window,
-        int flags = NCCL_WIN_COLL_SYMMETRIC) = 0;
-    virtual int deregisterWindow(ncclWindow_t window) = 0;
+    // remote access have completed. The registration is invalidated on
+    // successful deregistration.
+    virtual int registerBuffer(void* ptr, size_t bytes,
+                               NcclBufferRegistration* registration) = 0;
+    virtual int deregisterBuffer(
+        NcclBufferRegistration* registration) = 0;
 
-    // Snapshot passed by value to a CUDA kernel. The snapshot remains valid
-    // until shutdown() or destruction of the transport.
-    virtual NcclDeviceContext deviceContext() const = 0;
+    // Safe common path: every rank allocates, collectively checks that all
+    // allocations succeeded, and only then enters registration. All ranks
+    // must call this method in the same order. On failure, successful local
+    // allocations and registrations are cleaned up before returning.
+    virtual int allocateAndRegisterBuffer(
+        size_t bytes, void** ptr,
+        NcclBufferRegistration* registration) = 0;
 
-    virtual ncclComm_t communicator() const = 0;
-    virtual const NcclTransportProperties& properties() const = 0;
+    // Snapshot passed by value to a CUDA kernel and bound to one registered
+    // buffer. Device helpers accept local pointers within that buffer and
+    // resolve the private window and peer offsets. The snapshot remains valid
+    // until the registration is removed or the transport is shut down.
+    virtual NcclDeviceContext deviceContext(
+        const NcclBufferRegistration& registration) const = 0;
+
+    virtual NcclTransportProperties properties() const = 0;
     virtual bool initialized() const = 0;
 
-    // Destroy windows and communicators. The caller must first ensure that no
-    // kernel can still access the device communicator or any registered window.
+    // The caller must first ensure that no kernel can access the context or
+    // any registered buffer.
     virtual int shutdown() = 0;
 };
 #endif
