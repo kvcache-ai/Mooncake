@@ -1828,7 +1828,13 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
             metadata, SaturatingMultiply(static_cast<uint64_t>(metadata.size),
                                          erased_memory_replicas));
     }
+    const bool erased_local_disk = std::any_of(
+        erased_replicas.begin(), erased_replicas.end(),
+        [](const Replica& replica) { return replica.is_local_disk_replica(); });
     ReleaseLocalDiskUsage(erased_replicas);
+    if (erased_local_disk) {
+        accessor.GetShard().OnDiskReplicaRemoved(erased_local_disk, metadata);
+    }
     if (!metadata.IsValid()) {
         accessor.Erase();
     }
@@ -4408,19 +4414,61 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
     auto& metadata = accessor.Get();
 
+    if (replica_type != ReplicaType::DISK &&
+        replica_type != ReplicaType::LOCAL_DISK) {
+        LOG(ERROR) << "key=" << key
+                   << ", error=invalid_replica_type_for_eviction";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto target_pred = [replica_type, &client_id](const Replica& r) {
+        if (replica_type == ReplicaType::DISK) {
+            return r.is_disk_replica();
+        } else if (replica_type == ReplicaType::LOCAL_DISK) {
+            return r.is_local_disk_replica() &&
+                   r.get_descriptor().get_local_disk_descriptor().client_id ==
+                       client_id;
+        }
+        return false;
+    };
+
     if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, [replica_type, &client_id](const Replica& r) {
-                if (replica_type == ReplicaType::DISK) {
-                    return r.is_disk_replica();
-                } else if (replica_type == ReplicaType::LOCAL_DISK) {
-                    return r.is_local_disk_replica() &&
-                           r.get_descriptor()
-                                   .get_local_disk_descriptor()
-                                   .client_id == client_id;
-                }
-                return false;
-            });
+        auto remaining =
+            BuildRemainingReplicaDescriptors(metadata, target_pred);
+        if (use_batch_oplog_) {
+            std::vector<ReplicaID> removed_ids;
+            metadata.VisitReplicas(target_pred,
+                                   [&removed_ids](Replica& replica) {
+                                       removed_ids.push_back(replica.id());
+                                       replica.mark_removed();
+                                   });
+
+            tl::expected<OpLogEntry, ErrorCode> persist_result;
+            if (remaining.empty()) {
+                persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, tenant_id, key, {},
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            } else {
+                persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::PUT_END, tenant_id, key,
+                    SerializeMetadataForOpLogFromReplicaDescriptors(
+                        metadata.client_id, metadata.size, remaining,
+                        metadata.group_id, metadata.data_type),
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            }
+            if (!persist_result) {
+                return tl::make_unexpected(persist_result.error());
+            }
+            return {};
+        }
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
@@ -4440,28 +4488,16 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     }
 
     if (replica_type == ReplicaType::DISK) {
-        EraseReplicasWithCacheTotalAccounting(
-            metadata,
-            [](const Replica& replica) { return replica.is_disk_replica(); });
+        EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
         bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
             return r.is_local_disk_replica() && r.is_completed();
         });
-        EraseReplicasWithCacheTotalAccounting(
-            metadata, [&client_id](const Replica& replica) {
-                return replica.is_local_disk_replica() &&
-                       replica.get_descriptor()
-                               .get_local_disk_descriptor()
-                               .client_id == client_id;
-            });
+        EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
         if (had_completed_disk) {
             auto& shard = accessor.GetShard();
             shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
         }
-    } else {
-        LOG(ERROR) << "key=" << key
-                   << ", error=invalid_replica_type_for_eviction";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     if (!metadata.IsValid()) {

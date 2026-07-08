@@ -400,6 +400,20 @@ class MasterServiceHATest : public ::testing::Test {
             durable_entry, replica_ids, MasterService::QuotaEraseMode::kFull);
     }
 
+    static void SetLocalDiskUsedBytesForTesting(MasterService& service,
+                                                const UUID& client_id,
+                                                int64_t used_bytes) {
+        auto access = service.segment_manager_.getLocalDiskSegmentAccess();
+        access.getClientLocalDiskSegment().at(client_id)->ssd_used_bytes.store(
+            used_bytes, std::memory_order_relaxed);
+    }
+
+    static int64_t GetLocalDiskUsedBytesForTesting(
+        MasterService& service, const std::string& segment_name) {
+        auto access = service.segment_manager_.getLocalDiskSegmentAccess();
+        return access.getSsdUsedBytes(segment_name);
+    }
+
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
@@ -1338,6 +1352,64 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(4u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
+TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
+    const std::string cluster_id =
+        "test_batch_record_disk_evict_finalize_cluster";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .set_enable_offload(true)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    const std::string segment_name = "batch_disk_evict_finalize_segment";
+    auto mounted = PrepareSimpleSegment(service, segment_name);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_disk_evict_finalize_key";
+    PutObjectOnSegment(service, mounted.client_id, key, segment_name);
+    ReadBatchEventually(storage, 2, batch);
+
+    Replica local_disk_replica(mounted.client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service
+                    .AddReplica(mounted.client_id, key, kDefaultTenant,
+                                local_disk_replica)
+                    .has_value());
+    ReadBatchEventually(storage, 3, batch);
+    SetLocalDiskUsedBytesForTesting(service, mounted.client_id, 1024);
+
+    backend->BlockTxn();
+    ASSERT_TRUE(service
+                    .EvictDiskReplica(mounted.client_id, key, kDefaultTenant,
+                                      ReplicaType::LOCAL_DISK)
+                    .has_value());
+    EXPECT_EQ(1024, GetLocalDiskUsedBytesForTesting(service, segment_name));
+
+    auto before_finalize = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(before_finalize.has_value());
+    EXPECT_FALSE(std::any_of(before_finalize->replicas.begin(),
+                             before_finalize->replicas.end(),
+                             [](const Replica::Descriptor& desc) {
+                                 return desc.is_local_disk_replica();
+                             }));
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 4, batch);
+    EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(service, segment_name));
 }
 
 #ifdef USE_NOF
