@@ -787,7 +787,7 @@ jobs:
       run: |
         docker build -f docker/mooncake.Dockerfile \
           --build-arg PYTHON_VERSION=3.10 \
-          --build-arg EP_TORCH_VERSIONS="2.12.1;2.13.0" \
+          --build-arg EP_TORCH_VERSIONS="2.13.0" \
           -t mooncake:from-source .
 
   spell-check:
