@@ -218,6 +218,42 @@ void TransportSelector::loadPolicies() {
             }
         }
 
+        // Parse link-layer QoS attributes (RFC #2519 / #2568, step 1: stored
+        // only, not yet applied to QPs). Out-of-range values are ignored so a
+        // bad config never breaks selection.
+        if (policy_json.contains("service_level")) {
+            int sl = policy_json.value("service_level", -1);
+            if (sl >= 0 && sl <= 15) {
+                policy.service_level = sl;
+            } else {
+                LOG(WARNING) << "Ignore service_level in policy " << policy.name
+                             << ", value " << sl << " out of range (0-15)";
+            }
+        }
+        if (policy_json.contains("traffic_class")) {
+            int tc = policy_json.value("traffic_class", -1);
+            if (tc >= 0 && tc <= 255) {
+                policy.traffic_class = tc;
+            } else {
+                LOG(WARNING) << "Ignore traffic_class in policy " << policy.name
+                             << ", value " << tc << " out of range (0-255)";
+            }
+        }
+        // Reserved for step 2 (per-class QP pools); parsed for forward schema
+        // compatibility, no effect yet.
+        if (policy_json.contains("qp_pool")) {
+            auto& qp = policy_json["qp_pool"];
+            if (!qp.is_string()) {
+                LOG(WARNING) << "Ignore qp_pool in policy " << policy.name
+                             << ", expected a string";
+            } else {
+                auto value = qp.get<std::string>();
+                // Treat an empty string the same as unset (use default pool)
+                // so a blank config value doesn't look like an explicit pool.
+                if (!value.empty()) policy.qp_pool = std::move(value);
+            }
+        }
+
         policies_.push_back(std::move(policy));
         LOG(INFO) << "Loaded transport policy: " << policy.name
                   << " (segment_type=" << segment_type_str
@@ -404,6 +440,13 @@ SelectionResult TransportSelector::select(
                      << ", priority_level=" << context.priority_level;
         return result;  // UNSPEC, all devices
     }
+
+    // Carry the matched policy's link-layer QoS out to the caller (RFC #2519 /
+    // #2568, step 1). These are plumbed but not yet applied at QP setup; that
+    // is the per-class QP pool follow-up (step 2).
+    result.service_level = matching_policy->service_level;
+    result.traffic_class = matching_policy->traffic_class;
+    result.qp_pool = matching_policy->qp_pool;
 
     // Convert device names to mask
     result.device_mask = ~0ULL;  // Default: all devices

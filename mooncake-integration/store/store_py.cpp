@@ -2167,7 +2167,8 @@ PYBIND11_MODULE(store, m) {
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
             "  ssd_offload_path: SSD storage directory path (overrides env "
-            "var).")
+            "var).\n"
+            "  tenant_id: Tenant identifier (default 'default').")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

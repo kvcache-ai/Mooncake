@@ -19,6 +19,7 @@
 #include <string>
 
 #include "config.h"
+#include "multi_transport_locality.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
@@ -475,6 +476,14 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             if (p == "tcp") return 1;
             return 0;
         };
+        // hip transport uses GPU IPC, which cannot reach a GPU on another host.
+        // The device KV pool is registered under both rdma and hip, so a
+        // cross-host target must skip its hip buffers and fall back to rdma.
+        // This makes the intra-node fast path (hip) and the cross-node path
+        // (rdma) work automatically from a single multi-protocol segment,
+        // without requiring the operator to set MC_DISABLE_HIP.
+        const bool hip_reachable =
+            isHipReachableTarget(target_segment_desc->name, local_server_name_);
         std::string chosen;
         int chosen_priority = -1;
         for (const auto& buffer : target_segment_desc->buffers) {
@@ -486,6 +495,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                     : buffer.addr;
             if (entry.target_offset >= start &&
                 entry.target_offset < start + buffer.length) {
+                if (buffer.protocol == "hip" && !hip_reachable) continue;
                 int priority = protocol_priority(buffer.protocol);
                 if (priority > chosen_priority) {
                     chosen = buffer.protocol;
@@ -502,6 +512,12 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         if (!transport_map_.count(chosen)) {
             return Status::NotSupportedTransport("Transport " + chosen +
                                                  " not installed");
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "MultiTransport::selectTransport route: target_id="
+                      << entry.target_id << " segment_protocol=\"" << proto
+                      << "\" hip_reachable=" << hip_reachable
+                      << " chosen=" << chosen;
         }
         transport = transport_map_[chosen].get();
         return Status::OK();
@@ -538,6 +554,28 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
     std::string item;
     while (std::getline(ss, item, ',')) {
         if (!item.empty()) protos.push_back(item);
+    }
+
+    // hip GPU IPC cannot reach a remote host; downgrade an explicit hip
+    // preference to a cross-host-capable transport for a cross-host target
+    // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
+    if (preferred_proto == "hip" &&
+        !isHipReachableTarget(target_segment_desc->name, local_server_name_)) {
+        std::string fallback;
+        for (const char* candidate : {"rdma", "tcp"}) {
+            if (std::find(protos.begin(), protos.end(), candidate) !=
+                protos.end()) {
+                fallback = candidate;
+                break;
+            }
+        }
+        if (fallback.empty()) {
+            return Status::NotSupportedTransport(
+                "hip target is cross-host but segment " +
+                std::to_string(entry.target_id) +
+                " offers no cross-host transport (rdma/tcp)");
+        }
+        preferred_proto = fallback;
     }
 
 #ifdef USE_ASCEND_HETEROGENEOUS

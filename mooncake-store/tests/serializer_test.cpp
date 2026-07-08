@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "serializer.h"
-#include "serialize/serializer.hpp"
+#include "serialize/serializer.h"
 #include "segment.h"
 
 namespace mooncake::test {

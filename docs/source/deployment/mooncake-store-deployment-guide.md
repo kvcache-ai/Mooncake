@@ -199,10 +199,11 @@ mooncake_master \
   --offload_on_evict=true \
   --promotion_on_hit=true \
   --promotion_admission_threshold=2 \
-  --root_fs_dir=/mnt/ssd_cache \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
 ```
+
+Do not set `--root_fs_dir` with `--enable_offload=true`. `--root_fs_dir` is a legacy parameter from an older persistence path and may cause issues on the SSD offload path. Configure each real client's offload directory with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` instead.
 
 ---
 
@@ -278,7 +279,17 @@ mooncake_master \
   --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
 ```
 
-The v1 connector is a writable YAML file. The file must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
+You can also store the same YAML policy in etcd when Mooncake Store is built with `STORE_USE_ETCD=ON`:
+
+```bash
+mooncake_master \
+  --enable_multi_tenants=true \
+  --cluster_id=mooncake_cluster \
+  --tenant_quota_connector_type=etcd \
+  --tenant_quota_connector_uri=127.0.0.1:2379
+```
+
+The etcd connector stores the policy at `mooncake-store/<cluster_id>/tenant_quota_policy`. If the key does not exist, the master starts with an empty policy so the first tenant policy can be created through the admin API. It shares the process-wide store etcd client used by HA/oplog, so if HA or oplog also uses etcd, `tenant_quota_connector_uri` must match those etcd endpoints. The policy must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
 
 ```yaml
 version: 1
@@ -475,8 +486,8 @@ mooncake_master \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
-| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type |
-| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path |
+| `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type: `file` or `etcd` when built with `STORE_USE_ETCD=ON` |
+| `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path; for `etcd`, the endpoints string |
 
 ### High Availability
 
@@ -544,6 +555,8 @@ Flags for controlling data movement between DRAM and SSD.
 
 Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued.
 
+For SSD offload, configure the disk path on each real client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks these objects as `LOCAL_DISK` replicas. Do not use the legacy `--root_fs_dir` parameter with `--enable_offload=true`.
+
 When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at most `offloading_queue_limit * offload_cap_ratio` objects for SSD offload (default: `50000 * 0.5 = 25000`); objects exceeding this cap fall back to force-evict (discard) if `--offload_force_evict=true`, otherwise they remain in memory. For SSD-heavy workloads where NVMe bandwidth is underutilized while the KV-cache hit rate suffers, raise both `--offloading_queue_limit` and `--offload_cap_ratio` so more objects per cycle are actually persisted to SSD instead of discarded. Example: `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` yields a per-cycle cap of `400000` (vs the default `25000`).
 
 ### CXL Memory
@@ -560,8 +573,10 @@ When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the maste
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root_fs_dir` | empty | DFS mount directory for multi-layer storage backend |
+| `--root_fs_dir` | empty | Legacy DFS persistence directory; do not use with SSD offload |
 | `--global_file_segment_size` | `INT64_MAX` (unlimited) | Max available space for DFS segments; default does not cap DFS usage |
+
+`--root_fs_dir` is a legacy persistence parameter and is expected to be replaced as the distributed filesystem path is refactored. For SSD offload, configure `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` on each real client instead.
 
 ### NoF (NVMe-oF SSD Pool)
 
@@ -665,6 +680,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
+| `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
 ```{note}
@@ -695,12 +711,14 @@ Or via a JSON config file. The service also exposes a lightweight HTTP API (on `
   "local_buffer_size": 268435456,
   "protocol": "tcp",
   "device_name": "",
-  "master_server_address": "127.0.0.1:50051"
+  "master_server_address": "127.0.0.1:50051",
+  "tenant_id": "default"
 }
 ```
 
 ```bash
 python -m mooncake.mooncake_store_service --config=<config_path> --port=8081
+python -m mooncake.mooncake_store_service --config=<config_path> -Dtenant_id=tenant-a
 ```
 
 ### Method C — Resource-owning Real Client (`mooncake_client`)
@@ -711,7 +729,8 @@ Run the `mooncake_client` binary as a standalone RPC process that owns storage r
 mooncake_client \
   --global_segment_size="4GB" \
   --master_server_address="127.0.0.1:50051" \
-  --metadata_server="http://127.0.0.1:8080/metadata"
+  --metadata_server="http://127.0.0.1:8080/metadata" \
+  --tenant_id="default"
 ```
 
 | Flag | Default | Description |
@@ -724,6 +743,7 @@ mooncake_client \
 | `--protocol` | `tcp` | Transfer protocol |
 | `--device_names` | empty | Transfer device name(s), comma-separated |
 | `--threads` | `1` | Client worker thread count |
+| `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 

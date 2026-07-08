@@ -95,7 +95,7 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 
 The Master Service can optionally enforce strict multi-tenant memory quota admission. This feature is disabled by default. When `enable_multi_tenants=false`, request tenant IDs are ignored for object placement, all objects use the `default` namespace, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
 
-When strict multi-tenant mode is enabled, the tenant quota policy is loaded from the configured connector. The v1 connector is a writable YAML file configured by `tenant_quota_connector_type=file` and `tenant_quota_connector_uri=<path>`. Tenants must be explicitly present in that connector policy before they can write. Missing tenants, empty tenants, and an unregistered `default` tenant are rejected with `TENANT_NOT_REGISTERED`.
+When strict multi-tenant mode is enabled, the tenant quota policy is loaded from the configured connector. Supported connector types are `file` and, when the store is built with `STORE_USE_ETCD=ON`, `etcd`. The `file` connector uses `tenant_quota_connector_uri=<path>` as a writable YAML policy path. The `etcd` connector uses `tenant_quota_connector_uri=<endpoints>` as the etcd endpoints string and stores the same YAML policy in `mooncake-store/<cluster_id>/tenant_quota_policy`; if that key does not exist, the master starts with an empty policy so the first policy can be created through the admin API. The etcd connector shares the process-wide store etcd client used by HA/oplog, so deployments that enable both must configure matching etcd endpoints. Tenants must be explicitly present in that connector policy before they can write. Missing tenants, empty tenants, and an unregistered `default` tenant are rejected with `TENANT_NOT_REGISTERED`.
 
 The YAML policy uses schema version `1`:
 
@@ -730,6 +730,8 @@ This system provides support for a hierarchical cache architecture, enabling eff
 When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, and this path is a valid DFS-mounted directory on all machines where the clients reside, Mooncake Store's tiered caching functionality will work properly. Additionally, during master initialization, a `cluster_id` is loaded. This ID can be specified during master initialization (`--cluster_id=xxxx`). If not specified, the default value `mooncake_cluster` will be used. Subsequently, the root directory for client persistence will be `<root_fs_dir>/<cluster_id>`.
 
 ​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
+
+This `root_fs_dir` path is a legacy persistence path. SSD offload uses `--enable_offload=true` on the master and real client, stores data under the real client's `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, and records `LOCAL_DISK` replicas. Do not use `--root_fs_dir` with `--enable_offload=true`.
 
 ### Persistent Storage Space Configuration​
 Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.

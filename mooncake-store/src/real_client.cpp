@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "real_client.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "common.h"
 #include "config.h"
 #include "mutex.h"
@@ -1025,7 +1025,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
     // A size of 0 keeps the pure client/server setup semantics.
-    auto validate_size = [](const char *key, size_t value) {
+    // global_segment_size is a total capacity and may exceed max_mr_size; the
+    // setup path splits it into mountable chunks below.
+    auto validate_min_size = [](const char *key, size_t value) {
+        if (value != 0 && value < MIN_SEGMENT_SIZE) {
+            LOG(ERROR) << "Invalid " << key << ": " << value
+                       << ", must be 0 or at least " << MIN_SEGMENT_SIZE;
+            return false;
+        }
+        return true;
+    };
+    auto validate_single_segment_size = [](const char *key, size_t value) {
         if ((value != 0 && value < MIN_SEGMENT_SIZE) ||
             value > MAX_SEGMENT_SIZE) {
             LOG(ERROR) << "Invalid " << key << ": " << value
@@ -1035,8 +1045,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         return true;
     };
-    if (!validate_size(CONFIG_KEY_GLOBAL_SEGMENT_SIZE, global_segment_size) ||
-        !validate_size(CONFIG_KEY_LOCAL_BUFFER_SIZE, local_buffer_size)) {
+    if (!validate_min_size(CONFIG_KEY_GLOBAL_SEGMENT_SIZE,
+                           global_segment_size) ||
+        !validate_single_segment_size(CONFIG_KEY_LOCAL_BUFFER_SIZE,
+                                      local_buffer_size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -2613,7 +2625,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     // MEMORY / DISK: use client_->Get.  FilterQueryResult ensures
-    // Client::Get's internal FindFirstCompleteReplica can only see
+    // Client::Get internal FindFirstCompleteReplica can only see
     // the replica we selected, preventing accidental LOCAL_DISK picks.
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
@@ -3635,17 +3647,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         void *buffer = buffers[i];
         size_t size = sizes[i];
 
-        std::vector<mooncake::Slice> slices;
-        uint64_t offset = 0;
-
-        while (offset < size) {
-            auto chunk_size = std::min(size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-
-        all_slices[key] = std::move(slices);
+        all_slices[key] = split_into_slices(buffer, size);
     }
 
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
@@ -3685,15 +3687,7 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
     }
 
     // Create slices directly from the user buffer
-    std::vector<mooncake::Slice> slices;
-    uint64_t offset = 0;
-
-    while (offset < size) {
-        auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
-    }
+    std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
@@ -3800,14 +3794,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
         return {};
     }
 
-    std::vector<mooncake::Slice> slices;
-    uint64_t offset = 0;
-    while (offset < size) {
-        auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
-    }
+    std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
 
     auto result = client_->Upsert(key, slices, config);
     if (!result) {
@@ -3853,15 +3840,8 @@ RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
     ordered_batched_slices.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        std::vector<mooncake::Slice> slices;
-        uint64_t offset = 0;
-        while (offset < sizes[i]) {
-            auto chunk_size = std::min(sizes[i] - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-        ordered_batched_slices.emplace_back(std::move(slices));
+        ordered_batched_slices.emplace_back(
+            split_into_slices(buffers[i], sizes[i]));
     }
 
     return client_->BatchUpsert(keys, ordered_batched_slices, config);
@@ -4738,25 +4718,10 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
     }
 
     // Create slices directly from the user buffer
-    std::vector<mooncake::Slice> slices;
-    // Add metadata slice
-    uint64_t metadata_offset = 0;
-    while (metadata_offset < metadata_size) {
-        auto metadata_chunk_size =
-            std::min(metadata_size - metadata_offset, kMaxSliceSize);
-        void *metadata_chunk_ptr =
-            static_cast<char *>(metadata_buffer) + metadata_offset;
-        slices.emplace_back(Slice{metadata_chunk_ptr, metadata_chunk_size});
-        metadata_offset += metadata_chunk_size;
-    }
-
-    uint64_t offset = 0;
-    while (offset < size) {
-        auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
-    }
+    std::vector<mooncake::Slice> slices =
+        split_into_slices(metadata_buffer, metadata_size);
+    auto data_slices = split_into_slices(buffer, size);
+    slices.insert(slices.end(), data_slices.begin(), data_slices.end());
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
