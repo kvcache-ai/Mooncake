@@ -147,6 +147,22 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
+#ifdef USE_NOF
+    NoFSegment MakeNoFSegment(
+        std::string name = "test_nof_segment",
+        std::string endpoint = "test_nof_segment_endpoint",
+        size_t base = kDefaultSegmentBase + kDefaultSegmentSize,
+        size_t size = kDefaultSegmentSize) const {
+        NoFSegment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.base = base;
+        segment.size = size;
+        segment.te_endpoint = std::move(endpoint);
+        return segment;
+    }
+#endif
+
     struct MountedSegmentContext {
         UUID segment_id;
         UUID client_id;
@@ -839,6 +855,131 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentWritesBatchRecordOpLog) {
     EXPECT_EQ(4u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
 }
+
+TEST_F(MasterServiceHATest, BatchEvictWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_batch_evict_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_evict_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_evict_key";
+    PutObjectOnSegment(service, mounted.client_id, key, "batch_evict_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(3u, batch.entries[0].sequence_id);
+}
+
+TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_disk_evict_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_disk_evict_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_disk_evict_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_disk_evict_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    Replica local_disk_replica(mounted.client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service
+                    .AddReplica(mounted.client_id, key, kDefaultTenant,
+                                local_disk_replica)
+                    .has_value());
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_TRUE(service
+                    .EvictDiskReplica(mounted.client_id, key, kDefaultTenant,
+                                      ReplicaType::LOCAL_DISK)
+                    .has_value());
+    ReadBatchEventually(storage, 4, batch);
+
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(4u, batch.entries[0].sequence_id);
+    EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
+#ifdef USE_NOF
+TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_nof_evict_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    NoFSegment nof_segment =
+        MakeNoFSegment("batch_nof_evict_segment", "batch_nof_evict_endpoint");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountNoFSegment(nof_segment, client_id).has_value());
+
+    const std::string key = "batch_nof_evict_key";
+    ReplicateConfig config;
+    config.nof_replica_num = 1;
+    auto put_start =
+        service.PutStart(client_id, key, kDefaultTenant, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, kDefaultTenant, ReplicaType::NOF_SSD)
+            .has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                       /*evict_ratio_lowerbound=*/1.0);
+    ReadBatchEventually(storage, 2, batch);
+
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(2u, batch.entries[0].sequence_id);
+}
+#endif
 
 TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
     auto service_config = MasterServiceConfig::builder()

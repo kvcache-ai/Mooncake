@@ -2703,10 +2703,11 @@ auto MasterService::BatchReplicaClear(
                 tl::expected<OpLogEntry, ErrorCode> persist_result;
                 if (remaining.empty()) {
                     persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::REMOVE, normalized_tenant, key, {}, nullptr);
+                        OpType::REMOVE, normalized_tenant.value(), key, {},
+                        nullptr);
                 } else {
                     persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::PUT_END, normalized_tenant, key,
+                        OpType::PUT_END, normalized_tenant.value(), key,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata.client_id, metadata.size, remaining,
                             metadata.group_id, metadata.data_type),
@@ -4298,7 +4299,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
     auto& metadata = accessor.Get();
 
-    if (enable_ha_ && oplog_store_) {
+    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
         auto remaining = BuildRemainingReplicaDescriptors(
             metadata, [replica_type, &client_id](const Replica& r) {
                 if (replica_type == ReplicaType::DISK) {
@@ -4314,14 +4315,15 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
-            persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::REMOVE, metadata.tenant_id, key, {});
+            persist_result = AppendOpLogWithDurableFinalize(
+                OpType::REMOVE, metadata.tenant_id.value(), key, {}, nullptr);
         } else {
-            persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::PUT_END, metadata.tenant_id, key,
+            persist_result = AppendOpLogWithDurableFinalize(
+                OpType::PUT_END, metadata.tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
                     metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type));
+                    metadata.group_id, metadata.data_type),
+                nullptr);
         }
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
@@ -7540,7 +7542,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto persist_evict_oplog_or_skip =
         [&, this](const TenantId& tenant_id, const std::string& key,
                   const ObjectMetadata& metadata) -> bool {
-        if (!enable_ha_ || !oplog_store_) return true;
+        if (!enable_ha_ || (!oplog_store_ && !ordered_oplog_writer_)) {
+            return true;
+        }
 
         // Predict the descriptor list after evict_replicas() runs:
         // drop COMPLETE memory replicas with refcnt==0; keep everything else
@@ -7553,14 +7557,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
-            persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::REMOVE, tenant_id, key, {});
+            persist_result = AppendOpLogWithDurableFinalize(
+                OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
         } else {
-            persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::PUT_END, tenant_id, key,
+            persist_result = AppendOpLogWithDurableFinalize(
+                OpType::PUT_END, tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
                     metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type));
+                    metadata.group_id, metadata.data_type),
+                nullptr);
         }
         if (!persist_result) {
             LOG(WARNING) << "BatchEvict: OpLog persist failed for key=" << key
@@ -8087,7 +8092,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
                 // HA strong consistency: persist BEFORE erasing NoF replicas.
                 // Skip the key on persist failure.
-                if (enable_ha_ && oplog_store_) {
+                if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                     auto remaining = BuildRemainingReplicaDescriptors(
                         metadata, [](const Replica& r) {
                             return r.is_nof_replica() && r.is_completed() &&
@@ -8095,14 +8100,17 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                         });
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (remaining.empty()) {
-                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::REMOVE, tenant_it->first, it->first, {});
+                        persist_result = AppendOpLogWithDurableFinalize(
+                            OpType::REMOVE, tenant_it->first.value(),
+                            it->first, {}, nullptr);
                     } else {
-                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::PUT_END, tenant_it->first, it->first,
+                        persist_result = AppendOpLogWithDurableFinalize(
+                            OpType::PUT_END, tenant_it->first.value(),
+                            it->first,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata.client_id, metadata.size, remaining,
-                                metadata.group_id, metadata.data_type));
+                                metadata.group_id, metadata.data_type),
+                            nullptr);
                     }
                     if (!persist_result) {
                         LOG(WARNING)
