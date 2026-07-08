@@ -769,6 +769,57 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(2u, prefix.last_seq);
 }
 
+TEST_F(MasterServiceHATest, PutEndVisibleBeforeBatchRecordDurable) {
+    const std::string cluster_id = "test_batch_record_put_end_visible";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_put_visible_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_put_visible_segment"};
+    const std::string key = "batch_put_visible_key";
+    auto put_start =
+        service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+
+    backend->BlockTxn();
+    auto put_end = service.PutEnd(mounted.client_id, key, kDefaultTenant,
+                                  ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end.has_value());
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    EXPECT_TRUE(replicas.has_value());
+    if (replicas.has_value()) {
+        EXPECT_EQ(1u, replicas->replicas.size());
+        if (!replicas->replicas.empty()) {
+            EXPECT_TRUE(replicas->replicas.front().is_memory_replica());
+        }
+    }
+    DurablePrefix prefix;
+    auto prefix_read = storage.ReadDurablePrefix(prefix);
+    EXPECT_EQ(ErrorCode::OK, prefix_read);
+    if (prefix_read == ErrorCode::OK) {
+        EXPECT_EQ(1u, prefix.batch_id);
+        EXPECT_EQ(1u, prefix.last_seq);
+    }
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 2, batch);
+}
+
 TEST_F(MasterServiceHATest,
        NotifyOffloadSuccessFallbackWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_offload_cluster";
@@ -837,6 +888,61 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
+TEST_F(MasterServiceHATest,
+       NotifyOffloadSuccessFallbackVisibleBeforeBatchRecordDurable) {
+    const std::string cluster_id = "test_batch_record_offload_visible";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_offload_visible_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_offload_visible_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_offload_visible_seg");
+    ReadBatchEventually(storage, 2, batch);
+
+    OffloadTaskItem task{.tenant_id = kDefaultTenant, .key = key, .size = 1024};
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "local_disk_visible_endpoint";
+
+    backend->BlockTxn();
+    auto offload =
+        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata});
+    EXPECT_TRUE(offload.has_value());
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    EXPECT_TRUE(replicas.has_value());
+    if (replicas.has_value()) {
+        bool has_local_disk = false;
+        for (const auto& replica : replicas->replicas) {
+            has_local_disk = has_local_disk || replica.is_local_disk_replica();
+        }
+        EXPECT_TRUE(has_local_disk);
+    }
+    DurablePrefix prefix;
+    auto prefix_read = storage.ReadDurablePrefix(prefix);
+    EXPECT_EQ(ErrorCode::OK, prefix_read);
+    if (prefix_read == ErrorCode::OK) {
+        EXPECT_EQ(2u, prefix.batch_id);
+        EXPECT_EQ(2u, prefix.last_seq);
+    }
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
 }
 
 TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
@@ -953,6 +1059,62 @@ TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
+TEST_F(MasterServiceHATest,
+       NotifyPromotionSuccessVisibleBeforeBatchRecordDurable) {
+    const std::string cluster_id = "test_batch_record_promotion_visible";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    const auto mounted =
+        PrepareSimpleSegment(service, "batch_promotion_visible_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_promotion_visible_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_promotion_visible_seg"};
+    auto put_start =
+        service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(1u, put_start->size());
+    SeedPromotionTaskForTesting(&service, kDefaultTenant, key,
+                                mounted.client_id, put_start->front().id, 1024);
+
+    backend->BlockTxn();
+    auto promotion =
+        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    EXPECT_TRUE(promotion.has_value());
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    EXPECT_TRUE(replicas.has_value());
+    if (replicas.has_value()) {
+        EXPECT_EQ(1u, replicas->replicas.size());
+        if (!replicas->replicas.empty()) {
+            EXPECT_TRUE(replicas->replicas.front().is_memory_replica());
+        }
+    }
+    DurablePrefix prefix;
+    auto prefix_read = storage.ReadDurablePrefix(prefix);
+    EXPECT_EQ(ErrorCode::OK, prefix_read);
+    if (prefix_read == ErrorCode::OK) {
+        EXPECT_EQ(1u, prefix.batch_id);
+        EXPECT_EQ(1u, prefix.last_seq);
+    }
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 2, batch);
 }
 
 TEST_F(MasterServiceHATest, RemoveWritesBatchRecordOpLog) {
