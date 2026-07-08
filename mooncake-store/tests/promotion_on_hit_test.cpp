@@ -54,6 +54,10 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_admission_threshold_;
     }
 
+    static uint32_t GetPromotionQueueLimitForTesting(MasterService* service) {
+        return service->promotion_queue_limit_;
+    }
+
     static bool SetPromotionQueuedTimeForTesting(
         MasterService* service, const UUID& client_id, const std::string& key,
         std::chrono::steady_clock::time_point queued_time,
@@ -1738,6 +1742,37 @@ TEST_F(PromotionOnHitTest, AdmissionThresholdAboveMaxClampsToMax) {
     EXPECT_EQ(GetPromotionAdmissionThresholdForTesting(service.get()), 255u)
         << "threshold above the CountMinSketch counter max (255) must "
         << "be clamped to 255; otherwise the gate is unreachable.";
+}
+
+// promotion_queue_limit=0 would make the global cap gate reject every
+// promotion while promotion_on_hit still appears enabled. Verify direct
+// MasterServiceConfig construction clamps it to one usable slot.
+TEST_F(PromotionOnHitTest, QueueLimitZeroClampsToOne) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 0;  // would reject every admission
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+    EXPECT_EQ(GetPromotionQueueLimitForTesting(service.get()), 1u);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k1", 1024,
+                                       seg.segment_name));
+    {
+        auto r = service->GetReplicaList("k1", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    auto hb = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(hb.has_value());
+    EXPECT_EQ(hb->size(), 1u)
+        << "queue_limit=0 must clamp to one so promotion_on_hit is not "
+        << "silently enabled-but-unusable";
+
+    service->RemoveAll();
 }
 
 // Remove(force=true) on a key with an in-flight PromotionTask must

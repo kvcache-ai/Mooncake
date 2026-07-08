@@ -378,6 +378,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     promotion_queue_limit_ = config.promotion_queue_limit;
     promotion_max_per_heartbeat_ = config.promotion_max_per_heartbeat;
     promotion_max_budget_ms_ = config.promotion_max_budget_ms;
+    // Clamp to >=1: promotion_queue_limit=0 would make the cap gate reject
+    // every promotion while promotion_on_hit still appears enabled.
+    if (promotion_queue_limit_ == 0) {
+        promotion_queue_limit_ = 1;
+    }
     // Clamp to >=1: 0 would make PromotionObjectHeartbeat return an empty
     // batch every call, silently disabling promotion delivery.
     if (promotion_max_per_heartbeat_ == 0) {
