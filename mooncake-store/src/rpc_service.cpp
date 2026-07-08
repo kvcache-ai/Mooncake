@@ -230,6 +230,21 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     return results;
 }
 
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaListForAdmin(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    return master_service_.BatchGetReplicaListForAdmin(keys, tenant_id);
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
+                                             const std::string& tenant_id) {
+    return execute_rpc(
+        "GetReplicaListForAdmin",
+        [&] { return master_service_.GetReplicaListForAdmin(key, tenant_id); },
+        [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
