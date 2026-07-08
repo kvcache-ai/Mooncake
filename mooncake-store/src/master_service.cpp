@@ -3142,6 +3142,12 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     });
 
                 if (replica_list.empty()) {
+                    auto readiness = ClassifyReplicaReadiness(&metadata);
+                    if (!readiness) {
+                        results[original_idx] =
+                            tl::make_unexpected(readiness.error());
+                        continue;
+                    }
                     LOG(WARNING)
                         << "key=" << key << ", error=replica_not_ready";
                     results[original_idx] =
