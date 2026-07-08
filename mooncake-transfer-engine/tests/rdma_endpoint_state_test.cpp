@@ -17,7 +17,10 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
+#include "error.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -47,6 +50,11 @@ class RdmaEndPointTestPeer {
     static void setReadyWaitStartTs(RdmaEndPoint &endpoint, uint64_t start_ts) {
         endpoint.ready_wait_start_ts_.store(start_ts,
                                             std::memory_order_relaxed);
+    }
+
+    static void setPeerQpNums(RdmaEndPoint &endpoint,
+                              std::vector<uint32_t> peer_qp_nums) {
+        endpoint.peer_qp_num_list_ = std::move(peer_qp_nums);
     }
 };
 
@@ -94,6 +102,47 @@ TEST_F(RdmaEndPointStateTest, ReadyAckTimeoutOnlyAppliesToWaitingState) {
 
     RdmaEndPointTestPeer::setStatus(*endpoint_, RdmaEndPoint::CONNECTED);
     EXPECT_FALSE(endpoint_->readyAckTimedOut());
+}
+
+TEST_F(RdmaEndPointStateTest, ReadyAckWithSamePeerQpMarksEndpointReady) {
+    endpoint_->setPeerNicPath("peer@nic");
+    RdmaEndPointTestPeer::setPeerQpNums(*endpoint_, {11, 22});
+    RdmaEndPointTestPeer::setReadyWaitStartTs(*endpoint_, 1);
+    RdmaEndPointTestPeer::setStatus(*endpoint_,
+                                    RdmaEndPoint::CONNECTED_WAIT_READY_ACK);
+
+    RdmaEndPoint::HandShakeDesc peer_desc;
+    peer_desc.ready_ack = true;
+    peer_desc.ready_ack_supported = true;
+    peer_desc.qp_num = {11, 22};
+    RdmaEndPoint::HandShakeDesc local_desc;
+
+    EXPECT_EQ(0, endpoint_->setupConnectionsByPassive(peer_desc, local_desc));
+    EXPECT_TRUE(local_desc.reply_msg.empty());
+    EXPECT_TRUE(endpoint_->connected());
+    EXPECT_TRUE(endpoint_->readyToSend());
+    EXPECT_FALSE(endpoint_->readyAckTimedOut());
+}
+
+TEST_F(RdmaEndPointStateTest, StaleReadyAckWithDifferentPeerQpDoesNotReset) {
+    endpoint_->setPeerNicPath("peer@nic");
+    RdmaEndPointTestPeer::setPeerQpNums(*endpoint_, {11, 22});
+    RdmaEndPointTestPeer::setReadyWaitStartTs(*endpoint_, 1);
+    RdmaEndPointTestPeer::setStatus(*endpoint_,
+                                    RdmaEndPoint::CONNECTED_WAIT_READY_ACK);
+
+    RdmaEndPoint::HandShakeDesc peer_desc;
+    peer_desc.ready_ack = true;
+    peer_desc.ready_ack_supported = true;
+    peer_desc.qp_num = {33, 44};
+    RdmaEndPoint::HandShakeDesc local_desc;
+
+    EXPECT_EQ(ERR_REJECT_HANDSHAKE,
+              endpoint_->setupConnectionsByPassive(peer_desc, local_desc));
+    EXPECT_FALSE(local_desc.reply_msg.empty());
+    EXPECT_TRUE(endpoint_->connected());
+    EXPECT_FALSE(endpoint_->readyToSend());
+    EXPECT_TRUE(endpoint_->readyAckTimedOut());
 }
 
 }  // namespace

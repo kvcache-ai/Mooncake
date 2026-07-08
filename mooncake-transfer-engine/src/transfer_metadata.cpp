@@ -76,7 +76,8 @@ struct TransferHandshakeUtil {
         Json::Value qpNums(Json::arrayValue);
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
-        root["ready_ack"] = desc.ready_ack;
+        if (desc.ready_ack_supported || desc.ready_ack)
+            root["ready_ack"] = desc.ready_ack;
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address

@@ -622,11 +622,29 @@ int RdmaEndPoint::setupConnectionsByActive() {
 int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                             HandShakeDesc &local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (peer_desc.ready_ack && !connected()) {
-        local_desc.reply_msg =
-            "Received RDMA ready ACK for unconnected endpoint";
-        LOG(ERROR) << local_desc.reply_msg << ": " << toString();
-        return ERR_REJECT_HANDSHAKE;
+    if (peer_desc.ready_ack) {
+        if (!connected()) {
+            local_desc.reply_msg =
+                "Received RDMA ready ACK for unconnected endpoint";
+            LOG(ERROR) << local_desc.reply_msg << ": " << toString();
+            return ERR_REJECT_HANDSHAKE;
+        }
+
+        if (peer_qp_num_list_ != peer_desc.qp_num) {
+            local_desc.reply_msg =
+                "Received stale RDMA ready ACK with mismatched peer QP numbers";
+            LOG(WARNING) << local_desc.reply_msg << ", ack_peer_qp_num="
+                         << qpListToString(peer_desc.qp_num)
+                         << ", current_peer_qp_num="
+                         << qpListToString(peer_qp_num_list_) << ": "
+                         << toString();
+            return ERR_REJECT_HANDSHAKE;
+        }
+
+        ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+        status_.store(CONNECTED, std::memory_order_relaxed);
+        LOG(INFO) << "Received RDMA ready ACK.";
+        return 0;
     }
 
     if (connected()) {
@@ -634,15 +652,11 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         if (peer_qp_num_list_ == peer_desc.qp_num) {
             fillLocalHandshakeDesc(context_, peer_nic_path_, qpNum(),
                                    local_desc);
-            if (peer_desc.ready_ack || !peer_desc.ready_ack_supported) {
+            if (!peer_desc.ready_ack_supported) {
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
                 status_.store(CONNECTED, std::memory_order_relaxed);
-                if (peer_desc.ready_ack) {
-                    LOG(INFO) << "Received RDMA ready ACK.";
-                } else {
-                    LOG(INFO) << "Peer does not support RDMA ready ACK, "
-                                 "reusing connection.";
-                }
+                LOG(INFO) << "Peer does not support RDMA ready ACK, "
+                             "reusing connection.";
             } else {
                 LOG(INFO) << "Received same peer QP numbers, reusing "
                              "connection while waiting for ready ACK.";
