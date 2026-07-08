@@ -1072,6 +1072,141 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentWritesBatchRecordOpLog) {
     EXPECT_FALSE(batch.entries[0].payload.empty());
 }
 
+TEST_F(MasterServiceHATest, BatchReplicaClearAllReleasesAfterDurable) {
+    const std::string cluster_id = "test_batch_record_clear_all_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_store_type("etcd_batch_record")
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "clear_all_finalize_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "clear_all_finalize_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "clear_all_finalize_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    backend->BlockTxn();
+    auto res = service.BatchReplicaClear({key}, mounted.client_id, "");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1u, res->size());
+    EXPECT_EQ(key, (*res)[0]);
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string before_finalize_key = "before_clear_all_finalize_key";
+    auto before_finalize = service.PutStart(
+        mounted.client_id, before_finalize_key, kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
+
+    if (!before_finalize.has_value()) {
+        const std::string after_finalize_key = "after_clear_all_finalize_key";
+        auto after_finalize =
+            service.PutStart(mounted.client_id, after_finalize_key,
+                             kDefaultTenant, 1024, config);
+        EXPECT_TRUE(after_finalize.has_value())
+            << toString(after_finalize.error());
+    }
+}
+
+TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
+    const std::string cluster_id = "test_batch_record_clear_segment_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_store_type("etcd_batch_record")
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant, 2048}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "clear_finalize_seg1");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "clear_segment_finalize_key";
+    ReplicateConfig pinned_config;
+    pinned_config.replica_num = 1;
+    pinned_config.preferred_segments = {"clear_finalize_seg1"};
+    pinned_config.with_hard_pin = true;
+    ASSERT_TRUE(service
+                    .PutStart(mounted.client_id, key, kDefaultTenant, 1024,
+                              pinned_config)
+                    .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(mounted.client_id, key, kDefaultTenant, ReplicaType::MEMORY)
+            .has_value());
+    ReadBatchEventually(storage, 2, batch);
+
+    PrepareSimpleSegment(service, "clear_finalize_seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 3, batch);
+
+    auto copy_start =
+        service.CopyStart(mounted.client_id, key, kDefaultTenant,
+                          "clear_finalize_seg1", {"clear_finalize_seg2"});
+    ASSERT_TRUE(copy_start.has_value());
+    ASSERT_TRUE(
+        service.CopyEnd(mounted.client_id, key, kDefaultTenant).has_value());
+    ReadBatchEventually(storage, 4, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    backend->BlockTxn();
+    auto res = service.BatchReplicaClear({key}, mounted.client_id,
+                                         "clear_finalize_seg1");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1u, res->size());
+    EXPECT_EQ(key, (*res)[0]);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string before_finalize_key = "before_clear_segment_finalize_key";
+    auto before_finalize = service.PutStart(
+        mounted.client_id, before_finalize_key, kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 5, batch);
+
+    if (!before_finalize.has_value()) {
+        const std::string after_finalize_key =
+            "after_clear_segment_finalize_key";
+        auto after_finalize =
+            service.PutStart(mounted.client_id, after_finalize_key,
+                             kDefaultTenant, 1024, config);
+        EXPECT_TRUE(after_finalize.has_value())
+            << toString(after_finalize.error());
+    }
+}
+
 TEST_F(MasterServiceHATest, BatchEvictWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_batch_evict_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();

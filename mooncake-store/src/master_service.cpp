@@ -1812,19 +1812,23 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 
     std::unordered_set<ReplicaID> ids(replica_ids.begin(), replica_ids.end());
     auto& metadata = accessor.Get();
-    const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-    const size_t erased = EraseReplicasWithCacheTotalAccounting(
+    auto erased_replicas = PopReplicasWithCacheTotalAccounting(
         metadata, [&ids](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED &&
                    ids.contains(replica.id());
         });
-    if (erased == 0) {
+    if (erased_replicas.empty()) {
         return;
     }
-    const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
-    if (before_charge > after_charge) {
-        ReleaseCommittedQuotaCharge(metadata, before_charge - after_charge);
+    const uint64_t erased_memory_replicas = static_cast<uint64_t>(std::count_if(
+        erased_replicas.begin(), erased_replicas.end(),
+        [](const Replica& replica) { return replica.is_memory_replica(); }));
+    if (erased_memory_replicas > 0) {
+        ReleaseCommittedQuotaCharge(
+            metadata, SaturatingMultiply(static_cast<uint64_t>(metadata.size),
+                                         erased_memory_replicas));
     }
+    ReleaseLocalDiskUsage(erased_replicas);
     if (!metadata.IsValid()) {
         accessor.Erase();
     }
@@ -2675,7 +2679,31 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
-            if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+            if (enable_ha_ && use_batch_oplog_) {
+                std::vector<ReplicaID> removed_ids;
+                metadata.VisitReplicas(&Replica::fn_is_completed,
+                                       [&removed_ids](Replica& replica) {
+                                           removed_ids.push_back(replica.id());
+                                           replica.mark_removed();
+                                       });
+                auto persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, normalized_tenant, key, {},
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+                if (!persist_result) {
+                    continue;
+                }
+                cleared_keys.emplace_back(key);
+                VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
+                        << " successfully cleared all replicas for key=" << key
+                        << " for client_id=" << client_id;
+                continue;
+            }
+
+            if (enable_ha_ && oplog_store_) {
                 auto err = PersistRemoveForHA("BatchReplicaClear",
                                               normalized_tenant, key);
                 if (!err) {
@@ -2727,6 +2755,52 @@ auto MasterService::BatchReplicaClear(
                     }
                     return false;
                 });
+
+            if (enable_ha_ && use_batch_oplog_) {
+                auto remaining = BuildRemainingReplicaDescriptors(
+                    metadata, [&match_replica_on_segment](const Replica& r) {
+                        return match_replica_on_segment(r);
+                    });
+                std::vector<ReplicaID> removed_ids;
+                metadata.VisitReplicas(match_replica_on_segment,
+                                       [&removed_ids](Replica& replica) {
+                                           removed_ids.push_back(replica.id());
+                                           replica.mark_removed();
+                                       });
+
+                tl::expected<OpLogEntry, ErrorCode> persist_result;
+                if (remaining.empty()) {
+                    persist_result = AppendOpLogWithDurableFinalize(
+                        OpType::REMOVE, normalized_tenant, key, {},
+                        [this, removed_ids = std::move(removed_ids)](
+                            const OpLogEntry& durable_entry) {
+                            FinalizeRemovedReplicasAfterDurable(
+                                durable_entry, removed_ids,
+                                QuotaEraseMode::kFull);
+                        });
+                } else {
+                    persist_result = AppendOpLogWithDurableFinalize(
+                        OpType::PUT_END, normalized_tenant, key,
+                        SerializeMetadataForOpLogFromReplicaDescriptors(
+                            metadata.client_id, metadata.size, remaining,
+                            metadata.group_id, metadata.data_type),
+                        [this, removed_ids = std::move(removed_ids)](
+                            const OpLogEntry& durable_entry) {
+                            FinalizeRemovedReplicasAfterDurable(
+                                durable_entry, removed_ids,
+                                QuotaEraseMode::kFull);
+                        });
+                }
+                if (!persist_result) {
+                    continue;
+                }
+                cleared_keys.emplace_back(key);
+                VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
+                        << " successfully cleared replicas on segment_name="
+                        << segment_name << " for key=" << key
+                        << " for client_id=" << client_id;
+                continue;
+            }
 
             if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                 auto remaining = BuildRemainingReplicaDescriptors(
