@@ -889,7 +889,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         }
     }
 
-    if (enable_ha_ && oplog_store_) {
+    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
         SegmentMountOp op;
         op.segment_name = segment.name;
         op.transport_endpoint = segment.te_endpoint;
@@ -989,7 +989,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         MasterMetricManager::instance().inc_active_clients();
     }
 
-    if (enable_ha_ && oplog_store_) {
+    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
         for (const auto& seg : segments) {
             SegmentMountOp op;
             op.segment_name = seg.name;
@@ -2089,7 +2089,8 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         }
     }
 
-    if (enable_ha_ && oplog_store_ && !te_endpoint.empty()) {
+    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_) &&
+        !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue("UnmountSegment",
@@ -10505,6 +10506,20 @@ void MasterService::PersistSegmentOpForHAOrEnqueue(
 void MasterService::PersistSegmentOpForHAOrEnqueue(
     const char* why, OpType type, const TenantId& tenant_id,
     const std::string& key, const std::string& payload) {
+    if (use_batch_oplog_) {
+        // Segment lifecycle was retry-queue based in legacy mode; in
+        // batch-record mode the ordered writer owns retry until durable.
+        auto result = AppendOpLogVisibleBeforeDurable(
+            type, tenant_id.value(), key, payload);
+        if (!result) {
+            LOG(WARNING) << why
+                         << ": segment batch OpLog persist failed for key="
+                         << key << ", type=" << static_cast<int>(type)
+                         << ", err=" << static_cast<int>(result.error());
+        }
+        return;
+    }
+
     // Allocate the entry up-front so the retry queue and the up-front
     // attempt share the same sequence_id — standby applies idempotent
     // segment events but the seq must be monotonic.

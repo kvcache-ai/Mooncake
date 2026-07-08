@@ -410,6 +410,18 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_put_end_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
+    for (int i = 0; i < 50; ++i) {
+        read_err = storage.ReadBatch(1, batch);
+        if (read_err == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(ErrorCode::OK, read_err);
+
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segments = {"batch_put_end_segment"};
@@ -422,11 +434,8 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
             .PutEnd(mounted.client_id, key, kDefaultTenant, ReplicaType::MEMORY)
             .has_value());
 
-    OpLogBatchStorage storage(cluster_id, *backend);
-    OpLogBatchRecord batch;
-    ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
     for (int i = 0; i < 50; ++i) {
-        read_err = storage.ReadBatch(1, batch);
+        read_err = storage.ReadBatch(2, batch);
         if (read_err == ErrorCode::OK) {
             break;
         }
@@ -437,12 +446,12 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
-    EXPECT_EQ(1u, batch.entries[0].sequence_id);
+    EXPECT_EQ(2u, batch.entries[0].sequence_id);
 
     DurablePrefix prefix;
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
-    EXPECT_EQ(1u, prefix.batch_id);
-    EXPECT_EQ(1u, prefix.last_seq);
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(2u, prefix.last_seq);
 }
 
 TEST_F(MasterServiceHATest,
@@ -460,9 +469,29 @@ TEST_F(MasterServiceHATest,
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_offload_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
+    for (int i = 0; i < 50; ++i) {
+        read_err = storage.ReadBatch(1, batch);
+        if (read_err == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(ErrorCode::OK, read_err);
+
     const std::string key = "batch_offload_key";
     PutObjectOnSegment(service, mounted.client_id, key,
                        "batch_offload_segment");
+    for (int i = 0; i < 50; ++i) {
+        read_err = storage.ReadBatch(2, batch);
+        if (read_err == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(ErrorCode::OK, read_err);
 
     OffloadTaskItem task{.tenant_id = kDefaultTenant, .key = key, .size = 1024};
     StorageObjectMetadata metadata;
@@ -479,11 +508,8 @@ TEST_F(MasterServiceHATest,
     }
     EXPECT_TRUE(has_local_disk);
 
-    OpLogBatchStorage storage(cluster_id, *backend);
-    OpLogBatchRecord batch;
-    ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
     for (int i = 0; i < 50; ++i) {
-        read_err = storage.ReadBatch(2, batch);
+        read_err = storage.ReadBatch(3, batch);
         if (read_err == ErrorCode::OK) {
             break;
         }
@@ -494,8 +520,67 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
-    EXPECT_EQ(2u, batch.entries[0].sequence_id);
+    EXPECT_EQ(3u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
+TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
+    const std::string cluster_id = "test_batch_record_segment_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    const UUID client_id = generate_uuid();
+    Segment mounted = MakeSegment("batch_segment_mount");
+    ASSERT_TRUE(service.MountSegment(mounted, client_id).has_value());
+
+    const UUID remount_client_id = generate_uuid();
+    Segment remounted = MakeSegment("batch_segment_remount",
+                                    kDefaultSegmentBase + kDefaultSegmentSize);
+    ASSERT_TRUE(
+        service.ReMountSegment({remounted}, remount_client_id).has_value());
+
+    ASSERT_TRUE(service.UnmountSegment(mounted.id, client_id).has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    auto read_batch = [&](uint64_t batch_id) {
+        OpLogBatchRecord batch;
+        ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
+        for (int i = 0; i < 50; ++i) {
+            read_err = storage.ReadBatch(batch_id, batch);
+            if (read_err == ErrorCode::OK) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        EXPECT_EQ(ErrorCode::OK, read_err);
+        return batch;
+    };
+
+    auto mount_batch = read_batch(1);
+    ASSERT_EQ(1u, mount_batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_MOUNT, mount_batch.entries[0].op_type);
+    EXPECT_EQ(1u, mount_batch.entries[0].sequence_id);
+    EXPECT_FALSE(mount_batch.entries[0].payload.empty());
+
+    auto remount_batch = read_batch(2);
+    ASSERT_EQ(1u, remount_batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_MOUNT, remount_batch.entries[0].op_type);
+    EXPECT_EQ(2u, remount_batch.entries[0].sequence_id);
+    EXPECT_FALSE(remount_batch.entries[0].payload.empty());
+
+    auto unmount_batch = read_batch(3);
+    ASSERT_EQ(1u, unmount_batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_UNMOUNT, unmount_batch.entries[0].op_type);
+    EXPECT_EQ(3u, unmount_batch.entries[0].sequence_id);
+    EXPECT_FALSE(unmount_batch.entries[0].payload.empty());
 }
 
 TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
