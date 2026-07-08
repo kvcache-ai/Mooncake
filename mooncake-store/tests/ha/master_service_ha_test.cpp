@@ -1158,6 +1158,55 @@ TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
     EXPECT_EQ(3u, mock_store->EntryCount());
 }
 
+TEST_F(MasterServiceHATest, BatchRecordModeRejectsDirectLegacyOpLogWrites) {
+    const std::string cluster_id = "test_batch_record_no_legacy_writes";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto legacy_store = std::make_shared<MockOpLogStore>();
+    service.SetOpLogStoreForTesting(legacy_store);
+
+    auto source = PrepareSimpleSegment(service, "batch_no_legacy_source");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_no_legacy_key";
+    PutObjectOnSegment(service, source.client_id, key,
+                       "batch_no_legacy_source");
+    ReadBatchEventually(storage, 2, batch);
+
+    [[maybe_unused]] const auto target =
+        PrepareSimpleSegment(service, "batch_no_legacy_target",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_TRUE(service
+                    .CopyStart(source.client_id, key, kDefaultTenant,
+                               "batch_no_legacy_source",
+                               {"batch_no_legacy_target"})
+                    .has_value());
+    ASSERT_TRUE(
+        service.CopyEnd(source.client_id, key, kDefaultTenant).has_value());
+    ReadBatchEventually(storage, 4, batch);
+
+    EXPECT_EQ(0u, legacy_store->EntryCount());
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    EXPECT_EQ(4u, batch.entries[0].sequence_id);
+    EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
 TEST_F(MasterServiceHATest, RestoreFromStandbySnapshotClearsInvalidEndpoints) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
