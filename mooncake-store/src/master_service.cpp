@@ -5357,8 +5357,8 @@ bool MasterService::ExpirePromotionTaskForBudget(
     MasterMetricManager::instance().dec_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_expired();
     MasterMetricManager::instance().inc_promotion_late();
-    LOG(WARNING) << "Promotion task exceeded budget for key: "
-                 << object_id.user_key << " tenant=" << object_id.tenant_id;
+    VLOG(1) << "Promotion task exceeded budget for key: " << object_id.user_key
+            << " tenant=" << object_id.tenant_id;
 
     if (tenant_state.Empty()) {
         shard->tenants.erase(tenant_it);
@@ -5403,11 +5403,22 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                 const PromotionTaskItem* task_item;
                 int64_t remaining_ms;
             };
+            const auto candidate_less = [](const Candidate& a,
+                                           const Candidate& b) {
+                if (a.remaining_ms != b.remaining_ms) {
+                    return a.remaining_ms < b.remaining_ms;
+                }
+                if (a.task_item->queued_time != b.task_item->queued_time) {
+                    return a.task_item->queued_time < b.task_item->queued_time;
+                }
+                return *a.storage_key < *b.storage_key;
+            };
 
             const auto now = std::chrono::steady_clock::now();
-            std::vector<Candidate> candidates;
+            std::vector<Candidate> selected;
             std::vector<std::string> expired_storage_keys;
-            candidates.reserve(src.size());
+            selected.reserve(
+                std::min<size_t>(promotion_max_per_heartbeat_, src.size()));
 
             for (const auto& [storage_key, task_item] : src) {
                 const auto elapsed_ms =
@@ -5422,31 +5433,27 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                         ObjectIdentity{task_item.tenant_id, task_item.key});
                     continue;
                 }
-                candidates.push_back(
-                    Candidate{&storage_key, &task_item, remaining_ms});
+                Candidate candidate{&storage_key, &task_item, remaining_ms};
+                if (selected.size() < promotion_max_per_heartbeat_) {
+                    selected.push_back(candidate);
+                    std::push_heap(selected.begin(), selected.end(),
+                                   candidate_less);
+                } else if (candidate_less(candidate, selected.front())) {
+                    std::pop_heap(selected.begin(), selected.end(),
+                                  candidate_less);
+                    selected.back() = candidate;
+                    std::push_heap(selected.begin(), selected.end(),
+                                   candidate_less);
+                }
             }
 
             for (const auto& storage_key : expired_storage_keys) {
                 src.erase(storage_key);
             }
 
-            std::sort(
-                candidates.begin(), candidates.end(),
-                [](const Candidate& a, const Candidate& b) {
-                    if (a.remaining_ms != b.remaining_ms) {
-                        return a.remaining_ms < b.remaining_ms;
-                    }
-                    if (a.task_item->queued_time != b.task_item->queued_time) {
-                        return a.task_item->queued_time <
-                               b.task_item->queued_time;
-                    }
-                    return *a.storage_key < *b.storage_key;
-                });
+            std::sort(selected.begin(), selected.end(), candidate_less);
 
-            for (const auto& candidate : candidates) {
-                if (result.size() >= promotion_max_per_heartbeat_) {
-                    break;
-                }
+            for (const auto& candidate : selected) {
                 auto node = src.extract(*candidate.storage_key);
                 if (node.empty()) {
                     continue;

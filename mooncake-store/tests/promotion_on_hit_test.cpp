@@ -2351,6 +2351,65 @@ TEST_F(PromotionOnHitTest, BudgetModeUsesDeterministicTieBreaker) {
     service->RemoveAll();
 }
 
+// Budget mode keeps only the best deadline window while scanning a larger
+// backlog, and still expires late tasks found in the same heartbeat.
+TEST_F(PromotionOnHitTest, BudgetModeSelectsBestWindowFromBacklog) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;
+    config.promotion_max_budget_ms = 5000;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    auto enqueue = [&](const std::string& key) {
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
+                                           seg.segment_name));
+        auto r = service->GetReplicaList(key, "default");
+        ASSERT_TRUE(r.has_value());
+    };
+
+    for (const auto& key : {"skipped", "chosen_2", "late", "chosen_1"}) {
+        enqueue(key);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    ASSERT_TRUE(SetPromotionQueuedTimeForTesting(
+        service.get(), seg.client_id, "chosen_1",
+        now - std::chrono::milliseconds(4000)));
+    ASSERT_TRUE(SetPromotionQueuedTimeForTesting(
+        service.get(), seg.client_id, "chosen_2",
+        now - std::chrono::milliseconds(3000)));
+    ASSERT_TRUE(SetPromotionQueuedTimeForTesting(
+        service.get(), seg.client_id, "skipped",
+        now - std::chrono::milliseconds(100)));
+    ASSERT_TRUE(SetPromotionQueuedTimeForTesting(
+        service.get(), seg.client_id, "late",
+        now - std::chrono::milliseconds(6000)));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t within_pre = mm.get_promotion_within_budget();
+    const int64_t late_pre = mm.get_promotion_late();
+
+    auto first = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first->size(), 2u);
+    EXPECT_EQ((*first)[0].key, "chosen_1");
+    EXPECT_EQ((*first)[1].key, "chosen_2");
+    EXPECT_EQ(mm.get_promotion_within_budget() - within_pre, 2);
+    EXPECT_EQ(mm.get_promotion_late() - late_pre, 1);
+
+    auto second = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_EQ(second->size(), 1u);
+    EXPECT_EQ((*second)[0].key, "skipped");
+
+    service->RemoveAll();
+}
+
 // A queued task that has already missed its budget should be removed from the
 // per-client queue and from the per-shard PromotionTask map so it does not pin
 // promotion_in_flight or block future promotion attempts for the same key.

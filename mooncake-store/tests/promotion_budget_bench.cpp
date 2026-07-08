@@ -37,6 +37,8 @@ struct RunConfig {
     int heartbeat_ms = 1;
     int base_ms = 25;
     int per_ki_token_ms = 15;
+    int stress_tasks = 0;
+    int stress_max_age_ms = 1000;
     std::vector<int> tokens{1024, 3072};
     std::vector<int> max_per_heartbeat{1, 2};
     std::string out_csv;
@@ -74,11 +76,22 @@ struct RunResult {
     int late_counter;
     double avg_in_flight;
     double p95_wait_ms;
+    double avg_heartbeat_us;
+    double p95_heartbeat_us;
+    int heartbeat_calls;
     bool invariant_ok;
 };
 
-std::vector<BenchCase> BenchCases() {
-    return {{"light", 30, 30}, {"medium", 48, 90}, {"heavy", 72, 180}};
+std::vector<BenchCase> BuildBenchCases(const RunConfig& config) {
+    std::vector<BenchCase> cases{
+        {"light", 30, 30}, {"medium", 48, 90}, {"heavy", 72, 180}};
+    if (config.stress_tasks > 0) {
+        cases.push_back(
+            BenchCase{.name = "stress",
+                      .task_count = static_cast<size_t>(config.stress_tasks),
+                      .max_age_ms = config.stress_max_age_ms});
+    }
+    return cases;
 }
 
 int HiCacheBudgetMs(int base_ms, int per_ki_token_ms, int tokens) {
@@ -178,7 +191,9 @@ RunConfig ParseArgs(int argc, char** argv) {
         if (parse_int("--runs=", &config.runs) ||
             parse_int("--heartbeat_ms=", &config.heartbeat_ms) ||
             parse_int("--base_ms=", &config.base_ms) ||
-            parse_int("--per_ki_token_ms=", &config.per_ki_token_ms)) {
+            parse_int("--per_ki_token_ms=", &config.per_ki_token_ms) ||
+            parse_int("--stress_tasks=", &config.stress_tasks) ||
+            parse_int("--stress_max_age_ms=", &config.stress_max_age_ms)) {
             continue;
         }
         if (arg.rfind("--out_csv=", 0) == 0) {
@@ -194,7 +209,7 @@ void WriteRows(std::ostream& out, const std::vector<RunResult>& rows) {
     out << "scheduler,backlog,max_per_heartbeat,budget_ms,run,task_count,"
            "deadline_met_ratio,completed,expired,wasted_ssd_reads,"
            "within_budget_counter,late_counter,avg_in_flight,p95_wait_ms,"
-           "invariant_ok\n";
+           "avg_heartbeat_us,p95_heartbeat_us,heartbeat_calls,invariant_ok\n";
     out << std::fixed << std::setprecision(4);
     for (const auto& row : rows) {
         out << CsvEscape(row.scheduler) << ',' << CsvEscape(row.backlog) << ','
@@ -203,8 +218,9 @@ void WriteRows(std::ostream& out, const std::vector<RunResult>& rows) {
             << row.completed << ',' << row.expired << ','
             << row.wasted_ssd_reads << ',' << row.within_budget_counter << ','
             << row.late_counter << ',' << row.avg_in_flight << ','
-            << row.p95_wait_ms << ',' << (row.invariant_ok ? "true" : "false")
-            << '\n';
+            << row.p95_wait_ms << ',' << row.avg_heartbeat_us << ','
+            << row.p95_heartbeat_us << ',' << row.heartbeat_calls << ','
+            << (row.invariant_ok ? "true" : "false") << '\n';
     }
 }
 
@@ -268,6 +284,7 @@ RunResult RunOne(const std::string& scheduler, const BenchCase& bench_case,
     }
 
     std::vector<double> wait_ms;
+    std::vector<double> heartbeat_us;
     std::vector<double> in_flight_samples;
     int selected = 0;
     int deadline_met = 0;
@@ -278,10 +295,15 @@ RunResult RunOne(const std::string& scheduler, const BenchCase& bench_case,
         in_flight_samples.push_back(static_cast<double>(std::max<int64_t>(
             0, before_tick.in_flight - metrics_before.in_flight)));
 
+        const auto heartbeat_start = Clock::now();
         auto heartbeat = service->PromotionObjectHeartbeat(segment.client_id);
+        const auto heartbeat_now = Clock::now();
+        heartbeat_us.push_back(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                heartbeat_now - heartbeat_start)
+                .count());
         CHECK(heartbeat.has_value()) << "PromotionObjectHeartbeat failed";
 
-        const auto heartbeat_now = Clock::now();
         for (const auto& task : *heartbeat) {
             ++selected;
             const auto deadline =
@@ -342,6 +364,11 @@ RunResult RunOne(const std::string& scheduler, const BenchCase& bench_case,
             : std::accumulate(in_flight_samples.begin(),
                               in_flight_samples.end(), 0.0) /
                   in_flight_samples.size();
+    const double avg_heartbeat_us =
+        heartbeat_us.empty()
+            ? 0.0
+            : std::accumulate(heartbeat_us.begin(), heartbeat_us.end(), 0.0) /
+                  heartbeat_us.size();
     return RunResult{
         .scheduler = scheduler,
         .backlog = bench_case.name,
@@ -360,6 +387,9 @@ RunResult RunOne(const std::string& scheduler, const BenchCase& bench_case,
             static_cast<int>(Delta(metrics_after.late, metrics_before.late)),
         .avg_in_flight = avg_in_flight,
         .p95_wait_ms = Percentile(wait_ms, 0.95),
+        .avg_heartbeat_us = avg_heartbeat_us,
+        .p95_heartbeat_us = Percentile(heartbeat_us, 0.95),
+        .heartbeat_calls = static_cast<int>(heartbeat_us.size()),
         .invariant_ok = invariant_ok};
 }
 
@@ -405,6 +435,12 @@ std::vector<RunResult> AggregateMedian(const std::vector<RunResult>& runs) {
                 [](const auto& row) { return row.avg_in_flight; }),
             .p95_wait_ms =
                 median_metric([](const auto& row) { return row.p95_wait_ms; }),
+            .avg_heartbeat_us = median_metric(
+                [](const auto& row) { return row.avg_heartbeat_us; }),
+            .p95_heartbeat_us = median_metric(
+                [](const auto& row) { return row.p95_heartbeat_us; }),
+            .heartbeat_calls = static_cast<int>(median_metric(
+                [](const auto& row) { return row.heartbeat_calls; })),
             .invariant_ok =
                 std::all_of(group.begin(), group.end(),
                             [](const auto& row) { return row.invariant_ok; })});
@@ -424,7 +460,7 @@ int Main(int argc, char** argv) {
     }
 
     std::vector<RunResult> raw_runs;
-    for (const auto& bench_case : BenchCases()) {
+    for (const auto& bench_case : BuildBenchCases(config)) {
         for (int max_per : config.max_per_heartbeat) {
             for (int budget_ms : budgets) {
                 for (int run = 0; run < config.runs; ++run) {

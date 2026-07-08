@@ -19,6 +19,10 @@ DEFINE_string(master_server, "127.0.0.1:50051", "Mooncake master address");
 DEFINE_int32(within_tasks, 4, "Promotion tasks completed within budget");
 DEFINE_int32(late_tasks, 4, "Promotion tasks left to exceed the budget");
 DEFINE_int32(late_wait_ms, 120, "Milliseconds to wait before late heartbeat");
+DEFINE_bool(late_complete_tasks, false,
+            "Complete tasks returned by the late phase. Use this for "
+            "budget-vs-FIFO service comparisons: FIFO returns and completes "
+            "late work, while budget mode expires it before handoff.");
 DEFINE_uint64(object_size, 1024, "Synthetic object size in bytes");
 DEFINE_uint64(segment_size, 128ULL * 1024 * 1024,
               "Mounted memory segment size in bytes");
@@ -41,15 +45,15 @@ struct PhaseResult {
 template <typename T>
 const T& RequireExpected(const tl::expected<T, ErrorCode>& result,
                          const std::string& operation) {
-    CHECK(result.has_value()) << operation << " failed: "
-                              << toString(result.error());
+    CHECK(result.has_value())
+        << operation << " failed: " << toString(result.error());
     return result.value();
 }
 
 void RequireExpected(const tl::expected<void, ErrorCode>& result,
                      const std::string& operation) {
-    CHECK(result.has_value()) << operation << " failed: "
-                              << toString(result.error());
+    CHECK(result.has_value())
+        << operation << " failed: " << toString(result.error());
 }
 
 std::vector<std::string> MakeKeys(const std::string& phase, int count) {
@@ -72,10 +76,10 @@ void InjectLocalDiskOnlyKeys(MasterClient& client, const UUID& client_id,
     tasks.reserve(keys.size());
     metas.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        tasks.push_back(OffloadTaskItem{.tenant_id = "default",
-                                        .key = keys[i],
-                                        .size = static_cast<int64_t>(
-                                            FLAGS_object_size)});
+        tasks.push_back(
+            OffloadTaskItem{.tenant_id = "default",
+                            .key = keys[i],
+                            .size = static_cast<int64_t>(FLAGS_object_size)});
         StorageObjectMetadata metadata;
         metadata.bucket_id = 0;
         metadata.offset = static_cast<int64_t>(i * FLAGS_object_size);
@@ -118,10 +122,9 @@ PhaseResult RunPhase(MasterClient& client, const UUID& client_id,
                                            task.size, preferred_segments),
                 "PromotionAllocStart");
             ++result.alloc_started;
-            RequireExpected(
-                client.NotifyPromotionSuccess(client_id, task.key,
-                                              task.tenant_id),
-                "NotifyPromotionSuccess");
+            RequireExpected(client.NotifyPromotionSuccess(client_id, task.key,
+                                                          task.tenant_id),
+                            "NotifyPromotionSuccess");
             ++result.completed;
         }
     }
@@ -176,7 +179,8 @@ int main(int argc, char** argv) {
     rows.push_back(RunPhase(client, client_id, "within", FLAGS_within_tasks, 0,
                             true, preferred_segments));
     rows.push_back(RunPhase(client, client_id, "late", FLAGS_late_tasks,
-                            FLAGS_late_wait_ms, false, preferred_segments));
+                            FLAGS_late_wait_ms, FLAGS_late_complete_tasks,
+                            preferred_segments));
     WriteCsv(rows);
 
     for (const auto& row : rows) {
