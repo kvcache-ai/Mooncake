@@ -3459,7 +3459,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
                 if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
-                    if (enable_ha_ && oplog_store_) {
+                    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                         auto err =
                             PersistRemoveForHA("PutStart(stale cleanup REMOVE)",
                                                object_id.tenant_id, key);
@@ -3481,7 +3481,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     }
-                    if (enable_ha_ && oplog_store_) {
+                    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
                         auto err =
                             PersistRemoveForHA("PutStart(stale cleanup REMOVE)",
                                                object_id.tenant_id, key);
@@ -6731,13 +6731,14 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 // HA strong consistency: persist BEFORE PopReplicas. On
                 // persist failure leave metadata untouched so the next reaper
                 // pass can retry.
-                if (had_complete_replica && enable_ha_ && oplog_store_) {
+                if (had_complete_replica && enable_ha_ &&
+                    (oplog_store_ || ordered_oplog_writer_)) {
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (would_invalidate) {
-                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        persist_result = AppendOpLogAndWaitDurable(
                             OpType::REMOVE, tenant_it->first, *key_it, {});
                     } else {
-                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        persist_result = AppendOpLogAndWaitDurable(
                             OpType::PUT_END, tenant_it->first, *key_it,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata.client_id, metadata.size,
@@ -6811,13 +6812,14 @@ void MasterService::DiscardExpiredProcessingReplicas(
             // HA strong consistency: persist BEFORE dec_refcnt / PopReplicas.
             // On persist failure leave metadata + task untouched so the next
             // reaper pass can retry.
-            if (had_complete_replica && enable_ha_ && oplog_store_) {
+            if (had_complete_replica && enable_ha_ &&
+                (oplog_store_ || ordered_oplog_writer_)) {
                 tl::expected<OpLogEntry, ErrorCode> persist_result;
                 if (would_invalidate) {
-                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    persist_result = AppendOpLogAndWaitDurable(
                         OpType::REMOVE, tenant_it->first, task_it->first, {});
                 } else {
-                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    persist_result = AppendOpLogAndWaitDurable(
                         OpType::PUT_END, tenant_it->first, task_it->first,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata.client_id, metadata.size, post_descriptors,
