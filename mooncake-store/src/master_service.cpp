@@ -5080,7 +5080,27 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+    if (enable_ha_ && use_batch_oplog_) {
+        std::vector<ReplicaID> removed_ids;
+        metadata.VisitReplicas(&Replica::fn_is_completed,
+                               [&removed_ids](Replica& replica) {
+                                   removed_ids.push_back(replica.id());
+                                   replica.mark_removed();
+                               });
+        auto persist_result = AppendOpLogWithDurableFinalize(
+            OpType::REMOVE, object_id.tenant_id, key, {},
+            [this, removed_ids = std::move(removed_ids)](
+                const OpLogEntry& durable_entry) {
+                FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
+                                                    QuotaEraseMode::kFull);
+            });
+        if (!persist_result) {
+            return tl::make_unexpected(persist_result.error());
+        }
+        return {};
+    }
+
+    if (enable_ha_ && oplog_store_) {
         auto err = PersistRemoveForHA("Remove", object_id.tenant_id, key);
         if (!err) {
             return tl::make_unexpected(err.error());
