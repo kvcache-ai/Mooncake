@@ -253,11 +253,12 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
         MasterSnapshotManagerOptions options;
         options.enable_snapshot = true;
-        options.snapshot_interval_seconds = 300;
-        options.snapshot_child_timeout_seconds = 300;
-        options.snapshot_retention_count = 3;
-        options.snapshot_backup_dir = "";
-        options.use_snapshot_backup_dir = false;
+        options.snapshot_interval_seconds = service_->snapshot_interval_seconds_;
+        options.snapshot_child_timeout_seconds =
+            service_->snapshot_child_timeout_seconds_;
+        options.snapshot_retention_count = service_->snapshot_retention_count_;
+        options.snapshot_backup_dir = service_->snapshot_backup_dir_;
+        options.use_snapshot_backup_dir = service_->use_snapshot_backup_dir_;
         options.snapshot_catalog_store_type =
             service_->snapshot_catalog_store_type_;
         options.snapshot_catalog_store_connstring =
