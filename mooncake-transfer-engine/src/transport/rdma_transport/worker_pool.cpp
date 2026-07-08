@@ -356,14 +356,28 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
-        if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
-            LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first << ", deleting endpoint";
-            // Unified path failure handling
-            handlePathFailure(entry.first, endpoint.get());
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            entry.second.clear();
-            continue;
+        if (!endpoint->connected()) {
+            // Check handshake backoff before attempting connection
+            if (isInHandshakeBackoff(entry.first)) {
+                for (auto &slice : entry.second)
+                    failed_slice_list.push_back(slice);
+                entry.second.clear();
+                continue;
+            }
+            if (endpoint->setupConnectionsByActive()) {
+                LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
+                           << entry.first << ", deleting endpoint";
+                // Mark exponential backoff for this rail
+                markHandshakeBackoff(entry.first);
+                // Unified path failure handling
+                handlePathFailure(entry.first, endpoint.get());
+                for (auto &slice : entry.second)
+                    failed_slice_list.push_back(slice);
+                entry.second.clear();
+                continue;
+            }
+            // Connection succeeded, clear any backoff state
+            clearHandshakeBackoff(entry.first);
         }
         // Set endpoint pointer for each slice before submitting
         for (auto &slice : entry.second) {
@@ -739,6 +753,44 @@ void WorkerPool::handlePathFailure(const std::string &peer_nic_path,
     if (endpoint) {
         context_.deleteEndpointByPtr(endpoint);
     }
+}
+
+void WorkerPool::markHandshakeBackoff(const std::string &peer_nic_path) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    auto &state = rail_states_[peer_nic_path];
+    state.handshake_failures =
+        std::min(state.handshake_failures + 1, kHandshakeBackoffMaxFailures);
+    // Exponential backoff: base * 2^(failures-1), capped at max
+    uint64_t delay = kHandshakeBackoffBaseNs << (state.handshake_failures - 1);
+    if (delay > kHandshakeBackoffMaxNs) delay = kHandshakeBackoffMaxNs;
+    state.handshake_backoff_until_ns = getCurrentTimeInNano() + delay;
+    LOG(WARNING) << "Handshake backoff: peer=" << peer_nic_path
+                 << " failures=" << state.handshake_failures
+                 << " backoff_ms=" << (delay / 1000000);
+}
+
+bool WorkerPool::isInHandshakeBackoff(const std::string &peer_nic_path) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    auto it = rail_states_.find(peer_nic_path);
+    if (it == rail_states_.end()) return false;
+    auto &state = it->second;
+    if (state.handshake_backoff_until_ns == 0) return false;
+    uint64_t now = getCurrentTimeInNano();
+    if (now >= state.handshake_backoff_until_ns) {
+        // Backoff expired, allow retry (but don't clear failures yet;
+        // clearHandshakeBackoff does that on success)
+        state.handshake_backoff_until_ns = 0;
+        return false;
+    }
+    return true;
+}
+
+void WorkerPool::clearHandshakeBackoff(const std::string &peer_nic_path) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    auto it = rail_states_.find(peer_nic_path);
+    if (it == rail_states_.end()) return;
+    it->second.handshake_failures = 0;
+    it->second.handshake_backoff_until_ns = 0;
 }
 
 }  // namespace mooncake

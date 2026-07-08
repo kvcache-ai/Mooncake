@@ -239,6 +239,12 @@ add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
 
+add_executable(connection_limiter_test
+               ${WORKSPACE}/connection_limiter_test.cpp)
+target_link_libraries(connection_limiter_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME connection_limiter_test COMMAND connection_limiter_test)
+
 add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest
                                                  gtest_main)

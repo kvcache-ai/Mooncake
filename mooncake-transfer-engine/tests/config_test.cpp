@@ -27,6 +27,7 @@ class PkeyIndexEnvTest : public ::testing::Test {
         ::unsetenv("MC_PKEY_INDEX");
         ::unsetenv("MC_AUTO_GID_MAX_RETRIES");
         ::unsetenv("MC_IB_SL");
+        ::unsetenv("MC_MAX_CONCURRENT_HANDSHAKES");
     }
 };
 
@@ -156,6 +157,44 @@ TEST_F(PkeyIndexEnvTest, IbSlNonNumericKeepsDefault) {
     config.ib_service_level = 9;
     loadGlobalConfig(config);
     EXPECT_EQ(config.ib_service_level, 9);
+}
+
+TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesDefaultsToSixteenWhenUnset) {
+    ::unsetenv("MC_MAX_CONCURRENT_HANDSHAKES");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_handshakes, 16);
+}
+
+TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_HANDSHAKES", "4", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_handshakes, 4);
+}
+
+TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesZeroIsIgnored) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_HANDSHAKES", "0", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_handshakes = 8;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_handshakes, 8);
+}
+
+TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesNegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_HANDSHAKES", "-3", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_handshakes = 8;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_handshakes, 8);
+}
+
+TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesNonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_HANDSHAKES", "abc", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_handshakes = 8;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_handshakes, 8);
 }
 
 }  // namespace
