@@ -128,7 +128,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
     void CallHandleChildExit(pid_t pid, int status,
                              const std::string& snapshot_id) {
         if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->HandleChildExit(pid, status, snapshot_id);
+            service_->snapshot_manager_->HandleChildExit(pid, status,
+                                                         snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             temp_manager->HandleChildExit(pid, status, snapshot_id);
@@ -147,7 +148,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
     void CallCleanupOldSnapshot(int keep_count,
                                 const std::string& snapshot_id) {
         if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->CleanupOldSnapshot(keep_count, snapshot_id);
+            service_->snapshot_manager_->CleanupOldSnapshot(keep_count,
+                                                            snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             temp_manager->CleanupOldSnapshot(keep_count, snapshot_id);
@@ -162,8 +164,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
                 data, path, local_filename, snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
-            return temp_manager->UploadSnapshotPayloadFile(data, path, local_filename,
-                                                           snapshot_id);
+            return temp_manager->UploadSnapshotPayloadFile(
+                data, path, local_filename, snapshot_id);
         }
     }
 
@@ -256,8 +258,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
         options.snapshot_retention_count = 3;
         options.snapshot_backup_dir = "";
         options.use_snapshot_backup_dir = false;
-        options.snapshot_catalog_store_type = service_->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring = service_->snapshot_catalog_store_connstring_;
+        options.snapshot_catalog_store_type =
+            service_->snapshot_catalog_store_type_;
+        options.snapshot_catalog_store_connstring =
+            service_->snapshot_catalog_store_connstring_;
         options.ha_backend_type = service_->ha_backend_type_;
         options.ha_backend_connstring = service_->ha_backend_connstring_;
         options.cluster_id = service_->cluster_id_;
