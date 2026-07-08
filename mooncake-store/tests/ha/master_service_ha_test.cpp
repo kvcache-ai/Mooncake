@@ -1008,6 +1008,37 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     backend->SetTxnError(ErrorCode::OK);
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RetryRecoveryRestoresBatchWriterAccepting) {
+    const std::string cluster_id = "test_batch_record_e2e_retry_recovery";
+    auto backend = std::make_shared<FailingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+
+    backend->SetTxnError(ErrorCode::PERSISTENT_FAIL);
+    auto first = AppendVisibleForTesting(service, OpType::PUT_END,
+                                         kDefaultTenant, "retry_key", {});
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(backend->WaitForTxnCalls(1));
+
+    backend->SetTxnError(ErrorCode::OK);
+    ReadBatchEventually(storage, 1, batch);
+
+    auto recovered = AppendVisibleForTesting(
+        service, OpType::PUT_END, kDefaultTenant, "recovered_key", {});
+    ASSERT_TRUE(recovered.has_value()) << toString(recovered.error());
+    ReadBatchEventually(storage, 2, batch);
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
