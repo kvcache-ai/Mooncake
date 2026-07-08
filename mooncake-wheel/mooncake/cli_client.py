@@ -18,7 +18,8 @@ def main():
     bin_path = os.path.join(package_dir, "mooncake_client")
 
     # Make sure the binary is executable
-    os.chmod(bin_path, 0o755)
+    if not os.access(bin_path, os.R_OK | os.X_OK):
+        os.chmod(bin_path, 0o755)
 
     # Run the binary with all arguments passed through
     return subprocess.call([bin_path] + sys.argv[1:])
