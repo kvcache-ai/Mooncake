@@ -1795,6 +1795,41 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     return erased_replicas.size();
 }
 
+void MasterService::FinalizeRemovedReplicasAfterDurable(
+    const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
+    QuotaEraseMode quota_mode) {
+    if (replica_ids.empty()) {
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(
+        this, MakeObjectIdentityForRequest(durable_entry.object_key,
+                                           durable_entry.tenant_id));
+    if (!accessor.Exists()) {
+        return;
+    }
+
+    std::unordered_set<ReplicaID> ids(replica_ids.begin(), replica_ids.end());
+    auto& metadata = accessor.Get();
+    const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+    const size_t erased = EraseReplicasWithCacheTotalAccounting(
+        metadata, [&ids](const Replica& replica) {
+            return replica.status() == ReplicaStatus::REMOVED &&
+                   ids.contains(replica.id());
+        });
+    if (erased == 0) {
+        return;
+    }
+    const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
+    if (before_charge > after_charge) {
+        ReleaseCommittedQuotaCharge(metadata, before_charge - after_charge);
+    }
+    if (!metadata.IsValid()) {
+        accessor.Erase();
+    }
+}
+
 std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,

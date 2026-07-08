@@ -345,6 +345,30 @@ class MasterServiceHATest : public ::testing::Test {
             type, tenant_id, key, payload, std::move(callback));
     }
 
+    static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
+        MasterService& service, const std::string& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return {};
+        }
+        std::vector<ReplicaID> ids;
+        accessor.Get().VisitReplicas(&Replica::fn_is_completed,
+                                     [&ids](Replica& replica) {
+                                         ids.push_back(replica.id());
+                                         replica.mark_removed();
+                                     });
+        return ids;
+    }
+
+    static void FinalizeRemovedReplicasForTesting(
+        MasterService& service, const OpLogEntry& durable_entry,
+        const std::vector<ReplicaID>& replica_ids) {
+        service.FinalizeRemovedReplicasAfterDurable(
+            durable_entry, replica_ids, MasterService::QuotaEraseMode::kFull);
+    }
+
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
@@ -1375,6 +1399,53 @@ TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
     OpLogEntry entry;
     EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
     EXPECT_EQ(OpType::REMOVE, entry.op_type);
+}
+
+TEST_F(MasterServiceHATest, ReplicaMarkRemovedKeepsDescriptorState) {
+    Replica replica(generate_uuid(), 1024, "removed_state_endpoint",
+                    ReplicaStatus::COMPLETE);
+
+    const ReplicaID id = replica.id();
+    const auto descriptor = replica.get_descriptor();
+    ASSERT_EQ(ReplicaStatus::COMPLETE, replica.status());
+
+    replica.mark_removed();
+
+    EXPECT_EQ(ReplicaStatus::REMOVED, replica.status());
+    EXPECT_EQ(id, replica.id());
+    EXPECT_EQ(1024u,
+              replica.get_descriptor().get_local_disk_descriptor().object_size);
+    EXPECT_EQ(descriptor.get_local_disk_descriptor().client_id,
+              replica.get_descriptor().get_local_disk_descriptor().client_id);
+}
+
+TEST_F(MasterServiceHATest,
+       FinalizeRemovedReplicasAfterDurableErasesRemovedReplicas) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    MasterService service(service_config);
+
+    auto mounted = PrepareSimpleSegment(service, "finalize_removed_segment");
+    const std::string key = "finalize_removed_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "finalize_removed_segment");
+
+    const auto removed_ids =
+        MarkCompletedReplicasRemovedForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(1u, removed_ids.size());
+
+    OpLogEntry durable_entry;
+    durable_entry.op_type = OpType::REMOVE;
+    durable_entry.tenant_id = kDefaultTenant;
+    durable_entry.object_key = key;
+    durable_entry.sequence_id = 1;
+
+    FinalizeRemovedReplicasForTesting(service, durable_entry, removed_ids);
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+
+    FinalizeRemovedReplicasForTesting(service, durable_entry, removed_ids);
 }
 
 // PutRevoke(MEMORY) on an object with PROCESSING MEMORY + LOCAL_DISK publishes

@@ -1527,6 +1527,9 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
         MetadataShardAccessorRW* shard);
+    void FinalizeRemovedReplicasAfterDurable(
+        const OpLogEntry& durable_entry,
+        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,

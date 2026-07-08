@@ -445,6 +445,16 @@ class Replica {
         }
     }
 
+    void mark_removed() {
+        if (status_ == ReplicaStatus::COMPLETE) {
+            status_ = ReplicaStatus::REMOVED;
+        } else if (status_ == ReplicaStatus::REMOVED) {
+            LOG(WARNING) << "Replica already marked as removed";
+        } else {
+            LOG(ERROR) << "Cannot mark_removed from status: " << status_;
+        }
+    }
+
     void inc_refcnt() { refcnt_.fetch_add(1); }
 
     void dec_refcnt() { refcnt_.fetch_sub(1); }
