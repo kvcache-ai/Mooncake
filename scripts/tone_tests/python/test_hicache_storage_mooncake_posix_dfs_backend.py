@@ -22,6 +22,7 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
 
     mooncake_master_port_base = 50051
     mooncake_metadata_port_base = 8080
+    mooncake_metrics_port_base = 9003
     dfs_shard_count = 2
     dfs_shard_capacity = 1073741824
     dfs_scan_limit = 64 * 1024 * 1024
@@ -32,6 +33,7 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
         cls.mooncake_metadata_port = find_available_port(
             cls.mooncake_metadata_port_base
         )
+        cls.mooncake_metrics_port = find_available_port(cls.mooncake_metrics_port_base)
         cls.dfs_root = tempfile.mkdtemp(prefix="mooncake_posix_dfs_", dir="/tmp")
         cls.dfs_env = cls._get_dfs_env()
 
@@ -77,7 +79,9 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
         print("Starting Mooncake POSIX DFS services...")
         print(
             f"Using master port: {cls.mooncake_master_port}, "
-            f"metadata port: {cls.mooncake_metadata_port}, dfs root: {cls.dfs_root}"
+            f"metadata port: {cls.mooncake_metadata_port}, "
+            f"metrics port: {cls.mooncake_metrics_port}, "
+            f"dfs root: {cls.dfs_root}"
         )
 
         service_env = {**os.environ, **cls.dfs_env}
@@ -100,6 +104,7 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
                 "mooncake_master",
                 "--port",
                 str(cls.mooncake_master_port),
+                f"--metrics_port={cls.mooncake_metrics_port}",
                 "--enable_offload=true",
             ],
             env=service_env,
@@ -124,8 +129,22 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
                     metadata_url = (
                         f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata"
                     )
-                    response = requests.get(metadata_url, timeout=2)
-                    metadata_ready = response.status_code == 200
+                    params = {"key": "__mooncake_posix_dfs_health__"}
+                    put_response = requests.put(
+                        metadata_url,
+                        params=params,
+                        data=b"ok",
+                        timeout=2,
+                    )
+                    get_response = requests.get(
+                        metadata_url,
+                        params=params,
+                        timeout=2,
+                    )
+                    metadata_ready = (
+                        put_response.status_code == 200
+                        and get_response.status_code == 200
+                    )
                 except requests.RequestException:
                     pass
 
@@ -175,6 +194,10 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
             shutil.rmtree(cls.dfs_root, ignore_errors=True)
 
     @classmethod
+    def _get_model_name(cls):
+        return os.environ.get("SGLANG_TEST_MODEL_PATH", super()._get_model_name())
+
+    @classmethod
     def _get_additional_server_args_and_env(cls):
         extra_config = {
             "hicache_storage_pass_prefix_keys": True,
@@ -191,16 +214,17 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
             "check_server": False,
             "enable_ssd_offload": True,
             "ssd_offload_path": cls.dfs_root,
+            "interface_v1": 1,
             "replica_num": 1,
             "dfs_replica_num": 1,
         }
         server_args = {
             "--tp-size": 2,
-            "--hicache-ratio": 2,
+            "--hicache-ratio": 1.2,
             "--hicache-storage-backend": "dynamic",
             "--hicache-storage-backend-extra-config": json.dumps(extra_config),
             "--hicache-mem-layout": "page_first",
-            "--mem-fraction-static": 0.8,
+            "--mem-fraction-static": 0.6,
         }
         env_vars = {
             "MOONCAKE_MASTER": f"127.0.0.1:{cls.mooncake_master_port}",
