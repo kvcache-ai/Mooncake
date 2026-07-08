@@ -2379,6 +2379,8 @@ class MasterService {
     std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& should_remove) const;
+    tl::expected<void, ErrorCode> ClassifyReplicaReadiness(
+        const ObjectMetadata* metadata) const;
 
     std::mutex pending_mutations_mutex_;
     std::condition_variable pending_mutations_cv_;

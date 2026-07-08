@@ -10907,4 +10907,20 @@ MasterService::BuildRemainingReplicaDescriptors(
     return remaining;
 }
 
+tl::expected<void, ErrorCode> MasterService::ClassifyReplicaReadiness(
+    const ObjectMetadata* metadata) const {
+    if (metadata == nullptr || metadata->CountReplicas() == 0) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    if (metadata->HasReplica(&Replica::fn_is_completed)) {
+        return {};
+    }
+    if (metadata->AllReplicas([](const Replica& replica) {
+            return replica.status() == ReplicaStatus::REMOVED;
+        })) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+}
+
 }  // namespace mooncake

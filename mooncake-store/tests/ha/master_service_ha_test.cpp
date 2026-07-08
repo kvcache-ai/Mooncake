@@ -414,9 +414,63 @@ class MasterServiceHATest : public ::testing::Test {
         return access.getSsdUsedBytes(segment_name);
     }
 
+    static tl::expected<void, ErrorCode> ClassifyReplicaReadinessForTesting(
+        MasterService& service, const std::string& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return service.ClassifyReplicaReadiness(nullptr);
+        }
+        return service.ClassifyReplicaReadiness(&accessor.Get());
+    }
+
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
+
+TEST_F(MasterServiceHATest, ClassifyReplicaReadinessCoversReplicaStates) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(false)
+                              .build();
+    MasterService service(service_config);
+    auto mounted = PrepareSimpleSegment(service, "readiness_segment");
+
+    const std::string complete_key = "readiness_complete_key";
+    PutObjectOnSegment(service, mounted.client_id, complete_key,
+                       "readiness_segment");
+    EXPECT_TRUE(ClassifyReplicaReadinessForTesting(service, kDefaultTenant,
+                                                   complete_key)
+                    .has_value());
+
+    const std::string removed_key = "readiness_removed_key";
+    PutObjectOnSegment(service, mounted.client_id, removed_key,
+                       "readiness_segment");
+    MarkCompletedReplicasRemovedForTesting(service, kDefaultTenant,
+                                           removed_key);
+    auto removed = ClassifyReplicaReadinessForTesting(service, kDefaultTenant,
+                                                      removed_key);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, removed.error());
+
+    const std::string processing_key = "readiness_processing_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service
+                    .PutStart(mounted.client_id, processing_key, kDefaultTenant,
+                              1024, config)
+                    .has_value());
+    auto processing = ClassifyReplicaReadinessForTesting(
+        service, kDefaultTenant, processing_key);
+    ASSERT_FALSE(processing.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, processing.error());
+
+    auto missing = ClassifyReplicaReadinessForTesting(service, kDefaultTenant,
+                                                      "readiness_missing_key");
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, missing.error());
+}
 
 TEST_F(MasterServiceHATest,
        BatchRecordWriterInitMigratesLegacyLatestAndSetsSequence) {
