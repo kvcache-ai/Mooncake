@@ -462,13 +462,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
             // Initialize and start snapshot manager
             MasterSnapshotManagerOptions snapshot_options;
             snapshot_options.enable_snapshot = enable_snapshot_;
-            snapshot_options.snapshot_interval_seconds = snapshot_interval_seconds_;
-            snapshot_options.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
-            snapshot_options.snapshot_retention_count = snapshot_retention_count_;
+            snapshot_options.snapshot_interval_seconds =
+                snapshot_interval_seconds_;
+            snapshot_options.snapshot_child_timeout_seconds =
+                snapshot_child_timeout_seconds_;
+            snapshot_options.snapshot_retention_count =
+                snapshot_retention_count_;
             snapshot_options.snapshot_backup_dir = snapshot_backup_dir_;
             snapshot_options.use_snapshot_backup_dir = use_snapshot_backup_dir_;
-            snapshot_options.snapshot_catalog_store_type = snapshot_catalog_store_type_;
-            snapshot_options.snapshot_catalog_store_connstring = snapshot_catalog_store_connstring_;
+            snapshot_options.snapshot_catalog_store_type =
+                snapshot_catalog_store_type_;
+            snapshot_options.snapshot_catalog_store_connstring =
+                snapshot_catalog_store_connstring_;
             snapshot_options.ha_backend_type = ha_backend_type_;
             snapshot_options.ha_backend_connstring = ha_backend_connstring_;
             snapshot_options.cluster_id = cluster_id_;
@@ -478,8 +483,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 this, snapshot_options, snapshot_mutex_,
                 snapshot_object_store_.get(), snapshot_catalog_store_.get()
 #ifdef STORE_USE_ETCD
-                ,
-                snapshot_boundary_oplog_store_mutex_, snapshot_boundary_oplog_store_
+                                                  ,
+                snapshot_boundary_oplog_store_mutex_,
+                snapshot_boundary_oplog_store_
 #endif
             );
             snapshot_manager_->Start();
@@ -8106,7 +8112,6 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
     return metadata;
 }
-
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,

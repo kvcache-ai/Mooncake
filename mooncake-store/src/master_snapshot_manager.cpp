@@ -34,7 +34,8 @@ static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
 static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
 static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_BACKUP_SAVE_DIR = "mooncake_snapshot_save_backup";
+static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
+    "mooncake_snapshot_save_backup";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
@@ -72,16 +73,15 @@ MasterSnapshotManager::MasterSnapshotManager(
 {
 }
 
-MasterSnapshotManager::~MasterSnapshotManager() {
-    Stop();
-}
+MasterSnapshotManager::~MasterSnapshotManager() { Stop(); }
 
 void MasterSnapshotManager::Start() {
     if (snapshot_running_.load()) {
         return;
     }
     snapshot_running_ = true;
-    snapshot_thread_ = std::thread(&MasterSnapshotManager::SnapshotThreadFunc, this);
+    snapshot_thread_ =
+        std::thread(&MasterSnapshotManager::SnapshotThreadFunc, this);
     LOG(INFO) << "[MasterSnapshotManager] Started";
 }
 
@@ -91,7 +91,7 @@ void MasterSnapshotManager::Stop() {
         snapshot_running_ = false;
     }
     snapshot_thread_cv_.notify_all();
-    
+
     if (snapshot_thread_.joinable()) {
         snapshot_thread_.join();
     }
@@ -219,10 +219,9 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
     LOG(INFO) << "[Snapshot] snapshot_thread stopped";
 }
 
-
 void MasterSnapshotManager::WaitForSnapshotChild(pid_t pid,
-                                         const std::string& snapshot_id,
-                                         int log_pipe_fd) {
+                                                 const std::string& snapshot_id,
+                                                 int log_pipe_fd) {
     // Default 5 minute timeout
     const int64_t timeout_seconds = options_.snapshot_child_timeout_seconds;
 
@@ -321,7 +320,7 @@ void MasterSnapshotManager::WaitForSnapshotChild(pid_t pid,
 }
 
 void MasterSnapshotManager::HandleChildTimeout(pid_t pid,
-                                       const std::string& snapshot_id) {
+                                               const std::string& snapshot_id) {
     LOG(WARNING) << "[Snapshot] Child process timeout, snapshot_id="
                  << snapshot_id << ", child_pid=" << pid
                  << ", killing child process";
@@ -359,7 +358,7 @@ void MasterSnapshotManager::HandleChildTimeout(pid_t pid,
 }
 
 void MasterSnapshotManager::HandleChildExit(pid_t pid, int status,
-                                    const std::string& snapshot_id) {
+                                            const std::string& snapshot_id) {
     if (WIFEXITED(status)) {
         int exit_code = WEXITSTATUS(status);
         if (exit_code != 0) {
@@ -381,7 +380,6 @@ void MasterSnapshotManager::HandleChildExit(pid_t pid, int status,
         MasterMetricManager::instance().inc_snapshot_fail();
     }
 }
-
 
 tl::expected<ha::OpLogSequenceId, SerializationError>
 MasterSnapshotManager::ResolveSnapshotSequenceId() const {
@@ -432,8 +430,8 @@ MasterSnapshotManager::GetSnapshotBoundaryOpLogStore() const {
         return snapshot_boundary_oplog_store_.get();
     }
 
-    auto err =
-        EtcdHelper::ConnectToEtcdStoreClient(options_.ha_backend_connstring.c_str());
+    auto err = EtcdHelper::ConnectToEtcdStoreClient(
+        options_.ha_backend_connstring.c_str());
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(SerializationError(
             err, fmt::format("failed to connect to etcd for snapshot boundary: "
@@ -455,9 +453,9 @@ MasterSnapshotManager::GetSnapshotBoundaryOpLogStore() const {
 #endif
 
 tl::expected<ha::SnapshotDescriptor, SerializationError>
-MasterSnapshotManager::BuildSnapshotDescriptor(const std::string& snapshot_id,
-                                       const std::string& manifest_path,
-                                       const std::string& object_prefix) const {
+MasterSnapshotManager::BuildSnapshotDescriptor(
+    const std::string& snapshot_id, const std::string& manifest_path,
+    const std::string& object_prefix) const {
     auto sequence_id = ResolveSnapshotSequenceId();
     if (!sequence_id) {
         return tl::make_unexpected(sequence_id.error());
@@ -489,7 +487,6 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     return PersistState(descriptor.value());
 }
 
-
 tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     const ha::SnapshotDescriptor& descriptor) {
     const std::string& snapshot_id = descriptor.snapshot_id;
@@ -508,8 +505,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             "serializer_type={}, version={}",
             snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
         MasterService::MetadataSerializer metadata_serializer(master_service_);
-        SegmentSerializer segment_serializer(&master_service_->segment_manager_);
-        TaskManagerSerializer task_manager_serializer(&master_service_->task_manager_);
+        SegmentSerializer segment_serializer(
+            &master_service_->segment_manager_);
+        TaskManagerSerializer task_manager_serializer(
+            &master_service_->task_manager_);
 
         auto metadata_result = metadata_serializer.Serialize();
         if (!metadata_result) {
@@ -704,8 +703,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     return {};
 }
 
-
-tl::expected<void, SerializationError> MasterSnapshotManager::UploadSnapshotPayloadFile(
+tl::expected<void, SerializationError>
+MasterSnapshotManager::UploadSnapshotPayloadFile(
     const std::vector<uint8_t>& data, const std::string& path,
     const std::string& local_filename, const std::string& snapshot_id) {
     SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}",
@@ -747,7 +746,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::UploadSnapshotPayl
 }
 
 void MasterSnapshotManager::CleanupOldSnapshot(int keep_count,
-                                       const std::string& snapshot_id) {
+                                               const std::string& snapshot_id) {
     if (!snapshot_catalog_store_) {
         SNAP_LOG_ERROR(
             "[Snapshot] snapshot catalog store is not initialized, "

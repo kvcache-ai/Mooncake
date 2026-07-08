@@ -160,8 +160,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Snapshot Helper Methods ====================
 
-    // Wrapper method: Call MasterSnapshotManager's PersistState through MasterService
-    // This class is a friend of MasterService, so it can access private members
+    // Wrapper method: Call MasterSnapshotManager's PersistState through
+    // MasterService This class is a friend of MasterService, so it can access
+    // private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
         // If snapshot_manager_ exists, use it; otherwise create a temporary one
@@ -170,8 +171,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         // For tests that don't have snapshot_manager_ initialized,
-        // we need to access the old implementation or create a temporary manager
-        // This is a temporary compatibility layer for tests
+        // we need to access the old implementation or create a temporary
+        // manager This is a temporary compatibility layer for tests
         EnsureSnapshotStores(service);
 
         MasterSnapshotManagerOptions options;
@@ -181,8 +182,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         options.snapshot_retention_count = 3;
         options.snapshot_backup_dir = "";
         options.use_snapshot_backup_dir = false;
-        options.snapshot_catalog_store_type = service->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring = service->snapshot_catalog_store_connstring_;
+        options.snapshot_catalog_store_type =
+            service->snapshot_catalog_store_type_;
+        options.snapshot_catalog_store_connstring =
+            service->snapshot_catalog_store_connstring_;
         options.ha_backend_type = service->ha_backend_type_;
         options.ha_backend_connstring = service->ha_backend_connstring_;
         options.cluster_id = service->cluster_id_;
@@ -193,7 +196,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             service->snapshot_object_store_.get(),
             service->snapshot_catalog_store_.get()
 #ifdef STORE_USE_ETCD
-            ,
+                ,
             service->snapshot_boundary_oplog_store_mutex_,
             service->snapshot_boundary_oplog_store_
 #endif

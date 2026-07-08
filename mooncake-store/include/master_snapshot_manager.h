@@ -58,19 +58,19 @@ struct MasterSnapshotManagerOptions {
  * behavior, storage layout, flags, or locking semantics.
  */
 class MasterSnapshotManager {
-    friend class test::MasterServiceSnapshotTestBase;  // Allow test access to private methods
+    friend class test::MasterServiceSnapshotTestBase;  // Allow test access to
+                                                       // private methods
 
    public:
-    MasterSnapshotManager(MasterService* master_service,
-                          MasterSnapshotManagerOptions options,
-                          std::shared_mutex& snapshot_mutex,
-                          SnapshotObjectStore* snapshot_object_store,
-                          ha::SnapshotCatalogStore* snapshot_catalog_store
+    MasterSnapshotManager(
+        MasterService* master_service, MasterSnapshotManagerOptions options,
+        std::shared_mutex& snapshot_mutex,
+        SnapshotObjectStore* snapshot_object_store,
+        ha::SnapshotCatalogStore* snapshot_catalog_store
 #ifdef STORE_USE_ETCD
-                          ,
-                          std::mutex& snapshot_boundary_oplog_store_mutex,
-                          std::unique_ptr<EtcdOpLogStore>&
-                              snapshot_boundary_oplog_store
+        ,
+        std::mutex& snapshot_boundary_oplog_store_mutex,
+        std::unique_ptr<EtcdOpLogStore>& snapshot_boundary_oplog_store
 #endif
     );
 

@@ -92,7 +92,8 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
-    friend class MasterSnapshotManager;  // Allow access to internal state for snapshot
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
 
    public:
     using NoFProbeFn =
