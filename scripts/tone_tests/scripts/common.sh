@@ -231,7 +231,7 @@ get_whl(){
 
     echo "get whl file from github action"
     rm -f "$whls_path/mooncake.zip"
-    rm -f "$whls_path/*.whl"
+    rm -f "$whls_path"/*.whl
 
     local max_retries=5
     local base_delay=5 # seconds
