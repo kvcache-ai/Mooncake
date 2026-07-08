@@ -194,13 +194,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         auto temp_manager = std::make_unique<MasterSnapshotManager>(
             service, options, service->snapshot_mutex_,
             service->snapshot_object_store_.get(),
-            service->snapshot_catalog_store_.get()
-#ifdef STORE_USE_ETCD
-                ,
-            service->snapshot_boundary_oplog_store_mutex_,
-            service->snapshot_boundary_oplog_store_
-#endif
-        );
+            service->snapshot_catalog_store_.get());
 
         return temp_manager->PersistState(snapshot_id);
     }

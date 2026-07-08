@@ -53,25 +53,12 @@ MasterSnapshotManager::MasterSnapshotManager(
     MasterService* master_service, MasterSnapshotManagerOptions options,
     std::shared_mutex& snapshot_mutex,
     SnapshotObjectStore* snapshot_object_store,
-    ha::SnapshotCatalogStore* snapshot_catalog_store
-#ifdef STORE_USE_ETCD
-    ,
-    std::mutex& snapshot_boundary_oplog_store_mutex,
-    std::unique_ptr<EtcdOpLogStore>& snapshot_boundary_oplog_store
-#endif
-    )
+    ha::SnapshotCatalogStore* snapshot_catalog_store)
     : master_service_(master_service),
       options_(std::move(options)),
       snapshot_mutex_(snapshot_mutex),
       snapshot_object_store_(snapshot_object_store),
-      snapshot_catalog_store_(snapshot_catalog_store)
-#ifdef STORE_USE_ETCD
-      ,
-      snapshot_boundary_oplog_store_mutex_(snapshot_boundary_oplog_store_mutex),
-      snapshot_boundary_oplog_store_(snapshot_boundary_oplog_store)
-#endif
-{
-}
+      snapshot_catalog_store_(snapshot_catalog_store) {}
 
 MasterSnapshotManager::~MasterSnapshotManager() { Stop(); }
 
@@ -103,7 +90,9 @@ std::string MasterSnapshotManager::FormatTimestamp(
     auto time_t = std::chrono::system_clock::to_time_t(tp);
 
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+    std::tm tm_now;
+    localtime_r(&time_t, &tm_now);
+    ss << std::put_time(&tm_now, "%Y%m%d_%H%M%S");
 
     // Add milliseconds to ensure uniqueness
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(

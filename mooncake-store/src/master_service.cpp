@@ -481,13 +481,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
             snapshot_manager_ = std::make_unique<MasterSnapshotManager>(
                 this, snapshot_options, snapshot_mutex_,
-                snapshot_object_store_.get(), snapshot_catalog_store_.get()
-#ifdef STORE_USE_ETCD
-                                                  ,
-                snapshot_boundary_oplog_store_mutex_,
-                snapshot_boundary_oplog_store_
-#endif
-            );
+                snapshot_object_store_.get(), snapshot_catalog_store_.get());
             snapshot_manager_->Start();
         }
     }
