@@ -1858,8 +1858,8 @@ mod tests {
             .lock()
             .expect("debug evict-all callback lock should not be poisoned") = None;
 
-        let address = start_metrics_http_server("127.0.0.1:0")
-            .expect("metrics server should start");
+        let address =
+            start_metrics_http_server("127.0.0.1:0").expect("metrics server should start");
         let post_evict = |addr: &str| {
             http_request(
                 addr,
