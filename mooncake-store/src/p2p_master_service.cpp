@@ -45,6 +45,12 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
 
 auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
     -> tl::expected<RegisterClientResponse, ErrorCode> {
+    if (!req.ip_address || !req.rpc_port) {
+        LOG(ERROR) << "RegisterClient(P2P): missing endpoint"
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     auto result = MasterService::RegisterClient(req);
     if (!result.has_value()) {
         return result;

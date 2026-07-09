@@ -151,6 +151,33 @@ TEST_F(P2PRecordOplogTest, RegisterClientRecordsOplog) {
     EXPECT_EQ(payload.segments[0].name, segment.name);
 }
 
+TEST_F(P2PRecordOplogTest, RegisterClientRejectsMissingEndpoint) {
+    P2PMasterService service(MakeConfig());
+    const UUID segment_id{2, 2};
+
+    RegisterClientRequest missing_ip;
+    missing_ip.client_id = {1, 1};
+    missing_ip.rpc_port = 50051;
+    missing_ip.segments = {MakeSegment(segment_id)};
+    missing_ip.deployment_mode = DeploymentMode::P2P;
+    auto missing_ip_result = service.RegisterClient(missing_ip);
+    ASSERT_FALSE(missing_ip_result.has_value());
+    EXPECT_EQ(missing_ip_result.error(), ErrorCode::INVALID_PARAMS);
+
+    RegisterClientRequest missing_port;
+    missing_port.client_id = {3, 3};
+    missing_port.ip_address = "127.0.0.1";
+    missing_port.segments = {MakeSegment(segment_id)};
+    missing_port.deployment_mode = DeploymentMode::P2P;
+    auto missing_port_result = service.RegisterClient(missing_port);
+    ASSERT_FALSE(missing_port_result.has_value());
+    EXPECT_EQ(missing_port_result.error(), ErrorCode::INVALID_PARAMS);
+
+    auto* manager = service.GetOpLogManager();
+    ASSERT_NE(manager, nullptr);
+    EXPECT_EQ(manager->GetLastSequenceId(), 0);
+}
+
 TEST_F(P2PRecordOplogTest, MountAndUnmountSegmentRecordOplog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{3, 3};
