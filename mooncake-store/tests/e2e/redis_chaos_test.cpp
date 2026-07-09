@@ -210,7 +210,7 @@ class RedisChaosTest : public ::testing::Test {
         auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline) {
             auto client = ClientTestWrapper::CreateClientWrapper(
-                "0.0.0.0:" + std::to_string(kClientPortBase + index),
+                "127.0.0.1:" + std::to_string(kClientPortBase + index),
                 "P2PHANDSHAKE", "tcp", "", "redis://" + FLAGS_redis_endpoint,
                 /*local_buffer_size=*/1024 * 1024 * 128, FLAGS_redis_cluster_id,
                 /*enable_http_server=*/false);
