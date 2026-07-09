@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "tent/runtime/transfer_engine_impl.h"
-#include "tent/transport/transport.h"
+#include "tent/runtime/transport.h"
 
 using namespace mooncake::tent;
 using std::chrono::steady_clock;

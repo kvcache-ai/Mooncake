@@ -2279,6 +2279,7 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     TentMetrics::instance().recordWriteCompleted(
                         task.request.length, latency_seconds);
                 }
+#if TENT_METRICS_ENABLED
                 // Causal chain stage decomposition
                 if (task.dispatch_time.time_since_epoch().count() > 0) {
                     double queue_wait_us =
@@ -2299,6 +2300,7 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                         TENT_RECORD_STAGE_LATENCY("transport", transport_us);
                     }
                 }
+#endif
                 // Observability only (RFC #2519): if this transfer carried a
                 // deadline, emit the post-hoc feasibility ratio MLU =
                 // actual_transfer_time / available_window, where the window is
