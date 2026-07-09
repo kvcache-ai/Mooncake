@@ -185,10 +185,9 @@ TEST_F(ReplicaSelectionTest, ConcurrentSetAndSelectIsRaceFree) {
         for (int i = 0; i < kIterations && !stop; ++i) {
             if (i % 2 == 0) {
                 SetRemoteReplicaScorer([](const Replica::Descriptor &r) {
-                    return r.get_memory_descriptor()
-                                   .buffer_descriptor.protocol_ == "rdma"
-                               ? 0.0
-                               : 10.0;
+                    const auto &proto =
+                        r.get_memory_descriptor().buffer_descriptor.protocol_;
+                    return proto == "rdma" ? 0.0 : 10.0;
                 });
             } else {
                 SetRemoteReplicaScorer(nullptr);
