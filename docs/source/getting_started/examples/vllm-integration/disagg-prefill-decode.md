@@ -146,7 +146,7 @@ For detailed performance benchmarks and results, see the [vLLM Benchmark](../../
 This section is for vLLM V0 backend (≤ v0.6.4.post1). For new deployments, use the [V1 backend](#using-vllm-v1-recommended) above.
 ```
 
-This integration is based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884). Preview benchmark results are available at [vLLM Benchmark Results V0.2](../../../performance/vllm-benchmark-results-v0.2.md).
+This integration is based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884).
 
 ### Installation
 
