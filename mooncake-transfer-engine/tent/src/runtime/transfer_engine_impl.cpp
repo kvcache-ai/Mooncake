@@ -377,9 +377,13 @@ Status TransferEngineImpl::construct() {
         auto rdma_xport =
             transport_list_[static_cast<int>(TransportType::RDMA)];
         if (rdma_xport) {
+            std::weak_ptr<Transport> weak_rdma = rdma_xport;
             runtime_queue_->setDegradationPolicy(
-                [rdma_xport]() -> double {
-                    return rdma_xport->getEstimatedBandwidth();
+                [weak_rdma]() -> double {
+                    if (auto rdma = weak_rdma.lock()) {
+                        return rdma->getEstimatedBandwidth();
+                    }
+                    return -1.0;
                 },
                 DegradationHooks{}, nullptr);
             LOG(INFO) << "Admission queue degradation: live RDMA bw"
