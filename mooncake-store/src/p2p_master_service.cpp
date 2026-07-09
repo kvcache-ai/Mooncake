@@ -45,6 +45,12 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
 
 auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
     -> tl::expected<RegisterClientResponse, ErrorCode> {
+    if (GetClientManager().GetClient(req.client_id)) {
+        LOG(WARNING) << "RegisterClient(P2P): client already exists"
+                     << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+    }
+
     if (!req.ip_address || !req.rpc_port) {
         LOG(ERROR) << "RegisterClient(P2P): missing endpoint"
                    << ", client_id=" << req.client_id;
