@@ -25,6 +25,17 @@ TEST(ShowLinksTest, NoInitReturnsEmptyOrPlaceholder) {
     auto engine = std::make_unique<TransferEngine>(false);
     auto result = engine->showLinks();
     EXPECT_FALSE(result.empty());
+
+    auto json_result = engine->showLinks(true);
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    ASSERT_TRUE(reader->parse(json_result.data(),
+                              json_result.data() + json_result.size(), &root,
+                              &errors))
+        << errors;
+    EXPECT_TRUE(root.isMember("local_nics"));
 }
 
 TEST(ShowLinksTest, AutoDiscoverShowsNics) {
