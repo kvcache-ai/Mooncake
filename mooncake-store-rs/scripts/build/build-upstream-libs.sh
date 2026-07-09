@@ -128,7 +128,8 @@ cmake \
   -DUSE_REDIS=ON \
   -DUSE_HTTP=ON \
   -DUSE_ETCD=OFF \
-  -DBUILD_SHARED_LIBS=ON
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--push-state,--no-as-needed,-lrt,--pop-state"
 
 cmake --build "${UPSTREAM_BUILD_DIR}" \
   --target "${BUILD_TARGETS[@]}" \
