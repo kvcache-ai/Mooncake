@@ -379,7 +379,8 @@ MasterMetricManager::MasterMetricManager()
           "Promotion retry candidates that hit a gate again during retry scan"),
       promotion_candidate_expired_evaluated_(
           "master_promotion_candidate_expired_evaluated_total",
-          "Promotion retry candidates expired or exhausted during a retry scan"),
+          "Promotion retry candidates expired or exhausted during a retry "
+          "scan"),
       promotion_candidate_expired_unevaluated_(
           "master_promotion_candidate_expired_unevaluated_total",
           "Promotion retry candidates that aged out before the background "
@@ -2227,7 +2228,7 @@ std::string MasterMetricManager::get_summary_string(
         }
     }
 
-    auto delta = [&](int64_t SummaryCounters::* field) {
+    auto delta = [&](int64_t SummaryCounters::*field) {
         if (!has_previous_summary) {
             return int64_t{0};
         }

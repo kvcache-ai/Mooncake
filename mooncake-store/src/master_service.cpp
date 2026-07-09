@@ -5003,8 +5003,7 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
 // --- Promotion retry candidate helpers ---
 
 void MasterService::DecrementCandidateCount() {
-    uint64_t count =
-        promotion_candidate_count_.load(std::memory_order_relaxed);
+    uint64_t count = promotion_candidate_count_.load(std::memory_order_relaxed);
     while (count > 0) {
         if (promotion_candidate_count_.compare_exchange_weak(
                 count, count - 1, std::memory_order_relaxed)) {
@@ -5022,8 +5021,7 @@ void MasterService::EraseCandidate(TenantState& tenant_state,
 
 void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
     MetadataShardAccessorRW shard(
-        this,
-        getMetadataShardIndex(object_id.tenant_id, object_id.user_key));
+        this, getMetadataShardIndex(object_id.tenant_id, object_id.user_key));
     auto tenant_it = shard->tenants.find(object_id.tenant_id);
     if (tenant_it == shard->tenants.end()) return;
     EraseCandidate(tenant_it->second, object_id.user_key);
@@ -5040,7 +5038,8 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
     const auto now = std::chrono::steady_clock::now();
     auto it = tenant_state.promotion_candidates.find(key);
     if (it != tenant_state.promotion_candidates.end()) {
-        // Update existing entry: refresh last_seen, reset retry_after/retry_count.
+        // Update existing entry: refresh last_seen, reset
+        // retry_after/retry_count.
         it->second.last_seen = now;
         it->second.last_reason = reason;
         it->second.last_error = last_error;
@@ -5053,8 +5052,7 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
     }
 
     // Reserve a slot in the global candidate limit.
-    uint64_t count =
-        promotion_candidate_count_.load(std::memory_order_relaxed);
+    uint64_t count = promotion_candidate_count_.load(std::memory_order_relaxed);
     while (count < kPromotionCandidateLimit) {
         if (promotion_candidate_count_.compare_exchange_weak(
                 count, count + 1, std::memory_order_relaxed)) {
@@ -5064,8 +5062,7 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
     if (count >= kPromotionCandidateLimit) {
         VLOG(1) << "promotion_candidate_dropped key=" << key
                 << " reason=global_limit";
-        MasterMetricManager::instance()
-            .inc_promotion_candidate_dropped_limit();
+        MasterMetricManager::instance().inc_promotion_candidate_dropped_limit();
         return;
     }
 
@@ -5090,10 +5087,9 @@ std::chrono::milliseconds MasterService::CandidateBackoff(
     uint64_t backoff_ms =
         static_cast<uint64_t>(kPromotionCandidateInitialBackoff.count());
     for (uint32_t i = 1; i < retry_count; ++i) {
-        backoff_ms =
-            std::min<uint64_t>(backoff_ms * 2,
-                               static_cast<uint64_t>(
-                                   kPromotionCandidateMaxBackoff.count()));
+        backoff_ms = std::min<uint64_t>(
+            backoff_ms * 2,
+            static_cast<uint64_t>(kPromotionCandidateMaxBackoff.count()));
     }
     return std::chrono::milliseconds(backoff_ms);
 }
@@ -5108,8 +5104,7 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
                                      PromotionQueueResult result) {
     const auto now = std::chrono::steady_clock::now();
     MetadataShardAccessorRW shard(
-        this,
-        getMetadataShardIndex(object_id.tenant_id, object_id.user_key));
+        this, getMetadataShardIndex(object_id.tenant_id, object_id.user_key));
     auto tenant_it = shard->tenants.find(object_id.tenant_id);
     if (tenant_it == shard->tenants.end()) return;
     auto& tenant_state = tenant_it->second;
@@ -5129,8 +5124,7 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
         c.last_reason = PromotionCandidateReason::kPushFailed;
     }
 
-    const bool ttl_expired =
-        now - c.last_seen >= kPromotionCandidateTtl;
+    const bool ttl_expired = now - c.last_seen >= kPromotionCandidateTtl;
     if (ttl_expired || c.retry_count >= kPromotionCandidateMaxRetries) {
         VLOG(1) << "promotion_candidate_gave_up key=" << object_id.user_key
                 << " retries=" << c.retry_count;
@@ -5167,8 +5161,7 @@ size_t MasterService::RunPromotionCandidateRetryForTesting() {
     return RunPromotionCandidateRetry(kNumShards);
 }
 
-size_t MasterService::CountCandidatesForTesting(
-    const std::string& tenant_id) {
+size_t MasterService::CountCandidatesForTesting(const std::string& tenant_id) {
     const auto normalized = NormalizeTenantId(tenant_id);
     size_t count = 0;
     std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
@@ -5196,8 +5189,7 @@ void MasterService::ResetCandidateBackoffsForTesting() {
     }
 }
 
-size_t MasterService::RunPromotionCandidateRetry(
-    size_t max_shards_to_scan) {
+size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
     if (!promotion_on_hit_ ||
         promotion_candidate_count_.load(std::memory_order_relaxed) == 0) {
         return 0;
@@ -5209,10 +5201,9 @@ size_t MasterService::RunPromotionCandidateRetry(
 
     const size_t shards_to_scan = std::min(max_shards_to_scan, kNumShards);
     if (shards_to_scan == 0) return 0;
-    const size_t start_shard =
-        promotion_retry_cursor_.fetch_add(shards_to_scan,
-                                          std::memory_order_relaxed) %
-        kNumShards;
+    const size_t start_shard = promotion_retry_cursor_.fetch_add(
+                                   shards_to_scan, std::memory_order_relaxed) %
+                               kNumShards;
 
     {
         std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);

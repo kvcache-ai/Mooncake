@@ -2241,8 +2241,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto seg = PrepareSegment(*service, "retry_seg", kDefaultSegmentBase,
-                              seg_size);
+    auto seg =
+        PrepareSegment(*service, "retry_seg", kDefaultSegmentBase, seg_size);
     // LOCAL_DISK-only key: inject without a prior PutStart.
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_wm", 1024,
                                        seg.segment_name));
@@ -2283,8 +2283,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto seg = PrepareSegment(*service, "exhaust_seg", kDefaultSegmentBase,
-                              seg_size);
+    auto seg =
+        PrepareSegment(*service, "exhaust_seg", kDefaultSegmentBase, seg_size);
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_exhaust",
                                        1024, seg.segment_name));
 
@@ -2325,7 +2325,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto seg = PrepareSegment(*service, "rm_seg", kDefaultSegmentBase, seg_size);
+    auto seg =
+        PrepareSegment(*service, "rm_seg", kDefaultSegmentBase, seg_size);
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_rm", 1024,
                                        seg.segment_name));
 
@@ -2363,8 +2364,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 64;
-    auto seg = PrepareSegment(*service, "multi_seg", kDefaultSegmentBase,
-                              seg_size);
+    auto seg =
+        PrepareSegment(*service, "multi_seg", kDefaultSegmentBase, seg_size);
 
     auto& mm = MasterMetricManager::instance();
     const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
@@ -2381,8 +2382,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
     }
 
     EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, kKeys);
-    EXPECT_EQ(mm.get_promotion_candidate_expired_unevaluated() - unevaluated_pre,
-              0);
+    EXPECT_EQ(
+        mm.get_promotion_candidate_expired_unevaluated() - unevaluated_pre, 0);
     EXPECT_EQ(service->CountCandidatesForTesting("default"),
               static_cast<size_t>(kKeys));
 
@@ -2400,8 +2401,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto seg = PrepareSegment(*service, "reload_seg", kDefaultSegmentBase,
-                              seg_size);
+    auto seg =
+        PrepareSegment(*service, "reload_seg", kDefaultSegmentBase, seg_size);
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_reload",
                                        1024, seg.segment_name));
 
@@ -2419,9 +2420,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
     EXPECT_EQ(
         service->promotion_candidate_count_.load(std::memory_order_relaxed),
         0u);
-    EXPECT_EQ(
-        service->promotion_in_flight_.load(std::memory_order_relaxed),
-        0u);
+    EXPECT_EQ(service->promotion_in_flight_.load(std::memory_order_relaxed),
+              0u);
 
     service->RemoveAll();
 }

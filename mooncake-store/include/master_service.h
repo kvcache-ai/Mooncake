@@ -1199,7 +1199,8 @@ class MasterService {
         std::chrono::steady_clock::time_point first_seen;
         std::chrono::steady_clock::time_point last_seen;
         std::chrono::steady_clock::time_point retry_after;
-        PromotionCandidateReason last_reason{PromotionCandidateReason::kQueueCap};
+        PromotionCandidateReason last_reason{
+            PromotionCandidateReason::kQueueCap};
         ErrorCode last_error{ErrorCode::OK};
         uint32_t retry_count{0};
     };
@@ -1239,7 +1240,8 @@ class MasterService {
             replication_tasks;
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
-        std::unordered_map<std::string, PromotionCandidate> promotion_candidates;
+        std::unordered_map<std::string, PromotionCandidate>
+            promotion_candidates;
 
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
@@ -1980,8 +1982,8 @@ class MasterService {
     static constexpr size_t kPromotionRetryBatchSize = 128;
     static constexpr size_t kPromotionRetryShardBatch = 64;
     static constexpr std::chrono::milliseconds kPromotionCandidateTtl{60000};
-    static constexpr std::chrono::milliseconds kPromotionCandidateInitialBackoff{
-        10};
+    static constexpr std::chrono::milliseconds
+        kPromotionCandidateInitialBackoff{10};
     static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
         1000};
 
