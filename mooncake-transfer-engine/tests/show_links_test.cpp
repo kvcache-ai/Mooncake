@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <json/json.h>
 
 #include <string>
 
@@ -38,4 +39,19 @@ TEST(ShowLinksTest, OutputContainsTopologySection) {
     // If RDMA devices exist, should show topology
     // If not, gracefully show empty
     EXPECT_FALSE(result.empty());
+}
+
+TEST(ShowLinksTest, JsonOutputIsValid) {
+    auto engine = std::make_unique<TransferEngine>(true);
+    auto result = engine->showLinks(true);
+    EXPECT_FALSE(result.empty());
+
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    ASSERT_TRUE(reader->parse(result.data(), result.data() + result.size(),
+                              &root, &errors))
+        << errors;
+    EXPECT_TRUE(root.isMember("local_nics"));
 }

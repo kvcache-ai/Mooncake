@@ -38,22 +38,18 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = 1;
 
     if (FLAGS_discover_only) {
-        auto engine =
-            std::make_unique<TransferEngine>(/*auto_discover=*/true);
-        std::cout << engine->showLinks() << std::endl;
+        auto engine = std::make_unique<TransferEngine>(/*auto_discover=*/true);
+        std::cout << engine->showLinks(FLAGS_json) << std::endl;
         return 0;
     }
 
     if (FLAGS_local_server_name.empty()) {
-        LOG(ERROR)
-            << "Must specify --local_server_name or --discover_only";
+        LOG(ERROR) << "Must specify --local_server_name or --discover_only";
         return 1;
     }
 
-    auto engine =
-        std::make_unique<TransferEngine>(/*auto_discover=*/true);
-    int ret = engine->init(FLAGS_metadata_server,
-                           FLAGS_local_server_name,
+    auto engine = std::make_unique<TransferEngine>(/*auto_discover=*/true);
+    int ret = engine->init(FLAGS_metadata_server, FLAGS_local_server_name,
                            FLAGS_ip_or_host_name, FLAGS_rpc_port);
     if (ret) {
         LOG(ERROR) << "Failed to initialize TransferEngine";
@@ -62,7 +58,7 @@ int main(int argc, char** argv) {
 
     engine->installTransport("rdma", nullptr);
 
-    std::cout << engine->showLinks() << std::endl;
+    std::cout << engine->showLinks(FLAGS_json) << std::endl;
 
     engine->freeEngine();
     return 0;

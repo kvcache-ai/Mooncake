@@ -222,9 +222,10 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
-std::string TransferEngine::showLinks() const {
+std::string TransferEngine::showLinks(bool json) const {
     if (!impl_) return "{}";
-    return buildShowLinksReadable(impl_.get());
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
 }
 
 }  // namespace mooncake
@@ -677,9 +678,12 @@ void* TransferEngine::getBaseAddr() {
         return impl_->getBaseAddr();
 }
 
-std::string TransferEngine::showLinks() const {
-    if (use_tent_ || !impl_) return "(TENT mode or not initialized)";
-    return buildShowLinksReadable(impl_.get());
+std::string TransferEngine::showLinks(bool json) const {
+    if (use_tent_ || !impl_) {
+        return json ? "{}" : "(TENT mode or not initialized)";
+    }
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
 }
 
 }  // namespace mooncake
