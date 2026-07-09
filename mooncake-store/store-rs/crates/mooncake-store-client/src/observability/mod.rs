@@ -344,7 +344,6 @@ fn open_trace_file(path: &Path) -> Result<File> {
 
 /// Register a debug callback for the `POST /debug/evict-all` endpoint on the
 /// metrics HTTP server.  Must be called after `start_metrics_http_server`.
-#[allow(dead_code)]
 pub fn register_debug_evict_all(callback: DebugEvictAllFn) {
     *debug_evict_all_callback()
         .lock()
@@ -1849,6 +1848,40 @@ mod tests {
         *debug_evict_all_callback()
             .lock()
             .expect("debug evict-all callback lock should not be poisoned") = None;
+    }
+
+    #[test]
+    fn debug_evict_all_http_endpoint_returns_503_without_callback_and_200_after_registration() {
+        let _guard = metrics_test_lock().lock();
+        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+        *debug_evict_all_callback()
+            .lock()
+            .expect("debug evict-all callback lock should not be poisoned") = None;
+
+        let address = start_metrics_http_server("127.0.0.1:0")
+            .expect("metrics server should start");
+        let post_evict = |addr: &str| {
+            http_request(
+                addr,
+                &format!(
+                    "POST /debug/evict-all HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+        };
+
+        let response = post_evict(&address);
+        assert!(response.contains("HTTP/1.1 503"), "no callback → 503");
+        assert!(response.contains("evict-all callback not registered"));
+
+        register_debug_evict_all(Arc::new(|| Ok(42)));
+        let response = post_evict(&address);
+        assert!(response.contains("HTTP/1.1 200 OK"), "registered → 200");
+        assert!(response.contains(r#"{"evicted":42}"#));
+
+        *debug_evict_all_callback()
+            .lock()
+            .expect("debug evict-all callback lock should not be poisoned") = None;
+        stop_metrics_http_server().expect("metrics server should stop");
     }
 
     fn http_get(address: &str, path: &str) -> String {

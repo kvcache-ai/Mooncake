@@ -7,9 +7,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    record_heartbeat_health, stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate,
-    MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
-    OperationTracker, ReadQueryResultCache, ReplicationPolicy, ScratchReservation, StoreClient,
+    record_heartbeat_health, register_debug_evict_all, stable_phase_spread_ms, GetRequest,
+    HealthChannel, HealthUpdate, MooncakeCompatibilityFacade, MultiBufferGetRequest,
+    MultiBufferPutRequest, ObjectRef, OperationTracker, ReadQueryResultCache, ReplicationPolicy,
+    ScratchReservation, StoreClient,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
@@ -267,6 +268,8 @@ impl StoreDispatcher {
         let runtime = client.runtime_id().to_string();
         let health = Arc::new(client.health_channel());
         let hot_cache = LocalHotCache::from_env()?.map(Arc::new);
+        let evict_client = client.clone();
+        register_debug_evict_all(Arc::new(move || evict_client.debug_evict_all()));
         let executor = Arc::new(Runtime::new().map_err(|error| {
             StoreError::Transport(format!("dispatcher runtime should initialize: {error}"))
         })?);
