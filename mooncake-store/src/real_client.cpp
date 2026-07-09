@@ -997,6 +997,15 @@ inline std::optional<size_t> get_config_size(const ConfigDict &config,
     return static_cast<size_t>(parsed_size_opt.value());
 }
 
+inline std::string trim(const std::string &value) {
+    auto start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return "";
+    }
+    auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
 inline bool get_config_bool(const ConfigDict &config, const std::string &key,
                             bool default_value) {
     auto it = config.find(key);
@@ -1004,7 +1013,7 @@ inline bool get_config_bool(const ConfigDict &config, const std::string &key,
         return default_value;
     }
 
-    std::string value = it->second;
+    std::string value = trim(it->second);
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char c) { return std::tolower(c); });
     if (value == "true" || value == "1" || value == "yes" || value == "on" ||
@@ -1030,14 +1039,15 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
     }
 
     try {
+        std::string value = trim(it->second);
         size_t pos = 0;
-        int value = std::stoi(it->second, &pos);
-        if (pos != it->second.size()) {
+        int parsed_value = std::stoi(value, &pos);
+        if (pos != value.size()) {
             LOG(ERROR) << "Invalid integer value for config key '" << key
                        << "': " << it->second;
             return std::nullopt;
         }
-        return value;
+        return parsed_value;
     } catch (const std::exception &) {
         LOG(ERROR) << "Invalid integer value for config key '" << key
                    << "': " << it->second;

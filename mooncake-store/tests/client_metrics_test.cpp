@@ -406,6 +406,47 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
     EXPECT_EQ(client->tearDownAll(), 0);
 }
 
+TEST_F(ClientMetricsTest, HttpMetricsConfigParserTrimsWhitespace) {
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    ConfigDict config = {
+        {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1:" + std::to_string(client_port)},
+        {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+        {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "0"},
+        {CONFIG_KEY_LOCAL_BUFFER_SIZE, "0"},
+        {CONFIG_KEY_PROTOCOL, "tcp"},
+        {CONFIG_KEY_MASTER_SERVER_ADDR, master.master_address()},
+        {CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, " true "},
+        {CONFIG_KEY_CLIENT_HTTP_PORT, " " + std::to_string(http_port) + " "},
+    };
+
+    auto client = RealClient::create();
+    auto setup_result = client->setup_internal(config);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    auto health =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/health");
+    EXPECT_EQ(health.status, 200);
+    EXPECT_NE(health.body.find("\"status\":\"healthy\""), std::string::npos);
+
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
 TEST_F(ClientMetricsTest, HttpMetricsEndpointReturns503WhenMetricsDisabled) {
     ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
     setenv("MC_STORE_CLIENT_METRIC", "0", 1);
