@@ -12,6 +12,7 @@
 
 #include "master_service.h"
 #include "master_metric_manager.h"
+#include "master_snapshot_repository.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_logger.h"
@@ -40,8 +41,6 @@ static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 namespace {
-constexpr size_t kUnlimitedSnapshotList = 0;
-
 int64_t CurrentTimeMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -58,7 +57,10 @@ MasterSnapshotManager::MasterSnapshotManager(
       options_(std::move(options)),
       snapshot_mutex_(snapshot_mutex),
       snapshot_object_store_(snapshot_object_store),
-      snapshot_catalog_store_(snapshot_catalog_store) {}
+      snapshot_catalog_store_(snapshot_catalog_store),
+      repository_(std::make_unique<MasterSnapshotRepository>(
+          snapshot_object_store, snapshot_catalog_store,
+          options_.snapshot_backup_dir, options_.use_snapshot_backup_dir)) {}
 
 MasterSnapshotManager::~MasterSnapshotManager() { Stop(); }
 
@@ -548,13 +550,13 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         bool upload_success = true;
         std::string error_msg;
         SNAP_LOG_INFO("[Snapshot] Backend info: {}",
-                      snapshot_object_store_->GetConnectionInfo());
+                      repository_->GetObjectStoreConnectionInfo());
 
         // Upload metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         auto upload_result =
-            UploadSnapshotPayloadFile(serialized_metadata, metadata_path,
-                                      SNAPSHOT_METADATA_FILE, snapshot_id);
+            repository_->UploadPayloadFile(serialized_metadata, metadata_path,
+                                           SNAPSHOT_METADATA_FILE, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] metadata upload failed, snapshot_id={}, "
@@ -572,8 +574,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         // Upload segment
         std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         upload_result =
-            UploadSnapshotPayloadFile(serialized_segment, segment_path,
-                                      SNAPSHOT_SEGMENTS_FILE, snapshot_id);
+            repository_->UploadPayloadFile(serialized_segment, segment_path,
+                                           SNAPSHOT_SEGMENTS_FILE, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] segment upload failed, snapshot_id={}, "
@@ -590,7 +592,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         // Upload task manager
         std::string task_manager_path =
             path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
-        upload_result = UploadSnapshotPayloadFile(
+        upload_result = repository_->UploadPayloadFile(
             serialized_task_manager, task_manager_path,
             SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
         if (!upload_result) {
@@ -613,7 +615,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                         SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
                                             manifest_content.end());
-        upload_result = UploadSnapshotPayloadFile(
+        upload_result = repository_->UploadPayloadFile(
             manifest_bytes, manifest_path, SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
@@ -639,7 +641,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             snapshot_catalog_store_->GetSnapshotRoot() + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        auto publish_result = snapshot_catalog_store_->Publish(descriptor);
+        auto publish_result = repository_->PublishSnapshot(descriptor);
         if (publish_result != ErrorCode::OK) {
             SNAP_LOG_ERROR(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}, "
@@ -669,7 +671,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             "content={}",
             latest_path, snapshot_id, latest_content);
 
-        CleanupOldSnapshot(options_.snapshot_retention_count, snapshot_id);
+        repository_->CleanupOldSnapshots(options_.snapshot_retention_count,
+                                         snapshot_id);
         SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}",
                       snapshot_id);
     } catch (const std::exception& e) {
@@ -696,93 +699,13 @@ tl::expected<void, SerializationError>
 MasterSnapshotManager::UploadSnapshotPayloadFile(
     const std::vector<uint8_t>& data, const std::string& path,
     const std::string& local_filename, const std::string& snapshot_id) {
-    SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}",
-                  local_filename, path, snapshot_id);
-
-    std::string error_msg;
-    auto upload_result = snapshot_object_store_->UploadBuffer(path, data);
-    if (!upload_result) {
-        SNAP_LOG_ERROR(
-            "[Snapshot] {} upload failed, snapshot_id={}, file={}, error={}",
-            local_filename, snapshot_id, path, upload_result.error());
-
-        // Upload failed, save locally for manual recovery in exception
-        // scenarios
-        if (options_.use_snapshot_backup_dir) {
-            auto save_path = fs::path(options_.snapshot_backup_dir) /
-                             SNAPSHOT_BACKUP_SAVE_DIR / local_filename;
-            auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
-            if (!save_result) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] save {} to disk failed, snapshot_id={}, "
-                    "file={}",
-                    local_filename, snapshot_id, save_path.string());
-            }
-        }
-
-        error_msg.append(local_filename)
-            .append(" upload ")
-            .append(path)
-            .append(" failed; ");
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
-    } else {
-        SNAP_LOG_INFO("[Snapshot] Upload {} success: {}, snapshot_id={}",
-                      local_filename, path, snapshot_id);
-    }
-
-    return {};
+    return repository_->UploadPayloadFile(data, path, local_filename,
+                                          snapshot_id);
 }
 
 void MasterSnapshotManager::CleanupOldSnapshot(int keep_count,
                                                const std::string& snapshot_id) {
-    if (!snapshot_catalog_store_) {
-        SNAP_LOG_ERROR(
-            "[Snapshot] snapshot catalog store is not initialized, "
-            "snapshot_id={}",
-            snapshot_id);
-        return;
-    }
-
-    // List() loads one descriptor per published snapshot. This remains cheap
-    // because CleanupOldSnapshot() itself enforces snapshot_retention_count_
-    // and keeps the catalog single-digit in normal deployments.
-    auto list_result = snapshot_catalog_store_->List(kUnlimitedSnapshotList);
-    if (!list_result) {
-        SNAP_LOG_ERROR("[Snapshot] error=list failed, snapshot_id={}, code={}",
-                       snapshot_id, toString(list_result.error()));
-        return;
-    }
-
-    const auto& snapshots = list_result.value();
-
-    if (static_cast<int>(snapshots.size()) > keep_count) {
-        for (int i = keep_count; i < static_cast<int>(snapshots.size()); i++) {
-            const std::string& old_state_dir = snapshots[i].snapshot_id;
-
-            if (old_state_dir == snapshot_id) {
-                SNAP_LOG_WARN(
-                    "[Snapshot] Skipping deletion of current snapshot "
-                    "directory {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
-                continue;
-            }
-
-            auto delete_result = snapshot_catalog_store_->Delete(old_state_dir);
-            if (delete_result != ErrorCode::OK) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] Failed to delete old snapshot {}, "
-                    "snapshot_id={}, code={}",
-                    old_state_dir, snapshot_id, toString(delete_result));
-            } else {
-                SNAP_LOG_INFO(
-                    "[Snapshot] Successfully deleted old snapshot {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
-            }
-        }
-    }
+    repository_->CleanupOldSnapshots(keep_count, snapshot_id);
 }
 
 }  // namespace mooncake

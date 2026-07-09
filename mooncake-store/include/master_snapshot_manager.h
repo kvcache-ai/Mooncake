@@ -18,6 +18,7 @@ namespace mooncake {
 // Forward declarations
 class MasterService;
 class SnapshotObjectStore;
+class MasterSnapshotRepository;
 
 namespace ha {
 class SnapshotCatalogStore;
@@ -114,6 +115,8 @@ class MasterSnapshotManager {
     std::shared_mutex& snapshot_mutex_;
     SnapshotObjectStore* snapshot_object_store_;
     ha::SnapshotCatalogStore* snapshot_catalog_store_;
+
+    std::unique_ptr<MasterSnapshotRepository> repository_;
 
 #ifdef STORE_USE_ETCD
     mutable std::mutex snapshot_boundary_oplog_store_mutex_;
