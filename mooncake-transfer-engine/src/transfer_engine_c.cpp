@@ -250,3 +250,8 @@ int syncSegmentCache(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->syncSegmentCache();
 }
+
+void enableGracefulShutdown(transfer_engine_t engine) {
+    TransferEngine *native = (TransferEngine *)engine;
+    native->enableGracefulShutdown();
+}

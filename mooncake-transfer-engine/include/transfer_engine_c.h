@@ -165,6 +165,8 @@ int freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
 
 int syncSegmentCache(transfer_engine_t engine);
 
+void enableGracefulShutdown(transfer_engine_t engine);
+
 #ifdef __cplusplus
 }
 #endif  // __cplusplus

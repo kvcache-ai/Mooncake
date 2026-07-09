@@ -198,6 +198,8 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
+    void enableGracefulShutdown();
+
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;

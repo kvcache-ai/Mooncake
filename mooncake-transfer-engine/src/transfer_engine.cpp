@@ -15,6 +15,7 @@
 #ifndef USE_TENT
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
+#include "graceful_shutdown.h"
 #include <utility>
 
 namespace mooncake {
@@ -221,6 +222,11 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
+void TransferEngine::enableGracefulShutdown() {
+    if (impl_) registerEngineForShutdown(impl_);
+    installGracefulShutdownHandlers();
+}
+
 }  // namespace mooncake
 #else
 #include "transfer_engine.h"
@@ -229,6 +235,7 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
 #include "tent/common/config.h"
 
 #include <utility>
+#include "graceful_shutdown.h"
 
 namespace mooncake {
 
@@ -668,6 +675,11 @@ void* TransferEngine::getBaseAddr() {
         return nullptr;
     } else
         return impl_->getBaseAddr();
+}
+
+void TransferEngine::enableGracefulShutdown() {
+    if (!use_tent_ && impl_) registerEngineForShutdown(impl_);
+    installGracefulShutdownHandlers();
 }
 
 }  // namespace mooncake
