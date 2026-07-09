@@ -55,14 +55,14 @@ class P2pTransport {
     // Free a buffer previously returned by allocateBuffer.
     virtual void freeBuffer(void* ptr) = 0;
 
-    // Export an IPC handle for the buffer allocated by this rank.
-    // Returns a byte blob (serialised as int32_t array for Python compat).
-    // Returns empty vector if IPC is not needed (e.g. fabric memory).
+    // Export the metadata peers need to access this rank's buffer.
+    // Returns an opaque byte blob (serialised as int32_t array for Python
+    // compat). For classic IPC this is a cudaIpcMemHandle-like payload; for
+    // fabric-backed paths this may instead carry the remote base VA directly.
     virtual std::vector<int32_t> exportIpcHandle(void* ptr) = 0;
 
-    // Import peer IPC handles and populate the device-visible tables.
-    // remote_handles[i] is the handle exported by rank i (may be empty for
-    // ranks that use fabric memory or are on a different node).
+    // Import peer access metadata and populate the device-visible tables.
+    // remote_handles[i] is the blob exported by rank i.
     // active_ranks_mask[i] == 1 means rank i is participating.
     // After this call, availableTablePtr() and peerPtrsTablePtr() are valid.
     virtual void importPeerHandles(
