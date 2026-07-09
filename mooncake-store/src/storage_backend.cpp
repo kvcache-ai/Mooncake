@@ -1360,8 +1360,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         object_bucket_map_.reserve(object_bucket_map_.size() +
                                    bucket_keys.size());
         for (size_t i = 0; i < bucket_keys.size(); ++i) {
-            auto [it, inserted] = object_bucket_map_.insert(
-                {bucket_keys[i], std::move(metadatas[i])});
+            auto [it, inserted] =
+                object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
             if (!inserted) {
                 LOG(ERROR) << "Unexpected duplicate key after pre-check: "
                            << bucket_keys[i] << ", bucket_id=" << bucket_id;
@@ -1374,9 +1374,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // can find the keys and read from the committed bucket files.
 
     // Notify Master AFTER local index is committed.
-    // metadatas[i] were moved-from above: int64_t fields (bucket_id, offset,
-    // key_size, data_size) survive std::move unchanged; transport_endpoint
-    // (std::string) is empty but complete_handler rewrites it before the RPC.
+    // metadatas[i].transport_endpoint is empty here (it gets populated by
+    // complete_handler before the RPC); int64_t fields carry the metadata
+    // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
         auto error_code = complete_handler(bucket_keys, metadatas);
         if (error_code != ErrorCode::OK) {
