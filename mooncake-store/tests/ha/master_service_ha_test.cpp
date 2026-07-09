@@ -1327,6 +1327,54 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_TRUE(promotion_replicas->replicas.front().is_memory_replica());
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       SegmentLifecycleEntriesRemainFunctional) {
+    const std::string cluster_id = "test_batch_record_e2e_segment_lifecycle";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    const UUID mount_client = generate_uuid();
+    Segment mounted = MakeSegment("batch_e2e_lifecycle_mount");
+    ASSERT_TRUE(service.MountSegment(mounted, mount_client).has_value());
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_MOUNT, batch.entries[0].op_type);
+
+    const UUID remount_client = generate_uuid();
+    Segment remounted = MakeSegment("batch_e2e_lifecycle_remount",
+                                    kDefaultSegmentBase + kDefaultSegmentSize);
+    ASSERT_TRUE(
+        service.ReMountSegment({remounted}, remount_client).has_value());
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_MOUNT, batch.entries[0].op_type);
+
+    const std::string key = "batch_e2e_lifecycle_key";
+    PutObjectOnSegment(service, remount_client, key,
+                       "batch_e2e_lifecycle_remount");
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
+
+    ASSERT_TRUE(service.UnmountSegment(mounted.id, mount_client).has_value());
+    bool saw_unmount = false;
+    for (uint64_t batch_id = 4; batch_id <= 6 && !saw_unmount; ++batch_id) {
+        ReadBatchEventually(storage, batch_id, batch);
+        ASSERT_EQ(1u, batch.entries.size());
+        saw_unmount = batch.entries[0].op_type == OpType::SEGMENT_UNMOUNT;
+    }
+    EXPECT_TRUE(saw_unmount);
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
