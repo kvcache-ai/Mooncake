@@ -446,23 +446,28 @@ force_kill_gpu_procs() {
 
 # Fully clear GPU memory on the current node: graceful in-container kill first,
 # then host-level force-kill of any process still holding GPU memory.
+# Restart the reused container to reset all in-container state (processes, GPU
+# memory, ERDMA queue-pairs / RDMA contexts). 'docker restart' keeps the
+# writable layer, so the mooncake wheel and ERDMA drivers are NOT reinstalled.
+# force_kill_gpu_procs stays as a fallback for leftovers restart cannot reclaim.
 drain_gpu_local() {
-    ${docker_exec} "pkill -9 -f 'sglang|vllm' 2>/dev/null; true" >/dev/null 2>&1 || true
+    echo "Restarting container ${CONTAINER_NAME} to reset GPU/ERDMA state..."
+    docker restart ${CONTAINER_NAME} >/dev/null 2>&1 || true
     if ! wait_gpu_idle 60; then
         force_kill_gpu_procs
-        wait_gpu_idle 45 || echo "WARNING: GPU still occupied after force-kill (possible stuck/zombie process or GPU fault)"
+        wait_gpu_idle 45 || echo "WARNING: GPU still occupied after restart+force-kill (possible stuck/zombie process or GPU fault)"
     fi
 }
 
-# Between test cases in run-all the container is reused; fully clear GPU memory
-# on both the local and (for double-machine runs) remote nodes. No container
-# restart, so wheel / ERDMA drivers are not reinstalled.
+# Between test cases in run-all the container is reused; reset in-container
+# state on both the local and (for double-machine runs) remote nodes via a
+# lightweight container restart (no wheel / ERDMA driver reinstall).
 drain_gpu_between_tests() {
-    echo "===== Draining GPU between test cases ====="
+    echo "===== Resetting environment between test cases ====="
     drain_gpu_local
 
     if [ -n "$REMOTE_IP" ]; then
-        echo "Draining GPU on remote node $REMOTE_IP..."
+        echo "Resetting environment on remote node $REMOTE_IP..."
         ${SSH_CMD} "$REMOTE_IP" "
             source ${REMOTE_TEST_DIR}/run/.shrc && \
             source ${REMOTE_TEST_DIR}/scripts/common.sh && \
