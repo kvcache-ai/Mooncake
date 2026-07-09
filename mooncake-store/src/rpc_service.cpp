@@ -1,5 +1,7 @@
 #include "rpc_service.h"
 
+#include <algorithm>
+
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -79,7 +81,14 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::RetainGroups(
     const std::vector<std::string>& group_ids, uint64_t ttl_ms,
     const std::string& tenant_id) {
-    return master_service_.RetainGroups(group_ids, ttl_ms, tenant_id);
+    auto result = master_service_.RetainGroups(group_ids, ttl_ms, tenant_id);
+    const auto accepted = std::count_if(
+        result.begin(), result.end(),
+        [](const auto& item) { return item.has_value() && item.value(); });
+    LOG(INFO) << "RetainGroups accepted " << accepted << "/"
+              << group_ids.size() << " groups for ttl_ms=" << ttl_ms
+              << ", tenant_id=" << tenant_id;
+    return result;
 }
 
 tl::expected<
