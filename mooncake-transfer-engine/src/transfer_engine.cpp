@@ -14,6 +14,7 @@
 
 #ifndef USE_TENT
 #include "transfer_engine.h"
+#include "show_links.h"
 #include "transfer_engine_impl.h"
 #include <utility>
 
@@ -221,6 +222,12 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
+
+std::string TransferEngine::showLinks() const {
+    if (!impl_) return "{}";
+    return buildShowLinksReadable(impl_.get());
+}
+
 }  // namespace mooncake
 #else
 #include "transfer_engine.h"
@@ -229,6 +236,7 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
 #include "tent/common/config.h"
 
 #include <utility>
+#include "show_links.h"
 
 namespace mooncake {
 
@@ -668,6 +676,12 @@ void* TransferEngine::getBaseAddr() {
         return nullptr;
     } else
         return impl_->getBaseAddr();
+}
+
+
+std::string TransferEngine::showLinks() const {
+    if (use_tent_ || !impl_) return "(TENT mode or not initialized)";
+    return buildShowLinksReadable(impl_.get());
 }
 
 }  // namespace mooncake

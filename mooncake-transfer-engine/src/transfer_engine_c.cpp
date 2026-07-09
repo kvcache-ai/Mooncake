@@ -250,3 +250,10 @@ int syncSegmentCache(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->syncSegmentCache();
 }
+
+int showLinks(transfer_engine_t engine, char *buf_out, size_t buf_len) {
+    TransferEngine *native = (TransferEngine *)engine;
+    auto result = native->showLinks();
+    snprintf(buf_out, buf_len, "%s", result.c_str());
+    return 0;
+}

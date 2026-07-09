@@ -135,6 +135,11 @@ class RdmaTransport : public Transport {
                                       int &buffer_id, int &device_id,
                                       int retry_cnt = 0);
 
+    const std::vector<std::shared_ptr<RdmaContext>>& getContextList()
+        const {
+        return context_list_;
+    }
+
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
