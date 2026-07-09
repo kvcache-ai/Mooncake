@@ -1,4 +1,4 @@
-# SGLang Integration Performance Benchmarks
+# SGLang Integration Performance
 
 Benchmarks evaluating Mooncake's integration with SGLang across PD disaggregation and HiCache hierarchical KV cache storage.
 

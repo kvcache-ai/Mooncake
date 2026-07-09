@@ -1,4 +1,4 @@
-# vLLM Integration Performance Benchmarks
+# vLLM Integration Performance
 
 Benchmarks evaluating Mooncake's integration with vLLM across different backends and scenarios.
 
