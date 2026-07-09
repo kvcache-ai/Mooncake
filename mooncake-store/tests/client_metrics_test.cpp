@@ -1,12 +1,77 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+// csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
+// calls std::signal without including <csignal> itself.
+#include <csignal>
 #include <cstdlib>
+#include <optional>
 #include <string>
+#include <unordered_set>
+#include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
+#include "real_client.h"
+#include "test_server_helpers.h"
+#include "utils.h"
 
 namespace mooncake::test {
+namespace {
+
+struct HttpResponse {
+    int status;
+    std::string body;
+};
+
+HttpResponse FetchUrl(const std::string& url) {
+    coro_http::coro_http_client client;
+    auto res = client.get(url);
+    return HttpResponse{res.status, std::string(res.resp_body)};
+}
+
+int GetTestPort(std::unordered_set<int>& used_ports) {
+    for (int i = 0; i < 100; ++i) {
+        int port = getFreeTcpPort();
+        if (port > 0 && port < 65535 && !used_ports.contains(port)) {
+            used_ports.insert(port);
+            return port;
+        }
+    }
+    return -1;
+}
+
+class ScopedEnv {
+   public:
+    explicit ScopedEnv(const char* name) : name_(name) {
+        const char* value = std::getenv(name);
+        if (value) old_value_ = value;
+    }
+
+    ~ScopedEnv() {
+        if (old_value_) {
+            setenv(name_, old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> old_value_;
+};
+
+tl::expected<void, ErrorCode> SetupClientWithHttp(
+    const std::shared_ptr<RealClient>& client, const std::string& client_addr,
+    const std::string& master_addr, bool enable_http, int http_port) {
+    return client->setup_internal(
+        client_addr, "P2PHANDSHAKE", /*global_segment_size=*/0,
+        /*local_buffer_size=*/0, "tcp", "", master_addr, nullptr, "",
+        /*local_rpc_port=*/50052, /*enable_ssd_offload=*/false,
+        /*start_offload_rpc_server=*/false, /*ssd_offload_path=*/"",
+        /*tenant_id=*/"default", enable_http, http_port);
+}
+
+}  // namespace
 
 class ClientMetricsTest : public ::testing::Test {
    protected:
@@ -302,6 +367,114 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         metrics.serialize(serialized);
         verify(serialized);
     }
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    auto client = RealClient::create();
+    auto setup_result = SetupClientWithHttp(
+        client, "127.0.0.1:" + std::to_string(client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    auto metrics =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
+    EXPECT_EQ(metrics.status, 200);
+    EXPECT_EQ(metrics.body.find("metrics not available"), std::string::npos);
+
+    auto summary = FetchUrl("http://127.0.0.1:" + std::to_string(http_port) +
+                            "/metrics/summary");
+    EXPECT_EQ(summary.status, 200);
+    EXPECT_NE(summary.body.find("Client Metrics Summary"), std::string::npos);
+
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsEndpointReturns503WhenMetricsDisabled) {
+    ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    auto client = RealClient::create();
+    auto setup_result = SetupClientWithHttp(
+        client, "127.0.0.1:" + std::to_string(client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    auto metrics =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
+    EXPECT_EQ(metrics.status, 503);
+    EXPECT_NE(metrics.body.find("metrics not available"), std::string::npos);
+
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsPortConflictDoesNotFailSetup) {
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int first_client_port = GetTestPort(used_ports);
+    int second_client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(first_client_port, 0);
+    ASSERT_GT(second_client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    auto first_client = RealClient::create();
+    auto first_setup = SetupClientWithHttp(
+        first_client, "127.0.0.1:" + std::to_string(first_client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    ASSERT_TRUE(first_setup.has_value()) << toString(first_setup.error());
+
+    auto second_client = RealClient::create();
+    auto second_setup = SetupClientWithHttp(
+        second_client, "127.0.0.1:" + std::to_string(second_client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    EXPECT_TRUE(second_setup.has_value()) << toString(second_setup.error());
+
+    EXPECT_EQ(second_client->tearDownAll(), 0);
+    EXPECT_EQ(first_client->tearDownAll(), 0);
 }
 
 }  // namespace mooncake::test
