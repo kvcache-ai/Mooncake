@@ -1497,6 +1497,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (owner.staging) {
             task.staging = true;
             staging_proxy_->submit(&task, (BatchID)batch, owner.staging_params);
+            task.post_time = std::chrono::steady_clock::now();
             continue;
         }
 
@@ -2286,7 +2287,8 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                         std::chrono::duration<double, std::micro>(
                             task.dispatch_time - start_time)
                             .count();
-                    TENT_RECORD_STAGE_LATENCY("queue_wait", queue_wait_us);
+                    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait,
+                                              queue_wait_us);
                     if (task.post_time.time_since_epoch().count() > 0) {
                         double dispatch_us =
                             std::chrono::duration<double, std::micro>(
@@ -2296,8 +2298,10 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                             std::chrono::duration<double, std::micro>(
                                 end_time - task.post_time)
                                 .count();
-                        TENT_RECORD_STAGE_LATENCY("dispatch", dispatch_us);
-                        TENT_RECORD_STAGE_LATENCY("transport", transport_us);
+                        TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch,
+                                                  dispatch_us);
+                        TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport,
+                                                  transport_us);
                     }
                 }
 #endif

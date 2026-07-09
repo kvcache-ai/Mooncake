@@ -87,9 +87,14 @@ class TentMetrics {
     // transfer met its deadline; mlu >= 1 means it missed. Observability only.
     void recordDeadlineMLU(double mlu);
 
+    enum class Stage {
+        QueueWait,
+        Dispatch,
+        Transport,
+    };
+
     // Causal chain: record per-stage latency breakdown (microseconds).
-    // stage: "queue_wait" | "dispatch" | "transport"
-    void recordStageLatency(const std::string& stage, double latency_us);
+    void recordStageLatency(Stage stage, double latency_us);
 
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
@@ -302,12 +307,12 @@ class ScopedLatencyRecorder {
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
         ::mooncake::tent::ScopedLatencyRecorder::OperationType::Write, bytes)
 
-#define TENT_RECORD_STAGE_LATENCY(stage, latency_us)                 \
-    do {                                                             \
-        if (::mooncake::tent::TentMetrics::isEnabled()) {            \
-            ::mooncake::tent::TentMetrics::instance()                \
-                .recordStageLatency(stage, latency_us);              \
-        }                                                            \
+#define TENT_RECORD_STAGE_LATENCY(stage, latency_us)                      \
+    do {                                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                 \
+            ::mooncake::tent::TentMetrics::instance().recordStageLatency( \
+                stage, latency_us);                                       \
+        }                                                                 \
     } while (0)
 
 #else  // !TENT_METRICS_ENABLED

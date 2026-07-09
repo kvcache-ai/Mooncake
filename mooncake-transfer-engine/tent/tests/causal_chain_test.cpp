@@ -31,7 +31,6 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-
 class FakeSubBatch : public Transport::SubBatch {
    public:
     size_t size() const override { return task_count; }
@@ -43,8 +42,7 @@ class FakeSubBatch : public Transport::SubBatch {
 
 class FakeTransport : public Transport {
    public:
-    explicit FakeTransport(TransportType self_type)
-        : self_type_(self_type) {
+    explicit FakeTransport(TransportType self_type) : self_type_(self_type) {
         caps.dram_to_dram = true;
     }
 
@@ -243,12 +241,45 @@ TEST(CausalChain, MultipleTransfersAllComplete) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
 }
 
+TEST(CausalChain, TimestampsPopulatedOnDirectPath) {
+    auto cfg = makeCausalChainConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBB);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto status =
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)});
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    TransferStatus ts{};
+    for (int i = 0; i < 200; ++i) {
+        engine.getTransferStatus(batch, 0, ts);
+        if (ts.s == TransferStatusEnum::COMPLETED) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(ts.s, TransferStatusEnum::COMPLETED);
+    EXPECT_GE(fake->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
 #if TENT_METRICS_ENABLED
 #include "tent/metrics/tent_metrics.h"
 TEST(CausalChain, MetricsRecordStageLatencyIsCallable) {
-    TENT_RECORD_STAGE_LATENCY("queue_wait", 100.0);
-    TENT_RECORD_STAGE_LATENCY("dispatch", 50.0);
-    TENT_RECORD_STAGE_LATENCY("transport", 200.0);
+    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait, 100.0);
+    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch, 50.0);
+    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport, 200.0);
 }
 #endif
 
