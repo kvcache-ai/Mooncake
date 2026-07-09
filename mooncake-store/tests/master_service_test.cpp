@@ -1441,7 +1441,7 @@ TEST_F(MasterServiceTest,
     }
 }
 
-TEST_F(MasterServiceTest, RetainGroupsExtendsTheWholeGroupLease) {
+TEST_F(MasterServiceTest, RetainGroupsProtectsFutureGroupMembers) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(100).build();
     constexpr size_t kSegmentSize = 4 * 1024 * 1024;
@@ -1458,8 +1458,6 @@ TEST_F(MasterServiceTest, RetainGroupsExtendsTheWholeGroupLease) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(*service_, client_id, key_a, config, kObjectSize);
-    PutCompletedObject(*service_, client_id, key_b, config, kObjectSize);
 
     auto retained = service_->RetainGroups({group_id, "missing_group"}, 1000,
                                            "default");
@@ -1467,7 +1465,10 @@ TEST_F(MasterServiceTest, RetainGroupsExtendsTheWholeGroupLease) {
     ASSERT_TRUE(retained[0].has_value());
     EXPECT_TRUE(retained[0].value());
     ASSERT_TRUE(retained[1].has_value());
-    EXPECT_FALSE(retained[1].value());
+    EXPECT_TRUE(retained[1].value());
+
+    PutCompletedObject(*service_, client_id, key_a, config, kObjectSize);
+    PutCompletedObject(*service_, client_id, key_b, config, kObjectSize);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     ReplicateConfig trigger_config;

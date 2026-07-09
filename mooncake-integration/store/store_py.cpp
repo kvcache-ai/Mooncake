@@ -2302,9 +2302,8 @@ PYBIND11_MODULE(store, m) {
                 return self.real_client_->retainGroups(group_ids, ttl_ms);
             },
             py::arg("group_ids"), py::arg("ttl_ms"),
-            "Retain all complete objects in each group for the requested TTL. "
-            "Returns 1 if retained, 0 if absent or incomplete, and a negative "
-            "error code on failure.")
+            "Retain current and future objects in each group for the requested "
+            "TTL. Returns 1 if accepted and a negative error code on failure.")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;

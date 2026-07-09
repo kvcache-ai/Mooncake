@@ -1222,11 +1222,15 @@ class MasterService {
 
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
+        std::unordered_map<std::string,
+                           std::chrono::system_clock::time_point>
+            group_retention_deadlines;
 
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && group_members.empty();
+                   promotion_tasks.empty() && group_members.empty() &&
+                   group_retention_deadlines.empty();
         }
     };
 
@@ -1401,6 +1405,7 @@ class MasterService {
                                const std::string& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
+    void PruneExpiredGroupRetentions();
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,

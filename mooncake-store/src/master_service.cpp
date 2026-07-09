@@ -1606,11 +1606,32 @@ void MasterService::RegisterGroupMember(TenantState& tenant_state,
         return;
     }
     const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-    object_group_ids_[MakeTenantScopedKey(normalized_tenant, key)] = group_id;
-    groups_needing_lease_refresh_.insert(
-        MakeTenantScopedKey(normalized_tenant, group_id));
+    {
+        std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
+        object_group_ids_[MakeTenantScopedKey(normalized_tenant, key)] =
+            group_id;
+        groups_needing_lease_refresh_.insert(
+            MakeTenantScopedKey(normalized_tenant, group_id));
+    }
     tenant_state.group_members[group_id].insert(key);
+
+    auto retention_it = tenant_state.group_retention_deadlines.find(group_id);
+    if (retention_it == tenant_state.group_retention_deadlines.end()) {
+        return;
+    }
+    const auto now = std::chrono::system_clock::now();
+    if (retention_it->second <= now) {
+        tenant_state.group_retention_deadlines.erase(retention_it);
+        return;
+    }
+    auto metadata_it = tenant_state.metadata.find(key);
+    if (metadata_it != tenant_state.metadata.end()) {
+        const auto remaining_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                retention_it->second - now)
+                .count();
+        metadata_it->second.GrantLease(static_cast<uint64_t>(remaining_ms), 0);
+    }
 }
 
 void MasterService::UnregisterGroupMember(TenantState& tenant_state,
@@ -1951,9 +1972,12 @@ void MasterService::TaskCleanupThreadFunc() {
         }
 
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        auto write_access = task_manager_.get_write_access();
-        write_access.prune_expired_tasks();
-        write_access.prune_finished_tasks();
+        {
+            auto write_access = task_manager_.get_write_access();
+            write_access.prune_expired_tasks();
+            write_access.prune_finished_tasks();
+        }
+        PruneExpiredGroupRetentions();
     }
     LOG(INFO) << "Task cleanup thread stopped";
 }
@@ -2205,46 +2229,67 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::RetainGroups(
         }
 
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        MetadataShardAccessorRO shard(this, shard_idx);
-        auto tenant_it = shard->tenants.find(normalized_tenant);
-        if (tenant_it == shard->tenants.end()) {
-            for (const size_t i : group_indices) {
-                results[i] = false;
+        MetadataShardAccessorRW shard(this, shard_idx);
+        auto& tenant_state = shard->tenants[normalized_tenant];
+        const auto now = std::chrono::system_clock::now();
+        for (auto it = tenant_state.group_retention_deadlines.begin();
+             it != tenant_state.group_retention_deadlines.end();) {
+            if (it->second <= now) {
+                it = tenant_state.group_retention_deadlines.erase(it);
+            } else {
+                ++it;
             }
-            continue;
         }
-
-        const auto& tenant_state = tenant_it->second;
         for (const size_t i : group_indices) {
+            if (group_ids[i].empty()) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            const auto deadline = now + std::chrono::milliseconds(ttl_ms);
+            auto& retained_until =
+                tenant_state.group_retention_deadlines[group_ids[i]];
+            retained_until = std::max(retained_until, deadline);
+
             auto group_it = tenant_state.group_members.find(group_ids[i]);
             if (group_it == tenant_state.group_members.end() ||
                 group_it->second.empty()) {
-                results[i] = false;
+                results[i] = true;
                 continue;
             }
-
-            bool complete = true;
             for (const auto& member_key : group_it->second) {
                 auto member_it = tenant_state.metadata.find(member_key);
-                if (member_it == tenant_state.metadata.end() ||
-                    !member_it->second.IsValid() ||
-                    !member_it->second.HasReplica(&Replica::fn_is_completed)) {
-                    complete = false;
-                    break;
+                if (member_it != tenant_state.metadata.end()) {
+                    member_it->second.GrantLease(ttl_ms, 0);
                 }
-            }
-            if (!complete) {
-                results[i] = false;
-                continue;
-            }
-
-            for (const auto& member_key : group_it->second) {
-                tenant_state.metadata.at(member_key).GrantLease(ttl_ms, 0);
             }
             results[i] = true;
         }
     }
     return results;
+}
+
+void MasterService::PruneExpiredGroupRetentions() {
+    const auto now = std::chrono::system_clock::now();
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (auto tenant_it = shard->tenants.begin();
+             tenant_it != shard->tenants.end();) {
+            auto& tenant_state = tenant_it->second;
+            for (auto it = tenant_state.group_retention_deadlines.begin();
+                 it != tenant_state.group_retention_deadlines.end();) {
+                if (it->second <= now) {
+                    it = tenant_state.group_retention_deadlines.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (tenant_state.Empty()) {
+                tenant_it = shard->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
+        }
+    }
 }
 
 auto MasterService::GetAllKeys(const std::string& tenant_id)
