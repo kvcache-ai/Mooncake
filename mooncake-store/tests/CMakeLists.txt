@@ -86,6 +86,7 @@ add_store_test(p2p_oplog_test
     ha/oplog/p2p_oplog_applier_test.cpp
     ha/oplog/p2p_record_oplog_test.cpp
     ha/oplog/p2p_standby_metadata_store_test.cpp
+    ha/oplog/p2p_hot_standby_service_test.cpp
 )
 add_subdirectory(e2e)
 
