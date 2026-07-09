@@ -1222,6 +1222,42 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_FALSE(exists.value());
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       ProcessingOnlyObjectReturnsReplicaIsNotReady) {
+    const std::string cluster_id = "test_batch_record_e2e_processing_only";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_e2e_processing_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_e2e_processing_seg"};
+    const std::string key = "batch_e2e_processing_key";
+    ASSERT_TRUE(
+        service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config)
+            .has_value());
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_FALSE(replicas.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, replicas.error());
+
+    auto exists = service.ExistKey(key, kDefaultTenant);
+    ASSERT_FALSE(exists.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, exists.error());
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
