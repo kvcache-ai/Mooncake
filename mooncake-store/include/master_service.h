@@ -1562,6 +1562,10 @@ class MasterService {
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
     const bool allow_evict_soft_pinned_objects_;
+    std::array<double, UINT8_MAX + 1> object_type_reuse_scales_;
+    std::array<double, UINT8_MAX + 1> object_type_soft_pin_weights_;
+    std::array<int64_t, UINT8_MAX + 1> object_type_eviction_graces_;
+    std::array<double, UINT8_MAX + 1> object_type_budget_ratios_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{

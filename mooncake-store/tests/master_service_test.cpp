@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -7132,6 +7133,87 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest,
+       ObjectTypeEvictionScorePolicyRejectsInvalidBuilderInput) {
+    auto builder = MasterServiceConfig::builder();
+    EXPECT_THROW(builder.set_object_type_eviction_score_policy(
+                     ObjectDataType::KVCACHE,
+                     ObjectTypeEvictionScorePolicy{1.0, -1.0, 0}),
+                 std::invalid_argument);
+
+    EXPECT_THROW(builder.set_object_type_eviction_score_policy(
+                     ObjectDataType::KVCACHE,
+                     ObjectTypeEvictionScorePolicy{
+                         std::numeric_limits<double>::quiet_NaN(), 1.0, 0}),
+                 std::invalid_argument);
+
+    EXPECT_THROW(builder.set_object_type_eviction_score_policy(
+                     ObjectDataType::KVCACHE,
+                     ObjectTypeEvictionScorePolicy{
+                         1.0, std::numeric_limits<double>::infinity(), 0}),
+                 std::invalid_argument);
+}
+
+TEST_F(MasterServiceTest,
+       ObjectTypeEvictionScorePolicyRejectsInvalidDirectConfigInput) {
+    auto config = MasterServiceConfig::builder().build();
+    config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionScorePolicy{0.0, 1.0, 0};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionScorePolicy{1.0, -1.0, 0};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_score_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionScorePolicy{std::numeric_limits<double>::infinity(),
+                                      1.0, 0};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+}
+
+TEST_F(MasterServiceTest, ObjectTypeEvictionPolicyRejectsInvalidBuilderInput) {
+    auto builder = MasterServiceConfig::builder();
+    EXPECT_THROW(builder.set_object_type_eviction_policy(
+                     ObjectDataType::KVCACHE, ObjectTypeEvictionPolicy{-1.0}),
+                 std::invalid_argument);
+
+    EXPECT_THROW(
+        builder.set_object_type_eviction_policy(
+            ObjectDataType::KVCACHE,
+            ObjectTypeEvictionPolicy{std::numeric_limits<double>::quiet_NaN()}),
+        std::invalid_argument);
+
+    EXPECT_THROW(
+        builder.set_object_type_eviction_policy(
+            ObjectDataType::KVCACHE,
+            ObjectTypeEvictionPolicy{std::numeric_limits<double>::infinity()}),
+        std::invalid_argument);
+
+    EXPECT_THROW(builder.set_object_type_eviction_policy(
+                     ObjectDataType::KVCACHE, ObjectTypeEvictionPolicy{1.1}),
+                 std::invalid_argument);
+}
+
+TEST_F(MasterServiceTest,
+       ObjectTypeEvictionPolicyRejectsInvalidDirectConfigInput) {
+    auto config = MasterServiceConfig::builder().build();
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{-1.0};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{std::numeric_limits<double>::quiet_NaN()};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{std::numeric_limits<double>::infinity()};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+
+    config.object_type_eviction_policies[ObjectDataType::KVCACHE] =
+        ObjectTypeEvictionPolicy{1.1};
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 }
 
 TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {

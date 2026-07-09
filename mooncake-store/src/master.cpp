@@ -3,10 +3,13 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <cmath>
+#include <cstdint>
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
-#include <memory>   // For std::unique_ptr
+#include <limits>
+#include <memory>  // For std::unique_ptr
 #include <string>
 #include <thread>  // For std::thread
 #include <json/json.h>
@@ -62,6 +65,13 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
                    << ". " << error;
     }
     return parsed_value;
+}
+
+bool TryGetDoubleConfig(const mooncake::DefaultConfig& default_config,
+                        const std::string& key, double* value) {
+    const double missing = std::numeric_limits<double>::lowest();
+    default_config.GetDouble(key, value, missing);
+    return *value != missing;
 }
 
 // Derive the metadata server address for cleanup when it is deployed
@@ -451,6 +461,63 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
+    for (uint16_t type_id = 0; type_id <= UINT8_MAX; ++type_id) {
+        const auto data_type = static_cast<mooncake::ObjectDataType>(
+            static_cast<uint8_t>(type_id));
+        const std::string type_key = std::to_string(type_id);
+
+        bool has_score_policy = false;
+        mooncake::ObjectTypeEvictionScorePolicy score_policy;
+        double reuse_scale = 0.0;
+        if (TryGetDoubleConfig(default_config,
+                               "object_type_eviction_score_policies." +
+                                   type_key + ".reuse_scale",
+                               &reuse_scale)) {
+            score_policy.reuse_scale = reuse_scale;
+            has_score_policy = true;
+        }
+
+        double soft_pin_weight = 0.0;
+        if (TryGetDoubleConfig(default_config,
+                               "object_type_eviction_score_policies." +
+                                   type_key + ".soft_pin_weight",
+                               &soft_pin_weight)) {
+            score_policy.soft_pin_weight = soft_pin_weight;
+            has_score_policy = true;
+        }
+
+        const int64_t missing_eviction_grace =
+            std::numeric_limits<int64_t>::min();
+        int64_t eviction_grace = missing_eviction_grace;
+        default_config.GetInt64("object_type_eviction_score_policies." +
+                                    type_key + ".eviction_grace",
+                                &eviction_grace, missing_eviction_grace);
+        if (eviction_grace != missing_eviction_grace) {
+            score_policy.eviction_grace = eviction_grace;
+            has_score_policy = true;
+        }
+
+        if (has_score_policy) {
+            mooncake::ValidateObjectTypeEvictionScorePolicy(score_policy);
+            master_config.object_type_eviction_score_policies[data_type] =
+                score_policy;
+        }
+
+        double budget_ratio = 0.0;
+        if (TryGetDoubleConfig(
+                default_config,
+                "object_type_eviction_policies." + type_key + ".budget_ratio",
+                &budget_ratio)) {
+            if (!std::isfinite(budget_ratio) || budget_ratio < 0.0 ||
+                budget_ratio > 1.0) {
+                LOG(FATAL) << "object_type_eviction_policies." << type_key
+                           << ".budget_ratio must be finite and between 0.0 "
+                              "and 1.0";
+            }
+            master_config.object_type_eviction_policies[data_type]
+                .budget_ratio = budget_ratio;
+        }
+    }
     default_config.GetDouble("eviction_ratio", &master_config.eviction_ratio,
                              FLAGS_eviction_ratio);
     default_config.GetDouble("eviction_high_watermark_ratio",

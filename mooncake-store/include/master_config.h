@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 
 #include <glog/logging.h>
 
@@ -13,6 +15,38 @@ namespace mooncake {
 
 // Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
 class HttpMetadataServer;
+
+struct ObjectTypeEvictionScorePolicy {
+    double reuse_scale{1.0};
+    double soft_pin_weight{1.0};
+    int64_t eviction_grace{0};
+};
+
+struct ObjectTypeEvictionPolicy {
+    double budget_ratio{1.0};
+};
+
+inline void ValidateObjectTypeEvictionPolicy(
+    const ObjectTypeEvictionPolicy& policy) {
+    if (!std::isfinite(policy.budget_ratio) || policy.budget_ratio < 0.0 ||
+        policy.budget_ratio > 1.0) {
+        throw std::invalid_argument(
+            "budget_ratio must be finite and between 0.0 and 1.0");
+    }
+}
+
+inline void ValidateObjectTypeEvictionScorePolicy(
+    const ObjectTypeEvictionScorePolicy& policy) {
+    if (!std::isfinite(policy.reuse_scale) || policy.reuse_scale <= 0.0) {
+        throw std::invalid_argument(
+            "reuse_scale must be finite and greater than 0");
+    }
+    if (!std::isfinite(policy.soft_pin_weight) ||
+        policy.soft_pin_weight < 0.0) {
+        throw std::invalid_argument(
+            "soft_pin_weight must be finite and non-negative");
+    }
+}
 
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
@@ -39,6 +73,10 @@ struct MasterConfig {
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionScorePolicy>
+        object_type_eviction_score_policies;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionPolicy>
+        object_type_eviction_policies;
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
@@ -155,6 +193,10 @@ class MasterServiceSupervisorConfig {
     RequiredParam<int> metrics_port{"metrics_port"};
     RequiredParam<int64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
     RequiredParam<int64_t> default_kv_soft_pin_ttl{"default_kv_soft_pin_ttl"};
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionScorePolicy>
+        object_type_eviction_score_policies;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionPolicy>
+        object_type_eviction_policies;
     RequiredParam<bool> allow_evict_soft_pinned_objects{
         "allow_evict_soft_pinned_objects"};
     RequiredParam<double> eviction_ratio{"eviction_ratio"};
@@ -258,6 +300,9 @@ class MasterServiceSupervisorConfig {
         metrics_port = static_cast<int>(config.metrics_port);
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        object_type_eviction_score_policies =
+            config.object_type_eviction_score_policies;
+        object_type_eviction_policies = config.object_type_eviction_policies;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
@@ -414,6 +459,10 @@ class WrappedMasterServiceConfig {
 
     // Optional parameters (with default values)
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionScorePolicy>
+        object_type_eviction_score_policies;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionPolicy>
+        object_type_eviction_policies;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
@@ -501,6 +550,9 @@ class WrappedMasterServiceConfig {
 
         // Set optional parameters (these have default values)
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        object_type_eviction_score_policies =
+            config.object_type_eviction_score_policies;
+        object_type_eviction_policies = config.object_type_eviction_policies;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
@@ -613,6 +665,9 @@ class WrappedMasterServiceConfig {
 
         // Set optional parameters (these have default values)
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        object_type_eviction_score_policies =
+            config.object_type_eviction_score_policies;
+        object_type_eviction_policies = config.object_type_eviction_policies;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
@@ -694,6 +749,10 @@ class MasterServiceConfigBuilder {
    private:
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionScorePolicy>
+        object_type_eviction_score_policies_;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionPolicy>
+        object_type_eviction_policies_;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
@@ -757,6 +816,20 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_default_kv_soft_pin_ttl(uint64_t ttl) {
         default_kv_soft_pin_ttl_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_object_type_eviction_score_policy(
+        ObjectDataType data_type, ObjectTypeEvictionScorePolicy policy) {
+        ValidateObjectTypeEvictionScorePolicy(policy);
+        object_type_eviction_score_policies_[data_type] = policy;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_object_type_eviction_policy(
+        ObjectDataType data_type, ObjectTypeEvictionPolicy policy) {
+        ValidateObjectTypeEvictionPolicy(policy);
+        object_type_eviction_policies_[data_type] = policy;
         return *this;
     }
 
@@ -1032,6 +1105,10 @@ class MasterServiceConfig {
    public:
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionScorePolicy>
+        object_type_eviction_score_policies;
+    std::unordered_map<ObjectDataType, ObjectTypeEvictionPolicy>
+        object_type_eviction_policies;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
@@ -1115,6 +1192,9 @@ class MasterServiceConfig {
 
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        object_type_eviction_score_policies =
+            config.object_type_eviction_score_policies;
+        object_type_eviction_policies = config.object_type_eviction_policies;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
@@ -1202,6 +1282,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
+    config.object_type_eviction_score_policies =
+        object_type_eviction_score_policies_;
+    config.object_type_eviction_policies = object_type_eviction_policies_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
