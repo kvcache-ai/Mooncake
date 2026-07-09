@@ -27,6 +27,9 @@ struct MasterConfig {
     int64_t client_crashed_ttl_sec = -1;
 
     bool enable_ha;
+    bool enable_oplog = false;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
     bool enable_offload;
     std::string etcd_endpoints;
 
@@ -103,6 +106,9 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_oplog = false;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -166,6 +172,9 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_oplog = config.enable_oplog;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
 
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
@@ -286,6 +295,9 @@ class WrappedMasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
     bool enable_ha = false;
+    bool enable_oplog = false;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -328,6 +340,9 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         client_crashed_ttl_sec = config.client_crashed_ttl_sec;
         enable_ha = config.enable_ha;
+        enable_oplog = config.enable_oplog;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -375,6 +390,9 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
+        enable_oplog = config.enable_oplog;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -417,6 +435,9 @@ class MasterServiceConfigBuilder {
     int64_t client_crashed_ttl_sec_ = DEFAULT_CLIENT_CRASHED_TTL_SEC;
 
     bool enable_ha_ = false;
+    bool enable_oplog_ = false;
+    std::string oplog_store_type_ = "localfs";
+    std::string oplog_data_dir_ = "/tmp/mooncake_oplog";
     bool enable_offload_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
@@ -485,6 +506,21 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_ha(bool enable) {
         enable_ha_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
+        enable_oplog_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_store_type(const std::string& type) {
+        oplog_store_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_data_dir(const std::string& dir) {
+        oplog_data_dir_ = dir;
         return *this;
     }
 
@@ -600,6 +636,9 @@ class MasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
     bool enable_ha = false;
+    bool enable_oplog = false;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -638,6 +677,9 @@ class MasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         client_crashed_ttl_sec = config.client_crashed_ttl_sec;
         enable_ha = config.enable_ha;
+        enable_oplog = config.enable_oplog;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -680,6 +722,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
     config.enable_ha = enable_ha_;
+    config.enable_oplog = enable_oplog_;
+    config.oplog_store_type = oplog_store_type_;
+    config.oplog_data_dir = oplog_data_dir_;
     config.enable_offload = enable_offload_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;

@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <algorithm>
 
+#include "ha/oplog/p2p_oplog_types.h"
 #include "p2p_client_meta.h"
 
 namespace mooncake {
@@ -15,6 +16,106 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
         config.view_version);
     InitializeClientManager();
     client_manager_->Start();
+}
+
+ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
+                                        const std::string& payload, bool sync) {
+    // TODO: Record remaining failover-visible P2P mutations: client crash
+    // cleanup, heartbeat state transitions, replica eviction/rebalance, and
+    // task metadata.
+    auto* manager = GetOpLogManager();
+    if (manager == nullptr) {
+        return ErrorCode::OK;
+    }
+
+    if (sync) {
+        auto result = manager->AppendAndPersist(type, key, payload);
+        if (!result.has_value()) {
+            LOG(ERROR) << "P2PMasterService: failed to persist oplog"
+                       << ", op_type=" << static_cast<int>(type)
+                       << ", key=" << key
+                       << ", error=" << toString(result.error());
+            return result.error();
+        }
+    } else {
+        manager->Append(type, key, payload);
+    }
+    return ErrorCode::OK;
+}
+
+auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
+    -> tl::expected<RegisterClientResponse, ErrorCode> {
+    auto result = MasterService::RegisterClient(req);
+    if (!result.has_value()) {
+        return result;
+    }
+
+    RegisterClientPayload payload;
+    payload.client_id = req.client_id;
+    payload.ip_address = *req.ip_address;
+    payload.rpc_port = *req.rpc_port;
+    payload.segments = req.segments;
+    auto err =
+        RecordOplog(OpType_REGISTER_CLIENT, "", SerializeP2PPayload(payload));
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return result;
+}
+
+auto P2PMasterService::UnregisterClient(const UnregisterClientRequest& req)
+    -> tl::expected<UnregisterClientResponse, ErrorCode> {
+    auto result = MasterService::UnregisterClient(req);
+    if (!result.has_value()) {
+        return result;
+    }
+
+    UnregisterClientPayload payload;
+    payload.client_id = req.client_id;
+    auto err =
+        RecordOplog(OpType_UNREGISTER_CLIENT, "", SerializeP2PPayload(payload));
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return result;
+}
+
+auto P2PMasterService::MountSegment(const Segment& segment,
+                                    const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    auto result = MasterService::MountSegment(segment, client_id);
+    if (!result.has_value()) {
+        return result;
+    }
+
+    MountSegmentPayload payload;
+    payload.client_id = client_id;
+    payload.segment = segment;
+    auto err =
+        RecordOplog(OpType_MOUNT_SEGMENT, "", SerializeP2PPayload(payload));
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
+auto P2PMasterService::UnmountSegment(const UUID& segment_id,
+                                      const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    auto result = MasterService::UnmountSegment(segment_id, client_id);
+    if (!result.has_value()) {
+        return result;
+    }
+
+    UnmountSegmentPayload payload;
+    payload.segment_id = segment_id;
+    payload.client_id = client_id;
+    auto err =
+        RecordOplog(OpType_UNMOUNT_SEGMENT, "", SerializeP2PPayload(payload));
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
 }
 
 auto P2PMasterService::CollectReplicaOwnerClients(
@@ -268,6 +369,17 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
                          << ", max owner client num: " << max_replicas_per_key_;
             return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
         }
+        AddReplicaPayload payload;
+        payload.object_key = std::string(key);
+        payload.client_id = client_id;
+        payload.segment_id = segment_id;
+        payload.size = size;
+        ErrorCode record_err =
+            RecordOplog(OpType_ADD_REPLICA, payload.object_key,
+                        SerializeP2PPayload(payload));
+        if (record_err != ErrorCode::OK) {
+            return tl::make_unexpected(record_err);
+        }
         AddReplicaToSegmentIndex(shard, it->first, new_replica);
         OnReplicaAdded(new_replica);
         metadata.replicas_.push_back(std::move(new_replica));
@@ -276,6 +388,17 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
         replicas.push_back(std::move(new_replica));
         auto new_meta =
             std::make_unique<ObjectMetadata>(size, std::move(replicas));
+        AddReplicaPayload payload;
+        payload.object_key = std::string(key);
+        payload.client_id = client_id;
+        payload.segment_id = segment_id;
+        payload.size = size;
+        ErrorCode record_err =
+            RecordOplog(OpType_ADD_REPLICA, payload.object_key,
+                        SerializeP2PPayload(payload));
+        if (record_err != ErrorCode::OK) {
+            return tl::make_unexpected(record_err);
+        }
         auto emplace_it =
             shard.metadata.emplace(std::string(key), std::move(new_meta)).first;
         AddReplicaToSegmentIndex(shard, emplace_it->first,
@@ -316,6 +439,16 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
         auto seg_id = rit->get_segment_id();
         auto cli_id = rit->get_p2p_client_id();
         if (cli_id && seg_id && cli_id == client_id && *seg_id == segment_id) {
+            RemoveReplicaPayload payload;
+            payload.object_key = std::string(key);
+            payload.client_id = client_id;
+            payload.segment_id = segment_id;
+            ErrorCode record_err =
+                RecordOplog(OpType_REMOVE_REPLICA, payload.object_key,
+                            SerializeP2PPayload(payload));
+            if (record_err != ErrorCode::OK) {
+                return tl::make_unexpected(record_err);
+            }
             RemoveReplicaFromSegmentIndex(shard, it->first, *rit);
             OnReplicaRemoved(*rit);
             metadata.replicas_.erase(rit);

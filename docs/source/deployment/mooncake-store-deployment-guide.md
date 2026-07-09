@@ -33,6 +33,10 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
+### P2P HA OpLog Coverage
+
+The current P2P primary master records oplog entries for explicit client and segment lifecycle changes (`REGISTER_CLIENT`, `UNREGISTER_CLIENT`, `MOUNT_SEGMENT`, `UNMOUNT_SEGMENT`) and replica mapping changes (`ADD_REPLICA`, `REMOVE_REPLICA`). Remaining failover-visible metadata mutations still need follow-up coverage, including client crash cleanup, heartbeat state transitions, replica eviction/rebalance, and task metadata.
+
 - DFS Storage (optional)
   - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
   - `--global_file_segment_size` (int64, default `int64_max`): Maximum available space for DFS segments.

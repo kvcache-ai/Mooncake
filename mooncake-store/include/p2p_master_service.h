@@ -5,6 +5,7 @@
 #include "master_service.h"
 #include "p2p_client_manager.h"
 #include "p2p_rpc_types.h"
+#include "ha/oplog/oplog_manager.h"
 
 namespace mooncake {
 
@@ -17,6 +18,15 @@ class P2PMasterService : public MasterService {
     const ClientManager& GetClientManager() const override {
         return *client_manager_;
     }
+
+    auto RegisterClient(const RegisterClientRequest& req)
+        -> tl::expected<RegisterClientResponse, ErrorCode> override;
+    auto UnregisterClient(const UnregisterClientRequest& req)
+        -> tl::expected<UnregisterClientResponse, ErrorCode> override;
+    auto MountSegment(const Segment& segment, const UUID& client_id)
+        -> tl::expected<void, ErrorCode> override;
+    auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
+        -> tl::expected<void, ErrorCode> override;
 
     /**
      * @brief Get write route based on the config in the request
@@ -59,6 +69,10 @@ class P2PMasterService : public MasterService {
      * @brief Client notifies Master that metadata sync is complete
      */
     auto SetSyncCompleted(UUID client_id) -> tl::expected<void, ErrorCode>;
+
+    ErrorCode RecordOplog(OpType type, const std::string& key,
+                          const std::string& payload = std::string(),
+                          bool sync = true);
 
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,

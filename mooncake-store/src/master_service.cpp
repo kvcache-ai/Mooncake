@@ -2,9 +2,12 @@
 
 #include <cassert>
 #include <regex>
+#include <stdexcept>
 #include <ylt/util/tl/expected.hpp>
 
 #include "client_manager.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store_factory.h"
 #include "master_metric_manager.h"
 #include "types.h"
 
@@ -23,7 +26,29 @@ MasterService::ObjectMetadata::ObjectMetadata(size_t value_length,
 }
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    : enable_ha_(config.enable_ha), view_version_(config.view_version) {}
+    : enable_ha_(config.enable_ha), view_version_(config.view_version) {
+    if (!config.enable_oplog) {
+        return;
+    }
+
+    auto store = OpLogStoreFactory::Create(
+        ParseOpLogStoreType(config.oplog_store_type), config.cluster_id,
+        OpLogStoreRole::WRITER, config.oplog_data_dir);
+    if (!store) {
+        LOG(ERROR) << "MasterService: failed to initialize OpLogStore"
+                   << ", type=" << config.oplog_store_type
+                   << ", data_dir=" << config.oplog_data_dir
+                   << ", cluster_id=" << config.cluster_id;
+        throw std::runtime_error(
+            "failed to initialize OpLogStore while oplog is enabled: type=" +
+            config.oplog_store_type + ", data_dir=" + config.oplog_data_dir +
+            ", cluster_id=" + config.cluster_id);
+    }
+
+    oplog_manager_ = std::make_unique<OpLogManager>();
+    oplog_manager_->SetOpLogStore(
+        std::shared_ptr<OpLogStore>(std::move(store)));
+}
 
 void MasterService::InitializeClientManager() {
     GetClientManager().SetSegmentRemovalCallback(
