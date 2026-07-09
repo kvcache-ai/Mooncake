@@ -135,7 +135,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
 
 ### Performance
 
-For detailed performance benchmarks and results, see the [vLLM Benchmark](../../../performance/vllm-v1-support-benchmark.md) documentation.
+For detailed performance benchmarks and results, see the [vLLM PD Disaggregation Performance](../../../performance/vllm/vllm-v1-pd-performance.md) documentation.
 
 ---
 

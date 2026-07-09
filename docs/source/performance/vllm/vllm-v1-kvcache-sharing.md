@@ -42,4 +42,3 @@ This result shows that the distributed KV cache pool substantially improves cach
 ## Benchmark Scripts
 
 The benchmark scripts are provided in the artifact repository [here](https://github.com/ivanium/vllm/tree/feat/mooncake-store-int/scripts/mooncake/artifacts).
-
