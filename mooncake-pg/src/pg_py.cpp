@@ -33,10 +33,17 @@ __attribute__((constructor)) static void MooncakeBackendConstructor() {
     kwargsCpu["devices"] = py::make_tuple("cpu");
     register_backend("mooncake-cpu", py::cpp_function(createMooncakeCpuBackend),
                      /* extended_api */ true, **kwargsCpu);
+#ifndef MOONCAKE_EP_USE_MUSA
     py::dict kwargsCuda;
     kwargsCuda["devices"] = py::make_tuple("cuda");
     register_backend("mooncake", py::cpp_function(createMooncakeBackend),
                      /* extended_api */ true, **kwargsCuda);
+#else
+    py::dict kwargsMusa;
+    kwargsMusa["devices"] = py::make_tuple("musa");
+    register_backend("mooncake", py::cpp_function(createMooncakeBackend),
+                     /* extended_api */ true, **kwargsMusa);
+#endif
 }
 
 std::string getPreferredHca(c10::intrusive_ptr<c10d::ProcessGroup> backend,

@@ -1,15 +1,13 @@
 #include <memory>
 #include <mutex>
 #include <p2p_proxy.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <thread>
-#include "cuda_alike.h"
 #include "memory_location.h"
 #include "pg_utils.h"
 
@@ -322,7 +320,9 @@ void P2PProxy::reportBrokenPeer(int peer_rank) {
     // Set peerConnected to notify the connection poller to reconnect it.
     meta_->peerConnected[peer_rank] = false;
     meta_->activeRanks[peer_rank] = false;
-    meta_->activeRanksTensor[peer_rank] = 0;
+    if (meta_->activeRanksTensor.device().is_cpu()) {
+        meta_->activeRanksTensor[peer_rank] = 0;
+    }
     LOG(ERROR) << "Rank " << meta_->rank << " marking peer " << peer_rank
                << " as broken during P2P transfer.";
 }

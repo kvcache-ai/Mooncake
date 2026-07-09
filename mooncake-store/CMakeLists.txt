@@ -48,6 +48,9 @@ if(NOT TARGET asio_shared)
   endif()
 endif()
 
+option(ENABLE_KV_EVENTS
+       "Build master KV events ZMQ publisher (requires libzmq when ON)" OFF)
+
 # Extract version components for C++ usage
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
 

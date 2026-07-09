@@ -37,5 +37,11 @@ class TestImportStructure(unittest.TestCase):
         self.assertIsNotNone(TransferEngine)
         self.assertIsNotNone(TransferOpcode)
 
+    def test_top_level_buffer_pool_alias(self):
+        """Test top-level buffer-pool exports."""
+        from mooncake import BufferPool, RegisteredBufferPool
+
+        self.assertIs(BufferPool, RegisteredBufferPool)
+
 if __name__ == '__main__':
     unittest.main()

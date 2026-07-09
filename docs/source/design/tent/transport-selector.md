@@ -124,6 +124,26 @@ For programmatic control, the `transport_index` parameter selects which transpor
 auto result = selector.select(context, transports, transport_index);
 ```
 
+## Per-request override (`transport_hint`)
+
+`Request::transport_hint` lets a caller bypass the policy lookup for one request at a time. It's the per-request analogue of `transport_index` and sits on top of the configured policies, so callers can keep the global policy config as the default while still pinning specific requests.
+
+```cpp
+Request r{};
+r.opcode = Request::WRITE;
+r.source = local_ptr;
+r.target_id = seg;
+r.target_offset = 0;
+r.length = 4096;
+r.transport_hint = TransportType::TCP;   // UNSPEC (default) defers to policy
+engine.submitTransfer(batch_id, {r});
+```
+
+### Semantics
+
+* **`UNSPEC` (default)**: unchanged — `TransportSelector::select(...)` runs as documented above.
+* **Pinned**: the request's first attempt uses the hinted transport. On failover (when enabled), the engine asks the selector for the next candidate **with the hint excluded**, so failover never loops back onto the transport that already failed.
+
 ## Default Behavior
 
 If no `policy` is configured, TENT falls back to original behavior:

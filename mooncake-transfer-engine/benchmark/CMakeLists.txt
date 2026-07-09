@@ -16,6 +16,15 @@ else()
   message(STATUS "ROCm/HIP: Disabled")
 endif()
 
+if(USE_SUNRISE)
+  add_definitions(-DUSE_SUNRISE)
+  include_directories(${MC_TANGRT_ROOT}/include)
+  link_directories(${MC_TANGRT_ROOT}/lib)
+  message(STATUS "Sunrise/Tang: Enabled")
+else()
+  message(STATUS "Sunrise/Tang: Disabled")
+endif()
+
 file(GLOB TEBENCH_SOURCES "*.cpp")
 # The TENT backend is only available when USE_TENT is enabled; drop its
 # translation unit (which pulls in tent/ headers) from non-TENT builds.
@@ -41,8 +50,16 @@ endif()
 if(USE_HIP)
   target_link_libraries(tebench PUBLIC hip::host)
 endif()
+if(USE_SUNRISE)
+  target_link_libraries(tebench PUBLIC tangrt_shared)
+endif()
 
 # Set RPATH for finding libasio.so at runtime
+if(USE_SUNRISE AND MC_TANGRT_ROOT)
+  set(TANGRT_RPATH ":${MC_TANGRT_ROOT}/lib")
+else()
+  set(TANGRT_RPATH "")
+endif()
 set_target_properties(
   tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common")
+                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
 #include <csignal>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -13,10 +14,13 @@
 
 #include "pyclient.h"
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/coro_io.hpp>
@@ -25,6 +29,8 @@
 namespace mooncake {
 
 class RealClient;
+class UdsAcceptor;
+class UdsConnection;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -104,24 +110,24 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
-    struct RegisteredBufferRegion {
+    struct WritableBufferRegion {
         void *base{nullptr};
         size_t size{0};
         size_t offset{0};
     };
 
-    std::optional<RegisteredBufferRegion> resolve_registered_buffer(
+    std::optional<WritableBufferRegion> resolve_writable_buffer_region(
         void *buffer) const;
 
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
-     * @param buffer Pointer to the pre-allocated buffer (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to a writable Store buffer, either explicitly
+     * registered with register_buffer() or inside the setup-time local buffer
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory
+     * for zero-copy operations
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
@@ -130,20 +136,17 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
-        override;
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) override;
 
     /**
-     * @brief Get object data directly into pre-allocated buffers for multiple
-     * keys (batch version)
-     * @param keys Vector of keys of the objects to get
-     * @param buffers Vector of pointers to the pre-allocated buffers
-     * @param sizes Vector of sizes of the buffers
-     * @return Vector of 64-bit integers, where each element is the number of
-     * bytes read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @brief Batch query object placement/lease metadata for later read reuse
+     * @param keys Vector of keys to query
+     * @return Vector of query results in the same order as keys
      */
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
+
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
@@ -157,8 +160,9 @@ class RealClient : public PyClient {
      * @param all_sizes Vector of vectors of sizes of the buffers
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
@@ -169,30 +173,28 @@ class RealClient : public PyClient {
     /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
-     * @param buffer Pointer to the buffer containing data (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to Store-managed registered memory, either
+     * explicitly registered with register_buffer() or inside the setup-time
+     * local buffer
      * @param size Size of the data to put
      * @return 0 on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory,
+     * either an explicit register_buffer() region or the setup-time local
+     * buffer
      */
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
 
     /**
-     * @brief Put object data directly from pre-allocated buffers for multiple
-     * keys(metadata version, better not be directly used in Python)
-     * @param keys Vector of keys of the objects to put
-     * @param buffers Vector of pointers to the pre-allocated buffers
-     * @param metadata_buffers Vector of pointers to the pre-allocated metadata
-     * buffers
-     * @param size Number of sizes of the buffers
-     * @param metadata_size Number of sizes of the metadata buffers
+     * @brief Put one object directly from a registered data buffer plus a
+     * registered metadata buffer
+     * @param key Key of the object to put
+     * @param buffer Pointer to the registered data buffer
+     * @param metadata_buffer Pointer to the registered metadata buffer
+     * @param size Size of the data buffer in bytes
+     * @param metadata_size Size of the metadata buffer in bytes
      * @param config Replication configuration
-     * @return Vector of integers, where each element is 0 on success, or a
-     * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @return 0 on success, negative value on error
      */
     int put_from_with_metadata(
         const std::string &key, void *buffer, void *metadata_buffer,
@@ -208,8 +210,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
 
     std::vector<int> batch_put_from(
@@ -227,8 +230,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,
@@ -457,6 +461,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
         int32_t device_id, const UUID &client_id);
 
     // Share mem management for dummy client
@@ -531,6 +537,11 @@ class RealClient : public PyClient {
         uint64_t total_size;
     };
 
+    tl::expected<RangedReadMetadata, ErrorCode>
+    build_ranged_read_metadata_from_query_result(
+        const std::string &key,
+        tl::expected<QueryResult, ErrorCode> query_result);
+
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
 
@@ -554,7 +565,8 @@ class RealClient : public PyClient {
         std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
             *prepared_results = nullptr,
         const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
-            nullptr);
+            nullptr,
+        const QueryResultCache *query_result_cache = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -657,6 +669,8 @@ class RealClient : public PyClient {
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<CachedQueryResultResponse> batch_get_query_results(
+        const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
     std::vector<std::string> batch_replica_clear(
@@ -778,12 +792,26 @@ class RealClient : public PyClient {
         }
     };
 
+#if defined(USE_SUNRISE)
+    struct SunriseSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                sunrise_free_memory(ptr);
+            }
+        }
+    };
+#endif
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+#if defined(USE_SUNRISE)
+    std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
+        sunrise_segment_ptrs_;
+#endif
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -821,6 +849,7 @@ class RealClient : public PyClient {
 
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    std::optional<WritableBufferRegion> local_buffer_region_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -875,18 +904,16 @@ class RealClient : public PyClient {
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;
-    std::jthread ipc_thread_;
-    std::atomic<bool> ipc_running_{false};
+    std::unique_ptr<UdsAcceptor> uds_acceptor_;
     int start_ipc_server();
     int stop_ipc_server();
-    void ipc_server_func();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server();
     void stop_http_server();
 
-    void handle_ipc_shm_register(int client_sock);
-    void handle_ipc_shm_fd_request(int client_sock);
+    void handle_ipc_shm_register(UdsConnection &connection);
+    void handle_ipc_shm_fd_request(UdsConnection &connection);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(

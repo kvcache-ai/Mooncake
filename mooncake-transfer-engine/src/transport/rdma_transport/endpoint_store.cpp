@@ -94,6 +94,26 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
+int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find endpoint by pointer
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
+        if (iter->second.get() == endpoint_ptr) {
+            std::string peer_nic_path = iter->first;
+            waiting_list_len_++;
+            iter->second->beginDestroy();
+            waiting_list_.insert(iter->second);
+            endpoint_map_.erase(iter);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            return 0;
+        }
+    }
+    return -1;  // Not found
+}
+
 void FIFOEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) return;
     std::string victim = fifo_list_.front();
@@ -129,9 +149,15 @@ int FIFOEndpointStore::destroyQPs() {
 }
 
 int FIFOEndpointStore::disconnectQPs() {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     for (auto &kv : endpoint_map_) {
-        kv.second->disconnect();
+        kv.second->beginDestroy();
+        waiting_list_.insert(kv.second);
     }
+    waiting_list_len_ += endpoint_map_.size();
+    endpoint_map_.clear();
+    fifo_list_.clear();
+    fifo_map_.clear();
     return 0;
 }
 
@@ -228,6 +254,30 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
+int SIEVEEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find endpoint by pointer
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
+        if (iter->second.first.get() == endpoint_ptr) {
+            std::string peer_nic_path = iter->first;
+            iter->second.first->beginDestroy();
+            waiting_list_len_++;
+            waiting_list_.insert(iter->second.first);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            endpoint_map_.erase(iter);
+            return 0;
+        }
+    }
+    return -1;  // Not found
+}
+
 void SIEVEEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) {
         return;
@@ -274,8 +324,16 @@ int SIEVEEndpointStore::destroyQPs() {
 }
 
 int SIEVEEndpointStore::disconnectQPs() {
-    for (auto &endpoint : waiting_list_) endpoint->disconnect();
-    for (auto &kv : endpoint_map_) kv.second.first->disconnect();
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        kv.second.first->beginDestroy();
+        waiting_list_.insert(kv.second.first);
+    }
+    waiting_list_len_ += endpoint_map_.size();
+    endpoint_map_.clear();
+    fifo_list_.clear();
+    fifo_map_.clear();
+    hand_ = std::nullopt;
     return 0;
 }
 

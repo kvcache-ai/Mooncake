@@ -5,6 +5,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -272,6 +273,39 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     // Test isExist
     int exist_result = py_client_->isExist(key);
     EXPECT_EQ(exist_result, 1) << "Key should exist";
+}
+
+TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string key = "local_buffer_subrange_key";
+    const std::string test_data = "shared-local-buffer-read";
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    auto local_alloc =
+        py_client_->client_buffer_allocator_->allocate(test_data.size() + 32);
+    ASSERT_TRUE(local_alloc.has_value());
+    BufferHandle handle = std::move(*local_alloc);
+    auto* dst = static_cast<char*>(handle.ptr()) + 16;
+    std::memset(handle.ptr(), 0, handle.size());
+
+    auto bytes_read = py_client_->get_into(key, dst, test_data.size());
+    ASSERT_EQ(bytes_read, static_cast<int64_t>(test_data.size()));
+    EXPECT_EQ(std::string(dst, test_data.size()), test_data);
 }
 
 // Test Get Operation will fail if the lease has expired.
@@ -958,6 +992,23 @@ TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
         << "Setup should preserve zero-size pure client/server semantics";
 }
 
+TEST_F(RealClientTest,
+       ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {
+    ConfigDict config = MakeConfigDict(
+        "localhost:17816", std::to_string(MAX_SEGMENT_SIZE + 1), "0");
+    config[CONFIG_KEY_PROTOCOL] = "tcp";
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = "127.0.0.1:1";
+
+    ::testing::internal::CaptureStderr();
+    auto result = py_client_->setup_internal(config);
+    const std::string logs = ::testing::internal::GetCapturedStderr();
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(logs.find("Invalid global_segment_size"), std::string::npos)
+        << "global_segment_size above MAX_SEGMENT_SIZE should be accepted as "
+           "total capacity by ConfigDict validation";
+}
+
 TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
     GLogMuter muter;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
@@ -965,15 +1016,16 @@ TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
     master_address_ = master_.master_address();
 
     struct InvalidSizeCase {
-        const char* local_hostname;
-        const char* global_segment_size;
-        const char* local_buffer_size;
+        std::string local_hostname;
+        std::string global_segment_size;
+        std::string local_buffer_size;
     };
 
     const InvalidSizeCase invalid_size_cases[] = {
         {"localhost:17816", "50%", "16MB"},
         {"localhost:17817", "16MB", "16XB"},
         {"localhost:17818", "-5", "16MB"},
+        {"localhost:17819", "0", std::to_string(MAX_SEGMENT_SIZE + 1)},
     };
 
     for (const auto& test_case : invalid_size_cases) {
@@ -1759,6 +1811,65 @@ TEST_F(RealClientTest, ErrUnmountAndFreeInvalidSegmentIds) {
     EXPECT_NE(ret, 0)
         << "Unmount-and-free of non-existent segment ids should fail";
 }
+
+#if defined(USE_SUNRISE)
+TEST_F(RealClientTest, SetupWithConfigDictAcceptsSunriseLink) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config;
+    config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost:17813";
+    config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
+    config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_PROTOCOL] = "sunrise_link";
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "setup_internal(ConfigDict) should accept sunrise_link protocol";
+}
+
+TEST_F(RealClientTest, SetupAcceptsSunriseLink) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    int result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                        16 * 1024 * 1024, 16 * 1024 * 1024,
+                                        "sunrise_link", "", master_address_);
+    EXPECT_EQ(result, 0) << "sunrise_link should work with Classic TE";
+}
+
+TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     "sunrise_link", "", master_address_),
+              0);
+
+    const std::string key = "sunrise_link_host_key";
+    const std::string value = "sunrise_link_host_value";
+    std::span<const char> data_span(value.data(), value.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    {
+        auto buffer_handle = py_client_->get_buffer(key);
+        ASSERT_NE(buffer_handle, nullptr);
+        std::string actual(static_cast<const char*>(buffer_handle->ptr()),
+                           buffer_handle->size());
+        EXPECT_EQ(actual, value);
+    }
+
+    EXPECT_EQ(py_client_->remove(key, true), 0);
+    EXPECT_EQ(py_client_->isExist(key), 0);
+}
+#endif
 
 }  // namespace testing
 

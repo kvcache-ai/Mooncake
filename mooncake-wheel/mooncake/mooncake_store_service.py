@@ -131,7 +131,8 @@ class MooncakeStoreService:
                     self.config.master_server_address,
                     None,
                     self.config.enable_ssd_offload,
-                    self.config.ssd_offload_path
+                    self.config.ssd_offload_path,
+                    self.config.tenant_id
                 )
 
                 if ret != 0:
@@ -461,15 +462,16 @@ class MooncakeStoreService:
         try:
             data = await request.json()
             key = data.get('key')
-            value = data.get('value').encode()
+            raw_value = data.get('value')
 
-            if not key or not value:
+            if not key or raw_value is None:
                 return web.Response(
                     status=400,
                     text=json.dumps({'error': 'Missing key or value'}),
                     content_type='application/json'
                 )
 
+            value = raw_value.encode()
             ret = self.store.put(key, value)
             if ret != 0:
                 return web.Response(
@@ -494,14 +496,42 @@ class MooncakeStoreService:
     async def handle_get(self, request):
         try:
             key = request.match_info['key']
-            value = self.store.get(key)
+            exists = self.store.is_exist(key)
 
-            if not value:
+            if exists == 0:
                 return web.Response(
                     status=404,
                     text=json.dumps({'error': 'Key not found'}),
                     content_type='application/json'
                 )
+            if exists < 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({'error': 'Exist check failed'}),
+                    content_type='application/json'
+                )
+
+            value = self.store.get(key)
+            if value is None:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({'error': 'GET operation failed'}),
+                    content_type='application/json'
+                )
+            if value == b"":
+                exists = self.store.is_exist(key)
+                if exists == 0:
+                    return web.Response(
+                        status=404,
+                        text=json.dumps({'error': 'Key not found'}),
+                        content_type='application/json'
+                    )
+                if exists < 0:
+                    return web.Response(
+                        status=500,
+                        text=json.dumps({'error': 'Exist check failed'}),
+                        content_type='application/json'
+                    )
 
             return web.Response(
                 status=200,
@@ -521,9 +551,16 @@ class MooncakeStoreService:
             key = request.match_info['key']
             exists = self.store.is_exist(key)
 
+            if exists < 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({'error': 'Exist check failed'}),
+                    content_type='application/json'
+                )
+
             return web.Response(
                 status=200,
-                text=json.dumps({'exists': bool(exists)}),
+                text=json.dumps({'exists': exists > 0}),
                 content_type='application/json'
             )
         except Exception as e:
@@ -639,5 +676,11 @@ async def main():
         await service.stop()
         raise
 
+
+def sync_main():
+    """Synchronous entry point for ``mc_store_rest_server`` CLI."""
+    return asyncio.run(main())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    sync_main()

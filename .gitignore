@@ -199,14 +199,14 @@ mooncake-wheel/mooncake/allocator_ascend_npu.py
 mooncake-wheel/mooncake/mooncake_master
 mooncake-wheel/mooncake/transfer_engine_bench
 
-# Claude Code Memory
-CLAUDE.md
-
 # CodeQL
 _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
+
+# core dumps
+core_*
 
 # K8s local cache (auto-generated)
 mooncake-operator/.kube/
@@ -235,12 +235,9 @@ mooncake-wheel/mooncake/mooncake_client
 # Stripped binaries (build artifacts)
 *.stripped
 
-# Docker build support files (local build artifacts)
-/mooncake_master.bin
-/libk8s_lease_wrapper.bin
-
 # MacOS
 .DS_Store
+.envrc
 
 # Next.js build artifacts
 mooncake-operator/ui/.next/

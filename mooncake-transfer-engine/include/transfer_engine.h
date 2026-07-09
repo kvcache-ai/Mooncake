@@ -25,6 +25,13 @@ class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
 };
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
+namespace device {
+class P2pTransport;
+class RdmaTransport;
+}  // namespace device
+#endif
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -65,6 +72,10 @@ class TransferEngine {
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
+    TransferEngine(TransferEngine&&) = default;
+
+    TransferEngine& operator=(TransferEngine&&) = default;
+
     ~TransferEngine();
 
     int init(const std::string& metadata_conn_string,
@@ -81,6 +92,8 @@ class TransferEngine {
     std::string getLocalIpAndPort();
 
     int getRpcPort();
+
+    bool isUsingTent() const { return use_tent_; }
 
     SegmentHandle openSegment(const std::string& segment_name);
 
@@ -151,6 +164,17 @@ class TransferEngine {
     Transport* getTransport(const std::string& proto);
 
     std::map<std::string, TransportHealth> getTransportHealthMap() const;
+
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
+    // Device transport accessors (P2P + IBGDA).  Lazily created on first
+    // call and owned by the TransferEngine.  These allow EP (and future
+    // CPU-proxy paths) to obtain device transports from an engine instance
+    // instead of calling the global factory functions directly.
+    device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
+    device::RdmaTransport* getOrCreateRdmaTransport(
+        const std::vector<std::string>& device_filter = {});
+#endif
 
     /**
      * @brief Check if TCP is the only installed transport.

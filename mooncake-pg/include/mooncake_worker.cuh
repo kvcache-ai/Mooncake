@@ -1,13 +1,20 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#if !defined(__MUSA__)
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-#include <torch/torch.h>
+#include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
+#else
+// MUSA device compilation: minimal includes to avoid mcc compiler crash
+#include <cstddef>
+#include <cstdint>
+#endif
+
+#include <cuda_alike.h>
 #include <transfer_engine.h>
 
 #include <memory>
@@ -36,19 +43,27 @@ struct TransferGroupMeta {
     int taskCount;
     bool* activeRanks;
     bool* activeRanksDevice;
+#if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
+#endif
     bool peerConnected[kMaxNumRanks]{};
     TransferEngine* engine;
+#if !defined(__MUSA__)
     c10::intrusive_ptr<::c10d::Store> store;
+#endif
     int bufferBaseIndex;
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
 };
 
-__global__ struct Task {
+#if defined(__CUDACC__) || defined(__MUSA__)
+__global__
+#endif
+    struct Task {
     volatile bool active = false;
-    c10d::OpType opType = c10d::OpType::UNKNOWN;
+    int opType =
+        0;  // c10d::OpType as int, for ABI compatibility with kernel code
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;
@@ -57,6 +72,7 @@ __global__ struct Task {
     void* transferGroupMeta;
 };
 
+#if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
@@ -124,7 +140,7 @@ class MooncakeWorker {
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
-    bool running_ = false;
+    std::atomic<bool> running_{false};
     std::atomic<bool> started_{false};
     int cuda_device_index_;
 
@@ -159,6 +175,7 @@ class MooncakeWorkerManager {
     // detached threads must not outlive the MooncakeWorker object.
     std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
+#endif  // !defined(__MUSA__)
 
 }  // namespace mooncake
 
