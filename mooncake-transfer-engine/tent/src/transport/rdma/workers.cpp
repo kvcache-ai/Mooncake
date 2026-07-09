@@ -456,7 +456,9 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
         }
 
         std::vector<bool> promote(drained.size(), false);
-        for (size_t idx : decision.promote_indices) promote[idx] = true;
+        for (size_t idx : decision.promote_indices) {
+            if (idx < drained.size()) promote[idx] = true;
+        }
         for (size_t i = 0; i < drained.size(); ++i) {
             worker.queues[promote[i] ? to : from].push(drained[i]);
         }
