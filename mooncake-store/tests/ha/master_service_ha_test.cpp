@@ -1258,6 +1258,75 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, exists.error());
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       OffloadAndPromotionSuccessRemainFunctional) {
+    const std::string cluster_id = "test_batch_record_e2e_offload_promotion";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted =
+        PrepareSimpleSegment(service, "batch_e2e_offload_promotion_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string offload_key = "batch_e2e_offload_key";
+    PutObjectOnSegment(service, mounted.client_id, offload_key,
+                       "batch_e2e_offload_promotion_seg");
+    ReadBatchEventually(storage, 2, batch);
+
+    OffloadTaskItem task{
+        .tenant_id = kDefaultTenant, .key = offload_key, .size = 1024};
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "batch_e2e_offload_endpoint";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+            .has_value());
+    ReadBatchEventually(storage, 3, batch);
+
+    auto offload_replicas = service.GetReplicaList(offload_key, kDefaultTenant);
+    ASSERT_TRUE(offload_replicas.has_value())
+        << toString(offload_replicas.error());
+    bool has_local_disk = false;
+    for (const auto& replica : offload_replicas->replicas) {
+        has_local_disk = has_local_disk || replica.is_local_disk_replica();
+    }
+    EXPECT_TRUE(has_local_disk);
+
+    const std::string promotion_key = "batch_e2e_promotion_success_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_e2e_offload_promotion_seg"};
+    auto put_start = service.PutStart(mounted.client_id, promotion_key,
+                                      kDefaultTenant, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(1u, put_start->size());
+    SeedPromotionTaskForTesting(&service, kDefaultTenant, promotion_key,
+                                mounted.client_id, put_start->front().id, 1024);
+
+    ASSERT_TRUE(service
+                    .NotifyPromotionSuccess(mounted.client_id, promotion_key,
+                                            kDefaultTenant)
+                    .has_value());
+    ReadBatchEventually(storage, 4, batch);
+
+    auto promotion_replicas =
+        service.GetReplicaList(promotion_key, kDefaultTenant);
+    ASSERT_TRUE(promotion_replicas.has_value())
+        << toString(promotion_replicas.error());
+    ASSERT_EQ(1u, promotion_replicas->replicas.size());
+    EXPECT_TRUE(promotion_replicas->replicas.front().is_memory_replica());
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
