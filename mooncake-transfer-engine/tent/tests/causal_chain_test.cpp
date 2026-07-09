@@ -31,7 +31,6 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-static constexpr SegmentID LOCAL_SEGMENT_ID = 0;
 
 class FakeSubBatch : public Transport::SubBatch {
    public:
