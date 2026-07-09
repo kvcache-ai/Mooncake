@@ -385,6 +385,10 @@ Status TransferEngineImpl::construct() {
             LOG(INFO) << "Admission queue degradation: live RDMA bw"
                       << ", theta_local="
                       << runtime_queue_config_.limits.mlu_local_threshold;
+        } else {
+            LOG(WARNING) << "Admission queue degradation requested but RDMA "
+                            "transport is "
+                            "unavailable";
         }
     }
 
