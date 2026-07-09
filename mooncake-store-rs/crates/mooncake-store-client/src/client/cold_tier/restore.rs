@@ -24,10 +24,9 @@ use std::{
 use tracing::{debug, info, warn};
 
 impl StoreClient {
-    /// Debug/test-only: evict all DRAM KV cache entries from this storage owner.
+    /// Evict all DRAM KV cache entries from this storage owner.
     ///
     /// Returns the number of entries evicted.
-    #[cfg(test)]
     pub fn debug_evict_all(&self) -> Result<usize> {
         self.wait_for_restore_promotions();
         self.storage_owner.evict_all(&self.restore_promotions)
