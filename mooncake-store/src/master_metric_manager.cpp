@@ -2228,7 +2228,7 @@ std::string MasterMetricManager::get_summary_string(
         }
     }
 
-    auto delta = [&](int64_t SummaryCounters::*field) {
+    auto delta = [&](int64_t SummaryCounters::* field) {
         if (!has_previous_summary) {
             return int64_t{0};
         }
