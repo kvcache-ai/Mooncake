@@ -205,6 +205,10 @@ class MasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys, const std::string& tenant_id);
 
+    std::vector<tl::expected<bool, ErrorCode>> RetainGroups(
+        const std::vector<std::string>& group_ids, uint64_t ttl_ms,
+        const std::string& tenant_id);
+
     /**
      * @brief Fetch all keys for a single tenant.
      * @return ErrorCode::OK if exists

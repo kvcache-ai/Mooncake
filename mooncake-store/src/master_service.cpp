@@ -2176,6 +2176,77 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     return results;
 }
 
+std::vector<tl::expected<bool, ErrorCode>> MasterService::RetainGroups(
+    const std::vector<std::string>& group_ids, uint64_t ttl_ms,
+    const std::string& tenant_id) {
+    std::vector<tl::expected<bool, ErrorCode>> results(group_ids.size());
+    if (group_ids.empty()) {
+        return results;
+    }
+    if (ttl_ms == 0) {
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    const std::string normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    std::vector<std::vector<size_t>> indices_by_shard(kNumShards);
+    for (size_t i = 0; i < group_ids.size(); ++i) {
+        indices_by_shard[getShardIndex(group_ids[i])].push_back(i);
+    }
+
+    const size_t start_shard = RandomIndex(kNumShards);
+    for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
+        const size_t shard_idx =
+            (start_shard + kNumShards - scanned) % kNumShards;
+        const auto& group_indices = indices_by_shard[shard_idx];
+        if (group_indices.empty()) {
+            continue;
+        }
+
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        MetadataShardAccessorRO shard(this, shard_idx);
+        auto tenant_it = shard->tenants.find(normalized_tenant);
+        if (tenant_it == shard->tenants.end()) {
+            for (const size_t i : group_indices) {
+                results[i] = false;
+            }
+            continue;
+        }
+
+        const auto& tenant_state = tenant_it->second;
+        for (const size_t i : group_indices) {
+            auto group_it = tenant_state.group_members.find(group_ids[i]);
+            if (group_it == tenant_state.group_members.end() ||
+                group_it->second.empty()) {
+                results[i] = false;
+                continue;
+            }
+
+            bool complete = true;
+            for (const auto& member_key : group_it->second) {
+                auto member_it = tenant_state.metadata.find(member_key);
+                if (member_it == tenant_state.metadata.end() ||
+                    !member_it->second.IsValid() ||
+                    !member_it->second.HasReplica(&Replica::fn_is_completed)) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (!complete) {
+                results[i] = false;
+                continue;
+            }
+
+            for (const auto& member_key : group_it->second) {
+                tenant_state.metadata.at(member_key).GrantLease(ttl_ms, 0);
+            }
+            results[i] = true;
+        }
+    }
+    return results;
+}
+
 auto MasterService::GetAllKeys(const std::string& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;

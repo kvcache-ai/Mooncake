@@ -76,6 +76,12 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     return result;
 }
 
+std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::RetainGroups(
+    const std::vector<std::string>& group_ids, uint64_t ttl_ms,
+    const std::string& tenant_id) {
+    return master_service_.RetainGroups(group_ids, ttl_ms, tenant_id);
+}
+
 tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>
@@ -1348,6 +1354,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RetainGroups>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);

@@ -33,6 +33,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RetainGroups> {
+    static constexpr const char* value = "RetainGroups";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
 };
@@ -467,6 +472,12 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
         object_keys.size(), object_keys, tenant_id_);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterClient::RetainGroups(
+    const std::vector<std::string>& group_ids, uint64_t ttl_ms) {
+    return invoke_batch_rpc<&WrappedMasterService::RetainGroups, bool>(
+        group_ids.size(), group_ids, ttl_ms, tenant_id_);
 }
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>

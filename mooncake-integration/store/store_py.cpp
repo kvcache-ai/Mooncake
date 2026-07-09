@@ -2289,6 +2289,22 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
+        .def(
+            "retain_groups",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &group_ids, uint64_t ttl_ms) {
+                if (!self.real_client_) {
+                    return std::vector<int>(
+                        group_ids.size(),
+                        static_cast<int>(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                return self.real_client_->retainGroups(group_ids, ttl_ms);
+            },
+            py::arg("group_ids"), py::arg("ttl_ms"),
+            "Retain all complete objects in each group for the requested TTL. "
+            "Returns 1 if retained, 0 if absent or incomplete, and a negative "
+            "error code on failure.")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;

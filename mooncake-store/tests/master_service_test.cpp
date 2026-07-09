@@ -1441,6 +1441,51 @@ TEST_F(MasterServiceTest,
     }
 }
 
+TEST_F(MasterServiceTest, RetainGroupsExtendsTheWholeGroupLease) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(100).build();
+    constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+    constexpr size_t kObjectSize = 2 * 1024 * 1024;
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "retained_group_segment",
+                             kDefaultSegmentBase, kSegmentSize);
+    const UUID client_id = generate_uuid();
+
+    const std::string key_a = "retained_group_key_a";
+    const std::string key_b = "retained_group_key_b";
+    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(*service_, client_id, key_a, config, kObjectSize);
+    PutCompletedObject(*service_, client_id, key_b, config, kObjectSize);
+
+    auto retained = service_->RetainGroups({group_id, "missing_group"}, 1000,
+                                           "default");
+    ASSERT_EQ(retained.size(), 2);
+    ASSERT_TRUE(retained[0].has_value());
+    EXPECT_TRUE(retained[0].value());
+    ASSERT_TRUE(retained[1].has_value());
+    EXPECT_FALSE(retained[1].value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ReplicateConfig trigger_config;
+    trigger_config.replica_num = 1;
+    auto trigger_result = service_->PutStart(
+        client_id, "trigger_retained_group_eviction", "default", kObjectSize,
+        trigger_config);
+    ASSERT_FALSE(trigger_result.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
+    EXPECT_TRUE(service_->GetReplicaList(key_a, "default").has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key_b, "default").has_value());
+
+    auto invalid = service_->RetainGroups({group_id}, 0, "default");
+    ASSERT_EQ(invalid.size(), 1);
+    ASSERT_FALSE(invalid[0].has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid[0].error());
+}
+
 TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
     constexpr size_t kSegmentSize = 4 * 1024 * 1024;
     constexpr size_t kObjectSize = 2 * 1024 * 1024;

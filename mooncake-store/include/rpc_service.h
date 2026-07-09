@@ -44,6 +44,10 @@ class WrappedMasterService {
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<bool, ErrorCode>> RetainGroups(
+        const std::vector<std::string>& group_ids, uint64_t ttl_ms,
+        const std::string& tenant_id = "default");
+
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
