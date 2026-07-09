@@ -87,6 +87,10 @@ class TentMetrics {
     // transfer met its deadline; mlu >= 1 means it missed. Observability only.
     void recordDeadlineMLU(double mlu);
 
+    // Causal chain: record per-stage latency breakdown (microseconds).
+    // stage: "queue_wait" | "dispatch" | "transport"
+    void recordStageLatency(const std::string& stage, double latency_us);
+
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
     std::string getJsonMetrics();
@@ -177,6 +181,21 @@ class TentMetrics {
         "tent_deadline_mlu_permille",
         "Deadline feasibility ratio (MLU x 1000) distribution",
         kMluPerMilleBuckets};
+
+    // Causal chain stage latency histograms (microseconds)
+    // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
+    static inline const std::vector<double> kStageBuckets{
+        10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
+    ylt::metric::histogram_t stage_queue_wait_{
+        "tent_stage_queue_wait_us",
+        "Causal chain: queue wait latency in microseconds", kStageBuckets};
+    ylt::metric::histogram_t stage_dispatch_{
+        "tent_stage_dispatch_us",
+        "Causal chain: dispatch latency in microseconds", kStageBuckets};
+    ylt::metric::histogram_t stage_transport_{
+        "tent_stage_transport_us",
+        "Causal chain: transport execution latency in microseconds",
+        kStageBuckets};
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
@@ -283,6 +302,14 @@ class ScopedLatencyRecorder {
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
         ::mooncake::tent::ScopedLatencyRecorder::OperationType::Write, bytes)
 
+#define TENT_RECORD_STAGE_LATENCY(stage, latency_us)                 \
+    do {                                                             \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {            \
+            ::mooncake::tent::TentMetrics::instance()                \
+                .recordStageLatency(stage, latency_us);              \
+        }                                                            \
+    } while (0)
+
 #else  // !TENT_METRICS_ENABLED
 
 // No-op stub class for ScopedLatencyRecorder when metrics are disabled
@@ -301,6 +328,7 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
+#define TENT_RECORD_STAGE_LATENCY(stage, latency_us) ((void)0)
 
 #endif  // TENT_METRICS_ENABLED
 

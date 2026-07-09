@@ -173,8 +173,8 @@ void TentMetrics::shutdown() {
 void TentMetrics::registerMetrics() {
     // Pre-allocate vectors to avoid reallocation
     counters_.reserve(7);
-    histograms_.reserve(5);
-    histogram_boundaries_.reserve(5);
+    histograms_.reserve(8);
+    histogram_boundaries_.reserve(8);
 
     // Register all counters - add new counters here
     counters_ = {
@@ -186,12 +186,14 @@ void TentMetrics::registerMetrics() {
     // Register all histograms - add new histograms here
     // Note: histogram_boundaries_ must match the order of histograms_
     histograms_ = {
-        &read_latency_, &write_latency_, &read_size_,
-        &write_size_,   &deadline_mlu_,
+        &read_latency_,     &write_latency_,   &read_size_,
+        &write_size_,       &deadline_mlu_,     &stage_queue_wait_,
+        &stage_dispatch_,   &stage_transport_,
     };
     histogram_boundaries_ = {
-        kLatencyBuckets, kLatencyBuckets,     kSizeBuckets,
-        kSizeBuckets,    kMluPerMilleBuckets,
+        kLatencyBuckets,     kLatencyBuckets,  kSizeBuckets,
+        kSizeBuckets,        kMluPerMilleBuckets, kStageBuckets,
+        kStageBuckets,       kStageBuckets,
     };
 }
 
@@ -232,6 +234,20 @@ void TentMetrics::recordDeadlineMLU(double mlu) {
     if (mlu < 0.0) return;  // defensive: ignore invalid (e.g. window <= 0)
     // Store in per-mille so the integer histogram can bucket fractional ratios.
     deadline_mlu_.observe(static_cast<int64_t>(mlu * 1000.0));
+}
+
+void TentMetrics::recordStageLatency(const std::string& stage,
+                                     double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    int64_t val = static_cast<int64_t>(latency_us);
+    if (stage == "queue_wait") {
+        stage_queue_wait_.observe(val);
+    } else if (stage == "dispatch") {
+        stage_dispatch_.observe(val);
+    } else if (stage == "transport") {
+        stage_transport_.observe(val);
+    }
 }
 
 void TentMetrics::recordReadFailed(size_t bytes) {
@@ -390,6 +406,7 @@ void TentMetrics::recordReadFailed(size_t) {}
 void TentMetrics::recordWriteFailed(size_t) {}
 void TentMetrics::recordTransportFailover() {}
 void TentMetrics::recordDeadlineMLU(double) {}
+void TentMetrics::recordStageLatency(const std::string&, double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
     return "# TENT metrics disabled at compile time\n";

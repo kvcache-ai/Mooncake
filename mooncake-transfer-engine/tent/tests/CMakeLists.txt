@@ -208,6 +208,17 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
+# Causal chain stage decomposition: validates that dispatch_time and post_time
+# timestamps are populated on both queue and direct-commit paths.
+add_executable(causal_chain_test causal_chain_test.cpp)
+target_link_libraries(causal_chain_test PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(causal_chain_test PRIVATE asio_shared)
+endif()
+target_include_directories(causal_chain_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME causal_chain_test COMMAND causal_chain_test)
+
 # TPU PJRT shim test: exercises the dlopen'd adapter ABI (device-pointer
 # classification, D2H/H2D copy, device topology) against an in-process mock
 # adapter, so it runs on any Linux host without TPU hardware or a PJRT runtime.

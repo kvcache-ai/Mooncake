@@ -60,7 +60,9 @@ struct TaskInfo {
     bool staging{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
-    std::chrono::steady_clock::time_point start_time{};  // For latency tracking
+    std::chrono::steady_clock::time_point start_time{};     // Submit time
+    std::chrono::steady_clock::time_point dispatch_time{};  // Dispatch entry
+    std::chrono::steady_clock::time_point post_time{};      // Transport post
 };
 
 class TransferEngineImpl {
