@@ -27,7 +27,22 @@ namespace mooncake {
 static std::vector<NicDiagInfo> collectLocalNics(TransferEngineImpl* impl) {
     std::vector<NicDiagInfo> nics;
     auto* transport = impl->getTransport("rdma");
-    if (!transport) return nics;
+    if (!transport) {
+        auto topo = impl->getLocalTopology();
+        if (!topo) return nics;
+
+        for (const auto& hca : topo->getHcaList()) {
+            NicDiagInfo info;
+            info.device_name = hca;
+            info.numa_node = -1;
+            info.gid_index = -1;
+            info.port = 0;
+            info.active_speed = 0;
+            info.active_width = 0;
+            nics.push_back(info);
+        }
+        return nics;
+    }
 
     auto* rdma = static_cast<RdmaTransport*>(transport);
     for (auto& ctx : rdma->getContextList()) {
@@ -42,6 +57,10 @@ static std::vector<NicDiagInfo> collectLocalNics(TransferEngineImpl* impl) {
         nics.push_back(info);
     }
     return nics;
+}
+
+static bool hasTransportDetails(const NicDiagInfo& nic) {
+    return nic.gid_index >= 0;
 }
 
 static int computeSpeedGbps(int active_speed, int active_width) {
@@ -115,6 +134,7 @@ std::string buildShowLinksJson(TransferEngineImpl* impl) {
         n["gid_index"] = nic.gid_index;
         n["port"] = nic.port;
         n["speed_gbps"] = computeSpeedGbps(nic.active_speed, nic.active_width);
+        n["source"] = hasTransportDetails(nic) ? "rdma_transport" : "topology";
         nic_arr.append(n);
     }
     root["local_nics"] = nic_arr;
@@ -138,8 +158,13 @@ std::string buildShowLinksReadable(TransferEngineImpl* impl) {
         os << "  (no RDMA devices found)\n";
     }
     for (auto& nic : nics) {
-        os << "  " << nic.device_name << "  NUMA=" << nic.numa_node
-           << "  GID=" << nic.gid << " (idx=" << nic.gid_index << ")"
+        os << "  " << nic.device_name;
+        if (!hasTransportDetails(nic)) {
+            os << "  (topology only; RDMA transport not initialized)\n";
+            continue;
+        }
+        os << "  NUMA=" << nic.numa_node << "  GID=" << nic.gid
+           << " (idx=" << nic.gid_index << ")"
            << "  Port=" << (int)nic.port << "  "
            << computeSpeedGbps(nic.active_speed, nic.active_width) << "Gbps\n";
     }
