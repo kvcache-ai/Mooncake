@@ -5040,7 +5040,7 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
     const auto now = std::chrono::steady_clock::now();
     auto it = tenant_state.promotion_candidates.find(key);
     if (it != tenant_state.promotion_candidates.end()) {
-        // Update existing entry: refresh last_seen, reset retry_after.
+        // Update existing entry: refresh last_seen, reset retry_after/retry_count.
         it->second.last_seen = now;
         it->second.last_reason = reason;
         it->second.last_error = last_error;
@@ -5048,6 +5048,7 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
             it->second.sketch_score = sketch_score;
         }
         it->second.retry_after = now;
+        it->second.retry_count = 0;
         return;
     }
 
@@ -5146,8 +5147,9 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
 }
 
 void MasterService::ClearCandidatesForReload() {
-    for (auto& shard : metadata_shards_) {
-        for (auto& [tenant_id, tenant_state] : shard.tenants) {
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& [tenant_id, tenant_state] : shard->tenants) {
             (void)tenant_id;
             tenant_state.promotion_candidates.clear();
         }
