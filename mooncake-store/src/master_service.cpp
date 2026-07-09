@@ -6905,9 +6905,10 @@ bool MasterService::TryRestoreStateFromSnapshot(
         }
 
         {
-            // Rebuild file (SSD) total capacity from restored LocalDiskSegment
-            // instances, so that the SSD Storage denominator is correct after
-            // restore (matching the mem capacity rebuild above).
+            // Rebuild file (SSD) total capacity from restored
+            // LocalDiskSegment instances, so that the SSD Storage
+            // denominator is correct after restore (matching the mem
+            // capacity rebuild above).
             ScopedLocalDiskSegmentAccess local_disk_access =
                 segment_manager_.getLocalDiskSegmentAccess();
             auto& client_local_disk =

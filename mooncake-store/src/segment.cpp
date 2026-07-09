@@ -672,8 +672,8 @@ SegmentSerializer::Serialize() {
             segment_manager_->client_local_disk_segment_.at(client_uuid);
         packer.pack(UuidToString(client_uuid));
 
-        // Serialize LocalDiskSegment: [enable_offloading, count, storage_key1,
-        // task1, storage_key2, task2, ..., ssd_total_capacity_bytes]
+        // Serialize LocalDiskSegment: [enable_offloading, count,
+        // storage_key1, task1, ..., ssd_total_capacity_bytes]
         // Sort keys to ensure determinism.
         std::vector<std::string> sorted_keys;
         for (const auto& [key, _] : segment->offloading_objects) {
@@ -1031,9 +1031,9 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             auto segment =
                 std::make_shared<LocalDiskSegment>(enable_offloading);
 
-            // Backward compatibility: the last element (ssd_total_capacity_bytes)
-            // was added later. For old snapshots without this field, the
-            // capacity defaults to 0.
+            // Backward compatibility: the last element
+            // (ssd_total_capacity_bytes) was added later. For old
+            // snapshots without this field, capacity defaults to 0.
             if (client_value.via.array.size > 2 + count * 2) {
                 size_t cap_idx = client_value.via.array.size - 1;
                 if (IsMsgpackInteger(client_value.via.array.ptr[cap_idx])) {
