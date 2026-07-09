@@ -47,6 +47,19 @@ class TransferEngineShutdownToken : public ShutdownToken {
     TransferEngine* engine_;
 };
 
+std::shared_ptr<ShutdownToken> registerTransferEngineShutdownToken(
+    TransferEngine* engine) {
+    auto token = std::make_shared<TransferEngineShutdownToken>(engine);
+    registerTokenForShutdown(token);
+    return token;
+}
+
+void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
+    if (!token) return;
+    token->detach();
+    token.reset();
+}
+
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover)
@@ -60,9 +73,11 @@ TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
       impl_tent_(std::move(other.impl_tent_)),
       use_tent_(other.use_tent_) {
-    if (other.shutdown_token_) {
-        other.shutdown_token_->detach();
-        other.shutdown_token_.reset();
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
     }
 }
 
@@ -72,9 +87,11 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
     use_tent_ = other.use_tent_;
-    if (other.shutdown_token_) {
-        other.shutdown_token_->detach();
-        other.shutdown_token_.reset();
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
     }
     return *this;
 }
@@ -90,10 +107,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
-    if (shutdown_token_) {
-        shutdown_token_->detach();
-        shutdown_token_.reset();
-    }
+    detachShutdownToken(shutdown_token_);
     if (impl_) {
         impl_->freeEngine();
         impl_.reset();
@@ -280,8 +294,7 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
 
 void TransferEngine::enableGracefulShutdown() {
     if (!shutdown_token_) {
-        shutdown_token_ = std::make_shared<TransferEngineShutdownToken>(this);
-        registerTokenForShutdown(shutdown_token_);
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
     }
     installGracefulShutdownHandlers();
 }
@@ -325,6 +338,19 @@ class TransferEngineShutdownToken : public ShutdownToken {
     TransferEngine* engine_;
 };
 
+std::shared_ptr<ShutdownToken> registerTransferEngineShutdownToken(
+    TransferEngine* engine) {
+    auto token = std::make_shared<TransferEngineShutdownToken>(engine);
+    registerTokenForShutdown(token);
+    return token;
+}
+
+void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
+    if (!token) return;
+    token->detach();
+    token.reset();
+}
+
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover) {
@@ -351,9 +377,11 @@ TransferEngine::TransferEngine(TransferEngine&& other) noexcept
       impl_tent_(std::move(other.impl_tent_)),
       shutdown_token_(nullptr),
       use_tent_(other.use_tent_) {
-    if (other.shutdown_token_) {
-        other.shutdown_token_->detach();
-        other.shutdown_token_.reset();
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
     }
 }
 
@@ -363,9 +391,11 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
     use_tent_ = other.use_tent_;
-    if (other.shutdown_token_) {
-        other.shutdown_token_->detach();
-        other.shutdown_token_.reset();
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
     }
     return *this;
 }
@@ -419,10 +449,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
-    if (shutdown_token_) {
-        shutdown_token_->detach();
-        shutdown_token_.reset();
-    }
+    detachShutdownToken(shutdown_token_);
     if (!use_tent_ && impl_) {
         impl_->freeEngine();
         impl_.reset();
@@ -795,8 +822,7 @@ void* TransferEngine::getBaseAddr() {
 
 void TransferEngine::enableGracefulShutdown() {
     if (!shutdown_token_) {
-        shutdown_token_ = std::make_shared<TransferEngineShutdownToken>(this);
-        registerTokenForShutdown(shutdown_token_);
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
     }
     installGracefulShutdownHandlers();
 }
