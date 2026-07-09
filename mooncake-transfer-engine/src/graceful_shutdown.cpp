@@ -38,7 +38,7 @@ std::atomic<bool> g_cleanup_started{false};
 
 std::mutex g_install_mutex;
 bool g_handlers_installed = false;
-pid_t g_handlers_pid = 0;
+volatile sig_atomic_t g_handlers_pid = 0;
 bool g_atexit_registered = false;
 int g_signal_pipe[2] = {-1, -1};
 volatile sig_atomic_t g_signal_seen = 0;
@@ -113,11 +113,18 @@ bool startSignalWatcherLocked(pid_t current_pid) {
         return false;
     }
 
-    g_handlers_pid = current_pid;
+    g_handlers_pid = static_cast<sig_atomic_t>(current_pid);
     return true;
 }
 
 void shutdownSignalHandler(int signo) {
+    // After fork(), only the calling thread survives. If the parent had already
+    // installed handlers, the child inherits the handler and pipe fds but not
+    // the watcher thread. Exit directly instead of blocking forever in pause().
+    if (g_handlers_pid != static_cast<sig_atomic_t>(getpid())) {
+        _Exit(128 + signo);
+    }
+
     if (g_signal_seen == 0) {
         g_signal_seen = signo;
         unsigned char signal_byte = static_cast<unsigned char>(signo);
@@ -148,7 +155,9 @@ void registerEngineForShutdown(std::shared_ptr<TransferEngineImpl> impl) {
 void installGracefulShutdownHandlers() {
     std::lock_guard<std::mutex> lock(g_install_mutex);
     pid_t current_pid = getpid();
-    if (g_handlers_installed && g_handlers_pid == current_pid) return;
+    if (g_handlers_installed &&
+        g_handlers_pid == static_cast<sig_atomic_t>(current_pid))
+        return;
 
     if (!g_atexit_registered) {
         atexit(atexitCleanup);

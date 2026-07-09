@@ -23,6 +23,22 @@
 
 using namespace mooncake;
 
+namespace {
+
+void waitChildWithTimeout(pid_t pid, int* status) {
+    for (int i = 0; i < 50; ++i) {
+        pid_t ret = waitpid(pid, status, WNOHANG);
+        ASSERT_NE(ret, -1) << "waitpid() failed";
+        if (ret == pid) return;
+        usleep(100000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, status, 0);
+    FAIL() << "child did not exit before timeout";
+}
+
+}  // namespace
+
 TEST(GracefulShutdownTest, SigtermTriggersCleanExit) {
     pid_t pid = fork();
     ASSERT_NE(pid, -1) << "fork() failed";
@@ -38,7 +54,7 @@ TEST(GracefulShutdownTest, SigtermTriggersCleanExit) {
     kill(pid, SIGTERM);
 
     int status;
-    waitpid(pid, &status, 0);
+    waitChildWithTimeout(pid, &status);
     ASSERT_TRUE(WIFEXITED(status))
         << "Child did not exit normally (signaled: " << WIFSIGNALED(status)
         << ")";
@@ -60,7 +76,7 @@ TEST(GracefulShutdownTest, SigintTriggersCleanExit) {
     kill(pid, SIGINT);
 
     int status;
-    waitpid(pid, &status, 0);
+    waitChildWithTimeout(pid, &status);
     ASSERT_TRUE(WIFEXITED(status)) << "Child did not exit normally";
     EXPECT_EQ(WEXITSTATUS(status), 128 + SIGINT);
 }
@@ -89,8 +105,31 @@ TEST(GracefulShutdownTest, EngineDestroyedBeforeSignal) {
     kill(pid, SIGTERM);
 
     int status;
-    waitpid(pid, &status, 0);
+    waitChildWithTimeout(pid, &status);
     ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 128 + SIGTERM);
+}
+
+TEST(GracefulShutdownTest, ForkAfterInstallDoesNotHangChildSignal) {
+    auto engine = std::make_unique<TransferEngine>(false);
+    engine->enableGracefulShutdown();
+
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork() failed";
+
+    if (pid == 0) {
+        pause();
+        _exit(99);
+    }
+
+    usleep(100000);
+    kill(pid, SIGTERM);
+
+    int status;
+    waitChildWithTimeout(pid, &status);
+    ASSERT_TRUE(WIFEXITED(status))
+        << "Child did not exit normally (signaled: " << WIFSIGNALED(status)
+        << ")";
     EXPECT_EQ(WEXITSTATUS(status), 128 + SIGTERM);
 }
 
@@ -111,7 +150,7 @@ TEST(GracefulShutdownTest, MultipleEngines) {
     kill(pid, SIGTERM);
 
     int status;
-    waitpid(pid, &status, 0);
+    waitChildWithTimeout(pid, &status);
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 128 + SIGTERM);
 }
