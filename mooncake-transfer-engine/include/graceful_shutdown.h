@@ -21,6 +21,17 @@ namespace mooncake {
 
 class TransferEngineImpl;
 
+class ShutdownToken {
+   public:
+    virtual ~ShutdownToken() = default;
+
+    virtual void shutdown() = 0;
+
+    virtual void detach() = 0;
+};
+
+void registerTokenForShutdown(std::shared_ptr<ShutdownToken> token);
+
 void registerEngineForShutdown(std::shared_ptr<TransferEngineImpl> impl);
 
 void installGracefulShutdownHandlers();

@@ -23,6 +23,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "transfer_engine_impl.h"
@@ -32,7 +33,7 @@ namespace mooncake {
 namespace {
 
 std::mutex g_registry_mutex;
-std::vector<std::weak_ptr<TransferEngineImpl>> g_engines;
+std::vector<std::shared_ptr<ShutdownToken>> g_tokens;
 std::atomic<bool> g_cleanup_started{false};
 
 std::mutex g_install_mutex;
@@ -42,24 +43,37 @@ bool g_atexit_registered = false;
 int g_signal_pipe[2] = {-1, -1};
 volatile sig_atomic_t g_signal_seen = 0;
 
-std::vector<std::shared_ptr<TransferEngineImpl>> collectEnginesForCleanup() {
-    std::vector<std::shared_ptr<TransferEngineImpl>> engines;
-    std::lock_guard<std::mutex> lock(g_registry_mutex);
-    for (auto& weak : g_engines) {
-        if (auto impl = weak.lock()) {
-            engines.push_back(std::move(impl));
+class TransferEngineImplShutdownToken : public ShutdownToken {
+   public:
+    explicit TransferEngineImplShutdownToken(
+        std::shared_ptr<TransferEngineImpl> impl)
+        : impl_(std::move(impl)) {}
+
+    void shutdown() override {
+        if (auto impl = impl_.lock()) {
+            impl->freeEngine();
         }
     }
-    g_engines.clear();
-    return engines;
+
+    void detach() override { impl_.reset(); }
+
+   private:
+    std::weak_ptr<TransferEngineImpl> impl_;
+};
+
+std::vector<std::shared_ptr<ShutdownToken>> collectTokensForCleanup() {
+    std::lock_guard<std::mutex> lock(g_registry_mutex);
+    auto tokens = std::move(g_tokens);
+    g_tokens.clear();
+    return tokens;
 }
 
 void cleanupEngines() {
     if (g_cleanup_started.exchange(true)) return;
 
-    auto engines = collectEnginesForCleanup();
-    for (auto& impl : engines) {
-        impl->freeEngine();
+    auto tokens = collectTokensForCleanup();
+    for (auto& token : tokens) {
+        token->shutdown();
     }
 }
 
@@ -121,15 +135,14 @@ void shutdownSignalHandler(int signo) {
 
 }  // namespace
 
-void registerEngineForShutdown(std::shared_ptr<TransferEngineImpl> impl) {
+void registerTokenForShutdown(std::shared_ptr<ShutdownToken> token) {
     std::lock_guard<std::mutex> lock(g_registry_mutex);
-    g_engines.erase(
-        std::remove_if(g_engines.begin(), g_engines.end(),
-                       [](const std::weak_ptr<TransferEngineImpl>& w) {
-                           return w.expired();
-                       }),
-        g_engines.end());
-    g_engines.push_back(impl);
+    g_tokens.push_back(std::move(token));
+}
+
+void registerEngineForShutdown(std::shared_ptr<TransferEngineImpl> impl) {
+    registerTokenForShutdown(
+        std::make_shared<TransferEngineImplShutdownToken>(std::move(impl)));
 }
 
 void installGracefulShutdownHandlers() {
@@ -149,11 +162,9 @@ void installGracefulShutdownHandlers() {
     sigemptyset(&sa.sa_mask);
     sigaddset(&sa.sa_mask, SIGTERM);
     sigaddset(&sa.sa_mask, SIGINT);
-    sigaddset(&sa.sa_mask, SIGABRT);
     sa.sa_flags = 0;
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
 
     g_handlers_installed = true;
 }
