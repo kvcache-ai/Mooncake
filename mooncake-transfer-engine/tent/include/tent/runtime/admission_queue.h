@@ -58,6 +58,7 @@ struct QueueLimits {
     // dropped instead of dispatched, and on_local_decode_suggested is raised so
     // the caller can recompute locally. Requires deadline_aware = true.
     double mlu_local_threshold{0.0};
+    uint64_t promotion_slack_ns{0};
 };
 
 struct QueueOwnerInput {

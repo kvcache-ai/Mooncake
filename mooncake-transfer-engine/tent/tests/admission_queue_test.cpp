@@ -14,6 +14,7 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -593,6 +594,43 @@ TEST(AdmissionQueueTest, Step3NoDropWithoutBandwidthProvider) {
     auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
     ASSERT_EQ(picked.size(), 1u);
     EXPECT_TRUE(dropped.empty());
+}
+
+TEST(AdmissionQueueTest, Step3DynamicBandwidthProvider) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    std::atomic<double> live_bw{1e9};
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([&] { return live_bw.load(); }, hooks,
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    // At 1e9 B/s: time=16ns, window=10ns, MLU=1.6 >= 1.5 -> DROP.
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'010)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    EXPECT_TRUE(picked.empty());
+    ASSERT_EQ(dropped.size(), 1u);
+    EXPECT_EQ(hook_calls, 1);
+
+    // Increase bandwidth 10x -> same profile becomes feasible.
+    live_bw.store(1e10);
+    status = queue.tryAdmit(
+        makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'010)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    dropped.clear();
+    picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    // At 1e10 B/s: time=1.6ns, window=10ns, MLU=0.16 < 1.5 -> OK.
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(hook_calls, 1);
 }
 
 }  // namespace

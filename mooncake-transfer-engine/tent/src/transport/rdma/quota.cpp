@@ -356,5 +356,13 @@ int DeviceSelector::getDevicePriority(int dev_id) const {
     return static_cast<int>(base_index);
 }
 
+double DeviceSelector::getAggregateEwmaBandwidth() const {
+    double total = 0.0;
+    for (const auto& [id, dev] : devices_) {
+        total += dev.getEwmaBandwidth();
+    }
+    return total > 0.0 ? total : -1.0;
+}
+
 }  // namespace tent
 }  // namespace mooncake
