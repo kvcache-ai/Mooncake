@@ -58,7 +58,7 @@ class P2pTransport {
     // Export the metadata peers need to access this rank's buffer.
     // Returns an opaque byte blob (serialised as int32_t array for Python
     // compat). For classic IPC this is a cudaIpcMemHandle-like payload; for
-    // fabric-backed paths this may instead carry the remote base VA directly.
+    // fabric-backed paths this carries a CUmemFabricHandle plus mapping size.
     virtual std::vector<int32_t> exportIpcHandle(void* ptr) = 0;
 
     // Import peer access metadata and populate the device-visible tables.
