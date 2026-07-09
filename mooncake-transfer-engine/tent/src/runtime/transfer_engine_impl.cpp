@@ -384,8 +384,7 @@ Status TransferEngineImpl::construct() {
                 DegradationHooks{}, nullptr);
             LOG(INFO) << "Admission queue degradation: live RDMA bw"
                       << ", theta_local="
-                      << runtime_queue_config_.limits
-                             .mlu_local_threshold;
+                      << runtime_queue_config_.limits.mlu_local_threshold;
         }
     }
 
