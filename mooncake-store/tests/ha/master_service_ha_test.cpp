@@ -1082,6 +1082,60 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_EQ(key, batch.entries[0].object_key);
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RemoveDurableCallbackReleasesResources) {
+    const std::string cluster_id = "test_batch_record_e2e_remove_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_store_type("etcd_batch_record")
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted =
+        PrepareSimpleSegment(service, "batch_e2e_remove_finalize_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_e2e_remove_finalize_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_e2e_remove_finalize_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    backend->BlockTxn();
+    ASSERT_TRUE(
+        service.Remove(key, kDefaultTenant, /*force=*/true).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto before_finalize = service.PutStart(
+        mounted.client_id, "batch_e2e_before_remove_finalize_key",
+        kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
+
+    auto removed = service.ExistKey(key, kDefaultTenant);
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_FALSE(removed.value());
+
+    auto after_finalize = service.PutStart(
+        mounted.client_id, "batch_e2e_after_remove_finalize_key",
+        kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
