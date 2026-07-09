@@ -1487,6 +1487,103 @@ TEST_F(MasterServiceTest, RetainGroupsProtectsFutureGroupMembers) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid[0].error());
 }
 
+TEST_F(MasterServiceTest, RetainGroupsEnforcesAdmissionBounds) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_max_retained_groups(1)
+                              .set_max_group_retention_ttl_ms(100)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    auto accepted = service_->RetainGroups({"retained_group_a"}, 80, "default");
+    ASSERT_EQ(accepted.size(), 1);
+    ASSERT_TRUE(accepted[0].has_value());
+    EXPECT_TRUE(accepted[0].value());
+
+    auto extended =
+        service_->RetainGroups({"retained_group_a"}, 100, "default");
+    ASSERT_EQ(extended.size(), 1);
+    ASSERT_TRUE(extended[0].has_value());
+    EXPECT_TRUE(extended[0].value());
+
+    auto rejected = service_->RetainGroups({"retained_group_b"}, 80, "default");
+    ASSERT_EQ(rejected.size(), 1);
+    ASSERT_TRUE(rejected[0].has_value());
+    EXPECT_FALSE(rejected[0].value());
+
+    auto too_long =
+        service_->RetainGroups({"retained_group_a"}, 101, "default");
+    ASSERT_EQ(too_long.size(), 1);
+    ASSERT_FALSE(too_long[0].has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, too_long[0].error());
+}
+
+TEST_F(MasterServiceTest, RetainGroupsAdmissionCapIsConcurrent) {
+    constexpr size_t kMaxRetainedGroups = 8;
+    constexpr size_t kRequests = 32;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_max_retained_groups(kMaxRetainedGroups)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    std::atomic<size_t> accepted{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kRequests);
+
+    for (size_t i = 0; i < kRequests; ++i) {
+        threads.emplace_back([&, i] {
+            auto result = service_->RetainGroups(
+                {"concurrent_retained_group_" + std::to_string(i)}, 1000,
+                "default");
+            if (result[0].has_value() && result[0].value()) {
+                accepted.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(accepted.load(std::memory_order_relaxed), kMaxRetainedGroups);
+}
+
+TEST_F(MasterServiceTest, RetainedGroupBecomesEvictableAfterTtl) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(20).build();
+    constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+    constexpr size_t kObjectSize = 2 * 1024 * 1024;
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "expired_retained_group_segment",
+                             kDefaultSegmentBase, kSegmentSize);
+    const UUID client_id = generate_uuid();
+
+    const std::string key_a = "expired_retained_group_key_a";
+    const std::string key_b = "expired_retained_group_key_b";
+    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+
+    auto retained = service_->RetainGroups({group_id}, 60, "default");
+    ASSERT_EQ(retained.size(), 1);
+    ASSERT_TRUE(retained[0].has_value());
+    ASSERT_TRUE(retained[0].value());
+    PutCompletedObject(*service_, client_id, key_a, config, kObjectSize);
+    PutCompletedObject(*service_, client_id, key_b, config, kObjectSize);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ReplicateConfig trigger_config;
+    trigger_config.replica_num = 1;
+    auto trigger_result =
+        service_->PutStart(client_id, "trigger_expired_retained_group_eviction",
+                           "default", kObjectSize, trigger_config);
+    ASSERT_FALSE(trigger_result.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(service_->ExistKey(key_a, "default").value_or(true));
+    EXPECT_FALSE(service_->ExistKey(key_b, "default").value_or(true));
+}
+
 TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
     constexpr size_t kSegmentSize = 4 * 1024 * 1024;
     constexpr size_t kObjectSize = 2 * 1024 * 1024;

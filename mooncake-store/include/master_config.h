@@ -694,6 +694,8 @@ class MasterServiceConfigBuilder {
    private:
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    size_t max_retained_groups_ = DEFAULT_MAX_RETAINED_GROUPS;
+    uint64_t max_group_retention_ttl_ms_ = DEFAULT_MAX_GROUP_RETENTION_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
@@ -757,6 +759,16 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_default_kv_soft_pin_ttl(uint64_t ttl) {
         default_kv_soft_pin_ttl_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_retained_groups(size_t max_groups) {
+        max_retained_groups_ = max_groups;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_group_retention_ttl_ms(uint64_t ttl) {
+        max_group_retention_ttl_ms_ = ttl;
         return *this;
     }
 
@@ -1032,6 +1044,8 @@ class MasterServiceConfig {
    public:
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    size_t max_retained_groups = DEFAULT_MAX_RETAINED_GROUPS;
+    uint64_t max_group_retention_ttl_ms = DEFAULT_MAX_GROUP_RETENTION_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
@@ -1202,6 +1216,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
+    config.max_retained_groups = max_retained_groups_;
+    config.max_group_retention_ttl_ms = max_group_retention_ttl_ms_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;

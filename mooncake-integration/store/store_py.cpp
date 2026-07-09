@@ -2303,7 +2303,8 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("group_ids"), py::arg("ttl_ms"),
             "Retain current and future objects in each group for the requested "
-            "TTL. Returns 1 if accepted and a negative error code on failure.")
+            "TTL. Returns 1 if accepted, 0 if admission is full, and a "
+            "negative error code on failure.")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;

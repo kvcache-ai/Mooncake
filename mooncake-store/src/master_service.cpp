@@ -192,6 +192,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
           }),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
+      max_retained_groups_(config.max_retained_groups),
+      max_group_retention_ttl_ms_(config.max_group_retention_ttl_ms),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
@@ -1622,6 +1624,7 @@ void MasterService::RegisterGroupMember(TenantState& tenant_state,
     const auto now = std::chrono::system_clock::now();
     if (retention_it->second <= now) {
         tenant_state.group_retention_deadlines.erase(retention_it);
+        retained_group_count_.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
     auto metadata_it = tenant_state.metadata.find(key);
@@ -2207,9 +2210,13 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::RetainGroups(
     if (group_ids.empty()) {
         return results;
     }
-    if (ttl_ms == 0) {
+    if (ttl_ms == 0 || ttl_ms > max_group_retention_ttl_ms_) {
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+    if (max_retained_groups_ == 0) {
+        std::fill(results.begin(), results.end(), false);
         return results;
     }
 
@@ -2236,6 +2243,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::RetainGroups(
              it != tenant_state.group_retention_deadlines.end();) {
             if (it->second <= now) {
                 it = tenant_state.group_retention_deadlines.erase(it);
+                retained_group_count_.fetch_sub(1, std::memory_order_relaxed);
             } else {
                 ++it;
             }
@@ -2246,9 +2254,23 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::RetainGroups(
                 continue;
             }
             const auto deadline = now + std::chrono::milliseconds(ttl_ms);
-            auto& retained_until =
-                tenant_state.group_retention_deadlines[group_ids[i]];
-            retained_until = std::max(retained_until, deadline);
+            auto retention_it =
+                tenant_state.group_retention_deadlines.find(group_ids[i]);
+            if (retention_it == tenant_state.group_retention_deadlines.end()) {
+                const auto previous = retained_group_count_.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (previous >= max_retained_groups_) {
+                    retained_group_count_.fetch_sub(1,
+                                                    std::memory_order_relaxed);
+                    results[i] = false;
+                    continue;
+                }
+                retention_it = tenant_state.group_retention_deadlines
+                                   .emplace(group_ids[i], deadline)
+                                   .first;
+            } else {
+                retention_it->second = std::max(retention_it->second, deadline);
+            }
 
             auto group_it = tenant_state.group_members.find(group_ids[i]);
             if (group_it == tenant_state.group_members.end() ||
@@ -2279,6 +2301,8 @@ void MasterService::PruneExpiredGroupRetentions() {
                  it != tenant_state.group_retention_deadlines.end();) {
                 if (it->second <= now) {
                     it = tenant_state.group_retention_deadlines.erase(it);
+                    retained_group_count_.fetch_sub(1,
+                                                    std::memory_order_relaxed);
                 } else {
                     ++it;
                 }
@@ -7877,6 +7901,7 @@ void MasterService::MetadataSerializer::Reset() {
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }
+    service_->retained_group_count_.store(0, std::memory_order_relaxed);
     {
         std::unique_lock<std::shared_mutex> lock(
             service_->group_routing_mutex_);

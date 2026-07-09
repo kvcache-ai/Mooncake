@@ -1547,6 +1547,9 @@ class MasterService {
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
+    const size_t max_retained_groups_;
+    const uint64_t max_group_retention_ttl_ms_;
+    std::atomic<size_t> retained_group_count_{0};
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
