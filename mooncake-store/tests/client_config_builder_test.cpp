@@ -2,6 +2,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <filesystem>
+#include <unordered_map>
 
 #include "client_config_builder.h"
 
@@ -44,6 +45,51 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigKeyLeaseOverrides) {
 
     EXPECT_EQ(config.p2p_key_lease_duration_ms, 3333u);
     EXPECT_EQ(config.p2p_key_lease_scan_interval_ms, 444u);
+}
+
+TEST(ClientConfigBuilderTest, BuildP2PClientConfigReadsRedisDiscoveryConfig) {
+    std::unordered_map<std::string, std::string> raw_config = {
+        {"local_hostname", "127.0.0.1:12345"},
+        {"metadata_server", "http://127.0.0.1:8080/metadata"},
+        {"master_server_addr", "redis://127.0.0.1:6379"},
+        {"tiered_backend_config", kTieredConfigJson},
+        {"redis_cluster_id", "test-cluster"},
+        {"redis_password", "test-password"},
+        {"redis_db_index", "3"},
+        {"redis_master_view_ttl_sec", "9"},
+        {"redis_heartbeat_interval_sec", "4"},
+    };
+
+    auto config = ClientConfigBuilder::build_p2p_real_client(raw_config);
+
+    EXPECT_EQ(config.redis_cluster_id, "test-cluster");
+    EXPECT_EQ(config.redis_password, "test-password");
+    EXPECT_EQ(config.redis_db_index, 3);
+    EXPECT_EQ(config.redis_master_view_ttl_sec, 9);
+    EXPECT_EQ(config.redis_heartbeat_interval_sec, 4);
+}
+
+TEST(ClientConfigBuilderTest,
+     BuildCentralizedClientConfigReadsRedisDiscoveryConfig) {
+    std::unordered_map<std::string, std::string> raw_config = {
+        {"local_hostname", "127.0.0.1:12345"},
+        {"metadata_server", "http://127.0.0.1:8080/metadata"},
+        {"master_server_addr", "redis://127.0.0.1:6379"},
+        {"redis_cluster_id", "test-cluster"},
+        {"redis_password", "test-password"},
+        {"redis_db_index", "3"},
+        {"redis_master_view_ttl_sec", "9"},
+        {"redis_heartbeat_interval_sec", "4"},
+    };
+
+    auto config =
+        ClientConfigBuilder::build_centralized_real_client(raw_config);
+
+    EXPECT_EQ(config.redis_cluster_id, "test-cluster");
+    EXPECT_EQ(config.redis_password, "test-password");
+    EXPECT_EQ(config.redis_db_index, 3);
+    EXPECT_EQ(config.redis_master_view_ttl_sec, 9);
+    EXPECT_EQ(config.redis_heartbeat_interval_sec, 4);
 }
 
 TEST(ClientConfigBuilderTest,

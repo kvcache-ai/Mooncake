@@ -33,6 +33,14 @@ namespace mooncake {
 
 using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
 
+struct ClientMasterDiscoveryConfig {
+    std::string redis_cluster_id = DEFAULT_CLUSTER_ID;
+    std::string redis_password;
+    int redis_db_index = 0;
+    int redis_master_view_ttl_sec = 5;
+    int redis_heartbeat_interval_sec = 2;
+};
+
 /**
  * @brief Result of a query operation containing replica information
  */
@@ -612,6 +620,11 @@ class ClientService {
      */
     virtual void OnHAEvent(HAEvent event) { (void)event; }
 
+    bool IsHAMode(const std::string& master_server_entry) const;
+    ErrorCode ResolveMasterAddress(const std::string& master_server_entry,
+                                   std::string& master_address);
+    void SetMasterDiscoveryConfig(const RealClientConfigBase& config);
+
    protected:
     /**
      * @brief Acquires an in-flight request guard. If the service has not been
@@ -654,8 +667,10 @@ class ClientService {
     const std::string& get_te_endpoint() const { return te_endpoint_; }
 
     const std::string metadata_connstring_;
-    // For high availability
-    MasterViewHelper master_view_helper_;
+    // For high availability. Created lazily in ResolveMasterAddress().
+    std::unique_ptr<MasterViewHelper> master_view_helper_;
+    std::string master_view_helper_entry_;
+    ClientMasterDiscoveryConfig master_discovery_config_;
     std::thread heartbeat_thread_;
     std::atomic<bool> heartbeat_running_{false};
     std::condition_variable heartbeat_cv_;
