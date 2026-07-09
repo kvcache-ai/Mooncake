@@ -465,7 +465,8 @@ else
     -DUSE_HTTP=ON \
     -DUSE_ETCD=OFF \
     -DBUILD_SHARED_LIBS=ON \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--push-state,--no-as-needed,-lrt,--pop-state"
   _timer_elapsed $_CMAKE_SHARED_CONF_START "cmake configure (shared transfer_engine)"
 
   _CMAKE_SHARED_BUILD_START=$(_timer_start)
@@ -492,7 +493,8 @@ else
     -DUSE_HTTP=ON \
     -DUSE_ETCD=OFF \
     -DBUILD_SHARED_LIBS=OFF \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--push-state,--no-as-needed,-lrt,--pop-state"
 
   _timer_elapsed $_CMAKE_CONF_START "cmake configure (static engine)"
 
