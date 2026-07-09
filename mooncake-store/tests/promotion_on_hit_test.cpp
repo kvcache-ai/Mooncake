@@ -54,6 +54,33 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_admission_threshold_;
     }
 
+    static size_t CountPromotionCandidatesForTesting(
+        MasterService* service, const std::string& tenant) {
+        return service->CountCandidatesForTesting(tenant);
+    }
+
+    static void ResetCandidateBackoffsForTesting(MasterService* service) {
+        service->ResetCandidateBackoffsForTesting();
+    }
+
+    static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
+        return service->RunPromotionCandidateRetryForTesting();
+    }
+
+    static void ClearCandidatesForReloadForTesting(MasterService* service) {
+        service->ClearCandidatesForReload();
+    }
+
+    static uint64_t GetPromotionCandidateCountForTesting(
+        MasterService* service) {
+        return service->promotion_candidate_count_.load(
+            std::memory_order_relaxed);
+    }
+
+    static uint64_t GetPromotionInFlightForTesting(MasterService* service) {
+        return service->promotion_in_flight_.load(std::memory_order_relaxed);
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     std::string WriteTenantQuotaPolicyFile(
@@ -2258,7 +2285,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
 
     EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, 1)
         << "Expected one candidate recorded on watermark rejection";
-    EXPECT_EQ(service->CountCandidatesForTesting("default"), 1u);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
 
     // A second Get on the same key should update last_seen but not add a
     // duplicate candidate.
@@ -2266,7 +2293,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
         auto r = service->GetReplicaList("k_wm", "default");
         ASSERT_TRUE(r.has_value());
     }
-    EXPECT_EQ(service->CountCandidatesForTesting("default"), 1u)
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u)
         << "Duplicate candidate must not be created";
 
     service->RemoveAll();
@@ -2293,7 +2320,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
         auto r = service->GetReplicaList("k_exhaust", "default");
         ASSERT_TRUE(r.has_value());
     }
-    ASSERT_EQ(service->CountCandidatesForTesting("default"), 1u);
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
 
     auto& mm = MasterMetricManager::instance();
     const int64_t expired_pre = mm.get_promotion_candidate_expired_evaluated();
@@ -2302,11 +2329,11 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
     // Reset backoff timestamps before each scan so wall-clock time doesn't
     // gate retries and the loop completes without sleeping.
     for (int i = 0; i <= 10; ++i) {
-        service->ResetCandidateBackoffsForTesting();
-        service->RunPromotionCandidateRetryForTesting();
+        ResetCandidateBackoffsForTesting(service.get());
+        RunPromotionCandidateRetryForTesting(service.get());
     }
 
-    EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u)
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u)
         << "Candidate must be erased after max retries";
     EXPECT_GT(mm.get_promotion_candidate_expired_evaluated() - expired_pre, 0);
 
@@ -2338,15 +2365,15 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
         auto r = service->GetReplicaList("k_rm", "default");
         ASSERT_TRUE(r.has_value());
     }
-    ASSERT_EQ(service->CountCandidatesForTesting("default"), 1u);
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
 
     // Remove the object while candidate is pending.
     auto rm = service->Remove("k_rm", "default", /*force=*/true);
     ASSERT_TRUE(rm.has_value());
 
     // Retry scan should find object gone and erase candidate.
-    service->RunPromotionCandidateRetryForTesting();
-    EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u);
+    RunPromotionCandidateRetryForTesting(service.get());
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u);
 
     EXPECT_EQ(mm.get_promotion_candidate_admitted() - admitted_pre, 0);
 
@@ -2384,7 +2411,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
     EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, kKeys);
     EXPECT_EQ(
         mm.get_promotion_candidate_expired_unevaluated() - unevaluated_pre, 0);
-    EXPECT_EQ(service->CountCandidatesForTesting("default"),
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"),
               static_cast<size_t>(kKeys));
 
     service->RemoveAll();
@@ -2411,17 +2438,14 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
         auto r = service->GetReplicaList("k_reload", "default");
         ASSERT_TRUE(r.has_value());
     }
-    ASSERT_EQ(service->CountCandidatesForTesting("default"), 1u);
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
 
     // Simulate metadata reload.
-    service->ClearCandidatesForReload();
+    ClearCandidatesForReloadForTesting(service.get());
 
-    EXPECT_EQ(service->CountCandidatesForTesting("default"), 0u);
-    EXPECT_EQ(
-        service->promotion_candidate_count_.load(std::memory_order_relaxed),
-        0u);
-    EXPECT_EQ(service->promotion_in_flight_.load(std::memory_order_relaxed),
-              0u);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u);
+    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u);
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
 
     service->RemoveAll();
 }
