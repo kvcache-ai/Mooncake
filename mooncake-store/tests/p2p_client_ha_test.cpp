@@ -4,6 +4,10 @@
 #include "p2p_client_service.h"
 #undef protected
 
+#ifdef STORE_USE_REDIS
+#include "redis_helper.h"
+#endif
+
 namespace mooncake {
 namespace testing {
 
@@ -13,6 +17,59 @@ P2PClientService MakeClient() {
     return P2PClientService("P2PHANDSHAKE", /*http_port=*/0,
                             /*enable_http_server=*/false);
 }
+
+class FailingMasterViewHelper : public MasterViewHelper {
+   public:
+    ErrorCode GetMasterView(std::string& master_address,
+                            ViewVersionId& version) override {
+        (void)master_address;
+        (void)version;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+};
+
+#ifdef STORE_USE_REDIS
+std::string RedisMasterViewKey(const std::string& cluster_id) {
+    std::string normalized_cluster_id = cluster_id;
+    if (!normalized_cluster_id.empty() && normalized_cluster_id.back() != '/') {
+        normalized_cluster_id += '/';
+    }
+    return "mooncake:{" + normalized_cluster_id + "}master_view";
+}
+
+void WriteRedisMasterViewOrSkip(const std::string& cluster_id,
+                                const std::string& master_address,
+                                ViewVersionId version) {
+    redisContext* ctx = redisConnect("127.0.0.1", 6379);
+    if (!ctx || ctx->err) {
+        if (ctx) redisFree(ctx);
+        GTEST_SKIP() << "Redis is not available on 127.0.0.1:6379";
+    }
+
+    std::string key = RedisMasterViewKey(cluster_id);
+    std::string value =
+        RedisHelper::SerializeLeaderValue(master_address, version, 30);
+    RedisReplyPtr reply(static_cast<redisReply*>(
+        redisCommand(ctx, "SET %b %b EX 30", key.data(), key.size(),
+                     value.data(), value.size())));
+    redisFree(ctx);
+
+    ASSERT_TRUE(reply);
+    ASSERT_EQ(reply->type, REDIS_REPLY_STATUS);
+}
+
+void DeleteRedisMasterView(const std::string& cluster_id) {
+    redisContext* ctx = redisConnect("127.0.0.1", 6379);
+    if (!ctx || ctx->err) {
+        if (ctx) redisFree(ctx);
+        return;
+    }
+    std::string key = RedisMasterViewKey(cluster_id);
+    RedisReplyPtr reply(static_cast<redisReply*>(
+        redisCommand(ctx, "DEL %b", key.data(), key.size())));
+    redisFree(ctx);
+}
+#endif
 
 }  // namespace
 
@@ -109,6 +166,41 @@ TEST(P2PClientHATest, RedisDiscoveryInvalidEndpointReturnsError) {
 #endif
     EXPECT_TRUE(master_address.empty());
 }
+
+#ifdef STORE_USE_REDIS
+TEST(P2PClientHATest, RecreatesMasterViewHelperAfterResolveFailure) {
+    auto client = MakeClient();
+    P2PClientConfig config;
+    config.redis_cluster_id = "p2p-client-ha-reconnect-test";
+    client.SetMasterDiscoveryConfig(config);
+
+    const std::string master_server_entry = "redis://127.0.0.1:6379";
+    const std::string expected_master_address = "127.0.0.1:51051";
+    DeleteRedisMasterView(config.redis_cluster_id);
+
+    client.master_view_helper_ = std::make_unique<FailingMasterViewHelper>();
+    client.master_view_helper_entry_ = master_server_entry;
+
+    std::string master_address;
+    auto err = client.ResolveMasterAddress(master_server_entry, master_address);
+
+    EXPECT_EQ(err, ErrorCode::INTERNAL_ERROR);
+    EXPECT_TRUE(master_address.empty());
+    EXPECT_EQ(client.master_view_helper_, nullptr);
+    EXPECT_TRUE(client.master_view_helper_entry_.empty());
+
+    WriteRedisMasterViewOrSkip(config.redis_cluster_id, expected_master_address,
+                               7);
+    err = client.ResolveMasterAddress(master_server_entry, master_address);
+
+    EXPECT_EQ(err, ErrorCode::OK);
+    EXPECT_EQ(master_address, expected_master_address);
+    EXPECT_NE(client.master_view_helper_, nullptr);
+    EXPECT_EQ(client.master_view_helper_entry_, master_server_entry);
+
+    DeleteRedisMasterView(config.redis_cluster_id);
+}
+#endif
 
 }  // namespace testing
 }  // namespace mooncake

@@ -241,6 +241,9 @@ ErrorCode ClientService::ResolveMasterAddress(
         auto helper = CreateClientMasterViewHelper(master_server_entry,
                                                    master_discovery_config_);
         if (!helper) {
+            LOG(ERROR) << "Failed to create master view helper for "
+                       << master_server_entry << ": "
+                       << toString(helper.error());
             return helper.error();
         }
         master_view_helper_ = std::move(helper.value());
@@ -252,6 +255,8 @@ ErrorCode ClientService::ResolveMasterAddress(
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to resolve master address from "
                    << master_server_entry << ": " << toString(err);
+        master_view_helper_.reset();
+        master_view_helper_entry_.clear();
     }
     return err;
 }
