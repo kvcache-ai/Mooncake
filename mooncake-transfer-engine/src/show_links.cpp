@@ -24,14 +24,12 @@
 
 namespace mooncake {
 
-static std::vector<NicDiagInfo> collectLocalNics(
-    TransferEngineImpl* impl) {
+static std::vector<NicDiagInfo> collectLocalNics(TransferEngineImpl* impl) {
     std::vector<NicDiagInfo> nics;
     auto* transport = impl->getTransport("rdma");
     if (!transport) return nics;
 
-    auto* rdma =
-        static_cast<RdmaTransport*>(transport);
+    auto* rdma = static_cast<RdmaTransport*>(transport);
     for (auto& ctx : rdma->getContextList()) {
         NicDiagInfo info;
         info.device_name = ctx->deviceName();
@@ -49,25 +47,57 @@ static std::vector<NicDiagInfo> collectLocalNics(
 static int computeSpeedGbps(int active_speed, int active_width) {
     int lane_gbps = 0;
     switch (active_speed) {
-        case 1: lane_gbps = 2; break;
-        case 2: lane_gbps = 5; break;
-        case 4: lane_gbps = 10; break;
-        case 8: lane_gbps = 10; break;
-        case 16: lane_gbps = 14; break;
-        case 32: lane_gbps = 25; break;
-        case 64: lane_gbps = 50; break;
-        case 128: lane_gbps = 100; break;
-        case 256: lane_gbps = 200; break;
-        default: lane_gbps = active_speed; break;
+        case 1:
+            lane_gbps = 2;
+            break;
+        case 2:
+            lane_gbps = 5;
+            break;
+        case 4:
+            lane_gbps = 10;
+            break;
+        case 8:
+            lane_gbps = 10;
+            break;
+        case 16:
+            lane_gbps = 14;
+            break;
+        case 32:
+            lane_gbps = 25;
+            break;
+        case 64:
+            lane_gbps = 50;
+            break;
+        case 128:
+            lane_gbps = 100;
+            break;
+        case 256:
+            lane_gbps = 200;
+            break;
+        default:
+            lane_gbps = active_speed;
+            break;
     }
     int lanes = 1;
     switch (active_width) {
-        case 1: lanes = 1; break;
-        case 2: lanes = 4; break;
-        case 4: lanes = 8; break;
-        case 8: lanes = 12; break;
-        case 16: lanes = 2; break;
-        default: lanes = 1; break;
+        case 1:
+            lanes = 1;
+            break;
+        case 2:
+            lanes = 4;
+            break;
+        case 4:
+            lanes = 8;
+            break;
+        case 8:
+            lanes = 12;
+            break;
+        case 16:
+            lanes = 2;
+            break;
+        default:
+            lanes = 1;
+            break;
     }
     return lane_gbps * lanes;
 }
@@ -108,12 +138,10 @@ std::string buildShowLinksReadable(TransferEngineImpl* impl) {
         os << "  (no RDMA devices found)\n";
     }
     for (auto& nic : nics) {
-        os << "  " << nic.device_name << "  NUMA="
-           << nic.numa_node << "  GID=" << nic.gid
-           << " (idx=" << nic.gid_index << ")"
-           << "  Port=" << (int)nic.port
-           << "  " << computeSpeedGbps(nic.active_speed, nic.active_width)
-           << "Gbps\n";
+        os << "  " << nic.device_name << "  NUMA=" << nic.numa_node
+           << "  GID=" << nic.gid << " (idx=" << nic.gid_index << ")"
+           << "  Port=" << (int)nic.port << "  "
+           << computeSpeedGbps(nic.active_speed, nic.active_width) << "Gbps\n";
     }
 
     auto topo = impl->getLocalTopology();
@@ -122,8 +150,7 @@ std::string buildShowLinksReadable(TransferEngineImpl* impl) {
         auto matrix = topo->getMatrix();
         for (auto& [location, entry] : matrix) {
             os << "  " << location << " -> preferred: [";
-            for (size_t i = 0; i < entry.preferred_hca.size();
-                 i++) {
+            for (size_t i = 0; i < entry.preferred_hca.size(); i++) {
                 if (i > 0) os << ", ";
                 os << entry.preferred_hca[i];
             }

@@ -222,7 +222,6 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
-
 std::string TransferEngine::showLinks() const {
     if (!impl_) return "{}";
     return buildShowLinksReadable(impl_.get());
@@ -677,7 +676,6 @@ void* TransferEngine::getBaseAddr() {
     } else
         return impl_->getBaseAddr();
 }
-
 
 std::string TransferEngine::showLinks() const {
     if (use_tent_ || !impl_) return "(TENT mode or not initialized)";
