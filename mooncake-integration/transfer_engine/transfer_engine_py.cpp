@@ -536,6 +536,10 @@ int TransferEnginePy::batchTransferSync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
+        for (auto& entry : entries) {
+            entry.advise_retry_cnt = retry;
+        }
+
         auto batch_id = engine_->allocateBatchID(batch_size);
         Status s =
             notify
@@ -643,6 +647,10 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
+        for (auto& entry : entries) {
+            entry.advise_retry_cnt = retry;
+        }
+
         batch_id = engine_->allocateBatchID(batch_size);
         auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
 
