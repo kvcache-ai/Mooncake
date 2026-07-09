@@ -229,4 +229,18 @@ if(USE_TPU)
     tent_tpu_pjrt_shim_test
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_pjrt_shim_test COMMAND tent_tpu_pjrt_shim_test)
+
+  # Drives TpuTransport's staging hop (interior-offset chunks, and the
+  # exactly-one-device-side guard) against the same mock adapter.
+  add_executable(tent_tpu_transport_test tpu/tpu_transport_test.cpp)
+  add_dependencies(tent_tpu_transport_test mock_tpu_pjrt)
+  target_link_libraries(tent_tpu_transport_test
+                        PRIVATE gtest gtest_main tent_link_group
+                                ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_transport_test
+    PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
