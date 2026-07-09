@@ -665,7 +665,7 @@ TEST_F(AllocationStrategyTest,
         "contiguous", kSegmentBase + 0x10000000ULL, kSegmentSize, "contiguous");
 
     std::vector<std::unique_ptr<AllocatedBuffer>> fragmented_buffers;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         auto buffer = fragmented->allocate(8 * MiB);
         ASSERT_NE(buffer, nullptr);
         fragmented_buffers.emplace_back(std::move(buffer));
