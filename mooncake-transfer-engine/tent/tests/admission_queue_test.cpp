@@ -595,6 +595,280 @@ TEST(AdmissionQueueTest, Step3NoDropWithoutBandwidthProvider) {
     EXPECT_TRUE(dropped.empty());
 }
 
+// --- Deadline proximity promotion (step 4) --------------------------------
+
+QueueLimits promotionLimits(uint64_t slack_ns) {
+    QueueLimits limits{8, 1 << 20, 0, 0};
+    limits.deadline_aware = true;
+    limits.promotion_slack_ns = slack_ns;
+    return limits;
+}
+
+TEST(AdmissionQueueTest, PromotionDisabledKeepsEdfOrder) {
+    // promotion_slack_ns = 0 (default): pure EDF, no reordering.
+    QueueLimits limits{4, 4096, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    // Deadlines: 2000, 1500, 1800 → EDF: 1500, 1800, 2000.
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(1, 3,
+                           {makeOwnerWithDeadline(0, 16, 2000),
+                            makeOwnerWithDeadline(1, 16, 1500),
+                            makeOwnerWithDeadline(2, 16, 1800)}),
+                ids)
+            .code(),
+        Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 4096);
+    const std::vector<QueueOwnerId> expected{2, 3, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionMovesUrgentOwnersToFront) {
+    // slack threshold = 500 ns, now = 1000.
+    // owner A: deadline 2000, slack = 1000 → NOT promoted.
+    // owner B: deadline 1400, slack = 400 → promoted.
+    // owner C: deadline 1300, slack = 300 → promoted.
+    // Without promotion, EDF order is: C(1300), B(1400), A(2000).
+    // With promotion, promoted group {C,B} stays EDF among themselves → same.
+    // But the key test: B and C are still dispatched before A even though A
+    // might have been ahead in some FIFO scenario.
+    LocalTransferAdmissionQueue queue(promotionLimits(500));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(queue
+                  .tryAdmit(makeSubmit(1, 3,
+                                       {makeOwnerWithDeadline(0, 16, 2000),
+                                        makeOwnerWithDeadline(1, 16, 1400),
+                                        makeOwnerWithDeadline(2, 16, 1300)}),
+                            ids)
+                  .code(),
+              Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    // C(promoted,dl=1300) → B(promoted,dl=1400) → A(not promoted,dl=2000)
+    const std::vector<QueueOwnerId> expected{3, 2, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionReordersAcrossSeparateAdmits) {
+    // Owners admitted in separate calls with different deadlines.
+    // now = 5000, slack threshold = 2000.
+    // owner 1 (batch 1): deadline 10000, slack = 5000 → NOT promoted.
+    // owner 2 (batch 2): deadline 6500,  slack = 1500 → promoted.
+    // owner 3 (batch 3): deadline 6000,  slack = 1000 → promoted.
+    // Static EDF: 6000(3), 6500(2), 10000(1).
+    // After promotion: promoted {3,2} move ahead of {1} → same as EDF here,
+    // but the partition ensures urgents are prioritized over comfortable.
+    LocalTransferAdmissionQueue queue(promotionLimits(2000));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{5000}; });
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(queue
+                  .tryAdmit(makeSubmit(1, 1,
+                                       {makeOwnerWithDeadline(0, 16, 10000)}),
+                            ids)
+                  .code(),
+              Status::Code::kOk);
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 6500)}), ids)
+            .code(),
+        Status::Code::kOk);
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 6000)}), ids)
+            .code(),
+        Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    // Promoted (dl 6000, 6500) then non-promoted (dl 10000).
+    const std::vector<QueueOwnerId> expected{3, 2, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionSkipsNoDeadlineOwners) {
+    // Owners without a deadline (0) are never promoted regardless of slack.
+    LocalTransferAdmissionQueue queue(promotionLimits(5000));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    // owner 1: no deadline → not promoted.
+    // owner 2: deadline 2000, slack = 1000 → promoted.
+    ASSERT_EQ(queue
+                  .tryAdmit(makeSubmit(1, 2,
+                                       {makeOwnerWithDeadline(0, 16, 0),
+                                        makeOwnerWithDeadline(1, 16, 2000)}),
+                            ids)
+                  .code(),
+              Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    // owner 2 promoted ahead of owner 1 (no deadline stays behind).
+    const std::vector<QueueOwnerId> expected{2, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionPreservesEdfWithinPromotedGroup) {
+    // Multiple owners within the promotion threshold: their relative EDF
+    // order is preserved by stable_partition.
+    // now = 1000, slack threshold = 2000.
+    // owner A: deadline 2500, slack = 1500 → promoted.
+    // owner B: deadline 2200, slack = 1200 → promoted.
+    // owner C: deadline 2800, slack = 1800 → promoted.
+    // EDF order at admission: B(2200), A(2500), C(2800). All promoted.
+    // stable_partition preserves this relative order.
+    LocalTransferAdmissionQueue queue(promotionLimits(2000));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(queue
+                  .tryAdmit(makeSubmit(1, 3,
+                                       {makeOwnerWithDeadline(0, 16, 2500),
+                                        makeOwnerWithDeadline(1, 16, 2200),
+                                        makeOwnerWithDeadline(2, 16, 2800)}),
+                            ids)
+                  .code(),
+              Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    // EDF within promoted: B(2200)=id2, A(2500)=id1, C(2800)=id3.
+    const std::vector<QueueOwnerId> expected{2, 1, 3};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionCoexistsWithStep3Drop) {
+    // When both promotion and drop are active: first promote, then drop
+    // infeasible from the front. Owner with critical slack that is also
+    // infeasible should be dropped, not dispatched.
+    QueueLimits limits = promotionLimits(500);
+    limits.mlu_local_threshold = 1.5;
+    LocalTransferAdmissionQueue queue(limits);
+    // now = 1000, bandwidth = 1e9 B/s.
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    // owner 1: deadline 1010, slack = 10, length 16B → 16ns transfer,
+    //   MLU = 16e-9 / 10e-9 = 1.6 ≥ 1.5 → DROP (even though promoted).
+    // owner 2: deadline 1400, slack = 400 → promoted, MLU feasible.
+    // owner 3: deadline 5000, slack = 4000 → not promoted, feasible.
+    ASSERT_EQ(queue
+                  .tryAdmit(makeSubmit(1, 3,
+                                       {makeOwnerWithDeadline(0, 16, 1010),
+                                        makeOwnerWithDeadline(1, 16, 1400),
+                                        makeOwnerWithDeadline(2, 16, 5000)}),
+                            ids)
+                  .code(),
+              Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+
+    // owner 1 dropped, owner 2 dispatched (promoted), owner 3 dispatched.
+    const std::vector<QueueOwnerId> exp_pick{2, 3};
+    const std::vector<QueueOwnerId> exp_drop{1};
+    EXPECT_EQ(picked, exp_pick);
+    EXPECT_EQ(dropped, exp_drop);
+    EXPECT_EQ(hook_calls, 1);
+}
+
+TEST(AdmissionQueueTest, PromotionWithAdvancingTime) {
+    // Dispatch in two rounds. On first round, owner B has comfortable slack.
+    // On second round (time advanced), owner B enters critical slack and is
+    // promoted ahead of owner C.
+    QueueLimits limits = promotionLimits(500);
+    LocalTransferAdmissionQueue queue(limits);
+
+    uint64_t fake_now = 1000;
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [&] { return fake_now; });
+
+    std::vector<QueueOwnerId> ids;
+    // owner 1: deadline 1800, owner 2: deadline 1400, owner 3: deadline 3000.
+    // Admit across batches.
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1800)}), ids)
+            .code(),
+        Status::Code::kOk);
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 1400)}), ids)
+            .code(),
+        Status::Code::kOk);
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 3000)}), ids)
+            .code(),
+        Status::Code::kOk);
+
+    // Round 1: now = 1000. Slacks: 800, 400, 2000. Threshold 500.
+    // owner 2 (slack 400) → promoted. owner 1 (slack 800) → not promoted.
+    auto picked1 = queue.pickForDispatch(1, 1 << 20);
+    // Only 1 slot: picks owner 2 (promoted, earliest deadline in group).
+    ASSERT_EQ(picked1.size(), 1u);
+    EXPECT_EQ(picked1[0], 2u);
+
+    // Complete owner 2 so it's out.
+    ASSERT_EQ(
+        queue.complete(2, TransferStatusEnum::COMPLETED).code(),
+        Status::Code::kOk);
+
+    // Round 2: advance time. now = 1500. Slacks: 300(owner1), 1500(owner3).
+    // owner 1 (slack 300) → promoted.
+    fake_now = 1500;
+    auto picked2 = queue.pickForDispatch(2, 1 << 20);
+    // owner 1 promoted first, then owner 3.
+    const std::vector<QueueOwnerId> expected2{1, 3};
+    EXPECT_EQ(picked2, expected2);
+}
+
+TEST(AdmissionQueueTest, PromotionDisabledWithoutDeadlineAware) {
+    // promotion_slack_ns > 0 but deadline_aware = false → no promotion.
+    QueueLimits limits{4, 4096, 0, 0};
+    limits.deadline_aware = false;
+    limits.promotion_slack_ns = 5000;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    // FIFO order: 0(dl=1200), 1(dl=5000), 2(dl=1100).
+    ASSERT_EQ(queue
+                  .tryAdmit(makeSubmit(1, 3,
+                                       {makeOwnerWithDeadline(0, 16, 1200),
+                                        makeOwnerWithDeadline(1, 16, 5000),
+                                        makeOwnerWithDeadline(2, 16, 1100)}),
+                            ids)
+                  .code(),
+              Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 4096);
+    // Strict FIFO (deadline_aware = false ignores EDF and promotion).
+    const std::vector<QueueOwnerId> expected{1, 2, 3};
+    EXPECT_EQ(picked, expected);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

@@ -242,17 +242,42 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     const bool drop_enabled = limits_.deadline_aware &&
                               limits_.mlu_local_threshold > 0.0 &&
                               static_cast<bool>(bandwidth_provider_);
+    const bool promotion_enabled =
+        limits_.deadline_aware && limits_.promotion_slack_ns > 0;
+    const bool need_now = drop_enabled || promotion_enabled;
     const double bw_bps = drop_enabled ? bandwidth_provider_() : 0.0;
     const uint64_t now_ns =
-        drop_enabled
+        need_now
             ? (now_provider_
                    ? now_provider_()
                    : static_cast<uint64_t>(
-                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now()
                                  .time_since_epoch())
                              .count()))
             : 0;
+
+    // Deadline proximity promotion: partition fifo_ so owners with critical
+    // slack (deadline approaching within promotion_slack_ns) appear before
+    // owners with comfortable slack or no deadline. stable_partition preserves
+    // relative EDF order within each group.
+    if (promotion_enabled) {
+        std::stable_partition(
+            fifo_.begin(), fifo_.end(),
+            [&](QueueOwnerId id) {
+                auto it = owners_.find(id);
+                if (it == owners_.end() ||
+                    it->second.state != QueueState::Queued) {
+                    return false;
+                }
+                const uint64_t dl =
+                    it->second.request.deadline_ns;
+                if (dl == 0 || dl <= now_ns) return false;
+                return (dl - now_ns) <
+                       limits_.promotion_slack_ns;
+            });
+    }
 
     // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
     // if the owner is predicted to miss its deadline hard enough to drop.
