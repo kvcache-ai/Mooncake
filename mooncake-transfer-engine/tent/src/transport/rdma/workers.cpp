@@ -410,8 +410,8 @@ void Workers::asyncPostSend() {
             flows.reserve(slices.size());
             for (const RdmaSlice* s : slices) {
                 if (s && s->task) {
-                    flows.push_back(ArbFlow{s->task->request.deadline_ns,
-                                            s->task->request.length});
+                    flows.push_back(
+                        ArbFlow{s->task->request.deadline_ns, s->length});
                 } else {
                     flows.push_back(ArbFlow{0, 0});
                 }
