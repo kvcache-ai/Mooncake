@@ -214,9 +214,8 @@ class MasterService {
      */
     auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
 
-    auto ListWarmupTargets(
-        const UUID& client_id, uint64_t max_targets,
-        const std::vector<std::string>& preferred_protocols)
+    auto ListWarmupTargets(const UUID& client_id, uint64_t max_targets,
+                           const std::vector<std::string>& preferred_protocols)
         -> tl::expected<std::vector<WarmupTarget>, ErrorCode>;
 
     /**

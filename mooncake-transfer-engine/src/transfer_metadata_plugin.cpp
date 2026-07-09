@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -626,43 +627,71 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     void closeListen() {
-        if (listen_fd_ >= 0) {
-            // LOG(INFO) << "SocketHandShakePlugin: closing listen socket";
-            close(listen_fd_);
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lock(listen_fd_mutex_);
+            fd = listen_fd_;
             listen_fd_ = -1;
         }
+        if (fd >= 0) {
+            shutdown(fd, SHUT_RDWR);
+            close(fd);
+        }
     }
 
-    virtual ~SocketHandShakePlugin() {
-        if (listener_running_) {
-            listener_running_ = false;
-            queue_cv_.notify_all();
-            if (listener_.joinable()) listener_.join();
-            for (auto& worker : workers_) {
-                if (worker.joinable()) worker.join();
-            }
+    void drainQueuedConnections() {
+        std::queue<int> pending;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            pending.swap(conn_queue_);
         }
-        closeListen();
+        while (!pending.empty()) {
+            close(pending.front());
+            pending.pop();
+        }
     }
+
+    void stopDaemon() {
+        const bool was_running =
+            listener_running_.exchange(false, std::memory_order_acq_rel);
+        closeListen();
+        queue_cv_.notify_all();
+        if (listener_.joinable()) listener_.join();
+        drainQueuedConnections();
+        queue_cv_.notify_all();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+        workers_.clear();
+        if (was_running) {
+            VLOG(1) << "SocketHandShakePlugin: listener stopped";
+        }
+    }
+
+    virtual ~SocketHandShakePlugin() { stopDaemon(); }
 
     virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         on_connection_callback_ = callback;
     }
 
     virtual void registerOnMetadataCallBack(OnReceiveCallBack callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         on_metadata_callback_ = callback;
     }
 
     virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         on_notify_callback_ = callback;
     }
 
     virtual void registerOnProbeCallBack(OnReceiveCallBack callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         on_probe_callback_ = callback;
     }
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
-        if (listener_running_) {
+        if (listener_running_.load(std::memory_order_acquire)) {
             // LOG(INFO) << "SocketHandShakePlugin: listener already running";
             return 0;
         }
@@ -734,9 +763,17 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
-        listener_running_ = true;
+        listener_running_.store(true, std::memory_order_release);
         const int num_workers =
             std::max(1, globalConfig().handshake_worker_threads);
+        if (num_workers > 1) {
+            LOG(WARNING)
+                << "SocketHandShakePlugin: MC_HANDSHAKE_WORKER_THREADS="
+                << num_workers
+                << " enables experimental concurrent inbound handshake "
+                   "callbacks. Keep the default 1 to preserve serialized "
+                   "callback semantics.";
+        }
         for (int i = 0; i < num_workers; ++i) {
             workers_.emplace_back([this]() {
                 while (true) {
@@ -744,10 +781,15 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     {
                         std::unique_lock<std::mutex> lock(queue_mutex_);
                         queue_cv_.wait(lock, [this]() {
-                            return !listener_running_ || !conn_queue_.empty();
+                            return !listener_running_.load(
+                                       std::memory_order_acquire) ||
+                                   !conn_queue_.empty();
                         });
                         if (conn_queue_.empty()) {
-                            if (!listener_running_) return;
+                            if (!listener_running_.load(
+                                    std::memory_order_acquire)) {
+                                return;
+                            }
                             continue;
                         }
                         conn_fd = conn_queue_.front();
@@ -758,12 +800,16 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             });
         }
 
-        listener_ = std::thread([this]() {
-            while (listener_running_) {
+        const int listener_fd = listen_fd_;
+        listener_ = std::thread([this, listener_fd]() {
+            while (listener_running_.load(std::memory_order_acquire)) {
                 sockaddr_in addr;
                 socklen_t addr_len = sizeof(sockaddr_in);
-                int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
+                int conn_fd = accept(listener_fd, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
+                    if (!listener_running_.load(std::memory_order_acquire)) {
+                        break;
+                    }
                     if (errno != EWOULDBLOCK && errno != EINTR)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
                     continue;
@@ -821,21 +867,27 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return;
         }
 
+        OnReceiveCallBack callback;
         if (type == HandShakeRequestType::Connection ||
             type == HandShakeRequestType::OldProtocol) {
-            if (on_connection_callback_) on_connection_callback_(peer, local);
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            callback = on_connection_callback_;
         } else if (type == HandShakeRequestType::Metadata) {
-            if (on_metadata_callback_) on_metadata_callback_(peer, local);
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            callback = on_metadata_callback_;
         } else if (type == HandShakeRequestType::Notify) {
-            if (on_notify_callback_) on_notify_callback_(peer, local);
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            callback = on_notify_callback_;
         } else if (type == HandShakeRequestType::Probe) {
-            if (on_probe_callback_) on_probe_callback_(peer, local);
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            callback = on_probe_callback_;
         } else {
             LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                           "message type";
             close(conn_fd);
             return;
         }
+        if (callback) callback(peer, local);
 
         int ret = writeString(conn_fd, type, Json::FastWriter{}.write(local));
         if (ret) {
@@ -1278,12 +1330,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
     int listen_backlog_;
+    std::mutex listen_fd_mutex_;
 
     std::vector<std::thread> workers_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::queue<int> conn_queue_;
 
+    std::mutex callback_mutex_;
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
     OnReceiveCallBack on_notify_callback_;

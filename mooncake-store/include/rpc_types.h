@@ -84,6 +84,9 @@ struct NoFSegmentOwnerInfo {
 YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
 
 struct WarmupTarget {
+    // Store warmup is transport connection warmup, not KV data warmup. The
+    // master only returns eligible targets; the requesting Store Client issues
+    // the READ-only probe.
     std::string segment_name;
     UUID segment_id{0, 0};
     UUID client_id{0, 0};

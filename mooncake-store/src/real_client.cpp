@@ -944,15 +944,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     if (client_) {
-        const char* env = std::getenv("MC_STORE_WARMUP");
+        const char *env = std::getenv("MC_STORE_WARMUP");
         bool enable_warmup = enable_store_warmup;
         if (env) {
             std::string val = env;
             std::transform(val.begin(), val.end(), val.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            enable_warmup = enable_warmup ||
-                            (val == "1" || val == "true" ||
-                             val == "yes" || val == "on");
+            enable_warmup = enable_warmup || (val == "1" || val == "true" ||
+                                              val == "yes" || val == "on");
         }
         if (enable_warmup) {
             if (!local_buffer_region_.has_value() ||
@@ -965,8 +964,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 auto warmup_result = client_->warmup(client_buffer_allocator_);
                 if (!warmup_result) {
                     LOG(WARNING)
-                        << "Warmup failed: "
-                        << toString(warmup_result.error())
+                        << "Warmup failed: " << toString(warmup_result.error())
                         << ", continuing setup (will connect on demand)";
                 }
             }
@@ -1100,16 +1098,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                    enable_store_warmup_str.end(),
                    enable_store_warmup_str.begin(),
                    [](unsigned char c) { return std::tolower(c); });
-    bool enable_store_warmup = (enable_store_warmup_str == "true" ||
-                                enable_store_warmup_str == "1" ||
-                                enable_store_warmup_str == "yes" ||
-                                enable_store_warmup_str == "on");
+    bool enable_store_warmup =
+        (enable_store_warmup_str == "true" || enable_store_warmup_str == "1" ||
+         enable_store_warmup_str == "yes" || enable_store_warmup_str == "on");
 
-    return setup_internal(
-        local_hostname, metadata_server, global_segment_size, local_buffer_size,
-        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
-        enable_store_warmup);
+    return setup_internal(local_hostname, metadata_server, global_segment_size,
+                          local_buffer_size, protocol, rdma_devices,
+                          master_server_addr, nullptr, ipc_socket_path, 50052,
+                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
+                          enable_store_warmup);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(

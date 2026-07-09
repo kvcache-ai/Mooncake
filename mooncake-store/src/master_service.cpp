@@ -2193,8 +2193,26 @@ auto MasterService::ListWarmupTargets(
 
     auto protocol_allowed = [&](const std::string& protocol) {
         if (preferred_protocols.empty()) return true;
+        // Store segment protocol is normally a single token such as "tcp",
+        // "rdma", or "ub". Some deployments may persist a token list; match
+        // exact tokens only to avoid cross-protocol warmup by substring.
+        auto token_matches = [&](const std::string& preferred) {
+            size_t start = 0;
+            while (start < protocol.size()) {
+                start = protocol.find_first_not_of(" ,;|+", start);
+                if (start == std::string::npos) break;
+                const size_t end = protocol.find_first_of(" ,;|+", start);
+                const auto token = protocol.substr(
+                    start,
+                    end == std::string::npos ? std::string::npos : end - start);
+                if (token == preferred) return true;
+                if (end == std::string::npos) break;
+                start = end + 1;
+            }
+            return false;
+        };
         for (const auto& preferred : preferred_protocols) {
-            if (protocol.find(preferred) != std::string::npos) return true;
+            if (token_matches(preferred)) return true;
         }
         return false;
     };
@@ -2202,6 +2220,14 @@ auto MasterService::ListWarmupTargets(
     std::vector<WarmupTarget> targets;
     targets.reserve(all_segments.size());
     for (const auto& [segment, owner_client_id] : all_segments) {
+        if (owner_client_id == client_id) {
+            continue;
+        }
+        const std::string segment_name =
+            segment.te_endpoint.empty() ? segment.name : segment.te_endpoint;
+        if (segment_name.empty()) {
+            continue;
+        }
         SegmentStatus status;
         err = segment_access.GetSegmentStatusByName(segment.name, status);
         if (err != ErrorCode::OK || status != SegmentStatus::OK) {
@@ -2212,13 +2238,12 @@ auto MasterService::ListWarmupTargets(
         }
 
         WarmupTarget target;
-        target.segment_name = segment.te_endpoint.empty() ? segment.name
-                                                          : segment.te_endpoint;
+        target.segment_name = segment_name;
         target.segment_id = segment.id;
         target.client_id = owner_client_id;
         target.protocol = segment.protocol;
-        target.is_local = owner_client_id == client_id;
-        target.allow_warmup = !target.is_local && !target.segment_name.empty();
+        target.is_local = false;
+        target.allow_warmup = true;
         target.priority = targets.size();
         targets.emplace_back(std::move(target));
 

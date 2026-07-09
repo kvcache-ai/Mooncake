@@ -15,7 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -575,9 +575,10 @@ class Client {
     /**
      * @brief Warm up transport-level connections to eligible remote segments.
      *
-     * The warmup path is best-effort and READ-only. It uses registered client
-     * buffers as local destinations, validates remote buffer metadata, and
-     * never writes remote memory.
+     * This is connection warmup, not KV data warmup. The warmup path is
+     * best-effort and READ-only: it uses registered client buffers as local
+     * destinations, validates remote buffer metadata, and never writes remote
+     * memory. The default probe size is 64 bytes.
      */
     [[nodiscard]] tl::expected<void, ErrorCode> warmup(
         const std::shared_ptr<ClientBufferAllocator>& allocator);

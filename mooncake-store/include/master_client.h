@@ -390,9 +390,8 @@ class MasterClient {
      * @brief Fetch policy-filtered warmup targets for this client.
      */
     [[nodiscard]] tl::expected<std::vector<WarmupTarget>, ErrorCode>
-    ListWarmupTargets(
-        uint64_t max_targets,
-        const std::vector<std::string>& preferred_protocols = {});
+    ListWarmupTargets(uint64_t max_targets,
+                      const std::vector<std::string>& preferred_protocols = {});
 
     /**
      * @brief Gets all mounted NoF segments that match a segment name together

@@ -22,6 +22,7 @@
 #include <ranges>
 #include <span>
 #include <sched.h>
+#include <stdexcept>
 #include <thread>
 #include <set>
 #include <utility>
@@ -2730,45 +2731,50 @@ tl::expected<void, ErrorCode> Client::warmup(
         return {};
     }
 
-    auto read_size_from_env = []() -> size_t {
-        constexpr size_t kDefaultReadSize = 64;
-        const char* env = std::getenv("MC_STORE_WARMUP_READ_SIZE");
-        if (!env || env[0] == '\0') return kDefaultReadSize;
-        try {
-            auto value = static_cast<size_t>(std::stoull(env));
-            return value == 0 ? kDefaultReadSize : value;
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Invalid MC_STORE_WARMUP_READ_SIZE='" << env
-                         << "': " << e.what() << ", using "
-                         << kDefaultReadSize;
-            return kDefaultReadSize;
-        }
-    };
-    auto uint_from_env = [](const char* name, uint64_t default_value) {
+    constexpr uint64_t kDefaultReadSize = 64;
+    constexpr uint64_t kDefaultWarmupTimeoutMs = 1000;
+    constexpr uint64_t kDefaultWarmupMaxTargets = 0;
+    constexpr uint64_t kDefaultWarmupConcurrency = 16;
+    constexpr uint64_t kMaxWarmupConcurrency = 128;
+    constexpr uint64_t kMaxWarmupTimeoutMs = 60000;
+
+    auto uint_from_env = [](const char* name, uint64_t default_value,
+                            bool allow_zero, uint64_t max_value) -> uint64_t {
         const char* env = std::getenv(name);
         if (!env || env[0] == '\0') return default_value;
         try {
-            return static_cast<uint64_t>(std::stoull(env));
+            if (env[0] == '-') {
+                throw std::invalid_argument("negative value");
+            }
+            size_t pos = 0;
+            auto value = static_cast<uint64_t>(std::stoull(env, &pos));
+            if (pos != std::strlen(env) || (!allow_zero && value == 0) ||
+                (max_value > 0 && value > max_value)) {
+                LOG(WARNING) << "Invalid " << name << "='" << env << "', using "
+                             << default_value;
+                return default_value;
+            }
+            return value;
         } catch (const std::exception& e) {
-            LOG(WARNING) << "Invalid " << name << "='" << env << "': "
-                         << e.what() << ", using " << default_value;
+            LOG(WARNING) << "Invalid " << name << "='" << env
+                         << "': " << e.what() << ", using " << default_value;
             return default_value;
         }
     };
 
-    constexpr uint64_t kDefaultWarmupConcurrency = 16;
-    constexpr uint64_t kMaxWarmupConcurrency = 128;
-    const size_t warmup_read_size = read_size_from_env();
+    // MC_STORE_WARMUP_READ_SIZE is in bytes. It controls the size of the
+    // READ-only connection probe, not the size of a user data block.
+    const size_t warmup_read_size = static_cast<size_t>(uint_from_env(
+        "MC_STORE_WARMUP_READ_SIZE", kDefaultReadSize, false, 1024 * 1024));
     const uint64_t warmup_timeout_ms =
-        uint_from_env("MC_STORE_WARMUP_TIMEOUT_MS", 1000);
-    const uint64_t warmup_max_targets =
-        uint_from_env("MC_STORE_WARMUP_MAX_TARGETS", 0);
-    const uint64_t requested_concurrency =
-        uint_from_env("MC_STORE_WARMUP_CONCURRENCY",
-                      kDefaultWarmupConcurrency);
+        uint_from_env("MC_STORE_WARMUP_TIMEOUT_MS", kDefaultWarmupTimeoutMs,
+                      false, kMaxWarmupTimeoutMs);
+    const uint64_t warmup_max_targets = uint_from_env(
+        "MC_STORE_WARMUP_MAX_TARGETS", kDefaultWarmupMaxTargets, true, 0);
+    const uint64_t requested_concurrency = uint_from_env(
+        "MC_STORE_WARMUP_CONCURRENCY", kDefaultWarmupConcurrency, false, 0);
     const size_t warmup_concurrency = static_cast<size_t>(
-        std::clamp<uint64_t>(requested_concurrency, 1,
-                             kMaxWarmupConcurrency));
+        std::clamp<uint64_t>(requested_concurrency, 1, kMaxWarmupConcurrency));
     if (requested_concurrency > kMaxWarmupConcurrency) {
         LOG(WARNING) << "warmup: MC_STORE_WARMUP_CONCURRENCY="
                      << requested_concurrency << " exceeds max "
@@ -2779,9 +2785,8 @@ tl::expected<void, ErrorCode> Client::warmup(
     if (!protocol_.empty()) {
         preferred_protocols.push_back(protocol_);
     }
-    auto targets_result =
-        master_client_.ListWarmupTargets(warmup_max_targets,
-                                         preferred_protocols);
+    auto targets_result = master_client_.ListWarmupTargets(warmup_max_targets,
+                                                           preferred_protocols);
     if (!targets_result) {
         LOG(WARNING) << "warmup: ListWarmupTargets failed: "
                      << toString(targets_result.error())
@@ -2791,15 +2796,48 @@ tl::expected<void, ErrorCode> Client::warmup(
 
     const auto& targets = targets_result.value();
     LOG(INFO) << "warmup: pre-establishing READ-only connections to "
-              << targets.size() << " target(s), concurrency="
-              << warmup_concurrency << ", timeout_ms=" << warmup_timeout_ms
-              << ", read_size=" << warmup_read_size;
+              << targets.size()
+              << " target(s), concurrency=" << warmup_concurrency
+              << ", timeout_ms=" << warmup_timeout_ms
+              << ", max_targets=" << warmup_max_targets
+              << ", read_size_bytes=" << warmup_read_size;
 
     std::atomic<size_t> next_index{0};
     std::atomic<size_t> success_count{0};
     std::atomic<size_t> failed_count{0};
     std::atomic<size_t> skipped_count{0};
     std::atomic<size_t> timeout_count{0};
+    std::atomic<bool> stop_submitting{false};
+
+    struct PendingWarmupBatch {
+        Transport::BatchID batch_id;
+        std::string segment_name;
+    };
+    std::mutex pending_batches_mutex;
+    std::vector<PendingWarmupBatch> pending_batches;
+
+    auto is_terminal = [](const Transport::TransferStatus& ts) {
+        return ts.s == Transport::COMPLETED || ts.s == Transport::FAILED ||
+               ts.s == Transport::INVALID;
+    };
+    auto free_batch = [&](Transport::BatchID batch_id,
+                          const std::string& segment_name) {
+        auto free_status = transfer_engine_->freeBatchID(batch_id);
+        if (!free_status.ok()) {
+            LOG(WARNING) << "warmup: freeBatchID failed for '" << segment_name
+                         << "': " << free_status.message();
+            return false;
+        }
+        return true;
+    };
+    auto record_pending_batch = [&](Transport::BatchID batch_id,
+                                    const std::string& segment_name) {
+        {
+            std::lock_guard<std::mutex> lock(pending_batches_mutex);
+            pending_batches.push_back({batch_id, segment_name});
+        }
+        stop_submitting.store(true, std::memory_order_release);
+    };
 
     auto warmup_one = [&](const WarmupTarget& target, void* warmup_buffer) {
         if (!target.allow_warmup || target.is_local ||
@@ -2858,7 +2896,7 @@ tl::expected<void, ErrorCode> Client::warmup(
         if (!status.ok()) {
             LOG(WARNING) << "warmup: READ submitTransfer failed for '"
                          << target.segment_name << "': " << status.message();
-            transfer_engine_->freeBatchID(batch_id);
+            free_batch(batch_id, target.segment_name);
             failed_count.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -2875,8 +2913,7 @@ tl::expected<void, ErrorCode> Client::warmup(
                 timed_out = false;
                 break;
             }
-            if (ts.s == Transport::COMPLETED ||
-                ts.s == Transport::FAILED || ts.s == Transport::INVALID) {
+            if (is_terminal(ts)) {
                 timed_out = false;
                 terminal = true;
                 break;
@@ -2887,9 +2924,9 @@ tl::expected<void, ErrorCode> Client::warmup(
         if (terminal) {
             auto free_status = transfer_engine_->freeBatchID(batch_id);
             if (!free_status.ok()) {
-                LOG(WARNING) << "warmup: freeBatchID failed for '"
-                             << target.segment_name
-                             << "': " << free_status.message();
+                LOG(WARNING)
+                    << "warmup: freeBatchID failed for '" << target.segment_name
+                    << "': " << free_status.message();
             } else {
                 batch_freed = true;
             }
@@ -2900,15 +2937,14 @@ tl::expected<void, ErrorCode> Client::warmup(
             LOG(WARNING) << "warmup: READ timed out for '"
                          << target.segment_name << "' after "
                          << warmup_timeout_ms
-                         << " ms; batch left pending";
+                         << " ms; deferring batch free and stopping new "
+                            "warmup submissions";
+            record_pending_batch(batch_id, target.segment_name);
             timeout_count.fetch_add(1, std::memory_order_relaxed);
         } else {
             if (!batch_freed) {
-                auto free_status = transfer_engine_->freeBatchID(batch_id);
-                if (!free_status.ok()) {
-                    LOG(WARNING) << "warmup: freeBatchID failed for '"
-                                 << target.segment_name
-                                 << "': " << free_status.message();
+                if (!free_batch(batch_id, target.segment_name)) {
+                    record_pending_batch(batch_id, target.segment_name);
                 }
             }
             failed_count.fetch_add(1, std::memory_order_relaxed);
@@ -2917,7 +2953,7 @@ tl::expected<void, ErrorCode> Client::warmup(
 
     const auto start = std::chrono::steady_clock::now();
     const size_t worker_count = std::min(warmup_concurrency, targets.size());
-    std::vector<std::shared_ptr<BufferHandle>> worker_buffers;
+    std::vector<BufferHandle> worker_buffers;
     worker_buffers.reserve(worker_count);
     for (size_t i = 0; i < worker_count; ++i) {
         auto worker_buf = allocator->allocate(warmup_read_size);
@@ -2926,7 +2962,7 @@ tl::expected<void, ErrorCode> Client::warmup(
             break;
         }
         std::memset(worker_buf->ptr(), 0, worker_buf->size());
-        worker_buffers.emplace_back(std::move(worker_buf));
+        worker_buffers.emplace_back(std::move(*worker_buf));
     }
     if (worker_buffers.empty() && !targets.empty()) {
         LOG(WARNING) << "warmup: no worker buffers available, skipping";
@@ -2936,17 +2972,60 @@ tl::expected<void, ErrorCode> Client::warmup(
     std::vector<std::thread> workers;
     workers.reserve(worker_buffers.size());
     for (auto& worker_buf : worker_buffers) {
-        workers.emplace_back([&, warmup_buffer = worker_buf->ptr()]() {
+        void* warmup_buffer = worker_buf.ptr();
+        workers.emplace_back([&, warmup_buffer]() {
             while (true) {
+                if (stop_submitting.load(std::memory_order_acquire)) return;
                 const size_t index =
                     next_index.fetch_add(1, std::memory_order_relaxed);
                 if (index >= targets.size()) return;
+                if (stop_submitting.load(std::memory_order_acquire)) return;
                 warmup_one(targets[index], warmup_buffer);
             }
         });
     }
     for (auto& worker : workers) {
         if (worker.joinable()) worker.join();
+    }
+
+    const auto pending_drain_timeout = std::chrono::milliseconds(
+        std::min<uint64_t>(1000, std::max<uint64_t>(100, warmup_timeout_ms)));
+    const auto pending_drain_deadline =
+        std::chrono::steady_clock::now() + pending_drain_timeout;
+    while (std::chrono::steady_clock::now() < pending_drain_deadline) {
+        bool drained_any = false;
+        {
+            std::lock_guard<std::mutex> lock(pending_batches_mutex);
+            for (auto it = pending_batches.begin();
+                 it != pending_batches.end();) {
+                Transport::TransferStatus ts{};
+                auto s =
+                    transfer_engine_->getTransferStatus(it->batch_id, 0, ts);
+                if (s.ok() && is_terminal(ts)) {
+                    if (free_batch(it->batch_id, it->segment_name)) {
+                        drained_any = true;
+                        it = pending_batches.erase(it);
+                    } else {
+                        ++it;
+                    }
+                    continue;
+                }
+                ++it;
+            }
+            if (pending_batches.empty()) break;
+        }
+        if (!drained_any) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(pending_batches_mutex);
+        if (!pending_batches.empty()) {
+            LOG(WARNING) << "warmup: " << pending_batches.size()
+                         << " timed-out batch(es) still pending after "
+                         << pending_drain_timeout.count()
+                         << " ms drain; no more warmup submissions were made";
+        }
     }
 
     const auto duration_ms =

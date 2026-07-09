@@ -882,12 +882,11 @@ tl::expected<std::vector<WarmupTarget>, ErrorCode>
 MasterClient::ListWarmupTargets(
     uint64_t max_targets, const std::vector<std::string>& preferred_protocols) {
     ScopedVLogTimer timer(1, "MasterClient::ListWarmupTargets");
-    timer.LogRequest("client_id=", client_id_,
-                     ", max_targets=", max_targets);
+    timer.LogRequest("client_id=", client_id_, ", max_targets=", max_targets);
 
     auto result = invoke_rpc<&WrappedMasterService::ListWarmupTargets,
-                             std::vector<WarmupTarget>>(
-        client_id_, max_targets, preferred_protocols);
+                             std::vector<WarmupTarget>>(client_id_, max_targets,
+                                                        preferred_protocols);
     timer.LogResponseExpected(result);
     return result;
 }
