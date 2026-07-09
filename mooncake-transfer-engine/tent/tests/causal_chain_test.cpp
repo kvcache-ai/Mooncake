@@ -14,6 +14,11 @@ using std::chrono::steady_clock;
 
 static constexpr SegmentID LOCAL_SEGMENT_ID = 0;
 
+class FakeSubBatch : public Transport::SubBatch {
+   public:
+    size_t size() const override { return task_list.size(); }
+};
+
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(TransportType type) : type_(type) {}
@@ -28,7 +33,7 @@ class FakeTransport : public Transport {
 
     Status allocateSubBatch(std::shared_ptr<SubBatch>& sub_batch,
                             size_t max_size) override {
-        sub_batch = std::make_shared<SubBatch>();
+        sub_batch = std::make_shared<FakeSubBatch>();
         sub_batch->max_size = max_size;
         return Status::OK();
     }
