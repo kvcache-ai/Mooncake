@@ -27,6 +27,7 @@
 #include "ha/oplog/oplog_batch_standby_reader.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -291,6 +292,32 @@ class MasterServiceHATest : public ::testing::Test {
         ASSERT_EQ(ErrorCode::OK, read_err);
     }
 
+    void ReadRemoveBatchEventually(OpLogBatchStorage& storage,
+                                   uint64_t first_batch_id,
+                                   const std::string& key,
+                                   OpLogBatchRecord& batch) const {
+        bool saw_remove = false;
+        for (int attempt = 0; attempt < 50 && !saw_remove; ++attempt) {
+            for (uint64_t batch_id = first_batch_id;
+                 batch_id < first_batch_id + 8 && !saw_remove; ++batch_id) {
+                if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+                    continue;
+                }
+                for (const auto& entry : batch.entries) {
+                    if (entry.op_type == OpType::REMOVE &&
+                        entry.object_key == key) {
+                        saw_remove = true;
+                        break;
+                    }
+                }
+            }
+            if (!saw_remove) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        ASSERT_TRUE(saw_remove);
+    }
+
     std::string PutObjectWithTenant(MasterService& service,
                                     const UUID& client_id,
                                     const std::string& key,
@@ -399,18 +426,28 @@ class MasterServiceHATest : public ::testing::Test {
                                                        payload);
     }
 
-    static tl::expected<OpLogEntry, ErrorCode> AppendWaitDurableForTesting(
-        MasterService& service, OpType type, const std::string& tenant_id,
-        const std::string& key, const std::string& payload) {
-        return service.AppendOpLogAndWaitDurable(type, tenant_id, key, payload);
-    }
-
     static tl::expected<OpLogEntry, ErrorCode> AppendFinalizeForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload,
         MasterService::DurableFinalizeCallback callback) {
         return service.AppendOpLogWithDurableFinalize(
             type, tenant_id, key, payload, std::move(callback));
+    }
+
+    static tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+    ReserveBatchSlotForTesting(MasterService& service) {
+        if (!service.ordered_oplog_writer_) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return service.ordered_oplog_writer_->Reserve();
+    }
+
+    static void PrepareUnmountSegmentForTesting(MasterService& service,
+                                                const UUID& segment_id) {
+        auto segment_access = service.segment_manager_.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
+                                     segment_id, metrics_dec_capacity));
     }
 
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
@@ -720,12 +757,6 @@ TEST_F(MasterServiceHATest, BatchRecordSubmissionHelpersUseOrderedWriter) {
     ASSERT_TRUE(visible.has_value());
     EXPECT_EQ(1u, visible.value());
 
-    auto durable = AppendWaitDurableForTesting(
-        service, OpType::PUT_END, "tenant", "wait_key", "wait_payload");
-    ASSERT_TRUE(durable.has_value());
-    EXPECT_EQ(2u, durable->sequence_id);
-    EXPECT_EQ("wait_key", durable->object_key);
-
     std::promise<OpLogEntry> finalized_promise;
     auto finalized_future = finalized_promise.get_future();
     auto finalized = AppendFinalizeForTesting(
@@ -734,20 +765,20 @@ TEST_F(MasterServiceHATest, BatchRecordSubmissionHelpersUseOrderedWriter) {
             finalized_promise.set_value(durable_entry);
         });
     ASSERT_TRUE(finalized.has_value());
-    EXPECT_EQ(3u, finalized->sequence_id);
+    EXPECT_EQ(2u, finalized->sequence_id);
 
     ASSERT_EQ(std::future_status::ready,
               finalized_future.wait_for(std::chrono::seconds(5)));
     OpLogEntry finalized_entry = finalized_future.get();
-    EXPECT_EQ(3u, finalized_entry.sequence_id);
+    EXPECT_EQ(2u, finalized_entry.sequence_id);
     EXPECT_EQ(OpType::REMOVE, finalized_entry.op_type);
     EXPECT_EQ("remove_key", finalized_entry.object_key);
 
     OpLogBatchStorage storage(cluster_id, *backend);
     DurablePrefix prefix;
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
-    EXPECT_EQ(3u, prefix.batch_id);
-    EXPECT_EQ(3u, prefix.last_seq);
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(2u, prefix.last_seq);
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
@@ -1083,6 +1114,43 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
+       RemoveFailsBeforeMutationWhenBatchReservationUnavailable) {
+    const std::string cluster_id = "test_batch_record_remove_reserve_full";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_remove_reserve_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_remove_reserve_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_remove_reserve_seg");
+    ReadBatchEventually(storage, 2, batch);
+
+    auto held_reservation = ReserveBatchSlotForTesting(service);
+    ASSERT_TRUE(held_reservation.has_value())
+        << toString(held_reservation.error());
+
+    auto removed = service.Remove(key, kDefaultTenant, /*force=*/true);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, removed.error());
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    EXPECT_EQ(1u, replicas->replicas.size());
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
        RemoveDurableCallbackReleasesResources) {
     const std::string cluster_id = "test_batch_record_e2e_remove_finalize";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
@@ -1133,6 +1201,205 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     auto after_finalize = service.PutStart(
         mounted.client_id, "batch_e2e_after_remove_finalize_key",
         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       ClearInvalidHandlesReleasesResourcesAfterDurable) {
+    const std::string cluster_id = "test_batch_record_stale_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_store_type("etcd_batch_record")
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_stale_finalize_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto spare =
+        PrepareSimpleSegment(service, "batch_stale_finalize_spare",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 2, batch);
+
+    const std::string key = "batch_stale_finalize_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_stale_finalize_seg");
+    ReadBatchEventually(storage, 3, batch);
+
+    backend->BlockTxn();
+    auto unmounted =
+        service.UnmountSegment(mounted.segment_id, mounted.client_id);
+    ASSERT_TRUE(unmounted.has_value()) << toString(unmounted.error());
+
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_stale_finalize_spare"};
+    auto before_finalize =
+        service.PutStart(spare.client_id, "batch_stale_before_finalize",
+                         kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadRemoveBatchEventually(storage, 4, key, batch);
+
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> after_finalize =
+        tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+    for (int i = 0; i < 50; ++i) {
+        after_finalize =
+            service.PutStart(spare.client_id, "batch_stale_after_finalize",
+                             kDefaultTenant, 1024, config);
+        if (after_finalize.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       UpsertStartStaleCleanupReleasesResourcesAfterDurable) {
+    const std::string cluster_id = "test_batch_record_upsert_stale_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_store_type("etcd_batch_record")
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_upsert_stale_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto spare =
+        PrepareSimpleSegment(service, "batch_upsert_stale_spare",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 2, batch);
+
+    const std::string key = "batch_upsert_stale_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_upsert_stale_seg");
+    ReadBatchEventually(storage, 3, batch);
+
+    PrepareUnmountSegmentForTesting(service, mounted.segment_id);
+    backend->BlockTxn();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_upsert_stale_spare"};
+    auto upsert_result =
+        service.UpsertStart(spare.client_id, key, kDefaultTenant, 1024, config);
+    EXPECT_FALSE(upsert_result.has_value());
+
+    auto before_finalize =
+        service.PutStart(spare.client_id, "batch_upsert_stale_before_finalize",
+                         kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadRemoveBatchEventually(storage, 4, key, batch);
+
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> after_finalize =
+        tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+    for (int i = 0; i < 50; ++i) {
+        after_finalize =
+            service.PutStart(spare.client_id, "batch_upsert_stale_after",
+                             kDefaultTenant, 1024, config);
+        if (after_finalize.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       BatchRemoveStaleCleanupReleasesResourcesAfterDurable) {
+    const std::string cluster_id =
+        "test_batch_record_batch_remove_stale_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_store_type("etcd_batch_record")
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted =
+        PrepareSimpleSegment(service, "batch_remove_stale_finalize_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto spare =
+        PrepareSimpleSegment(service, "batch_remove_stale_finalize_spare",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 2, batch);
+
+    const std::string key = "batch_remove_stale_finalize_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_remove_stale_finalize_seg");
+    ReadBatchEventually(storage, 3, batch);
+
+    PrepareUnmountSegmentForTesting(service, mounted.segment_id);
+    backend->BlockTxn();
+
+    auto remove_result = service.BatchRemove({key}, kDefaultTenant,
+                                             /*force=*/true);
+    ASSERT_EQ(1u, remove_result.size());
+    EXPECT_FALSE(remove_result[0].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result[0].error());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_remove_stale_finalize_spare"};
+    auto before_finalize =
+        service.PutStart(spare.client_id, "batch_remove_stale_before_finalize",
+                         kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadRemoveBatchEventually(storage, 4, key, batch);
+
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> after_finalize =
+        tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+    for (int i = 0; i < 50; ++i) {
+        after_finalize =
+            service.PutStart(spare.client_id, "batch_remove_stale_after",
+                             kDefaultTenant, 1024, config);
+        if (after_finalize.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
@@ -1482,6 +1749,154 @@ TEST_F(MasterServiceHATest, PutEndVisibleBeforeBatchRecordDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 2, batch);
+}
+
+TEST_F(MasterServiceHATest, CopyEndVisibleBeforeBatchRecordDurable) {
+    const std::string cluster_id = "test_batch_record_copy_end_visible";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto source = PrepareSimpleSegment(service, "batch_copy_visible_src");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_copy_visible_key";
+    PutObjectOnSegment(service, source.client_id, key,
+                       "batch_copy_visible_src");
+    ReadBatchEventually(storage, 2, batch);
+
+    PrepareSimpleSegment(service, "batch_copy_visible_dst",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_TRUE(service
+                    .CopyStart(source.client_id, key, kDefaultTenant,
+                               "batch_copy_visible_src",
+                               {"batch_copy_visible_dst"})
+                    .has_value());
+
+    backend->BlockTxn();
+    auto copy_future = std::async(std::launch::async, [&] {
+        return service.CopyEnd(source.client_id, key, kDefaultTenant);
+    });
+    const auto status = copy_future.wait_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(std::future_status::ready, status)
+        << "CopyEnd must queue batch OpLog and return before durable";
+    if (status != std::future_status::ready) {
+        backend->AllowTxn();
+    }
+    auto copy_end = copy_future.get();
+    ASSERT_TRUE(copy_end.has_value()) << toString(copy_end.error());
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(3u, prefix.batch_id);
+    EXPECT_EQ(3u, prefix.last_seq);
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(2u, replicas->replicas.size());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+}
+
+TEST_F(MasterServiceHATest,
+       MoveEndHidesSourceBeforeDurableAndReleasesAfterDurable) {
+    const std::string cluster_id = "test_batch_record_move_end_visible";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .set_eviction_high_watermark_ratio(1.0)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto source = PrepareSimpleSegment(service, "batch_move_visible_src",
+                                       kDefaultSegmentBase, 1024);
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_move_visible_key";
+    PutObjectOnSegment(service, source.client_id, key, "batch_move_visible_src",
+                       1024);
+    ReadBatchEventually(storage, 2, batch);
+
+    PrepareSimpleSegment(service, "batch_move_visible_dst",
+                         kDefaultSegmentBase + kDefaultSegmentSize, 1024);
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_TRUE(service
+                    .MoveStart(source.client_id, key, kDefaultTenant,
+                               "batch_move_visible_src",
+                               "batch_move_visible_dst")
+                    .has_value());
+
+    backend->BlockTxn();
+    auto move_future = std::async(std::launch::async, [&] {
+        return service.MoveEnd(source.client_id, key, kDefaultTenant);
+    });
+    const auto status = move_future.wait_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(std::future_status::ready, status)
+        << "MoveEnd must queue batch OpLog and return before durable";
+    if (status != std::future_status::ready) {
+        backend->AllowTxn();
+    }
+    auto move_end = move_future.get();
+    ASSERT_TRUE(move_end.has_value()) << toString(move_end.error());
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(3u, prefix.batch_id);
+    EXPECT_EQ(3u, prefix.last_seq);
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(1u, replicas->replicas.size());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_move_visible_src"};
+    auto before_finalize =
+        service.PutStart(source.client_id, "batch_move_before_finalize",
+                         kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> after_finalize =
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    for (int i = 0; i < 50; ++i) {
+        after_finalize =
+            service.PutStart(source.client_id, "batch_move_after_finalize",
+                             kDefaultTenant, 1024, config);
+        if (after_finalize.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
 TEST_F(MasterServiceHATest,
@@ -2717,23 +3132,18 @@ TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
     ASSERT_TRUE(visible.has_value());
     EXPECT_EQ(1u, visible.value());
 
-    auto durable = AppendWaitDurableForTesting(
-        service, OpType::PUT_END, "tenant", "wait_key", "wait_payload");
-    ASSERT_TRUE(durable.has_value());
-    EXPECT_EQ(2u, durable->sequence_id);
-
     bool finalized = false;
     auto finalized_entry = AppendFinalizeForTesting(
         service, OpType::REMOVE, "tenant", "remove_key", {},
         [&finalized](const OpLogEntry& durable_entry) {
             finalized = true;
-            EXPECT_EQ(3u, durable_entry.sequence_id);
+            EXPECT_EQ(2u, durable_entry.sequence_id);
             EXPECT_EQ("remove_key", durable_entry.object_key);
         });
     ASSERT_TRUE(finalized_entry.has_value());
     EXPECT_TRUE(finalized);
-    EXPECT_EQ(3u, finalized_entry->sequence_id);
-    EXPECT_EQ(3u, mock_store->EntryCount());
+    EXPECT_EQ(2u, finalized_entry->sequence_id);
+    EXPECT_EQ(2u, mock_store->EntryCount());
 }
 
 TEST_F(MasterServiceHATest, BatchRecordModeRejectsDirectLegacyOpLogWrites) {

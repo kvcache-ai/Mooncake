@@ -42,6 +42,7 @@
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_store.h"
 #include "ha/oplog/oplog_store_factory.h"
+#include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
 
@@ -1530,6 +1531,25 @@ class MasterService {
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+    void FinalizeExpiredProcessingReplicasAfterDurable(
+        const OpLogEntry& durable_entry,
+        const std::chrono::system_clock::time_point& ttl);
+    void FinalizeExpiredReplicationTaskAfterDurable(
+        const OpLogEntry& durable_entry, ReplicaID source_id,
+        const std::vector<ReplicaID>& target_ids,
+        const std::chrono::system_clock::time_point& ttl);
+    struct StaleHandleCleanupPlan {
+        std::vector<ReplicaID> removed_ids;
+        std::vector<Replica::Descriptor> remaining;
+        bool would_invalidate{false};
+    };
+    StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
+        const ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const;
+    tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
+        const std::string& why, const TenantId& tenant_id,
+        const std::string& key, ObjectMetadata& metadata,
+        const StaleHandleCleanupPlan& plan);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -1703,7 +1723,8 @@ class MasterService {
             // violation (client_mutex_ must be acquired before metadata shard).
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
-            if (tenant_state_ != nullptr &&
+            if (!(service_->enable_ha_ && service_->use_batch_oplog_) &&
+                tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
@@ -2280,11 +2301,14 @@ class MasterService {
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);
-    tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndWaitDurable(
-        OpType type, const std::string& tenant_id, const std::string& key,
-        const std::string& payload);
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
         OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload, DurableFinalizeCallback callback);
+    tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+    ReserveBatchOpLogSlot();
+    tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
+        OrderedOpLogWriter::Reservation&& reservation, OpType type,
+        const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
     ErrorCode PersistOpLogEntryWithSyncRetries(const OpLogEntry& entry) const;
 
