@@ -16,6 +16,7 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <sstream>
@@ -33,6 +34,12 @@ namespace tent {
 thread_local int tl_wid = -1;
 
 namespace {
+struct ArbitrationEntry {
+    RdmaSlice* slice;
+    double mlu;
+    size_t order;
+};
+
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
 // map. Returning a stable reference is safe because the map stores values
 // via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
@@ -406,21 +413,32 @@ void Workers::asyncPostSend() {
                                                 .default_bandwidth_gbps *
                                             1e9 / 8.0
                                       : 0.0;
-            std::vector<ArbFlow> flows;
-            flows.reserve(slices.size());
-            for (const RdmaSlice* s : slices) {
-                if (s && s->task) {
-                    flows.push_back(
-                        ArbFlow{s->task->request.deadline_ns, s->length});
-                } else {
-                    flows.push_back(ArbFlow{0, 0});
+            if (bw_bps > 0.0) {
+                thread_local std::vector<ArbitrationEntry> scratch;
+                scratch.clear();
+                scratch.reserve(slices.size());
+
+                for (size_t i = 0; i < slices.size(); ++i) {
+                    const RdmaSlice* s = slices[i];
+                    ArbFlow flow{0, 0};
+                    if (s && s->task) {
+                        flow = ArbFlow{s->task->request.deadline_ns, s->length};
+                    }
+                    scratch.push_back(ArbitrationEntry{
+                        slices[i], PredictedMlu(flow, now_ns, bw_bps), i});
+                }
+
+                std::sort(
+                    scratch.begin(), scratch.end(),
+                    [](const ArbitrationEntry& a, const ArbitrationEntry& b) {
+                        if (a.mlu > b.mlu) return true;
+                        if (a.mlu < b.mlu) return false;
+                        return a.order < b.order;
+                    });
+                for (size_t i = 0; i < scratch.size(); ++i) {
+                    slices[i] = scratch[i].slice;
                 }
             }
-            auto order = OrderByUrgency(flows, now_ns, bw_bps);
-            std::vector<RdmaSlice*> reordered;
-            reordered.reserve(slices.size());
-            for (size_t i : order) reordered.push_back(slices[i]);
-            slices.swap(reordered);
         }
 
         int num_submitted = endpoint->submitSlices(slices, tl_wid);
