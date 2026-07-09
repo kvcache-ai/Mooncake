@@ -2632,10 +2632,19 @@ mod tests {
         AdminService::new(backend, "memory://test", MetadataKeyspace::default())
     }
 
+    // Redis auth is resolved from the process-global MC_REDIS_PASSWORD /
+    // MC_REDIS_USERNAME env vars. RedisEnvGuard clears them so the passwordless
+    // test redis accepts connections, but that only works if a single redis test
+    // mutates the shared env at a time. Serialize them and hold the guard for the
+    // whole test lifetime.
+    static REDIS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct RedisTestServer {
         child: Child,
         url: String,
         dir: PathBuf,
+        _env_guard: RedisEnvGuard,
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
     struct RedisEnvGuard {
@@ -2672,7 +2681,10 @@ mod tests {
 
     impl RedisTestServer {
         fn start() -> Option<Self> {
-            let _env_guard = RedisEnvGuard::clear_auth();
+            let serial = REDIS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let env_guard = RedisEnvGuard::clear_auth();
             if !Command::new("redis-server")
                 .arg("--version")
                 .stdout(Stdio::null())
@@ -2716,7 +2728,13 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    return Some(Self { child, url, dir });
+                    return Some(Self {
+                        child,
+                        url,
+                        dir,
+                        _env_guard: env_guard,
+                        _serial: serial,
+                    });
                 }
                 sleep(Duration::from_millis(50));
             }
