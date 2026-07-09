@@ -89,9 +89,10 @@ struct MooncakeEpBuffer {
     bool ibgda_disabled_ = false;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
-    // Cap on active RoCE QPs per peer: spreading small EP messages across too many
-    // QP/doorbell/progress streams hurts when GPUs share an HCA. Default 8;
-    // override at runtime with MOONCAKE_EP_ACTIVE_QPS_PER_RANK (>= per-rank QP count disables).
+    // Cap on active RoCE QPs per peer: spreading small EP messages across too
+    // many QP/doorbell/progress streams hurts when GPUs share an HCA. Default
+    // 8; override at runtime with MOONCAKE_EP_ACTIVE_QPS_PER_RANK (>= per-rank
+    // QP count disables).
     int active_qps_cap_ = 8;
 
     // Stream for communication
