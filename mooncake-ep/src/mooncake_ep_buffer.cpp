@@ -9,9 +9,9 @@ namespace mooncake {
 
 namespace {
 
-int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce) {
+int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap) {
     if (!is_roce) return qps_per_rank;
-    return std::min(qps_per_rank, kEpActiveQpsPerRank);
+    return std::min(qps_per_rank, cap);
 }
 
 }  // namespace
@@ -50,6 +50,23 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       comm_stream(at::cuda::getStreamFromPool(true)) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
+
+    // Optional runtime override for the RoCE active-QP cap (default 8).
+    // Set MOONCAKE_EP_ACTIVE_QPS_PER_RANK to a value >= the per-rank QP count
+    // (e.g. 256) to effectively disable the cap.
+    if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
+        char* end = nullptr;
+        long v = std::strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0) {
+            active_qps_cap_ = static_cast<int>(v);
+        } else {
+            LOG(WARNING) << "[EP] ignoring invalid "
+                            "MOONCAKE_EP_ACTIVE_QPS_PER_RANK='"
+                         << env << "'";
+        }
+    }
+    LOG(INFO) << "[EP] RoCE active QPs/rank cap = " << active_qps_cap_;
+
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
@@ -220,7 +237,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
     int active_qps_per_rank = active_qps_per_rank_for_ep(
-        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce());
+        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
+        active_qps_cap_);
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
@@ -380,7 +398,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
     int active_qps_per_rank = active_qps_per_rank_for_ep(
-        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce());
+        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
+        active_qps_cap_);
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
