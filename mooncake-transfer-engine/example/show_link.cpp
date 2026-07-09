@@ -16,10 +16,10 @@
 #include <glog/logging.h>
 
 #include <iostream>
+#include <memory>
 
 #include "show_links.h"
 #include "transfer_engine.h"
-#include "transfer_engine_impl.h"
 
 DEFINE_string(metadata_server, "etcd://127.0.0.1:2379",
               "Metadata server connection string");
@@ -38,7 +38,11 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = 1;
 
     if (FLAGS_discover_only) {
-        auto engine = std::make_unique<TransferEngine>(/*auto_discover=*/true);
+        auto engine = std::make_unique<TransferEngine>(/*auto_discover=*/false);
+        auto topology = engine->getLocalTopology();
+        if (topology) {
+            topology->discover({});
+        }
         std::cout << engine->showLinks(FLAGS_json) << std::endl;
         return 0;
     }
