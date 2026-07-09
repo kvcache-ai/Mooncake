@@ -167,6 +167,15 @@ jobs:
         kill $MASTER_PID 2>/dev/null || true
       shell: bash
 
+    - name: Reclaim disk before Go store binding integration tests
+      run: |
+        df -h
+        rm -rf mooncake-store/rust/target
+        rm -rf ~/.cargo/registry ~/.cargo/git
+        rm -rf ~/.cache/sccache || true
+        df -h
+      shell: bash
+
     - name: Run Go store binding integration tests
       run: |
         $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
