@@ -83,4 +83,9 @@ if(STORE_USE_REDIS)
             --master_path=${CMAKE_BINARY_DIR}/mooncake-store/src/mooncake_master
             --out_dir=${CMAKE_BINARY_DIR}/redis_chaos_output
     )
+    set_tests_properties(redis_chaos_test PROPERTIES
+        LABELS "redis_ha"
+        RUN_SERIAL TRUE
+        TIMEOUT 180
+    )
 endif()

@@ -50,6 +50,10 @@ class ClientTestWrapper {
      * @param master_server_entry The master server entry.
      * @param local_buffer_size The local buffer size that will be used for get
      * and put operations.
+     * @param redis_cluster_id Optional Redis HA cluster ID for tests using
+     * redis:// master discovery.
+     * @param enable_http_server Whether to start the client's HTTP metrics
+     * server.
      * @return The client wrapper.
      */
     static std::optional<std::shared_ptr<ClientTestWrapper>>
@@ -58,7 +62,9 @@ class ClientTestWrapper {
                         const std::string& protocol,
                         const std::string& device_name,
                         const std::string& master_server_entry,
-                        size_t local_buffer_size = 1024 * 1024 * 128);
+                        size_t local_buffer_size = 1024 * 1024 * 128,
+                        const std::string& redis_cluster_id = "",
+                        bool enable_http_server = true);
 
     // Mount a segment. The buffer will be used to unmount the segment.
     ErrorCode Mount(const size_t size, void*& buffer);

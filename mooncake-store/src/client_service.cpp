@@ -687,7 +687,8 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
 void ClientService::HeartbeatThreadMain(
     bool is_ha_mode, std::string current_master_address,
     const std::string& master_server_entry) {
-    // How many failed heartbeats before getting latest master view from etcd
+    // How many failed heartbeats before getting latest master view from HA
+    // backend
     const int max_heartbeat_fail_count = 10;
     // How long to wait for next heartbeat after success
     const int success_heartbeat_interval_ms = 1000;

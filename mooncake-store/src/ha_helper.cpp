@@ -178,15 +178,19 @@ int MasterServiceSupervisor::Start() {
             std::chrono::seconds(mv_helper->GetLeaderLeaseTTLSeconds()));
 
         LOG(INFO) << "Starting master service...";
+        std::unique_ptr<WrappedMasterService> wrapped_master_service;
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
-            WrappedCentralizedMasterService wrapped_master_service(
-                WrappedMasterServiceConfig(config_, view_version));
-            RegisterCentralizedRpcService(server, wrapped_master_service);
+            wrapped_master_service =
+                std::make_unique<WrappedCentralizedMasterService>(
+                    WrappedMasterServiceConfig(config_, view_version));
+            RegisterCentralizedRpcService(
+                server, static_cast<WrappedCentralizedMasterService&>(
+                            *wrapped_master_service));
         } else {
-            WrappedP2PMasterService wrapped_master_service(
+            wrapped_master_service = std::make_unique<WrappedP2PMasterService>(
                 WrappedMasterServiceConfig(config_, view_version));
-
-            RegisterP2PRpcService(server, wrapped_master_service);
+            RegisterP2PRpcService(server, static_cast<WrappedP2PMasterService&>(
+                                              *wrapped_master_service));
         }
         // Metric reporting is now handled by WrappedMasterService.
 

@@ -28,10 +28,16 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.
 
 - High Availability (optional)
-  - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
+  - `--enable_ha` (bool, default `false`): Enable HA.
+  - `--election_backend` (str, default `etcd`): Election backend, either `etcd` or `redis`.
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
+  - `--redis_endpoint` (str, default empty): Redis endpoint for Redis-based HA, such as `10.0.0.10:6379`.
+  - `--redis_password` (str, default empty): Redis AUTH password for Redis-based HA.
+  - `--redis_db_index` (int, default `0`): Redis DB index for Redis-based HA.
+  - `--redis_master_view_ttl_sec` (int, default `5`): TTL for the Redis master view key.
+  - `--redis_heartbeat_interval_sec` (int, default `2`): Redis leader renewal interval. It must be smaller than `--redis_master_view_ttl_sec`.
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
-  - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
+  - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence and HA metadata isolation.
 
 - DFS Storage (optional)
   - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
@@ -48,6 +54,46 @@ mooncake_master \
   --metrics_port=9003 \
   --enable_metric_reporting=true
 ```
+
+## Redis-based Master HA
+
+Redis-based HA uses Redis as the coordination backend for master election. It is independent from the Transfer Engine metadata backend: the Store master election backend can use Redis even if the Transfer Engine metadata service uses etcd, Redis, or HTTP.
+
+Build with Redis HA support before deployment:
+
+```bash
+cmake -S . -B build -DSTORE_USE_REDIS=ON
+cmake --build build --target mooncake_master
+```
+
+Start multiple master processes with the same Redis endpoint and cluster ID. Each master must advertise an RPC address that clients can reach; do not use `0.0.0.0` as the advertised address in a multi-node deployment.
+
+```bash
+mooncake_master \
+  --enable_ha=true \
+  --election_backend=redis \
+  --redis_endpoint=10.0.0.10:6379 \
+  --cluster_id=mooncake_cluster \
+  --rpc_address=10.0.0.1
+```
+
+Repeat the command on the other master nodes with their own reachable `--rpc_address` values, for example `10.0.0.2` and `10.0.0.3`, while keeping `--redis_endpoint` and `--cluster_id` identical.
+
+Clients should use the matching Redis endpoint for HA master discovery:
+
+```text
+master_server_entry = "redis://10.0.0.10:6379"
+```
+
+The client Redis cluster ID must match the masters' `--cluster_id`. If the client does not set a cluster ID explicitly, it uses the default `mooncake_cluster`.
+
+Operational notes:
+
+- Keep `--redis_heartbeat_interval_sec` smaller than `--redis_master_view_ttl_sec`. The default pair is `2` seconds and `5` seconds.
+- A smaller TTL reduces failover latency but is more sensitive to transient Redis or scheduling delays. Increase the TTL if CI or production logs show unexpected leader churn.
+- The active leader renews the Redis master view key periodically. If the leader process exits or loses renewal, the key expires and another master can be elected.
+- Clients using `redis://` resolve the current leader from Redis and reconnect after heartbeat failures. Existing requests may fail during the failover window and should be retried by the caller.
+- Redis HA metadata is isolated by `--cluster_id`, so different Mooncake Store clusters can share one Redis instance when they use different cluster IDs.
 
 **Tips:**
 
