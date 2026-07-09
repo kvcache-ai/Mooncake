@@ -1091,9 +1091,13 @@ TransferSubmitter::submit_batch_get_offload_object(
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     // Pre-allocate to avoid repeated vector growth.
+    // Only count slices for the requested keys, not the entire map.
     size_t total_slices = 0;
-    for (const auto& [key, slices] : batched_slices) {
-        total_slices += slices.size();
+    for (const auto& key : keys) {
+        auto it = batched_slices.find(key);
+        if (it != batched_slices.end()) {
+            total_slices += it->second.size();
+        }
     }
     requests.reserve(total_slices);
     // Open the segment once — all keys share the same transfer_engine_addr.
@@ -1169,7 +1173,25 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
                 src = slice.ptr;
             }
             offset += slice.size;
-            std::memcpy(dest, src, slice.size);
+
+            int src_dev = -1, dst_dev = -1;
+            bool src_on_gpu = gpu_staging::IsDevicePointer(src, &src_dev);
+            bool dst_on_gpu = gpu_staging::IsDevicePointer(dest, &dst_dev);
+
+            if (!src_on_gpu && !dst_on_gpu) {
+                std::memcpy(dest, src, slice.size);
+            } else {
+                int dev = src_on_gpu ? src_dev : dst_dev;
+                gpu_staging::SetDevice(dev);
+                if (!gpu_staging::CopyAuto(dest, src, slice.size)) {
+                    LOG(ERROR)
+                        << "Inline GPU memcpy failed: src_dev=" << src_dev
+                        << " dst_dev=" << dst_dev << " size=" << slice.size;
+                    auto fail_state = std::make_shared<MemcpyOperationState>();
+                    fail_state->set_completed(ErrorCode::TRANSFER_FAIL);
+                    return TransferFuture(fail_state);
+                }
+            }
         }
 
         // Return a pre-completed future (no async work needed)
