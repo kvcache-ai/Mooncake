@@ -1,4 +1,4 @@
-# SGLang HiCache with Mooncake Backend Benchmark
+# SGLang HiCache x Mooncake Store Performance
 
 We evaluated the performance of SGLang HiCache using a multi-turn conversation benchmark designed to simulate realistic user interactions. The benchmark spawns concurrent clients, each engaging in multi-round conversations. For every client, starting from the second round, the input consists of the concatenation of the input and output from the preceding round.
 
