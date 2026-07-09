@@ -1136,6 +1136,54 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       PartialEvictLeavesRemainingCompleteReplicasReadable) {
+    const std::string cluster_id = "test_batch_record_e2e_partial_evict";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_e2e_partial_evict_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_e2e_partial_evict_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_e2e_partial_evict_seg");
+    ReadBatchEventually(storage, 2, batch);
+
+    OffloadTaskItem task{.tenant_id = kDefaultTenant, .key = key, .size = 1024};
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "batch_e2e_partial_evict_disk";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+            .has_value());
+    ReadBatchEventually(storage, 3, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    ReadBatchEventually(storage, 4, batch);
+
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(1u, replicas->replicas.size());
+    EXPECT_TRUE(replicas->replicas.front().is_local_disk_replica());
+}
+
 TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_put_end_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
