@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -35,17 +37,34 @@ namespace mooncake {
 // Scores a remote replica candidate; lower score == more preferred.
 using ReplicaScorer = std::function<double(const Replica::Descriptor &)>;
 
-// Process-wide injected scorer (empty == use the built-in protocol-priority
-// scorer). Intended to be set once during initialization. Reads are
-// racy-benign: an empty function simply falls back to the built-in order.
-inline ReplicaScorer &RemoteReplicaScorer() {
+namespace detail {
+
+inline std::shared_mutex &ScorerMutex() {
+    static std::shared_mutex mu;
+    return mu;
+}
+
+inline ReplicaScorer &ScorerStorage() {
     static ReplicaScorer scorer;
     return scorer;
 }
 
+}  // namespace detail
+
+// Return a snapshot (copy) of the current scorer. The copy is taken under a
+// shared lock so concurrent reads are non-blocking. Callers invoke the
+// returned copy outside the lock, avoiding both the data race and any
+// potential deadlock from calling user code under a lock.
+inline ReplicaScorer GetRemoteReplicaScorer() {
+    std::shared_lock lk(detail::ScorerMutex());
+    return detail::ScorerStorage();
+}
+
 // Inject a topology-/load-aware scorer (e.g. from the transfer engine).
+// Takes a unique lock; expected to be called once during initialization.
 inline void SetRemoteReplicaScorer(ReplicaScorer scorer) {
-    RemoteReplicaScorer() = std::move(scorer);
+    std::unique_lock lk(detail::ScorerMutex());
+    detail::ScorerStorage() = std::move(scorer);
 }
 
 // Built-in remote-replica score: prefer RDMA over TCP. Purely a function of
@@ -67,7 +86,9 @@ inline bool RemoteReplicaScoringEnabled() {
         const char *env = std::getenv("MC_STORE_REPLICA_SCORING");
         return env && std::string(env) == "1";
     }();
-    return env_enabled || static_cast<bool>(RemoteReplicaScorer());
+    if (env_enabled) return true;
+    std::shared_lock lk(detail::ScorerMutex());
+    return static_cast<bool>(detail::ScorerStorage());
 }
 
 // Among the remote MEMORY replicas, return the lowest-scoring one (nullptr if
@@ -76,7 +97,7 @@ inline bool RemoteReplicaScoringEnabled() {
 inline const Replica::Descriptor *PickBestRemoteMemory(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
-    const ReplicaScorer &injected = RemoteReplicaScorer();
+    ReplicaScorer scorer = GetRemoteReplicaScorer();
     const Replica::Descriptor *best = nullptr;
     double best_score = std::numeric_limits<double>::max();
     for (const auto &r : replicas) {
@@ -85,7 +106,7 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
         if (local_endpoints.count(r.get_memory_descriptor()
                                       .buffer_descriptor.transport_endpoint_))
             continue;  // local replicas are handled by the caller
-        double score = injected ? injected(r) : BuiltinRemoteReplicaScore(r);
+        double score = scorer ? scorer(r) : BuiltinRemoteReplicaScore(r);
         if (score < best_score) {
             best_score = score;
             best = &r;

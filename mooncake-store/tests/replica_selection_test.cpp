@@ -9,7 +9,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -160,6 +162,58 @@ TEST_F(ReplicaSelectionTest, LocalStillWinsWhenScoringOn) {
     EXPECT_EQ(
         sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
         "nodeB");
+}
+
+// --- Concurrency: verify no data race on SetRemoteReplicaScorer vs reads ---
+
+TEST_F(ReplicaSelectionTest, ConcurrentSetAndSelectIsRaceFree) {
+    constexpr int kIterations = 50000;
+    constexpr int kReaderThreads = 4;
+
+    std::unordered_set<std::string> local;
+    std::vector<Replica::Descriptor> reps = {
+        MakeMemory("nodeA", "tcp"),
+        MakeMemory("nodeB", "rdma"),
+        MakeMemory("nodeC", "rdma"),
+    };
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> read_count{0};
+
+    // Writer: repeatedly swap scorers while readers are active.
+    std::thread writer([&] {
+        for (int i = 0; i < kIterations && !stop; ++i) {
+            if (i % 2 == 0) {
+                SetRemoteReplicaScorer([](const Replica::Descriptor &r) {
+                    return r.get_memory_descriptor()
+                                   .buffer_descriptor.protocol_ == "rdma"
+                               ? 0.0
+                               : 10.0;
+                });
+            } else {
+                SetRemoteReplicaScorer(nullptr);
+            }
+        }
+        stop = true;
+    });
+
+    // Readers: call SelectBestReplica (which reads the scorer) concurrently.
+    std::vector<std::thread> readers;
+    for (int t = 0; t < kReaderThreads; ++t) {
+        readers.emplace_back([&] {
+            while (!stop) {
+                const auto *sel = SelectBestReplica(reps, local);
+                ASSERT_NE(sel, nullptr);
+                read_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    writer.join();
+    for (auto &r : readers) r.join();
+
+    // Sanity: readers actually ran a meaningful number of iterations.
+    EXPECT_GT(read_count.load(), kIterations);
 }
 
 }  // namespace
