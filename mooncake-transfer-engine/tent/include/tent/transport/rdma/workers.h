@@ -76,6 +76,9 @@ class Workers {
 
    private:
     struct RouteHint {
+        // Owning reference to the segment snapshot; keeps all raw pointers
+        // below valid for the lifetime of this hint.
+        SegmentDescRef pin;
         SegmentDesc *segment;
         BufferDesc *buffer;
         const Topology::MemEntry *topo_entry;

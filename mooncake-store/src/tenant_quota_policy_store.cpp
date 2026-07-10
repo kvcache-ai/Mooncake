@@ -18,6 +18,9 @@
 #include <glog/logging.h>
 #include <yaml-cpp/yaml.h>
 
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#endif
 #include "types.h"
 
 namespace mooncake {
@@ -30,6 +33,34 @@ bool IsValidTenantQuotaName(const std::string& name) {
 std::string ErrnoMessage(const std::string& action, const std::string& path) {
     return action + " '" + path + "' failed: " + std::strerror(errno);
 }
+
+#ifdef STORE_USE_ETCD
+tl::expected<std::string, std::string> NormalizeClusterIdForEtcdKey(
+    const std::string& cluster_id) {
+    std::string normalized =
+        cluster_id.empty() ? std::string(DEFAULT_CLUSTER_ID) : cluster_id;
+    while (!normalized.empty() && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+    if (normalized.empty()) {
+        normalized = DEFAULT_CLUSTER_ID;
+    }
+    if (!IsValidClusterIdComponent(normalized)) {
+        return tl::make_unexpected("invalid tenant quota etcd cluster_id '" +
+                                   cluster_id + "'");
+    }
+    return normalized;
+}
+
+tl::expected<std::string, std::string> BuildTenantQuotaEtcdKey(
+    const std::string& cluster_id) {
+    auto normalized = NormalizeClusterIdForEtcdKey(cluster_id);
+    if (!normalized) {
+        return tl::make_unexpected(normalized.error());
+    }
+    return "mooncake-store/" + normalized.value() + "/tenant_quota_policy";
+}
+#endif
 
 tl::expected<void, std::string> WriteAll(int fd, const std::string& content,
                                          const std::string& path) {
@@ -345,17 +376,91 @@ tl::expected<void, std::string> YamlTenantQuotaPolicyStore::Save(
     return {};
 }
 
-tl::expected<std::unique_ptr<TenantQuotaPolicyStore>, std::string>
-CreateTenantQuotaPolicyStore(const std::string& type, const std::string& uri) {
-    if (type != "file") {
-        return tl::make_unexpected("unsupported tenant quota connector type '" +
-                                   type + "'");
+#ifdef STORE_USE_ETCD
+EtcdTenantQuotaPolicyStore::EtcdTenantQuotaPolicyStore(
+    const std::string& endpoints, const std::string& cluster_id) {
+    auto key = BuildTenantQuotaEtcdKey(cluster_id);
+    if (!key) {
+        throw std::invalid_argument(key.error());
     }
-    if (uri.empty()) {
+    if (endpoints.empty()) {
+        throw std::invalid_argument(
+            "tenant quota etcd connector requires a non-empty uri");
+    }
+    ErrorCode connect_error = EtcdHelper::ConnectToEtcdStoreClient(endpoints);
+    if (connect_error != ErrorCode::OK) {
+        if (connect_error == ErrorCode::INVALID_PARAMS) {
+            throw std::runtime_error(
+                "failed to connect tenant quota etcd store: "
+                "tenant_quota_connector_uri must match the already connected "
+                "store etcd endpoints used by HA/oplog");
+        }
+        throw std::runtime_error("failed to connect tenant quota etcd store: " +
+                                 toString(connect_error));
+    }
+    key_ = std::move(key.value());
+}
+
+tl::expected<TenantQuotaPolicySnapshot, std::string>
+EtcdTenantQuotaPolicyStore::Load() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string content;
+    EtcdRevisionId revision_id = 0;
+    ErrorCode error =
+        EtcdHelper::Get(key_.c_str(), key_.size(), content, revision_id);
+    if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return TenantQuotaPolicySnapshot{};
+    }
+    if (error != ErrorCode::OK) {
         return tl::make_unexpected(
-            "tenant quota file connector requires a non-empty uri");
+            "failed to load tenant quota policy from "
+            "etcd key '" +
+            key_ + "': " + toString(error));
     }
-    return std::make_unique<YamlTenantQuotaPolicyStore>(uri);
+    return ParseTenantQuotaPolicyYaml(content);
+}
+
+tl::expected<void, std::string> EtcdTenantQuotaPolicyStore::Save(
+    const TenantQuotaPolicySnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string content = FormatTenantQuotaPolicyYaml(snapshot);
+    ErrorCode error = EtcdHelper::Put(key_.c_str(), key_.size(),
+                                      content.c_str(), content.size());
+    if (error != ErrorCode::OK) {
+        return tl::make_unexpected(
+            "failed to save tenant quota policy to "
+            "etcd key '" +
+            key_ + "': " + toString(error));
+    }
+    return {};
+}
+#endif
+
+tl::expected<std::unique_ptr<TenantQuotaPolicyStore>, std::string>
+CreateTenantQuotaPolicyStore(const std::string& type, const std::string& uri,
+                             const std::string& cluster_id) {
+    if (type == "file") {
+        if (uri.empty()) {
+            return tl::make_unexpected(
+                "tenant quota file connector requires a non-empty uri");
+        }
+        return std::make_unique<YamlTenantQuotaPolicyStore>(uri);
+    }
+    if (type == "etcd") {
+#ifdef STORE_USE_ETCD
+        try {
+            return std::make_unique<EtcdTenantQuotaPolicyStore>(uri,
+                                                                cluster_id);
+        } catch (const std::exception& e) {
+            return tl::make_unexpected(e.what());
+        }
+#else
+        return tl::make_unexpected(
+            "tenant quota etcd connector requires STORE_USE_ETCD");
+#endif
+    }
+    return tl::make_unexpected("unsupported tenant quota connector type '" +
+                               type + "'");
 }
 
 }  // namespace mooncake

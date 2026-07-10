@@ -26,6 +26,7 @@ set(MOONCAKE_STORE_SOURCES
     aligned_client_buffer.cpp
     real_client.cpp
     dummy_client.cpp
+    uds_transport.cpp
     shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
@@ -37,6 +38,7 @@ set(MOONCAKE_STORE_SOURCES
     device/cuda_like_accelerator_device.cpp
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp
+    device/sunrise_accelerator_device.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -112,6 +114,25 @@ find_library(
   XXHASH_LIBRARY
   NAMES xxhash libxxhash
   PATHS /usr/lib /usr/local/lib /usr/lib64)
+set(KV_EVENTS_ZMQ_FOUND FALSE)
+if(ENABLE_KV_EVENTS)
+  find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
+                                              /usr/lib64)
+  find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include /usr/local/include)
+  if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+    message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
+    list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
+    list(APPEND EXTRA_LIBS ${ZMQ_LIBRARY})
+    list(APPEND MOONCAKE_STORE_SOURCES kv_event/kv_event_publisher.cpp)
+    set(KV_EVENTS_ZMQ_FOUND TRUE)
+  else()
+    message(
+      FATAL_ERROR
+        "ENABLE_KV_EVENTS is ON but libzmq was not found. "
+        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
+  endif()
+endif()
+
 if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
   message(
     STATUS "Found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}")
@@ -244,6 +265,9 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+if(KV_EVENTS_ZMQ_FOUND)
+  target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
+endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
@@ -309,6 +333,9 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
+if(USE_SUNRISE)
+  target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
+endif()
 
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
@@ -379,4 +406,14 @@ if(USE_ASCEND
   target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
   target_link_libraries(mooncake_client PRIVATE ascendcl)
 endif()
+
+if(USE_SUNRISE)
+    target_link_libraries(mooncake_store PRIVATE
+        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+    target_link_libraries(mooncake_client PRIVATE
+        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
+
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

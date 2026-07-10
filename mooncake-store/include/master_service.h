@@ -36,6 +36,7 @@
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
+#include "kv_event/kv_event_publisher.h"
 
 namespace mooncake {
 namespace ha {
@@ -62,6 +63,9 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
 }  // namespace test
+namespace benchmarks {
+class BatchEvictBench;
+}  // namespace benchmarks
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -82,6 +86,7 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
 
    public:
@@ -284,6 +289,9 @@ class MasterService {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>;
 
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
+
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
      * @param object_keys Vector of object key strings to clear.
@@ -323,11 +331,29 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Read-only single-key replica list query for admin use.
+     * Unlike GetReplicaList, this does not grant leases, trigger
+     * promotion, or update cache-hit metrics.
+     */
+    auto GetReplicaListForAdmin(const std::string& key,
+                                const std::string& tenant_id)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
      * @brief Get replica lists for a batch of objects.
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id);
+
+    /**
+     * @brief Read-only batch replica list query for admin use.
+     * Unlike BatchGetReplicaList, this does not grant leases, trigger
+     * promotion, or update cache-hit metrics.
+     */
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
 
     /**
      * @brief Start a put operation for an object
@@ -829,6 +855,8 @@ class MasterService {
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
     std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+    void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
+    std::string GetClientHostId(const UUID& client_id) const;
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
@@ -1860,6 +1888,7 @@ class MasterService {
     mutable std::shared_mutex client_mutex_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
+    std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
@@ -2105,6 +2134,26 @@ class MasterService {
     std::mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);
+
+    std::unique_ptr<KvEventPublisher> kv_event_publisher_;
+
+    static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
+    static std::string MediumForReplicaType(ReplicaType replica_type);
+    static std::string MediumForMetadata(const ObjectMetadata& metadata);
+    void PublishKvStored(const std::string& key, ReplicaType replica_type,
+                         const ObjectMetadata& metadata,
+                         const std::string& tenant_id);
+    void PublishKvRemoved(const std::string& key,
+                          const ObjectMetadata& metadata,
+                          const std::string& tenant_id);
+    void PublishKvRemoved(const std::string& key, const std::string& medium,
+                          const std::string& tenant_id,
+                          const std::string& group_id);
+    void PublishKvRemovedAfterEvict(const std::string& key,
+                                    uint64_t freed_bytes,
+                                    const std::string& medium,
+                                    const ObjectMetadata& metadata,
+                                    const std::string& tenant_id);
 };
 
 }  // namespace mooncake

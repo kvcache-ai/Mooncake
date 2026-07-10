@@ -143,7 +143,8 @@ class MooncakeStoreService:
                     self.config.master_server_address,
                     None,
                     self.config.enable_ssd_offload,
-                    self.config.ssd_offload_path
+                    self.config.ssd_offload_path,
+                    self.config.tenant_id
                 )
 
                 if ret != 0:

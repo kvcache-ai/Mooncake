@@ -343,8 +343,8 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
         } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
             mem_type = adxl::MEM_DEVICE;
         } else {
-            LOG(ERROR) << "mem addr:" << addr
-                       << " can not be recognized, try set to host mem.";
+            LOG(INFO) << "mem addr:" << addr
+                      << " can not be recognized, try set to host mem.";
             mem_type = adxl::MEM_HOST;
         }
     } else {

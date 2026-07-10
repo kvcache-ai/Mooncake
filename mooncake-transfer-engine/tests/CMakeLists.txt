@@ -182,7 +182,9 @@ if(USE_SUNRISE)
   target_include_directories(sunrise_link_transport_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
   target_link_libraries(sunrise_link_transport_test PUBLIC transfer_engine
-                                                           gtest gtest_main)
+                                                           gtest gtest_main
+                                                           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                                                           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_test COMMAND sunrise_link_transport_test)
 
   add_executable(sunrise_link_transport_runtime_test
@@ -190,7 +192,9 @@ if(USE_SUNRISE)
   target_include_directories(sunrise_link_transport_runtime_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
   target_link_libraries(sunrise_link_transport_runtime_test
-                        PUBLIC transfer_engine gtest gtest_main)
+                        PUBLIC transfer_engine gtest gtest_main
+                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_runtime_test
            COMMAND sunrise_link_transport_runtime_test)
 
@@ -199,9 +203,31 @@ if(USE_SUNRISE)
   target_include_directories(sunrise_link_transport_unit_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
   target_link_libraries(sunrise_link_transport_unit_test
-                        PUBLIC transfer_engine gtest gtest_main)
+                        PUBLIC transfer_engine gtest gtest_main
+                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_unit_test
            COMMAND sunrise_link_transport_unit_test)
+
+  add_executable(sunrise_allocator_test
+                 ${WORKSPACE}/sunrise_allocator_test.cpp)
+  target_include_directories(sunrise_allocator_test
+                             PRIVATE ${MC_TANGRT_ROOT}/include)
+  target_link_libraries(sunrise_allocator_test
+                        PUBLIC transfer_engine gtest gtest_main
+                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  add_test(NAME sunrise_allocator_test COMMAND sunrise_allocator_test)
+
+  add_executable(sunrise_link_copy_test
+                 ${WORKSPACE}/sunrise_link_copy_test.cpp)
+  target_include_directories(sunrise_link_copy_test
+                             PRIVATE ${MC_TANGRT_ROOT}/include)
+  target_link_libraries(sunrise_link_copy_test
+                        PUBLIC transfer_engine gtest gtest_main
+                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  add_test(NAME sunrise_link_copy_test COMMAND sunrise_link_copy_test)
 endif()
 
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
@@ -217,6 +243,13 @@ add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME rdma_gid_probe_test COMMAND rdma_gid_probe_test)
+
+add_executable(multi_transport_locality_test
+               ${WORKSPACE}/multi_transport_locality_test.cpp)
+target_link_libraries(multi_transport_locality_test PUBLIC transfer_engine gtest
+                                                           gtest_main)
+add_test(NAME multi_transport_locality_test
+         COMMAND multi_transport_locality_test)
 
 add_executable(rdma_context_reprobe_test
                ${WORKSPACE}/rdma_context_reprobe_test.cpp)

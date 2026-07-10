@@ -55,6 +55,7 @@ struct TaskInfo {
     int xport_priority{0};        // transport priority (for fallback)
     int failover_count{0};        // number of failover attempts
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
+    std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
     bool staging{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};

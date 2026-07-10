@@ -1,0 +1,5 @@
+if(USE_TPU)
+    file(GLOB XPORT_SOURCES "*.cpp")
+    add_library(tent_xport_tpu STATIC ${XPORT_SOURCES})
+    target_link_libraries(tent_xport_tpu PUBLIC tent_rpc tent_common)
+endif()

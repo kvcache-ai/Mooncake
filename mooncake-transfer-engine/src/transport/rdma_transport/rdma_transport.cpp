@@ -777,6 +777,17 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
          ++buffer_id) {
         const auto &buffer = buffers[buffer_id];
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        // The RDMA transport must only bind buffers registered under the rdma
+        // protocol. Device (hip) buffers alias the same GPU addresses but carry
+        // no lkey/rkey, so picking one yields an empty-lkey out-of-bounds read
+        // in the submit path. The !empty() guard leaves legacy single-protocol
+        // descriptors (empty protocol field) unaffected.
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
+
         // Check if offset is within buffer range
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {
@@ -815,6 +826,12 @@ int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
     for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
          ++buffer_id) {
         const auto &buffer = buffers[buffer_id];
+
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
 
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {

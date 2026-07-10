@@ -33,12 +33,29 @@ target_include_directories(tent_ip_utils_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
 
+add_executable(tent_qp_pool_layout_test qp_pool_layout_test.cpp)
+target_link_libraries(tent_qp_pool_layout_test PRIVATE tent_common gtest
+                                                       gtest_main)
+target_include_directories(tent_qp_pool_layout_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_qp_pool_layout_test COMMAND tent_qp_pool_layout_test)
+
 add_executable(tent_coalesce_regions_test coalesce_regions_test.cpp)
 target_link_libraries(tent_coalesce_regions_test PRIVATE tent_common gtest
                                                          gtest_main)
 target_include_directories(tent_coalesce_regions_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_coalesce_regions_test COMMAND tent_coalesce_regions_test)
+
+add_executable(segment_manager_test segment_manager_test.cpp)
+target_link_libraries(segment_manager_test PRIVATE gtest gtest_main
+                                                   tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(segment_manager_test PRIVATE asio_shared)
+endif()
+target_include_directories(segment_manager_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME segment_manager_test COMMAND segment_manager_test)
 
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
@@ -190,3 +207,26 @@ target_include_directories(tent_runtime_queue_dispatch_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
+
+# TPU PJRT shim test: exercises the dlopen'd adapter ABI (device-pointer
+# classification, D2H/H2D copy, device topology) against an in-process mock
+# adapter, so it runs on any Linux host without TPU hardware or a PJRT runtime.
+if(USE_TPU)
+  # Mock adapter satisfying the tpu_pjrt_abi.h C ABI. Built as a shared object
+  # that the shim (and the test) load via dlopen.
+  add_library(mock_tpu_pjrt SHARED tpu/mock_tpu_pjrt_adapter.cpp)
+  target_include_directories(mock_tpu_pjrt
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+  add_executable(tent_tpu_pjrt_shim_test tpu/tpu_pjrt_shim_test.cpp)
+  add_dependencies(tent_tpu_pjrt_shim_test mock_tpu_pjrt)
+  target_link_libraries(tent_tpu_pjrt_shim_test
+                        PRIVATE gtest gtest_main tent_link_group
+                                ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_pjrt_shim_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_pjrt_shim_test
+    PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  add_test(NAME tent_tpu_pjrt_shim_test COMMAND tent_tpu_pjrt_shim_test)
+endif()

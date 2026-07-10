@@ -260,8 +260,8 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto target_id = path.remote_segment_id;
     auto device_id = path.remote_device_id;
 
-    auto status =
-        segment_manager.withCachedSegment(target_id, [&](SegmentDesc* segment) {
+    auto status = segment_manager.withCachedSegment(
+        target_id, hint.pin, [&](SegmentDesc* segment) {
             hint.segment = segment;
             if (segment->type != SegmentType::Memory) {
                 return Status::NeedsRefreshCache(
@@ -670,7 +670,7 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
                              uint64_t addr, uint64_t length) {
     auto& segment_manager = transport_->metadata_->segmentManager();
     CHECK_STATUS(segment_manager.withCachedSegment(
-        segment_id, [&](SegmentDesc* segment) {
+        segment_id, hint.pin, [&](SegmentDesc* segment) {
             hint.segment = segment;
             hint.buffer = segment->findBuffer(addr, length);
             if (!hint.buffer)

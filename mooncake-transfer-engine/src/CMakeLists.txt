@@ -107,7 +107,16 @@ if(USE_HIP)
   if(USE_HIP_DMABUF)
     find_package(hsa-runtime64 CONFIG)
     if(hsa-runtime64_FOUND)
-      target_compile_definitions(transfer_engine PRIVATE USE_HIP_DMABUF)
+      # The dmabuf MR-registration code lives in rdma_context.cpp, which is
+      # compiled in the rdma_transport OBJECT library and pulled into
+      # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
+      # transfer_engine never reaches that object compilation, so the dmabuf
+      # path is silently compiled out and GPU MRs fall back to plain
+      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
+      # include/link usage requirements) on the target that actually compiles
+      # rdma_context.cpp.
+      target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
+      target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)
       target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
       message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
     else()
