@@ -816,6 +816,7 @@ struct HttpQueryDrainJobResponse {
     uint64_t blocked_units{0};
     uint64_t active_units{0};
     uint64_t migrated_bytes{0};
+    double speed_mbps{0.0};
     std::string message;
     int32_t error_code{0};
     std::string error_message;
@@ -823,7 +824,7 @@ struct HttpQueryDrainJobResponse {
 YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
          status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
          succeeded_units, failed_units, blocked_units, active_units,
-         migrated_bytes, message, error_code, error_message);
+         migrated_bytes, speed_mbps, message, error_code, error_message);
 
 namespace {
 
@@ -844,6 +845,7 @@ HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
     payload.blocked_units = job.blocked_units;
     payload.active_units = job.active_units;
     payload.migrated_bytes = job.migrated_bytes;
+    payload.speed_mbps = job.speed_mbps;
     payload.message = job.message;
     return payload;
 }
