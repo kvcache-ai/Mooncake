@@ -67,6 +67,11 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->RunPromotionCandidateRetryForTesting();
     }
 
+    static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
+                                                       size_t shards_to_scan) {
+        return service->RunPromotionCandidateRetry(shards_to_scan);
+    }
+
     static void ClearCandidatesForReloadForTesting(MasterService* service) {
         service->ClearCandidatesForReload();
     }
@@ -2295,6 +2300,95 @@ TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
     }
     EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u)
         << "Duplicate candidate must not be created";
+
+    service->RemoveAll();
+}
+
+// A candidate recorded while the promotion queue is full is admitted once the
+// active slot is released and the retry scanner reaches it.
+TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.promotion_queue_limit = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "retry_cap_seg", kDefaultSegmentBase,
+                              seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_busy", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_retry", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t candidate_admitted_pre =
+        mm.get_promotion_candidate_admitted();
+    const int64_t promotion_admitted_pre = mm.get_promotion_admitted();
+
+    {
+        auto r = service->GetReplicaList("k_busy", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(mm.get_promotion_admitted() - promotion_admitted_pre, 1);
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+
+    {
+        auto r = service->GetReplicaList("k_retry", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    auto failed =
+        service->NotifyPromotionFailure(seg.client_id, "k_busy", "default");
+    ASSERT_TRUE(failed.has_value());
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+
+    ResetCandidateBackoffsForTesting(service.get());
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 1u);
+
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u);
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(mm.get_promotion_candidate_admitted() - candidate_admitted_pre,
+              1);
+
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    ASSERT_EQ(heartbeat->size(), 1u);
+    EXPECT_EQ(heartbeat->front().key, "k_retry");
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "retry_noop_seg", kDefaultSegmentBase,
+                              seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_noop", 1024,
+                                       seg.segment_name));
+
+    {
+        auto r = service->GetReplicaList("k_noop", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get(),
+                                                   /*shards_to_scan=*/0),
+              0u);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
 
     service->RemoveAll();
 }
