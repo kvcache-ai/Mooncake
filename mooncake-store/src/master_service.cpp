@@ -4198,40 +4198,79 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
+    auto target_pred = [replica_type](const Replica& r) {
+        if (replica_type == ReplicaType::ALL) {
+            return r.is_memory_replica() || r.is_nof_replica();
+        }
+        return r.type() == replica_type;
+    };
+
     if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, [replica_type](const Replica& r) {
-                if (replica_type == ReplicaType::ALL) {
-                    return r.is_memory_replica() || r.is_nof_replica();
-                }
-                return r.type() == replica_type;
+        auto remaining =
+            BuildRemainingReplicaDescriptors(metadata, target_pred);
+        std::vector<ReplicaID> removed_ids;
+        if (use_batch_oplog_) {
+            auto reservation = ReserveBatchOpLogSlot();
+            if (!reservation) {
+                return tl::make_unexpected(reservation.error());
+            }
+            metadata.VisitReplicas(target_pred, [&removed_ids](Replica& r) {
+                removed_ids.push_back(r.id());
+                r.mark_removed();
             });
 
-        tl::expected<OpLogEntry, ErrorCode> persist_result;
+            tl::expected<OpLogEntry, ErrorCode> persist_result;
+            if (remaining.empty()) {
+                persist_result = AppendReservedOpLogWithDurableFinalize(
+                    std::move(reservation.value()), OpType::REMOVE,
+                    tenant_id.value(), key, {},
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            } else {
+                persist_result = AppendReservedOpLogWithDurableFinalize(
+                    std::move(reservation.value()), OpType::PUT_END,
+                    tenant_id.value(), key,
+                    SerializeMetadataForOpLogFromReplicaDescriptors(
+                        metadata.client_id, metadata.size, remaining,
+                        metadata.group_id, metadata.data_type),
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            }
+            if (!persist_result) {
+                return tl::make_unexpected(persist_result.error());
+            }
+            return {};
+        }
+
+        metadata.VisitReplicas(target_pred, [&removed_ids](Replica& r) {
+            removed_ids.push_back(r.id());
+            r.mark_removed();
+        });
+        OpLogEntry entry;
         if (remaining.empty()) {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::REMOVE, metadata.tenant_id.value(), key, {}, nullptr);
+            entry = oplog_manager_.AllocateEntry(
+                OpType::REMOVE, tenant_id.value(), key, {});
         } else {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
+            entry = oplog_manager_.AllocateEntry(
+                OpType::PUT_END, tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
                     metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type),
-                nullptr);
+                    metadata.group_id, metadata.data_type));
         }
-        if (!persist_result) {
-            return tl::make_unexpected(persist_result.error());
-        }
+        EnqueueRemovedReplicaFinalize("PutRevoke", std::move(entry),
+                                      std::move(removed_ids),
+                                      QuotaEraseMode::kFull);
+        return {};
     }
 
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-    EraseReplicasWithCacheTotalAccounting(
-        metadata, [replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() || replica.is_nof_replica();
-            }
-            return replica.type() == replica_type;
-        });
+    EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (before_charge > after_charge) {
         ReleaseCommittedQuotaCharge(metadata, before_charge - after_charge);
@@ -5010,8 +5049,6 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
-    // Decrement source reference count is deferred until after persist.
-
     // First validate that all target replicas are still healthy. If any
     // replica is invalid we won't be able to mark it complete; this affects
     // the post-mutation descriptor list.
@@ -5031,43 +5068,15 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         }
     }
 
-    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
-        // Build post-mutation descriptors: existing COMPLETE replicas plus
-        // the targets that are about to be marked COMPLETE.
-        std::vector<Replica::Descriptor> post;
-        for (const auto& rep : metadata.GetAllReplicas()) {
-            if (rep.status() == ReplicaStatus::COMPLETE) {
-                post.push_back(rep.get_descriptor());
-                continue;
-            }
-            if (std::find(commit_target_ids.begin(), commit_target_ids.end(),
-                          rep.id()) != commit_target_ids.end()) {
-                Replica::Descriptor desc = rep.get_descriptor();
-                desc.status = ReplicaStatus::COMPLETE;
-                post.push_back(std::move(desc));
-            }
+    std::optional<OrderedOpLogWriter::Reservation> batch_reservation;
+    if (enable_ha_ && use_batch_oplog_) {
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) {
+            return tl::make_unexpected(reservation.error());
         }
-
-        auto payload = SerializeMetadataForOpLogFromReplicaDescriptors(
-            metadata.client_id, metadata.size, post, metadata.group_id,
-            metadata.data_type);
-        if (use_batch_oplog_) {
-            auto persist_result = AppendOpLogVisibleBeforeDurable(
-                OpType::PUT_END, metadata.tenant_id.value(), key, payload);
-            if (!persist_result) {
-                return tl::make_unexpected(persist_result.error());
-            }
-        } else {
-            auto persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key, payload,
-                nullptr);
-            if (!persist_result) {
-                return tl::make_unexpected(persist_result.error());
-            }
-        }
+        batch_reservation = std::move(reservation.value());
     }
 
-    // Persist OK — apply local commit.
     source->dec_refcnt();
     for (const auto& replica_id : commit_target_ids) {
         auto replica = metadata.GetReplicaByID(replica_id);
@@ -5077,6 +5086,36 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                 completed_quota_charge, static_cast<uint64_t>(metadata.size));
         }
     }
+
+    if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+        std::vector<Replica::Descriptor> post;
+        metadata.VisitReplicas(&Replica::fn_is_completed,
+                               [&post](const Replica& replica) {
+                                   post.push_back(replica.get_descriptor());
+                               });
+        auto payload = SerializeMetadataForOpLogFromReplicaDescriptors(
+            metadata.client_id, metadata.size, post, metadata.group_id,
+            metadata.data_type);
+        if (batch_reservation) {
+            auto persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(*batch_reservation), OpType::PUT_END,
+                tenant_id.value(), key, payload, nullptr);
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "CopyEnd: PUT_END persist failed for key=" << key
+                    << ", err=" << static_cast<int>(persist_result.error());
+            }
+        } else {
+            auto persist_result = AppendOpLogVisibleBeforeDurable(
+                OpType::PUT_END, tenant_id.value(), key, payload);
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "CopyEnd: PUT_END persist failed for key=" << key
+                    << ", err=" << static_cast<int>(persist_result.error());
+            }
+        }
+    }
+
     SyncCacheTotalAccounting(metadata);
 
     const uint64_t commit_charge =
@@ -7080,39 +7119,52 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Locate the staged replica without mutating it. mark_complete is
-    // deferred until after persist.
     bool committed = false;
     Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
     if (staged != nullptr && staged->is_memory_replica() &&
         staged->is_processing()) {
-        if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
-            // Build post-mutation descriptors: existing COMPLETE replicas plus
-            // the staged replica flipped to COMPLETE.
-            std::vector<Replica::Descriptor> post;
-            for (const auto& rep : metadata.GetAllReplicas()) {
-                if (rep.id() == task_it->second.alloc_id) {
-                    Replica::Descriptor desc = rep.get_descriptor();
-                    desc.status = ReplicaStatus::COMPLETE;
-                    post.push_back(std::move(desc));
-                } else if (rep.status() == ReplicaStatus::COMPLETE) {
-                    post.push_back(rep.get_descriptor());
-                }
+        std::optional<OrderedOpLogWriter::Reservation> batch_reservation;
+        if (enable_ha_ && use_batch_oplog_) {
+            auto reservation = ReserveBatchOpLogSlot();
+            if (!reservation) {
+                return tl::make_unexpected(reservation.error());
             }
-
-            auto persist_result = AppendOpLogVisibleBeforeDurable(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post, metadata.group_id,
-                    metadata.data_type));
-            if (!persist_result) {
-                // Keep staged replica PROCESSING and task untouched. Caller
-                // can retry; promotion_in_flight remains accurate.
-                return tl::make_unexpected(persist_result.error());
-            }
+            batch_reservation = std::move(reservation.value());
         }
         staged->mark_complete();
         committed = true;
+        if (enable_ha_ && (oplog_store_ || ordered_oplog_writer_)) {
+            std::vector<Replica::Descriptor> post;
+            metadata.VisitReplicas(&Replica::fn_is_completed,
+                                   [&post](const Replica& replica) {
+                                       post.push_back(replica.get_descriptor());
+                                   });
+
+            const auto payload =
+                SerializeMetadataForOpLogFromReplicaDescriptors(
+                    metadata.client_id, metadata.size, post, metadata.group_id,
+                    metadata.data_type);
+            if (batch_reservation) {
+                auto persist_result = AppendReservedOpLogWithDurableFinalize(
+                    std::move(*batch_reservation), OpType::PUT_END,
+                    tenant_id.value(), key, payload, nullptr);
+                if (!persist_result) {
+                    LOG(WARNING)
+                        << "NotifyPromotionSuccess: PUT_END persist failed "
+                        << "for key=" << key
+                        << ", err=" << static_cast<int>(persist_result.error());
+                }
+            } else {
+                auto persist_result = AppendOpLogVisibleBeforeDurable(
+                    OpType::PUT_END, tenant_id.value(), key, payload);
+                if (!persist_result) {
+                    LOG(WARNING)
+                        << "NotifyPromotionSuccess: PUT_END persist failed "
+                        << "for key=" << key
+                        << ", err=" << static_cast<int>(persist_result.error());
+                }
+            }
+        }
     }
 
     // Drop the source LOCAL_DISK replica's refcnt and erase the task.
@@ -11176,6 +11228,10 @@ void MasterService::PendingMutationWorker() {
 bool MasterService::ProcessPendingMutationOnce(PendingMutation& m) {
     ErrorCode err = oplog_store_->WriteOpLog(m.oplog_entry, true);
     if (err == ErrorCode::OK) {
+        if (m.kind == PendingMutationKind::RELEASE_REMOVED_REPLICAS) {
+            FinalizeRemovedReplicasAfterDurable(
+                m.oplog_entry, m.removed_replica_ids, m.quota_mode);
+        }
         VLOG(1) << "PendingMutation retry successful for key: " << m.key;
         return true;
     }
@@ -11216,6 +11272,22 @@ void MasterService::EnqueueRetryOnPersistFailure(const char* why,
     m.segment_name = "";
     m.oplog_entry = std::move(entry);
     m.attempt = 0;
+    m.next_retry_at = std::chrono::steady_clock::now();
+    EnqueuePendingMutation(std::move(m));
+}
+
+void MasterService::EnqueueRemovedReplicaFinalize(
+    const char* why, OpLogEntry entry, std::vector<ReplicaID> replica_ids,
+    QuotaEraseMode quota_mode) {
+    LOG(WARNING) << why << " for key=" << entry.object_key
+                 << ", sequence_id=" << entry.sequence_id
+                 << ", enqueueing removed replica finalize";
+    PendingMutation m;
+    m.kind = PendingMutationKind::RELEASE_REMOVED_REPLICAS;
+    m.key = entry.object_key;
+    m.oplog_entry = std::move(entry);
+    m.removed_replica_ids = std::move(replica_ids);
+    m.quota_mode = quota_mode;
     m.next_retry_at = std::chrono::steady_clock::now();
     EnqueuePendingMutation(std::move(m));
 }

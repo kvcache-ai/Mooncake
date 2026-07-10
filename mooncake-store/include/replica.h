@@ -446,7 +446,8 @@ class Replica {
     }
 
     void mark_removed() {
-        if (status_ == ReplicaStatus::COMPLETE) {
+        if (status_ == ReplicaStatus::COMPLETE ||
+            status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::REMOVED;
         } else if (status_ == ReplicaStatus::REMOVED) {
             LOG(WARNING) << "Replica already marked as removed";

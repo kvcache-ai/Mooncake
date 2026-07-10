@@ -448,6 +448,14 @@ class MasterServiceHATest : public ::testing::Test {
         service.ClearInvalidHandles(alive_clients);
     }
 
+    static size_t ReplicaCountForTesting(MasterService& service,
+                                         const std::string& tenant_id,
+                                         const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
+    }
+
     static void PrepareUnmountSegmentForTesting(MasterService& service,
                                                 const UUID& segment_id) {
         auto segment_access = service.segment_manager_.getSegmentAccess();
@@ -2192,6 +2200,44 @@ TEST_F(MasterServiceHATest,
     ReadBatchEventually(storage, 2, batch);
 }
 
+TEST_F(MasterServiceHATest,
+       NotifyPromotionSuccessPersistFailureStillCompletesLocally) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    MasterService service(service_config);
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service.SetOpLogStoreForTesting(mock_store);
+
+    const auto mounted = PrepareSimpleSegment(service, "promotion_fail_seg");
+    const std::string key = "promotion_persist_fail_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"promotion_fail_seg"};
+    auto put_start =
+        service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(1u, put_start->size());
+    SeedPromotionTaskForTesting(&service, kDefaultTenant, key,
+                                mounted.client_id, put_start->front().id, 1024);
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+    const size_t entries_before = mock_store->EntryCount();
+
+    auto promotion =
+        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    EXPECT_TRUE(promotion.has_value())
+        << "promotion should not fail on best-effort PUT_END persistence";
+    EXPECT_EQ(entries_before, mock_store->EntryCount());
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(1u, replicas->replicas.size());
+}
+
 TEST_F(MasterServiceHATest, RemoveWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_remove_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
@@ -3377,7 +3423,15 @@ TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
     ASSERT_TRUE(res.has_value());
 
     OpLogEntry entry;
-    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    ErrorCode find_err = ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    for (int i = 0; i < 50; ++i) {
+        find_err = mock_store->FindLatestEntryForKey(key, entry);
+        if (find_err == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(ErrorCode::OK, find_err);
     EXPECT_EQ(OpType::REMOVE, entry.op_type);
 }
 
@@ -3640,9 +3694,9 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(entry.payload.empty());
 }
 
-// CopyEnd must NOT mark target replicas COMPLETE or erase the task when
-// OpLog persist fails.
-TEST_F(MasterServiceHATest, CopyEndPersistFailureSkipsLocalMutation) {
+// CopyEnd should finish locally even when PUT_END persistence is temporarily
+// unavailable; the new replica is an additive optimization.
+TEST_F(MasterServiceHATest, CopyEndPersistFailureStillCompletesLocally) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
@@ -3667,24 +3721,16 @@ TEST_F(MasterServiceHATest, CopyEndPersistFailureSkipsLocalMutation) {
     ASSERT_TRUE(copy_start.has_value());
 
     mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+    const size_t entries_before = mock_store->EntryCount();
 
     auto res = service->CopyEnd(client_id, key, kDefaultTenant);
-    EXPECT_FALSE(res.has_value())
-        << "CopyEnd must return error when OpLog persist fails";
+    EXPECT_TRUE(res.has_value())
+        << "CopyEnd should not fail on best-effort PUT_END persistence";
+    EXPECT_EQ(entries_before, mock_store->EntryCount());
 
-    // Target replicas must remain PROCESSING (not COMPLETE).
     auto list = service->GetReplicaList(key, kDefaultTenant);
     ASSERT_TRUE(list.has_value());
-    // Only the original COMPLETE memory replica should be in the published
-    // descriptor list — target replicas are still PROCESSING and excluded.
-    EXPECT_EQ(1u, list->replicas.size())
-        << "Only the original source replica should be COMPLETE";
-
-    // Retrying after restoring persist should succeed.
-    mock_store->SetWriteError(ErrorCode::OK);
-    auto retry = service->CopyEnd(client_id, key, kDefaultTenant);
-    EXPECT_TRUE(retry.has_value())
-        << "CopyEnd retry should succeed after persist is restored";
+    EXPECT_EQ(2u, list->replicas.size());
 }
 
 // MoveEnd must NOT decrement source refcnt or mark target COMPLETE when
@@ -3735,11 +3781,9 @@ TEST_F(MasterServiceHATest, MoveEndPersistFailureSkipsLocalMutation) {
         << "MoveEnd retry should succeed after persist is restored";
 }
 
-// PutRevoke must NOT mutate metadata when OpLog persist fails (also
-// implicitly checks H.1 metric ordering: dec_mem_cache_nums must not run
-// when persist fails). The PROCESSING replica should still be revokable
-// after we restore persist.
-TEST_F(MasterServiceHATest, PutRevokePersistFailureSkipsLocalMutation) {
+// PutRevoke should hide revoked replicas immediately and release their space
+// after the legacy retry queue makes the OpLog durable.
+TEST_F(MasterServiceHATest, PutRevokePersistFailureFinalizesAfterRetry) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
@@ -3765,17 +3809,21 @@ TEST_F(MasterServiceHATest, PutRevokePersistFailureSkipsLocalMutation) {
 
     auto res =
         service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
-    EXPECT_FALSE(res.has_value())
-        << "PutRevoke must return error when OpLog persist fails";
+    ASSERT_TRUE(res.has_value())
+        << "PutRevoke should not fail on best-effort REMOVE persistence";
 
-    // Restore persist; PutRevoke must succeed because the PROCESSING replica
-    // was NOT erased on the failed attempt.
+    auto exists = service->ExistKey(key, kDefaultTenant);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+    EXPECT_EQ(1u, ReplicaCountForTesting(*service, kDefaultTenant, key));
+
     mock_store->SetWriteError(ErrorCode::OK);
-    auto retry =
-        service->PutRevoke(client_id, key, kDefaultTenant, ReplicaType::MEMORY);
-    EXPECT_TRUE(retry.has_value())
-        << "PutRevoke retry must succeed because the PROCESSING replica "
-           "was preserved after persist failure";
+    for (int i = 0;
+         i < 50 && ReplicaCountForTesting(*service, kDefaultTenant, key) != 0;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(0u, ReplicaCountForTesting(*service, kDefaultTenant, key));
 }
 
 // ===== Step 2: strong-consistency eviction =====

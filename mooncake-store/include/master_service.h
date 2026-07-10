@@ -2328,6 +2328,7 @@ class MasterService {
         CLEAR_ALL_REPLICAS = 2,
         CLEAR_REPLICAS_ON_SEGMENT = 3,
         SEGMENT_LIFECYCLE = 4,
+        RELEASE_REMOVED_REPLICAS = 5,
     };
 
     struct PendingMutation {
@@ -2335,6 +2336,8 @@ class MasterService {
         std::string key;
         std::string segment_name;
         OpLogEntry oplog_entry;
+        std::vector<ReplicaID> removed_replica_ids;
+        QuotaEraseMode quota_mode{QuotaEraseMode::kFull};
         uint32_t attempt{0};
         std::chrono::steady_clock::time_point next_retry_at{};
     };
@@ -2344,6 +2347,9 @@ class MasterService {
     bool ProcessPendingMutationOnce(PendingMutation& m);
     void EnqueueRetryOnPersistFailure(const char* why, PendingMutationKind kind,
                                       OpLogEntry entry);
+    void EnqueueRemovedReplicaFinalize(const char* why, OpLogEntry entry,
+                                       std::vector<ReplicaID> replica_ids,
+                                       QuotaEraseMode quota_mode);
     void AppendOrPersistOrEnqueue(const char* why, OpType type,
                                   const std::string& key,
                                   const std::string& payload,
