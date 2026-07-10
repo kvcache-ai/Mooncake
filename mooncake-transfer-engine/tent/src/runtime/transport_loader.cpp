@@ -45,6 +45,10 @@
 #include "tent/transport/ub/ub_tent_transport.h"
 #endif
 
+#ifdef USE_TPU
+#include "tent/transport/tpu/tpu_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -101,6 +105,11 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_UB
     if (conf_->get("transports/ub/enable", true))
         transport_list_[UB] = std::make_shared<UbTentTransport>();
+#endif
+
+#ifdef USE_TPU
+    if (conf_->get("transports/tpu/enable", true))
+        transport_list_[TPU] = std::make_shared<TpuTransport>();
 #endif
 
     return Status::OK();

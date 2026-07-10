@@ -1,4 +1,4 @@
-#include "aligned_client_buffer.hpp"
+#include "aligned_client_buffer.h"
 
 #include <glog/logging.h>
 #include <sys/mman.h>

@@ -81,9 +81,9 @@ endif()
 if(USE_SUNRISE)
   target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
   target_include_directories(tent_interface INTERFACE ${MC_TANGRT_ROOT}/include)
-  target_link_directories(tent_interface INTERFACE
-                          ${MC_TANGRT_ROOT}/lib/linux-x86_64
-                          ${MC_TANGRT_ROOT}/lib)
+  target_link_directories(
+    tent_interface INTERFACE ${MC_TANGRT_ROOT}/lib/linux-x86_64
+    ${MC_TANGRT_ROOT}/lib)
   target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
 endif()
 
@@ -139,6 +139,7 @@ foreach(
   platform_rocm
   platform_ascend
   platform_sunrise
+  platform_tpu
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -150,6 +151,7 @@ foreach(
   tent_xport_ascend_direct
   tent_xport_sunrise_link
   tent_xport_ub
+  tent_xport_tpu
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})
