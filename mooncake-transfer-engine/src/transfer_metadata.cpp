@@ -1033,6 +1033,8 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
+    const auto sync_start = std::chrono::steady_clock::now();
+
     // Collect segment names to sync first, then release lock before network I/O
     std::vector<std::string> names_to_sync;
     {
@@ -1103,12 +1105,17 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             desc->dump();
         }
     }
+    const auto sync_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - sync_start)
+            .count();
     LOG(INFO) << "Segment cache sync finished, requested_segment="
               << (segment_name.empty() ? "<all>" : segment_name)
               << ", scanned=" << names_to_sync.size()
               << ", fetched=" << fetched_count << ", updated=" << updated_count
               << ", unchanged=" << unchanged_count
-              << ", failed=" << failed_count << ", skipped=" << skipped_count;
+              << ", failed=" << failed_count << ", skipped=" << skipped_count
+              << ", sync_duration_ms=" << sync_duration_ms;
     return 0;
 }
 
