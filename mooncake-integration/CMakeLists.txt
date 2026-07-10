@@ -75,7 +75,7 @@ if(WITH_TE)
     target_link_libraries(engine PRIVATE CUDA::cudart)
   endif()
 
-  if(BUILD_TESTING)
+  if(BUILD_UNIT_TESTS)
     add_executable(transfer_retry_hint_test
                    transfer_engine/retry_utils_test.cpp)
     target_include_directories(transfer_retry_hint_test PRIVATE
