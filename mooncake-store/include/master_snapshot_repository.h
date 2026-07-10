@@ -58,7 +58,7 @@ class MasterSnapshotRepository {
      * @param keep_count Number of recent snapshots to keep
      * @param current_snapshot_id Current snapshot ID (for logging)
      */
-    void CleanupOldSnapshots(int keep_count,
+    void CleanupOldSnapshots(size_t keep_count,
                              const std::string& current_snapshot_id);
 
     /**

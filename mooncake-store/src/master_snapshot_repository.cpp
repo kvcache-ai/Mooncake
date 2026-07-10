@@ -74,7 +74,7 @@ ErrorCode MasterSnapshotRepository::PublishSnapshot(
 }
 
 void MasterSnapshotRepository::CleanupOldSnapshots(
-    int keep_count, const std::string& current_snapshot_id) {
+    size_t keep_count, const std::string& current_snapshot_id) {
     if (!catalog_store_) {
         SNAP_LOG_ERROR(
             "[Snapshot] snapshot catalog store is not initialized, "
@@ -95,8 +95,8 @@ void MasterSnapshotRepository::CleanupOldSnapshots(
 
     const auto& snapshots = list_result.value();
 
-    if (static_cast<int>(snapshots.size()) > keep_count) {
-        for (int i = keep_count; i < static_cast<int>(snapshots.size()); i++) {
+    if (snapshots.size() > keep_count) {
+        for (size_t i = keep_count; i < snapshots.size(); i++) {
             const std::string& old_state_dir = snapshots[i].snapshot_id;
 
             if (old_state_dir == current_snapshot_id) {

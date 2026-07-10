@@ -703,7 +703,7 @@ MasterSnapshotManager::UploadSnapshotPayloadFile(
                                           snapshot_id);
 }
 
-void MasterSnapshotManager::CleanupOldSnapshot(int keep_count,
+void MasterSnapshotManager::CleanupOldSnapshot(size_t keep_count,
                                                const std::string& snapshot_id) {
     repository_->CleanupOldSnapshots(keep_count, snapshot_id);
 }
