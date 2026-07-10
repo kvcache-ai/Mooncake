@@ -238,11 +238,8 @@ class NcclDeviceContext {
     const void* native_comm_ = nullptr;
     const void* native_window_ = nullptr;
     const void* local_base_ = nullptr;
-    size_t buffer_bytes_ = 0;
     int rank_ = -1;
-    int num_ranks_ = 0;
     int gin_context_count_ = 0;
-    int lsa_barrier_count_ = 0;
     bool gin_enabled_ = false;
     bool lsa_multimem_enabled_ = false;
 
@@ -261,7 +258,10 @@ class NcclTransport {
     virtual std::vector<int32_t> createUniqueId() = 0;
 
     // Create the host and device communicators. Every rank must call this with
-    // the same unique ID and compatible config.
+    // the same unique ID and compatible config. The NCCL headers used to build
+    // Mooncake and device kernels must exactly match the runtime libnccl;
+    // initialization rejects a mismatch. Rebuild AOT kernels and regenerate
+    // cached JIT kernels after every NCCL upgrade.
     virtual int initialize(const NcclTransportConfig& config,
                            const std::vector<int32_t>& unique_id) = 0;
 

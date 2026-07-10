@@ -30,6 +30,12 @@
 #error "Mooncake NCCL DeviceTransport requires NCCL 2.30.4 or newer"
 #endif
 
+// NCCL device code uses version-specific Device API definitions and layouts
+// from nccl_device.h. Mooncake therefore requires these headers to exactly
+// match the loaded runtime libnccl. After an NCCL upgrade, rebuild AOT kernels
+// that include this header and invalidate and re-JIT cached NCCL Device API
+// kernels before running.
+
 namespace mooncake {
 namespace device {
 namespace detail {
@@ -51,29 +57,14 @@ struct NcclDeviceContextAccess {
         return static_cast<const char*>(ctx.local_base_);
     }
 
-    __device__ __forceinline__ static size_t bufferBytes(
-        const NcclDeviceContext& ctx) {
-        return ctx.buffer_bytes_;
-    }
-
     __device__ __forceinline__ static int rank(
         const NcclDeviceContext& ctx) {
         return ctx.rank_;
     }
 
-    __device__ __forceinline__ static int numRanks(
-        const NcclDeviceContext& ctx) {
-        return ctx.num_ranks_;
-    }
-
     __device__ __forceinline__ static int ginContextCount(
         const NcclDeviceContext& ctx) {
         return ctx.gin_context_count_;
-    }
-
-    __device__ __forceinline__ static int lsaBarrierCount(
-        const NcclDeviceContext& ctx) {
-        return ctx.lsa_barrier_count_;
     }
 
     __device__ __forceinline__ static bool ginEnabled(
@@ -87,23 +78,8 @@ struct NcclDeviceContextAccess {
     }
 };
 
-__device__ __forceinline__ void mc_nccl_trap() {
-    asm volatile("trap;");
-}
-
-__device__ __forceinline__ bool mc_nccl_pointer_in_buffer(
-    const NcclDeviceContext& ctx, const void* ptr, size_t bytes = 1) {
-    const uintptr_t base = reinterpret_cast<uintptr_t>(
-        NcclDeviceContextAccess::localBase(ctx));
-    const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-    const size_t extent = NcclDeviceContextAccess::bufferBytes(ctx);
-    return address >= base && bytes <= extent &&
-           address - base <= extent - bytes;
-}
-
 __device__ __forceinline__ size_t mc_nccl_pointer_offset(
-    const NcclDeviceContext& ctx, const void* ptr, size_t bytes = 1) {
-    if (!mc_nccl_pointer_in_buffer(ctx, ptr, bytes)) mc_nccl_trap();
+    const NcclDeviceContext& ctx, const void* ptr) {
     return static_cast<size_t>(
         static_cast<const char*>(ptr) -
         NcclDeviceContextAccess::localBase(ctx));
@@ -112,32 +88,33 @@ __device__ __forceinline__ size_t mc_nccl_pointer_offset(
 __device__ __forceinline__ int mc_nccl_gin_context(
     const NcclDeviceContext& ctx, unsigned int channel) {
     const int count = NcclDeviceContextAccess::ginContextCount(ctx);
-    if (count <= 0) mc_nccl_trap();
     return static_cast<int>(channel % static_cast<unsigned int>(count));
 }
 
 }  // namespace detail
 
-// Pointer and route queries are per-thread operations.
+// Device operations in this header are intentionally unchecked, matching the
+// existing Mooncake and NCCL device APIs. The caller must provide a live
+// context, a valid and reachable rank, the required NCCL resources, and pointer
+// ranges wholly contained in the registration bound to ctx. Violating a
+// precondition is undefined behavior. Hoist capability and route queries out of
+// hot loops when the route is already known.
+
+// Pointer and route queries are per-thread operations. peer must be a valid
+// world rank.
 __device__ __forceinline__ bool mc_nccl_lsa_available(
     const NcclDeviceContext& ctx, int peer) {
-    if (peer < 0 || peer >= detail::NcclDeviceContextAccess::numRanks(ctx))
-        return false;
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     return ncclTeamRankIsMember(ncclTeamLsa(comm), ncclTeamWorld(comm), peer);
 }
 
 __device__ __forceinline__ bool mc_nccl_gin_available(
     const NcclDeviceContext& ctx) {
-    if (!detail::NcclDeviceContextAccess::ginEnabled(ctx)) return false;
-    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    return comm.ginConnectionCount > 0 && comm.ginContextCount > 0;
+    return detail::NcclDeviceContextAccess::ginEnabled(ctx);
 }
 
 __device__ __forceinline__ NcclDeviceRoute mc_nccl_route(
     const NcclDeviceContext& ctx, int peer) {
-    if (peer < 0 || peer >= detail::NcclDeviceContextAccess::numRanks(ctx))
-        return NcclDeviceRoute::kUnavailable;
     if (peer == detail::NcclDeviceContextAccess::rank(ctx))
         return NcclDeviceRoute::kLocal;
     if (mc_nccl_lsa_available(ctx, peer)) return NcclDeviceRoute::kLsa;
@@ -149,9 +126,8 @@ __device__ __forceinline__ NcclDeviceRoute mc_nccl_route(
 // the registration used to create ctx, and peer must be local or LSA reachable.
 __device__ __forceinline__ void* mc_nccl_peer_ptr(
     const NcclDeviceContext& ctx, int peer, const void* local_ptr) {
-    const NcclDeviceRoute route = mc_nccl_route(ctx, peer);
-    if (route == NcclDeviceRoute::kLocal) return const_cast<void*>(local_ptr);
-    if (route != NcclDeviceRoute::kLsa) return nullptr;
+    if (peer == detail::NcclDeviceContextAccess::rank(ctx))
+        return const_cast<void*>(local_ptr);
 
     const size_t offset = detail::mc_nccl_pointer_offset(ctx, local_ptr);
     return ncclGetPeerPointer(detail::NcclDeviceContextAccess::window(ctx),
@@ -167,7 +143,6 @@ __device__ __forceinline__ bool mc_nccl_multimem_available(
 // have been initialized with require_lsa_multimem=true.
 __device__ __forceinline__ void* mc_nccl_multimem_ptr(
     const NcclDeviceContext& ctx, const void* local_ptr) {
-    if (!mc_nccl_multimem_available(ctx)) return nullptr;
     const size_t offset = detail::mc_nccl_pointer_offset(ctx, local_ptr);
     return ncclGetLsaMultimemPointer(
         detail::NcclDeviceContextAccess::window(ctx), offset,
@@ -179,12 +154,6 @@ __device__ __forceinline__ void* mc_nccl_multimem_ptr(
 // World/cross-LSA synchronization remains the caller's responsibility.
 __device__ __forceinline__ void mc_nccl_lsa_barrier(
     const NcclDeviceContext& ctx, unsigned int barrier_index) {
-    if (barrier_index >= static_cast<unsigned int>(
-                             detail::NcclDeviceContextAccess::lsaBarrierCount(
-                                 ctx))) {
-        detail::mc_nccl_trap();
-    }
-
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclLsaBarrierSession<ncclCoopCta> barrier{
         ncclCoopCta{}, comm, ncclTeamTagLsa{}, barrier_index,
@@ -197,6 +166,9 @@ __device__ __forceinline__ void mc_nccl_lsa_barrier(
 // If a warp staged send_ptr, the caller must synchronize the warp before this
 // call. mc_nccl_flush() makes sources issued on the context safe to reuse, but
 // remote settlement requires mc_nccl_put_with_signal() and a receiver wait.
+// GIN calls require GIN to be enabled, a valid nonlocal destination, and a
+// nonnegative channel. Signal pointers must be naturally aligned uint64_t
+// objects inside the registration.
 
 __device__ __forceinline__ void mc_nccl_put(
     const NcclDeviceContext& ctx, int channel, int dst_rank,
@@ -204,17 +176,9 @@ __device__ __forceinline__ void mc_nccl_put(
     int lane_id) {
     (void)qps_per_rank;
     if (lane_id != 0) return;
-    if (dst_rank < 0 ||
-        dst_rank >= detail::NcclDeviceContextAccess::numRanks(ctx) ||
-        dst_rank == detail::NcclDeviceContextAccess::rank(ctx) ||
-        !mc_nccl_gin_available(ctx)) {
-        detail::mc_nccl_trap();
-    }
 
-    const size_t src_offset =
-        detail::mc_nccl_pointer_offset(ctx, send_ptr, nbytes);
-    const size_t dst_offset =
-        detail::mc_nccl_pointer_offset(ctx, recv_ptr, nbytes);
+    const size_t src_offset = detail::mc_nccl_pointer_offset(ctx, send_ptr);
+    const size_t dst_offset = detail::mc_nccl_pointer_offset(ctx, recv_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
@@ -233,19 +197,11 @@ __device__ __forceinline__ void mc_nccl_put_with_signal(
     uint64_t* completion_ptr, uint64_t completion_delta, int lane_id) {
     (void)qps_per_rank;
     if (lane_id != 0) return;
-    if (dst_rank < 0 ||
-        dst_rank >= detail::NcclDeviceContextAccess::numRanks(ctx) ||
-        dst_rank == detail::NcclDeviceContextAccess::rank(ctx) ||
-        !mc_nccl_gin_available(ctx)) {
-        detail::mc_nccl_trap();
-    }
 
-    const size_t src_offset =
-        detail::mc_nccl_pointer_offset(ctx, send_ptr, nbytes);
-    const size_t dst_offset =
-        detail::mc_nccl_pointer_offset(ctx, recv_ptr, nbytes);
-    const size_t completion_offset = detail::mc_nccl_pointer_offset(
-        ctx, completion_ptr, sizeof(uint64_t));
+    const size_t src_offset = detail::mc_nccl_pointer_offset(ctx, send_ptr);
+    const size_t dst_offset = detail::mc_nccl_pointer_offset(ctx, recv_ptr);
+    const size_t completion_offset =
+        detail::mc_nccl_pointer_offset(ctx, completion_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
@@ -265,19 +221,27 @@ __device__ __forceinline__ void mc_nccl_signal_add(
     (void)qps_per_rank;
     if (lane_id != 0) return;
 
-    const NcclDeviceRoute route = mc_nccl_route(ctx, dst_rank);
-    if (route == NcclDeviceRoute::kLocal || route == NcclDeviceRoute::kLsa) {
-        auto* target = static_cast<uint64_t*>(
-            mc_nccl_peer_ptr(ctx, dst_rank, signal_ptr));
+    if (dst_rank == detail::NcclDeviceContextAccess::rank(ctx)) {
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(
+            *signal_ptr);
+        signal.fetch_add(value, cuda::memory_order_release);
+        return;
+    }
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    if (ncclTeamRankIsMember(ncclTeamLsa(comm), ncclTeamWorld(comm),
+                             dst_rank)) {
+        const size_t signal_offset =
+            detail::mc_nccl_pointer_offset(ctx, signal_ptr);
+        auto* target = static_cast<uint64_t*>(ncclGetPeerPointer(
+            detail::NcclDeviceContextAccess::window(ctx), signal_offset,
+            dst_rank));
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(*target);
         signal.fetch_add(value, cuda::memory_order_release);
         return;
     }
-    if (route != NcclDeviceRoute::kGin) detail::mc_nccl_trap();
 
-    const size_t signal_offset = detail::mc_nccl_pointer_offset(
-        ctx, signal_ptr, sizeof(uint64_t));
-    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    const size_t signal_offset =
+        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
@@ -288,7 +252,7 @@ __device__ __forceinline__ void mc_nccl_signal_add(
 
 __device__ __forceinline__ void mc_nccl_flush(
     const NcclDeviceContext& ctx, int channel, int lane_id) {
-    if (lane_id != 0 || !mc_nccl_gin_available(ctx)) return;
+    if (lane_id != 0) return;
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
@@ -298,14 +262,14 @@ __device__ __forceinline__ void mc_nccl_flush(
 __device__ __forceinline__ uint64_t mc_nccl_read_signal(
     const NcclDeviceContext& ctx, int channel,
     const uint64_t* signal_ptr) {
-    const size_t signal_offset = detail::mc_nccl_pointer_offset(
-        ctx, signal_ptr, sizeof(uint64_t));
     if (!mc_nccl_gin_available(ctx)) {
         auto& value = *const_cast<uint64_t*>(signal_ptr);
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(value);
         return signal.load(cuda::memory_order_acquire);
     }
 
+    const size_t signal_offset =
+        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
@@ -319,14 +283,16 @@ __device__ __forceinline__ void mc_nccl_wait_signal(
     const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr,
     uint64_t least, int lane_id) {
     if (lane_id != 0) return;
-    const size_t signal_offset = detail::mc_nccl_pointer_offset(
-        ctx, signal_ptr, sizeof(uint64_t));
     if (!mc_nccl_gin_available(ctx)) {
-        while (mc_nccl_read_signal(ctx, channel, signal_ptr) < least) {
+        auto& value = *const_cast<uint64_t*>(signal_ptr);
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(value);
+        while (signal.load(cuda::memory_order_acquire) < least) {
         }
         return;
     }
 
+    const size_t signal_offset =
+        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
