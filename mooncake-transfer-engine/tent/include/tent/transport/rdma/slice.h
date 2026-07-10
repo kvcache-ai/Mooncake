@@ -61,6 +61,10 @@ struct RdmaTask {
     volatile int resolved_slices;
     volatile TransferStatusEnum first_error = PENDING;
 
+    // Set by the control thread. Workers observe this flag before posting or
+    // retrying a slice. Already-posted WRs are allowed to drain normally.
+    std::atomic<bool> cancel_requested{false};
+
     // Reference counting for UAF protection
     std::atomic<int> ref_count{0};
 
@@ -92,6 +96,9 @@ struct RdmaSlice {
     int qp_index = 0;
     int retry_count = 0;
     bool failed = false;
+    // True while DeviceSelector accounts this slice against source_dev_id.
+    // The worker clears it exactly once on completion, failure, or cancel.
+    bool quota_charged = false;
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
     // Non-owning pointer to the per-worker RailMonitor for this slice's

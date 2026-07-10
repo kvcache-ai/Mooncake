@@ -322,6 +322,18 @@ int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
     return 0;
 }
 
+int tent_cancel_task(tent_engine_t engine, tent_batch_id_t batch_id,
+                     size_t task_id) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(batch_id);
+    auto status = CAST(engine)->cancelTransfer(batch_id, task_id);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_cancel_task: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
 int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
                         tent_status_t* xfer_status) {
     CHECK_POINTER(engine);

@@ -441,6 +441,10 @@ Status RdmaTransport::submitTransferTasks(
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;
+        task->success_slices = 0;
+        task->resolved_slices = 0;
+        task->first_error = PENDING;
+        task->cancel_requested.store(false, std::memory_order_relaxed);
         task->ref();  // Batch holds a reference to the task
 
         const double merge_ratio = 0.25;
@@ -492,6 +496,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = task;
             slice->retry_count = 0;
+            slice->quota_charged = false;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
@@ -499,8 +504,10 @@ Status RdmaTransport::submitTransferTasks(
             slice->priority = request.priority;  // Copy priority from request
             task->num_slices++;
             task->ref();  // Each slice holds a reference to the task
-            if (slice_idx < slice_dev_ids.size())
+            if (slice_idx < slice_dev_ids.size()) {
                 slice->source_dev_id = slice_dev_ids[slice_idx];
+                slice->quota_charged = true;
+            }
             offset += length;
             int part_id = next_worker_idx % num_workers;
             auto& list = slice_lists[part_id];
@@ -534,6 +541,19 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto* task = rdma_batch->task_list[task_id];
     status = TransferStatus{task->status_word, task->transferred_bytes};
     return Status::OK();
+}
+
+Status RdmaTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
+    auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
+    if (!rdma_batch) {
+        return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
+    }
+    if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    }
+    auto* task = rdma_batch->task_list[task_id];
+    if (task->status_word != PENDING) return Status::OK();
+    return workers_->cancel(task);
 }
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
