@@ -27,6 +27,14 @@ target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)
 
+# Reproducible hot-path microbenchmark; intentionally not registered with
+# ctest. Run manually when changing deadline promotion partitioning.
+add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
+                                        ../src/runtime/admission_queue.cpp)
+target_link_libraries(deadline_promotion_bench PRIVATE tent_common)
+target_include_directories(deadline_promotion_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
 add_executable(promotion_policy_test promotion_policy_test.cpp)
 target_link_libraries(promotion_policy_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(promotion_policy_test
