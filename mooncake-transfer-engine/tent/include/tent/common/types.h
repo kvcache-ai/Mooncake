@@ -66,6 +66,16 @@ inline TransportType c_to_transport_hint(int v) {
     return static_cast<TransportType>(v);
 }
 
+enum class IntentType : int {
+    INTENT_UNSPEC = 0,
+    FOREGROUND_GET,
+    BACKGROUND_PREFETCH,
+    MIGRATION,
+    CHECKPOINT,
+    WEIGHT_LOADING,
+    STAGING_INTERNAL,
+};
+
 struct Request {
     enum OpCode { READ, WRITE };
     OpCode opcode;
@@ -86,6 +96,7 @@ struct Request {
     // (MLU = actual transfer time / available window) on completion; it does
     // not yet drive any admission or scheduling decision. See RFC #2519.
     uint64_t deadline_ns = 0;
+    IntentType intent_type = IntentType::INTENT_UNSPEC;
 };
 
 enum TransferStatusEnum {

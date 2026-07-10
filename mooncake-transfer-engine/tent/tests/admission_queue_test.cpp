@@ -14,6 +14,7 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -593,6 +594,196 @@ TEST(AdmissionQueueTest, Step3NoDropWithoutBandwidthProvider) {
     auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
     ASSERT_EQ(picked.size(), 1u);
     EXPECT_TRUE(dropped.empty());
+}
+
+// --- Deadline proximity promotion (step 4) --------------------------------
+
+QueueLimits promotionLimits(uint64_t slack_ns) {
+    QueueLimits limits{8, 1 << 20, 0, 0};
+    limits.deadline_aware = true;
+    limits.promotion_slack_ns = slack_ns;
+    return limits;
+}
+
+TEST(AdmissionQueueTest, PromotionDisabledKeepsEdfOrder) {
+    QueueLimits limits{4, 4096, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3,
+                                  {makeOwnerWithDeadline(0, 16, 2000),
+                                   makeOwnerWithDeadline(1, 16, 1500),
+                                   makeOwnerWithDeadline(2, 16, 1800)}),
+                       ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 4096);
+    const std::vector<QueueOwnerId> expected{2, 3, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionMovesUrgentOwnersToFront) {
+    LocalTransferAdmissionQueue queue(promotionLimits(500));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3,
+                                  {makeOwnerWithDeadline(0, 16, 2000),
+                                   makeOwnerWithDeadline(1, 16, 1400),
+                                   makeOwnerWithDeadline(2, 16, 1300)}),
+                       ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    const std::vector<QueueOwnerId> expected{3, 2, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionReordersAcrossSeparateAdmits) {
+    LocalTransferAdmissionQueue queue(promotionLimits(2000));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{5000}; });
+
+    std::vector<QueueOwnerId> ids;
+    auto s1 = queue.tryAdmit(
+        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 10000)}), ids);
+    ASSERT_EQ(s1.code(), Status::Code::kOk);
+    auto s2 = queue.tryAdmit(
+        makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 6500)}), ids);
+    ASSERT_EQ(s2.code(), Status::Code::kOk);
+    auto s3 = queue.tryAdmit(
+        makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 6000)}), ids);
+    ASSERT_EQ(s3.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    const std::vector<QueueOwnerId> expected{3, 2, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionSkipsNoDeadlineOwners) {
+    LocalTransferAdmissionQueue queue(promotionLimits(5000));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 2,
+                                  {makeOwnerWithDeadline(0, 16, 0),
+                                   makeOwnerWithDeadline(1, 16, 2000)}),
+                       ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    const std::vector<QueueOwnerId> expected{2, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionPreservesEdfWithinPromotedGroup) {
+    LocalTransferAdmissionQueue queue(promotionLimits(2000));
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3,
+                                  {makeOwnerWithDeadline(0, 16, 2500),
+                                   makeOwnerWithDeadline(1, 16, 2200),
+                                   makeOwnerWithDeadline(2, 16, 2800)}),
+                       ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 1 << 20);
+    const std::vector<QueueOwnerId> expected{2, 1, 3};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionCoexistsWithStep3Drop) {
+    QueueLimits limits = promotionLimits(500);
+    limits.mlu_local_threshold = 1.5;
+    LocalTransferAdmissionQueue queue(limits);
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3,
+                                  {makeOwnerWithDeadline(0, 16, 1010),
+                                   makeOwnerWithDeadline(1, 16, 1400),
+                                   makeOwnerWithDeadline(2, 16, 5000)}),
+                       ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+
+    const std::vector<QueueOwnerId> exp_pick{2, 3};
+    const std::vector<QueueOwnerId> exp_drop{1};
+    EXPECT_EQ(picked, exp_pick);
+    EXPECT_EQ(dropped, exp_drop);
+    EXPECT_EQ(hook_calls, 1);
+}
+
+TEST(AdmissionQueueTest, PromotionWithAdvancingTime) {
+    QueueLimits limits = promotionLimits(500);
+    LocalTransferAdmissionQueue queue(limits);
+
+    uint64_t fake_now = 1000;
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [&] { return fake_now; });
+
+    std::vector<QueueOwnerId> ids;
+    auto s1 = queue.tryAdmit(
+        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1800)}), ids);
+    ASSERT_EQ(s1.code(), Status::Code::kOk);
+    auto s2 = queue.tryAdmit(
+        makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 1400)}), ids);
+    ASSERT_EQ(s2.code(), Status::Code::kOk);
+    auto s3 = queue.tryAdmit(
+        makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 3000)}), ids);
+    ASSERT_EQ(s3.code(), Status::Code::kOk);
+
+    auto picked1 = queue.pickForDispatch(1, 1 << 20);
+    ASSERT_EQ(picked1.size(), 1u);
+    EXPECT_EQ(picked1[0], 2u);
+
+    auto cstatus = queue.complete(2, TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(cstatus.code(), Status::Code::kOk);
+
+    fake_now = 1500;
+    auto picked2 = queue.pickForDispatch(2, 1 << 20);
+    const std::vector<QueueOwnerId> expected2{1, 3};
+    EXPECT_EQ(picked2, expected2);
+}
+
+TEST(AdmissionQueueTest, PromotionDisabledWithoutDeadlineAware) {
+    QueueLimits limits{4, 4096, 0, 0};
+    limits.deadline_aware = false;
+    limits.promotion_slack_ns = 5000;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy(nullptr, DegradationHooks{},
+                               [] { return uint64_t{1000}; });
+
+    std::vector<QueueOwnerId> ids;
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 3,
+                                  {makeOwnerWithDeadline(0, 16, 1200),
+                                   makeOwnerWithDeadline(1, 16, 5000),
+                                   makeOwnerWithDeadline(2, 16, 1100)}),
+                       ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(4, 4096);
+    const std::vector<QueueOwnerId> expected{1, 2, 3};
+    EXPECT_EQ(picked, expected);
 }
 
 }  // namespace

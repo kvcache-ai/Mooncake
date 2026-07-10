@@ -33,6 +33,14 @@ target_include_directories(bw_arbitration_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME bw_arbitration_test COMMAND bw_arbitration_test)
 
+# Reproducible hot-path microbenchmark; intentionally not registered with
+# ctest. Run manually when changing deadline promotion partitioning.
+add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
+                                        ../src/runtime/admission_queue.cpp)
+target_link_libraries(deadline_promotion_bench PRIVATE tent_common)
+target_include_directories(deadline_promotion_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
 add_executable(promotion_policy_test promotion_policy_test.cpp)
 target_link_libraries(promotion_policy_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(promotion_policy_test
@@ -194,6 +202,13 @@ endif()
 target_include_directories(tent_transport_hint_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
+
+add_executable(tent_intent_type_test intent_type_test.cpp)
+target_link_libraries(tent_intent_type_test PRIVATE gtest gtest_main
+                                                    tent_common)
+target_include_directories(tent_intent_type_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_intent_type_test COMMAND tent_intent_type_test)
 
 # ProgressWorker skeleton test: covers default-off behavior, event-driven
 # progress without poll-failover, and freeBatch races (issue #2116).
