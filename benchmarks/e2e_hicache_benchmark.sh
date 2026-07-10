@@ -21,6 +21,8 @@ OUTPUT_DIR="${2:-benchmarks/e2e_results_$(date +%Y%m%d_%H%M%S)}"
 MOONCAKE_MASTER_PORT=50051
 MOONCAKE_METADATA_PORT=8080
 SGLANG_PORT=30000
+MOONCAKE_BUILD_DIR="${MOONCAKE_BUILD_DIR:-${BUILD_DIR:-build}}"
+MOONCAKE_MASTER_BIN="${MOONCAKE_MASTER_BIN:-}"
 
 # Colors
 RED='\033[0;31m'
@@ -33,6 +35,69 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 mkdir -p "$OUTPUT_DIR"
+
+resolve_mooncake_master_bin() {
+    if [ -n "$MOONCAKE_MASTER_BIN" ] && [ -x "$MOONCAKE_MASTER_BIN" ]; then
+        return 0
+    fi
+
+    local candidate
+    for candidate in \
+        "./${MOONCAKE_BUILD_DIR}/mooncake-store/src/mooncake_master" \
+        "./${MOONCAKE_BUILD_DIR}/mooncake-store/mooncake_master" \
+        "./build/mooncake-store/src/mooncake_master" \
+        "./build/mooncake-store/mooncake_master"; do
+        if [ -x "$candidate" ]; then
+            MOONCAKE_MASTER_BIN="$candidate"
+            return 0
+        fi
+    done
+
+    candidate=$(python3 - <<'PY' 2>/dev/null || true
+import importlib.util
+import os
+
+spec = importlib.util.find_spec("mooncake")
+if spec and spec.submodule_search_locations:
+    path = os.path.join(next(iter(spec.submodule_search_locations)), "mooncake_master")
+    if os.path.exists(path):
+        print(path)
+PY
+)
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        MOONCAKE_MASTER_BIN="$candidate"
+        return 0
+    fi
+
+    candidate=$(command -v mooncake_master || true)
+    if [ -n "$candidate" ]; then
+        MOONCAKE_MASTER_BIN="$candidate"
+        return 0
+    fi
+
+    return 1
+}
+
+stop_process_group() {
+    local pid="$1"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    # Processes are started with setsid when available, so their PID is also
+    # the process group ID. Fall back to killing the single PID for non-Linux
+    # shells without setsid.
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+
+    for _ in $(seq 1 20); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
 
 # ======================================================================
 # Phase 1: Environment Check
@@ -69,15 +134,13 @@ check_prereqs() {
         log "Model: $MODEL_PATH"
     fi
 
-    # Check mooncake_master binary
-    if ! command -v mooncake_master &>/dev/null; then
-        # Try build directory
-        if [ -f "./build/mooncake-store/mooncake_master" ]; then
-            export PATH="./build/mooncake-store:$PATH"
-            log "Found mooncake_master in build/"
-        else
-            warn "mooncake_master not found. Will try to build."
-        fi
+    # Check mooncake_master binary. Prefer the real binary over the Python
+    # console-script wrapper so cleanup can terminate the process reliably.
+    if resolve_mooncake_master_bin; then
+        log "Mooncake Master binary: $MOONCAKE_MASTER_BIN"
+    else
+        err "mooncake_master not found. Build Mooncake first or set MOONCAKE_MASTER_BIN."
+        missing=1
     fi
 
     # Check SGLang
@@ -104,8 +167,8 @@ log "Phase 2: Launching Mooncake Master Service"
 
 cleanup() {
     log "Cleaning up..."
-    [ -n "${MASTER_PID:-}" ] && kill "$MASTER_PID" 2>/dev/null || true
-    [ -n "${SGLANG_PID:-}" ] && kill "$SGLANG_PID" 2>/dev/null || true
+    [ -n "${MASTER_PID:-}" ] && stop_process_group "$MASTER_PID"
+    [ -n "${SGLANG_PID:-}" ] && stop_process_group "$SGLANG_PID"
     wait 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -113,12 +176,21 @@ trap cleanup EXIT
 launch_mooncake_master() {
     log "Starting mooncake_master on port $MOONCAKE_MASTER_PORT..."
 
-    mooncake_master \
-        --rpc_port="$MOONCAKE_MASTER_PORT" \
-        --enable_http_metadata_server=true \
-        --http_metadata_server_port="$MOONCAKE_METADATA_PORT" \
-        --metrics_port=9003 \
-        > "$OUTPUT_DIR/mooncake_master.log" 2>&1 &
+    if command -v setsid &>/dev/null; then
+        setsid "$MOONCAKE_MASTER_BIN" \
+            --rpc_port="$MOONCAKE_MASTER_PORT" \
+            --enable_http_metadata_server=true \
+            --http_metadata_server_port="$MOONCAKE_METADATA_PORT" \
+            --metrics_port=9003 \
+            > "$OUTPUT_DIR/mooncake_master.log" 2>&1 &
+    else
+        "$MOONCAKE_MASTER_BIN" \
+            --rpc_port="$MOONCAKE_MASTER_PORT" \
+            --enable_http_metadata_server=true \
+            --http_metadata_server_port="$MOONCAKE_METADATA_PORT" \
+            --metrics_port=9003 \
+            > "$OUTPUT_DIR/mooncake_master.log" 2>&1 &
+    fi
     MASTER_PID=$!
 
     # Wait for master to be ready
@@ -151,17 +223,31 @@ launch_sglang() {
     export MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:${MOONCAKE_METADATA_PORT}/metadata"
     export MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296  # 4GB
 
-    python3 -m sglang.launch_server \
-        --model-path "$MODEL_PATH" \
-        --port "$SGLANG_PORT" \
-        --page-size 64 \
-        --enable-hierarchical-cache \
-        --hicache-ratio 2 \
-        --hicache-storage-backend mooncake \
-        --hicache-storage-prefetch-policy timeout \
-        --mem-fraction-static 0.8 \
-        --log-level info \
-        > "$log_file" 2>&1 &
+    if command -v setsid &>/dev/null; then
+        setsid python3 -m sglang.launch_server \
+            --model-path "$MODEL_PATH" \
+            --port "$SGLANG_PORT" \
+            --page-size 64 \
+            --enable-hierarchical-cache \
+            --hicache-ratio 2 \
+            --hicache-storage-backend mooncake \
+            --hicache-storage-prefetch-policy timeout \
+            --mem-fraction-static 0.8 \
+            --log-level info \
+            > "$log_file" 2>&1 &
+    else
+        python3 -m sglang.launch_server \
+            --model-path "$MODEL_PATH" \
+            --port "$SGLANG_PORT" \
+            --page-size 64 \
+            --enable-hierarchical-cache \
+            --hicache-ratio 2 \
+            --hicache-storage-backend mooncake \
+            --hicache-storage-prefetch-policy timeout \
+            --mem-fraction-static 0.8 \
+            --log-level info \
+            > "$log_file" 2>&1 &
+    fi
     SGLANG_PID=$!
 
     # Wait for SGLang to be ready
@@ -248,7 +334,7 @@ else:
     print(json.dumps({'workload': 'multi_turn_conversation', 'error': 'no successful requests'}))
 " > "$OUTPUT_DIR/bench_multiturn.json" 2>&1
 
-    log "Multi-turn results: $(cat $OUTPUT_DIR/bench_multiturn.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(f\"avg_latency={d.get(\"avg_latency_ms\",\"N/A\")}ms, throughput={d.get(\"avg_throughput_tok_s\",\"N/A\")} tok/s\")' 2>/dev/null || echo 'parsing failed')"
+    log "Multi-turn results: $(python3 -c 'import sys,json; d=json.load(sys.stdin); print("avg_latency={}ms, throughput={} tok/s".format(d.get("avg_latency_ms", "N/A"), d.get("avg_throughput_tok_s", "N/A")))' < "$OUTPUT_DIR/bench_multiturn.json" 2>/dev/null || echo 'parsing failed')"
 }
 
 # Workload 2: Prefix sharing (many requests with same system prompt)
@@ -307,7 +393,7 @@ else:
     print(json.dumps({'workload': 'prefix_sharing', 'error': 'no successful requests'}))
 " > "$OUTPUT_DIR/bench_prefix_sharing.json" 2>&1
 
-    log "Prefix sharing results: $(cat $OUTPUT_DIR/bench_prefix_sharing.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(f\"avg_latency={d.get(\"avg_latency_ms\",\"N/A\")}ms, requests={d.get(\"total_requests\",\"N/A\")}\")' 2>/dev/null || echo 'parsing failed')"
+    log "Prefix sharing results: $(python3 -c 'import sys,json; d=json.load(sys.stdin); print("avg_latency={}ms, requests={}".format(d.get("avg_latency_ms", "N/A"), d.get("total_requests", "N/A")))' < "$OUTPUT_DIR/bench_prefix_sharing.json" 2>/dev/null || echo 'parsing failed')"
 }
 
 # Workload 3: Cache miss heavy (unique queries, tests Bloom Filter)
@@ -353,7 +439,7 @@ else:
     print(json.dumps({'workload': 'cache_miss_heavy', 'error': 'no successful requests'}))
 " > "$OUTPUT_DIR/bench_cache_miss.json" 2>&1
 
-    log "Cache miss results: $(cat $OUTPUT_DIR/bench_cache_miss.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(f\"avg_latency={d.get(\"avg_latency_ms\",\"N/A\")}ms, requests={d.get(\"total_requests\",\"N/A\")}\")' 2>/dev/null || echo 'parsing failed')"
+    log "Cache miss results: $(python3 -c 'import sys,json; d=json.load(sys.stdin); print("avg_latency={}ms, requests={}".format(d.get("avg_latency_ms", "N/A"), d.get("total_requests", "N/A")))' < "$OUTPUT_DIR/bench_cache_miss.json" 2>/dev/null || echo 'parsing failed')"
 }
 
 run_multiturn_benchmark

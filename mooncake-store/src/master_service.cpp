@@ -500,6 +500,8 @@ auto MasterService::BatchReplicaClear(
         }
 
         // Safety check: Do not clear an object that has an active lease.
+        metadata.FlushDeferredLease(default_kv_lease_ttl_,
+                                    default_kv_soft_pin_ttl_);
         if (!metadata.IsLeaseExpired()) {
             LOG(WARNING) << "BatchReplicaClear: key=" << key
                          << " has active lease, skipping";
@@ -634,47 +636,66 @@ auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MasterMetricManager::instance().inc_total_get_nums();
 
-    // Bloom filter fast path: skip shard lock if key definitely not present.
-    // MayContainWithHash returns the std::hash value for free, which we reuse
-    // for shard indexing — saving one full std::hash computation per Get.
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+
+    auto load_replicas =
+        [this](const std::string& lookup_key,
+               size_t lookup_hash) -> tl::expected<GetReplicaListResponse,
+                                                   ErrorCode> {
+        MetadataAccessorRO accessor(this, lookup_key, lookup_hash);
+
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << lookup_key << ", info=object_not_found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        const auto& metadata = accessor.Get();
+
+        std::vector<Replica::Descriptor> replica_list;
+        metadata.VisitReplicas(
+            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+                replica_list.emplace_back(replica.get_descriptor());
+            });
+
+        if (replica_list.empty()) {
+            LOG(WARNING) << "key=" << lookup_key << ", error=replica_not_ready";
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+
+        if (replica_list[0].is_memory_replica()) {
+            MasterMetricManager::instance().inc_mem_cache_hit_nums();
+        } else if (replica_list[0].is_disk_replica()) {
+            MasterMetricManager::instance().inc_file_cache_hit_nums();
+        }
+        MasterMetricManager::instance().inc_valid_get_nums();
+        // Deferred lease: mark as recently accessed (lock-free atomic store).
+        // The eviction thread will flush this into an actual lease extension,
+        // avoiding SpinLock acquisition on the read hot path.
+        metadata.TouchDeferred();
+
+        return GetReplicaListResponse(std::move(replica_list),
+                                      default_kv_lease_ttl_);
+    };
+
+    // Bloom filter fast path: skip exact shard lookup if key is definitely not
+    // present. Prefix lookup still runs, because an absent full key may extend a
+    // stored KVCache prefix.
     size_t key_hash = 0;
-    if (!bloom_filter_.MayContainWithHash(key, key_hash)) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    if (bloom_filter_.MayContainWithHash(key, key_hash)) {
+        auto exact_result = load_replicas(key, key_hash);
+        if (exact_result.has_value() ||
+            exact_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            return exact_result;
+        }
     }
 
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, key, key_hash);
-
-    if (!accessor.Exists()) {
+    auto prefix_match = prefix_index_.LongestPrefixMatch(key);
+    if (prefix_match.matched_length == 0) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
-    const auto& metadata = accessor.Get();
 
-    std::vector<Replica::Descriptor> replica_list;
-    metadata.VisitReplicas(
-        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
-            replica_list.emplace_back(replica.get_descriptor());
-        });
-
-    if (replica_list.empty()) {
-        LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-    }
-
-    if (replica_list[0].is_memory_replica()) {
-        MasterMetricManager::instance().inc_mem_cache_hit_nums();
-    } else if (replica_list[0].is_disk_replica()) {
-        MasterMetricManager::instance().inc_file_cache_hit_nums();
-    }
-    MasterMetricManager::instance().inc_valid_get_nums();
-    // Deferred lease: mark as recently accessed (lock-free atomic store).
-    // The eviction thread will flush this into an actual lease extension,
-    // avoiding SpinLock acquisition on the read hot path.
-    metadata.TouchDeferred();
-
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_);
+    const size_t prefix_hash = std::hash<std::string>{}(prefix_match.matched_key);
+    return load_replicas(prefix_match.matched_key, prefix_hash);
 }
 
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
@@ -785,6 +806,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
                               config.with_soft_pin));
+    // The Bloom filter tracks metadata existence, including in-flight PutStart
+    // objects. GetReplicaList must still find these keys and report
+    // REPLICA_IS_NOT_READY instead of treating them as absent.
+    bloom_filter_.Add(key);
     // Also insert the metadata into processing set for monitoring.
     shard->processing_keys.insert(key);
 
@@ -843,9 +868,6 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
-
-    // Register key in bloom filter for fast ExistKey lookups
-    bloom_filter_.Add(key);
 
     // Register key in prefix radix tree for prefix-aware matching
     prefix_index_.Insert(key);
@@ -1441,6 +1463,7 @@ auto MasterService::Remove(const std::string& key, bool force)
     }
 
     auto& metadata = accessor.Get();
+    metadata.FlushDeferredLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
     if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
@@ -1487,6 +1510,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
+                it->second.FlushDeferredLease(default_kv_lease_ttl_,
+                                              default_kv_soft_pin_ttl_);
                 if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
@@ -1550,6 +1575,8 @@ long MasterService::RemoveAll(bool force) {
         // Only remove completed objects with expired leases (unless force=true)
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
+            it->second.FlushDeferredLease(default_kv_lease_ttl_,
+                                          default_kv_soft_pin_ttl_);
             /**
              * The reason the force operation here does not bypass the replica
              * check is that put operations (which could also be copy or move)

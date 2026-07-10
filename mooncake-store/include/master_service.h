@@ -511,10 +511,11 @@ class MasterService {
         const std::chrono::system_clock::time_point put_start_time;
         const size_t size;
 
-        // Deferred lease touch: set by GetReplicaList (lock-free), flushed
-        // by eviction thread. Eliminates SpinLock acquisition on the read
-        // hot path — a single atomic store replaces lock+write+unlock.
+        // Deferred lease touch: set by read paths (lock-free), flushed by
+        // eviction/removal paths. The timestamp preserves TTL semantics even
+        // when the flush happens after the original access.
         mutable std::atomic<bool> recently_accessed{false};
+        mutable std::atomic<int64_t> recent_access_ms{0};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -671,6 +672,12 @@ class MasterService {
         /// The eviction thread calls FlushDeferredLease() to convert this
         /// flag into an actual lease extension.
         void TouchDeferred() const {
+            const auto now = std::chrono::system_clock::now();
+            const auto now_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch())
+                    .count();
+            recent_access_ms.store(now_ms, std::memory_order_relaxed);
             recently_accessed.store(true, std::memory_order_relaxed);
         }
 
@@ -679,7 +686,23 @@ class MasterService {
         void FlushDeferredLease(const uint64_t ttl,
                                 const uint64_t soft_ttl) const {
             if (recently_accessed.exchange(false, std::memory_order_relaxed)) {
-                GrantLease(ttl, soft_ttl);
+                const auto access_ms =
+                    recent_access_ms.load(std::memory_order_relaxed);
+                const auto access_time =
+                    access_ms > 0
+                        ? std::chrono::system_clock::time_point(
+                              std::chrono::milliseconds(access_ms))
+                        : std::chrono::system_clock::now();
+                SpinLocker locker(&lock);
+                lease_timeout =
+                    std::max(lease_timeout,
+                             access_time + std::chrono::milliseconds(ttl));
+                if (soft_pin_timeout) {
+                    soft_pin_timeout =
+                        std::max(*soft_pin_timeout,
+                                 access_time +
+                                     std::chrono::milliseconds(soft_ttl));
+                }
             }
         }
 
@@ -769,7 +792,7 @@ class MasterService {
 
     // Counting Bloom Filter for fast negative lookups in ExistKey/Query.
     // 4M slots (~2MB with 4-bit counters) supports ~280K keys at <0.01% FPR.
-    // Keys are added on PutEnd and removed on eviction/erase via Remove().
+    // Keys are added when metadata is created and removed on eviction/erase.
     // Unlike standard Bloom Filter, the counting variant prevents false positive
     // accumulation under continuous KVCache churn.
     BloomFilter bloom_filter_{1 << 22, 3};

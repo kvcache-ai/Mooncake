@@ -563,6 +563,27 @@ void put_object(MasterService& service, const UUID& client_id,
         << "Key does not exist after put: " << key;
 }
 
+TEST_F(MasterServiceTest, GetReplicaListFallsBackToLongestStoredPrefix) {
+    auto service_ = std::make_unique<MasterService>();
+    const UUID client_id = generate_uuid();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+
+    const std::string prefix_key = "llama3/L0/tok_0_512";
+    const std::string extended_key = prefix_key + "_turn2_user_prompt";
+    put_object(*service_, client_id, prefix_key);
+
+    auto exact_result = service_->GetReplicaList(prefix_key);
+    ASSERT_TRUE(exact_result.has_value());
+    ASSERT_EQ(1, exact_result.value().replicas.size());
+
+    auto prefix_result = service_->GetReplicaList(extended_key);
+    ASSERT_TRUE(prefix_result.has_value())
+        << "GetReplicaList should return the longest stored KVCache prefix";
+    ASSERT_EQ(1, prefix_result.value().replicas.size());
+    EXPECT_EQ(exact_result.value().replicas[0].id,
+              prefix_result.value().replicas[0].id);
+}
+
 TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     const uint64_t kv_lease_ttl = 100;
     auto service_config = MasterServiceConfig::builder()
