@@ -137,7 +137,9 @@ optional fifth class field. Total utilization requires
 `--qos_link_capacity_gbps`. Missing baselines are emitted as `N/A` in text and
 `null` in JSON rather than being inferred from the mixed run. Run isolated and
 mixed cases with the same block size, batch size, transport, memory type, and
-host pair.
+host pair. JSONL records retain `isolated_throughput_gbps` and
+`link_capacity_gbps` alongside the derived values so every metric can be
+recomputed from one record.
 
 ## 5. Runtime Configuration
 

@@ -49,6 +49,7 @@ struct QosClassMetrics {
     std::optional<double> slo_attainment;
     double goodput_gbps = 0.0;
     double weighted_goodput_gbps = 0.0;
+    std::optional<double> isolated_throughput_gbps;
     std::optional<double> isolation_leakage;
 };
 
@@ -60,6 +61,7 @@ struct QosMetricsReport {
     double weighted_goodput_gbps = 0.0;
     double jain_fairness = 0.0;
     std::optional<double> max_isolation_leakage;
+    std::optional<double> link_capacity_gbps;
     std::optional<double> total_utilization;
     std::vector<QosClassMetrics> classes;
 };
