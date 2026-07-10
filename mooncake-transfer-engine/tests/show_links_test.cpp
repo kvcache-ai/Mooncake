@@ -51,8 +51,8 @@ TEST(ShowLinksTest, CApiSupportsJsonAndRejectsInvalidArguments) {
     Json::CharReaderBuilder builder;
     std::string errors;
     std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
-    ASSERT_TRUE(reader->parse(output, output + std::strlen(output), &root,
-                              &errors))
+    ASSERT_TRUE(
+        reader->parse(output, output + std::strlen(output), &root, &errors))
         << errors;
     EXPECT_TRUE(root.isMember("local_nics"));
 
