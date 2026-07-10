@@ -47,7 +47,7 @@ namespace ha {
 class SnapshotCatalogStore;
 class MasterSnapshotCodec;
 class MasterSnapshotCodecTest;  // test fixture, needs private state access
-}
+}  // namespace ha
 
 class EtcdOpLogStore;
 
