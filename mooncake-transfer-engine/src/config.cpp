@@ -330,11 +330,11 @@ void loadGlobalConfig(GlobalConfig& config) {
                                 "MC_TE_METADATA_REFRESH_INTERVAL_SECONDS";
             }
         } catch (const std::exception& e) {
-            LOG(WARNING)
-                << "Invalid MC_TE_METADATA_REFRESH_INTERVAL_SECONDS environment "
-                   "value: "
-                << te_metadata_refresh_interval_seconds
-                << ". Error: " << e.what();
+            LOG(WARNING) << "Invalid MC_TE_METADATA_REFRESH_INTERVAL_SECONDS "
+                            "environment "
+                            "value: "
+                         << te_metadata_refresh_interval_seconds
+                         << ". Error: " << e.what();
         }
     }
 

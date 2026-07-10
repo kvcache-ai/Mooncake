@@ -193,10 +193,9 @@ void TransferMetadata::startMetadataRefreshPollingIfNeeded() {
     const auto refresh_interval_seconds =
         config.te_metadata_refresh_interval_seconds;
     should_stop_metadata_refresh_thread_ = false;
-    metadata_refresh_thread_ = std::thread(
-        [this, refresh_interval_seconds]() {
-            metadataRefreshPollingLoop(refresh_interval_seconds);
-        });
+    metadata_refresh_thread_ = std::thread([this, refresh_interval_seconds]() {
+        metadataRefreshPollingLoop(refresh_interval_seconds);
+    });
     LOG(INFO) << "TE metadata refresh polling enabled, interval_seconds="
               << refresh_interval_seconds;
 }
@@ -214,8 +213,7 @@ void TransferMetadata::metadataRefreshPollingLoop(
     std::unique_lock<std::mutex> lock(metadata_refresh_mutex_);
     while (!should_stop_metadata_refresh_thread_) {
         if (metadata_refresh_cv_.wait_for(
-                lock, std::chrono::seconds(refresh_interval_seconds),
-                [this]() {
+                lock, std::chrono::seconds(refresh_interval_seconds), [this]() {
                     return should_stop_metadata_refresh_thread_.load();
                 })) {
             break;
@@ -224,8 +222,8 @@ void TransferMetadata::metadataRefreshPollingLoop(
         try {
             int ret = syncSegmentCache("");
             if (ret) {
-                LOG(WARNING) << "TE metadata refresh polling failed, ret="
-                             << ret;
+                LOG(WARNING)
+                    << "TE metadata refresh polling failed, ret=" << ret;
             }
         } catch (const std::exception &e) {
             LOG(ERROR) << "Exception in TE metadata refresh polling: "
@@ -1022,16 +1020,13 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     return result;
 }
 
-bool TransferMetadata::SegmentDesc::operator==(
-    const SegmentDesc &other) const {
+bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
     // timestamp is intentionally excluded: metadata encoding may refresh it
     // even when the operational descriptor is unchanged.
     return name == other.name && protocol == other.protocol &&
            devices == other.devices && topology == other.topology &&
-           buffers == other.buffers &&
-           nvmeof_buffers == other.nvmeof_buffers &&
-           cxl_name == other.cxl_name &&
-           cxl_base_addr == other.cxl_base_addr &&
+           buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
+           cxl_name == other.cxl_name && cxl_base_addr == other.cxl_base_addr &&
            rank_info == other.rank_info &&
            tcp_data_port == other.tcp_data_port &&
            rdma_server_name == other.rdma_server_name;
@@ -1081,10 +1076,9 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
 
             const auto segment_id = it->second;
             auto current_it = segment_id_to_desc_map_.find(segment_id);
-            const auto old_desc =
-                current_it == segment_id_to_desc_map_.end()
-                    ? nullptr
-                    : current_it->second;
+            const auto old_desc = current_it == segment_id_to_desc_map_.end()
+                                      ? nullptr
+                                      : current_it->second;
             bool changed = true;
             if (old_desc) {
                 changed = *old_desc != *desc;
@@ -1112,11 +1106,9 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     LOG(INFO) << "Segment cache sync finished, requested_segment="
               << (segment_name.empty() ? "<all>" : segment_name)
               << ", scanned=" << names_to_sync.size()
-              << ", fetched=" << fetched_count
-              << ", updated=" << updated_count
+              << ", fetched=" << fetched_count << ", updated=" << updated_count
               << ", unchanged=" << unchanged_count
-              << ", failed=" << failed_count
-              << ", skipped=" << skipped_count;
+              << ", failed=" << failed_count << ", skipped=" << skipped_count;
     return 0;
 }
 

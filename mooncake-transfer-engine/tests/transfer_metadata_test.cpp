@@ -188,8 +188,7 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     int sockfd = -1;
     const uint16_t port = findAvailableTcpPort(sockfd);
     ASSERT_GT(port, 0);
-    const std::string remote_segment_name =
-        "127.0.0.1:" + std::to_string(port);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
 
     ASSERT_EQ(server.addLocalSegment(
                   LOCAL_SEGMENT_ID, remote_segment_name,
@@ -201,14 +200,13 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     rpc_desc.sockfd = sockfd;
     ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
 
-    ASSERT_EQ(client.addLocalSegment(
-                  LOCAL_SEGMENT_ID, "127.0.0.1:0",
-                  makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
-              0);
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
 
     const auto segment_id = client.getSegmentID(remote_segment_name);
-    ASSERT_NE(segment_id,
-              static_cast<TransferMetadata::SegmentID>(-1));
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
     auto cached_desc = client.getSegmentDescByID(segment_id);
     ASSERT_TRUE(cached_desc);
     ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
@@ -216,9 +214,9 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     ASSERT_EQ(server.removeLocalMemoryBuffer(
                   reinterpret_cast<void*>(kInitialAddr), false),
               0);
-    ASSERT_EQ(server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr),
-                                          false),
-              0);
+    ASSERT_EQ(
+        server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr), false),
+        0);
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(3);
