@@ -1016,6 +1016,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     ctx.priority_level =
         request.priority;  // Use request priority for selection
     ctx.policy_name = request.policy_name;  // Optional: bind to specific policy
+    ctx.intent_type = request.intent_type;  // Business intent policy filter
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports
