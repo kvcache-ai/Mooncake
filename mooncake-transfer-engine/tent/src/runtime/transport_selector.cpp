@@ -125,14 +125,18 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
         {
             "file_storage",
             SegmentType::File,
-            std::nullopt,   // same_machine doesn't matter for file
-            std::nullopt,   // local_memory_pattern
-            std::nullopt,   // remote_memory_pattern
-            std::nullopt,   // min_size
-            std::nullopt,   // max_size
-            std::nullopt,   // priority
-            {},             // devices (empty = all devices)
-            {GDS, IOURING}  // File segment priority (original: GDS -> IOURING)
+            std::nullopt,    // same_machine doesn't matter for file
+            std::nullopt,    // local_memory_pattern
+            std::nullopt,    // remote_memory_pattern
+            std::nullopt,    // min_size
+            std::nullopt,    // max_size
+            std::nullopt,    // priority
+            {},              // devices (empty = all devices)
+            {GDS, IOURING},  // File priority (original: GDS -> IOURING)
+            std::nullopt,    // service_level
+            std::nullopt,    // traffic_class
+            std::nullopt,    // qp_pool
+            std::nullopt     // intent_type
         },
         {
             "memory_default",
@@ -140,11 +144,15 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
             std::nullopt,  // any machine
             std::nullopt,  // any local memory
             std::nullopt,  // any remote memory
-            std::nullopt,  // any size
-            std::nullopt,  // min_priority
+            std::nullopt,  // min_size
+            std::nullopt,  // max_size
+            std::nullopt,  // priority
             {},            // devices (empty = all devices)
-            {}  // Empty priority = use buffer_transports order (original
-                // behavior)
+            {},            // Empty = use buffer_transports order
+            std::nullopt,  // service_level
+            std::nullopt,  // traffic_class
+            std::nullopt,  // qp_pool
+            std::nullopt   // intent_type
         },
     };
 }
