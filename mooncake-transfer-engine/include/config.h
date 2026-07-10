@@ -53,6 +53,10 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Maximum number of concurrent RDMA handshakes per transport instance.
+    // Limits the thundering-herd effect when many nodes connect simultaneously.
+    // Override via MC_MAX_CONCURRENT_HANDSHAKES.
+    int max_concurrent_handshakes = 16;
     // Connect timeout (seconds) for outbound handshake-port RPCs (QP
     // handshake, probe, notify, metadata exchange). A plain blocking
     // connect() has no deadline: to an unroutable address (e.g. a

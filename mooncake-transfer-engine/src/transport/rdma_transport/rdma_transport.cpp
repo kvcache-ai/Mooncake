@@ -70,7 +70,9 @@ bool has_ibv_reg_mr_iova2(void) {
     return sym != NULL;
 }
 
-RdmaTransport::RdmaTransport() {
+RdmaTransport::RdmaTransport()
+    : connection_limiter_(std::make_unique<ConnectionLimiter>(
+          globalConfig().max_concurrent_handshakes)) {
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
     if (MCIbRelaxedOrderingMode == 0) {
         LOG(INFO) << "[RDMA] Relaxed ordering disabled via "

@@ -18,6 +18,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -38,6 +39,32 @@ class RdmaEndPoint;
 class TransferMetadata;
 class RdmaTransportTestPeer;
 class WorkerPool;
+
+// Counting semaphore that limits concurrent RDMA handshakes to prevent
+// thundering-herd QP failures during large-scale simultaneous startup.
+class ConnectionLimiter {
+   public:
+    explicit ConnectionLimiter(int max_concurrent)
+        : max_concurrent_(max_concurrent), current_(0) {}
+
+    void acquire() {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return current_ < max_concurrent_; });
+        ++current_;
+    }
+
+    void release() {
+        std::unique_lock<std::mutex> lock(mu_);
+        --current_;
+        cv_.notify_one();
+    }
+
+   private:
+    const int max_concurrent_;
+    int current_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+};
 
 class RdmaTransport : public Transport {
     friend class RdmaContext;
@@ -135,6 +162,15 @@ class RdmaTransport : public Transport {
                                       int &buffer_id, int &device_id,
                                       int retry_cnt = 0);
 
+   public:
+    // Acquire/release a handshake slot to limit concurrent connection setup.
+    void acquireHandshakeSlot() {
+        if (connection_limiter_) connection_limiter_->acquire();
+    }
+    void releaseHandshakeSlot() {
+        if (connection_limiter_) connection_limiter_->release();
+    }
+
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
@@ -144,6 +180,7 @@ class RdmaTransport : public Transport {
     // local_server_name_ keeps the TCP-reachable address for P2P routing.
     std::string rdma_server_name_;
     std::mutex local_desc_lock_;
+    std::unique_ptr<ConnectionLimiter> connection_limiter_;
 };
 
 using TransferRequest = Transport::TransferRequest;

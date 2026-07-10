@@ -335,6 +335,25 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* max_concurrent_handshakes =
+        std::getenv("MC_MAX_CONCURRENT_HANDSHAKES");
+    if (max_concurrent_handshakes) {
+        try {
+            int val = std::stoi(max_concurrent_handshakes);
+            if (val > 0) {
+                config.max_concurrent_handshakes = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_MAX_CONCURRENT_HANDSHAKES";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_MAX_CONCURRENT_HANDSHAKES environment "
+                            "value: "
+                         << max_concurrent_handshakes
+                         << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_connect_timeout =
         std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
     if (handshake_connect_timeout) {

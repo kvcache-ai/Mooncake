@@ -30,6 +30,7 @@
 #include "common.h"
 #include "config.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
+#include "transport/rdma_transport/rdma_transport.h"
 
 namespace mooncake {
 constexpr uint8_t kMaxHopLimit = 16;
@@ -395,8 +396,11 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // Perform the RPC without holding the lock to avoid deadlock and allow
         // "simultaneous open" handshake handling.
+        // Acquire a handshake slot to limit concurrent connection storms.
+        context_.engine().acquireHandshakeSlot();
         int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                                  peer_desc);
+        context_.engine().releaseHandshakeSlot();
 
         // We should check the RPC return code before comparing
         // `peer_qp_num_list_` with `peer_desc.qp_num`, since a failed RPC may
