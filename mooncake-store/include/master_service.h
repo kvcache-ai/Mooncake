@@ -1531,6 +1531,8 @@ class MasterService {
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+    void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
+                                           QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl);
@@ -2403,8 +2405,6 @@ class MasterService {
     std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& should_remove) const;
-    tl::expected<void, ErrorCode> ClassifyReplicaReadiness(
-        const ObjectMetadata* metadata) const;
 
     std::mutex pending_mutations_mutex_;
     std::condition_variable pending_mutations_cv_;

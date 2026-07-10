@@ -442,6 +442,12 @@ class MasterServiceHATest : public ::testing::Test {
         return service.ordered_oplog_writer_->Reserve();
     }
 
+    static void ClearInvalidHandlesForTesting(
+        MasterService& service,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+        service.ClearInvalidHandles(alive_clients);
+    }
+
     static void PrepareUnmountSegmentForTesting(MasterService& service,
                                                 const UUID& segment_id) {
         auto segment_access = service.segment_manager_.getSegmentAccess();
@@ -488,65 +494,11 @@ class MasterServiceHATest : public ::testing::Test {
         return access.getSsdUsedBytes(segment_name);
     }
 
-    static tl::expected<void, ErrorCode> ClassifyReplicaReadinessForTesting(
-        MasterService& service, const std::string& tenant_id,
-        const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
-        if (!accessor.Exists()) {
-            return service.ClassifyReplicaReadiness(nullptr);
-        }
-        return service.ClassifyReplicaReadiness(&accessor.Get());
-    }
-
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
-
-TEST_F(MasterServiceHATest, ClassifyReplicaReadinessCoversReplicaStates) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
-                              .set_enable_ha(false)
-                              .build();
-    MasterService service(service_config);
-    auto mounted = PrepareSimpleSegment(service, "readiness_segment");
-
-    const std::string complete_key = "readiness_complete_key";
-    PutObjectOnSegment(service, mounted.client_id, complete_key,
-                       "readiness_segment");
-    EXPECT_TRUE(ClassifyReplicaReadinessForTesting(service, kDefaultTenant,
-                                                   complete_key)
-                    .has_value());
-
-    const std::string removed_key = "readiness_removed_key";
-    PutObjectOnSegment(service, mounted.client_id, removed_key,
-                       "readiness_segment");
-    MarkCompletedReplicasRemovedForTesting(service, kDefaultTenant,
-                                           removed_key);
-    auto removed = ClassifyReplicaReadinessForTesting(service, kDefaultTenant,
-                                                      removed_key);
-    ASSERT_FALSE(removed.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, removed.error());
-
-    const std::string processing_key = "readiness_processing_key";
-    ReplicateConfig config;
-    config.replica_num = 1;
-    ASSERT_TRUE(service
-                    .PutStart(mounted.client_id, processing_key, kDefaultTenant,
-                              1024, config)
-                    .has_value());
-    auto processing = ClassifyReplicaReadinessForTesting(
-        service, kDefaultTenant, processing_key);
-    ASSERT_FALSE(processing.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, processing.error());
-
-    auto missing = ClassifyReplicaReadinessForTesting(service, kDefaultTenant,
-                                                      "readiness_missing_key");
-    ASSERT_FALSE(missing.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, missing.error());
-}
 
 TEST_F(MasterServiceHATest, GetReplicaListClassifiesRemovedReplicaStates) {
     auto service_config = MasterServiceConfig::builder()
@@ -628,7 +580,7 @@ TEST_F(MasterServiceHATest, BatchGetReplicaListClassifiesRemovedReplicaStates) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, results[3].error());
 }
 
-TEST_F(MasterServiceHATest, ExistKeyClassifiesRemovedReplicaStates) {
+TEST_F(MasterServiceHATest, ExistKeyRequiresCompletedReplica) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(false)
@@ -660,8 +612,8 @@ TEST_F(MasterServiceHATest, ExistKeyClassifiesRemovedReplicaStates) {
                               1024, config)
                     .has_value());
     auto processing = service.ExistKey(processing_key, kDefaultTenant);
-    ASSERT_FALSE(processing.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, processing.error());
+    ASSERT_TRUE(processing.has_value());
+    EXPECT_FALSE(processing.value());
 
     auto missing =
         service.ExistKey("exist_readiness_missing_key", kDefaultTenant);
@@ -669,7 +621,7 @@ TEST_F(MasterServiceHATest, ExistKeyClassifiesRemovedReplicaStates) {
     EXPECT_FALSE(missing.value());
 }
 
-TEST_F(MasterServiceHATest, BatchExistKeyClassifiesRemovedReplicaStates) {
+TEST_F(MasterServiceHATest, BatchExistKeyRequiresCompletedReplica) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(false)
@@ -705,8 +657,8 @@ TEST_F(MasterServiceHATest, BatchExistKeyClassifiesRemovedReplicaStates) {
     EXPECT_TRUE(results[0].value());
     ASSERT_TRUE(results[1].has_value());
     EXPECT_FALSE(results[1].value());
-    ASSERT_FALSE(results[2].has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, results[2].error());
+    ASSERT_TRUE(results[2].has_value());
+    EXPECT_FALSE(results[2].value());
     ASSERT_TRUE(results[3].has_value());
     EXPECT_FALSE(results[3].value());
 }
@@ -1111,6 +1063,50 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
     EXPECT_EQ(key, batch.entries[0].object_key);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest, RemoveByRegexWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_remove_regex";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_regex_remove_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string removed_key = "batch_regex_remove_key";
+    const std::string kept_key = "batch_regex_keep_key";
+    PutObjectOnSegment(service, mounted.client_id, removed_key,
+                       "batch_regex_remove_segment");
+    ReadBatchEventually(storage, 2, batch);
+    PutObjectOnSegment(service, mounted.client_id, kept_key,
+                       "batch_regex_remove_segment");
+    ReadBatchEventually(storage, 3, batch);
+
+    auto removed = service.RemoveByRegex("^batch_regex_remove_", kDefaultTenant,
+                                         /*force=*/true);
+    ASSERT_TRUE(removed.has_value()) << toString(removed.error());
+    EXPECT_EQ(1, removed.value());
+
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+    EXPECT_EQ(removed_key, batch.entries[0].object_key);
+    auto removed_exists = service.ExistKey(removed_key, kDefaultTenant);
+    ASSERT_TRUE(removed_exists.has_value()) << toString(removed_exists.error());
+    EXPECT_FALSE(removed_exists.value());
+    auto kept_exists = service.ExistKey(kept_key, kDefaultTenant);
+    ASSERT_TRUE(kept_exists.has_value()) << toString(kept_exists.error());
+    EXPECT_TRUE(kept_exists.value());
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
@@ -3273,6 +3269,26 @@ TEST_F(MasterServiceHATest, RemoveByRegexPublishesRemoveOpLog) {
                     removed_keys.end())
             << "Missing REMOVE OpLog for key=" << key;
     }
+}
+
+TEST_F(MasterServiceHATest,
+       ClearInvalidHandlesDoesNotPublishWhenNothingChanged) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    PutObject(*service, context.client_id, "clear_invalid_noop_key");
+
+    const size_t entries_before = mock_store->EntryCount();
+    ClearInvalidHandlesForTesting(*service, {context.client_id});
+    EXPECT_EQ(entries_before, mock_store->EntryCount());
 }
 
 // Test that BatchRemove skips erase when OpLog persist fails.
