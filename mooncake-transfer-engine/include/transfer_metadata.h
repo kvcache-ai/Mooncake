@@ -196,6 +196,11 @@ class TransferMetadata {
                              bool update_metadata);
 
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+    int removeLocalMemoryBuffer(void *addr, const std::string &protocol,
+                                bool update_metadata);
+    int removeLocalMemoryBuffers(const std::vector<void *> &addr_list,
+                                 const std::string &protocol,
+                                 bool update_metadata);
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
@@ -251,6 +256,7 @@ class TransferMetadata {
     std::string common_key_prefix_;
     std::string rpc_meta_prefix_;
     // local cache
+    std::mutex local_segment_txn_mutex_;
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;

@@ -107,6 +107,84 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     ASSERT_EQ(re, 0);
 }
 
+TEST_F(TransferMetadataTest, BulkMemoryRemovalIsAtomic) {
+    auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment_desc->name = "test_bulk_remove";
+    segment_desc->protocol = "rdma";
+    ASSERT_EQ(metadata_client->addLocalSegment(
+                  LOCAL_SEGMENT_ID, "test_bulk_remove",
+                  std::move(segment_desc)),
+              0);
+
+    constexpr uint64_t kFirstAddr = 0x10000;
+    constexpr uint64_t kSecondAddr = 0x20000;
+    for (uint64_t addr : {kFirstAddr, kSecondAddr}) {
+        TransferMetadata::BufferDesc buffer;
+        buffer.addr = addr;
+        buffer.length = 4096;
+#ifdef ENABLE_MULTI_PROTOCOL
+        buffer.protocol = "rdma";
+#endif
+        ASSERT_EQ(metadata_client->addLocalMemoryBuffer(buffer, false), 0);
+    }
+
+    std::vector<void*> addresses = {
+        reinterpret_cast<void*>(kFirstAddr),
+        reinterpret_cast<void*>(0x30000),
+    };
+    ASSERT_EQ(metadata_client->removeLocalMemoryBuffers(
+                  addresses, "rdma", false),
+              ERR_ADDRESS_NOT_REGISTERED);
+
+    auto current =
+        metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->buffers.size(), 2);
+    EXPECT_EQ(current->buffers[0].addr, kFirstAddr);
+    EXPECT_EQ(current->buffers[1].addr, kSecondAddr);
+
+    addresses[1] = reinterpret_cast<void*>(kSecondAddr);
+    ASSERT_EQ(metadata_client->removeLocalMemoryBuffers(
+                  addresses, "rdma", false),
+              0);
+    current = metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(current, nullptr);
+    EXPECT_TRUE(current->buffers.empty());
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST_F(TransferMetadataTest, ProtocolScopedMemoryRemoval) {
+    auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment_desc->name = "test_protocol_remove";
+    segment_desc->protocol = "tcp,nccl";
+    ASSERT_EQ(metadata_client->addLocalSegment(
+                  LOCAL_SEGMENT_ID, "test_protocol_remove",
+                  std::move(segment_desc)),
+              0);
+
+    constexpr uint64_t kSharedAddr = 0x40000;
+    for (const char* protocol : {"tcp", "nccl"}) {
+        TransferMetadata::BufferDesc buffer;
+        buffer.name = protocol;
+        buffer.addr = kSharedAddr;
+        buffer.length = 4096;
+        buffer.protocol = protocol;
+        ASSERT_EQ(metadata_client->addLocalMemoryBuffer(buffer, false), 0);
+    }
+
+    ASSERT_EQ(metadata_client->removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(kSharedAddr), "nccl", false),
+              0);
+    auto current =
+        metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->buffers.size(), 1);
+    EXPECT_EQ(current->buffers.front().protocol, "tcp");
+    EXPECT_EQ(current->buffers.front().addr, kSharedAddr);
+    EXPECT_EQ(current->buffers.front().length, 4096);
+}
+#endif
+
 // add, get and remove RPCMetaEntryMeta
 TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     auto hostname_port = parseHostNameWithPort(local_server_name);
