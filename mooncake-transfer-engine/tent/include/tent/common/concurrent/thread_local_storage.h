@@ -163,8 +163,13 @@ class ThreadLocalStorage {
 
     static void sweepDeadNodes(ThreadState& state) {
         for (auto it = state.nodes.begin(); it != state.nodes.end();) {
-            if (!it->second.control->owner_alive.load(
-                    std::memory_order_acquire)) {
+            // A null control cannot be observed today (the sweep runs before
+            // try_emplace on the same thread, and control is assigned
+            // immediately after emplace by a nothrow shared_ptr copy), but
+            // check it for consistency with ~ThreadNode and robustness to
+            // reordering.
+            if (!it->second.control || !it->second.control->owner_alive.load(
+                                           std::memory_order_acquire)) {
                 if (state.cached_value == &it->second.value) {
                     state.cached_id = 0;
                     state.cached_value = nullptr;

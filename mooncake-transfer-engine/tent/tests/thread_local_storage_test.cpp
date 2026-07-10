@@ -225,7 +225,9 @@ TEST(ThreadLocalStorageTest, HotPathMicrobench) {
     // Wall-clock assertions flake under sanitizers (TSAN alone is ~14x);
     // elsewhere keep a loose ceiling that still catches syscall- or
     // contention-class regressions on the hot path.
-    if (!kSanitized) EXPECT_LT(ns, 100.0);
+    if (!kSanitized) {
+        EXPECT_LT(ns, 100.0);
+    }
 }
 
 }  // namespace tent
