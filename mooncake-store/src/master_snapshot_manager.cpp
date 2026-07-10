@@ -496,55 +496,33 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
             snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
-        MasterService::MetadataSerializer metadata_serializer(master_service_);
-        SegmentSerializer segment_serializer(
-            &master_service_->segment_manager_);
-        TaskManagerSerializer task_manager_serializer(
-            &master_service_->task_manager_);
 
-        auto metadata_result = metadata_serializer.Serialize();
-        if (!metadata_result) {
+        // Use the new MasterSnapshotCodec to encode all state
+        ha::MasterSnapshotCodec codec;
+        ha::MasterSnapshotStateView state_view(
+            *master_service_,
+            master_service_->segment_manager_,
+            master_service_->nof_segment_manager_,
+            master_service_->task_manager_);
+
+        auto encode_result = codec.Encode(state_view);
+        if (!encode_result) {
             SNAP_LOG_ERROR(
-                "[Snapshot] metadata serialization failed, snapshot_id={}, "
+                "[Snapshot] state encoding failed, snapshot_id={}, "
                 "code={}, msg={}",
-                snapshot_id, toString(metadata_result.error().code),
-                metadata_result.error().message);
-
-            return tl::make_unexpected(metadata_result.error());
+                snapshot_id, toString(encode_result.error().code),
+                encode_result.error().message);
+            return tl::make_unexpected(encode_result.error());
         }
+
         SNAP_LOG_INFO(
-            "[Snapshot] metadata serialization_successful, snapshot_id={}",
+            "[Snapshot] state encoding successful, snapshot_id={}",
             snapshot_id);
 
-        auto segment_result = segment_serializer.Serialize();
-        if (!segment_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] segment serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(segment_result.error().code),
-                segment_result.error().message);
-            return tl::make_unexpected(segment_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] segment serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        auto task_manager_result = task_manager_serializer.Serialize();
-        if (!task_manager_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] task manager serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(task_manager_result.error().code),
-                task_manager_result.error().message);
-            return tl::make_unexpected(task_manager_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] task manager serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        const auto& serialized_metadata = metadata_result.value();
-        const auto& serialized_segment = segment_result.value();
-        const auto& serialized_task_manager = task_manager_result.value();
+        const auto& payloads = encode_result.value();
+        const auto& serialized_metadata = payloads.at("metadata");
+        const auto& serialized_segment = payloads.at("segments");
+        const auto& serialized_task_manager = payloads.at("task_manager");
 
         // When backup_dir is enabled, try all uploads to ensure complete backup
         // When backup_dir is disabled, use fail-fast mode
@@ -611,9 +589,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Upload manifest
-        std::string manifest_content =
-            fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
-                        SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
+        std::string manifest_content = ha::MasterSnapshotCodec::GetManifestContent();
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
                                             manifest_content.end());
         upload_result = repository_->UploadPayloadFile(
