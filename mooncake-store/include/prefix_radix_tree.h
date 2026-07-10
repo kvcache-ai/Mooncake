@@ -39,9 +39,9 @@ namespace mooncake {
 class PrefixRadixTree {
    public:
     struct MatchResult {
-        std::string matched_key;    // The key that matched
-        size_t matched_length;      // Length of the matched prefix
-        bool is_exact;              // True if exact match
+        std::string matched_key;  // The key that matched
+        size_t matched_length;    // Length of the matched prefix
+        bool is_exact;            // True if exact match
     };
 
     PrefixRadixTree() : root_(std::make_unique<Node>()) {}
@@ -129,8 +129,8 @@ class PrefixRadixTree {
 
    private:
     struct Node {
-        // Edge label: the substring stored on the edge from parent to this node.
-        // Empty for root node.
+        // Edge label: the substring stored on the edge from parent to this
+        // node. Empty for root node.
         std::string label;
 
         // Children indexed by first character of their label.

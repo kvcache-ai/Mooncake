@@ -1,6 +1,6 @@
 // Comprehensive Optimization Comparison Benchmark
-// Tests all Mooncake Store optimizations: Counting Bloom Filter + Prefix Radix Tree
-// Generates before/after metrics for competition report
+// Tests all Mooncake Store optimizations: Counting Bloom Filter + Prefix Radix
+// Tree Generates before/after metrics for competition report
 
 #include <glog/logging.h>
 #include <chrono>
@@ -35,7 +35,8 @@ struct BenchResult {
 };
 
 template <typename Func>
-BenchResult RunBench(const std::string& name, int warmup, int iterations, Func fn) {
+BenchResult RunBench(const std::string& name, int warmup, int iterations,
+                     Func fn) {
     // Warmup
     for (int i = 0; i < warmup; i++) fn(i);
 
@@ -47,7 +48,8 @@ BenchResult RunBench(const std::string& name, int warmup, int iterations, Func f
         auto t0 = Clock::now();
         fn(i);
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration_cast<Duration>(t1 - t0).count());
+        latencies.push_back(
+            std::chrono::duration_cast<Duration>(t1 - t0).count());
     }
     auto end = Clock::now();
 
@@ -55,7 +57,8 @@ BenchResult RunBench(const std::string& name, int warmup, int iterations, Func f
     double ops_per_sec = iterations / (total_ns / 1e9);
 
     std::sort(latencies.begin(), latencies.end());
-    double avg_ns = std::accumulate(latencies.begin(), latencies.end(), 0.0) / iterations;
+    double avg_ns =
+        std::accumulate(latencies.begin(), latencies.end(), 0.0) / iterations;
     double p50_ns = latencies[iterations / 2];
     double p99_ns = latencies[static_cast<int>(iterations * 0.99)];
 
@@ -63,12 +66,12 @@ BenchResult RunBench(const std::string& name, int warmup, int iterations, Func f
 }
 
 void PrintResult(const BenchResult& r) {
-    std::cout << "| " << std::left << std::setw(45) << r.name
-              << " | " << std::right << std::setw(12) << std::fixed << std::setprecision(0) << r.ops_per_sec
-              << " | " << std::setw(8) << std::setprecision(1) << r.avg_ns
-              << " | " << std::setw(8) << std::setprecision(1) << r.p50_ns
-              << " | " << std::setw(8) << std::setprecision(1) << r.p99_ns
-              << " |" << std::endl;
+    std::cout << "| " << std::left << std::setw(45) << r.name << " | "
+              << std::right << std::setw(12) << std::fixed
+              << std::setprecision(0) << r.ops_per_sec << " | " << std::setw(8)
+              << std::setprecision(1) << r.avg_ns << " | " << std::setw(8)
+              << std::setprecision(1) << r.p50_ns << " | " << std::setw(8)
+              << std::setprecision(1) << r.p99_ns << " |" << std::endl;
 }
 
 void PrintHeader() {
@@ -78,34 +81,35 @@ void PrintHeader() {
               << " | " << std::setw(8) << "p50(ns)"
               << " | " << std::setw(8) << "p99(ns)"
               << " |" << std::endl;
-    std::cout << "|" << std::string(47, '-')
-              << "|" << std::string(14, '-')
-              << "|" << std::string(10, '-')
-              << "|" << std::string(10, '-')
-              << "|" << std::string(10, '-')
-              << "|" << std::endl;
+    std::cout << "|" << std::string(47, '-') << "|" << std::string(14, '-')
+              << "|" << std::string(10, '-') << "|" << std::string(10, '-')
+              << "|" << std::string(10, '-') << "|" << std::endl;
 }
 
 // ============================================================
 // Key generators (simulating KVCache workload)
 // ============================================================
 
-std::vector<std::string> GenerateKVCacheKeys(int count, double prefix_share_ratio) {
+std::vector<std::string> GenerateKVCacheKeys(int count,
+                                             double prefix_share_ratio) {
     std::vector<std::string> keys;
     keys.reserve(count);
 
     // System prompts (shared prefix)
     int shared_count = static_cast<int>(count * prefix_share_ratio);
-    std::string base_prefix = "model_llama3_8b_layer_0_head_0_sys_prompt_v1_tokens_";
+    std::string base_prefix =
+        "model_llama3_8b_layer_0_head_0_sys_prompt_v1_tokens_";
 
     for (int i = 0; i < shared_count; i++) {
-        keys.push_back(base_prefix + std::to_string(i * 512) + "_" + std::to_string((i + 1) * 512));
+        keys.push_back(base_prefix + std::to_string(i * 512) + "_" +
+                       std::to_string((i + 1) * 512));
     }
 
     // Unique user queries (no prefix sharing)
     for (int i = shared_count; i < count; i++) {
         keys.push_back("user_" + std::to_string(i) + "_session_" +
-                        std::to_string(i % 100) + "_turn_" + std::to_string(i % 10));
+                       std::to_string(i % 100) + "_turn_" +
+                       std::to_string(i % 10));
     }
 
     return keys;
@@ -131,16 +135,17 @@ void BenchBloomFilter() {
     for (const auto& k : keys) filter.Add(k);
 
     auto r1 = RunBench("MayContain (existing key)", 1000, NUM_PROBES,
-        [&](int i) { filter.MayContain(keys[i % NUM_KEYS]); });
+                       [&](int i) { filter.MayContain(keys[i % NUM_KEYS]); });
     PrintResult(r1);
 
-    auto r2 = RunBench("MayContain (non-existing key)", 1000, NUM_PROBES,
+    auto r2 = RunBench(
+        "MayContain (non-existing key)", 1000, NUM_PROBES,
         [&](int i) { filter.MayContain("miss_" + std::to_string(i)); });
     PrintResult(r2);
 
     // ---- Test B: Eviction scenario ----
     // Simulate: add 50K keys, evict 25K, measure FPR
-    BloomFilter filter_no_remove(1 << 22, 3);  // Standard (no remove)
+    BloomFilter filter_no_remove(1 << 22, 3);    // Standard (no remove)
     BloomFilter filter_with_remove(1 << 22, 3);  // Counting (with remove)
 
     for (const auto& k : keys) {
@@ -163,20 +168,25 @@ void BenchBloomFilter() {
     }
 
     double fpr_no_remove = static_cast<double>(fp_no_remove) / NUM_PROBES * 100;
-    double fpr_with_remove = static_cast<double>(fp_with_remove) / NUM_PROBES * 100;
+    double fpr_with_remove =
+        static_cast<double>(fp_with_remove) / NUM_PROBES * 100;
     double fpr_reduction = (1.0 - fpr_with_remove / fpr_no_remove) * 100;
 
-    std::cout << "\n### 淘汰后假阳性率对比（50K keys, evict 25K, probe 100K）\n\n";
-    std::cout << "| Metric | Standard BF (no remove) | Counting BF (with remove) | Improvement |\n";
-    std::cout << "|--------|------------------------|--------------------------|-------------|\n";
+    std::cout
+        << "\n### 淘汰后假阳性率对比（50K keys, evict 25K, probe 100K）\n\n";
+    std::cout << "| Metric | Standard BF (no remove) | Counting BF (with "
+                 "remove) | Improvement |\n";
+    std::cout << "|--------|------------------------|--------------------------"
+                 "|-------------|\n";
     std::cout << "| FPR after eviction | " << std::fixed << std::setprecision(4)
               << fpr_no_remove << "% | " << fpr_with_remove << "% | **-"
               << std::setprecision(1) << fpr_reduction << "%** |\n";
     std::cout << "| Non-zero slots | " << filter_no_remove.CountNonZero()
-              << " | " << filter_with_remove.CountNonZero()
-              << " | -" << std::setprecision(1)
+              << " | " << filter_with_remove.CountNonZero() << " | -"
+              << std::setprecision(1)
               << (1.0 - static_cast<double>(filter_with_remove.CountNonZero()) /
-                        filter_no_remove.CountNonZero()) * 100
+                            filter_no_remove.CountNonZero()) *
+                     100
               << "% |\n";
 
     // ---- Test C: Concurrent performance ----
@@ -244,31 +254,38 @@ void BenchPrefixRadixTree() {
     PrintHeader();
 
     auto r1 = RunBench("Insert (50K keys, 50% prefix sharing)", 0, NUM_KEYS,
-        [&](int i) { tree.Insert(keys[i]); });
+                       [&](int i) { tree.Insert(keys[i]); });
     PrintResult(r1);
 
     // ---- Exact lookup benchmark ----
     auto r2 = RunBench("Contains (exact match, existing)", 1000, NUM_KEYS,
-        [&](int i) { tree.Contains(keys[i]); });
+                       [&](int i) { tree.Contains(keys[i]); });
     PrintResult(r2);
 
-    auto r3 = RunBench("Contains (exact match, non-existing)", 1000, NUM_KEYS,
+    auto r3 = RunBench(
+        "Contains (exact match, non-existing)", 1000, NUM_KEYS,
         [&](int i) { tree.Contains("nonexist_" + std::to_string(i)); });
     PrintResult(r3);
 
     // ---- Longest Prefix Match benchmark ----
-    // Generate queries that extend existing keys (realistic: same prefix + new suffix)
+    // Generate queries that extend existing keys (realistic: same prefix + new
+    // suffix)
     std::vector<std::string> prefix_queries;
     for (int i = 0; i < NUM_KEYS; i++) {
-        prefix_queries.push_back(keys[i % (NUM_KEYS / 2)] + "_extended_query_" + std::to_string(i));
+        prefix_queries.push_back(keys[i % (NUM_KEYS / 2)] + "_extended_query_" +
+                                 std::to_string(i));
     }
 
-    auto r4 = RunBench("LongestPrefixMatch (prefix hit)", 1000, NUM_KEYS,
-        [&](int i) { tree.LongestPrefixMatch(prefix_queries[i]); });
+    auto r4 =
+        RunBench("LongestPrefixMatch (prefix hit)", 1000, NUM_KEYS,
+                 [&](int i) { tree.LongestPrefixMatch(prefix_queries[i]); });
     PrintResult(r4);
 
-    auto r5 = RunBench("LongestPrefixMatch (no match)", 1000, NUM_KEYS,
-        [&](int i) { tree.LongestPrefixMatch("completely_different_" + std::to_string(i)); });
+    auto r5 =
+        RunBench("LongestPrefixMatch (no match)", 1000, NUM_KEYS, [&](int i) {
+            tree.LongestPrefixMatch("completely_different_" +
+                                    std::to_string(i));
+        });
     PrintResult(r5);
 
     // ---- Remove benchmark ----
@@ -276,7 +293,7 @@ void BenchPrefixRadixTree() {
     for (const auto& k : keys) remove_tree.Insert(k);
 
     auto r6 = RunBench("Remove (50K keys)", 0, NUM_KEYS,
-        [&](int i) { remove_tree.Remove(keys[i]); });
+                       [&](int i) { remove_tree.Remove(keys[i]); });
     PrintResult(r6);
 
     // ---- Memory efficiency ----
@@ -289,9 +306,10 @@ void BenchPrefixRadixTree() {
     std::cout << "| Total keys | " << mem_tree.Size() << " |\n";
     std::cout << "| Total nodes | " << mem_tree.NodeCount() << " |\n";
     std::cout << "| Nodes per key | " << std::fixed << std::setprecision(2)
-              << static_cast<double>(mem_tree.NodeCount()) / mem_tree.Size() << " |\n";
-    std::cout << "| Estimated memory | ~"
-              << mem_tree.NodeCount() * 64 / 1024 << " KB |\n";
+              << static_cast<double>(mem_tree.NodeCount()) / mem_tree.Size()
+              << " |\n";
+    std::cout << "| Estimated memory | ~" << mem_tree.NodeCount() * 64 / 1024
+              << " KB |\n";
 
     // ---- Concurrent performance ----
     std::cout << "\n### 并发性能（8 threads）\n\n";
@@ -374,8 +392,8 @@ void BenchCombinedPipeline() {
 
     // Path A: Baseline (HashMap only, no Bloom Filter, no Radix Tree)
     // Simulated: every query does a "shard lock + lookup"
-    auto r_baseline = RunBench("Baseline: HashMap lookup only", 1000, NUM_QUERIES,
-        [&](int i) {
+    auto r_baseline = RunBench(
+        "Baseline: HashMap lookup only", 1000, NUM_QUERIES, [&](int i) {
             // Simulate: always acquire lock + lookup
             volatile bool found = false;
             for (int j = 0; j < 3; j++) {  // simulate lock overhead
@@ -387,8 +405,8 @@ void BenchCombinedPipeline() {
     PrintResult(r_baseline);
 
     // Path B: + Bloom Filter (skip lock on definite miss)
-    auto r_bloom = RunBench("+ Bloom Filter (skip miss)", 1000, NUM_QUERIES,
-        [&](int i) {
+    auto r_bloom =
+        RunBench("+ Bloom Filter (skip miss)", 1000, NUM_QUERIES, [&](int i) {
             if (!bf.MayContain(queries[i])) {
                 return;  // Fast path: skip lock
             }
@@ -403,8 +421,8 @@ void BenchCombinedPipeline() {
     PrintResult(r_bloom);
 
     // Path C: + Bloom Filter + Radix Tree (prefix fallback)
-    auto r_full = RunBench("+ Bloom Filter + Radix Tree (full)", 1000, NUM_QUERIES,
-        [&](int i) {
+    auto r_full = RunBench(
+        "+ Bloom Filter + Radix Tree (full)", 1000, NUM_QUERIES, [&](int i) {
             if (!bf.MayContain(queries[i])) {
                 // Try prefix match as fallback
                 auto match = tree.LongestPrefixMatch(queries[i]);
@@ -422,18 +440,21 @@ void BenchCombinedPipeline() {
     PrintResult(r_full);
 
     // Calculate improvements
-    double bloom_improvement = (r_bloom.ops_per_sec / r_baseline.ops_per_sec - 1.0) * 100;
-    double full_improvement = (r_full.ops_per_sec / r_baseline.ops_per_sec - 1.0) * 100;
+    double bloom_improvement =
+        (r_bloom.ops_per_sec / r_baseline.ops_per_sec - 1.0) * 100;
+    double full_improvement =
+        (r_full.ops_per_sec / r_baseline.ops_per_sec - 1.0) * 100;
 
     std::cout << "\n### 吞吐量提升\n\n";
     std::cout << "| Configuration | ops/s | vs Baseline |\n";
     std::cout << "|--------------|-------|------------|\n";
-    std::cout << "| Baseline (HashMap only) | " << std::fixed << std::setprecision(0)
-              << r_baseline.ops_per_sec << " | - |\n";
-    std::cout << "| + Bloom Filter | " << r_bloom.ops_per_sec
-              << " | **+" << std::setprecision(1) << bloom_improvement << "%** |\n";
+    std::cout << "| Baseline (HashMap only) | " << std::fixed
+              << std::setprecision(0) << r_baseline.ops_per_sec << " | - |\n";
+    std::cout << "| + Bloom Filter | " << r_bloom.ops_per_sec << " | **+"
+              << std::setprecision(1) << bloom_improvement << "%** |\n";
     std::cout << "| + Bloom Filter + Radix Tree | " << r_full.ops_per_sec
-              << " | **+" << std::setprecision(1) << full_improvement << "%** |\n";
+              << " | **+" << std::setprecision(1) << full_improvement
+              << "%** |\n";
 }
 
 }  // namespace mooncake
@@ -443,7 +464,8 @@ int main(int argc, char** argv) {
 
     std::cout << "# Mooncake Store 优化对比 Benchmark\n";
     std::cout << "**Date**: " << __DATE__ << " " << __TIME__ << "\n";
-    std::cout << "**Hardware**: skv-node1 (Xeon Gold 5218R 40c x2, 192GB DRAM)\n\n";
+    std::cout
+        << "**Hardware**: skv-node1 (Xeon Gold 5218R 40c x2, 192GB DRAM)\n\n";
 
     mooncake::BenchBloomFilter();
     mooncake::BenchPrefixRadixTree();
@@ -453,7 +475,8 @@ int main(int argc, char** argv) {
     std::cout << "| 优化模块 | 关键指标 | 效果 |\n";
     std::cout << "|---------|---------|------|\n";
     std::cout << "| Counting Bloom Filter | 淘汰后 FPR | 降低 87%+ |\n";
-    std::cout << "| Counting Bloom Filter | 长期查询加速 | 持续 40%+ (不退化) |\n";
+    std::cout
+        << "| Counting Bloom Filter | 长期查询加速 | 持续 40%+ (不退化) |\n";
     std::cout << "| Prefix Radix Tree | 前缀匹配 | O(|key|) 复杂度 |\n";
     std::cout << "| Prefix Radix Tree | 前缀命中率 | 多轮对话提升 20-40% |\n";
     std::cout << "| S3-FIFO | 系统提示词保护 | 100% 存活率 |\n";

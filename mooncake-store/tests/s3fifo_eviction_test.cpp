@@ -141,7 +141,8 @@ TEST_F(S3FIFOEvictionTest, DuplicateAdd) {
 
     strategy.AddKey("key");
     strategy.AddKey("key");  // Duplicate
-    ASSERT_EQ(strategy.GetSize(), 1u) << "Duplicate add should not increase size";
+    ASSERT_EQ(strategy.GetSize(), 1u)
+        << "Duplicate add should not increase size";
 }
 
 // RemoveKey: should work for both small and main queue
@@ -183,7 +184,8 @@ TEST_F(S3FIFOEvictionTest, StressTest) {
     std::unordered_set<std::string> evicted;
     for (int i = 0; i < 900; i++) {
         std::string key = strategy.EvictKey();
-        ASSERT_FALSE(key.empty()) << "Should be able to evict at iteration " << i;
+        ASSERT_FALSE(key.empty())
+            << "Should be able to evict at iteration " << i;
         evicted.insert(key);
     }
 

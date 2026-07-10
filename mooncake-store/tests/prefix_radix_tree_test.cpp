@@ -26,7 +26,7 @@ TEST_F(PrefixRadixTreeTest, BasicInsertContains) {
 
     ASSERT_TRUE(tree.Contains("hello"));
     ASSERT_TRUE(tree.Contains("world"));
-    ASSERT_FALSE(tree.Contains("hell"));  // prefix, not a key
+    ASSERT_FALSE(tree.Contains("hell"));    // prefix, not a key
     ASSERT_FALSE(tree.Contains("helloo"));  // extension, not a key
     ASSERT_EQ(tree.Size(), 2u);
 }
@@ -38,12 +38,12 @@ TEST_F(PrefixRadixTreeTest, SharedPrefix) {
     tree.Insert("abc");
     tree.Insert("abcdef");
     tree.Insert("abcxyz");
-    tree.Insert("abd");
+    tree.Insert("abz");
 
     ASSERT_TRUE(tree.Contains("abc"));
     ASSERT_TRUE(tree.Contains("abcdef"));
     ASSERT_TRUE(tree.Contains("abcxyz"));
-    ASSERT_TRUE(tree.Contains("abd"));
+    ASSERT_TRUE(tree.Contains("abz"));
     ASSERT_FALSE(tree.Contains("ab"));
     ASSERT_FALSE(tree.Contains("abcd"));
     ASSERT_EQ(tree.Size(), 4u);
@@ -97,7 +97,8 @@ TEST_F(PrefixRadixTreeTest, LongestPrefixMatch) {
     // Prefix match: query extends beyond stored key
     result = tree.LongestPrefixMatch("system_prompt_v1_turn1_user_response");
     ASSERT_EQ(result.matched_key, "system_prompt_v1_turn1_user");
-    ASSERT_EQ(result.matched_length, std::string("system_prompt_v1_turn1_user").size());
+    ASSERT_EQ(result.matched_length,
+              std::string("system_prompt_v1_turn1_user").size());
     ASSERT_FALSE(result.is_exact);
 
     // Partial prefix match: should find the longest stored prefix
@@ -116,16 +117,16 @@ TEST_F(PrefixRadixTreeTest, KVCacheTokenSequences) {
 
     // Simulate token-level KV cache keys
     // Format: model_id/layer/prefix_hash
-    tree.Insert("llama3/L0/tok_0_512");       // System prompt
-    tree.Insert("llama3/L0/tok_0_1024");      // System + user query 1
-    tree.Insert("llama3/L0/tok_0_1536");      // System + user query 1 + response 1
-    tree.Insert("llama3/L0/tok_0_2048");      // Full conversation turn 1
+    tree.Insert("llama3/L0/tok_0_512");   // System prompt
+    tree.Insert("llama3/L0/tok_0_1024");  // System + user query 1
+    tree.Insert("llama3/L0/tok_0_1536");  // System + user query 1 + response 1
+    tree.Insert("llama3/L0/tok_0_2048");  // Full conversation turn 1
 
     // New request shares system prompt
     auto result = tree.LongestPrefixMatch("llama3/L0/tok_0_512_new_query");
     ASSERT_EQ(result.matched_key, "llama3/L0/tok_0_512");
-    LOG(INFO) << "KVCache prefix reuse: matched "
-              << result.matched_length << " chars of "
+    LOG(INFO) << "KVCache prefix reuse: matched " << result.matched_length
+              << " chars of "
               << "llama3/L0/tok_0_512" << " (system prompt reused)";
 
     // New request shares system + user query 1
@@ -198,7 +199,8 @@ TEST_F(PrefixRadixTreeTest, ConcurrentReadWrite) {
     for (int t = 0; t < 2; t++) {
         threads.emplace_back([&, t]() {
             for (int i = 0; i < 1000; i++) {
-                tree.Insert("new_t" + std::to_string(t) + "_" + std::to_string(i));
+                tree.Insert("new_t" + std::to_string(t) + "_" +
+                            std::to_string(i));
             }
         });
     }
@@ -234,8 +236,8 @@ TEST_F(PrefixRadixTreeTest, MemoryEfficiency) {
     size_t key_count = tree.Size();
     size_t node_count = tree.NodeCount();
 
-    LOG(INFO) << "Memory efficiency: " << key_count << " keys, "
-              << node_count << " nodes (compression ratio: "
+    LOG(INFO) << "Memory efficiency: " << key_count << " keys, " << node_count
+              << " nodes (compression ratio: "
               << (1.0 - static_cast<double>(node_count) / key_count) * 100
               << "%)";
 

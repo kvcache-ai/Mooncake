@@ -97,7 +97,8 @@ TEST_F(BloomFilterTest, ConcurrentAccess) {
     for (int t = 0; t < kNumThreads; t++) {
         threads.emplace_back([&, t]() {
             for (int i = 0; i < kOpsPerThread; i++) {
-                std::string key = "t" + std::to_string(t) + "_k" + std::to_string(i);
+                std::string key =
+                    "t" + std::to_string(t) + "_k" + std::to_string(i);
                 filter.Add(key);
                 // Immediately check: must find it (no false negative)
                 if (!filter.MayContain(key)) {
@@ -123,7 +124,7 @@ TEST_F(BloomFilterTest, KVCacheKeyFormat) {
         "model_llama3_layer_0_head_0_tokens_0_512",
         "system_prompt_v2_hash_7f3c2a",
         "user_session_12345_turn_3_prefix",
-        "",  // empty key
+        "",                      // empty key
         std::string(1000, 'x'),  // very long key
     };
 
@@ -165,8 +166,7 @@ TEST_F(BloomFilterTest, RemoveDoesNotAffectOtherKeys) {
 
     ASSERT_TRUE(filter.MayContain("key_a"))
         << "Removing key_b should not affect key_a";
-    ASSERT_FALSE(filter.MayContain("key_b"))
-        << "key_b should be removed";
+    ASSERT_FALSE(filter.MayContain("key_b")) << "key_b should be removed";
     ASSERT_TRUE(filter.MayContain("key_c"))
         << "Removing key_b should not affect key_c";
 }
@@ -252,7 +252,8 @@ TEST_F(BloomFilterTest, ConcurrentAddRemove) {
     for (int t = 0; t < 4; t++) {
         threads.emplace_back([&, t]() {
             for (int i = 0; i < kNumKeys; i++) {
-                std::string key = "transient_t" + std::to_string(t) + "_" + std::to_string(i);
+                std::string key =
+                    "transient_t" + std::to_string(t) + "_" + std::to_string(i);
                 filter.Add(key);
             }
         });
@@ -262,7 +263,8 @@ TEST_F(BloomFilterTest, ConcurrentAddRemove) {
     for (int t = 0; t < 4; t++) {
         threads.emplace_back([&, t]() {
             for (int i = 0; i < kNumKeys; i++) {
-                std::string key = "transient_t" + std::to_string(t) + "_" + std::to_string(i);
+                std::string key =
+                    "transient_t" + std::to_string(t) + "_" + std::to_string(i);
                 filter.Remove(key);
             }
         });
@@ -297,7 +299,8 @@ TEST_F(BloomFilterTest, KVCacheEvictionSimulation) {
     }
 
     double fpr_before = filter.EstimateFPR();
-    LOG(INFO) << "Estimated FPR after initial fill: " << (fpr_before * 100) << "%"
+    LOG(INFO) << "Estimated FPR after initial fill: " << (fpr_before * 100)
+              << "%"
               << ", non-zero counters: " << filter.CountNonZero();
 
     // Phase 2: Evict oldest half
@@ -306,7 +309,8 @@ TEST_F(BloomFilterTest, KVCacheEvictionSimulation) {
     }
 
     double fpr_after_evict = filter.EstimateFPR();
-    LOG(INFO) << "Estimated FPR after eviction: " << (fpr_after_evict * 100) << "%"
+    LOG(INFO) << "Estimated FPR after eviction: " << (fpr_after_evict * 100)
+              << "%"
               << ", non-zero counters: " << filter.CountNonZero();
 
     // Phase 3: Add new generation
@@ -315,7 +319,8 @@ TEST_F(BloomFilterTest, KVCacheEvictionSimulation) {
     }
 
     double fpr_final = filter.EstimateFPR();
-    LOG(INFO) << "Estimated FPR after new generation: " << (fpr_final * 100) << "%"
+    LOG(INFO) << "Estimated FPR after new generation: " << (fpr_final * 100)
+              << "%"
               << ", non-zero counters: " << filter.CountNonZero();
 
     // Verify: all live keys found
@@ -335,8 +340,7 @@ TEST_F(BloomFilterTest, KVCacheEvictionSimulation) {
 
     LOG(INFO) << "KVCache eviction simulation: PASS"
               << " (FPR: " << (fpr_before * 100) << "% → "
-              << (fpr_after_evict * 100) << "% → "
-              << (fpr_final * 100) << "%)";
+              << (fpr_after_evict * 100) << "% → " << (fpr_final * 100) << "%)";
 }
 
 // Diagnostic methods: CountNonZero and EstimateFPR

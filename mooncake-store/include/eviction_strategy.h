@@ -239,8 +239,8 @@ class S3FIFOEvictionStrategy : public EvictionStrategy {
    private:
     static constexpr uint8_t kMaxFreq = 3;
 
-    std::deque<std::string> small_queue_;   // FIFO, entry point
-    std::deque<std::string> main_queue_;    // FIFO, promoted objects
+    std::deque<std::string> small_queue_;            // FIFO, entry point
+    std::deque<std::string> main_queue_;             // FIFO, promoted objects
     std::unordered_map<std::string, uint8_t> freq_;  // access frequency
 
     // Ghost set: metadata-only tracking of recently evicted keys

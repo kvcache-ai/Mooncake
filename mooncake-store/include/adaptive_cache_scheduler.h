@@ -51,13 +51,13 @@ class AdaptiveCacheScheduler {
 
         // Parameter ranges for each mode
         // PREFIX_HEAVY: conserve memory, protect hot objects
-        double prefix_watermark = 0.92;   // Trigger later
-        double prefix_evict_ratio = 0.03; // Evict less
+        double prefix_watermark = 0.92;         // Trigger later
+        double prefix_evict_ratio = 0.03;       // Evict less
         uint64_t prefix_soft_pin_ms = 3600000;  // 1 hour
 
         // SCAN_HEAVY: fast turnover
-        double scan_watermark = 0.80;     // Trigger earlier
-        double scan_evict_ratio = 0.10;   // Evict more
+        double scan_watermark = 0.80;        // Trigger earlier
+        double scan_evict_ratio = 0.10;      // Evict more
         uint64_t scan_soft_pin_ms = 300000;  // 5 minutes
 
         // MIXED: balanced
@@ -105,10 +105,9 @@ class AdaptiveCacheScheduler {
      */
     std::optional<SchedulerOutput> Schedule() {
         auto now = std::chrono::steady_clock::now();
-        auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - last_schedule_time_)
-                .count();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now - last_schedule_time_)
+                              .count();
 
         if (elapsed_ms < static_cast<int64_t>(config_.scheduling_interval_ms)) {
             return std::nullopt;  // Too early
@@ -129,8 +128,8 @@ class AdaptiveCacheScheduler {
         // Compute instantaneous hit rate
         double instant_hit_rate = 0.5;  // Default when no data
         if (delta_gets > 0) {
-            instant_hit_rate =
-                static_cast<double>(delta_hits) / static_cast<double>(delta_gets);
+            instant_hit_rate = static_cast<double>(delta_hits) /
+                               static_cast<double>(delta_gets);
         }
 
         // EWMA smoothing
@@ -190,10 +189,14 @@ class AdaptiveCacheScheduler {
 
     static const char* ModeToString(WorkloadMode mode) {
         switch (mode) {
-            case WorkloadMode::PREFIX_HEAVY: return "PREFIX_HEAVY";
-            case WorkloadMode::SCAN_HEAVY: return "SCAN_HEAVY";
-            case WorkloadMode::MIXED: return "MIXED";
-            default: return "UNKNOWN";
+            case WorkloadMode::PREFIX_HEAVY:
+                return "PREFIX_HEAVY";
+            case WorkloadMode::SCAN_HEAVY:
+                return "SCAN_HEAVY";
+            case WorkloadMode::MIXED:
+                return "MIXED";
+            default:
+                return "UNKNOWN";
         }
     }
 

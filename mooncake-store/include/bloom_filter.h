@@ -28,7 +28,8 @@ namespace mooncake {
  *
  * Thread safety: All operations are lock-free using atomic operations.
  * Add(), Remove(), and MayContain() can be called concurrently from any thread.
- * Counter overflow is capped at 15 (saturating arithmetic) to prevent wraparound.
+ * Counter overflow is capped at 15 (saturating arithmetic) to prevent
+ * wraparound.
  */
 class BloomFilter {
    public:
@@ -39,9 +40,7 @@ class BloomFilter {
      * @param num_hashes Number of hash functions. Optimal is (m/n)*ln(2).
      */
     explicit BloomFilter(size_t num_slots = 1 << 22, size_t num_hashes = 3)
-        : num_slots_(num_slots),
-          num_hashes_(num_hashes),
-          counters_(num_slots) {
+        : num_slots_(num_slots), num_hashes_(num_hashes), counters_(num_slots) {
         // Zero-initialize all counters
         for (auto& c : counters_) {
             c.store(0, std::memory_order_relaxed);
@@ -136,8 +135,8 @@ class BloomFilter {
 
     /// Get the estimated false positive rate (for diagnostics).
     double EstimateFPR() const {
-        double fill_ratio =
-            static_cast<double>(CountNonZero()) / static_cast<double>(num_slots_);
+        double fill_ratio = static_cast<double>(CountNonZero()) /
+                            static_cast<double>(num_slots_);
         // FPR ≈ (fill_ratio)^num_hashes
         double fpr = 1.0;
         for (size_t i = 0; i < num_hashes_; ++i) {

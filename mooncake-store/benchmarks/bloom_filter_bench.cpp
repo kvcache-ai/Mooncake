@@ -79,7 +79,7 @@ class BenchWorker {
         static thread_local std::mt19937 rng(std::random_device{}());
         std::uniform_real_distribution<double> miss_dist(0.0, 1.0);
         std::uniform_int_distribution<uint64_t> key_dist(0,
-                                                          num_prefill_keys_ - 1);
+                                                         num_prefill_keys_ - 1);
 
         while (gRunning.load(std::memory_order_relaxed)) {
             std::vector<std::string> keys;
@@ -149,8 +149,8 @@ int main(int argc, char** argv) {
         for (uint64_t i = 0; i < FLAGS_num_prefill_keys;) {
             std::vector<std::string> keys;
             std::vector<std::vector<uint64_t>> slice_lengths;
-            uint64_t batch = std::min(FLAGS_batch_size,
-                                       FLAGS_num_prefill_keys - i);
+            uint64_t batch =
+                std::min(FLAGS_batch_size, FLAGS_num_prefill_keys - i);
             for (uint64_t j = 0; j < batch; j++) {
                 keys.push_back("bench_key_" + std::to_string(i + j));
                 slice_lengths.push_back({FLAGS_value_size});
@@ -170,8 +170,9 @@ int main(int argc, char** argv) {
     LOG(INFO) << "Prefill done";
 
     // Run benchmark workers
-    LOG(INFO) << "Starting " << FLAGS_num_threads << " workers, miss_ratio="
-              << FLAGS_miss_ratio << ", duration=" << FLAGS_duration << "s";
+    LOG(INFO) << "Starting " << FLAGS_num_threads
+              << " workers, miss_ratio=" << FLAGS_miss_ratio
+              << ", duration=" << FLAGS_duration << "s";
 
     std::vector<std::thread> workers;
     for (size_t i = 0; i < FLAGS_num_threads; i++) {
@@ -205,8 +206,8 @@ int main(int argc, char** argv) {
               << "Miss ratio: " << FLAGS_miss_ratio << "\n"
               << "Threads: " << FLAGS_num_threads << "\n"
               << "Total ops: " << total << "\n"
-              << "Ops/sec: " << std::fixed << std::setprecision(0) << ops_per_sec
-              << "\n"
+              << "Ops/sec: " << std::fixed << std::setprecision(0)
+              << ops_per_sec << "\n"
               << "Hits: " << gHits.load() << " Misses: " << gMisses.load()
               << "\n";
 

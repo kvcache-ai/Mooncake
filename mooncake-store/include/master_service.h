@@ -1119,19 +1119,17 @@ class MasterService {
                 const auto access_ms =
                     recent_access_ms.load(std::memory_order_relaxed);
                 const auto access_time =
-                    access_ms > 0
-                        ? std::chrono::system_clock::time_point(
-                              std::chrono::milliseconds(access_ms))
-                        : std::chrono::system_clock::now();
+                    access_ms > 0 ? std::chrono::system_clock::time_point(
+                                        std::chrono::milliseconds(access_ms))
+                                  : std::chrono::system_clock::now();
                 SpinLocker locker(&lock);
                 lease_timeout =
                     std::max(lease_timeout,
                              access_time + std::chrono::milliseconds(ttl));
                 if (soft_pin_timeout) {
-                    soft_pin_timeout =
-                        std::max(*soft_pin_timeout,
-                                 access_time +
-                                     std::chrono::milliseconds(soft_ttl));
+                    soft_pin_timeout = std::max(
+                        *soft_pin_timeout,
+                        access_time + std::chrono::milliseconds(soft_ttl));
                 }
             }
         }
@@ -1601,8 +1599,9 @@ class MasterService {
     }
 
     // Lease related members
-    const uint64_t default_kv_lease_ttl_;     // in milliseconds
-    uint64_t default_kv_soft_pin_ttl_;        // in milliseconds (mutable for adaptive scheduler)
+    const uint64_t default_kv_lease_ttl_;  // in milliseconds
+    uint64_t default_kv_soft_pin_ttl_;  // in milliseconds (mutable for adaptive
+                                        // scheduler)
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members

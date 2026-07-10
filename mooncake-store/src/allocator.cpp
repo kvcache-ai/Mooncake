@@ -471,15 +471,15 @@ PmemBufferAllocator::PmemBufferAllocator(std::string segment_name,
         if (fd_ < 0) {
             LOG(ERROR) << "failed_to_open_dax_device path=" << pmem_path
                        << " errno=" << errno;
-            throw std::runtime_error("Failed to open DAX device: " +
-                                     pmem_path);
+            throw std::runtime_error("Failed to open DAX device: " + pmem_path);
         }
         // MAP_SYNC ensures write-back persistence on DAX
         base_addr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                           MAP_SHARED_VALIDATE | MAP_SYNC, fd_, 0);
         if (base_addr_ == MAP_FAILED) {
             // Fallback without MAP_SYNC (kernel < 4.15 or non-DAX)
-            LOG(WARNING) << "MAP_SYNC not supported, falling back to MAP_SHARED";
+            LOG(WARNING)
+                << "MAP_SYNC not supported, falling back to MAP_SHARED";
             base_addr_ =
                 mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         }

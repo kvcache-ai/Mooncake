@@ -2598,8 +2598,8 @@ auto MasterService::GetReplicaList(const std::string& key,
     };
 
     // Bloom filter fast path: skip exact shard lookup if key is definitely not
-    // present. Prefix lookup still runs, because an absent full key may extend a
-    // stored KVCache prefix.
+    // present. Prefix lookup still runs, because an absent full key may extend
+    // a stored KVCache prefix.
     const std::string scoped_key =
         MakeTenantScopedKey(object_id.tenant_id, object_id.user_key);
     if (bloom_filter_.MayContain(scoped_key)) {
@@ -4547,7 +4547,8 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     }
 
     auto& metadata = accessor.Get();
-    metadata.FlushDeferredLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    metadata.FlushDeferredLease(default_kv_lease_ttl_,
+                                default_kv_soft_pin_ttl_);
 
     if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";

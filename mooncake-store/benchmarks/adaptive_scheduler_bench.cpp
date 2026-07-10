@@ -101,40 +101,34 @@ class WorkloadGenerator {
                     case WorkloadPhase::PREFIX_HEAVY:
                         // 90% system prompt, 10% unique
                         if (r < 0.9) {
-                            keys.push_back(
-                                "sys_prompt_" +
-                                std::to_string(prompt_dist(rng)));
+                            keys.push_back("sys_prompt_" +
+                                           std::to_string(prompt_dist(rng)));
                         } else {
                             keys.push_back(
                                 "unique_" +
-                                std::to_string(
-                                    scan_counter_.fetch_add(1)));
+                                std::to_string(scan_counter_.fetch_add(1)));
                         }
                         break;
                     case WorkloadPhase::SCAN_HEAVY:
                         // 10% system prompt, 90% unique (will miss)
                         if (r < 0.1) {
-                            keys.push_back(
-                                "sys_prompt_" +
-                                std::to_string(prompt_dist(rng)));
+                            keys.push_back("sys_prompt_" +
+                                           std::to_string(prompt_dist(rng)));
                         } else {
                             keys.push_back(
                                 "scan_" +
-                                std::to_string(
-                                    scan_counter_.fetch_add(1)));
+                                std::to_string(scan_counter_.fetch_add(1)));
                         }
                         break;
                     case WorkloadPhase::MIXED:
                         // 50/50
                         if (r < 0.5) {
-                            keys.push_back(
-                                "sys_prompt_" +
-                                std::to_string(prompt_dist(rng)));
+                            keys.push_back("sys_prompt_" +
+                                           std::to_string(prompt_dist(rng)));
                         } else {
                             keys.push_back(
                                 "mixed_" +
-                                std::to_string(
-                                    scan_counter_.fetch_add(1)));
+                                std::to_string(scan_counter_.fetch_add(1)));
                         }
                         break;
                 }
@@ -160,10 +154,14 @@ class WorkloadGenerator {
 
 static const char* PhaseToString(WorkloadPhase p) {
     switch (p) {
-        case WorkloadPhase::PREFIX_HEAVY: return "PREFIX_HEAVY";
-        case WorkloadPhase::SCAN_HEAVY: return "SCAN_HEAVY";
-        case WorkloadPhase::MIXED: return "MIXED";
-        default: return "UNKNOWN";
+        case WorkloadPhase::PREFIX_HEAVY:
+            return "PREFIX_HEAVY";
+        case WorkloadPhase::SCAN_HEAVY:
+            return "SCAN_HEAVY";
+        case WorkloadPhase::MIXED:
+            return "MIXED";
+        default:
+            return "UNKNOWN";
     }
 }
 
@@ -228,8 +226,7 @@ int main(int argc, char** argv) {
 
     // Run three phases
     WorkloadPhase phases[] = {WorkloadPhase::PREFIX_HEAVY,
-                              WorkloadPhase::SCAN_HEAVY,
-                              WorkloadPhase::MIXED};
+                              WorkloadPhase::SCAN_HEAVY, WorkloadPhase::MIXED};
 
     std::cout << "\n=== Adaptive Cache Scheduler Benchmark ===\n"
               << "Threads: " << FLAGS_num_threads
