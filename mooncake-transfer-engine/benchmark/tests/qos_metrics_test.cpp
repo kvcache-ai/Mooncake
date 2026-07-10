@@ -83,6 +83,8 @@ TEST(QosMetricsTest, CalculatesSloFairnessIsolationAndUtilization) {
     EXPECT_NEAR(*report.max_isolation_leakage, 0.5, 1e-12);
     ASSERT_TRUE(report.total_utilization);
     EXPECT_NEAR(*report.total_utilization, 0.5, 1e-12);
+    ASSERT_TRUE(report.link_capacity_gbps);
+    EXPECT_NEAR(*report.link_capacity_gbps, 0.01, 1e-12);
 
     const auto& foreground = report.classes[0];
     EXPECT_EQ(foreground.operations, 3);
@@ -91,6 +93,8 @@ TEST(QosMetricsTest, CalculatesSloFairnessIsolationAndUtilization) {
     EXPECT_NEAR(*foreground.slo_attainment, 2.0 / 3.0, 1e-12);
     EXPECT_NEAR(foreground.goodput_gbps, 0.002, 1e-12);
     EXPECT_NEAR(foreground.weighted_goodput_gbps, 0.004, 1e-12);
+    ASSERT_TRUE(foreground.isolated_throughput_gbps);
+    EXPECT_NEAR(*foreground.isolated_throughput_gbps, 0.006, 1e-12);
 
     EXPECT_FALSE(report.classes[1].slo_attainment);
 }
@@ -113,9 +117,11 @@ TEST(QosMetricsTest, UsesNullForUnavailableJsonMetrics) {
     ASSERT_NO_THROW(input >> record);
     EXPECT_EQ(record["schema_version"], 1);
     EXPECT_TRUE(record["total_utilization"].is_null());
+    EXPECT_TRUE(record["link_capacity_gbps"].is_null());
     EXPECT_TRUE(record["max_isolation_leakage"].is_null());
     EXPECT_TRUE(record["classes"][0]["slo_attainment"].is_null());
     EXPECT_TRUE(record["classes"][0]["isolation_leakage"].is_null());
+    EXPECT_TRUE(record["classes"][0]["isolated_throughput_gbps"].is_null());
     std::remove(path.c_str());
 }
 

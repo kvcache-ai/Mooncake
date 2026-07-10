@@ -160,6 +160,7 @@ QosMetricsReport calculateQosMetrics(size_t block_size, size_t batch_size,
         metrics.threads = config.threads;
         metrics.slo_us = config.slo_us;
         metrics.weight = config.weight;
+        metrics.isolated_throughput_gbps = config.isolated_throughput_gbps;
         metrics.operations = class_stats.transfer_duration.count();
         metrics.p99_us = class_stats.transfer_duration.p99();
 
@@ -197,6 +198,7 @@ QosMetricsReport calculateQosMetrics(size_t block_size, size_t batch_size,
     report.jain_fairness = jainIndex(normalized_throughput);
     report.max_isolation_leakage = max_leakage;
     if (link_capacity_gbps > 0.0) {
+        report.link_capacity_gbps = link_capacity_gbps;
         report.total_utilization =
             report.aggregate_throughput_gbps / link_capacity_gbps;
     }
@@ -229,6 +231,7 @@ void printQosMetrics(const QosMetricsReport& report) {
                   << " throughput=" << metrics.throughput_gbps
                   << " GB/s p99_us=" << std::setprecision(1) << metrics.p99_us
                   << " slo_attainment=";
+        std::cout << std::setprecision(6);
         if (metrics.slo_attainment) {
             std::cout << std::setprecision(6) << *metrics.slo_attainment;
         } else {
@@ -255,6 +258,7 @@ bool appendQosMetricsJsonl(const std::string& path,
         {"weighted_goodput_gbps", report.weighted_goodput_gbps},
         {"jain_fairness", report.jain_fairness},
         {"max_isolation_leakage", optionalJson(report.max_isolation_leakage)},
+        {"link_capacity_gbps", optionalJson(report.link_capacity_gbps)},
         {"total_utilization", optionalJson(report.total_utilization)},
         {"classes", nlohmann::json::array()},
     };
@@ -270,6 +274,8 @@ bool appendQosMetricsJsonl(const std::string& path,
             {"slo_attainment", optionalJson(metrics.slo_attainment)},
             {"goodput_gbps", metrics.goodput_gbps},
             {"weighted_goodput_gbps", metrics.weighted_goodput_gbps},
+            {"isolated_throughput_gbps",
+             optionalJson(metrics.isolated_throughput_gbps)},
             {"isolation_leakage", optionalJson(metrics.isolation_leakage)},
         });
     }
