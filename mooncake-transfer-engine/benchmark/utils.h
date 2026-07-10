@@ -70,6 +70,7 @@ struct XferBenchConfig {
     static int start_num_threads;
     static uint64_t deadline_us;
     static int deadline_tight_threads;
+    static bool deadline_bw_arbitration;
 
     static std::string metadata_type;
     static std::string metadata_url_list;

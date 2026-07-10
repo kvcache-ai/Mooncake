@@ -51,6 +51,8 @@ std::shared_ptr<Config> loadConfig() {
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
+    config->set("transports/rdma/deadline_bw_arbitration",
+                XferBenchConfig::deadline_bw_arbitration);
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {

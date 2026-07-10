@@ -41,6 +41,8 @@ DEFINE_uint64(deadline_us, 0,
 DEFINE_int32(deadline_tight_threads, 0,
              "tent only: workers [0, N) that carry --deadline_us; remaining "
              "workers have no deadline.");
+DEFINE_bool(deadline_bw_arbitration, false,
+            "tent only: enable deadline-aware RDMA bandwidth arbitration.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
 DEFINE_string(metadata_type, "p2p",
@@ -78,6 +80,7 @@ int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
+bool XferBenchConfig::deadline_bw_arbitration = false;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
@@ -106,6 +109,7 @@ void XferBenchConfig::loadFromFlags() {
     max_num_threads = FLAGS_max_num_threads;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
+    deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
     duration = FLAGS_duration;
 
     metadata_type = FLAGS_metadata_type;
