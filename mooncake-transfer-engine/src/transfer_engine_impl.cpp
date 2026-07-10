@@ -138,7 +138,13 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-            if (port == 0) {
+            // Preserve the legacy dynamic-port behavior for callers that pass
+            // only a host name.  The parser supplies the default handshake
+            // port for those callers, but that port was not explicitly
+            // requested and cannot be shared by multiple local processes.
+            // Explicit non-zero ports are honored so independently launched
+            // peers can advertise predictable endpoints.
+            if (!hasExplicitPort(local_server_name) || port == 0) {
                 desc.rpc_port = findAvailableTcpPort(desc.sockfd);
                 if (desc.rpc_port == 0) {
                     LOG(ERROR)
