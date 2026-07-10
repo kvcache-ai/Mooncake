@@ -337,7 +337,8 @@ int TENTBenchRunner::runInitiatorTasks(
 double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t target_addr,
                                           uint64_t block_size,
-                                          uint64_t batch_size, OpCode opcode) {
+                                          uint64_t batch_size, OpCode opcode,
+                                          uint64_t deadline_ns) {
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -348,6 +349,7 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
         entry.transport_hint = transport_hint_;
+        entry.deadline_ns = deadline_ns;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;
