@@ -68,7 +68,8 @@ struct MasterSnapshotPayloads {
  * - metadata: msgpack-encoded metadata shards (compressed per-shard with zstd)
  * - segments: msgpack-encoded segment manager state
  * - task_manager: msgpack-encoded task manager state
- * - manifest.txt: format descriptor (e.g., "messagepack|1.0.0|master")
+ * - manifest.txt: format descriptor "<type>|<version>|<snapshot_id>"
+ *   (e.g., "messagepack|1.0.0|snapshot-000123")
  */
 class MasterSnapshotCodec {
    public:
@@ -107,12 +108,25 @@ class MasterSnapshotCodec {
         MasterService* master_service,
         const MasterSnapshotPayloads& payloads) const;
 
+    // Canonical serializer identifiers embedded in the snapshot manifest.
+    static constexpr const char* kSerializerType = "messagepack";
+    static constexpr const char* kSerializerVersion = "1.0.0";
+
     /**
-     * @brief Get the manifest content for this codec version.
+     * @brief Encode a snapshot manifest into its on-disk byte representation.
      *
-     * @return Manifest string (e.g., "messagepack|1.0.0|master")
+     * The manifest is a "<type>|<version>|<snapshot_id>" descriptor. Keeping
+     * the encoding here (rather than hand-crafting the format string at the
+     * call site) ensures the manifest layout stays owned by the codec.
+     *
+     * @param type Serializer/protocol type (e.g., "messagepack")
+     * @param version Snapshot format version (e.g., "1.0.0")
+     * @param snapshot_id Identifier of the snapshot being written
+     * @return Manifest bytes ready to upload
      */
-    static std::string GetManifestContent();
+    static std::vector<uint8_t> EncodeManifest(const std::string& type,
+                                               const std::string& version,
+                                               const std::string& snapshot_id);
 
    private:
     // Metadata encoding/decoding (delegates to MetadataSerializer for now)

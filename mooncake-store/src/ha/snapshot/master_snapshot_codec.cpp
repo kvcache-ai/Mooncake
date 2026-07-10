@@ -11,8 +11,11 @@
 
 namespace mooncake::ha {
 
-std::string MasterSnapshotCodec::GetManifestContent() {
-    return "messagepack|1.0.0|master";
+std::vector<uint8_t> MasterSnapshotCodec::EncodeManifest(
+    const std::string& type, const std::string& version,
+    const std::string& snapshot_id) {
+    std::string manifest = type + "|" + version + "|" + snapshot_id;
+    return std::vector<uint8_t>(manifest.begin(), manifest.end());
 }
 
 tl::expected<MasterSnapshotPayloads, SerializationError>

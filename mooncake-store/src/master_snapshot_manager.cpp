@@ -587,10 +587,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Upload manifest
-        std::string manifest_content =
-            ha::MasterSnapshotCodec::GetManifestContent();
-        std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
-                                            manifest_content.end());
+        std::vector<uint8_t> manifest_bytes =
+            ha::MasterSnapshotCodec::EncodeManifest(SNAPSHOT_SERIALIZER_TYPE,
+                                                    SNAPSHOT_SERIALIZER_VERSION,
+                                                    snapshot_id);
         upload_result = repository_->UploadPayloadFile(
             manifest_bytes, manifest_path, SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {

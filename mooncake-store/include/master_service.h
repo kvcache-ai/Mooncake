@@ -46,6 +46,7 @@ class MasterSnapshotManager;
 namespace ha {
 class SnapshotCatalogStore;
 class MasterSnapshotCodec;
+class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }
 
 class EtcdOpLogStore;
@@ -93,9 +94,11 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
-    friend class MasterSnapshotManager;  // Allow access to internal state for
-                                         // snapshot
-    friend class ha::MasterSnapshotCodec;  // Allow codec to access private members
+    friend class MasterSnapshotManager;    // Allow access to internal state for
+                                           // snapshot
+    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
+                                           // members
+    friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
 
    public:
     using NoFProbeFn =
