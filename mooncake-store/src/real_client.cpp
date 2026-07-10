@@ -12,6 +12,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -1038,21 +1039,17 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
         return default_value;
     }
 
-    try {
-        std::string value = trim(it->second);
-        size_t pos = 0;
-        int parsed_value = std::stoi(value, &pos);
-        if (pos != value.size()) {
-            LOG(ERROR) << "Invalid integer value for config key '" << key
-                       << "': " << it->second;
-            return std::nullopt;
-        }
-        return parsed_value;
-    } catch (const std::exception &) {
+    std::string value = trim(it->second);
+    int parsed_value = 0;
+    const char *begin = value.data();
+    const char *end = begin + value.size();
+    auto [ptr, ec] = std::from_chars(begin, end, parsed_value);
+    if (ec != std::errc{} || ptr != end) {
         LOG(ERROR) << "Invalid integer value for config key '" << key
                    << "': " << it->second;
         return std::nullopt;
     }
+    return parsed_value;
 }
 }  // namespace
 

@@ -447,6 +447,31 @@ TEST_F(ClientMetricsTest, HttpMetricsConfigParserTrimsWhitespace) {
     EXPECT_EQ(client->tearDownAll(), 0);
 }
 
+TEST_F(ClientMetricsTest, HttpMetricsConfigParserRejectsInvalidIntegers) {
+    const char* invalid_ports[] = {
+        "9300x",
+        "999999999999999999999999",
+    };
+
+    for (const char* invalid_port : invalid_ports) {
+        ConfigDict config = {
+            {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1:1"},
+            {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+            {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "0"},
+            {CONFIG_KEY_LOCAL_BUFFER_SIZE, "0"},
+            {CONFIG_KEY_PROTOCOL, "tcp"},
+            {CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, "true"},
+            {CONFIG_KEY_CLIENT_HTTP_PORT, invalid_port},
+        };
+
+        auto client = RealClient::create();
+        auto setup_result = client->setup_internal(config);
+        ASSERT_FALSE(setup_result.has_value()) << invalid_port;
+        EXPECT_EQ(setup_result.error(), ErrorCode::INVALID_PARAMS)
+            << invalid_port;
+    }
+}
+
 TEST_F(ClientMetricsTest, HttpMetricsEndpointReturns503WhenMetricsDisabled) {
     ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
     setenv("MC_STORE_CLIENT_METRIC", "0", 1);
