@@ -189,6 +189,13 @@ target_include_directories(tent_transport_hint_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
 
+add_executable(tent_intent_type_test intent_type_test.cpp)
+target_link_libraries(tent_intent_type_test PRIVATE gtest gtest_main
+                                                    tent_common)
+target_include_directories(tent_intent_type_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_intent_type_test COMMAND tent_intent_type_test)
+
 # ProgressWorker skeleton test: covers default-off behavior, event-driven
 # progress without poll-failover, and freeBatch races (issue #2116).
 add_executable(tent_progress_worker_test progress_worker_test.cpp)
