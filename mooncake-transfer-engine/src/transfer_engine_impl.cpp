@@ -742,7 +742,32 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
-    for (auto& buffer : buffer_list) {
+    std::vector<BufferEntry> sorted_buffers = buffer_list;
+    std::sort(sorted_buffers.begin(), sorted_buffers.end(),
+              [](const BufferEntry& lhs, const BufferEntry& rhs) {
+                  return reinterpret_cast<uintptr_t>(lhs.addr) <
+                         reinterpret_cast<uintptr_t>(rhs.addr);
+              });
+
+    for (size_t i = 0; i < sorted_buffers.size(); ++i) {
+        const auto& buffer = sorted_buffers[i];
+        if (buffer.length == 0) {
+            LOG(ERROR)
+                << "Transfer Engine does not support zero length memory region";
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        if (i > 0) {
+            const auto& previous = sorted_buffers[i - 1];
+            auto address = reinterpret_cast<uintptr_t>(buffer.addr);
+            auto previous_address = reinterpret_cast<uintptr_t>(previous.addr);
+            if (address - previous_address < previous.length) {
+                LOG(ERROR) << "Transfer Engine does not support overlapped "
+                              "memory region";
+                return ERR_ADDRESS_OVERLAPPED;
+            }
+        }
+
         if (checkOverlap(buffer.addr, buffer.length)) {
             LOG(ERROR)
                 << "Transfer Engine does not support overlapped memory region";
