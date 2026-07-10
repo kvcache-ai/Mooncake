@@ -441,8 +441,8 @@ Status RdmaTransport::submitTransferTasks(
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;
-        task->success_slices = 0;
-        task->resolved_slices = 0;
+        task->success_slices.store(0, std::memory_order_relaxed);
+        task->resolved_slices.store(0, std::memory_order_relaxed);
         task->first_error = PENDING;
         task->cancel_requested.store(false, std::memory_order_relaxed);
         task->ref();  // Batch holds a reference to the task

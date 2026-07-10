@@ -47,7 +47,10 @@ RailMonitor& getOrCreateRail(
 }  // namespace
 
 Workers::Workers(RdmaTransport* transport)
-    : transport_(transport), num_workers_(0), running_(false) {
+    : transport_(transport),
+      num_workers_(0),
+      running_(false),
+      worker_context_(nullptr) {
     device_selector_ = std::make_unique<DeviceSelector>();
     device_selector_->loadTopology(transport_->local_topology_);
     auto& conf = transport_->conf_;
@@ -259,6 +262,10 @@ Status Workers::cancel(RdmaTask* task) {
     if (task->cancel_requested.exchange(true, std::memory_order_acq_rel)) {
         return Status::OK();
     }
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        !num_workers_) {
+        return Status::OK();
+    }
     // Wake every worker because one task may have slices distributed across
     // several queues. Cancellation remains best effort for slices already
     // posted to a QP; those drain through the normal CQ path.
@@ -271,7 +278,7 @@ Status Workers::cancel(RdmaTask* task) {
 }
 
 bool Workers::cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice) {
-    if (!slice ||
+    if (!slice || !slice->task ||
         !slice->task->cancel_requested.load(std::memory_order_acquire))
         return false;
     if (slice->word == PENDING) {

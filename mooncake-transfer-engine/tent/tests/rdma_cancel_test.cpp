@@ -25,8 +25,8 @@ TEST(RdmaCancelTest, PartialCancellationWaitsForPostedSlices) {
     task.num_slices = 2;
     task.status_word = PENDING;
     task.transferred_bytes = 0;
-    task.success_slices = 0;
-    task.resolved_slices = 0;
+    task.success_slices.store(0);
+    task.resolved_slices.store(0);
     task.first_error = PENDING;
     // Two slice references plus the batch reference. updateSliceStatus drops
     // one reference per resolved slice; the stack object is never deallocated.
@@ -48,7 +48,7 @@ TEST(RdmaCancelTest, PartialCancellationWaitsForPostedSlices) {
     updateSliceStatus(&posted, COMPLETED);
     EXPECT_EQ(task.status_word, CANCELED);
     EXPECT_EQ(task.transferred_bytes, 8192u);
-    EXPECT_EQ(task.resolved_slices, 2);
+    EXPECT_EQ(task.resolved_slices.load(), 2);
 }
 
 TEST(RdmaCancelTest, FullyPostedTaskMayStillComplete) {
@@ -56,8 +56,8 @@ TEST(RdmaCancelTest, FullyPostedTaskMayStillComplete) {
     task.num_slices = 1;
     task.status_word = PENDING;
     task.transferred_bytes = 0;
-    task.success_slices = 0;
-    task.resolved_slices = 0;
+    task.success_slices.store(0);
+    task.resolved_slices.store(0);
     task.first_error = PENDING;
     task.cancel_requested.store(true);
     task.ref_count.store(2);
