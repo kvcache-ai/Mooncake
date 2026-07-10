@@ -140,3 +140,19 @@ if(USE_NCCL_DEVICE AND BUILD_NCCL_DEVICE_TRANSPORT_EXAMPLE)
     endif()
   endif()
 endif()
+
+option(BUILD_NCCL_HOST_TRANSPORT_EXAMPLE
+       "Build the two-GPU NCCL host RMA Transfer Engine example"
+       OFF)
+if(USE_NCCL_HOST AND BUILD_NCCL_HOST_TRANSPORT_EXAMPLE)
+  add_executable(nccl_host_transport_example
+                 ${WORKSPACE}/nccl_host_transport_example.cpp)
+  target_include_directories(nccl_host_transport_example PRIVATE
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
+  target_link_libraries(nccl_host_transport_example PRIVATE
+    transfer_engine NCCL::nccl glog::glog gflags::gflags)
+  add_executable(nccl_host_transport_distributed_example
+                 ${WORKSPACE}/nccl_host_transport_distributed_example.cpp)
+  target_link_libraries(nccl_host_transport_distributed_example PRIVATE
+    transfer_engine NCCL::nccl glog::glog gflags::gflags)
+endif()

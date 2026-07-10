@@ -153,6 +153,10 @@ class Transport {
                                     // transport
             } local;
             struct {
+                void *event;  // cudaEvent_t
+                int device_id;
+            } nccl;
+            struct {
                 uint64_t dest_addr;
             } tcp;
             struct {

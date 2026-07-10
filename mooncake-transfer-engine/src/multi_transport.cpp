@@ -31,6 +31,9 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
+#ifdef USE_NCCL_HOST
+#include "transport/nccl_transport/nccl_transport.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #endif
@@ -337,6 +340,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new NVMeoFTransport();
     }
 #endif
+#ifdef USE_NCCL_HOST
+    else if (std::string(proto) == "nccl") {
+        transport = new NcclHostTransport();
+    }
+#endif
 #ifdef USE_ASCEND_DIRECT
     else if (std::string(proto) == "ascend") {
         transport = new AscendDirectTransport();
@@ -467,6 +475,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     // priority instead of relying on buffer registration order.
     if (proto.find(',') != std::string::npos) {
         auto protocol_priority = [](const std::string& p) {
+            if (p == "nccl") return 5;
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.

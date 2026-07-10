@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -53,6 +54,7 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
+        int32_t device_id = -1;  // CUDA device for GPU-backed transports
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
@@ -138,6 +140,8 @@ class TransferMetadata {
     };
 
     struct HandShakeDesc {
+        std::string protocol;
+        std::string payload;
         std::string local_nic_path;
         uint16_t local_lid = 0;
         std::string local_gid;
@@ -215,6 +219,10 @@ class TransferMetadata {
     int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
                              uint16_t listen_port, int sockfd);
 
+    int registerHandshakeHandler(const std::string &protocol,
+                                 OnReceiveHandShake on_receive_handshake);
+    int unregisterHandshakeHandler(const std::string &protocol);
+
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
@@ -258,6 +266,10 @@ class TransferMetadata {
 
     std::shared_ptr<HandShakePlugin> handshake_plugin_;
     std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
+    std::mutex handshake_handler_mutex_;
+    std::unordered_map<std::string, OnReceiveHandShake> handshake_handlers_;
+    OnReceiveHandShake default_handshake_handler_;
+    bool handshake_daemon_started_{false};
 };
 
 }  // namespace mooncake
