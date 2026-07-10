@@ -63,3 +63,15 @@ endif()
 set_target_properties(
   tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
                      INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
+
+if(BUILD_UNIT_TESTS)
+  add_executable(tebench_qos_metrics_test tests/qos_metrics_test.cpp
+                                          qos_metrics.cpp utils.cpp)
+  target_link_libraries(tebench_qos_metrics_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  target_include_directories(
+    tebench_qos_metrics_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_qos_metrics_test COMMAND tebench_qos_metrics_test)
+endif()

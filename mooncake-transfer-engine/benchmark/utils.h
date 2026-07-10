@@ -68,6 +68,9 @@ struct XferBenchConfig {
     static int duration;
     static int max_num_threads;
     static int start_num_threads;
+    static std::string qos_classes;
+    static double qos_link_capacity_gbps;
+    static std::string qos_output_jsonl;
 
     static std::string metadata_type;
     static std::string metadata_url_list;
@@ -106,6 +109,14 @@ struct XferMetricStats {
     double p99() { return percentile(99.0); }
 
     double p999() { return percentile(99.9); }
+
+    double fractionAtOrBelow(double threshold) const {
+        if (samples.empty()) return 0.0;
+        const auto count = std::count_if(
+            samples.begin(), samples.end(),
+            [threshold](double value) { return value <= threshold; });
+        return static_cast<double>(count) / samples.size();
+    }
 
     void add(double value) { samples.push_back(value); }
 
@@ -152,6 +163,10 @@ void printStatsHeader();
 
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
+
+void printDeadlineGroupStats(const char* group, size_t block_size,
+                             size_t batch_size, XferBenchStats& stats,
+                             int num_threads, uint64_t deadline_us);
 
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {

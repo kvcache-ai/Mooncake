@@ -91,6 +91,54 @@ Each output row corresponds to one benchmark configuration.
 
 A short (~1 second) warmup phase is executed before measurements begin.
 
+### 4.1 QoS Metrics Baseline
+
+Use `--qos_classes` to partition a fixed number of worker threads into QoS
+classes:
+
+```text
+name:threads:slo_us:weight[:isolated_gbps],...
+```
+
+For example, the following closed-loop mixed workload assigns four workers to
+an SLO-constrained foreground class and twelve workers to a best-effort
+checkpoint class:
+
+```bash
+./tebench \
+  --target_seg_name=<SEG> \
+  --backend=tent \
+  --start_num_threads=16 \
+  --max_num_threads=16 \
+  --qos_classes=foreground:4:1000:4:12.5,checkpoint:12:0:1:10.0 \
+  --qos_link_capacity_gbps=25 \
+  --qos_output_jsonl=qos-results.jsonl
+```
+
+The class thread counts must add up to the fixed `start_num_threads` value.
+An `slo_us` of zero marks a best-effort class. For TENT, a non-zero SLO is also
+sent as the request's relative deadline; the classic backend measures the same
+SLO but ignores the scheduling hint.
+
+The human-readable summary and the optional versioned JSONL record report:
+
+| Metric | Definition |
+| ------ | ---------- |
+| `slo_attainment` | Fraction of completed batches whose measured end-to-end transfer time is at most `slo_us` |
+| `p99_us` | P99 end-to-end batch transfer latency for the class |
+| `goodput_gbps` | Class throughput multiplied by SLO attainment; best-effort classes use attainment 1 |
+| `weighted_goodput_gbps` | Sum of `weight × goodput_gbps` |
+| `jain_fairness` | Jain index over per-class `throughput_gbps / weight` |
+| `isolation_leakage` | `max(0, 1 - mixed_throughput / isolated_throughput)` |
+| `total_utilization` | Aggregate measured throughput divided by `qos_link_capacity_gbps` |
+
+Isolation leakage requires a matching class-only baseline, supplied as the
+optional fifth class field. Total utilization requires
+`--qos_link_capacity_gbps`. Missing baselines are emitted as `N/A` in text and
+`null` in JSON rather than being inferred from the mixed run. Run isolated and
+mixed cases with the same block size, batch size, transport, memory type, and
+host pair.
+
 ## 5. Runtime Configuration
 
 This section summarizes the key runtime options that control workload behavior,
@@ -192,3 +240,14 @@ gpu_id + thread_id
 
 * `--metadata_type` : `p2p | etcd | redis | http` (default: `p2p`)
 * `--metadata_url_list` : comma-separated URLs (ignored in `p2p` mode)
+
+### 5.7 QoS Reporting
+
+* `--qos_classes` : class/thread/SLO/weight contract described in Section 4.1
+* `--qos_link_capacity_gbps` : measured usable link capacity in decimal GB/s
+* `--qos_output_jsonl` : append one schema-versioned JSON object per benchmark
+  configuration
+
+QoS mode intentionally requires a fixed thread count. Sweep offered load by
+running explicit cases with different class thread allocations so every output
+record has an unambiguous workload contract.
