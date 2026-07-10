@@ -1,6 +1,6 @@
-# vLLM with Mooncake Transfer Engine Benchmark
+# vLLM PD Disaggregation Performance
 
-Mooncake has now implemented a vLLM connector, enabling direct support for the Prefill-Decode (PD) separation architecture in vLLM v1. We evaluated the performance of this integration, focusing on the efficiency of cross-node KV cache transfer using RDMA.
+Mooncake has now implemented a vLLM connector, enabling direct support for the Prefill-Decode (PD) disaggregation architecture in vLLM v1. We evaluated the performance of this integration, focusing on the efficiency of cross-node KV cache transfer using RDMA.
 
 ## Benchmark Result
 
@@ -8,7 +8,7 @@ Mooncake has now implemented a vLLM connector, enabling direct support for the P
 
 We measured the actual transfer bandwidth during the execution of requests with varying prompt lengths.
 
-![KV Transfer Bandwidth (Actual)](../image/vllm_benchmark_actual_bandwidth.png)
+![KV Transfer Bandwidth (Actual)](../../image/vllm_benchmark_actual_bandwidth.png)
 
 In a 1P1D (1 Prefiller, 1 Decoder) configuration using the Qwen3-8B model, Mooncake achieved a peak actual transfer bandwidth of **142.25 GB/s**. Given the theoretical maximum bandwidth of approximately 200 GB/s for the 8x RoCE connections, this represents a **71.1% bandwidth utilization rate**. This efficiency demonstrates that the custom transfer protocol and GPU Direct RDMA capabilities can effectively saturate high-performance networks.
 
@@ -16,9 +16,9 @@ In a 1P1D (1 Prefiller, 1 Decoder) configuration using the Qwen3-8B model, Moonc
 
 We analyzed the Time To First Token (TTFT) to understand the impact of KV transfer overhead on end-to-end latency.
 
-![TTFT Breakdown](../image/vllm_benchmark_ttft_breakdown.png)
+![TTFT Breakdown](../../image/vllm_benchmark_ttft_breakdown.png)
 
-![Transfer Time vs KV Size](../image/vllm_benchmark_transfer_time.png)
+![Transfer Time vs KV Size](../../image/vllm_benchmark_transfer_time.png)
 
 The results show that Mooncake's high-speed transfer ensures that the overhead of moving KV cache is negligible compared to the computation time. For a prompt length of 32,768 tokens (transferring 4.50 GB of data), the actual KV transfer took only **31.65 ms**, accounting for merely **4.2%** of the total TTFT.
 
