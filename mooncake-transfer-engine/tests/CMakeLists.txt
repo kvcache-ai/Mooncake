@@ -77,6 +77,12 @@ if(USE_TCP)
   target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
+
+  add_executable(tcp_write_visibility_test
+                 ${WORKSPACE}/tcp_write_visibility_test.cpp)
+  target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+  add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
 endif()
 
 add_executable(tcp_address_validation_test

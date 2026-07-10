@@ -113,7 +113,45 @@ class TcpTransport;
 
 using ValidateAddrFn = std::function<bool(uint64_t, uint64_t)>;
 
-// Server-side session: handles one transfer request on a persistent connection
+// --- Acknowledged framing (protocol v2, #2086) ------------------------------
+// v1 framing gives the initiator no channel to learn whether the receiver
+// applied (or even accepted) a WRITE: COMPLETED fires when the final chunk
+// enters the initiator's kernel socket buffer, while megabytes may still be
+// in flight toward destination memory, and a rejected request is silently
+// "successful". v2 requests set the high bit of the opcode; the server then
+// (a) prefixes every READ response with an 8-byte status frame and (b) sends
+// an 8-byte status frame for WRITE only after the final chunk has been
+// applied to destination memory. Initiators enable v2 only when the target
+// segment advertises tcp_proto_version >= 2, so old servers never see
+// flagged opcodes and old initiators keep receiving v1 framing.
+static constexpr uint8_t kOpcodeV2Flag = 0x80;
+// Status frames carry a magic in the high 32 bits so that a v2 initiator
+// which reaches a v1 server through a stale descriptor (v1 treats unknown
+// opcodes as READ and immediately streams payload bytes) fails fast on the
+// first frame instead of misinterpreting the stream. Residual risk: payload
+// bytes that happen to equal a valid frame (2^-64 per request, data
+// dependent) are indistinguishable in-band; eliminating that would need a
+// nonce/checksum handshake, which this deliberately avoids.
+static constexpr uint64_t kStatusMagic = 0x4D435456ull << 32;  // "MCTV"
+static constexpr uint64_t kStatusOk = kStatusMagic | 0;
+static constexpr uint64_t kStatusAddrRejected = kStatusMagic | 1;
+static inline bool statusFrameValid(uint64_t frame) {
+    return (frame & 0xFFFFFFFF00000000ull) == kStatusMagic;
+}
+
+// Operational escape hatch: MC_TCP_PROTO=1 forces initiators to speak the
+// legacy unacknowledged framing even to v2-capable servers. Also used by
+// tests to cover the mixed-version matrix in one process.
+static bool forceLegacyTcpProto() {
+    // Read per call (startTransfer already does metadata lookups; getenv is
+    // noise) so tests can cover both protocol modes in one process.
+    const char* env = std::getenv("MC_TCP_PROTO");
+    return env && env[0] == '1' && env[1] == '\0';
+}
+
+// Server-side session: handles transfer requests on a persistent connection.
+// The session owns the socket; ending the callback chain without rearming
+// (start()/next handler) drops the last reference and closes the connection.
 struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     explicit ServerSession(std::shared_ptr<tcpsocket> socket,
                            ValidateAddrFn validate_addr)
@@ -125,16 +163,30 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
-    std::function<void(TransferStatusEnum)> on_finalize_;
-    std::mutex session_mutex_;
+    bool v2_ = false;
+    uint64_t status_frame_;
 
     void start() {
-        session_mutex_.lock();
         total_transferred_bytes_ = 0;
         readHeader();
     }
 
    private:
+    // Send an 8-byte status frame, then run `next` (or end the session —
+    // closing the connection — when `next` is empty or the send fails).
+    void sendStatus(uint64_t status, std::function<void()> next) {
+        status_frame_ = htole64(status);
+        auto self(shared_from_this());
+        asio::async_write(*socket_,
+                          asio::buffer(&status_frame_, sizeof(status_frame_)),
+                          [this, self, next = std::move(next)](
+                              const asio::error_code& ec, std::size_t) {
+                              if (ec)
+                                  return;  // connection closes with the session
+                              if (next) next();
+                          });
+    }
+
     void readHeader() {
         auto self(shared_from_this());
         asio::async_read(
@@ -147,10 +199,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ec.message() << " (value: " << ec.value() << ")"
                             << ", bytes read: " << len;
                     }
-                    session_mutex_.unlock();
                     return;
                 }
 
+                v2_ = (header_.opcode & kOpcodeV2Flag) != 0;
+                const uint8_t opcode = header_.opcode & ~kOpcodeV2Flag;
                 local_buffer_ = (char*)(le64toh(header_.addr));
                 uint64_t size = le64toh(header_.size);
                 if (validate_addr_ &&
@@ -159,13 +212,21 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                                << std::hex << (uint64_t)local_buffer_
                                << std::dec << " with size " << size
                                << " is not within any registered buffer";
-                    session_mutex_.unlock();
+                    // v2 initiators learn of the rejection; v1 initiators
+                    // only see the connection close (and, for small WRITEs,
+                    // may have already reported success — the defect v2
+                    // exists to fix).
+                    if (v2_) sendStatus(kStatusAddrRejected, nullptr);
                     return;
                 }
-                if (header_.opcode == (uint8_t)TransferRequest::WRITE)
+                if (opcode == (uint8_t)TransferRequest::WRITE) {
                     readBody();
-                else
+                } else if (v2_) {
+                    // READ, v2: status frame precedes the data.
+                    sendStatus(kStatusOk, [this] { writeBody(); });
+                } else {
                     writeBody();
+                }
             });
     }
 
@@ -177,7 +238,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            session_mutex_.unlock();
             // Transfer complete, wait for next request on this connection
             start();
             return;
@@ -205,7 +265,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 LOG(ERROR) << "ServerSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                session_mutex_.unlock();
                 delete[] dram_buffer;
                 return;  // Connection will be closed
             }
@@ -230,7 +289,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-                    session_mutex_.unlock();
                     return;  // Connection will be closed
                 }
                 total_transferred_bytes_ += transferred_bytes;
@@ -246,9 +304,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            session_mutex_.unlock();
-            // Transfer complete, wait for next request on this connection
-            start();
+            // Destination memory now holds the complete payload. Under v2,
+            // acknowledge before accepting the next request — this is what
+            // makes the initiator's COMPLETED mean "applied at the
+            // destination" rather than "left my socket buffer".
+            if (v2_) {
+                sendStatus(kStatusOk, [this] { start(); });
+            } else {
+                start();
+            }
             return;
         }
 
@@ -280,7 +344,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ". Error: " << ec.message()
                             << " (value: " << ec.value() << ")";
                     }
-                    session_mutex_.unlock();
                     if (cuda_device >= 0) delete[] dram_buffer;
                     return;  // Connection will be closed
                 }
@@ -305,7 +368,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
                         delete[] dram_buffer;
-                        session_mutex_.unlock();
                         return;  // Connection will be closed
                     }
                     delete[] dram_buffer;
@@ -319,30 +381,79 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 // Client-side session: initiates one transfer request
 struct ClientSession : public std::enable_shared_from_this<ClientSession> {
-    explicit ClientSession(std::shared_ptr<tcpsocket> socket,
-                           std::function<void()> on_complete = nullptr)
-        : socket_(std::move(socket)), on_complete_(std::move(on_complete)) {}
+    explicit ClientSession(std::shared_ptr<tcpsocket> socket, bool use_v2,
+                           std::function<void(bool)> on_complete = nullptr)
+        : socket_(std::move(socket)),
+          v2_(use_v2),
+          on_complete_(std::move(on_complete)) {}
 
     std::shared_ptr<tcpsocket> socket_;
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
+    bool v2_;
+    uint64_t status_frame_;
+    // v2 WRITE runs the body stream and the ack read concurrently (one
+    // async op per direction; handlers serialize on the io thread). The
+    // concurrent read lets a rejection — or a v1 server's bogus payload —
+    // abort a large in-flight WRITE instead of deadlocking on mutually
+    // full socket buffers, and delivers rejection frames before the close.
+    bool write_body_done_ = false;
+    bool write_acked_ok_ = false;
+    // An early negative/malformed ack can arrive while asio::async_write still
+    // owns a buffer pointing into the caller's source memory. Do not publish a
+    // terminal status until that body operation has completed or been
+    // cancelled: callers are allowed to release the source buffer as soon as
+    // the transfer becomes terminal.
+    bool write_body_in_flight_ = false;
+    bool write_abort_requested_ = false;
     std::function<void(TransferStatusEnum)> on_finalize_;
-    std::function<void()> on_complete_;  // Callback when transfer completes
-    std::mutex session_mutex_;
+    // Invoked exactly once per request with clean=true iff the protocol
+    // exchange terminated in a well-defined connection state. A socket whose
+    // request did not end cleanly must not be reused: the server-side session
+    // may be mid-frame, and the next request's header would be consumed as
+    // body bytes.
+    std::function<void(bool)> on_complete_;
 
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
-        session_mutex_.lock();
         local_buffer_ = (char*)buffer;
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
-        header_.opcode = (uint8_t)opcode;
+        header_.opcode = (uint8_t)opcode | (v2_ ? kOpcodeV2Flag : 0);
         total_transferred_bytes_ = 0;
         writeHeader();
     }
 
    private:
+    // Single terminal path: finish connection ownership, then report the
+    // outcome. Posted so it runs after the invoking callback returns.
+    void finalize(TransferStatusEnum status, bool clean) {
+        auto self(shared_from_this());
+        asio::post(
+            socket_->get_executor(),
+            [this, self, status, clean, on_finalize = std::move(on_finalize_),
+             on_complete = std::move(on_complete_)]() {
+                // Finish connection ownership before publishing terminal
+                // status. Once on_finalize marks the slice, the caller may
+                // immediately free the batch or destroy the transport.
+                if (on_complete) on_complete(clean);
+                if (on_finalize) on_finalize(status);
+            });
+    }
+
+    // Abort a v2 WRITE and cancel any body operation. If asio still owns the
+    // current source buffer, its completion handler is responsible for
+    // finalizing after the buffer is quiescent.
+    void abortWrite() {
+        write_abort_requested_ = true;
+        if (socket_ && socket_->is_open()) {
+            asio::error_code ec;
+            socket_->close(ec);
+        }
+        if (!write_body_in_flight_) finalize(TransferStatusEnum::FAILED, false);
+    }
+
     void writeHeader() {
         auto self(shared_from_this());
         asio::async_write(
@@ -353,21 +464,102 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << "ClientSession::writeHeader failed. Error: "
                         << ec.message() << " (value: " << ec.value() << ")"
                         << ", bytes written: " << len;
-                    asio::post(
-                        socket_->get_executor(),
-                        [this, self, on_finalize = std::move(on_finalize_),
-                         on_complete = std::move(on_complete_)]() {
-                            if (on_finalize)
-                                on_finalize(TransferStatusEnum::FAILED);
-                            session_mutex_.unlock();
-                            if (on_complete) on_complete();
-                        });
+                    finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
-                if (header_.opcode == (uint8_t)TransferRequest::WRITE)
+                if ((header_.opcode & ~kOpcodeV2Flag) ==
+                    (uint8_t)TransferRequest::WRITE) {
+                    if (v2_) readWriteAck();  // concurrent with the body
                     writeBody();
-                else
+                } else if (v2_) {
+                    readReadStatus();
+                } else {
                     readBody();
+                }
+            });
+    }
+
+    // v2 READ: the server prefixes the data with a status frame.
+    void readReadStatus() {
+        auto self(shared_from_this());
+        asio::async_read(
+            *socket_, asio::buffer(&status_frame_, sizeof(status_frame_)),
+            [this, self](const asio::error_code& ec, std::size_t len) {
+                if (ec || len != sizeof(status_frame_)) {
+                    LOG(ERROR)
+                        << "ClientSession: failed to read READ status "
+                           "frame. Error: "
+                        << ec.message() << " (value: " << ec.value() << ")";
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                uint64_t frame = le64toh(status_frame_);
+                if (!statusFrameValid(frame)) {
+                    LOG(ERROR) << "ClientSession: malformed READ status "
+                                  "frame (peer likely speaks the legacy "
+                                  "protocol); dropping connection";
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                if (frame != kStatusOk) {
+                    LOG(ERROR) << "ClientSession: READ rejected by server, "
+                                  "status "
+                               << (frame & 0xFFFFFFFFull);
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                readBody();
+            });
+    }
+
+    // v2 WRITE: completion is the server's acknowledgment that the payload
+    // has been applied to destination memory. Armed concurrently with the
+    // body stream; a well-behaved v2 server only sends the frame after the
+    // final chunk, so a frame arriving before the body is done is either a
+    // rejection or a legacy peer's payload — both close the socket immediately
+    // and publish failure only after the outstanding body write is quiescent.
+    void readWriteAck() {
+        auto self(shared_from_this());
+        asio::async_read(
+            *socket_, asio::buffer(&status_frame_, sizeof(status_frame_)),
+            [this, self](const asio::error_code& ec, std::size_t len) {
+                if (ec || len != sizeof(status_frame_)) {
+                    // The body path may have already finalized a failure and
+                    // closed the socket; finalize() is idempotent (moved-from
+                    // callbacks are null-checked).
+                    if (ec != asio::error::operation_aborted) {
+                        LOG(ERROR)
+                            << "ClientSession: failed to read WRITE "
+                               "ack frame. Error: "
+                            << ec.message() << " (value: " << ec.value() << ")";
+                    }
+                    abortWrite();
+                    return;
+                }
+                uint64_t frame = le64toh(status_frame_);
+                if (!statusFrameValid(frame)) {
+                    LOG(ERROR) << "ClientSession: malformed WRITE ack frame "
+                                  "(peer likely speaks the legacy protocol); "
+                                  "dropping connection";
+                    abortWrite();
+                    return;
+                }
+                if (frame != kStatusOk) {
+                    LOG(ERROR) << "ClientSession: WRITE rejected by server, "
+                                  "status "
+                               << (frame & 0xFFFFFFFFull);
+                    abortWrite();
+                    return;
+                }
+                if (!write_body_done_) {
+                    // The server's ack can legitimately overtake the final
+                    // local write-completion handler (both become ready
+                    // together for small writes; the io thread may run this
+                    // handler first). Record it; the body path finalizes.
+                    write_acked_ok_ = true;
+                    return;
+                }
+                finalize(TransferStatusEnum::COMPLETED, true);
             });
     }
 
@@ -379,14 +571,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            asio::post(socket_->get_executor(),
-                       [this, self, on_finalize = std::move(on_finalize_),
-                        on_complete = std::move(on_complete_)]() {
-                           if (on_finalize)
-                               on_finalize(TransferStatusEnum::COMPLETED);
-                           session_mutex_.unlock();
-                           if (on_complete) on_complete();
-                       });
+            finalize(TransferStatusEnum::COMPLETED, true);
             return;
         }
 
@@ -413,22 +598,12 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-                    // Post entire cleanup to ensure it runs after callback
-                    // returns
-                    asio::post(socket_->get_executor(),
-                               [this, self, dram_buffer, cuda_device,
-                                on_finalize = std::move(on_finalize_),
-                                on_complete = std::move(on_complete_)]() {
-                                   if (on_finalize)
-                                       on_finalize(TransferStatusEnum::FAILED);
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                                   if (cuda_device >= 0) delete[] dram_buffer;
+                    if (cuda_device >= 0) delete[] dram_buffer;
 #endif
-                                   session_mutex_.unlock();
-                                   if (on_complete) on_complete();
-                               });
+                    finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
 
@@ -451,19 +626,8 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                             << "ClientSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        // Post entire cleanup to ensure it runs after callback
-                        // returns
-                        asio::post(
-                            socket_->get_executor(),
-                            [this, self, dram_buffer,
-                             on_finalize = std::move(on_finalize_),
-                             on_complete = std::move(on_complete_)]() {
-                                if (on_finalize)
-                                    on_finalize(TransferStatusEnum::FAILED);
-                                delete[] dram_buffer;
-                                session_mutex_.unlock();
-                                if (on_complete) on_complete();
-                            });
+                        delete[] dram_buffer;
+                        finalize(TransferStatusEnum::FAILED, false);
                         return;
                     }
                     delete[] dram_buffer;
@@ -482,15 +646,22 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            // Post cleanup to ensure it runs after callback returns
-            asio::post(socket_->get_executor(),
-                       [this, self, on_finalize = std::move(on_finalize_),
-                        on_complete = std::move(on_complete_)]() {
-                           if (on_finalize)
-                               on_finalize(TransferStatusEnum::COMPLETED);
-                           session_mutex_.unlock();
-                           if (on_complete) on_complete();
-                       });
+            if (v2_) {
+                if (write_abort_requested_) {
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                // Completion comes from the server's acknowledgment, whose
+                // read is already in flight (armed in writeHeader) and may
+                // have finished first.
+                write_body_done_ = true;
+                if (write_acked_ok_)
+                    finalize(TransferStatusEnum::COMPLETED, true);
+            } else {
+                // v1: no acknowledgment exists in the protocol; this only
+                // means the payload left the initiator (#2086).
+                finalize(TransferStatusEnum::COMPLETED, true);
+            }
             return;
         }
 
@@ -516,26 +687,19 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                // Post entire cleanup to ensure it runs after callback returns
-                asio::post(socket_->get_executor(),
-                           [this, self, dram_buffer,
-                            on_finalize = std::move(on_finalize_),
-                            on_complete = std::move(on_complete_)]() {
-                               if (on_finalize)
-                                   on_finalize(TransferStatusEnum::FAILED);
-                               delete[] dram_buffer;
-                               session_mutex_.unlock();
-                               if (on_complete) on_complete();
-                           });
+                delete[] dram_buffer;
+                abortWrite();
                 return;
             }
         }
 #endif
 
+        write_body_in_flight_ = true;
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, cuda_device, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
+                write_body_in_flight_ = false;
                 if (cuda_device >= 0) {
                     delete[] dram_buffer;
                 }
@@ -546,17 +710,14 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-                    // Post entire cleanup to ensure it runs after callback
-                    // returns
-                    asio::post(
-                        socket_->get_executor(),
-                        [this, self, on_finalize = std::move(on_finalize_),
-                         on_complete = std::move(on_complete_)]() {
-                            if (on_finalize)
-                                on_finalize(TransferStatusEnum::FAILED);
-                            session_mutex_.unlock();
-                            if (on_complete) on_complete();
-                        });
+                    abortWrite();
+                    return;
+                }
+                if (write_abort_requested_) {
+                    // The early ack path closed the socket while this
+                    // operation still owned the caller's source buffer. It is
+                    // safe to publish failure now that the handler has run.
+                    finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
                 total_transferred_bytes_ += transferred_bytes;
@@ -708,6 +869,9 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     desc->protocol = "tcp";
 #endif
     desc->tcp_data_port = tcp_data_port;
+    // Advertise acknowledged framing (#2086); initiators fall back to v1
+    // against descriptors that do not carry the field.
+    desc->tcp_proto_version = 2;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -1026,6 +1190,28 @@ bool TcpTransport::validateAddress(uint64_t addr, uint64_t size) const {
     return false;
 }
 
+void TcpTransport::discardConnection(
+    const std::string& host, uint16_t port,
+    std::shared_ptr<asio::ip::tcp::socket> socket) {
+    if (socket && socket->is_open()) {
+        asio::error_code ec;
+        socket->close(ec);
+    }
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    auto it = connection_pool_.find(ConnectionKey{host, port});
+    if (it != connection_pool_.end()) {
+        auto& queue = it->second;
+        for (auto queue_it = queue.begin(); queue_it != queue.end();
+             ++queue_it) {
+            if ((*queue_it)->socket == socket) {
+                queue.erase(queue_it);
+                break;
+            }
+        }
+        if (queue.empty()) connection_pool_.erase(it);
+    }
+}
+
 void TcpTransport::startTransfer(Slice* slice) {
     auto desc = metadata_->getSegmentDescByID(slice->target_id);
     if (!desc) {
@@ -1045,6 +1231,15 @@ void TcpTransport::startTransfer(Slice* slice) {
         return;
     }
 
+    // Zero-length requests are complete by definition. v1 reported them
+    // COMPLETED while the server silently rejected size==0 in address
+    // validation; short-circuiting keeps that outcome (rather than turning
+    // no-ops into v2 rejection failures) without the pointless round trip.
+    if (slice->length == 0) {
+        slice->markSuccess();
+        return;
+    }
+
     // Get connection from pool
     auto socket =
         getConnection(meta_entry.ip_or_host_name, desc->tcp_data_port);
@@ -1056,7 +1251,9 @@ void TcpTransport::startTransfer(Slice* slice) {
     }
 
     try {
-        auto session = std::make_shared<ClientSession>(socket);
+        const bool use_v2 =
+            desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
+        auto session = std::make_shared<ClientSession>(socket, use_v2);
 
         session->on_finalize_ = [slice](TransferStatusEnum status) {
             if (status == TransferStatusEnum::COMPLETED)
@@ -1065,15 +1262,21 @@ void TcpTransport::startTransfer(Slice* slice) {
                 slice->markFailed();
         };
 
-        // Return connection to pool when transfer completes, or close if
-        // disabled
+        // Return connection to pool when the request terminated cleanly;
+        // otherwise the server-side session state is unknown (it may be
+        // mid-frame), so reusing the socket would desynchronize the next
+        // request. Discard it instead.
         if (enable_connection_pool_) {
             session->on_complete_ = [this, host = meta_entry.ip_or_host_name,
-                                     port = desc->tcp_data_port, socket]() {
-                returnConnection(host, port, socket);
+                                     port = desc->tcp_data_port,
+                                     socket](bool clean) {
+                if (clean)
+                    returnConnection(host, port, socket);
+                else
+                    discardConnection(host, port, socket);
             };
         } else {
-            session->on_complete_ = [socket]() {
+            session->on_complete_ = [socket](bool) {
                 // Close connection immediately after transfer
                 if (socket && socket->is_open()) {
                     asio::error_code ec;
@@ -1091,32 +1294,11 @@ void TcpTransport::startTransfer(Slice* slice) {
                    << ", opcode: " << (int)slice->opcode
                    << ", target_id: " << slice->target_id
                    << ". Exception: " << e.what();
-        // On exception, always close the socket and remove from pool if present
-        // Don't return it to the pool as it may be in an inconsistent state
-        if (socket && socket->is_open()) {
-            asio::error_code ec;
-            socket->close(ec);
-        }
-        if (enable_connection_pool_) {
-            // Remove the connection from pool if it was pooled
-            ConnectionKey key{meta_entry.ip_or_host_name,
-                              static_cast<uint16_t>(desc->tcp_data_port)};
-            std::lock_guard<std::mutex> lock(pool_mutex_);
-            auto it = connection_pool_.find(key);
-            if (it != connection_pool_.end()) {
-                auto& queue = it->second;
-                for (auto queue_it = queue.begin(); queue_it != queue.end();
-                     ++queue_it) {
-                    if ((*queue_it)->socket == socket) {
-                        queue.erase(queue_it);
-                        break;
-                    }
-                }
-                if (queue.empty()) {
-                    connection_pool_.erase(it);
-                }
-            }
-        }
+        // On exception, always close the socket and remove from pool if
+        // present. Don't return it to the pool as it may be in an
+        // inconsistent state.
+        discardConnection(meta_entry.ip_or_host_name,
+                          static_cast<uint16_t>(desc->tcp_data_port), socket);
         slice->markFailed();
     }
 }
