@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +29,11 @@ namespace tent {
 using BatchID = uint64_t;
 using SegmentID = uint64_t;
 
+// QoS priority levels
+static constexpr uint8_t PRIO_HIGH = 0;
+static constexpr uint8_t PRIO_MEDIUM = 1;
+static constexpr uint8_t PRIO_LOW = 2;
+
 struct Notification {
     std::string name;
     std::string msg;
@@ -37,6 +43,39 @@ struct Notification {
 #define LOCAL_SEGMENT_ID (0ull)
 #endif
 
+enum TransportType : int {
+    UNSPEC = 0,
+    RDMA,
+    MNNVL,
+    SHM,
+    NVLINK,
+    GDS,
+    IOURING,
+    TCP,
+    AscendDirect,
+    SUNRISE_LINK,
+    TPU,
+    // Sentinel: must remain the last enumerator.
+    kNumTransportTypes,
+};
+
+const static int kSupportedTransportTypes = (int)kNumTransportTypes;
+
+inline TransportType c_to_transport_hint(int v) {
+    if (v < 0 || v >= kSupportedTransportTypes) return UNSPEC;
+    return static_cast<TransportType>(v);
+}
+
+enum class IntentType : int {
+    INTENT_UNSPEC = 0,
+    FOREGROUND_GET,
+    BACKGROUND_PREFETCH,
+    MIGRATION,
+    CHECKPOINT,
+    WEIGHT_LOADING,
+    STAGING_INTERNAL,
+};
+
 struct Request {
     enum OpCode { READ, WRITE };
     OpCode opcode;
@@ -44,6 +83,20 @@ struct Request {
     SegmentID target_id;
     uint64_t target_offset;
     size_t length;
+    int priority =
+        PRIO_HIGH;  // Request priority (PRIO_HIGH, PRIO_MEDIUM, PRIO_LOW)
+    std::optional<std::string>
+        policy_name;  // Optional: bind to specific policy by name
+    TransportType transport_hint =
+        UNSPEC;  // UNSPEC = follow policy; otherwise pin this request to the
+                 // name transport.
+    // Optional SLO deadline as an absolute steady_clock timestamp in
+    // nanoseconds. 0 = no deadline (default), behaves exactly as today.
+    // When set, the engine emits an observability-only feasibility metric
+    // (MLU = actual transfer time / available window) on completion; it does
+    // not yet drive any admission or scheduling decision. See RFC #2519.
+    uint64_t deadline_ns = 0;
+    IntentType intent_type = IntentType::INTENT_UNSPEC;
 };
 
 enum TransferStatusEnum {
@@ -69,19 +122,6 @@ enum Permission {
 
 using Location = std::string;
 const static std::string kWildcardLocation = "*";
-
-enum TransportType {
-    RDMA = 0,
-    MNNVL,
-    SHM,
-    NVLINK,
-    GDS,
-    IOURING,
-    TCP,
-    AscendDirect,
-    UNSPEC
-};
-const static int kSupportedTransportTypes = 8;
 
 struct MemoryOptions {
     Location location = kWildcardLocation;

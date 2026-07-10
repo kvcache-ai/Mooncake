@@ -27,6 +27,15 @@ class EtcdHelper {
         const std::string& etcd_endpoints);
 
     /*
+     * @brief Reset the global store etcd client and reconnect to the given
+     *        endpoints. This cancels active store watches/keepalives in the Go
+     *        wrapper and creates a fresh clientv3.Client.
+     * @param etcd_endpoints: The endpoints of the etcd store client.
+     * @return: Error code.
+     */
+    static ErrorCode ResetEtcdStoreClient(const std::string& etcd_endpoints);
+
+    /*
      * @brief Get the value of a key from the etcd.
      * @param key: The key to get the value of.
      * @param key_size: The size of the key in bytes.
@@ -71,6 +80,13 @@ class EtcdHelper {
     static ErrorCode GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id);
 
     /*
+     * @brief Revoke a lease in etcd immediately.
+     * @param lease_id: The lease id to revoke.
+     * @return: Error code.
+     */
+    static ErrorCode RevokeLease(EtcdLeaseId lease_id);
+
+    /*
      * @brief Watch a key until it is deleted. This is a blocking function.
      * @param key: The key to watch.
      * @param key_size: The size of the key in bytes.
@@ -101,6 +117,14 @@ class EtcdHelper {
      * @return: Error code.
      */
     static ErrorCode CancelKeepAlive(EtcdLeaseId lease_id);
+
+    /*
+     * @brief Wait until a keep alive context is registered and cancellable.
+     * @param lease_id: The lease id to wait for.
+     * @param timeout_ms: Wait timeout in milliseconds.
+     * @return: Error code.
+     */
+    static ErrorCode WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms);
 
     /*
      * @brief Put a key-value pair to etcd.

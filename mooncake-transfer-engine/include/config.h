@@ -22,6 +22,9 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace mooncake {
 
@@ -34,7 +37,8 @@ struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
     uint8_t port = 1;
-    int gid_index = -1;  // -1 for auto-selection, >=0 for user-specified
+    int gid_index = -1;       // -1 for auto-selection, >=0 for user-specified
+    uint16_t pkey_index = 0;  // QP attr.pkey_index; override via MC_PKEY_INDEX
     uint64_t max_mr_size = 0x10000000000;
     size_t max_cqe = 4096;
     int max_ep_per_ctx = 65536;
@@ -47,7 +51,14 @@ struct GlobalConfig {
     int workers_per_ctx = 2;
     size_t slice_size = 65536;
     int retry_cnt = 9;
+    int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Connect timeout (seconds) for outbound handshake-port RPCs (QP
+    // handshake, probe, notify, metadata exchange). A plain blocking
+    // connect() has no deadline: to an unroutable address (e.g. a
+    // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
+    // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
+    int handshake_connect_timeout = 5;
     bool metacache = true;
     int log_level = google::INFO;
     bool trace = false;
@@ -57,13 +68,46 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+    bool enable_hca_peer_affinity = false;
+    std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
+    bool log_rdma_slice_affinity = false;
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
+    // InfiniBand Service Level (SL), 0-15. -1 = use default (0).
+    // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to
+    // steer KV-cache traffic into a different VL than EP all-to-all.
+    int ib_service_level = -1;
+    // mlx5 QP UDP source ports for ECMP path diversification.
+    // Empty = no modification. QP at index i uses
+    // mlx5_qp_udp_sports[i % size]. Requires mlx5 device + RoCEv2,
+    // and the binary must be built with USE_MLX5DV.
+    std::vector<uint16_t> mlx5_qp_udp_sports;
+    // mlx5 QP LAG port balancing. When enabled, QPs are distributed across
+    // physical LAG ports: QP at index i is pinned to port (i % num_lag_ports)
+    // + 1. num_lag_ports is queried from hardware; if the device is not in LAG
+    // mode the setting is a no-op. Requires USE_MLX5DV.
+    bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
+    bool ascend_agent_mode = false;
+    bool sunrise_use_device_mem = false;
+    // Transient flag scoped to a single TE init: set true by the Store entry
+    // (Client::InitTransferEngine) before installing the ascend transport, and
+    // reset to false right after. Lets ascend_direct distinguish a Store-init
+    // TE from a normal/P2P TE so each can resolve its own
+    // ASCEND_GLOBAL_RESOURCE_CONFIG (e.g. Store=RoCE, P2P=HCCS). Assumes TE
+    // inits are serialized within the process.
+    bool ascend_store_te_init = false;
+    // ub config parameters
+    size_t num_jfc_per_ctx = 2;
+    size_t num_jfce_per_ctx = 2;
+    int eid_index = 0;
+    uint64_t max_seg_size = 0x10000000000;
+    size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
+    size_t num_jetty_per_ep = 1;
 };
 
 struct RpcCommunicatorConfig {
@@ -73,15 +117,20 @@ struct RpcCommunicatorConfig {
     size_t pool_size = 10;
 };
 
-void loadGlobalConfig(GlobalConfig &config);
+void loadGlobalConfig(GlobalConfig& config);
 
 void dumpGlobalConfig();
 
-void updateGlobalConfig(ibv_device_attr &device_attr);
+void updateGlobalConfig(ibv_device_attr& device_attr);
 
-GlobalConfig &globalConfig();
+GlobalConfig& globalConfig();
 
 uint16_t getDefaultHandshakePort();
+
+// Validates a port range. Returns {default_min, default_max} on invalid input.
+// Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max);
 
 }  // namespace mooncake
 

@@ -9,10 +9,11 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
 
-  # Build asio_shared library for standalone build
-  # Set compile definitions before add_subdirectory to ensure proper compilation
+  # Build asio_shared in mooncake-common for standalone builds.
+  # Set compile definitions before adding targets that include ASIO headers.
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
-  add_subdirectory(../mooncake-asio ${CMAKE_CURRENT_BINARY_DIR}/mooncake-asio)
+  add_subdirectory(../mooncake-common/src
+                   ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
 
 if (USE_ASCEND)
@@ -60,8 +61,9 @@ if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-# Non-peermem requires cuMem allocated memory pointers
-if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
+# Non-peermem requires cuMem allocated memory pointers; since WITH_NVIDIA_PEERMEM
+# is now a runtime environment variable, always build when GPU support is present.
+if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA)
   add_subdirectory(nvlink-allocator)
 endif()
 
@@ -72,5 +74,12 @@ endif()
 
 if (USE_TENT)
   add_subdirectory(tent)
+endif()
+
+# tebench only needs the classic Transfer Engine for its default "classic"
+# backend; the TENT backend is compiled in conditionally (see benchmark/
+# CMakeLists.txt and main.cpp). Keep it gated solely on BUILD_BENCHMARK so it
+# can be built without enabling USE_TENT.
+if (BUILD_BENCHMARK)
   add_subdirectory(benchmark)
 endif()

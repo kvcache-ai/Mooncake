@@ -16,12 +16,38 @@
 namespace mooncake {
 namespace testing {
 
+namespace {
+
+std::string ResolveMasterBackendConnstring(const MasterRunnerConfig& config) {
+    if (!config.ha_backend_connstring.empty()) {
+        return config.ha_backend_connstring;
+    }
+    return config.etcd_endpoints;
+}
+
+}  // namespace
+
 MasterProcessHandler::MasterProcessHandler(const std::string& path,
                                            const std::string& etcd_endpoints,
                                            const int port, const int index,
                                            const std::string& out_dir)
     : master_path_(path),
-      etcd_endpoints_(etcd_endpoints),
+      config_(MasterRunnerConfig{
+          .enable_ha = true,
+          .ha_backend_type = "etcd",
+          .ha_backend_connstring = "",
+          .etcd_endpoints = etcd_endpoints,
+      }),
+      port_(port),
+      index_(index),
+      out_dir_(out_dir) {}
+
+MasterProcessHandler::MasterProcessHandler(const std::string& path,
+                                           const MasterRunnerConfig& config,
+                                           const int port, const int index,
+                                           const std::string& out_dir)
+    : master_path_(path),
+      config_(config),
       port_(port),
       index_(index),
       out_dir_(out_dir) {}
@@ -111,16 +137,43 @@ bool MasterProcessHandler::start() {
         close(stdout_fd);
         close(stderr_fd);
 
-        // Execute the master
+        // Build command line arguments.
         std::string rpc_address_arg = "--rpc-address=0.0.0.0";
         std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
-        LOG(INFO) << "[m" << index_ << "] Execl master" << " "
-                  << rpc_address_arg << " " << rpc_port_arg;
-        execl(master_path_.c_str(), master_path_.c_str(), "--enable-ha=true",
-              ("--etcd-endpoints=" + etcd_endpoints_).c_str(),
-              rpc_address_arg.c_str(), rpc_port_arg.c_str(), nullptr);
+        std::vector<std::string> args;
+        args.push_back(master_path_);
+        args.push_back(std::string("--enable-ha=") +
+                       (config_.enable_ha ? "true" : "false"));
+        args.push_back("--ha-backend-type=" + config_.ha_backend_type);
 
-        // If execl returns, it means there was an error
+        const auto backend_connstring = ResolveMasterBackendConnstring(config_);
+        if (!backend_connstring.empty()) {
+            args.push_back("--ha-backend-connstring=" + backend_connstring);
+        }
+        if (!config_.etcd_endpoints.empty()) {
+            args.push_back("--etcd-endpoints=" + config_.etcd_endpoints);
+        }
+        args.push_back(rpc_address_arg);
+        args.push_back(rpc_port_arg);
+
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (auto& arg : args) {
+            argv.push_back(arg.data());
+        }
+        argv.push_back(nullptr);
+
+        std::string cmdline;
+        for (const auto& arg : args) {
+            if (!cmdline.empty()) {
+                cmdline += ' ';
+            }
+            cmdline += arg;
+        }
+        LOG(INFO) << "[m" << index_ << "] Executing: " << cmdline;
+        execv(master_path_.c_str(), argv.data());
+
+        // If execv returns, it means there was an error.
         LOG(ERROR) << "[m" << index_
                    << "] Master process terminated with error: "
                    << strerror(errno);

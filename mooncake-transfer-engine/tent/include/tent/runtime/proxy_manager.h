@@ -31,6 +31,7 @@ struct StageBufferCache;
 
 struct StagingTask {
     TaskInfo* native{nullptr};
+    BatchID batch{0};
     std::vector<std::string> params;
 };
 
@@ -44,14 +45,15 @@ class ProxyManager {
 
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
-                          size_t chunk_size = 8 * 1024 * 1024,
-                          size_t chunk_count = 32);
+                          size_t chunk_size = 4 * 1024 * 1024,
+                          size_t chunk_count = 64);
 
     ~ProxyManager();
 
     Status deconstruct();
 
-    Status submit(TaskInfo* task, const std::vector<std::string>& params);
+    Status submit(TaskInfo* task, BatchID batch,
+                  const std::vector<std::string>& params);
 
     Status getStatus(TaskInfo* task, TransferStatus& task_status);
 

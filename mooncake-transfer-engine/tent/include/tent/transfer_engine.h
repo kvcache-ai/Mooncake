@@ -32,12 +32,17 @@ extern "C" {
 #define OPCODE_READ (0)
 #define OPCODE_WRITE (1)
 
+/* IMPORTANT: callers MUST zero-initialize this struct
+ * (e.g. `tent_request_t r = {0};`). transport_hint relies on
+ * UNSPEC == 0 for the no-hint default. */
 struct tent_request {
     int opcode;
     void* source;
     tent_segment_id_t target_id;
     uint64_t target_offset;
     uint64_t length;
+    int priority;       /* Request priority (0=HIGH, 1=MEDIUM, 2=LOW) */
+    int transport_hint; /* TRANSPORT_UNSPEC=follow policy, else pin transport */
 };
 
 typedef struct tent_request tent_request_t;
@@ -94,15 +99,16 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define PERM_GLOBAL_READ_ONLY (1)
 #define PERM_GLOBAL_READ_WRITE (2)
 
-#define TRANSPORT_RDMA (0)
-#define TRANSPORT_MNNVL (1)
-#define TRANSPORT_SHM (2)
-#define TRANSPORT_NVLINK (3)
-#define TRANSPORT_GDS (4)
-#define TRANSPORT_IOURING (5)
-#define TRANSPORT_TCP (6)
-#define TRANSPORT_ASCEND_DIRECT (7)
-#define TRANSPORT_UNSPEC (8)
+#define TRANSPORT_UNSPEC (0)
+#define TRANSPORT_RDMA (1)
+#define TRANSPORT_MNNVL (2)
+#define TRANSPORT_SHM (3)
+#define TRANSPORT_NVLINK (4)
+#define TRANSPORT_GDS (5)
+#define TRANSPORT_IOURING (6)
+#define TRANSPORT_TCP (7)
+#define TRANSPORT_ASCEND_DIRECT (8)
+#define TRANSPORT_SUNRISE_LINK (9)
 
 struct tent_memory_options {
     char location[64];
@@ -297,6 +303,8 @@ class TransferEngine {
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
 
+    Status probePeerAliveByID(SegmentID target_id);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
 
@@ -304,6 +312,14 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    // Drive one progress step on a batch and return its aggregated status.
+    // Unlike getTransferStatus, this always allows internal failover/resubmit
+    // regardless of enable_auto_failover_on_poll. The call is non-blocking and
+    // performs at most one state-machine step per task; callers that want to
+    // wait for completion must invoke it in a loop. PENDING means "make
+    // progress later"; terminal states (COMPLETED/FAILED) will not be revived.
+    Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
    private:
     std::unique_ptr<TransferEngineImpl> impl_;

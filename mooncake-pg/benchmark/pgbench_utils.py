@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import datetime
+import os
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 
 
+PGTEST_DEVICE_FILTER_ENV_VAR = "MOONCAKE_PGTEST_DEVICE_FILTERS"
 NCCL_DTYPE_ORDER = [
     "int8",
     "uint8",
@@ -24,6 +26,32 @@ NCCL_DTYPE_ORDER = [
 ]
 
 _SIZE_RE = re.compile(r"^(\d+)([KkMmGgTt])?[Bb]?$")
+
+
+def parse_device_filters(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    filters = [item.strip() for item in raw.split(",") if item.strip()]
+    return filters or None
+
+
+def resolve_pgtest_device_filters(
+    device_filters: Sequence[str] | None = None,
+) -> list[str] | None:
+    if device_filters is not None:
+        resolved = [item.strip() for item in device_filters if item.strip()]
+        return resolved or None
+    return parse_device_filters(os.getenv(PGTEST_DEVICE_FILTER_ENV_VAR))
+
+
+def configure_mooncake_device_filter(
+    pg_module,
+    device_filters: Sequence[str] | None = None,
+) -> list[str] | None:
+    resolved = resolve_pgtest_device_filters(device_filters)
+    if resolved is not None:
+        pg_module.set_device_filter(resolved)
+    return resolved
 
 
 def parse_size(value: object) -> int:

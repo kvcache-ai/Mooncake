@@ -60,8 +60,9 @@ if command -v apt-get &> /dev/null; then
             libunwind-dev \
             libnuma-dev \
             libpython3-dev \
-            libboost-all-dev \
+            libboost-dev \
             libssl-dev \
+            libzstd-dev \
             libgrpc-dev \
             libgrpc++-dev \
             libprotobuf-dev \
@@ -89,6 +90,7 @@ elif command -v yum &> /dev/null; then
             hiredis-devel \
             libcurl-devel \
             jsoncpp-devel \
+            zstd-devel \
             mpich \
             mpich-devel
     # Install yaml-cpp

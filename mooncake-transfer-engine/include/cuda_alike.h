@@ -1,6 +1,5 @@
 #pragma once
 
-#include <bits/stdint-uintn.h>
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -8,11 +7,24 @@
 #include "gpu_vendor/hip.h"
 #elif defined(USE_MUSA)
 #include "gpu_vendor/musa.h"
+#elif defined(USE_MLU)
+#include "gpu_vendor/mlu.h"
 #elif defined(USE_UBSHMEM)
 #include "gpu_vendor/ubshmem.h"
+#elif defined(USE_MACA)
+#include "gpu_vendor/maca.h"
+#elif defined(USE_SUNRISE)
+#include "gpu_vendor/sunrise.h"
+#elif defined(USE_HYGON)
+#include <cuda.h>
+#include <cuda_runtime.h>
+#elif defined(USE_COREX)
+#include <cuda.h>
+#include <cuda_runtime.h>
 #endif
 
-#if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_UBSHMEM)
+#if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_MLU) && \
+    !defined(USE_UBSHMEM) && !defined(USE_MACA) && !defined(USE_SUNRISE)
 #include <string>
 const static std::string GPU_PREFIX = "cuda:";
 #endif

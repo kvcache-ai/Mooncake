@@ -17,7 +17,6 @@
 
 #include <functional>
 #include <iostream>
-#include <queue>
 #include <string>
 
 #include <acl/acl.h>
@@ -38,7 +37,6 @@ struct HixlTask {
     uint64_t batch_size = 0;
     std::string remote_hixl;
     uint64_t start_time = 0;
-    bool sync = false;
 };
 
 struct HixlSubBatch : public Transport::SubBatch {
@@ -78,8 +76,6 @@ class AscendDirectTransport : public Transport {
     virtual const char *getName() const { return "ascend_direct"; }
 
    private:
-    void workerThread();
-
     Status initHixl(const std::shared_ptr<Config> &conf);
 
     Status checkAndConnect(const std::string &remote_hixl);
@@ -87,7 +83,7 @@ class AscendDirectTransport : public Transport {
     void disconnect(const std::string &remote_hixl, int32_t timeout_in_millis);
 
     void startTransfer(SegmentID target_id, Request::OpCode opcode,
-                       const std::vector<HixlTask *> &tasks, bool sync = false);
+                       const std::vector<HixlTask *> &tasks);
 
     void localCopy(Request::OpCode opcode,
                    const std::vector<HixlTask *> &tasks);
@@ -114,8 +110,7 @@ class AscendDirectTransport : public Transport {
     int32_t device_logic_id_{};
     aclrtContext rt_context_{nullptr};
     std::unique_ptr<hixl::Hixl> hixl_;
-    bool use_buffer_pool_{false};
-    bool auto_connect_{false};
+    bool auto_connect_{true};
     uint64_t connect_timeout_;
     uint64_t transfer_timeout_;
     std::string local_hixl_name_{};
@@ -132,12 +127,6 @@ class AscendDirectTransport : public Transport {
 
     std::map<uint64_t, hixl::MemHandle> addr_to_mem_handle_;
     std::mutex mem_handle_mutex_;
-
-    std::atomic_bool running_ = false;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-    std::queue<std::vector<HixlTask *>> task_queue_;
-    std::thread worker_thread_;
 };
 }  // namespace tent
 }  // namespace mooncake

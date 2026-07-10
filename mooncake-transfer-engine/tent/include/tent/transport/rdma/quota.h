@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TENT_QUOTA_H
-#define TENT_QUOTA_H
+#ifndef TENT_SELECTOR_H
+#define TENT_SELECTOR_H
 
 #include <atomic>
 #include <vector>
@@ -30,47 +30,83 @@
 namespace mooncake {
 namespace tent {
 
-class SharedQuotaManager;
+// Bandwidth constants (Gbps)
+static constexpr double kDefaultBwGbps = 400.0;
+static constexpr double kMinBwGbps = 10.0;
+static constexpr double kMaxBwGbps = 800.0;
+
+class SharedSlotManager;
 
 /**
- * @brief DeviceQuota implements NIC selection based on adaptive feedback.
+ * @brief DeviceSelector implements NIC selection with two modes:
  *
- * Each NIC maintains a smoothed estimate of its average service time,
- * updated after each request completes. The allocator predicts the total
- * completion time of each NIC as:
+ * 1. Baseline mode (smart_selection_enabled=false): Simple round-robin
+ *    - Deterministic, no load tracking
+ *    - All devices used equally
  *
- *     predicted_time = (active_bytes / bandwidth) + avg_service_time
+ * 2. Smart mode (smart_selection_enabled=true): EWMA-based selection
+ *    - Tracks global inflight bytes per device
+ *    - Learns effective bandwidth via EWMA
+ *    - Selects device with minimal predicted completion time
+ *    - Supports multi-path for large requests
  *
- * and selects the NIC with the smallest predicted_time.
+ * Selection formula:
+ *     predicted_time = (inflight + slice_bytes) / ewma_bandwidth
  *
- * The estimator is updated using exponential smoothing:
- *
- *     avg_service_time <- (1 - alpha) * avg_service_time + alpha *
- * observed_time
+ * EWMA update:
+ *     ewma_bandwidth <- alpha * ewma_bandwidth + (1 - alpha) *
+ * observed_bandwidth
  */
-class DeviceQuota {
+class DeviceSelector {
    public:
+    // Candidate device for allocation
+    struct Candidate {
+        int dev_id;
+        double score;
+        bool is_cross_numa;
+    };
+
     struct DeviceInfo {
         int dev_id;
         double bw_gbps;
         int numa_id;
         uint64_t padding0[5];
-        std::atomic<uint64_t> active_bytes{0};
+        std::atomic<uint64_t> inflight_bytes{0};
         uint64_t padding1[7];
-        std::atomic<uint64_t> diffusion_active_bytes{0};
+        std::atomic<double> ewma_bandwidth_bps{50e9};
         uint64_t padding2[7];
-        std::atomic<double> beta0{0.0};  // Fixed latency (PCIe, setup)
-        uint64_t padding3[7];
-        std::atomic<double> beta1{1.0};  // Effective bandwidth correction
-        uint64_t padding4[7];
+        std::atomic<uint64_t> total_bytes{0};
+        uint64_t padding3[5];
+
+        uint64_t getInflightBytes() const {
+            return inflight_bytes.load(std::memory_order_relaxed);
+        }
+
+        void addInflight(uint64_t bytes) {
+            inflight_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+
+        void releaseInflight(uint64_t bytes) {
+            inflight_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        }
+
+        double getEwmaBandwidth() const {
+            return ewma_bandwidth_bps.load(std::memory_order_relaxed);
+        }
+
+        double getTheoreticalBandwidth() const {
+            if (bw_gbps >= kMinBwGbps && bw_gbps <= kMaxBwGbps)
+                return bw_gbps * 1e9 / 8.0;
+            return kDefaultBwGbps * 1e9 / 8.0;
+        }
     };
 
    public:
-    DeviceQuota() = default;
-    ~DeviceQuota() = default;
+    DeviceSelector() = default;
+    ~DeviceSelector() = default;
 
-    DeviceQuota(const DeviceQuota &) = delete;
-    DeviceQuota &operator=(const DeviceQuota &) = delete;
+    DeviceSelector(const DeviceSelector &) = delete;
+    DeviceSelector &operator=(const DeviceSelector &) = delete;
 
     Status loadTopology(std::shared_ptr<Topology> &local_topology);
 
@@ -78,46 +114,111 @@ class DeviceQuota {
 
     Status enableSharedQuota(const std::string &shm_name);
 
+    std::shared_ptr<SharedSlotManager> getSharedSlotManager() const {
+        return slot_manager_;
+    }
+
+    // Allocate devices for a request (new API)
+    // slice_bytes: pre-calculated slice size from rdma_transport to ensure
+    // consistency
+    Status allocate(uint64_t total_length, uint32_t num_slices,
+                    uint64_t slice_bytes, const std::string &location,
+                    std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,
+                    uint64_t device_mask = ~0ULL);
+
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
 
     Status release(int dev_id, uint64_t length, double latency);
 
-    void setDiffusionActiveBytes(int dev_id, uint64_t value) {
-        devices_[dev_id].diffusion_active_bytes.store(
-            value, std::memory_order_relaxed);
+    void updateTrafficStats(int dev_id, uint64_t length) {
+        auto it = devices_.find(dev_id);
+        if (it != devices_.end()) {
+            it->second.total_bytes.fetch_add(length, std::memory_order_relaxed);
+        }
     }
 
-    uint64_t getActiveBytes(int dev_id) {
-        return devices_[dev_id].active_bytes.load(std::memory_order_relaxed);
+    void setSmartSelection(bool enable) { smart_selection_enabled_ = enable; }
+    bool getSmartSelection() const { return smart_selection_enabled_; }
+
+    void setLearningRate(double alpha) {
+        sched_params_.bandwidth_learning_rate = std::clamp(alpha, 0.0, 1.0);
     }
 
-    void setLearningRate(double alpha) { alpha_ = std::clamp(alpha, 0.0, 1.0); }
+    int getDeviceRank(const std::string &location, int dev_id) const;
 
-    void setLocalWeight(double local_weight) {
-        local_weight_ = std::clamp(local_weight, 0.0, 1.0);
+    void printTrafficStats();
+
+    void fillDevicePriorities();
+    int getDevicePriority(int dev_id) const;
+
+    struct SchedulingParams {
+        // NUMA tier penalties (rank 0 = local, should be smallest)
+        double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
+                                                                   10.0};
+
+        // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
+        // learning)
+        double bandwidth_learning_rate = 0.01;
+
+        // Enable priority-based filtering
+        bool enable_priority_filtering = true;
+
+        // Local device priority rotation interval (microseconds)
+        uint64_t local_rotation_interval_us = 200;
+
+        // Score random jitter range (to avoid deterministic selection)
+        double score_jitter_range = 1e-9;
+
+        // Epsilon for division by zero protection
+        double score_epsilon = 1e-12;
+
+        // EWMA bandwidth bounds (multiplier of theoretical bandwidth)
+        double ewma_min_multiplier = 0.1;   // 10% of theoretical
+        double ewma_max_multiplier = 10.0;  // 1000% of theoretical
+
+        // Default bandwidth (Gbps) when topology info unavailable
+        double default_bandwidth_gbps = 400.0;  // Default NIC bandwidth
+        double min_bandwidth_gbps = 10.0;       // Minimum valid NIC bandwidth
+        double max_bandwidth_gbps = 800.0;      // Maximum valid NIC bandwidth
+
+        // Shared slot rotation interval (milliseconds)
+        int slot_rotation_interval_ms = 2;
+
+        std::vector<int> device_base_priorities;
+    };
+
+    void setSchedulingParams(const SchedulingParams &params) {
+        sched_params_ = params;
     }
 
-    void setDiffusionInterval(uint64_t msec) {
-        diffusion_interval_ = msec * 1000000ull;
+    const SchedulingParams &getSchedulingParams() const {
+        return sched_params_;
     }
-
-    void setCrossNumaAccess(bool enable = true) { allow_cross_numa_ = enable; }
 
    private:
     std::shared_ptr<Topology> local_topology_;
     std::unordered_map<int, DeviceInfo> devices_;
-    mutable std::shared_mutex rwlock_;
-    bool allow_cross_numa_ = false;
-    double alpha_ = 0.01;
-    double local_weight_ = 0.9;
-    uint64_t diffusion_interval_ = 10 * 1000000ull;
-    std::shared_ptr<SharedQuotaManager> shared_quota_;
-    bool enable_quota_ = true;
-    bool update_quota_params_ = true;
+    std::shared_ptr<SharedSlotManager> slot_manager_;
+    bool smart_selection_enabled_ = true;
+    SchedulingParams sched_params_;
+
+    Status buildCandidates(const Topology::MemEntry *entry,
+                           uint64_t slice_bytes, uint64_t device_mask,
+                           std::vector<Candidate> &candidates,
+                           int request_priority = PRIO_HIGH);
+
+    void selectSinglePath(const std::vector<Candidate> &candidates,
+                          uint32_t num_slices, uint64_t total_length,
+                          std::vector<int> &slice_dev_ids);
+
+    void selectMultiPath(const std::vector<Candidate> &candidates,
+                         uint32_t num_slices, uint64_t total_length,
+                         std::vector<int> &slice_dev_ids,
+                         bool probe_mode = false);
 };
 
 }  // namespace tent
 }  // namespace mooncake
 
-#endif  // TENT_QUOTA_H
+#endif  // TENT_SELECTOR_H

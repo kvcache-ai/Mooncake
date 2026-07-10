@@ -47,7 +47,7 @@ class LocalBuffers;
 using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
 
 struct RdmaSubBatch : public Transport::SubBatch {
-    std::vector<RdmaTask> task_list;
+    std::vector<RdmaTask*> task_list;
     std::vector<RdmaSlice*> slice_chain;
     size_t max_size;
     virtual size_t size() const { return task_list.size(); }
@@ -114,10 +114,17 @@ class RdmaTransport : public Transport {
    public:
     Status setupLocalSegment();
 
+    std::shared_ptr<Config> config() const { return conf_; }
+
    private:
     bool installed_;
     std::shared_ptr<Config> conf_;
     std::string local_segment_name_;
+    // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
+    // rdma_server_name_ holds the RDMA-reachable address for NIC path
+    // construction, while local_segment_name_ keeps the TCP-reachable
+    // address for P2P routing.
+    std::string rdma_server_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     LocalBufferManager local_buffer_manager_;
@@ -133,10 +140,12 @@ class RdmaTransport : public Transport {
 
     // Map QP number to Endpoint for notification processing
     RWSpinlock notify_endpoint_map_lock_;
-    std::unordered_map<uint32_t, RdmaEndPoint*> notify_qp_to_endpoint_;
+    std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>>
+        notify_qp_to_endpoint_;
 
     // Register/unregister notification QP (called by Endpoint)
-    void registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint);
+    void registerNotifyQp(uint32_t qp_num,
+                          const std::shared_ptr<RdmaEndPoint>& endpoint);
     void unregisterNotifyQp(uint32_t qp_num);
     std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id,
                                               int device_id);

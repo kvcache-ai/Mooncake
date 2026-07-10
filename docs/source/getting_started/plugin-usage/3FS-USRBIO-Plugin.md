@@ -1,4 +1,8 @@
-# Mooncake HF3FS Plugin
+# Mooncake HF3FS Plugin (Experimental)
+
+```{warning}
+**Experimental / incomplete.** The HF3FS (3FS USRBIO) integration is under development and is not yet considered production-ready. Behavior, build flags, and configuration may change without notice. Use only for evaluation and testing.
+```
 
 This plugin implements 3FS native API (USRBIO) as a high-performance storage backend for Mooncake.
 
@@ -6,9 +10,9 @@ This plugin implements 3FS native API (USRBIO) as a high-performance storage bac
 
 ### 1. 3FS Installation
 - Build and install [3FS](https://github.com/deepseek-ai/3FS/)
-- Required library: `libhf3fs_api_shared.so` (Default location: `3FS_PATH/build/src/lib/api`)  
+- Required library: `libhf3fs_api_shared.so` (Default location: `3FS_PATH/build/src/lib/api`)
   → Install to: `/usr/lib/`
-- Required header: `hf3fs_usrbio.h` (Default location: `3FS_PATH/src/lib/api`)  
+- Required header: `hf3fs_usrbio.h` (Default location: `3FS_PATH/src/lib/api`)
   → Install to: `/usr/include/`
 
 ### 2. Mooncake Configuration
@@ -27,10 +31,10 @@ Start master server and specify the 3FS mount point:
 ```bash
 
 ./build/mooncake-store/src/mooncake_master \
-    --root_fs_dir=/path/to/3fs_mount_point 
+    --root_fs_dir=/path/to/3fs_mount_point
 ```
 ### Important Notes
-1. The specified directory **must** be a 3FS mount point  
+1. The specified directory **must** be a 3FS mount point
    - If not, the system will automatically fall back to POSIX API
 2. For optimal performance:
    - Ensure proper permissions on the 3FS mount point

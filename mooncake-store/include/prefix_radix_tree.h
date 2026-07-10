@@ -119,6 +119,14 @@ class PrefixRadixTree {
         return countNodes(root_.get());
     }
 
+    /// Remove all keys. Caller should ensure no concurrent operation depends
+    /// on the old index contents.
+    void Clear() {
+        std::unique_lock lock(mutex_);
+        root_ = std::make_unique<Node>();
+        size_ = 0;
+    }
+
    private:
     struct Node {
         // Edge label: the substring stored on the edge from parent to this node.

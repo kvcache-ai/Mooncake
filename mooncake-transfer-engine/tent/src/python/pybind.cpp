@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -259,6 +260,11 @@ PYBIND11_MODULE(tent, m) {
     m.attr("LOCAL_SEGMENT_ID") = py::int_(LOCAL_SEGMENT_ID);
     m.attr("kWildcardLocation") = py::str(kWildcardLocation);
 
+    // Priority constants
+    m.attr("PRIO_HIGH") = py::int_(PRIO_HIGH);
+    m.attr("PRIO_MEDIUM") = py::int_(PRIO_MEDIUM);
+    m.attr("PRIO_LOW") = py::int_(PRIO_LOW);
+
     // -------------------------------------------------------------------------
     // Enums
     // -------------------------------------------------------------------------
@@ -284,6 +290,7 @@ PYBIND11_MODULE(tent, m) {
         .export_values();
 
     py::enum_<TransportType>(m, "TransportType")
+        .value("UNSPEC", TransportType::UNSPEC)
         .value("RDMA", TransportType::RDMA)
         .value("MNNVL", TransportType::MNNVL)
         .value("SHM", TransportType::SHM)
@@ -292,7 +299,17 @@ PYBIND11_MODULE(tent, m) {
         .value("IOURING", TransportType::IOURING)
         .value("TCP", TransportType::TCP)
         .value("AscendDirect", TransportType::AscendDirect)
-        .value("UNSPEC", TransportType::UNSPEC)
+        .value("SUNRISE_LINK", TransportType::SUNRISE_LINK)
+        .export_values();
+
+    py::enum_<IntentType>(m, "IntentType")
+        .value("INTENT_UNSPEC", IntentType::INTENT_UNSPEC)
+        .value("FOREGROUND_GET", IntentType::FOREGROUND_GET)
+        .value("BACKGROUND_PREFETCH", IntentType::BACKGROUND_PREFETCH)
+        .value("MIGRATION", IntentType::MIGRATION)
+        .value("CHECKPOINT", IntentType::CHECKPOINT)
+        .value("WEIGHT_LOADING", IntentType::WEIGHT_LOADING)
+        .value("STAGING_INTERNAL", IntentType::STAGING_INTERNAL)
         .export_values();
 
     py::enum_<SegmentInfo::Type>(m, "SegmentInfoType")
@@ -314,17 +331,29 @@ PYBIND11_MODULE(tent, m) {
         .def(py::init<>())
         .def(py::init([](Request::OpCode opcode, uint64_t source,
                          uint64_t target_id, uint64_t target_offset,
-                         size_t length) {
+                         size_t length, int priority,
+                         TransportType transport_hint,
+                         std::optional<std::string> policy_name,
+                         uint64_t deadline_ns, IntentType intent_type) {
                  Request r;
                  r.opcode = opcode;
                  r.source = U64ToPtr(source);
                  r.target_id = target_id;
                  r.target_offset = target_offset;
                  r.length = length;
+                 r.priority = priority;
+                 r.transport_hint = transport_hint;
+                 r.policy_name = std::move(policy_name);
+                 r.deadline_ns = deadline_ns;
+                 r.intent_type = intent_type;
                  return r;
              }),
              py::arg("opcode"), py::arg("source"), py::arg("target_id"),
-             py::arg("target_offset"), py::arg("length"))
+             py::arg("target_offset"), py::arg("length"),
+             py::arg("priority") = PRIO_HIGH,
+             py::arg("transport_hint") = TransportType::UNSPEC,
+             py::arg("policy_name") = std::nullopt, py::arg("deadline_ns") = 0,
+             py::arg("intent_type") = IntentType::INTENT_UNSPEC)
         .def_property(
             "opcode", [](const Request& r) { return r.opcode; },
             [](Request& r, Request::OpCode op) { r.opcode = op; })
@@ -333,7 +362,12 @@ PYBIND11_MODULE(tent, m) {
             [](Request& r, uint64_t addr) { r.source = U64ToPtr(addr); })
         .def_readwrite("target_id", &Request::target_id)
         .def_readwrite("target_offset", &Request::target_offset)
-        .def_readwrite("length", &Request::length);
+        .def_readwrite("length", &Request::length)
+        .def_readwrite("priority", &Request::priority)
+        .def_readwrite("transport_hint", &Request::transport_hint)
+        .def_readwrite("policy_name", &Request::policy_name)
+        .def_readwrite("deadline_ns", &Request::deadline_ns)
+        .def_readwrite("intent_type", &Request::intent_type);
 
     py::class_<TransferStatus>(m, "TransferStatus")
         .def(py::init<>())

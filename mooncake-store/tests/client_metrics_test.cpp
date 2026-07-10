@@ -45,6 +45,8 @@ TEST_F(ClientMetricsTest, TransferMetricsSummaryTest) {
     // Check byte formatting
     EXPECT_TRUE(summary.find("Total Read: 1.00 KB") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Write: 2.00 MB") != std::string::npos);
+    EXPECT_TRUE(summary.find("Average Read Throughput:") != std::string::npos);
+    EXPECT_TRUE(summary.find("Average Write Throughput:") != std::string::npos);
 
     // Check latency summaries
     EXPECT_TRUE(summary.find("Get: count=3") != std::string::npos);
@@ -109,15 +111,23 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     std::array<std::string, 1> exist_key_label = {"ExistKey"};
     metrics.master_client_metric.rpc_count.inc(exist_key_label);
     metrics.master_client_metric.rpc_latency.observe(exist_key_label, 180);
+    metrics.ObserveTransferOperation(TransferOperationKind::kRead, "get_buffer",
+                                     2 * 1024, 220);
+    metrics.ObserveTransferOperation(TransferOperationKind::kWrite, "put_batch",
+                                     4 * 1024, 420);
 
     std::string summary = metrics.summary_metrics();
 
-    // Should contain both transfer and RPC metrics
+    // Should contain transfer, RPC, and interface metrics
     EXPECT_TRUE(summary.find("Transfer Metrics Summary") != std::string::npos);
     EXPECT_TRUE(summary.find("RPC Metrics Summary") != std::string::npos);
+    EXPECT_TRUE(summary.find("Interface Operation Metrics Summary") !=
+                std::string::npos);
     EXPECT_TRUE(summary.find("Total Read: 5.00 MB") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Write: 10.00 MB") != std::string::npos);
     EXPECT_TRUE(summary.find("ExistKey: count=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("get_buffer: count=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("put_batch: count=1") != std::string::npos);
 
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
@@ -173,6 +183,33 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
     EXPECT_TRUE(summary.find("max<") != std::string::npos ||
                 summary.find("No data") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, BandwidthSummaryRespectsEnvFlag) {
+    setenv("MC_STORE_CLIENT_METRIC_BANDWIDTH", "0", 1);
+    auto metrics = ClientMetric::Create();
+    ASSERT_NE(metrics, nullptr);
+
+    metrics->transfer_metric.total_read_bytes.inc(1024);
+    std::string summary = metrics->summary_metrics();
+    EXPECT_TRUE(summary.find("Average Read Throughput:") == std::string::npos);
+
+    unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
+}
+
+TEST_F(ClientMetricsTest, SummaryCanOmitMasterRpcMetrics) {
+    auto metrics = ClientMetric::Create({}, false);
+    ASSERT_NE(metrics, nullptr);
+
+    metrics->ObserveTransferOperation(TransferOperationKind::kRead,
+                                      "get_buffer", 1024, 200);
+    std::string summary = metrics->summary_metrics();
+    std::string serialized;
+    metrics->serialize(serialized);
+
+    EXPECT_TRUE(summary.find("RPC Metrics Summary") == std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_client_rpc_count") ==
+                std::string::npos);
 }
 
 TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {

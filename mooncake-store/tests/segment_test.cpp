@@ -5,6 +5,11 @@
 
 #include <boost/functional/hash.hpp>
 
+#include <algorithm>
+#include <functional>
+#include <string>
+#include <vector>
+
 namespace mooncake {
 
 // Test fixture for Segment tests
@@ -86,6 +91,26 @@ class SegmentTest : public ::testing::Test {
         std::vector<UUID> client_ids;
         client_ids.push_back(client_id);
         ValidateMountedSegments(segment_manager, segments, client_ids);
+    }
+
+    bool HasAllocatorForSegment(const SegmentManager& segment_manager,
+                                const UUID& segment_id) {
+        const auto mounted_it =
+            segment_manager.mounted_segments_.find(segment_id);
+        if (mounted_it == segment_manager.mounted_segments_.end()) {
+            return false;
+        }
+
+        const auto& mounted_segment = mounted_it->second;
+        const auto* allocators =
+            segment_manager.allocator_manager_.getAllocators(
+                mounted_segment.segment.name);
+        if (allocators == nullptr) {
+            return false;
+        }
+
+        return std::find(allocators->begin(), allocators->end(),
+                         mounted_segment.buf_allocator) != allocators->end();
     }
 
     void ValidateMountedLocalDiskSegments(
@@ -275,6 +300,251 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
     // Verify segment remains unmounted after second unmount
     ValidateMountedSegments(segment_manager, empty_segment_vec,
                             empty_client_ids_vec);
+}
+
+TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
+    SegmentManager segment_manager;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "status_segment";
+    segment.size = 1024 * 1024 * 16;
+    segment.base = 0x100000000;
+
+    UUID client_id = generate_uuid();
+
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+
+    SegmentStatus status = SegmentStatus::UNDEFINED;
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::OK);
+    EXPECT_TRUE(segment_access.IsSegmentAllocatable(segment.name));
+    EXPECT_TRUE(HasAllocatorForSegment(segment_manager, segment.id));
+
+    ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
+                                                    SegmentStatus::DRAINING),
+              ErrorCode::OK);
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::DRAINING);
+    EXPECT_FALSE(segment_access.IsSegmentAllocatable(segment.name));
+    EXPECT_FALSE(HasAllocatorForSegment(segment_manager, segment.id));
+
+    ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
+                                                    SegmentStatus::DRAINED),
+              ErrorCode::OK);
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::DRAINED);
+    EXPECT_FALSE(segment_access.IsSegmentAllocatable(segment.name));
+    EXPECT_FALSE(HasAllocatorForSegment(segment_manager, segment.id));
+
+    ASSERT_EQ(
+        segment_access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
+        ErrorCode::OK);
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::OK);
+    EXPECT_TRUE(segment_access.IsSegmentAllocatable(segment.name));
+    EXPECT_TRUE(HasAllocatorForSegment(segment_manager, segment.id));
+}
+
+TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
+    SegmentManager segment_manager;
+
+    Segment segment0;
+    segment0.id = generate_uuid();
+    segment0.name = "host0_segment";
+    segment0.size = 1024 * 1024 * 16;
+    segment0.base = 0x100000000;
+    segment0.host_id = "host0";
+
+    Segment segment1;
+    segment1.id = generate_uuid();
+    segment1.name = "host1_segment";
+    segment1.size = 1024 * 1024 * 16;
+    segment1.base = 0x200000000;
+    segment1.host_id = "host1";
+
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment0, client_id),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment1, client_id),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_GE(ordered.size(), 2u);
+        EXPECT_EQ(ordered[0], segment1.name);
+    }
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.SetSegmentStatusByName(
+                      segment1.name, SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_EQ(ordered.size(), 1u);
+        EXPECT_EQ(ordered[0], segment0.name);
+    }
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.SetSegmentStatusByName(segment1.name,
+                                                        SegmentStatus::OK),
+                  ErrorCode::OK);
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment1.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment1.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_EQ(ordered.size(), 1u);
+        EXPECT_EQ(ordered[0], segment0.name);
+    }
+}
+
+TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
+    SegmentManager segment_manager;
+
+    Segment segment0;
+    segment0.id = generate_uuid();
+    segment0.name = "shared_host_segment";
+    segment0.size = 1024 * 1024 * 16;
+    segment0.base = 0x100000000;
+    segment0.host_id = "host1";
+
+    Segment segment1;
+    segment1.id = generate_uuid();
+    segment1.name = segment0.name;
+    segment1.size = 1024 * 1024 * 16;
+    segment1.base = 0x200000000;
+    segment1.host_id = "host1";
+
+    UUID client_id = generate_uuid();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment0, client_id),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment1, client_id),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_EQ(ordered.size(), 1u);
+        EXPECT_EQ(ordered[0], segment0.name);
+    }
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment0.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment0.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_EQ(ordered.size(), 1u);
+        EXPECT_EQ(ordered[0], segment1.name);
+    }
+}
+
+TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
+    SegmentManager segment_manager;
+
+    Segment segment_a;
+    segment_a.id = generate_uuid();
+    segment_a.name = "host1_segment_a";
+    segment_a.size = 1024 * 1024 * 16;
+    segment_a.base = 0x100000000;
+    segment_a.host_id = "host1";
+
+    Segment segment_b;
+    segment_b.id = generate_uuid();
+    segment_b.name = "host1_segment_b";
+    segment_b.size = 1024 * 1024 * 16;
+    segment_b.base = 0x200000000;
+    segment_b.host_id = "host1";
+
+    UUID client_id = generate_uuid();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment_a, client_id),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment_b, client_id),
+                  ErrorCode::OK);
+    }
+
+    const std::string key = "stable_rotation_key";
+    std::vector<std::string> sorted_segments = {segment_a.name, segment_b.name};
+    std::sort(sorted_segments.begin(), sorted_segments.end());
+    const size_t start = std::hash<std::string>{}(key) % sorted_segments.size();
+
+    auto allocator_access = segment_manager.getAllocatorAccess();
+    auto ordered = allocator_access.GetHostOrderedSegments("host1", key);
+    ASSERT_EQ(ordered.size(), 2u);
+    EXPECT_EQ(ordered[0], sorted_segments[start]);
+    EXPECT_EQ(ordered[1],
+              sorted_segments[(start + 1) % sorted_segments.size()]);
+}
+
+TEST_F(SegmentTest, PrepareUnmountDrainedSegment) {
+    SegmentManager segment_manager;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "drained_segment";
+    segment.size = 1024 * 1024 * 16;
+    segment.base = 0x100000000;
+
+    UUID client_id = generate_uuid();
+
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
+                                                    SegmentStatus::DRAINED),
+              ErrorCode::OK);
+
+    size_t metrics_dec_capacity = 0;
+    ASSERT_EQ(
+        segment_access.PrepareUnmountSegment(segment.id, metrics_dec_capacity),
+        ErrorCode::OK);
+    ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                  metrics_dec_capacity),
+              ErrorCode::OK);
+
+    std::vector<Segment> empty_segments;
+    std::vector<UUID> empty_client_ids;
+    ValidateMountedSegments(segment_manager, empty_segments, empty_client_ids);
 }
 
 // ReMountSegmentSuccess:

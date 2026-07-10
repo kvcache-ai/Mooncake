@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "tent/common/utils/ip.h"
+#include "common.h"
+
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -92,42 +94,60 @@ Status checkLocalIpAddress(std::string &hostname, bool &ipv6) {
 std::pair<std::string, uint16_t> parseHostNameWithPort(const std::string &url,
                                                        uint16_t default_port) {
     uint16_t port = default_port;
+    if (url.empty()) return std::make_pair(url, port);
 
-    // Check if url is valid IPv6 address
-    in6_addr addr;
-    if (inet_pton(AF_INET6, url.c_str(), &addr) == 1) return {url, port};
-
-    // Check if url is valid IPv6 address with port
-    size_t start_pos = 0;
-    size_t end_pos = url.find_last_of(']');
-    size_t port_pos = url.find_last_of(':');
-    if (url.front() == '[' && end_pos != std::string::npos &&
-        port_pos > end_pos) {
-        auto ip = url.substr(start_pos + 1, end_pos - start_pos - 1);
-        std::string port_str = url.substr(port_pos + 1);
-        int val = std::atoi(port_str.c_str());
-        if (val <= 0 || val > 65535) {
-            LOG(WARNING) << "Illegal port number in " << url
-                         << ". Use default port " << port << " instead";
-        } else {
-            port = static_cast<uint16_t>(val);
+    // Helper: check if a string is a valid numeric IP (IPv4 or IPv6),
+    // automatically stripping scope IDs (e.g., %eth0) before validation
+    auto isNumericAddress = [](const std::string &host) -> bool {
+        std::string check = host;
+        auto pct = host.find('%');
+        if (pct != std::string::npos) {
+            if (host.find(':', pct) != std::string::npos) {
+                return false;
+            }
+            check = host.substr(0, pct);
         }
-        return std::make_pair(port_str, port);
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_flags = AI_NUMERICHOST;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        int ret = getaddrinfo(check.c_str(), nullptr, &hints, &res);
+        if (ret == 0) freeaddrinfo(res);
+        return ret == 0;
+    };
+
+    if (isNumericAddress(url)) return {url, port};
+
+    size_t end_pos = url.find_last_of(']');
+    if (url.front() == '[' && end_pos != std::string::npos) {
+        std::string ip = url.substr(1, end_pos - 1);
+        if (!isNumericAddress(ip)) {
+            LOG(WARNING) << "Illegal bracketed IPv6 address: " << ip;
+            return std::make_pair(std::string(), port);
+        }
+        if (end_pos + 1 < url.size() && url[end_pos + 1] == ':') {
+            port = getPortFromString(url.substr(end_pos + 2), default_port);
+        }
+        return std::make_pair(ip, port);
     }
 
-    // Check if url has port field
-    auto pos = url.find(':');
-    if (pos == url.npos) return std::make_pair(url, port);
-    auto trimmed_server_name = url.substr(0, pos);
-    auto port_str = url.substr(pos + 1);
-    int val = std::atoi(port_str.c_str());
-    if (val <= 0 || val > 65535)
-        LOG(WARNING) << "Illegal port number in " << url
-                     << ". Use default port " << port << " instead";
-    else
-        port = (uint16_t)val;
+    auto pos = url.rfind(':');
+    if (pos != std::string::npos) {
+        std::string host_part = url.substr(0, pos);
+        std::string port_str = url.substr(pos + 1);
 
-    return std::make_pair(trimmed_server_name, port);
+        if (!isNumericAddress(host_part) &&
+            host_part.find(':') != std::string::npos) {
+            LOG(WARNING) << "Illegal IPv6 address: " << host_part;
+            return std::make_pair(std::string(), port);
+        }
+
+        return std::make_pair(host_part,
+                              getPortFromString(port_str, default_port));
+    }
+
+    return std::make_pair(url, port);
 }
 
 std::string buildIpAddrWithPort(const std::string &hostname, uint16_t port,

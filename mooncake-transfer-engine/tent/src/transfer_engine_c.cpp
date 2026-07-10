@@ -47,7 +47,8 @@ tent_engine_t tent_create_engine() {
                          << ", fallback to default config";
         }
     }
-    for (auto& attr : tl_settings.attrs) config->set(attr.first, attr.second);
+    for (auto& attr : tl_settings.attrs)
+        config->setFromString(attr.first, attr.second);
     auto engine = new mooncake::tent::TransferEngineImpl(config);
     return (tent_engine_t)engine;
 }
@@ -215,6 +216,9 @@ int tent_submit(tent_engine_t engine, tent_batch_id_t batch_id,
         req_list[index].target_id = entries[index].target_id;
         req_list[index].target_offset = entries[index].target_offset;
         req_list[index].length = entries[index].length;
+        req_list[index].priority = entries[index].priority;
+        req_list[index].transport_hint =
+            mooncake::tent::c_to_transport_hint(entries[index].transport_hint);
     }
     auto status = CAST(engine)->submitTransfer(batch_id, req_list);
     if (!status.ok()) {
@@ -240,6 +244,9 @@ int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
         req_list[index].target_id = entries[index].target_id;
         req_list[index].target_offset = entries[index].target_offset;
         req_list[index].length = entries[index].length;
+        req_list[index].priority = entries[index].priority;
+        req_list[index].transport_hint =
+            mooncake::tent::c_to_transport_hint(entries[index].transport_hint);
     }
     mooncake::tent::Notification notifi;
     notifi.name = name;

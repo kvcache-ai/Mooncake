@@ -16,6 +16,8 @@ python mooncake-pg/benchmark/pgbench.py \
   --collective all_reduce --backend mooncake --device cuda -g 8 -b 8 -e 128M -f 2
 ```
 
+Set `MOONCAKE_PGTEST_DEVICE_FILTERS=mlx5_1,mlx5_2,...` to explicitly set HCA whitelist.
+
 ## Notes
 - Single-node only (v1). Use `-g/--ngpus` as local ranks when spawning.
 - Dtypes align with nccl-tests; use `-d all` to sweep supported types.

@@ -35,6 +35,8 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+
+class RdmaEndPoint;
 class TransferMetadata;
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
@@ -64,6 +66,8 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        // Per-request transport pin, TENT only.
+        int transport_hint = 0;
     };
 
     enum TransferStatusEnum {
@@ -109,24 +113,44 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
+        std::string source_location;
         SliceStatus status;
         TransferTask *task;
-        std::vector<uint32_t> dest_rkeys;
+        // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
+        // are 32-bit. Use a scoped alias so the width is defined in one place.
+#if defined(USE_EFA) || defined(USE_CXI)
+        using mr_key_t = uint64_t;
+#else
+        using mr_key_t = uint32_t;
+#endif
+        std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
 
         union {
             struct {
                 uint64_t dest_addr;
-                uint32_t source_lkey;
-                uint32_t dest_rkey;
+                mr_key_t source_lkey;
+                mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
                 volatile int *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
+                RdmaEndPoint *endpoint;  // Endpoint used for this transfer
             } rdma;
             struct {
+                uint64_t dest_addr;
+                volatile int *jetty_depth;
+                uint32_t retry_cnt;
+                uint32_t max_retry_cnt;
+                void *r_seg;
+                void *l_seg;
+                void *endpoint;
+            } ub;
+            struct {
                 void *dest_addr;
+                void *cuda_stream;  // cudaStream_t, used by async NVLink
+                                    // transport
             } local;
             struct {
                 uint64_t dest_addr;
@@ -147,6 +171,7 @@ class Transport {
                 uint64_t dest_addr;
                 void *handle;
                 int64_t start_time;
+                int32_t engine_id;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;
@@ -277,6 +302,12 @@ class Transport {
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+
+        // Pointer to the transport that handles this task, set by
+        // MultiTransport::submitTransfer(). Used to delegate
+        // transport-specific completion polling (e.g., CUDA stream
+        // query for NVLink async transfers) in getTransferStatus().
+        Transport *transport_ = nullptr;
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;

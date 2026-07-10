@@ -27,13 +27,6 @@ class HAMetricManager {
     // --- Singleton Access ---
     static HAMetricManager& instance();
 
-    /**
-     * @brief Explicitly initialize the singleton instance.
-     * Use this at startup (e.g. main) to ensure thread-safe initialization
-     * of the underlying metric library components.
-     */
-    static void Init() { instance(); }
-
     HAMetricManager(const HAMetricManager&) = delete;
     HAMetricManager& operator=(const HAMetricManager&) = delete;
     HAMetricManager(HAMetricManager&&) = delete;

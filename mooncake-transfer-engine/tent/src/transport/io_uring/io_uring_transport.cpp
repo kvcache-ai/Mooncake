@@ -87,7 +87,7 @@ Status IOUringTransport::install(std::string& local_segment_name,
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
     caps.dram_to_file = true;
-    if (Platform::getLoader().type() == "cuda") {
+    if (Platform::getLoader().type() != "cpu") {
         caps.gpu_to_file = true;
     }
     return Status::OK();
@@ -117,14 +117,16 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto io_uring_batch = Slab<IOUringSubBatch>::Get().allocate();
     if (!io_uring_batch)
         return Status::InternalError("Unable to allocate IO Uring sub-batch");
-    batch = io_uring_batch;
     io_uring_batch->max_size = max_size;
     io_uring_batch->task_list.reserve(max_size);
     int rc = io_uring_queue_init(max_size, &io_uring_batch->ring, 0);
-    if (rc)
+    if (rc) {
+        Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
         return Status::InternalError(
             std::string("io_uring_queue_init failed: ") + strerror(-rc) +
             LOC_MARK);
+    }
+    batch = io_uring_batch;
     return Status::OK();
 }
 
@@ -139,12 +141,20 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
 }
 
 std::string IOUringTransport::getIOUringFilePath(SegmentID target_id) {
-    SegmentDesc* desc = nullptr;
-    auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
-    if (!status.ok() || desc->type != SegmentType::File) return "";
-    auto& detail = std::get<FileSegmentDesc>(desc->detail);
-    if (detail.buffers.empty()) return "";
-    return detail.buffers[0].path;
+    std::string ret;
+    auto status = metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            if (segment->type != SegmentType::File)
+                return Status::NeedsRefreshCache(
+                    "Segment type is not File" LOC_MARK);
+            auto& detail = std::get<FileSegmentDesc>(segment->detail);
+            if (detail.buffers.empty())
+                return Status::NeedsRefreshCache("No buffers found" LOC_MARK);
+            ret = detail.buffers[0].path;
+            return Status::OK();
+        });
+    if (!status.ok()) return "";
+    return ret;
 }
 
 IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
@@ -257,6 +267,7 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             }
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
+        batch->notifyProgress();
     }
     return Status::OK();
 }

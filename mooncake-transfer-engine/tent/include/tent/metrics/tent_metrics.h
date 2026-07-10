@@ -34,6 +34,7 @@
 #endif
 
 #if TENT_METRICS_ENABLED
+#include <csignal>  // Required before ylt headers: coro_io.hpp uses std::signal/SIGPIPE
 #include <ylt/metric.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 #endif
@@ -78,6 +79,13 @@ class TentMetrics {
     void recordWriteCompleted(size_t bytes, double latency_seconds = 0.0);
     void recordReadFailed(size_t bytes);
     void recordWriteFailed(size_t bytes);
+    void recordTransportFailover();
+
+    // Record the deadline feasibility ratio (MLU) for a completed transfer
+    // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
+    // where window_seconds is (deadline - submit_time). mlu < 1 means the
+    // transfer met its deadline; mlu >= 1 means it missed. Observability only.
+    void recordDeadlineMLU(double mlu);
 
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
@@ -126,6 +134,9 @@ class TentMetrics {
                                                 "Total read failures via TENT"};
     ylt::metric::counter_t write_failures_total_{
         "tent_write_failures_total", "Total write failures via TENT"};
+    ylt::metric::counter_t failover_total_{
+        "tent_transport_failover_total",
+        "Total cross-transport failover events"};
 
     // Histograms - stored as pointers for unified management
     std::vector<ylt::metric::histogram_t*> histograms_;
@@ -155,6 +166,17 @@ class TentMetrics {
     ylt::metric::histogram_t write_size_{
         "tent_write_size_bytes", "Write request size distribution in bytes",
         kSizeBuckets};
+
+    // Deadline feasibility ratio (MLU) distribution for transfers that carried
+    // a deadline. Stored in per-mille (MLU x 1000) so the histogram can use
+    // integer observe() like the others; the 1000 boundary is MLU == 1.0, the
+    // feasible/infeasible line (< 1000 met the deadline, >= 1000 missed it).
+    static inline const std::vector<double> kMluPerMilleBuckets{
+        100, 250, 500, 750, 900, 1000, 1250, 1500, 2000, 5000};
+    ylt::metric::histogram_t deadline_mlu_{
+        "tent_deadline_mlu_permille",
+        "Deadline feasibility ratio (MLU x 1000) distribution",
+        kMluPerMilleBuckets};
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
@@ -244,6 +266,14 @@ class ScopedLatencyRecorder {
         }                                                                \
     } while (0)
 
+#define TENT_RECORD_TRANSPORT_FAILOVER()                  \
+    do {                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) { \
+            ::mooncake::tent::TentMetrics::instance()     \
+                .recordTransportFailover();               \
+        }                                                 \
+    } while (0)
+
 // RAII macro for automatic latency measurement
 #define TENT_SCOPED_READ_LATENCY(bytes)                              \
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
@@ -268,6 +298,7 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_WRITE_COMPLETED(bytes, latency) ((void)0)
 #define TENT_RECORD_READ_FAILED(bytes) ((void)0)
 #define TENT_RECORD_WRITE_FAILED(bytes) ((void)0)
+#define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
 

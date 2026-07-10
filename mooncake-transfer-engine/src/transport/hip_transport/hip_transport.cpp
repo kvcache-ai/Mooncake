@@ -27,6 +27,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "hip_device_guard.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -58,13 +59,13 @@ struct FdGuard {
         }
     }
     // Disable copy/move
-    FdGuard(const FdGuard &) = delete;
-    FdGuard &operator=(const FdGuard &) = delete;
-    FdGuard(FdGuard &&) = delete;
-    FdGuard &operator=(FdGuard &&) = delete;
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    FdGuard(FdGuard&&) = delete;
+    FdGuard& operator=(FdGuard&&) = delete;
 };
 
-static bool checkHip(hipError_t result, const char *message) {
+static bool checkHip(hipError_t result, const char* message) {
     if (result != hipSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
                    << hipGetErrorString(result) << ")";
@@ -77,7 +78,7 @@ static bool checkHip(hipError_t result, const char *message) {
 // differences. In ROCm 7.1+, the signature was changed:
 // the second argument is (void*)(uintptr_t)fd instead of a pointer to the fd
 static hipError_t importFromShareableHandle(
-    hipMemGenericAllocationHandle_t *handle, hipxFabricHandle *export_handle) {
+    hipMemGenericAllocationHandle_t* handle, hipxFabricHandle* export_handle) {
     static const int runtime_version = []() {
         int version = 0;
         if (!checkHip(hipRuntimeGetVersion(&version),
@@ -93,7 +94,7 @@ static hipError_t importFromShareableHandle(
 
     if (runtime_version >= 70100000) {
         return hipMemImportFromShareableHandle(
-            handle, (void *)(uintptr_t)export_handle->fd,
+            handle, (void*)(uintptr_t)export_handle->fd,
             HIPX_MEM_HANDLE_TYPE_FABRIC);
     } else {
         return hipMemImportFromShareableHandle(handle, export_handle,
@@ -101,7 +102,7 @@ static hipError_t importFromShareableHandle(
     }
 }
 
-static int open_fd(const hipxFabricHandle &export_handle) {
+static int open_fd(const hipxFabricHandle& export_handle) {
     int fd = export_handle.fd;
     int pid = export_handle.pid;
 
@@ -124,8 +125,8 @@ static int open_fd(const hipxFabricHandle &export_handle) {
     return open_fd;
 }
 
-static int openIPCHandle(const std::vector<unsigned char> &buffer,
-                         void **shm_addr) {
+static int openIPCHandle(const std::vector<unsigned char>& buffer,
+                         void** shm_addr) {
     hipIpcMemHandle_t handle;
     memcpy(&handle, buffer.data(), sizeof(handle));
     if (!checkHip(hipIpcOpenMemHandle(shm_addr, handle,
@@ -136,8 +137,8 @@ static int openIPCHandle(const std::vector<unsigned char> &buffer,
     return 0;
 }
 
-static int openShareableHandle(const std::vector<unsigned char> &buffer,
-                               size_t length, void **shm_addr) {
+static int openShareableHandle(const std::vector<unsigned char>& buffer,
+                               size_t length, void** shm_addr) {
     hipxFabricHandle export_handle;
     memcpy(&export_handle, buffer.data(), sizeof(export_handle));
 
@@ -160,7 +161,7 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
         return -1;
     }
 
-    if (!checkHip(hipMemAddressReserve((hipDeviceptr_t *)shm_addr, length, 0,
+    if (!checkHip(hipMemAddressReserve((hipDeviceptr_t*)shm_addr, length, 0,
                                        nullptr, 0),
                   "HipTransport: hipMemAddressReserve failed")) {
         return -1;
@@ -192,7 +193,7 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     return 0;
 }
 
-static int getDeviceFromPointer(void *ptr) {
+static int getDeviceFromPointer(void* ptr) {
     if (!ptr) {
         LOG(ERROR) << "HipTransport: null pointer passed to "
                       "getDeviceFromPointer";
@@ -226,7 +227,7 @@ static int getDeviceFromPointer(void *ptr) {
     }
 }
 
-static int setDeviceContext(void *source_ptr, int &device_id) {
+static int setDeviceContext(void* source_ptr, int& device_id) {
     // Get device ID from source pointer
     device_id = getDeviceFromPointer(source_ptr);
 
@@ -251,6 +252,24 @@ static int setDeviceContext(void *source_ptr, int &device_id) {
 }
 
 static void setupP2PAccess(int num_devices) {
+    // The loop switches devices; the guard restores the caller's on return.
+    HipDeviceGuard device_guard;
+
+    auto clearStickyPeerAccessError = [](int src_device, int dst_device) {
+        // hipDeviceEnablePeerAccess may leave hipErrorPeerAccessAlreadyEnabled
+        // in the runtime's last-error slot. Clear it so subsequent PyTorch HIP
+        // calls (for example torch.empty during the next connector init) do not
+        // observe a stale error.
+        hipError_t last_error = hipGetLastError();
+        if (last_error != hipSuccess &&
+            last_error != hipErrorPeerAccessAlreadyEnabled) {
+            LOG(WARNING) << "HipTransport: unexpected sticky HIP error after "
+                            "enabling P2P access from device "
+                         << src_device << " to device " << dst_device << " ("
+                         << hipGetErrorString(last_error) << ")";
+        }
+    };
+
     for (int i = 0; i < num_devices; ++i) {
         if (!checkHip(hipSetDevice(i), "HipTransport: failed to set device")) {
             continue;
@@ -269,8 +288,10 @@ static void setupP2PAccess(int num_devices) {
 
             if (can_access_peer) {
                 hipError_t result = hipDeviceEnablePeerAccess(j, 0);
-                if (result != hipSuccess &&
-                    result != hipErrorPeerAccessAlreadyEnabled) {
+                if (result == hipErrorPeerAccessAlreadyEnabled) {
+                    clearStickyPeerAccessError(i, j);
+                } else if (result != hipSuccess) {
+                    clearStickyPeerAccessError(i, j);
                     LOG(WARNING) << "HipTransport: failed to enable P2P access "
                                     "from device "
                                  << i << " to device " << j << " ("
@@ -286,7 +307,7 @@ static void setupP2PAccess(int num_devices) {
 }
 
 static int getNumStreams() {
-    const char *env = getenv("MC_HIP_NUM_STREAMS");
+    const char* env = getenv("MC_HIP_NUM_STREAMS");
     if (env) {
         try {
             int value = std::stoi(env);
@@ -305,7 +326,7 @@ static int getNumStreams() {
 }
 
 static int getNumEvents() {
-    const char *env = getenv("MC_HIP_NUM_EVENTS");
+    const char* env = getenv("MC_HIP_NUM_EVENTS");
     if (env) {
         try {
             int value = std::stoi(env);
@@ -326,8 +347,8 @@ static int getNumEvents() {
 static bool supportFabricMem() {
     // By default, use IPC mode. Fabric memory is enabled only when
     // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 is explicitly set.
-    const char *hip_ipc = getenv("MC_USE_HIP_IPC");
-    const char *nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+    const char* hip_ipc = getenv("MC_USE_HIP_IPC");
+    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
 
     bool fabric_enabled = (hip_ipc && strcmp(hip_ipc, "0") == 0) ||
                           (nvlink_ipc && strcmp(nvlink_ipc, "0") == 0);
@@ -389,39 +410,56 @@ HipTransport::HipTransport()
 
 HipTransport::~HipTransport() {
     if (use_fabric_mem_) {
-        for (auto &entry : remap_entries_) {
+        for (auto& entry : remap_entries_) {
             freePinnedLocalMemory(entry.second.shm_addr);
         }
     } else {
-        for (auto &entry : remap_entries_) {
+        for (auto& entry : remap_entries_) {
             (void)hipIpcCloseMemHandle(entry.second.shm_addr);
         }
     }
     remap_entries_.clear();
 }
 
-int HipTransport::install(std::string &local_server_name,
+int HipTransport::install(std::string& local_server_name,
                           std::shared_ptr<TransferMetadata> metadata,
                           std::shared_ptr<Topology> topology) {
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
+    // Compose with any local segment another transport (e.g. RDMA) already
+    // installed instead of overwriting it, so a single-node segment can
+    // advertise both protocols (e.g. "rdma,hip"). Work on a copy (the map may
+    // hand back a descriptor other threads are reading) and publish the new
+    // one atomically via addLocalSegment.
+    auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
+    if (old_desc) *desc = *old_desc;
 
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (desc->protocol.empty()) {
+        desc->protocol = "hip";
+    } else if (desc->protocol.find("hip") == std::string::npos) {
+        desc->protocol += ",hip";
+    }
+#else
     desc->protocol = "hip";
+#endif
 
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
 }
 
-Status HipTransport::startAsyncTransfer(const TransferRequest &request,
-                                        TransferTask &task,
-                                        PendingTransfer &pending) {
+Status HipTransport::startAsyncTransfer(const TransferRequest& request,
+                                        TransferTask& task,
+                                        PendingTransfer& pending) {
     hipError_t err;
     int device_id;
+
+    HipDeviceGuard device_guard;
 
     if (setDeviceContext(request.source, device_id) != 0) {
         return Status::InvalidArgument("Failed to set device context");
@@ -438,9 +476,9 @@ Status HipTransport::startAsyncTransfer(const TransferRequest &request,
     task.total_bytes = request.length;
 
     // Allocate and configure slice
-    Slice *slice = getSliceCache().allocate();
-    slice->source_addr = (char *)request.source;
-    slice->local.dest_addr = (char *)dest_addr;
+    Slice* slice = getSliceCache().allocate();
+    slice->source_addr = (char*)request.source;
+    slice->local.dest_addr = (char*)dest_addr;
     slice->length = request.length;
     slice->opcode = request.opcode;
     slice->task = &task;
@@ -465,10 +503,10 @@ Status HipTransport::startAsyncTransfer(const TransferRequest &request,
 
     // Perform async memory copy
     if (slice->opcode == TransferRequest::READ) {
-        err = hipMemcpyAsync(slice->source_addr, (void *)slice->local.dest_addr,
+        err = hipMemcpyAsync(slice->source_addr, (void*)slice->local.dest_addr,
                              slice->length, hipMemcpyDefault, stream);
     } else {
-        err = hipMemcpyAsync((void *)slice->local.dest_addr, slice->source_addr,
+        err = hipMemcpyAsync((void*)slice->local.dest_addr, slice->source_addr,
                              slice->length, hipMemcpyDefault, stream);
     }
 
@@ -495,8 +533,8 @@ Status HipTransport::startAsyncTransfer(const TransferRequest &request,
 }
 
 void HipTransport::synchronizePendingTransfers(
-    std::vector<PendingTransfer> &pending_transfers) {
-    for (auto &pt : pending_transfers) {
+    std::vector<PendingTransfer>& pending_transfers) {
+    for (auto& pt : pending_transfers) {
         // Wait for event to complete
         hipError_t err = hipEventSynchronize(pt.event);
         if (err == hipSuccess) {
@@ -513,8 +551,8 @@ void HipTransport::synchronizePendingTransfers(
 }
 
 Status HipTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "HipTransport: Exceed the limitation of current batch's "
                       "capacity";
@@ -530,15 +568,15 @@ Status HipTransport::submitTransfer(
     std::vector<PendingTransfer> pending_transfers;
     pending_transfers.reserve(entries.size());
 
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
+    for (auto& request : entries) {
+        TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
 
         PendingTransfer pending;
         Status status = startAsyncTransfer(request, task, pending);
         if (!status.ok()) {
             // Clean up any pending transfers we've already created
-            for (auto &pt : pending_transfers) {
+            for (auto& pt : pending_transfers) {
                 event_pool_.putEvent(pt.event, pt.device_id);
             }
             return status;
@@ -553,8 +591,8 @@ Status HipTransport::submitTransfer(
 }
 
 Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                       TransferStatus &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+                                       TransferStatus& status) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
 
     if (task_id >= task_count) {
@@ -564,7 +602,7 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     // Get task and status info
-    auto &task = batch_desc.task_list[task_id];
+    auto& task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -585,22 +623,22 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 Status HipTransport::submitTransferTask(
-    const std::vector<TransferTask *> &task_list) {
+    const std::vector<TransferTask*>& task_list) {
     // Submit async transfers and collect pending transfer info
     std::vector<PendingTransfer> pending_transfers;
     pending_transfers.reserve(task_list.size());
 
-    for (auto *task_ptr : task_list) {
+    for (auto* task_ptr : task_list) {
         assert(task_ptr);
-        auto &task = *task_ptr;
+        auto& task = *task_ptr;
         assert(task.request);
-        auto &request = *task.request;
+        auto& request = *task.request;
 
         PendingTransfer pending;
         Status status = startAsyncTransfer(request, task, pending);
         if (!status.ok()) {
             // Clean up any pending transfers we've already created
-            for (auto &pt : pending_transfers) {
+            for (auto& pt : pending_transfers) {
                 event_pool_.putEvent(pt.event, pt.device_id);
             }
             return status;
@@ -614,8 +652,8 @@ Status HipTransport::submitTransferTask(
     return Status::OK();
 }
 
-int HipTransport::registerLocalMemory(void *addr, size_t length,
-                                      const std::string &location,
+int HipTransport::registerLocalMemory(void* addr, size_t length,
+                                      const std::string& location,
                                       bool remote_accessible,
                                       bool update_metadata) {
     std::lock_guard<std::mutex> lock(register_mutex_);
@@ -626,17 +664,23 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
 
     // IPC-based memory registration
     if (!use_fabric_mem_) {
-        // Validate memory type
+        // Only device memory can be exported via HIP IPC. Callers that register
+        // a batch across all transports (e.g. SGLang's PD metadata/aux buffers,
+        // which live in host memory) also hand those host buffers to this
+        // transport. Skip non-device memory gracefully and let RDMA/TCP
+        // register it; returning an error would roll back the entire
+        // multi-protocol batch and tear down every session.
         hipPointerAttribute_t attr;
-        if (!checkHip(hipPointerGetAttributes(&attr, addr),
-                      "HipTransport: hipPointerGetAttributes failed")) {
-            return -1;
-        }
-
-        if (attr.type != hipMemoryTypeDevice) {
-            LOG(ERROR) << "Unsupported memory type, " << addr << " "
-                       << attr.type;
-            return -1;
+        hipError_t attr_err = hipPointerGetAttributes(&attr, addr);
+        if (attr_err != hipSuccess || attr.type != hipMemoryTypeDevice) {
+            // Clear any sticky error the failed query latched so it does not
+            // poison subsequent HIP calls made by the caller.
+            (void)hipGetLastError();
+            if (globalConfig().trace) {
+                LOG(INFO) << "HipTransport: skipping non-device memory " << addr
+                          << ", leaving it to other transports";
+            }
+            return 0;
         }
 
         // Get IPC handle
@@ -653,6 +697,9 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         desc.length = length;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 
@@ -669,9 +716,9 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         }
 
         // Find whole physical page for memory registration
-        void *real_addr;
+        void* real_addr;
         size_t real_size;
-        result = hipMemGetAddressRange((hipDeviceptr_t *)&real_addr, &real_size,
+        result = hipMemGetAddressRange((hipDeviceptr_t*)&real_addr, &real_size,
                                        (hipDeviceptr_t)addr);
         if (result != hipSuccess) {
             LOG(WARNING) << "HipTransport: hipMemGetAddressRange failed: "
@@ -696,23 +743,23 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)real_addr;
         desc.length = real_size;
         desc.name = location;
-        desc.shm_name = serializeBinaryData((const void *)&export_handle_raw,
+        desc.shm_name = serializeBinaryData((const void*)&export_handle_raw,
                                             sizeof(hipxFabricHandle));
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
 
-int HipTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
-int HipTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
+int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                               uint64_t length,
                                               uint64_t target_id) {
     auto desc = metadata_->getSegmentDescByID(target_id);
 
     // Search for matching buffer entry
-    for (auto &entry : desc->buffers) {
+    for (auto& entry : desc->buffers) {
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             // Check if already remapped (shared lock)
@@ -732,7 +779,7 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 std::vector<unsigned char> output_buffer;
                 deserializeBinaryData(entry.shm_name, output_buffer);
 
-                void *shm_addr = nullptr;
+                void* shm_addr = nullptr;
                 int rc = -1;
 
                 if (output_buffer.size() == sizeof(hipIpcMemHandle_t) &&
@@ -765,15 +812,15 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             return 0;
         }
     }
-    LOG(ERROR) << "Requested address " << (void *)dest_addr << " to "
-               << (void *)(dest_addr + length) << " not found!";
+    LOG(ERROR) << "Requested address " << (void*)dest_addr << " to "
+               << (void*)(dest_addr + length) << " not found!";
     return ERR_INVALID_ARGUMENT;
 }
 
 int HipTransport::registerLocalMemoryBatch(
-    const std::vector<Transport::BufferEntry> &buffer_list,
-    const std::string &location) {
-    for (auto &buffer : buffer_list) {
+    const std::vector<Transport::BufferEntry>& buffer_list,
+    const std::string& location) {
+    for (auto& buffer : buffer_list) {
         int rc = registerLocalMemory(buffer.addr, buffer.length, location, true,
                                      false);
         if (rc < 0) return rc;
@@ -782,17 +829,17 @@ int HipTransport::registerLocalMemoryBatch(
 }
 
 int HipTransport::unregisterLocalMemoryBatch(
-    const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) {
+    const std::vector<void*>& addr_list) {
+    for (auto& addr : addr_list) {
         int rc = unregisterLocalMemory(addr, false);
         if (rc < 0) return rc;
     }
     return metadata_->updateLocalSegmentDesc();
 }
 
-void *HipTransport::allocatePinnedLocalMemory(size_t size) {
+void* HipTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
-        void *ptr = nullptr;
+        void* ptr = nullptr;
         if (!checkHip(hipMalloc(&ptr, size),
                       "HipTransport: hipMalloc failed")) {
             return nullptr;
@@ -804,7 +851,7 @@ void *HipTransport::allocatePinnedLocalMemory(size_t size) {
     hipDevice_t currentDev;
     hipMemAllocationProp prop = {};
     hipMemGenericAllocationHandle_t handle;
-    void *ptr = nullptr;
+    void* ptr = nullptr;
     int hipDev;
     int flag = 0;
 
@@ -845,7 +892,7 @@ void *HipTransport::allocatePinnedLocalMemory(size_t size) {
         return nullptr;
     }
 
-    result = hipMemAddressReserve((hipDeviceptr_t *)&ptr, size, granularity,
+    result = hipMemAddressReserve((hipDeviceptr_t*)&ptr, size, granularity,
                                   nullptr, 0);
     if (!checkHip(result, "HipTransport: hipMemAddressReserve failed")) {
         (void)hipMemRelease(handle);
@@ -880,7 +927,7 @@ void *HipTransport::allocatePinnedLocalMemory(size_t size) {
     return ptr;
 }
 
-void HipTransport::freePinnedLocalMemory(void *ptr) {
+void HipTransport::freePinnedLocalMemory(void* ptr) {
     if (!supportFabricMem()) {
         (void)hipFree(ptr);
         return;

@@ -699,7 +699,10 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 
 启用持久化功能后，对于每次 `Put`或`BatchPut` 操作，都会发起一次同步的memory pool写入操作和一次异步的DFS持久化操作。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
 
-#### 3FS USRBIO 插件
+#### 3FS USRBIO 插件（实验性 / 未完成）
+
+> **实验性功能：** HF3FS（3FS USRBIO）相关集成仍在开发中，尚未达到可视为生产就绪的程度；接口与行为可能变更，建议仅用于评估与测试。
+
 如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
 
 ### 内置元数据服务器
@@ -718,10 +721,12 @@ HTTP 元数据服务器可通过以下参数进行配置：
 
 #### 环境变量说明
 
-- **MC_STORE_CLUSTER_ID**: 在多集群复用 master 场景下标识元数据, 默认 'mooncake'
+- **MC_STORE_CLUSTER_ID**: 在多集群复用 master 场景下标识元数据, 默认 'mooncake_cluster'
 - **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
 - **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
 - **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
+- **MC_STORE_CLIENT_MIN_PORT**: 客户端使用的最小端口号, 默认 12300。端口范围必须在 1024–32767 或 61000–65535 之间（排除知名端口和临时端口）。无效值将回退为默认值。
+- **MC_STORE_CLIENT_MAX_PORT**: 客户端使用的最大端口号, 默认 14300。范围约束同上；必须 ≥ MC_STORE_CLIENT_MIN_PORT。
 - **MC_STORE_USE_HUGEPAGE**: 启用 hugepage 优化, 默认禁用, 设置为 1/true 启用
 - **MC_STORE_HUGEPAGE_SIZE**: hugepage 页大小, 默认 2M
 
@@ -779,6 +784,8 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
+如果 Master 运行在容器中，而容器 IP 可能动态变化，建议使用 `--rpc-interface=<网卡名>`（例如 `--rpc-interface=eth0`）而不是写死 `--rpc-address`。Master 会在启动时解析该网卡当前的 IPv4 地址，并将其作为最终的 `rpc_address` 使用。
+
 **高可用模式**:
 
 高可用模式依赖于 etcd 服务进行协调。如果 Transfer Engine 也使用 etcd 作为其元数据服务，那么 Mooncake Store 使用的 etcd 集群可以与 Transfer Engine 使用的集群共用，也可以是独立的。
@@ -788,6 +795,7 @@ Master service listening on 0.0.0.0:50051
 --enable-ha：启用高可用模式
 --etcd-endpoints：指定 etcd 服务的多个入口，使用分号 ';' 分隔
 --rpc-address：该实例的 RPC 地址。注意，这里填写的地址应当是客户端可访问的地址。
+--rpc-interface：按网卡名解析当前实例的 IPv4 地址。设置后会覆盖 --rpc-address，适合容器 IP 会变化的场景。
 ```
 
 例如:
@@ -796,6 +804,14 @@ Master service listening on 0.0.0.0:50051
     --enable-ha=true \
     --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
     --rpc-address=10.0.0.1
+```
+
+容器部署示例：
+```
+./build/mooncake-store/src/mooncake_master \
+    --enable-ha=true \
+    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
+    --rpc-interface=eth0
 ```
 
 ### 启动验证程序

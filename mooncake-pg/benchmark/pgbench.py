@@ -9,11 +9,11 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import mooncake.pg as pg
 
 from pgbench_utils import (
     busbw_factor,
     compute_counts,
+    configure_mooncake_device_filter,
     format_header,
     format_result_line,
     list_supported_dtypes,
@@ -21,8 +21,6 @@ from pgbench_utils import (
     resolve_dtype,
     resolve_reduce_op,
 )
-
-pg.set_device_filter(["mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4"])
 
 COLLECTIVES = {
     "all_reduce",
@@ -448,7 +446,9 @@ def _run_worker(local_rank: int, args: argparse.Namespace) -> None:
     backend = args.backend
     if backend in ("mooncake", "mooncake-cpu"):
         try:
-            import mooncake.pg as pg  # noqa: F401
+            import mooncake.pg as pg
+
+            configure_mooncake_device_filter(pg)
         except (
             Exception
         ) as exc:  # pragma: no cover - import-time failure should be explicit

@@ -14,14 +14,15 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
-#include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -31,8 +32,14 @@
 #include <sys/stat.h>
 
 #include "cuda_alike.h"
+#include "config.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "char_util.h"
+#ifdef USE_UB
+#include <libgen.h>
+#include <urma_api.h>
+#endif
 
 namespace mooncake {
 
@@ -138,10 +145,56 @@ struct InfinibandDevice {
     int numa_node;
 };
 
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+                return !std::isspace(ch);
+            }));
+}
+
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
+}
+
+static std::set<std::string> getIbvDeviceWhitelist() {
+    std::set<std::string> whitelist;
+    const char *env = std::getenv("MC_TE_FILTERS");
+    if (!env || !*env) {
+        return whitelist;
+    }
+
+    LOG(INFO) << "IB device whitelist: " << env;
+    std::string env_str(env);
+    size_t start = 0;
+    size_t pos = 0;
+    while ((pos = env_str.find(',', start)) != std::string::npos) {
+        std::string token = env_str.substr(start, pos - start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+        start = pos + 1;
+    }
+    if (start < env_str.length()) {
+        std::string token = env_str.substr(start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+    }
+    return whitelist;
+}
+
 static std::vector<InfinibandDevice> listInfiniBandDevices(
     const std::vector<std::string> &filter) {
+#ifndef USE_CXI
     int num_devices = 0;
     std::vector<InfinibandDevice> devices;
+    const auto whitelist = getIbvDeviceWhitelist();
 
     struct ibv_device **device_list = ibv_get_device_list(&num_devices);
     if (!device_list) {
@@ -159,6 +212,12 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         if (!filter.empty() && std::find(filter.begin(), filter.end(),
                                          device_name) == filter.end())
             continue;
+
+        if (!whitelist.empty() &&
+            whitelist.find(device_name) == whitelist.end()) {
+            LOG(INFO) << "Skipping device: " << device_name;
+            continue;
+        }
 
         // Check device availability before adding to the list
         if (!isIbDeviceAvailable(device_list[i])) {
@@ -190,7 +249,204 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     }
     ibv_free_device_list(device_list);
     return devices;
+#else
+    // assume devices available and working, later use libcxi to check if they
+    // actually work
+    std::vector<std::string> device_names;
+    std::vector<InfinibandDevice> devices;
+    const char *nic_path = "/sys/class/cxi";
+
+    DIR *dir = opendir(nic_path);
+    if (!dir) {
+        perror("opendir");
+        LOG(WARNING) << "No CXI devices were found, check you system";
+        return {};
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type == DT_LNK && std::string(entry->d_name) != "." &&
+            std::string(entry->d_name) != "..") {
+            device_names.emplace_back(entry->d_name);
+        }
+    }
+    closedir(dir);
+
+    for (auto &dv_name : device_names) {
+        if (!filter.empty() &&
+            std::find(filter.begin(), filter.end(), dv_name) == filter.end())
+            continue;
+
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/class/cxi/%s/device",
+                 dv_name.c_str());
+        if (realpath(path, resolved_path) == NULL) {
+            PLOG(ERROR) << "Can't resolve CXI device path for " << path;
+            continue;
+        }
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+
+        snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
+        std::ifstream(path) >> numa_node;
+
+        devices.push_back(InfinibandDevice{.name = std::move(dv_name),
+                                           .pci_bus_id = std::move(pci_bus_id),
+                                           .numa_node = numa_node});
+    }
+    return devices;
+#endif
 }
+
+static void precomputeResolvedHcaPeerAffinity(
+    const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, std::vector<int>>>
+        &affinity_by_local) {
+    affinity_by_local.clear();
+    const auto &config = globalConfig();
+    if (!config.enable_hca_peer_affinity) return;
+    if (config.nic_peer_affinity.empty()) {
+        LOG(WARNING) << "MC_ENABLE_HCA_PEER_AFFINITY is set, but "
+                        "MC_NIC_PEER_AFFINITY has no valid mappings.";
+        return;
+    }
+
+    for (const auto &entry : matrix) {
+        if (entry.first.rfind("cuda:", 0) != 0) continue;
+
+        std::unordered_set<std::string> preferred_set(
+            entry.second.preferred_hca.begin(),
+            entry.second.preferred_hca.end());
+
+        for (const auto &mapping : config.nic_peer_affinity) {
+            const auto &local_hca = mapping.first;
+            const auto &peer_hcas = mapping.second;
+
+            std::vector<int> peer_preferred_hca;
+            std::unordered_set<std::string> peer_preferred_set;
+            for (const auto &peer_hca : peer_hcas) {
+                if (!preferred_set.count(peer_hca)) continue;
+                auto hca_id_it = hca_id_map.find(peer_hca);
+                if (hca_id_it == hca_id_map.end()) continue;
+                if (peer_preferred_set.insert(peer_hca).second) {
+                    peer_preferred_hca.push_back(hca_id_it->second);
+                }
+            }
+
+            if (peer_preferred_hca.empty()) continue;
+            affinity_by_local[local_hca][entry.first] =
+                std::move(peer_preferred_hca);
+        }
+    }
+}
+
+#ifdef USE_UB
+struct UBDevice {
+    std::string name;
+    std::string pci_bus_id;
+    int numa_node;
+};
+
+static std::vector<UBDevice> listUBDevices(
+    const std::vector<std::string> &filter) {
+    int num_devices = 0;
+    std::vector<UBDevice> devices;
+
+    urma_init_attr_t init_attr = {};
+    if (urma_init(&init_attr) != URMA_SUCCESS) {
+        LOG(WARNING) << "Failed to urma init";
+        return {};
+    }
+    LOG(INFO) << "URMA module init success";
+    urma_device_t **device_list = urma_get_device_list(&num_devices);
+    if (!device_list) {
+        LOG(WARNING) << "No UB devices found, check your device installation";
+        urma_uninit();
+        return {};
+    }
+    if (device_list && num_devices <= 0) {
+        LOG(WARNING) << "No UB devices found, check your device installation";
+        urma_free_device_list(device_list);
+        return {};
+    }
+
+    for (int i = 0; i < num_devices; ++i) {
+        std::string device_name = device_list[i]->name;
+        if (!filter.empty() && std::find(filter.begin(), filter.end(),
+                                         device_name) == filter.end())
+            continue;
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+        // Get the PCI bus id for the infiniband device. Note that
+        snprintf(path, sizeof(path), "/sys/class/ubcore/%s",
+                 device_list[i]->name);
+        LOG(INFO) << "listUBDevices: path " << path;
+        if (realpath(path, resolved_path) == NULL) {
+            LOG(ERROR) << "listUBDevices: realpath " << resolved_path
+                       << " failed";
+            continue;
+        }
+        LOG(INFO) << "listUBDevices: realpath " << resolved_path;
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+        snprintf(path, sizeof(path), "%s/numa",
+                 dirname(dirname(resolved_path)));
+        LOG(INFO) << "listUBDevices: numanodepath " << path;
+        std::ifstream(path) >> numa_node;
+        LOG(INFO) << "UBDevices : performation node ----"
+                  << device_list[i]->name << " : " << numa_node;
+
+        devices.push_back(UBDevice{.name = std::move(device_name),
+                                   .pci_bus_id = std::move(pci_bus_id),
+                                   .numa_node = numa_node});
+    }
+    urma_free_device_list(device_list);
+    urma_uninit();
+    return devices;
+}
+
+static std::vector<TopologyEntry> discoverCpuTopology(
+    const std::vector<UBDevice> &all_hca) {
+    DIR *dir = opendir("/sys/devices/system/node");
+    struct dirent *entry;
+    std::vector<TopologyEntry> topology;
+
+    if (dir == NULL) {
+        PLOG(WARNING)
+            << "discoverCpuTopology: open /sys/devices/system/node failed";
+        return {};
+    }
+    while ((entry = readdir(dir))) {
+        const char *prefix = "node";
+        if (entry->d_type != DT_DIR ||
+            strncmp(entry->d_name, prefix, strlen(prefix)) != 0) {
+            continue;
+        }
+        int node_id = atoi(entry->d_name + strlen(prefix));
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+        // an HCA connected to the same cpu NUMA node is preferred
+        for (const auto &hca : all_hca) {
+            if (hca.numa_node == node_id) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        topology.push_back(
+            TopologyEntry{.name = "cpu:" + std::to_string(node_id),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    (void)closedir(dir);
+    return topology;
+}
+#endif
 
 static std::vector<TopologyEntry> discoverCpuTopology(
     const std::vector<InfinibandDevice> &all_hca) {
@@ -229,7 +485,9 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -285,23 +543,23 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char *ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
 
-        // Find HCAs with minimum distance in one pass
+        // Find HCAs with minimum distance in one pass.
         int min_distance = INT_MAX;
         std::vector<std::string> min_distance_hcas;
 
-        std::vector<InfinibandDevice> sameNuma_hca;
+        std::vector<InfinibandDevice> same_numa_hca;
         for (const auto &hca : all_hca) {
             if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
-                sameNuma_hca.push_back(hca);
+                same_numa_hca.push_back(hca);
             }
         }
         const auto &candidate_preferred_hca =
-            sameNuma_hca.empty() ? all_hca : sameNuma_hca;
+            same_numa_hca.empty() ? all_hca : same_numa_hca;
 
         for (const auto &hca : candidate_preferred_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
@@ -332,8 +590,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
     }
     return topology;
 }
-
-#endif  // USE_CUDA
+#endif
 
 Topology::Topology() {
     auto str = getenv("MC_PATH_ROUNDROBIN");
@@ -360,16 +617,26 @@ void Topology::clear() {
     matrix_.clear();
     hca_list_.clear();
     resolved_matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
 }
 
 int Topology::discover(const std::vector<std::string> &filter) {
     matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
     auto all_hca = listInfiniBandDevices(filter);
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
     for (auto &ent : discoverCudaTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
+#endif
+#ifdef USE_UB
+    auto ub_all_hca = listUBDevices(filter);
+    for (auto &ent : discoverCpuTopology(ub_all_hca)) {
         matrix_[ent.name] = ent;
     }
 #endif
@@ -397,6 +664,7 @@ int Topology::parse(const std::string &topology_json) {
     }
 
     matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
     for (const auto &key : root.getMemberNames()) {
         const Json::Value &value = root[key];
         if (value.isArray() && value.size() == 2) {
@@ -454,6 +722,36 @@ int Topology::selectDevice(const std::string storage_type,
     return selectDevice(storage_type, retry_count);
 }
 
+int Topology::selectDeviceByLocalHca(const std::string storage_type,
+                                     std::string_view local_hca,
+                                     int retry_count) {
+    if (!local_hca.empty()) {
+        auto local_it =
+            resolved_hca_peer_affinity_by_local_.find(std::string(local_hca));
+        if (local_it != resolved_hca_peer_affinity_by_local_.end()) {
+            auto hints_it = local_it->second.find(std::string(storage_type));
+            if (hints_it != local_it->second.end() &&
+                !hints_it->second.empty()) {
+                const auto &candidates = hints_it->second;
+                if (retry_count == 0) {
+                    int rand_value;
+                    if (use_round_robin_) {
+                        thread_local int tl_counter = 0;
+                        rand_value = tl_counter;
+                        tl_counter = (tl_counter + 1) % 10000;
+                    } else {
+                        rand_value = SimpleRandom::Get().next();
+                    }
+                    return candidates[rand_value % candidates.size()];
+                }
+                return candidates[(retry_count - 1) % candidates.size()];
+            }
+        }
+    }
+
+    return selectDevice(storage_type, retry_count);
+}
+
 int Topology::selectDevice(const std::string storage_type, int retry_count) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
@@ -485,6 +783,7 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
 
 int Topology::resolve() {
     resolved_matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
     hca_list_.clear();
     std::map<std::string, int> hca_id_map;
     int next_hca_map_index = 0;
@@ -519,6 +818,8 @@ int Topology::resolve() {
                 hca_id_map[hca];
         }
     }
+    precomputeResolvedHcaPeerAffinity(matrix_, hca_id_map,
+                                      resolved_hca_peer_affinity_by_local_);
     return 0;
 }
 

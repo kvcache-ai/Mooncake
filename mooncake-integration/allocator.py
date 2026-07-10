@@ -3,20 +3,22 @@ import logging
 import os
 import threading
 from importlib import resources
-from typing import Dict, Final, Optional
+from typing import Dict, Final
 from enum import IntEnum
 
 from torch import device as torch_device
 from torch.cuda.memory import CUDAPluggableAllocator
 
+from .fabric_allocator_utils import get_mooncake_so_path, probe_allocator_backend
+
 logger = logging.getLogger(__name__)
 
 
 class MemoryBackend(IntEnum):
-    USE_CUDAMALLOC  = 0
+    USE_CUDAMALLOC = 0
     USE_CUMEMCREATE = 1
-    UNKNOWN         = -1
-    UNSUPPORTED     = -2
+    UNKNOWN = -1
+    UNSUPPORTED = -2
 
 
 class NVLinkAllocator:
@@ -27,65 +29,34 @@ class NVLinkAllocator:
 
     @classmethod
     def _get_so_path(cls) -> str:
-        """Dynamically locate nvlink_allocator.so in the mooncake package installation"""
-        try:
-            # Attempt to locate package resource
-            with resources.path("mooncake", "nvlink_allocator.so") as so_path:
-                if so_path.exists():
-                    return str(so_path)
-        except (ImportError, FileNotFoundError, TypeError):
-            pass
-
-        # Fallback strategy: check in package location via import metadata
-        try:
-            import mooncake
-
-            base_path = os.path.dirname(os.path.abspath(mooncake.__file__))
-            so_path = os.path.join(base_path, "nvlink_allocator.so")
-            if os.path.exists(so_path):
-                return so_path
-        except (ImportError, FileNotFoundError, TypeError):
-            raise ImportError(
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
-            )
+        return get_mooncake_so_path(
+            "nvlink_allocator.so",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2.",
+        )
 
     @classmethod
     def _probe_fabric_memory_support(cls, so_path: str) -> MemoryBackend:
-        """
-        Probe whether the system supports fabric memory by calling a C++ function
-        that attempts cuMemCreate with CU_MEM_HANDLE_TYPE_FABRIC.
-        We assume the shared library exports a symbol like:
-            extern "C" MemoryBackendType mc_probe_fabric_support(int device_id);
-        """
+        supported_type = probe_allocator_backend(
+            so_path,
+            "mc_allocator_probe",
+            ctypes.c_int,
+            int(MemoryBackend.UNSUPPORTED),
+        )
         try:
+            backend = MemoryBackend(supported_type)
+        except ValueError:
+            logger.info("Unknown Backend error")
+            return MemoryBackend.UNKNOWN
 
-            lib = ctypes.CDLL(so_path)
-
-            # Try to get the probe function
-            probe_func = lib.mc_probe_fabric_support
-            probe_func.argtypes = [ctypes.c_int]
-            probe_func.restype = ctypes.c_int
-
-            # Use device 0 for probing
-            dev_id = 0
-            supported_type = probe_func(dev_id)
-            if supported_type == MemoryBackend.USE_CUDAMALLOC:
-                logger.info(f"Use CudaMalloc fallback")
-            elif supported_type == MemoryBackend.USE_CUMEMCREATE:
-                logger.info(f"Supports Fabric Memory")
-            else:
-                logger.info("Unknown Backend error")
-            return supported_type
-
-        except AttributeError:
-            logger.warning(
-                "Symbol 'mc_probe_fabric_support' not found in nvlink_allocator.so. "
-                "Assuming fabric memory is NOT supported (you may need to update the library)."
-            )
-            return MemoryBackend.UNSUPPORTED
-        except Exception as e:
-            logger.warning(f"Failed to probe fabric memory support: {e}")
-            return MemoryBackend.UNSUPPORTED
+        if backend == MemoryBackend.USE_CUDAMALLOC:
+            logger.info("Use CudaMalloc fallback")
+        elif backend == MemoryBackend.USE_CUMEMCREATE:
+            logger.info("Supports Fabric Memory")
+        elif backend == MemoryBackend.UNSUPPORTED:
+            logger.info("Allocator backend probing is unsupported")
+        else:
+            logger.info("Unknown Backend error")
+        return backend
 
     @classmethod
     def detect_mem_backend(cls) -> MemoryBackend:
@@ -93,14 +64,15 @@ class NVLinkAllocator:
         if not cls._probe_done:
             with cls._lock:
                 if cls._probe_done:
-                    return
-                so_path = None
+                    return cls._supports_fabric
                 try:
-                    so_path = cls._get_so_path()
-                    # First try dedicated probe function
-                    cls._supports_fabric = cls._probe_fabric_memory_support(so_path)
+                    cls._supports_fabric = cls._probe_fabric_memory_support(
+                        cls._get_so_path()
+                    )
                 except Exception as e:
-                    logger.error(f"Critical error during fabric memory probe setup: {e}")
+                    logger.error(
+                        f"Critical error during fabric memory probe setup: {e}"
+                    )
                     cls._supports_fabric = MemoryBackend.UNSUPPORTED
 
                 cls._probe_done = True
@@ -112,7 +84,7 @@ class NVLinkAllocator:
             if device not in cls._instances:
                 so_path = cls._get_so_path()
                 cls._instances[device] = CUDAPluggableAllocator(
-                    so_path, "mc_nvlink_malloc", "mc_nvlink_free"
+                    so_path, "mc_allocator_malloc", "mc_allocator_free"
                 )
             return cls._instances[device]
 

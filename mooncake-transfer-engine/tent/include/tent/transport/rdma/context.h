@@ -114,6 +114,9 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    // PCIe Relaxed Ordering support
+    bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
+
     // Notification CQ (dedicated for notification QPs)
     RdmaCQ *notifyCq() { return notify_cq_; }
 
@@ -148,6 +151,9 @@ class RdmaContext {
 
     // Dedicated CQ for notification QPs (one per device)
     RdmaCQ *notify_cq_ = nullptr;
+
+    // PCIe Relaxed Ordering support
+    bool relaxed_ordering_enabled_ = false;
 
     const IbvSymbols &verbs_;
 };

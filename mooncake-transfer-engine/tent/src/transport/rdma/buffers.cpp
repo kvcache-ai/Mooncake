@@ -78,12 +78,16 @@ LocalBufferManager::LocalBufferManager() {}
 
 LocalBufferManager::~LocalBufferManager() { clear(); }
 
-static inline int getAccessFlags(Permission perm) {
+static inline int getAccessFlags(Permission perm,
+                                 bool relaxed_ordering = false) {
     int access = IBV_ACCESS_LOCAL_WRITE;
     if (perm == kGlobalReadWrite) {
         access |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     } else if (perm == kGlobalReadOnly) {
         access |= IBV_ACCESS_REMOTE_READ;
+    }
+    if (relaxed_ordering) {
+        access |= IBV_ACCESS_RELAXED_ORDERING;
     }
     return access;
 }
@@ -98,7 +102,6 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                                              bool force_sequential) {
     AddressRange range((void*)desc.addr, desc.length);
     BufferEntryForRdma staging;
-    auto access = getAccessFlags(options.perm);
     assert(desc.rkey.empty());
     size_t context_count = 0;
     for (auto* context : context_list_) {
@@ -116,6 +119,9 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         for (size_t id = 0; id < context_list_.size(); ++id) {
             auto* context = context_list_[id];
             if (!context) continue;
+            // Calculate access flags per context (for relaxed ordering support)
+            int access = getAccessFlags(options.perm,
+                                        context->isRelaxedOrderingEnabled());
             tasks.emplace_back(std::async(
                 std::launch::async,
                 [context, &mem_reg_list, id, addr, length, access]() {
@@ -128,6 +134,9 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         for (size_t id = 0; id < context_list_.size(); ++id) {
             auto* context = context_list_[id];
             if (!context) continue;
+            // Calculate access flags per context (for relaxed ordering support)
+            int access = getAccessFlags(options.perm,
+                                        context->isRelaxedOrderingEnabled());
             mem_reg_list[id] =
                 context->registerMemReg((void*)desc.addr, desc.length, access);
         }
@@ -203,7 +212,8 @@ Status LocalBufferManager::addDevice(RdmaContext* context) {
     for (auto& buffer : buffer_list_) {
         auto range = buffer.first;
         auto& options = buffer.second.options;
-        auto access = getAccessFlags(options.perm);
+        auto access =
+            getAccessFlags(options.perm, context->isRelaxedOrderingEnabled());
         if (buffer.second.mem_reg_map.count(context)) continue;
         auto mem_reg =
             context->registerMemReg(range.addr, range.length, access);

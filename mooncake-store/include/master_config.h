@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 
 #include <glog/logging.h>
 
@@ -10,6 +11,21 @@
 
 namespace mooncake {
 
+// Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
+class HttpMetadataServer;
+
+inline std::string ResolveConfiguredHABackendConnstring(
+    std::string_view ha_backend_type, std::string_view ha_backend_connstring,
+    std::string_view etcd_endpoints) {
+    if (!ha_backend_connstring.empty()) {
+        return std::string(ha_backend_connstring);
+    }
+    if (ha_backend_type == "etcd") {
+        return std::string(etcd_endpoints);
+    }
+    return {};
+}
+
 // The configuration for the master server
 struct MasterConfig {
     bool enable_metric_reporting;
@@ -17,6 +33,7 @@ struct MasterConfig {
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
+    std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
@@ -25,10 +42,17 @@ struct MasterConfig {
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
+    double nof_eviction_ratio;
+    double nof_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
+    int64_t nof_heartbeat_interval_sec;
+    uint32_t nof_heartbeat_probe_timeout_ms;
+    uint32_t nof_heartbeat_failures_threshold;
 
     bool enable_ha;
     bool enable_offload;
+    std::string ha_backend_type;
+    std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
     std::string cluster_id;
@@ -41,6 +65,15 @@ struct MasterConfig {
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
+    // Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*)
+    // when client heartbeat times out. Works in two modes: (1) co-located
+    // (enable_http_metadata_server=true) via in-process removal, or
+    // (2) separately-deployed metadata server via async HTTP DELETE.
+    bool enable_metadata_cleanup_on_timeout;
+
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
 
     uint64_t put_start_discard_timeout_sec;
     uint64_t put_start_release_timeout_sec;
@@ -48,6 +81,9 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
@@ -56,9 +92,17 @@ struct MasterConfig {
     uint64_t snapshot_child_timeout_seconds;
     uint32_t snapshot_retention_count;
 
-    // Snapshot storage backend type: "local" or "s3", required when snapshot
-    // or restore is enabled
-    std::string snapshot_backend_type;
+    // Snapshot object store type: "local" or "s3", required when
+    // snapshot or restore is enabled
+    std::string snapshot_object_store_type;
+
+    // Snapshot catalog store type: ""/"embedded" or "redis". Empty keeps the
+    // embedded catalog behavior. "payload" remains a deprecated alias.
+    std::string snapshot_catalog_store_type;
+
+    // Optional connection string for snapshot catalog store. When empty, the
+    // implementation may fall back to a backend-specific default.
+    std::string snapshot_catalog_store_connstring;
 
     // Task manager configuration
     uint32_t max_total_finished_tasks;
@@ -70,6 +114,38 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+
+    // Offload-on-evict: defer LOCAL_DISK offload to eviction time
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
+
+    // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
+    // async copy back to MEMORY so the next Get is fast.
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
+    // Max promotion tasks PromotionObjectHeartbeat returns to a single
+    // client per call. Each task is a synchronous SSD-read + RDMA-write
+    // on the client; serializing them avoids blocking past the client-
+    // liveness window. Default 1 is conservative; small-object or RDMA-
+    // rich clusters may safely raise it.
+    uint32_t promotion_max_per_heartbeat = 1;
+
+    // KV Events publisher (RFC #1527) for cache-aware indexers.
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
 };
 
 class MasterServiceSupervisorConfig {
@@ -84,7 +160,16 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_ratio{"eviction_ratio"};
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
+    RequiredParam<double> nof_eviction_ratio{"nof_eviction_ratio"};
+    RequiredParam<double> nof_eviction_high_watermark_ratio{
+        "nof_eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    RequiredParam<int64_t> nof_heartbeat_interval_sec{
+        "nof_heartbeat_interval_sec"};
+    RequiredParam<uint32_t> nof_heartbeat_probe_timeout_ms{
+        "nof_heartbeat_probe_timeout_ms"};
+    RequiredParam<uint32_t> nof_heartbeat_failures_threshold{
+        "nof_heartbeat_failures_threshold"};
     RequiredParam<bool> enable_offload{"enable_offload"};
     RequiredParam<int> rpc_port{"rpc_port"};
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
@@ -94,6 +179,8 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -104,6 +191,9 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -120,11 +210,45 @@ class MasterServiceSupervisorConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
+    uint32_t promotion_max_per_heartbeat = 1;
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
+
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
+
+    // Metadata cleanup on client timeout. Resolved in main() (not from
+    // MasterConfig) and forwarded to the serving primary's
+    // WrappedMasterService. Co-located: in-process server pointer; separate:
+    // derived http(s) URL.
+    HttpMetadataServer* http_metadata_server = nullptr;
+    std::string http_metadata_remote_url;
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -138,8 +262,35 @@ class MasterServiceSupervisorConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -148,7 +299,10 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        ha_backend_type = config.ha_backend_type;
         etcd_endpoints = config.etcd_endpoints;
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -165,6 +319,9 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
@@ -172,7 +329,10 @@ class MasterServiceSupervisorConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -183,6 +343,9 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        pod_name = config.pod_name;
+        pod_namespace = config.pod_namespace;
         validate();
     }
 
@@ -214,8 +377,26 @@ class MasterServiceSupervisorConfig {
             throw std::runtime_error(
                 "eviction_high_watermark_ratio is not set");
         }
+        if (!nof_eviction_ratio.IsSet()) {
+            throw std::runtime_error("nof_eviction_ratio is not set");
+        }
+        if (!nof_eviction_high_watermark_ratio.IsSet()) {
+            throw std::runtime_error(
+                "nof_eviction_high_watermark_ratio is not set");
+        }
         if (!client_live_ttl_sec.IsSet()) {
             throw std::runtime_error("client_live_ttl_sec is not set");
+        }
+        if (!nof_heartbeat_interval_sec.IsSet()) {
+            throw std::runtime_error("nof_heartbeat_interval_sec is not set");
+        }
+        if (!nof_heartbeat_probe_timeout_ms.IsSet()) {
+            throw std::runtime_error(
+                "nof_heartbeat_probe_timeout_ms is not set");
+        }
+        if (!nof_heartbeat_failures_threshold.IsSet()) {
+            throw std::runtime_error(
+                "nof_heartbeat_failures_threshold is not set");
         }
         if (!rpc_port.IsSet()) {
             throw std::runtime_error("rpc_port is not set");
@@ -240,10 +421,40 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
+    uint32_t promotion_max_per_heartbeat = 1;
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -254,6 +465,9 @@ class WrappedMasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -262,7 +476,9 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -291,15 +507,49 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
+        ha_backend_type = config.ha_backend_type;
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring,
+            config.etcd_endpoints);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -315,11 +565,17 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else if (config.allocation_strategy == "ssd_free_ratio_first") {
+            allocation_strategy_type =
+                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "local_first") {
+            allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
-                         << "Valid options are: random, free_ratio_first, cxl "
+                         << "Valid options are: random, free_ratio_first, cxl, "
+                            "ssd_free_ratio_first, local_first "
                             "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
@@ -333,7 +589,10 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -360,17 +619,47 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
+        ha_backend_type = config.ha_backend_type;
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring,
+            config.etcd_endpoints);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -380,7 +669,10 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -407,10 +699,20 @@ class MasterServiceConfigBuilder {
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio_ =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms_ =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold_ =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    std::string ha_backend_type_ = "etcd";
+    std::string ha_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -419,6 +721,9 @@ class MasterServiceConfigBuilder {
         AllocationStrategyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
+    bool enable_multi_tenants_ = false;
+    std::string tenant_quota_connector_type_ = "file";
+    std::string tenant_quota_connector_uri_;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
@@ -428,7 +733,9 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type_;
+    std::string snapshot_object_store_type_;
+    std::string snapshot_catalog_store_type_;
+    std::string snapshot_catalog_store_connstring_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -470,6 +777,17 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_nof_eviction_ratio(double ratio) {
+        nof_eviction_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_eviction_high_watermark_ratio(
+        double ratio) {
+        nof_eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_view_version(ViewVersionId version) {
         view_version_ = version;
         return *this;
@@ -480,6 +798,23 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_nof_heartbeat_interval_sec(int64_t ttl) {
+        nof_heartbeat_interval_sec_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_heartbeat_probe_timeout_ms(
+        uint32_t timeout_ms) {
+        nof_heartbeat_probe_timeout_ms_ = timeout_ms;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_heartbeat_failures_threshold(
+        uint32_t threshold) {
+        nof_heartbeat_failures_threshold_ = threshold;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_enable_ha(bool enable) {
         enable_ha_ = enable;
         return *this;
@@ -487,6 +822,18 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ha_backend_type(
+        const std::string& backend_type) {
+        ha_backend_type_ = backend_type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ha_backend_connstring(
+        const std::string& connstring) {
+        ha_backend_connstring_ = connstring;
         return *this;
     }
 
@@ -515,6 +862,23 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allocation_strategy_type(
         AllocationStrategyType type) {
         allocation_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_multi_tenants(bool enable) {
+        enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_tenant_quota_connector_type(
+        const std::string& type) {
+        tenant_quota_connector_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_tenant_quota_connector_uri(
+        const std::string& uri) {
+        tenant_quota_connector_uri_ = uri;
         return *this;
     }
 
@@ -563,11 +927,45 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_snapshot_backend_type(
+    MasterServiceConfigBuilder& set_snapshot_object_store_type(
         const std::string& type) {
-        snapshot_backend_type_ = type;
+        snapshot_object_store_type_ = type;
         return *this;
     }
+
+    // Deprecated compatibility shims for older tests and call sites.
+    MasterServiceConfigBuilder& set_snapshot_payload_store_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_payload_backend_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_type(
+        const std::string& type) {
+        snapshot_catalog_store_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_backend_type(
+        const std::string& type) {
+        return set_snapshot_catalog_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_connstring(
+        const std::string& connstring) {
+        snapshot_catalog_store_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_backend_connstring(
+        const std::string& connstring) {
+        return set_snapshot_catalog_store_connstring(connstring);
+    }
+
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
         uint32_t max_total_finished_tasks) {
         max_total_finished_tasks_ = max_total_finished_tasks;
@@ -639,10 +1037,40 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+    size_t offloading_queue_limit = 50000;
+    double offload_cap_ratio = 0.5;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
+    uint32_t promotion_max_per_heartbeat = 1;
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -653,6 +1081,9 @@ class MasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_multi_tenants = false;
+    std::string tenant_quota_connector_type = "file";
+    std::string tenant_quota_connector_uri;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -661,7 +1092,9 @@ class MasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -686,10 +1119,39 @@ class MasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        offloading_queue_limit = config.offloading_queue_limit;
+        offload_cap_ratio = config.offload_cap_ratio;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
+        ha_backend_type = config.ha_backend_type;
+        ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -698,6 +1160,9 @@ class MasterServiceConfig {
         allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_connector_type = config.tenant_quota_connector_type;
+        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -707,7 +1172,10 @@ class MasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -737,10 +1205,18 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.nof_eviction_ratio = nof_eviction_ratio_;
+    config.nof_eviction_high_watermark_ratio =
+        nof_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
+    config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
+    config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
+    config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.ha_backend_type = ha_backend_type_;
+    config.ha_backend_connstring = ha_backend_connstring_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
@@ -750,13 +1226,19 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_multi_tenants = enable_multi_tenants_;
+    config.tenant_quota_connector_type = tenant_quota_connector_type_;
+    config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
     config.enable_snapshot = enable_snapshot_;
     config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_retention_count = snapshot_retention_count_;
-    config.snapshot_backend_type = snapshot_backend_type_;
+    config.snapshot_object_store_type = snapshot_object_store_type_;
+    config.snapshot_catalog_store_type = snapshot_catalog_store_type_;
+    config.snapshot_catalog_store_connstring =
+        snapshot_catalog_store_connstring_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =
@@ -785,6 +1267,7 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    std::optional<bool> enable_offload;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
@@ -801,6 +1284,7 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    std::optional<bool> enable_offload_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
@@ -829,6 +1313,11 @@ class InProcMasterConfigBuilder {
 
     InProcMasterConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
         default_kv_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_enable_offload(bool enable) {
+        enable_offload_ = enable;
         return *this;
     }
 
@@ -881,6 +1370,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.enable_offload = enable_offload_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;

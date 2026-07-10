@@ -39,6 +39,9 @@ class RedisMetaStore : public MetaStore {
 
     virtual Status connect(const std::string &endpoint);
 
+    Status connect(const std::string &endpoint, const std::string &username,
+                   const std::string &password, uint8_t db_index);
+
     Status connect(const std::string &endpoint, const std::string &password,
                    uint8_t db_index);
 

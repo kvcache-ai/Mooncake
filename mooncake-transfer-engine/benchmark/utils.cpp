@@ -44,10 +44,15 @@ DEFINE_string(metadata_url_list, "",
 DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
-DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
+DEFINE_string(xport_type, "",
+              "Transport type: rdma|shm|mnnvl|gds|iouring|sunrise_link");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
+DEFINE_string(
+    tent_transport_hint, "unspec",
+    "tent only: per-request transport_hint. "
+    "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
 
 namespace mooncake {
 namespace tent {
@@ -72,6 +77,7 @@ int XferBenchConfig::rpc_server_port = 0;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
+std::string XferBenchConfig::tent_transport_hint;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
@@ -99,6 +105,7 @@ void XferBenchConfig::loadFromFlags() {
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
     notifi = FLAGS_notifi;
+    tent_transport_hint = FLAGS_tent_transport_hint;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;

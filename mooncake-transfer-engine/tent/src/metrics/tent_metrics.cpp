@@ -172,29 +172,26 @@ void TentMetrics::shutdown() {
 
 void TentMetrics::registerMetrics() {
     // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(6);
-    histograms_.reserve(4);
-    histogram_boundaries_.reserve(4);
+    counters_.reserve(7);
+    histograms_.reserve(5);
+    histogram_boundaries_.reserve(5);
 
     // Register all counters - add new counters here
     counters_ = {
         &read_bytes_total_,     &write_bytes_total_,   &read_requests_total_,
         &write_requests_total_, &read_failures_total_, &write_failures_total_,
+        &failover_total_,
     };
 
     // Register all histograms - add new histograms here
     // Note: histogram_boundaries_ must match the order of histograms_
     histograms_ = {
-        &read_latency_,
-        &write_latency_,
-        &read_size_,
-        &write_size_,
+        &read_latency_, &write_latency_, &read_size_,
+        &write_size_,   &deadline_mlu_,
     };
     histogram_boundaries_ = {
-        kLatencyBuckets,
-        kLatencyBuckets,
-        kSizeBuckets,
-        kSizeBuckets,
+        kLatencyBuckets, kLatencyBuckets,     kSizeBuckets,
+        kSizeBuckets,    kMluPerMilleBuckets,
     };
 }
 
@@ -228,6 +225,15 @@ void TentMetrics::recordWriteCompleted(size_t bytes, double latency_seconds) {
     }
 }
 
+void TentMetrics::recordDeadlineMLU(double mlu) {
+    // Fast path: check runtime switch first
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    if (mlu < 0.0) return;  // defensive: ignore invalid (e.g. window <= 0)
+    // Store in per-mille so the integer histogram can bucket fractional ratios.
+    deadline_mlu_.observe(static_cast<int64_t>(mlu * 1000.0));
+}
+
 void TentMetrics::recordReadFailed(size_t bytes) {
     // Fast path: check runtime switch first
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
@@ -244,6 +250,13 @@ void TentMetrics::recordWriteFailed(size_t bytes) {
 
     write_failures_total_.inc();
     write_requests_total_.inc();  // Count failed requests too
+}
+
+void TentMetrics::recordTransportFailover() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+
+    failover_total_.inc();
 }
 
 std::string TentMetrics::getPrometheusMetrics() {
@@ -328,6 +341,7 @@ std::string TentMetrics::getSummaryString() {
     double write_reqs = write_requests_total_.value();
     double read_fails = read_failures_total_.value();
     double write_fails = write_failures_total_.value();
+    double failovers = failover_total_.value();
 
     // Format bytes in human-readable form
     auto formatBytes = [](double bytes) -> std::string {
@@ -351,7 +365,8 @@ std::string TentMetrics::getSummaryString() {
         << static_cast<uint64_t>(read_fails) << " fails) | "
         << "Write: " << formatBytes(write_bytes) << " ("
         << static_cast<uint64_t>(write_reqs) << " reqs, "
-        << static_cast<uint64_t>(write_fails) << " fails)";
+        << static_cast<uint64_t>(write_fails) << " fails) | "
+        << "Failovers: " << static_cast<uint64_t>(failovers);
 
     return oss.str();
 }
@@ -373,6 +388,8 @@ void TentMetrics::recordReadCompleted(size_t, double) {}
 void TentMetrics::recordWriteCompleted(size_t, double) {}
 void TentMetrics::recordReadFailed(size_t) {}
 void TentMetrics::recordWriteFailed(size_t) {}
+void TentMetrics::recordTransportFailover() {}
+void TentMetrics::recordDeadlineMLU(double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
     return "# TENT metrics disabled at compile time\n";

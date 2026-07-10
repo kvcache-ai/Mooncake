@@ -42,6 +42,26 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     }
 }
 
+ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {
+    std::lock_guard<std::mutex> lock(etcd_mutex_);
+
+    char* err_msg = nullptr;
+    int ret = EtcdStoreResetClientWrapper(
+        const_cast<char*>(etcd_endpoints.c_str()), &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to reset etcd store client: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+
+    connected_endpoints_ = etcd_endpoints;
+    etcd_connected_ = true;
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
                           std::string& value, EtcdRevisionId& revision_id) {
     char* err_msg = nullptr;
@@ -141,6 +161,16 @@ ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     return ErrorCode::OK;
 }
 
+ErrorCode EtcdHelper::RevokeLease(EtcdLeaseId lease_id) {
+    char* err_msg = nullptr;
+    if (0 != EtcdStoreRevokeLeaseWrapper(lease_id, &err_msg)) {
+        LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::WatchUntilDeleted(const char* key,
                                         const size_t key_size) {
     char* err_msg = nullptr;
@@ -190,6 +220,17 @@ ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     char* err_msg = nullptr;
     if (0 != EtcdStoreCancelKeepAliveWrapper(lease_id, &err_msg)) {
         LOG(ERROR) << "Failed to cancel keep lease: " << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms) {
+    char* err_msg = nullptr;
+    if (0 !=
+        EtcdStoreWaitKeepAliveReadyWrapper(lease_id, timeout_ms, &err_msg)) {
+        LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
@@ -381,6 +422,11 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
+ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {
+    (void)etcd_endpoints;
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+}
+
 ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
                           std::string& value, EtcdRevisionId& revision_id) {
     (void)key;
@@ -421,6 +467,12 @@ ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
+ErrorCode EtcdHelper::RevokeLease(EtcdLeaseId lease_id) {
+    (void)lease_id;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
 ErrorCode EtcdHelper::WatchUntilDeleted(const char* key,
                                         const size_t key_size) {
     (void)key;
@@ -444,6 +496,13 @@ ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
 
 ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     (void)lease_id;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms) {
+    (void)lease_id;
+    (void)timeout_ms;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }

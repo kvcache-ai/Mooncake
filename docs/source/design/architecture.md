@@ -12,7 +12,7 @@ Mooncake:
 
 ## Architectural Overview
 ![architecture](../image/mooncake-store.png)
-- Mooncake provides object-level operations, i.e. `Get/Put/List/Del`, and also supports dynamically configurating replication strategies (`Replicate` operations);
+- Mooncake provides object-level operations, i.e. `Get/Put/List/Del`, and also supports dynamically configuring replication strategies (`Replicate` operations);
 - Mooncake supports zero-copy and multi-NIC data transfer over VRAM/DRAM/NVMe SSD. This feature is supported by Transfer Engine, which has been open-sourced;
 - **The master node** centrally manages the mappings of objects to VRAM/DRAM/NVM buffers. The master node also drives **managed pool buffer nodes** to achieve data transfer by calling Transfer Engine's APIs;
 - **Managed pool buffer nodes** mainly provide DRAM space for storing objects.

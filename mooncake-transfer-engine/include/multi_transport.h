@@ -39,6 +39,12 @@ class MultiTransport {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    Status mp_submitTransfer(BatchID batch_id,
+                             const std::vector<TransferRequest> &entries,
+                             std::string &proto);
+#endif
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
 
@@ -49,12 +55,26 @@ class MultiTransport {
 
     Transport *getTransport(const std::string &proto);
 
+    /**
+     * @brief Check if TCP is the only installed transport.
+     *
+     * When only TCP transport is available (no RDMA, NVLink, etc.),
+     * local memcpy is preferred over TCP loopback for same-host transfers.
+     */
+    bool isTcpOnly() const;
+
     std::vector<Transport *> listTransports();
 
     void *getBaseAddr();
 
    private:
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    Status mp_selectTransport(const TransferRequest &entry,
+                              Transport *&transport,
+                              std::string &preferred_proto);
+#endif
 
    private:
     std::shared_ptr<TransferMetadata> metadata_;

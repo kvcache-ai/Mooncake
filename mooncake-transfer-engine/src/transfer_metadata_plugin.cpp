@@ -16,10 +16,12 @@
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <json/value.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <random>
@@ -87,15 +89,23 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
     }
 
     RedisStoragePlugin(const std::string &metadata_uri,
-                       const std::string &password, const uint8_t &db_index)
+                       const std::string &username, const std::string &password,
+                       const uint8_t &db_index)
         : RedisStoragePlugin(metadata_uri) {
         if (!client_) {
             return;
         }
 
         if (!password.empty()) {
-            auto *reply = static_cast<redisReply *>(
-                redisCommand(client_, "AUTH %s", password.c_str()));
+            redisReply *reply = nullptr;
+            if (!username.empty()) {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b %b", username.data(), username.size(),
+                    password.data(), password.size()));
+            } else {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b", password.data(), password.size()));
+            }
             if (!reply || reply->type == REDIS_REPLY_ERROR) {
                 LOG(ERROR) << "RedisStoragePlugin: authentication failed for "
                            << metadata_uri_;
@@ -542,6 +552,9 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
+        const char *username = std::getenv("MC_REDIS_USERNAME");
+        std::string username_str = username ? username : "";
+
         const char *password = std::getenv("MC_REDIS_PASSWORD");
         std::string password_str = password ? password : "";
 
@@ -563,8 +576,8 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
             }
         }
 
-        return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second,
-                                                    password_str, db_index);
+        return std::make_shared<RedisStoragePlugin>(
+            parsed_conn_string.second, username_str, password_str, db_index);
     }
 #endif  // USE_REDIS
 
@@ -634,6 +647,10 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) {
         on_notify_callback_ = callback;
+    }
+
+    virtual void registerOnProbeCallBack(OnReceiveCallBack callback) {
+        on_probe_callback_ = callback;
     }
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
@@ -767,6 +784,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                         on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
                     if (on_notify_callback_) on_notify_callback_(peer, local);
+                } else if (type == HandShakeRequestType::Probe) {
+                    if (on_probe_callback_) on_probe_callback_(peer, local);
                 } else {
                     LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                                   "message type";
@@ -839,6 +858,43 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return 0;
             }
             if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
+                return ret;
+            }
+        }
+
+        freeaddrinfo(result);
+        return ret;
+    }
+
+    virtual int sendProbe(std::string ip_or_host_name, uint16_t rpc_port,
+                          const Json::Value &local, Json::Value &peer) {
+        struct addrinfo hints;
+        struct addrinfo *result, *rp;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        char service[16];
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
+            PLOG(ERROR)
+                << "SocketHandShakePlugin: failed to get IP address of peer "
+                   "server "
+                << ip_or_host_name << ":" << rpc_port
+                << ", check DNS and /etc/hosts, or use IPv4 address instead";
+            return ERR_DNS;
+        }
+
+        int ret = 0;
+        for (rp = result; rp; rp = rp->ai_next) {
+            ret = doSendProbe(rp, local, peer);
+            if (ret == 0) {
+                freeaddrinfo(result);
+                return 0;
+            }
+            if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
                 return ret;
             }
         }
@@ -874,6 +930,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return 0;
             }
             if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
                 return ret;
             }
         }
@@ -905,9 +962,77 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
+        // SO_RCVTIMEO does not apply to connect(). A blocking connect() to
+        // an unroutable address (e.g. a torn-down pod IP) stalls for the
+        // kernel's full SYN-retry cycle -- minutes -- and this runs on RDMA
+        // worker threads, where the stall also blocks CQ polling. Connect in
+        // non-blocking mode and bound the wait with poll().
+        int flags = fcntl(conn_fd, F_GETFL, 0);
+        if (flags == -1 || fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(O_NONBLOCK)";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
         if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
-            PLOG(ERROR) << "SocketHandShakePlugin: connect()"
-                        << getNetworkAddress(addr->ai_addr);
+            if (errno != EINPROGRESS) {
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+
+            const int64_t deadline_ms =
+                getCurrentTimeInMilli() +
+                globalConfig().handshake_connect_timeout * 1000;
+            struct pollfd pfd;
+            pfd.fd = conn_fd;
+            pfd.events = POLLOUT;
+            while (true) {
+                const int64_t remaining_ms =
+                    deadline_ms - getCurrentTimeInMilli();
+                // poll() returning 0 already means the timeout expired; an
+                // exhausted deadline (only reachable after EINTR) is the
+                // same condition.
+                int ret =
+                    remaining_ms <= 0 ? 0 : poll(&pfd, 1, (int)remaining_ms);
+                if (ret > 0) break;
+                if (ret == 0) {
+                    errno = ETIMEDOUT;
+                    PLOG(ERROR) << "SocketHandShakePlugin: connect() "
+                                << getNetworkAddress(addr->ai_addr);
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                if (errno != EINTR) {
+                    PLOG(ERROR) << "SocketHandShakePlugin: poll()";
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                // EINTR: retry with the remaining time.
+            }
+
+            int conn_err = 0;
+            socklen_t err_len = sizeof(conn_err);
+            if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &conn_err,
+                           &err_len)) {
+                PLOG(ERROR) << "SocketHandShakePlugin: getsockopt(SO_ERROR)";
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+            if (conn_err) {
+                errno = conn_err;
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+        }
+
+        // Restore blocking mode; the request/response exchange relies on
+        // blocking reads bounded by SO_RCVTIMEO.
+        if (fcntl(conn_fd, F_SETFL, flags) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(restore flags)";
             close(conn_fd);
             return ERR_SOCKET;
         }
@@ -982,6 +1107,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return 0;
             }
             if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
                 return ret;
             }
         }
@@ -1022,6 +1148,45 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         std::string errs;
         if (!parseJsonString(json_str, peer_notify, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
+                          "message, malformed json format: "
+                       << errs;
+            close(conn_fd);
+            return ERR_MALFORMED_JSON;
+        }
+
+        close(conn_fd);
+        return 0;
+    }
+
+    int doSendProbe(struct addrinfo *addr, const Json::Value &local_probe,
+                    Json::Value &peer_probe) {
+        int conn_fd = -1;
+        int ret = doConnect(addr, conn_fd);
+        if (ret) {
+            return ret;
+        }
+
+        ret = writeString(conn_fd, HandShakeRequestType::Probe,
+                          Json::FastWriter{}.write(local_probe));
+        if (ret) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to send probe message: "
+                   "malformed json format, check tcp connection";
+            close(conn_fd);
+            return ret;
+        }
+
+        auto [type, json_str] = readString(conn_fd);
+        if (type != HandShakeRequestType::Probe) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: unexpected probe message type";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        std::string errs;
+        if (!parseJsonString(json_str, peer_probe, &errs)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive probe "
                           "message, malformed json format: "
                        << errs;
             close(conn_fd);
@@ -1082,6 +1247,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
     OnReceiveCallBack on_notify_callback_;
+    OnReceiveCallBack on_probe_callback_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(

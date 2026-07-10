@@ -2343,7 +2343,7 @@ TEST_F(StorageBackendTest,
     // Deleter thread: calls DeleteBucket
     std::thread deleter_thread([&]() {
         delete_started.store(true);
-        auto delete_result = storage_backend.DeleteBucket(bucket_id);
+        std::ignore = storage_backend.DeleteBucket(bucket_id);
         delete_completed.store(true);
     });
 

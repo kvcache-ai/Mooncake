@@ -1,4 +1,13 @@
+---
+orphan: true
+---
+
 # vLLM v1 backend Disaggregated Serving with MooncakeConnector
+
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [Disaggregated Prefill-Decode](disagg-prefill-decode) guide. Please use that guide for up-to-date information.
+```
 
 ## Overview
 
@@ -16,7 +25,7 @@ Install mooncake-transfer-engine through pip:
 pip install mooncake-transfer-engine
 ```
 
-Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../build.md).
+Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../build.md).
 
 ### Install vLLM
 
@@ -45,7 +54,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
 #### Proxy Server
 
 ```bash
-# In vllm root directory. 
+# In vllm root directory.
 python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
   --prefiller-host 192.168.0.2 --prefiller-port 8010 \
   --decoder-host 192.168.0.3 --decoder-port 8020
@@ -100,7 +109,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
     - `kv_producer`: For prefiller instances that generate KV caches
     - `kv_consumer`: For decoder instances that consume KV caches
     - `kv_both`: Enables symmetric functionality (experimental)
-    - `num_workers`: Thread pool size in each prefiller worker to send kvcache (default 10)
+  - `num_workers`: Thread pool size in each prefiller worker to send kvcache (default 10)
 
 ## Environment Variables
 
@@ -118,7 +127,7 @@ The following environment variables can be used to customize Mooncake behavior:
 
 ## Performance
 
-For detailed performance benchmarks and results, see the [vLLM Benchmark](../../performance/vllm-v1-support-benchmark.md) documentation.
+For detailed performance benchmarks and results, see the [vLLM PD Disaggregation Performance](../../../performance/vllm/vllm-v1-pd-performance.md) documentation.
 
 ## Notes
 

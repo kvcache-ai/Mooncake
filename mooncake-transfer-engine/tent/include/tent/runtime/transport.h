@@ -22,12 +22,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <queue>
 #include <string>
 
 #include "tent/common/status.h"
+#include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/control_plane.h"
 
@@ -45,9 +47,20 @@ struct Capabilities {
 class Transport {
    public:
     struct SubBatch {
-        SubBatch() {}
+        SubBatch() : device_mask(~0ULL) {}
         virtual ~SubBatch() {}
         virtual size_t size() const = 0;
+        void notifyProgress() {
+            if (notify_progress) notify_progress(progress_batch_id);
+        }
+
+        uint64_t device_mask;  // Device mask for transport selection
+        // Named QP pool for this batch's transfers (RFC #2568 step 3). Empty =
+        // no pool (default spray). Carried like device_mask, from the matched
+        // SelectionPolicy down to each RdmaTask.
+        std::string qp_pool;
+        BatchID progress_batch_id{0};
+        std::function<void(BatchID)> notify_progress;
     };
 
     using SubBatchRef = SubBatch *;

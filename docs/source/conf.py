@@ -41,35 +41,28 @@ extensions = [
     "sphinx.ext.linkcode",
     "sphinx.ext.intersphinx",
     "sphinx_copybutton",
-    "autodoc2",
     "myst_parser",
     "sphinxarg.ext",
     "sphinx_design",
     "sphinx_togglebutton",
+    "sphinxcontrib.mermaid",
 ]
 myst_enable_extensions = [
     "colon_fence",
     "fieldlist",
 ]
-autodoc2_packages = [
-    {
-        "path": "../../Mooncake",
-        "exclude_dirs": ["__pycache__", "third_party"],
-    },
-]
-autodoc2_output_dir = "api"
-autodoc2_render_plugin = "myst"
-autodoc2_hidden_objects = ["dunder", "private", "inherited"]
-autodoc2_sort_names = True
-autodoc2_index_template = None
-
+myst_fence_as_directive = ["mermaid"]
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns: list[str] = ["**/*.template.md", "**/*.inc.md"]
+exclude_patterns: list[str] = [
+    "**/*.template.md",
+    "**/*.inc.md",
+    "zh_archive/**",
+]
 
 # Exclude the prompt "$" when copying code
 copybutton_prompt_text = r"\$ "
@@ -92,6 +85,7 @@ html_theme_options = {
     # Prevents the full API being added to the left sidebar of every page.
     # Reduces build time by 2.5x and reduces build size from ~225MB to ~95MB.
     'collapse_navbar': True,
+    'show_navbar_depth': 2,
     # Makes API visible in the right sidebar on API reference pages.
     'show_toc_level': 3,
 }

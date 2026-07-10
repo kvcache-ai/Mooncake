@@ -40,8 +40,8 @@ class Environ {
         return enable_dest_device_affinity_;
     }
     bool GetUseIpv6() const { return use_ipv6_; }
-    int GetMinPrcPort() const { return min_prc_port_; }
-    int GetMaxPrcPort() const { return max_prc_port_; }
+    int GetMinRpcPort() const { return min_rpc_port_; }
+    int GetMaxRpcPort() const { return max_rpc_port_; }
     int GetEnableParallelRegMr() const { return enable_parallel_reg_mr_; }
     std::string GetEndpointStoreType() const { return endpoint_store_type_; }
     bool GetForceTcp() const { return force_tcp_; }
@@ -49,12 +49,33 @@ class Environ {
     bool GetForceMnnvl() const { return force_mnnvl_; }
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
+    bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
+    int GetEfaCqThreads() const { return efa_cq_threads_; }
 
-   private:
-    Environ();
+    // AWS / S3 client configuration
+    std::string GetAwsRegion() const { return aws_region_; }
+    std::string GetAwsS3Endpoint() const { return aws_s3_endpoint_; }
+    std::string GetAwsBucketName() const { return aws_bucket_name_; }
+    std::string GetAwsAccessKeyId() const { return aws_access_key_id_; }
+    std::string GetAwsSecretAccessKey() const { return aws_secret_access_key_; }
+    bool GetAwsUseVirtualAddressing() const {
+        return aws_use_virtual_addressing_;
+    }
+    bool GetAwsUseHttps() const { return aws_use_https_; }
+    // Empty string means "unset" — s3_helper keeps the AWS SDK default in
+    // that case. Parsing to AWS enums is done by the consumer.
+    std::string GetAwsRequestChecksumCalculation() const {
+        return aws_request_checksum_calculation_;
+    }
+    std::string GetAwsResponseChecksumValidation() const {
+        return aws_response_checksum_validation_;
+    }
+    int64_t GetAwsConnectTimeoutMs() const { return aws_connect_timeout_ms_; }
+    int64_t GetAwsRequestTimeoutMs() const { return aws_request_timeout_ms_; }
 
     // Helper method to get int from env
     static int GetInt(const char* name, int default_value);
+    static int64_t GetInt64(const char* name, int64_t default_value);
     // Helper method to get size_t from env
     static size_t GetSizeT(const char* name, size_t default_value);
     // Helper method to get bool from env (checks for "1", "true", "TRUE")
@@ -62,6 +83,9 @@ class Environ {
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
+
+   private:
+    Environ();
 
     // Member variables
     int num_cq_per_ctx_;
@@ -90,8 +114,8 @@ class Environ {
     int fragment_ratio_;
     bool enable_dest_device_affinity_;
     bool use_ipv6_;
-    int min_prc_port_;
-    int max_prc_port_;
+    int min_rpc_port_;
+    int max_rpc_port_;
     int enable_parallel_reg_mr_;
     std::string endpoint_store_type_;
     bool force_tcp_;
@@ -99,6 +123,21 @@ class Environ {
     bool force_mnnvl_;
     bool intra_nvlink_;
     bool path_roundrobin_;
+    bool with_nvidia_peermem_;
+    int efa_cq_threads_;
+
+    // AWS / S3 client configuration
+    std::string aws_region_;
+    std::string aws_s3_endpoint_;
+    std::string aws_bucket_name_;
+    std::string aws_access_key_id_;
+    std::string aws_secret_access_key_;
+    bool aws_use_virtual_addressing_;
+    bool aws_use_https_;
+    std::string aws_request_checksum_calculation_;
+    std::string aws_response_checksum_validation_;
+    int64_t aws_connect_timeout_ms_;
+    int64_t aws_request_timeout_ms_;
 };
 
 }  // namespace mooncake

@@ -8,12 +8,15 @@
 
 #include "client_wrapper.h"
 #include "e2e_utils.h"
+#include "ha/leadership/leader_coordinator_factory.h"
 #include "process_handler.h"
 #include "types.h"
 #include "utils.h"
 
 USE_engine_flags;
 FLAG_etcd_endpoints;
+FLAG_ha_backend_type;
+FLAG_ha_backend_connstring;
 FLAG_master_path;
 FLAG_client_path;
 FLAG_out_dir;
@@ -23,6 +26,33 @@ constexpr int client_port_base = 12888;
 
 namespace mooncake {
 namespace testing {
+
+namespace {
+
+std::shared_ptr<ha::LeaderCoordinator> CreateLeaderCoordinatorOrNull(
+    ha::HABackendType backend_type, const std::string& connstring) {
+    ha::HABackendSpec spec{
+        .type = backend_type,
+        .connstring = connstring,
+        .cluster_namespace = "",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    if (!coordinator) {
+        return nullptr;
+    }
+    return std::shared_ptr<ha::LeaderCoordinator>(
+        std::move(coordinator.value()));
+}
+
+tl::expected<ha::HABackendType, ErrorCode> ParseConfiguredHABackendType() {
+    auto backend_type = ha::ParseHABackendType(FLAGS_ha_backend_type);
+    if (!backend_type.has_value()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return backend_type.value();
+}
+
+}  // namespace
 
 class ChaosTest : public ::testing::Test {
    protected:
@@ -36,10 +66,13 @@ class ChaosTest : public ::testing::Test {
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata URL: " << FLAGS_engine_meta_url;
 
-        master_view_helper_ = std::make_shared<MasterViewHelper>();
-        EXPECT_EQ(master_view_helper_->ConnectToEtcd(FLAGS_etcd_endpoints),
-                  ErrorCode::OK)
-            << "Failed to connect to etcd";
+        auto backend_type = ParseConfiguredHABackendType();
+        ASSERT_TRUE(backend_type.has_value())
+            << "Invalid HA backend type: " << FLAGS_ha_backend_type;
+        leader_coordinator_ = CreateLeaderCoordinatorOrNull(
+            backend_type.value(), ResolveTestHABackendConnstring());
+        ASSERT_TRUE(leader_coordinator_ != nullptr)
+            << "Failed to create HA leader coordinator";
     }
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
@@ -47,11 +80,17 @@ class ChaosTest : public ::testing::Test {
     void SetUp() override {
         // Start masters
         const int master_num = 3;
+        MasterRunnerConfig master_config{
+            .enable_ha = true,
+            .ha_backend_type = FLAGS_ha_backend_type,
+            .ha_backend_connstring = FLAGS_ha_backend_connstring,
+            .etcd_endpoints = FLAGS_etcd_endpoints,
+        };
         for (int i = 0; i < master_num; ++i) {
             masters_.emplace_back(
                 std::make_unique<mooncake::testing::MasterProcessHandler>(
-                    FLAGS_master_path, FLAGS_etcd_endpoints,
-                    master_port_base + i, i, FLAGS_out_dir));
+                    FLAGS_master_path, master_config, master_port_base + i, i,
+                    FLAGS_out_dir));
             ASSERT_TRUE(masters_.back()->start());
         }
 
@@ -73,8 +112,7 @@ class ChaosTest : public ::testing::Test {
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
             host_name,              // Local hostname
             FLAGS_engine_meta_url,  // Metadata connection string
-            FLAGS_protocol, FLAGS_device_name,
-            "etcd://" + FLAGS_etcd_endpoints);
+            FLAGS_protocol, FLAGS_device_name, BuildTestMasterServerEntry());
         EXPECT_TRUE(client_opt.has_value()) << "Failed to create client";
         if (!client_opt.has_value()) {
             return nullptr;
@@ -84,10 +122,11 @@ class ChaosTest : public ::testing::Test {
 
     static void GetLeaderIndex(int& leader_index) {
         // Find out the leader
-        std::string master_address;
-        ViewVersionId version;
-        ASSERT_EQ(master_view_helper_->GetMasterView(master_address, version),
-                  ErrorCode::OK);
+        auto current_view = leader_coordinator_->ReadCurrentView();
+        ASSERT_TRUE(current_view.has_value());
+        ASSERT_TRUE(current_view.value().has_value());
+        const std::string& master_address =
+            current_view.value()->leader_address;
 
         // Validate master address format: should be ip:port
         size_t colon_pos = master_address.find(':');
@@ -113,14 +152,14 @@ class ChaosTest : public ::testing::Test {
     }
 
     static void WaitMasterViewChange() {
-        sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
+        sleep(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC * 3);
     }
 
     static void WaitClientCrashDetection() {
         sleep(DEFAULT_CLIENT_LIVE_TTL_SEC + 5);
     }
 
-    static std::shared_ptr<MasterViewHelper> master_view_helper_;
+    static std::shared_ptr<ha::LeaderCoordinator> leader_coordinator_;
 
     // Instance members for master management
     std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
@@ -128,7 +167,7 @@ class ChaosTest : public ::testing::Test {
     int leader_index_;
 };
 
-std::shared_ptr<MasterViewHelper> ChaosTest::master_view_helper_ = nullptr;
+std::shared_ptr<ha::LeaderCoordinator> ChaosTest::leader_coordinator_ = nullptr;
 
 // Verify the system failover after the leader is killed.
 TEST_F(ChaosTest, LeaderKilledFailover) {
@@ -306,7 +345,7 @@ TEST_F(ChaosTest, ClientKilledFailover) {
         .mount_prob = 1000,
         .unmount_prob = 0,
         .port = client_port_base + 0,  // index 0
-        .master_server_entry = "etcd://" + FLAGS_etcd_endpoints,
+        .master_server_entry = BuildTestMasterServerEntry(),
         .engine_meta_url = FLAGS_engine_meta_url,
         .protocol = FLAGS_protocol,
         .device_name = FLAGS_device_name,

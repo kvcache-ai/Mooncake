@@ -8,6 +8,11 @@ add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
 
+# Add BatchGetReplicaList latency benchmark executable
+add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
+target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
+                                                       mooncake_store)
+
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)
@@ -21,7 +26,7 @@ target_link_libraries(
                                 gflags::gflags glog::glog pthread)
 
 # Add allocation strategy benchmark executable
-# This benchmark tests AllocationStrategy performance with configurable 
+# This benchmark tests AllocationStrategy performance with configurable
 # segment counts, allocation sizes, replica counts, and workload patterns
 add_executable(allocation_strategy_bench allocation_strategy_bench.cpp)
 target_link_libraries(
@@ -35,8 +40,21 @@ target_link_libraries(
                               gflags::gflags glog::glog pthread)
 
 # Adaptive scheduler benchmark: simulates LLM workload phases
-# (PREFIX_HEAVY → SCAN_HEAVY → MIXED) and verifies scheduler mode transitions
+# (PREFIX_HEAVY -> SCAN_HEAVY -> MIXED) and verifies scheduler mode transitions
 add_executable(adaptive_scheduler_bench adaptive_scheduler_bench.cpp)
 target_link_libraries(
   adaptive_scheduler_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
+
+# Add NoF worker pool benchmark executable
+if(USE_NOF)
+  add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
+  target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
+                                                       gflags::gflags)
+endif()
+
+# Add BatchEvict benchmark executable
+add_executable(batch_evict_bench batch_evict_bench.cpp)
+target_link_libraries(
+  batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
+                            gflags::gflags glog::glog pthread)

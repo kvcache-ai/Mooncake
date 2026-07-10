@@ -1,6 +1,8 @@
 {
   "name": "Mooncake Dev",
-  "dockerFile": "Dockerfile",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
   "runArgs": [
     "--cap-add=SYS_PTRACE",
     "--cap-add=NET_RAW",
@@ -18,7 +20,7 @@
     "vscode": {
       "settings": {
         "terminal.integrated.shell.linux": "/bin/bash",
-        "bazel.buildifierFixOnFormat": true,
+        "bazel.buildifierFixOnFormat": true
       }
     }
   }

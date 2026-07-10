@@ -1,0 +1,122 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "tent/runtime/progress_worker.h"
+
+#include <chrono>
+
+#include "tent/common/status.h"
+#include "tent/runtime/transfer_engine_impl.h"
+
+namespace mooncake {
+namespace tent {
+
+ProgressWorker::ProgressWorker(TransferEngineImpl* impl,
+                               std::chrono::microseconds fallback_interval)
+    : impl_(impl), fallback_interval_(fallback_interval) {}
+
+ProgressWorker::~ProgressWorker() { stop(); }
+
+void ProgressWorker::start() {
+    if (running_.exchange(true, std::memory_order_acq_rel)) return;
+    thread_ = std::thread(&ProgressWorker::runner, this);
+}
+
+void ProgressWorker::stop() {
+    if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // Drop pending work; outstanding batches will be reaped via the
+        // user thread's freeBatch path.
+        order_.clear();
+        queued_.clear();
+        queue_ready_ = false;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+}
+
+void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id) {
+    if (!batch_id) return;
+    if (!running_.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!queued_.insert(batch_id).second) return;
+        order_.push_back(batch_id);
+    }
+    cv_.notify_one();
+}
+
+void ProgressWorker::notifyRuntimeQueueReady() {
+    if (!running_.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        queue_ready_ = true;
+    }
+    cv_.notify_one();
+}
+
+void ProgressWorker::runner() {
+    while (true) {
+        BatchID batch_id = 0;
+        bool queue_ready = false;
+        bool fallback_due = false;
+        bool queue_active = impl_->hasActiveRuntimeQueue();
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            if (queue_active && fallback_interval_.count() > 0) {
+                const bool woke = cv_.wait_for(lk, fallback_interval_, [&] {
+                    return !running_.load(std::memory_order_acquire) ||
+                           queue_ready_ || !order_.empty();
+                });
+                fallback_due = !woke;
+            } else {
+                cv_.wait(lk, [&] {
+                    return !running_.load(std::memory_order_acquire) ||
+                           queue_ready_ || !order_.empty();
+                });
+            }
+            if (!running_.load(std::memory_order_acquire)) return;
+            queue_ready = queue_ready_;
+            queue_ready_ = false;
+            if (!order_.empty()) {
+                batch_id = order_.front();
+                order_.pop_front();
+                queued_.erase(batch_id);
+            }
+        }
+        if (queue_ready) {
+            (void)impl_->progressRuntimeQueue();
+            (void)impl_->lazyFreeBatch();
+        }
+        // progressBatch acquires the engine's progress_mutex_ and silently
+        // returns InvalidArgument if the batch was freed before we got here.
+        // PENDING means "kick again later"; the next notify wakes us up.
+        // Terminal states are observed here; lazyFreeBatch reclaims a batch
+        // only if freeBatch has already marked it free_requested.
+        if (batch_id) {
+            TransferStatus s;
+            (void)impl_->progressBatch(batch_id, s);
+            (void)impl_->progressRuntimeQueue();
+            (void)impl_->lazyFreeBatch();
+        }
+        if (fallback_due && !queue_ready && !batch_id && queue_active) {
+            (void)impl_->progressRuntimeQueue();
+            (void)impl_->lazyFreeBatch();
+        }
+    }
+}
+
+}  // namespace tent
+}  // namespace mooncake

@@ -1,3 +1,5 @@
+#pragma once
+
 #include <string>
 #include <musa.h>
 #include <musa_runtime.h>
@@ -20,6 +22,11 @@ const static std::string GPU_PREFIX = "musa:";
 #define CU_POINTER_ATTRIBUTE_RANGE_SIZE MU_POINTER_ATTRIBUTE_RANGE_SIZE
 #define CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED \
     MU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED \
+    MU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED
+#define CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL MU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+
+#define CUcontext MUcontext
 
 #define CUdevice MUdevice
 #define CUdeviceptr MUdeviceptr
@@ -77,6 +84,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaMemcpyDefault musaMemcpyDefault
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#define cudaMemcpyKind musaMemcpyKind
 #define cudaMemset musaMemset
 #define cudaMemsetAsync musaMemsetAsync
 #define cudaMemoryTypeDevice musaMemoryTypeDevice
@@ -86,7 +94,40 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaPointerGetAttributes musaPointerGetAttributes
 #define cudaSetDevice musaSetDevice
 #define cudaStreamCreate musaStreamCreate
+#define cudaStreamCreateWithFlags musaStreamCreateWithFlags
+#define cudaStreamNonBlocking musaStreamNonBlocking
 #define cudaStreamDestroy musaStreamDestroy
+#define cudaStreamPerThread musaStreamPerThread
+#define cudaStreamQuery musaStreamQuery
+#define cudaStreamWaitEvent musaStreamWaitEvent
+#define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaStreamSynchronize musaStreamSynchronize
 #define cudaStream_t musaStream_t
 #define cudaSuccess musaSuccess
+#define cudaErrorNotReady musaErrorNotReady
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaEvent_t musaEvent_t
+#define cudaEventCreateWithFlags musaEventCreateWithFlags
+#define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventDestroy musaEventDestroy
+#define cudaEventRecord musaEventRecord
+#define cudaEventSynchronize musaEventSynchronize
+#define cudaDeviceProp musaDeviceProp
+#define cudaGetDeviceProperties musaGetDeviceProperties
+#define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
+#define cudaDevAttrClockRate musaDevAttrClockRate
+#define cudaLaunchConfig_t musaLaunchConfig_t
+#define cudaLaunchAttribute musaLaunchAttribute
+#define cudaLaunchAttributeCooperative musaLaunchAttributeCooperative
+#define cudaLaunchKernelEx musaLaunchKernelEx
+#define CUDA_R_16BF MUSA_R_16BF
+#define CUDA_R_32F MUSA_R_32F
+
+// IBGDA-specific mappings
+#define cuInit muInit
+#define cuDevicePrimaryCtxRetain muDevicePrimaryCtxRetain
+#define cuDevicePrimaryCtxRelease muDevicePrimaryCtxRelease
+#define cuCtxSetCurrent muCtxSetCurrent
+#define cudaHostRegisterMapped musaHostRegisterMapped
+#define cudaHostRegisterIoMemory musaHostRegisterIoMemory
+#define cudaHostGetDevicePointer musaHostGetDevicePointer

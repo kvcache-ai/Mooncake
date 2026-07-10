@@ -5,6 +5,7 @@ build_ofed4
 old
 local_test
 go.sum
+!mooncake-common/etcd/go.sum
 *.so
 bin
 mod
@@ -197,14 +198,16 @@ mooncake-wheel/mooncake/allocator_ascend_npu.py
 mooncake-wheel/mooncake/mooncake_master
 mooncake-wheel/mooncake/transfer_engine_bench
 
-# Claude Code Memory
-CLAUDE.md
-
 # CodeQL
 _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
 contest_info/
-.claude/
 .gstack/
+
+# core dumps
+core_*
+# MacOS
+.DS_Store
+.envrc

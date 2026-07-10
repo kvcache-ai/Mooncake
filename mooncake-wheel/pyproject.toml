@@ -1,36 +1,54 @@
+# mooncake-wheel/pyproject.toml
+#
+# This file is built from this directory; scripts/build_wheel.sh `cd`s
+# here before invoking setuptools. Do not move this file or its parent
+# build script out of sync.
+#
+# NOTE: the `keywords` and `classifiers` arrays below MUST stay on a
+# single line. They are sed-substituted by scripts/build_wheel.sh for
+# each build variant (non-cuda, cuda13, npu, efa, efa-non-cuda, musa);
+# reordering or wrapping will silently break the variant build matrix.
+#
+# `readme = "README.md"` points at a per-build copy of the repo-root
+# README.md, materialized by scripts/build_wheel.sh (which `cp`s
+# ../README.md into this directory before invoking the build backend, and
+# `rm`s it after). This avoids modern setuptools' path-sandbox check
+# (rejects `../`-traversal) while keeping the root README.md the single
+# source of truth for the long description.
+
 [build-system]
 requires = ["setuptools>=61.0.0", "wheel>=0.37.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.10"
-description = "Python binding of a Mooncake library using pybind11"
+version = "0.3.11.post1"
+description = "A KVCache-centric Disaggregated Architecture for large-scale LLM inference and training."
 authors = [
     { name = "Mooncake Authors" }
 ]
-requires-python = ">=3.8"
-dependencies = ["aiohttp", "requests"]
-keywords = ["mooncake", "data transfer", "kv cache", "llm inference"]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: C++",
-    "Operating System :: POSIX :: Linux",
-]
-readme = ""
+requires-python = ">=3.10"
+readme = "README.md"   # local copy of ../README.md, materialized at build time by scripts/build_wheel.sh
+dependencies = ["aiohttp", "requests", "msgpack"]
+# Single-line arrays: sed-substituted by scripts/build_wheel.sh for each variant.
+keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
+classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
-Documentation = "https://github.com/kvcache-ai/Mooncake/tree/main/doc"
+Documentation = "https://kvcache-ai.github.io/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 Issues = "https://github.com/kvcache-ai/Mooncake/issues"
+Blog = "https://kvcache.ai/blog"
+Changelog = "https://github.com/kvcache-ai/Mooncake/releases"
+Slack = "https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA"
 
 [project.scripts]
 mooncake_master = "mooncake.cli:main"
 mooncake_client = "mooncake.cli_client:main"
 transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
-mc_store_rest_server = "mooncake.mooncake_store_service:main"
+mc_store_rest_server = "mooncake.mooncake_store_service:sync_main"
 transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
 
 [tool.setuptools]

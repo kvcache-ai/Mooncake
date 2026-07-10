@@ -1,13 +1,12 @@
 import ctypes
 import logging
-import os
 import threading
-from importlib import resources
 from typing import Dict, Final
-import torch_npu
 
 from torch import device as torch_device
 from torch_npu.npu.memory import NPUPluggableAllocator
+
+from .fabric_allocator_utils import get_mooncake_so_path, probe_allocator_backend
 
 logger = logging.getLogger(__name__)
 
@@ -20,62 +19,26 @@ class UBShmemAllocator:
 
     @classmethod
     def _get_so_path(cls) -> str:
-        """Dynamically locate ubshmem_fabric_allocator.so in the mooncake package installation"""
-        try:
-            # Attempt to locate package resource
-            with resources.path("mooncake", "ubshmem_fabric_allocator.so") as so_path:
-                if so_path.exists():
-                    return str(so_path)
-        except (ImportError, FileNotFoundError, TypeError):
-            pass
-
-        # Fallback strategy: check in package location via import metadata
-        try:
-            import mooncake
-
-            base_path = os.path.dirname(os.path.abspath(mooncake.__file__))
-            so_path = os.path.join(base_path, "ubshmem_fabric_allocator.so")
-            if os.path.exists(so_path):
-                return so_path
-        except (ImportError, FileNotFoundError, TypeError):
-            raise ImportError(
-                "UBShmemAllocator require mooncake-transfer-engine with USE_UBSHMEM enabled."
-            )
+        return get_mooncake_so_path(
+            "ubshmem_fabric_allocator.so",
+            "UBShmemAllocator require mooncake-transfer-engine with USE_UBSHMEM enabled.",
+        )
 
     @classmethod
     def _probe_fabric_memory_support(cls, so_path: str) -> bool:
-        """
-        Probe whether the system supports fabric memory by calling a C++ function
-        that attempts aclrtMallocPhysical with fabric memory support.
-        The shared library exports a symbol like:
-            extern "C" bool mc_probe_ub_fabric_support(int device_id);
-        """
-        try:
-            lib = ctypes.CDLL(so_path)
-
-            # Try to get the probe function
-            probe_func = lib.mc_probe_ub_fabric_support
-            probe_func.argtypes = [ctypes.c_int]
-            probe_func.restype = ctypes.c_bool
-
-            # Use device 0 for probing
-            dev_id = 0
-            supported = probe_func(dev_id)
-            if supported:
-                logger.info(f"Supports Fabric Memory with aclMallocPhysical")
-            else:
-                logger.info("Fabric memory not supported")
-            return supported
-
-        except AttributeError:
-            logger.warning(
-                "Symbol 'mc_probe_ub_fabric_support' not found in ubshmem_fabric_allocator.so. "
-                "Assuming fabric memory is NOT supported (you may need to update the library)."
+        supported = bool(
+            probe_allocator_backend(
+                so_path,
+                "mc_allocator_probe",
+                ctypes.c_int,
+                0,
             )
-            return False
-        except Exception as e:
-            logger.warning(f"Failed to probe fabric memory support: {e}")
-            return False
+        )
+        if supported:
+            logger.info("Supports Fabric Memory with aclMallocPhysical")
+        else:
+            logger.info("Fabric memory not supported")
+        return supported
 
     @classmethod
     def detect_mem_backend(cls) -> bool:
@@ -84,13 +47,14 @@ class UBShmemAllocator:
             with cls._lock:
                 if cls._probe_done:
                     return cls._supports_fabric
-                so_path = None
                 try:
-                    so_path = cls._get_so_path()
-                    # First try dedicated probe function
-                    cls._supports_fabric = cls._probe_fabric_memory_support(so_path)
+                    cls._supports_fabric = cls._probe_fabric_memory_support(
+                        cls._get_so_path()
+                    )
                 except Exception as e:
-                    logger.error(f"Critical error during fabric memory probe setup: {e}")
+                    logger.error(
+                        f"Critical error during fabric memory probe setup: {e}"
+                    )
                     cls._supports_fabric = False
 
                 cls._probe_done = True
@@ -102,6 +66,6 @@ class UBShmemAllocator:
             if device not in cls._instances:
                 so_path = cls._get_so_path()
                 cls._instances[device] = NPUPluggableAllocator(
-                    so_path, "mc_ub_fabric_malloc", "mc_ub_fabric_free"
+                    so_path, "mc_allocator_malloc", "mc_allocator_free"
                 )
             return cls._instances[device]
