@@ -117,10 +117,9 @@ class TransferEnginePy {
     // may be affected when using the batchTransferSync API. We currently
     // found this issue only in multi-node NVLink transfers.
     int batchTransferSync(const char *target_hostname,
-                          const std::vector<uintptr_t> &buffers,
-                          const std::vector<uintptr_t> &peer_buffer_addresses,
-                          const std::vector<size_t> &lengths,
-                          TransferOpcode opcode,
+                          std::vector<uintptr_t> buffers,
+                          std::vector<uintptr_t> peer_buffer_addresses,
+                          std::vector<size_t> lengths, TransferOpcode opcode,
                           TransferNotify *notify = nullptr,
                           const std::string &transport_hint = "");
 

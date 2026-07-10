@@ -490,10 +490,10 @@ int TransferEnginePy::transferSync(const char* target_hostname,
 }
 
 int TransferEnginePy::batchTransferSync(
-    const char* target_hostname, const std::vector<uintptr_t>& buffers,
-    const std::vector<uintptr_t>& peer_buffer_addresses,
-    const std::vector<size_t>& lengths, TransferOpcode opcode,
-    TransferNotify* notify, const std::string& transport_hint) {
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    TransferOpcode opcode, TransferNotify* notify,
+    const std::string& transport_hint) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
