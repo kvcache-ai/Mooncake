@@ -2,6 +2,7 @@
 **/*.Dockerfile
 .git/
 build/
+**/build/
 **/node_modules/
 **/__pycache__/
 **/.git/

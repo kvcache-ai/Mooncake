@@ -18,7 +18,7 @@ ENV PYTHON_VERSION=${PYTHON_VERSION} \
     PATH="/usr/local/go/bin:${PATH}" \
     GOPROXY="https://goproxy.cn,https://goproxy.io,direct"
 
-# Install base build utilities and Python (Ubuntu 22.04 has Python 3.10 built-in)
+# --- Layer 1: System packages (rarely changes) ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -29,6 +29,7 @@ RUN apt-get update && \
         pkg-config \
         build-essential \
         cmake \
+        ccache \
         liburing-dev \
         libnuma-dev \
         libzstd-dev \
@@ -46,21 +47,45 @@ RUN apt-get update && \
     apt-get purge -y --auto-remove software-properties-common && \
     rm -rf /var/lib/apt/lists/*
 
+# Configure ccache for the main build
+ENV CCACHE_DIR=/root/.ccache \
+    CCACHE_MAXSIZE=5G
+
 WORKDIR /workspace
+
+# --- Layer 2: Dependencies (cached as long as deps scripts don't change) ---
+# Copy only what dependencies.sh needs, so source code changes don't
+# invalidate this expensive layer.
+COPY dependencies.sh /workspace/
+COPY extern/ /workspace/extern/
+COPY .gitmodules /workspace/
+COPY mooncake-common/ /workspace/mooncake-common/
+# Remove stale CMake caches (e.g. from local builds) that cause path mismatches
+RUN find . -name CMakeCache.txt -delete && \
+    find . -name cmake_install.cmake -delete && \
+    rm -rf extern/yalantinglibs/build
+RUN --mount=type=cache,target=/root/.ccache \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/root/go \
+    bash dependencies.sh -y
+
+# --- Layer 3: Source code + build (ccache skips unchanged .cpp files) ---
 COPY . /workspace
 
 # Clean stale CMake caches that cause path mismatches in container
 RUN find . -name CMakeCache.txt -delete && \
     find . -name cmake_install.cmake -delete
 
-# Install Mooncake dependencies (yalantinglibs, Go, etc.)
-RUN bash dependencies.sh -y
-
 # Configure & build Mooncake (no CUDA, no RDMA, K8s lease)
-# Use -j2 to avoid OOM in constrained build environments
-RUN mkdir -p build && \
+# ccache + cache mount give near-incremental rebuild speed
+RUN --mount=type=cache,target=/root/.ccache \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/root/go \
+    mkdir -p build && \
     cd build && \
     cmake -G Ninja .. \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
         -DUSE_CUDA=OFF \
@@ -71,8 +96,9 @@ RUN mkdir -p build && \
     cmake --build . --parallel 2 --target build_k8s_lease_wrapper && \
     cmake --build . --parallel 2
 
-# Build the Python wheel from local sources
-RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
+# Build the Python wheel
+RUN --mount=type=cache,target=/root/.cache/pip \
+    OUTPUT_DIR=dist ./scripts/build_wheel.sh
 
 ###############################################################################
 # Stage 2: install the freshly built wheel into a runtime image
@@ -103,6 +129,6 @@ RUN apt-get update && \
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
 COPY scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
 RUN chmod 755 /usr/local/bin/mooncake-hicache-sizing
-RUN python3 -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
+RUN python3 -m pip install --no-deps --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]
