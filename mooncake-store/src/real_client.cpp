@@ -826,6 +826,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
+            const bool defer_hugetlb_population =
+                should_use_hugepage && seg_numa_nodes.empty() &&
+                should_defer_hugetlb_population();
 
             if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
@@ -841,7 +844,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
-                                                  get_hugepage_size_from_env());
+                                                  get_hugepage_size_from_env(),
+                                                  defer_hugetlb_population);
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -874,6 +878,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
+
+            // The direct HugeTLB path can defer population so mmap() does not
+            // synchronously fault a very large Store segment. Populate it in
+            // parallel immediately before transfer-engine registration. Keep
+            // NUMA-segmented mappings on their existing ibv_reg_mr()-driven
+            // first-touch path so mbind placement is preserved.
+            if (defer_hugetlb_population && !is_mmap_arena_allocation(ptr)) {
+                populate_hugetlb_mapping(ptr, mapped_size);
+            }
+
             auto mount_result =
                 client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {

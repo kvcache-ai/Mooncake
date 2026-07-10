@@ -811,8 +811,25 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 |----------|---------|-------------|
 | `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` |
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `1GB` |
+| `MC_STORE_HUGEPAGE_POPULATE_MODE` | unset | Set `rdma` to defer direct-mmap HugeTLB population until immediately before transfer-engine registration and fault pages in with parallel CPU writes |
+| `MC_DISABLE_RDMA_PRE_TOUCH` | `false` | Disable the RDMA transport's register/deregister pre-touch pass. Accepts `1`/`true`/`yes`/`on`; recommended with `MC_STORE_HUGEPAGE_POPULATE_MODE=rdma` to avoid duplicate preparation |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
+
+For large RDMA Store segments using the direct-`mmap()` path, deferred
+population avoids blocking in `mmap(MAP_POPULATE)` on the full mapping:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+export MC_STORE_HUGEPAGE_POPULATE_MODE=rdma
+export MC_DISABLE_RDMA_PRE_TOUCH=1
+```
+
+The mmap arena retains its eager `MAP_POPULATE` behavior for DMA safety. If
+the arena is enabled, also set `MC_DISABLE_MMAP_ARENA=1` to benchmark or use
+the deferred direct-mmap path. NUMA-segmented mappings keep their existing
+`mbind()` plus RDMA-registration first-touch behavior.
 
 #### yalantinglibs Log Level
 

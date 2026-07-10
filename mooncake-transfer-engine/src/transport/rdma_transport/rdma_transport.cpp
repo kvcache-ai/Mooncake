@@ -225,6 +225,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     bool do_pre_touch = context_list_.size() > 0 &&
                         std::thread::hardware_concurrency() >= 4 &&
                         length >= (size_t)4 * 1024 * 1024 * 1024;
+    if (do_pre_touch && Environ::GetBool("MC_DISABLE_RDMA_PRE_TOUCH", false)) {
+        do_pre_touch = false;
+    }
     if (do_pre_touch) {
         // Parallel Pre-touch the memory to speedup the registration process.
         int ret = preTouchMemory(addr, length);

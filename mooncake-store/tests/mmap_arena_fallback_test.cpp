@@ -3,6 +3,7 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 
 #include <cstdint>
 #include <cstring>
@@ -42,9 +43,52 @@ class MmapArenaFallbackTest : public ::testing::Test {
     void TearDown() override {
         unsetenv("MC_DISABLE_MMAP_ARENA");
         unsetenv("MC_MMAP_ARENA_POOL_SIZE");
+        unsetenv("MC_STORE_HUGEPAGE_POPULATE_MODE");
+        unsetenv("MC_STORE_HUGEPAGE_SIZE");
         unsetenv("MC_STORE_USE_HUGEPAGE");
     }
 };
+
+TEST_F(MmapArenaFallbackTest,
+       DeferredHugetlbPopulationRequiresHugepagesAndRdmaMode) {
+    unsetenv("MC_STORE_USE_HUGEPAGE");
+    unsetenv("MC_STORE_HUGEPAGE_POPULATE_MODE");
+    EXPECT_FALSE(should_defer_hugetlb_population());
+
+    setenv("MC_STORE_HUGEPAGE_POPULATE_MODE", "rdma", 1);
+    EXPECT_FALSE(should_defer_hugetlb_population());
+
+    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    EXPECT_TRUE(should_defer_hugetlb_population());
+
+    setenv("MC_STORE_HUGEPAGE_POPULATE_MODE", "mmap", 1);
+    EXPECT_FALSE(should_defer_hugetlb_population());
+}
+
+TEST_F(MmapArenaFallbackTest, PopulateHugetlbMappingUsesConfiguredPageStride) {
+    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    setenv("MC_STORE_HUGEPAGE_SIZE", "2MB", 1);
+
+    constexpr size_t kPageCount = 3;
+    constexpr size_t kMapSize = kPageCount * SZ_2MB;
+    void* mapping = mmap(nullptr, kMapSize, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+
+    auto* bytes = static_cast<unsigned char*>(mapping);
+    for (size_t page = 0; page < kPageCount; ++page) {
+        bytes[page * SZ_2MB] = 0xAB;
+    }
+    bytes[kMapSize - 1] = 0xAB;
+
+    populate_hugetlb_mapping(mapping, kMapSize);
+
+    for (size_t page = 0; page < kPageCount; ++page) {
+        EXPECT_EQ(bytes[page * SZ_2MB], 0);
+    }
+    EXPECT_EQ(bytes[kMapSize - 1], 0);
+    EXPECT_EQ(munmap(mapping, kMapSize), 0);
+}
 
 TEST_F(MmapArenaFallbackTest, ArenaInitFailureIsStickyForProcessLifetime) {
     unsetenv("MC_DISABLE_MMAP_ARENA");

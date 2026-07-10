@@ -17,15 +17,18 @@
 
 #include <algorithm>
 #include <atomic>
-#include <memory>
-#include <random>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
-#include <sys/mman.h>
+#include <memory>
+#include <mutex>
 #include <numa.h>
 #include <numaif.h>
-#include <mutex>
+#include <random>
+#include <sys/mman.h>
+#include <thread>
+#include <vector>
 
 // Feature flag to enable/disable arena allocator. Disabled by default so the
 // library does not pre-map a large pool unless the operator opts in via gflag
@@ -237,7 +240,72 @@ static inline size_t mmap_map_size(size_t total_size, size_t hugepage_size) {
     return align_up(total_size, page_size);
 }
 
+bool should_defer_hugetlb_population() {
+    const char *populate_mode = std::getenv("MC_STORE_HUGEPAGE_POPULATE_MODE");
+    return get_hugepage_size_from_env() > 0 && populate_mode != nullptr &&
+           std::strcmp(populate_mode, "rdma") == 0;
+}
+
+namespace {
+
+void touch_mmap_pages(void *ptr, size_t map_size, size_t page_size) {
+    if (ptr == nullptr || map_size == 0 || page_size == 0) {
+        return;
+    }
+
+    const size_t page_count = (map_size + page_size - 1) / page_size;
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    size_t num_threads =
+        hardware_threads == 0 ? 1 : std::min<size_t>(hardware_threads, 16);
+    num_threads = std::min(num_threads, page_count);
+
+    auto *data = static_cast<volatile char *>(ptr);
+    if (num_threads <= 1) {
+        for (size_t page = 0; page < page_count; ++page) {
+            data[page * page_size] = 0;
+        }
+        data[map_size - 1] = 0;
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    const size_t pages_per_thread =
+        (page_count + num_threads - 1) / num_threads;
+    for (size_t thread_index = 0; thread_index < num_threads; ++thread_index) {
+        const size_t begin_page = thread_index * pages_per_thread;
+        const size_t end_page =
+            std::min(begin_page + pages_per_thread, page_count);
+        threads.emplace_back([data, page_size, begin_page, end_page]() {
+            for (size_t page = begin_page; page < end_page; ++page) {
+                data[page * page_size] = 0;
+            }
+        });
+    }
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    data[map_size - 1] = 0;
+}
+
+}  // namespace
+
+void populate_hugetlb_mapping(void *ptr, size_t total_size) {
+    const size_t hugepage_size = get_hugepage_size_from_env();
+    if (ptr == nullptr || total_size == 0 || hugepage_size == 0) {
+        return;
+    }
+
+    touch_mmap_pages(ptr, mmap_map_size(total_size, hugepage_size),
+                     hugepage_size);
+}
+
 void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
+    return allocate_buffer_mmap_memory(total_size, alignment, false);
+}
+
+void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
+                                  bool defer_hugetlb_population) {
     if (total_size == 0) {
         LOG(ERROR) << "Total size must be greater than 0 for mmap";
         return nullptr;
@@ -266,7 +334,12 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     }
 
     // Traditional mmap allocation (fallback or arena disabled).
-    unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
+    const bool defer_direct_population =
+        defer_hugetlb_population && get_hugepage_size_from_env() > 0;
+    unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (!defer_direct_population) {
+        flags |= MAP_POPULATE;
+    }
     const size_t hugepage_size = get_hugepage_size_from_env(&flags);
     const size_t map_size = mmap_map_size(total_size, hugepage_size);
     const size_t guaranteed_alignment =
@@ -288,6 +361,11 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
 
     VLOG(1) << "Allocated " << total_size << " bytes via mmap() at " << ptr;
     return ptr;
+}
+
+bool is_mmap_arena_allocation(const void *ptr) {
+    return ptr != nullptr && g_mmap_arena && g_mmap_arena->isInitialized() &&
+           g_mmap_arena->owns(ptr);
 }
 
 void free_buffer_mmap_memory(void *ptr, size_t total_size) {

@@ -378,6 +378,23 @@ inline size_t align_up(size_t size, size_t alignment) {
 }
 
 /**
+ * @brief Whether HugeTLB page population should be deferred until the Store
+ * segment is about to be registered with the transfer engine.
+ *
+ * Enabled when MC_STORE_USE_HUGEPAGE is set and
+ * MC_STORE_HUGEPAGE_POPULATE_MODE=rdma.
+ */
+[[nodiscard]] bool should_defer_hugetlb_population();
+
+/**
+ * @brief Fault in a fresh HugeTLB mapping with parallel CPU writes.
+ *
+ * Touches one byte per configured hugepage and the final byte of the mapping.
+ * Call this only for a newly allocated mapping whose contents may be zeroed.
+ */
+void populate_hugetlb_mapping(void* ptr, size_t total_size);
+
+/**
  * Allocate mmap-backed buffer memory for host KV / transfer buffers.
  *
  * When the global mmap arena is enabled, this function serves allocations
@@ -393,6 +410,24 @@ inline size_t align_up(size_t size, size_t alignment) {
  * @return Pointer to the allocation, or nullptr on failure.
  */
 void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+
+/**
+ * Allocate mmap-backed memory, optionally deferring direct HugeTLB population.
+ *
+ * When defer_hugetlb_population is true, a direct HugeTLB mmap omits
+ * MAP_POPULATE so the caller can populate the mapping later. Arena allocations
+ * retain their existing eager-population behavior.
+ */
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
+                                  bool defer_hugetlb_population);
+
+/**
+ * @brief Return whether ptr is backed by the global mmap arena.
+ *
+ * Intended for callers that need to distinguish an eagerly populated arena
+ * allocation from a direct mmap fallback.
+ */
+[[nodiscard]] bool is_mmap_arena_allocation(const void* ptr);
 
 /**
  * Release memory previously returned by allocate_buffer_mmap_memory().
