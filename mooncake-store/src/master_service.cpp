@@ -8323,6 +8323,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
 tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     std::vector<std::string> draining_segments;
+    DrainSourceSegmentsByClient source_segments_by_client;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
@@ -8333,7 +8334,18 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
 
         draining_segments.reserve(request.segments.size());
         for (const auto& segment_name : request.segments) {
-            auto err = segment_access.SetSegmentStatusByName(
+            UUID client_id;
+            auto err = segment_access.GetClientIdBySegmentName(segment_name,
+                                                               client_id);
+            if (err != ErrorCode::OK) {
+                for (const auto& updated_segment : draining_segments) {
+                    (void)segment_access.SetSegmentStatusByName(
+                        updated_segment, SegmentStatus::OK);
+                }
+                return tl::make_unexpected(err);
+            }
+
+            err = segment_access.SetSegmentStatusByName(
                 segment_name, SegmentStatus::DRAINING);
             if (err != ErrorCode::OK) {
                 for (const auto& updated_segment : draining_segments) {
@@ -8343,12 +8355,14 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
                 return tl::make_unexpected(err);
             }
             draining_segments.push_back(segment_name);
+            source_segments_by_client[client_id].push_back(segment_name);
         }
     }
 
     auto job = std::make_shared<DrainJob>();
     job->id = generate_uuid();
     job->request = request;
+    job->source_segments_by_client = std::move(source_segments_by_client);
     job->created_at = std::chrono::system_clock::now();
     job->last_updated_at = job->created_at;
     job->status = JobStatus::CREATED;
@@ -8444,6 +8458,13 @@ std::string MasterService::MakeDrainUnitKey(
     const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     return std::to_string(normalized_tenant.size()) + ":" + normalized_tenant +
            ":" + std::to_string(key.size()) + ":" + key + ":" + source_segment;
+}
+
+std::string MasterService::MakeDrainLocalDiskUnitKey(
+    const std::string& tenant_id, const std::string& key,
+    const UUID& client_id) const {
+    return "local-disk:" + UuidToString(client_id) + ":" +
+           MakeDrainUnitKey(tenant_id, key, "");
 }
 
 std::optional<std::string> MasterService::SelectDrainTargetForKey(
@@ -8553,7 +8574,6 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     for (const auto& [_, task] : job.active_tasks) {
         active_unit_keys.insert(task.unit_key);
     }
-
     std::unordered_set<std::string> blocked_unit_keys;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -8561,6 +8581,30 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (const auto& [key, metadata] : tenant_state.metadata) {
+                    // LOCAL_DISK replicas are client-scoped and have no
+                    // segment name. Associate them with every requested
+                    // source segment owned by that client and fail closed:
+                    // REPLICA_MOVE cannot migrate them yet.
+                    metadata.VisitReplicas(
+                        &Replica::fn_is_local_disk_replica,
+                        [&](const Replica& replica) {
+                            const auto holder_id =
+                                replica.get_local_disk_client_id();
+                            if (!holder_id.has_value() ||
+                                !job.source_segments_by_client.contains(
+                                    holder_id.value())) {
+                                return;
+                            }
+
+                            const auto unit_key = MakeDrainLocalDiskUnitKey(
+                                tenant_id, key, holder_id.value());
+                            if (job.terminal_failed_unit_keys.insert(unit_key)
+                                    .second) {
+                                job.failed_units++;
+                                job.has_unsupported_local_disk_replicas = true;
+                            }
+                        });
+
                     for (const auto& source_segment : job.request.segments) {
                         const auto unit_key =
                             MakeDrainUnitKey(tenant_id, key, source_segment);
@@ -8636,7 +8680,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
     job.status = JobStatus::RUNNING;
     job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job running";
+    job.message = job.has_unsupported_local_disk_replicas
+                      ? "Drain job cannot migrate LOCAL_DISK replicas"
+                      : "Drain job running";
 }
 
 bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
@@ -8646,12 +8692,36 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 
     std::unordered_set<std::string> remaining_segments;
     std::unordered_set<std::string> remaining_unit_keys;
+    bool has_remaining_local_disk_replicas = false;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         for (size_t i = 0; i < kNumShards; ++i) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (const auto& [key, metadata] : tenant_state.metadata) {
+                    metadata.VisitReplicas(
+                        &Replica::fn_is_local_disk_replica,
+                        [&](const Replica& replica) {
+                            const auto holder_id =
+                                replica.get_local_disk_client_id();
+                            if (!holder_id.has_value()) {
+                                return;
+                            }
+                            auto source_it = job.source_segments_by_client.find(
+                                holder_id.value());
+                            if (source_it ==
+                                job.source_segments_by_client.end()) {
+                                return;
+                            }
+
+                            has_remaining_local_disk_replicas = true;
+                            remaining_segments.insert(source_it->second.begin(),
+                                                      source_it->second.end());
+                            remaining_unit_keys.insert(
+                                MakeDrainLocalDiskUnitKey(tenant_id, key,
+                                                          holder_id.value()));
+                        });
+
                     const auto replica_segments =
                         metadata.GetReplicaSegmentNames();
                     for (const auto& source_segment : job.request.segments) {
@@ -8713,7 +8783,10 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 
     job.status = JobStatus::FAILED;
     job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job failed: unrecoverable units remain";
+    job.message = has_remaining_local_disk_replicas
+                      ? "Drain job failed: LOCAL_DISK replicas remain on "
+                        "source clients"
+                      : "Drain job failed: unrecoverable units remain";
     return true;
 }
 
