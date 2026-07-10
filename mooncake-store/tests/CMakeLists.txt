@@ -9,6 +9,7 @@ function(add_store_test name)
            ${ETCD_WRAPPER_LIB}
            glog
            ibverbs
+           numa
            gtest
            gtest_main
            pthread)

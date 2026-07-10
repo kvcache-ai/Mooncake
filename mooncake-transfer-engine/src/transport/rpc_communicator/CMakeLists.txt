@@ -12,9 +12,10 @@ target_link_libraries(rpc_communicator
     pthread 
 )
 
-target_include_directories(rpc_communicator 
-    PRIVATE 
+target_include_directories(rpc_communicator
+    PRIVATE
     ${Python3_INCLUDE_DIRS}
+    ${ASIO_INCLUDE_DIR}
 )
 
 if(TARGET pybind11::headers)

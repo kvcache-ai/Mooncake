@@ -1,0 +1,49 @@
+\t\t\t\t\t\t`
+import os, json, time, urllib.request, sys
+
+pod_ip = os.environ.get('POD_IP', '')
+port = os.environ.get('MC_STORE_CLIENT_MIN_PORT', '13006')
+segment = pod_ip + ':' + port
+cluster = os.environ.get('CLUSTER_NAME', '')
+namespace = os.environ.get('POD_NAMESPACE', '')
+
+# Log to stderr so kubelet captures it (visible via kubectl describe/kubectl logs)
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+log("prestop starting: cluster=%s ns=%s segment=%s" % (cluster, namespace, segment))
+
+def is_drained():
+    """Query all 3 masters directly for segment status.
+    Return True if ANY master reports DRAINED, without needing
+    leader discovery (which can fail due to DNS timing)."""
+    for i in range(3):
+        try:
+            addr = '%s-master-%d.%s-master-headless.%s.svc' % (cluster, i, cluster, namespace)
+            url = 'http://' + addr + ':9003/api/v1/segments/status?segment=' + segment
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read().decode()
+                result = json.loads(data)
+                status = result.get('status_name', '')
+                if status == 'DRAINED':
+                    log("detected DRAINED on master %d (%s)" % (i, addr))
+                    return True
+        except Exception as e:
+            log("master %d error: %s" % (i, str(e)))
+            continue
+    return False
+
+timeout = 600
+interval = 3
+elapsed = 0
+while elapsed < timeout:
+    log("poll #%d: checking..." % (elapsed // interval))
+    if is_drained():
+        log("DRAINED detected, exiting")
+        sys.exit(0)
+    time.sleep(interval)
+    elapsed += interval
+log("timeout reached, exiting anyway")
+sys.exit(0)
+`

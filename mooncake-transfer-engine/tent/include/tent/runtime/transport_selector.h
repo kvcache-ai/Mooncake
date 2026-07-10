@@ -179,6 +179,12 @@ class TransportSelector {
      */
     bool isLegacyMode() const { return legacy_mode_; }
 
+    /**
+     * @brief Set the rail monitor for RDMA health checking.
+     * When set, select() will skip RDMA transports whose rails are unhealthy.
+     */
+    void setRailMonitor(const RailMonitor* monitor) { rail_monitor_ = monitor; }
+
     static std::string transportTypeName(TransportType type);
     static TransportType parseTransportType(const std::string& str);
     static std::optional<std::vector<TransportType>> reorderWithHint(
@@ -200,6 +206,7 @@ class TransportSelector {
     std::shared_ptr<Topology> topology_;
     std::vector<SelectionPolicy> policies_;
     bool legacy_mode_{false};  // If true, skip selector and return empty result
+    const RailMonitor* rail_monitor_{nullptr};
 };
 
 }  // namespace tent

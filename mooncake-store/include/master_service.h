@@ -2075,11 +2075,16 @@ class MasterService {
         uint64_t failed_units{0};
         uint64_t blocked_units{0};
         uint64_t migrated_bytes{0};
+        // bandwidth tracking
+        uint64_t migrated_bytes_at_last_check_{0};
+        std::chrono::system_clock::time_point last_rate_check_;
+        double speed_mbps{0.0};
         std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
             active_tasks;
         std::unordered_set<std::string> completed_unit_keys;
         std::unordered_map<std::string, uint32_t> retry_counts;
         std::unordered_set<std::string> terminal_failed_unit_keys;
+        std::unordered_set<std::string> blocked_unit_keys;
     };
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;

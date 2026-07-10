@@ -91,6 +91,12 @@ class RdmaTransport : public Transport {
 
     virtual const char* getName() const { return "rdma"; }
 
+    /**
+     * @brief Check if at least one RDMA context is active.
+     * Used by TransportSelector to determine RDMA availability.
+     */
+    bool available() const;
+
     virtual bool supportNotification() const override { return true; }
 
     virtual Status sendNotification(SegmentID target_id,

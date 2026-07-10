@@ -179,6 +179,10 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
 
+std::map<std::string, TransportHealth> TransferEngine::getTransportHealthMap() const {
+    return impl_->getTransportHealthMap();
+}
+
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
@@ -594,6 +598,13 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
         return nullptr;
     else
         return impl_->getTransport(proto);
+}
+
+std::map<std::string, TransportHealth> TransferEngine::getTransportHealthMap() const {
+    if (use_tent_)
+        return {};
+    else
+        return impl_->getTransportHealthMap();
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \

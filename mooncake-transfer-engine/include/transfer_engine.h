@@ -163,6 +163,8 @@ class TransferEngine {
 
     Transport* getTransport(const std::string& proto);
 
+    std::map<std::string, TransportHealth> getTransportHealthMap() const;
+
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
     // Device transport accessors (P2P + IBGDA).  Lazily created on first

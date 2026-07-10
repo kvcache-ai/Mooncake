@@ -1,0 +1,35 @@
+apiVersion: mooncake.io/v1alpha1
+kind: MooncakeCluster
+metadata:
+  name: demo
+  namespace: default
+spec:
+  image: mooncake-store:latest
+  master:
+    replicas: 3
+    rpcPort: 50051
+    metricsPort: 9003
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+  workers:
+    replicas: 2
+    segmentSize: "1Gi"
+    rdmaEnabled: false
+    gpuEnabled: false
+    resources:
+      requests:
+        cpu: "1"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "2Gi"
+  ha:
+    type: k8s
+  eviction:
+    ratio: 0.05
+    highWatermarkRatio: 0.95

@@ -436,6 +436,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_rpc_address);
     default_config.GetString("rpc_interface", &master_config.rpc_interface,
                              FLAGS_rpc_interface);
+    default_config.GetString("local_hostname", &master_config.local_hostname,
+                             "");
     default_config.GetInt32("rpc_conn_timeout_seconds",
                             &master_config.rpc_conn_timeout_seconds,
                             FLAGS_rpc_conn_timeout_seconds);
@@ -1479,7 +1481,9 @@ int main(int argc, char* argv[]) {
             master_config.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#endif
         }
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(

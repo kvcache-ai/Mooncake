@@ -34,6 +34,7 @@ struct MasterConfig {
     uint32_t rpc_thread_num;
     std::string rpc_address;
     std::string rpc_interface;
+    std::string local_hostname;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
@@ -182,7 +183,7 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
-    std::string local_hostname = "0.0.0.0:50051";
+    std::string local_hostname;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -303,7 +304,11 @@ class MasterServiceSupervisorConfig {
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
-        local_hostname = rpc_address + ":" + std::to_string(rpc_port);
+        if (!config.local_hostname.empty()) {
+            local_hostname = config.local_hostname;
+        } else {
+            local_hostname = rpc_address + ":" + std::to_string(rpc_port);
+        }
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;

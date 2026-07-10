@@ -1,0 +1,7 @@
+namespace: mooncake-operator-system
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+- ../ui

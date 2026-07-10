@@ -166,8 +166,9 @@ struct CreateDrainJobRequest {
     std::vector<std::string> segments;
     std::vector<std::string> target_segments;
     uint32_t max_concurrency{4};
+    uint32_t bandwidth_mbps{0};  // 0 = unlimited
 };
-YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency);
+YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency, bandwidth_mbps);
 
 struct QueryJobResponse {
     UUID id;
@@ -181,11 +182,12 @@ struct QueryJobResponse {
     uint64_t blocked_units;
     uint64_t active_units;
     uint64_t migrated_bytes;
+    double speed_mbps{0.0};
     std::string message;
 };
 YLT_REFL(QueryJobResponse, id, type, status, created_at_ms_epoch,
          last_updated_at_ms_epoch, segments, succeeded_units, failed_units,
-         blocked_units, active_units, migrated_bytes, message);
+         blocked_units, active_units, migrated_bytes, speed_mbps, message);
 
 /**
  * @brief Response structure for QueryTask operation

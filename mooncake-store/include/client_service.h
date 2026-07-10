@@ -622,6 +622,11 @@ class Client {
 
     bool is_ping_healthy() const { return last_ping_success_.load(); }
 
+    std::map<std::string, TransportHealth> GetTransportHealth() const {
+        if (!transfer_engine_) return {};
+        return transfer_engine_->getTransportHealthMap();
+    }
+
     /**
      * @brief Get current frequency admission count for a key.
      * @return estimated count, or 0 if admission sketch is disabled.

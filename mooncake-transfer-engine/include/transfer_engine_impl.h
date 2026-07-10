@@ -345,6 +345,10 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
+    std::map<std::string, TransportHealth> getTransportHealthMap() const {
+        return multi_transports_->getTransportHealthMap();
+    }
+
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
     // Device transport accessors — lazily created, owned by this impl.

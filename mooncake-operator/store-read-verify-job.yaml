@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: store-read-verify
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: verify
+        image: mooncake-store:latest
+        imagePullPolicy: Never
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/lib/mooncake
+        command:
+        - python3
+        - -c
+        - |
+          import os, sys
+          from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+
+          master_addr = "my-cluster-master-headless.default:50051"
+          metadata_server = "http://my-cluster-master-headless.default:8080/metadata"
+          hostname = os.environ["POD_IP"]
+
+          store = MooncakeDistributedStore()
+          retcode = store.setup(hostname, metadata_server, 0, 512*1024*1024, "tcp", "", master_addr)
+          if retcode != 0:
+              print(f"setup failed: {retcode}", flush=True)
+              sys.exit(1)
+          print(f"Store setup OK, hostname={hostname}", flush=True)
+
+          config = ReplicateConfig()
+          config.replica_num = 3
+
+          test_data = {
+              "verify-data-a1b2c3": b"A" * (1024*1024),
+              "verify-data-d4e5f6": b"B" * (2*1024*1024),
+              "verify-data-g7h8i9": b"C" * (1*1024),
+          }
+
+          for key, value in test_data.items():
+              ret = store.put(key=key, value=value, config=config)
+              print(f"PUT {key}: {len(value)}B ret={ret}", flush=True)
+              if ret != 0:
+                  print(f"FAIL: put returned {ret}", flush=True)
+                  sys.exit(1)
+
+          for key, expected in test_data.items():
+              got = store.get(key)
+              if got is None:
+                  print(f"FAIL: get({key}) returned None", flush=True)
+                  sys.exit(1)
+              if len(got) != len(expected):
+                  print(f"FAIL: {key} size mismatch: got {len(got)} expected {len(expected)}", flush=True)
+                  sys.exit(1)
+              if got != expected:
+                  print(f"FAIL: {key} content mismatch", flush=True)
+                  sys.exit(1)
+              print(f"GET {key}: {len(got)}B MATCH", flush=True)
+
+          print("=== ALL PUT/GET VERIFICATION PASSED ===", flush=True)

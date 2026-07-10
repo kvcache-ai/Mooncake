@@ -106,6 +106,10 @@ int main(int argc, char *argv[]) {
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
     size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);
+    if (local_buffer_size == 0) {
+        // Default to 16MB when not explicitly set
+        local_buffer_size = 16 * 1024 * 1024;
+    }
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
     globalConfig().ascend_agent_mode = true;

@@ -165,14 +165,19 @@ struct ReplicaTransferSummary {
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
-    if (config.nof_replica_num == 0) {
-        return summary.allocated_memory_replicas > 0;
+    const auto write_mode = DetermineReplicaWriteMode(config);
+    if (write_mode == ReplicaWriteMode::RELIABLE_MULTI_REPLICA) {
+        return summary.allocated_memory_replicas == config.replica_num &&
+               summary.allocated_nof_replicas == config.nof_replica_num;
     }
-    if (DetermineReplicaWriteMode(config) ==
-        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+    if (write_mode == ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
         return summary.allocated_memory_replicas +
                    summary.allocated_nof_replicas >
                0;
+    }
+    // SINGLE_REPLICA
+    if (config.nof_replica_num == 0) {
+        return summary.allocated_memory_replicas > 0;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
            summary.allocated_nof_replicas == config.nof_replica_num;
@@ -3863,6 +3868,10 @@ void Client::StorageHeartbeatThreadMain() {
 
             LOG(INFO) << "Reconnected to master " << next_view.leader_address;
             ping_fail_count = 0;
+            if (!remount_segment_future.valid()) {
+                remount_segment_future =
+                    std::async(std::launch::async, remount_segment);
+            }
         } else {
             const std::string current_master_address = direct_master_address_;
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
@@ -3879,6 +3888,10 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(INFO) << "Reconnected to master " << current_master_address;
             last_ping_success_.store(true);
             ping_fail_count = 0;
+            if (!remount_segment_future.valid()) {
+                remount_segment_future =
+                    std::async(std::launch::async, remount_segment);
+            }
         }
     }
     // Explicitly wait for the remount segment thread to finish

@@ -7,6 +7,7 @@ add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
 target_link_libraries(
   transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog
                     pthread)
+target_include_directories(transport PRIVATE ${ASIO_INCLUDE_DIR})
 
 if(USE_UB)
   add_subdirectory(kunpeng_transport)

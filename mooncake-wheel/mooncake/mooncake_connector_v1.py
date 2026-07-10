@@ -11,10 +11,12 @@ import asyncio
 import threading
 import time
 import importlib.metadata
+import json
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import IntEnum
 from queue import Queue
 from os import getenv
 from typing import TYPE_CHECKING, Any, Optional
@@ -67,8 +69,83 @@ VLLM_MOONCAKE_SIDE_CHANNEL_PORT = int(getenv("VLLM_MOONCAKE_SIDE_CHANNEL_PORT", 
 VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT = int(getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", 120))
 VLLM_MOONCAKE_SENDER_WORKERS = int(getenv("VLLM_MOONCAKE_SENDER_WORKERS", 10))
 VLLM_MOONCAKE_PROTOCOL = getenv("VLLM_MOONCAKE_PROTOCOL", "rdma")
+VLLM_MOONCAKE_MIGRATION_BLOCK_POOL_SIZE = int(getenv("VLLM_MOONCAKE_MIGRATION_BLOCK_POOL_SIZE", "4096"))
+VLLM_MOONCAKE_MIGRATION_BANDWIDTH_MBPS = int(getenv("MOONCAKE_MIGRATION_BANDWIDTH_MBPS", "0"))
+VLLM_MOONCAKE_MIGRATION_HTTP_PORT = int(getenv("VLLM_MOONCAKE_MIGRATION_HTTP_PORT", "6558"))
+VLLM_MOONCAKE_MIGRATION_DUAL_WRITE_SYNC_INTERVAL = float(
+    getenv("VLLM_MOONCAKE_MIGRATION_DUAL_WRITE_SYNC_INTERVAL", "0.2")
+)
+VLLM_MOONCAKE_MIGRATION_SWITCH_STABLE_CHECKS = int(
+    getenv("VLLM_MOONCAKE_MIGRATION_SWITCH_STABLE_CHECKS", "5")
+)
 
 logger = init_logger(__name__)
+
+
+class MigrationPhase(IntEnum):
+    IDLE = 0
+    BACKGROUND_COPY = 1
+    DUAL_WRITE = 2
+    SWITCH_OVER = 3
+    COMPLETED = 4
+
+
+@dataclass
+class MigratingRequestMeta:
+    request_id: ReqId
+    target_host: str
+    target_port: int              # RPC port (for TransferEngine)
+    migration_port: int = 18900   # HTTP port (for migration control API)
+    target_base_addr: list[int] = field(default_factory=list)
+    block_id_map: dict[int, int] = field(default_factory=dict)
+    phase: MigrationPhase = MigrationPhase.IDLE
+    phase_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Phase 2: dual-write tracking
+    pending_block_ids: set[int] = field(default_factory=set)
+    synced_block_ids: set[int] = field(default_factory=set)
+    extra_target_pool: list[int] = field(default_factory=list)
+    switch_check_counter: int = 0
+    last_synced_count: int = 0
+    target_block_pool_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass
+class MigrationTargetInfo:
+    request_id: ReqId
+    target_block_ids: list[int]
+    kv_caches_base_addr: list[int]
+
+
+class MigrationRateLimiter:
+    """Token bucket rate limiter for migration bandwidth."""
+
+    def __init__(self, max_mb_per_sec: int = 0):
+        self.max_bytes_per_sec = max_mb_per_sec * 1024 * 1024
+        if self.max_bytes_per_sec > 0:
+            self.bucket_size = self.max_bytes_per_sec * 2  # burst up to 2x
+            self.tokens = float(self.bucket_size)
+            self.last_refill = time.monotonic()
+        else:
+            self.bucket_size = 0
+            self.tokens = 0.0
+            self.last_refill = 0.0
+
+    async def acquire(self, bytes_count: float):
+        if self.max_bytes_per_sec <= 0:
+            return  # unlimited
+        while self.tokens < bytes_count:
+            self._refill()
+            await asyncio.sleep(0.01)
+        self.tokens -= bytes_count
+
+    def _refill(self):
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        self.tokens = min(
+            self.bucket_size,
+            self.tokens + elapsed * self.max_bytes_per_sec
+        )
+        self.last_refill = now
 
 
 class MooncakeAgentMetadata(
@@ -516,11 +593,35 @@ class MooncakeConnectorWorker:
         self._encoder = msgspec.msgpack.Encoder()
         self._decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
 
+        # Migration live-migration state
+        self.migration_reqs: dict[ReqId, MigratingRequestMeta] = {}
+        self.migration_block_pool: Optional[asyncio.Queue[int]] = None
+        self.migration_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="vllm-mooncake-migration",
+        )
+        self.migration_rate_limiter = MigrationRateLimiter(
+            VLLM_MOONCAKE_MIGRATION_BANDWIDTH_MBPS,
+        )
+        self.migration_http_port = VLLM_MOONCAKE_MIGRATION_HTTP_PORT
+        self.migration_http_server: Optional[asyncio.AbstractServer] = None
+        self.active_recving_reqs: set[ReqId] = set()
+
     def __del__(self):
         self.shutdown()
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
+        # Cleanup migration resources
+        self.migration_reqs.clear()
+        if self.migration_http_server is not None:
+            try:
+                self.migration_http_server.close()
+            except Exception:
+                pass
+            self.migration_http_server = None
+        self.migration_executor.shutdown(wait=False)
+
         self.async_zmq_ctx.term()
         if self.kv_role != "kv_consumer":
             self._sender_executor.shutdown(wait=False)
@@ -742,8 +843,13 @@ class MooncakeConnectorWorker:
         logger.debug("regiestered num_blocks=%d block_len=%d", self.num_blocks,
                      self.block_len)
 
-        # No need to launch server for D node.
+        # No need to launch server for D node, but start migration HTTP server.
         if self.kv_role == "kv_consumer":
+            if self.migration_http_port > 0:
+                asyncio.run_coroutine_threadsafe(
+                    self._start_migration_http_server(),
+                    self.receiver_loop,
+                )
             return
 
         ready_event = threading.Event()
@@ -754,6 +860,603 @@ class MooncakeConnectorWorker:
             self.sender_loop,
         )
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+
+    # ──── Migration HTTP Server ────
+
+    async def _start_migration_http_server(self):
+        """Start minimal async HTTP server for migration control API."""
+        if self.migration_block_pool is None:
+            self.migration_block_pool = asyncio.Queue()
+            for i in range(VLLM_MOONCAKE_MIGRATION_BLOCK_POOL_SIZE):
+                self.migration_block_pool.put_nowait(i)
+        self.migration_http_server = await asyncio.start_server(
+            self._migration_http_handler,
+            host="0.0.0.0",
+            port=self.migration_http_port,
+        )
+        logger.info(
+            "Migration HTTP server listening on 0.0.0.0:%d",
+            self.migration_http_port,
+        )
+
+    async def _migration_http_handler(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ):
+        """Handle incoming HTTP requests for migration control."""
+        try:
+            request_line = await reader.readuntil(b"\r\n")
+            method, path, _ = request_line.decode().strip().split(" ", 2)
+
+            headers = {}
+            while True:
+                header_line = await reader.readuntil(b"\r\n")
+                if header_line == b"\r\n":
+                    break
+                key, value = header_line.decode().strip().split(": ", 1)
+                headers[key.lower()] = value
+
+            body = b""
+            if "content-length" in headers:
+                body_len = int(headers["content-length"])
+                body = await reader.readexactly(body_len)
+
+            if method == "GET" and path == "/api/v1/active_requests":
+                response_body = json.dumps(
+                    {"request_ids": list(self.active_recving_reqs)}
+                ).encode()
+                await self._send_http_response(writer, 200, response_body)
+            elif method == "POST" and path == "/api/v1/prepare_migration":
+                result = await self._handle_prepare_migration(body)
+                await self._send_http_response(
+                    writer, 200, result.encode()
+                )
+            elif method == "POST" and path == "/api/v1/start_migration":
+                result = await self._handle_start_migration(body)
+                await self._send_http_response(
+                    writer, 200, result.encode()
+                )
+            elif method == "POST" and path == "/api/v1/allocate_blocks":
+                result = await self._handle_allocate_blocks(body)
+                await self._send_http_response(
+                    writer, 200, result.encode()
+                )
+            elif method == "POST" and path == "/api/v1/switch_over":
+                result = await self._handle_switch_over(body)
+                await self._send_http_response(
+                    writer, 200, result.encode()
+                )
+            elif method == "GET" and path.startswith("/api/v1/migration/status"):
+                req_id = path.split("/")[-1]
+                if req_id in self.migration_reqs:
+                    meta = self.migration_reqs[req_id]
+                    result = json.dumps({
+                        "request_id": req_id,
+                        "phase": meta.phase.name,
+                        "target_host": meta.target_host,
+                        "target_port": meta.target_port,
+                    }).encode()
+                else:
+                    result = json.dumps({
+                        "request_id": req_id, "phase": "UNKNOWN"
+                    }).encode()
+                await self._send_http_response(writer, 200, result)
+            else:
+                await self._send_http_response(
+                    writer, 404, b'{"error":"not found"}'
+                )
+        except Exception as e:
+            logger.error("Migration HTTP handler error: %s", e)
+            try:
+                await self._send_http_response(
+                    writer, 500,
+                    json.dumps({"error": str(e)}).encode(),
+                )
+            except Exception:
+                pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _send_http_response(
+        self, writer: asyncio.StreamWriter, status: int, body: bytes
+    ):
+        """Send a minimal HTTP response."""
+        status_text = {
+            200: "OK",
+            404: "Not Found",
+            500: "Internal Server Error",
+        }.get(status, "Unknown")
+        response = (
+            f"HTTP/1.1 {status} {status_text}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode() + body
+        writer.write(response)
+        await writer.drain()
+
+    # ──── Migration API Handlers ────
+
+    async def _migration_http_request(
+        self, host: str, port: int, method: str, path: str,
+        body: Optional[dict] = None,
+    ) -> dict:
+        """Make an HTTP request to a migration endpoint."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5.0
+            )
+            body_bytes = json.dumps(body).encode() if body else b""
+            request_line = f"{method} {path} HTTP/1.1\r\n".encode()
+            headers = (
+                f"Host: {host}:{port}\r\n"
+                f"Content-Length: {len(body_bytes)}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode()
+            writer.write(request_line + headers + body_bytes)
+            await writer.drain()
+
+            # Read response
+            while True:
+                line = await reader.readuntil(b"\r\n")
+                if line == b"\r\n":
+                    break
+            resp_body = b""
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                resp_body += chunk
+            writer.close()
+            await writer.wait_closed()
+            return json.loads(resp_body) if resp_body else {}
+        except Exception as e:
+            logger.error("Migration HTTP request to %s:%d%s failed: %s",
+                         host, port, path, e)
+            return {"error": str(e)}
+
+    async def _handle_prepare_migration(self, body: bytes) -> str:
+        """Pre-allocate blocks for migration on target node."""
+        data = json.loads(body)
+        request_id = data["request_id"]
+        num_blocks = data["num_blocks"]
+        extra_blocks = data.get("extra_blocks", 0)
+
+        if self.migration_block_pool is None:
+            return json.dumps({"error": "migration_block_pool not initialized"})
+
+        target_block_ids = []
+        for _ in range(num_blocks):
+            try:
+                block_id = await asyncio.wait_for(
+                    self.migration_block_pool.get(), timeout=5.0
+                )
+                target_block_ids.append(block_id)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Migration block pool exhausted for request %s (%d/%d)",
+                    request_id, len(target_block_ids), num_blocks,
+                )
+                break
+
+        extra_target_block_ids = []
+        for _ in range(extra_blocks):
+            try:
+                block_id = await asyncio.wait_for(
+                    self.migration_block_pool.get(), timeout=5.0
+                )
+                extra_target_block_ids.append(block_id)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Extra block pool exhausted for request %s (%d/%d)",
+                    request_id, len(extra_target_block_ids), extra_blocks,
+                )
+                break
+
+        logger.info(
+            "Prepared migration for request %s: %d blocks + %d extra",
+            request_id, len(target_block_ids), len(extra_target_block_ids),
+        )
+        return json.dumps({
+            "request_id": request_id,
+            "target_block_ids": target_block_ids,
+            "extra_target_block_ids": extra_target_block_ids,
+            "kv_caches_base_addr": self.kv_caches_base_addr,
+        })
+
+    async def _handle_start_migration(self, body: bytes) -> str:
+        """Start migration on source node (trigger Phase 1 BACKGROUND_COPY)."""
+        data = json.loads(body)
+        request_id = data["request_id"]
+        target_host = data["target_host"]
+        target_port = data["target_port"]
+        target_base_addr = data["target_base_addr"]
+        block_id_map = {int(k): v for k, v in data["block_id_map"].items()}
+        extra_target_block_ids = data.get("extra_target_block_ids", [])
+
+        meta = MigratingRequestMeta(
+            request_id=request_id,
+            target_host=target_host,
+            target_port=target_port,
+            migration_port=data.get("migration_port", VLLM_MOONCAKE_MIGRATION_HTTP_PORT),
+            target_base_addr=target_base_addr,
+            block_id_map=block_id_map,
+            phase=MigrationPhase.BACKGROUND_COPY,
+            phase_event=asyncio.Event(),
+            extra_target_pool=list(extra_target_block_ids),
+        )
+        self.migration_reqs[request_id] = meta
+
+        logger.info(
+            "Starting migration for request %s -> %s:%d (%d blocks, %d extra)",
+            request_id, target_host, target_port,
+            len(block_id_map), len(extra_target_block_ids),
+        )
+
+        # Start Phase 1 in background
+        asyncio.ensure_future(self._background_copy_existing_blocks(meta))
+
+        return json.dumps({"status": "started", "phase": "BACKGROUND_COPY"})
+
+    async def _handle_allocate_blocks(self, body: bytes) -> str:
+        """Allocate additional migration blocks for an existing migration."""
+        data = json.loads(body)
+        request_id = data["request_id"]
+        num_blocks = data["num_blocks"]
+
+        if self.migration_block_pool is None:
+            return json.dumps({"error": "migration_block_pool not initialized"})
+
+        target_block_ids = []
+        for _ in range(num_blocks):
+            try:
+                block_id = await asyncio.wait_for(
+                    self.migration_block_pool.get(), timeout=5.0
+                )
+                target_block_ids.append(block_id)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Allocate blocks pool exhausted for request %s (%d/%d)",
+                    request_id, len(target_block_ids), num_blocks,
+                )
+                break
+
+        logger.info(
+            "Allocated %d extra blocks for request %s",
+            len(target_block_ids), request_id,
+        )
+        return json.dumps({
+            "request_id": request_id,
+            "target_block_ids": target_block_ids,
+            "kv_caches_base_addr": self.kv_caches_base_addr,
+        })
+
+    # ──── Migration Phase 1: BACKGROUND_COPY ────
+
+    async def _background_copy_existing_blocks(
+        self, meta: MigratingRequestMeta
+    ):
+        """Phase 1: Copy all existing blocks from source to target."""
+        request_id = meta.request_id
+
+        try:
+            src_ptrs, dst_ptrs, lengths, remote_session = (
+                self._build_migration_transfer_params(meta)
+            )
+
+            if not src_ptrs:
+                logger.info(
+                    "No existing blocks to copy for request %s", request_id
+                )
+                meta.phase = MigrationPhase.DUAL_WRITE
+                meta.phase_event.set()
+                return
+
+            total_bytes = sum(lengths)
+            await self.migration_rate_limiter.acquire(total_bytes)
+
+            loop = asyncio.get_running_loop()
+            ret_value = await loop.run_in_executor(
+                self.migration_executor,
+                self._send_blocks,
+                remote_session,
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+            )
+
+            if ret_value != 0:
+                logger.error(
+                    "Migration Phase 1 failed for request %s: %d",
+                    request_id, ret_value,
+                )
+                meta.phase = MigrationPhase.IDLE
+                return
+
+            logger.info(
+                "Migration Phase 1 (BACKGROUND_COPY) complete for request %s: "
+                "%d blocks, %d bytes",
+                request_id, len(src_ptrs), total_bytes,
+            )
+
+            # Populate all existing blocks as synced
+            meta.synced_block_ids = set(meta.block_id_map.keys())
+
+            meta.phase = MigrationPhase.DUAL_WRITE
+            meta.phase_event.set()
+
+            # Start Phase 2 dual-write sync loop and switch readiness check
+            asyncio.ensure_future(self._dual_write_sync_loop(meta))
+            asyncio.ensure_future(self._check_switch_readiness(meta))
+
+        except Exception as e:
+            logger.error(
+                "Migration Phase 1 error for request %s: %s",
+                request_id, e,
+            )
+            meta.phase = MigrationPhase.IDLE
+
+    def _build_migration_transfer_params(
+        self, meta: MigratingRequestMeta,
+    ) -> tuple[list[int], list[int], list[int], str]:
+        """Build transfer params using block_id_map."""
+        src_ptrs = []
+        dst_ptrs = []
+        lengths = []
+        local_base_addr = self.kv_caches_base_addr
+        remote_base_addr = meta.target_base_addr
+        block_len = self.block_len
+        remote_session = f"{meta.target_host}:{meta.target_port}"
+
+        block_id_map = meta.block_id_map
+        if not block_id_map:
+            return src_ptrs, dst_ptrs, lengths, remote_session
+
+        src_block_ids = list(block_id_map.keys())
+        dst_block_ids = [block_id_map[sid] for sid in src_block_ids]
+
+        group_src, group_dst = group_concurrent_contiguous(
+            src_block_ids, dst_block_ids
+        )
+
+        for local_base, remote_base in zip(local_base_addr, remote_base_addr):
+            for src_group, dst_group in zip(group_src, group_dst):
+                src_ptrs.append(
+                    local_base + src_group[0] * block_len
+                )
+                dst_ptrs.append(
+                    remote_base + dst_group[0] * block_len
+                )
+                lengths.append(block_len * len(src_group))
+
+        return src_ptrs, dst_ptrs, lengths, remote_session
+
+    # ──── Migration Phase 2: Dual-Write Sync ────
+
+    async def _dual_write_sync_loop(self, meta: MigratingRequestMeta):
+        """Phase 2: Continuously sync newly received blocks to target."""
+        request_id = meta.request_id
+        logger.info(
+            "Dual-write sync loop started for request %s", request_id,
+        )
+
+        while True:
+            try:
+                await asyncio.sleep(VLLM_MOONCAKE_MIGRATION_DUAL_WRITE_SYNC_INTERVAL)
+
+                if meta.phase not in (MigrationPhase.DUAL_WRITE,):
+                    break
+
+                # Pick up pending blocks
+                async with meta.target_block_pool_lock:
+                    pending = list(meta.pending_block_ids)
+                    meta.pending_block_ids.clear()
+
+                if not pending:
+                    continue
+
+                # Allocate target blocks if extra pool is exhausted
+                new_target_ids = []
+                for src_block_id in pending:
+                    async with meta.target_block_pool_lock:
+                        if meta.extra_target_pool:
+                            target_id = meta.extra_target_pool.pop(0)
+                        else:
+                            new_target_ids.append(src_block_id)
+                            continue
+                    meta.block_id_map[src_block_id] = target_id
+
+                if new_target_ids:
+                    resp = await self._migration_http_request(
+                        meta.target_host, meta.migration_port,
+                        "POST", "/api/v1/allocate_blocks",
+                        {"request_id": request_id, "num_blocks": len(new_target_ids)},
+                    )
+                    if "error" in resp:
+                        logger.error(
+                            "Failed to allocate extra blocks for %s: %s",
+                            request_id, resp.get("error"),
+                        )
+                        continue
+                    allocated = resp.get("target_block_ids", [])
+                    async with meta.target_block_pool_lock:
+                        meta.extra_target_pool.extend(allocated)
+                    # Retry mapping
+                    remaining = list(new_target_ids)
+                    new_target_ids = []
+                    for src_block_id in remaining:
+                        async with meta.target_block_pool_lock:
+                            if meta.extra_target_pool:
+                                target_id = meta.extra_target_pool.pop(0)
+                            else:
+                                new_target_ids.append(src_block_id)
+                                continue
+                        meta.block_id_map[src_block_id] = target_id
+                    if new_target_ids:
+                        logger.warning(
+                            "Still %d blocks unallocated for %s after allocate_blocks",
+                            len(new_target_ids), request_id,
+                        )
+                        # Put back into pending
+                        async with meta.target_block_pool_lock:
+                            meta.pending_block_ids.update(new_target_ids)
+                        continue
+
+                # Build transfer params for pending blocks only
+                meta_subset = MigratingRequestMeta(
+                    request_id=meta.request_id,
+                    target_host=meta.target_host,
+                    target_port=meta.target_port,
+                    target_base_addr=meta.target_base_addr,
+                    block_id_map={
+                        sid: meta.block_id_map[sid] for sid in pending
+                        if sid in meta.block_id_map
+                    },
+                    phase=meta.phase,
+                    phase_event=asyncio.Event(),
+                )
+                src_ptrs, dst_ptrs, lengths, remote_session = (
+                    self._build_migration_transfer_params(meta_subset)
+                )
+                if not src_ptrs:
+                    continue
+
+                total_bytes = sum(lengths)
+                await self.migration_rate_limiter.acquire(total_bytes)
+
+                loop = asyncio.get_running_loop()
+                ret_value = await loop.run_in_executor(
+                    self.migration_executor,
+                    self._send_blocks,
+                    remote_session,
+                    src_ptrs,
+                    dst_ptrs,
+                    lengths,
+                )
+
+                if ret_value != 0:
+                    logger.error(
+                        "Dual-write transfer failed for request %s: %d",
+                        request_id, ret_value,
+                    )
+                    async with meta.target_block_pool_lock:
+                        meta.pending_block_ids.update(pending)
+                    continue
+
+                # Mark as synced
+                meta.synced_block_ids.update(
+                    sid for sid in pending if sid in meta.block_id_map
+                )
+                logger.debug(
+                    "Dual-write synced %d blocks for %s "
+                    "(total synced: %d)",
+                    len(pending), request_id, len(meta.synced_block_ids),
+                )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    "Dual-write sync error for %s: %s", request_id, e,
+                )
+                await asyncio.sleep(1.0)
+
+        logger.info("Dual-write sync loop ended for request %s", request_id)
+
+    # ──── Migration Phase 3: Switch Readiness ────
+
+    async def _check_switch_readiness(self, meta: MigratingRequestMeta):
+        """Monitor for stability and transition to SWITCH_OVER."""
+        request_id = meta.request_id
+        logger.info(
+            "Switch readiness check started for request %s", request_id,
+        )
+        stable_checks_required = VLLM_MOONCAKE_MIGRATION_SWITCH_STABLE_CHECKS
+
+        while True:
+            try:
+                await asyncio.sleep(VLLM_MOONCAKE_MIGRATION_DUAL_WRITE_SYNC_INTERVAL)
+
+                if meta.phase not in (MigrationPhase.DUAL_WRITE,):
+                    break
+
+                current_synced = len(meta.synced_block_ids)
+                if current_synced == meta.last_synced_count:
+                    meta.switch_check_counter += 1
+                    logger.debug(
+                        "Switch check %d/%d for %s (synced: %d)",
+                        meta.switch_check_counter, stable_checks_required,
+                        request_id, current_synced,
+                    )
+                else:
+                    # Still making progress, reset counter
+                    meta.switch_check_counter = 0
+                    meta.last_synced_count = current_synced
+
+                if meta.switch_check_counter >= stable_checks_required:
+                    logger.info(
+                        "Request %s stable for %d checks, "
+                        "triggering SWITCH_OVER",
+                        request_id, stable_checks_required,
+                    )
+                    asyncio.ensure_future(self._do_switch_over(meta))
+                    break
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    "Switch readiness check error for %s: %s",
+                    request_id, e,
+                )
+                await asyncio.sleep(1.0)
+
+    async def _do_switch_over(self, meta: MigratingRequestMeta):
+        """Phase 3: Switch over to target node."""
+        request_id = meta.request_id
+        meta.phase = MigrationPhase.SWITCH_OVER
+        meta.phase_event.set()
+
+        logger.info(
+            "SWITCH_OVER for request %s -> %s:%d",
+            request_id, meta.target_host, meta.target_port,
+        )
+
+        # Notify target node to activate this request's blocks
+        resp = await self._migration_http_request(
+            meta.target_host, meta.migration_port,
+            "POST", "/api/v1/switch_over",
+            {"request_id": request_id},
+        )
+        if "error" in resp:
+            logger.error(
+                "Switch-over notification to target failed for %s: %s",
+                request_id, resp.get("error"),
+            )
+            return
+
+        meta.phase = MigrationPhase.COMPLETED
+        logger.info(
+            "Migration COMPLETED for request %s", request_id,
+        )
+
+    async def _handle_switch_over(self, body: bytes) -> str:
+        """Handle switch-over notification on target node."""
+        data = json.loads(body)
+        request_id = data["request_id"]
+        logger.info(
+            "Switch-over received for request %s on target", request_id,
+        )
+        # Target-side: mark blocks as active (they're already in memory)
+        return json.dumps({
+            "request_id": request_id, "status": "activated",
+        })
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
@@ -862,6 +1565,19 @@ class MooncakeConnectorWorker:
 
         self.finished_recving_reqs.update(local_req_ids)
 
+        # Migration dual-write hook: if any received request is undergoing
+        # DUAL_WRITE migration, add its new blocks to pending for sync
+        for local_req_id, blocks in zip(local_req_ids, block_ids):
+            if local_req_id in self.migration_reqs:
+                meta = self.migration_reqs[local_req_id]
+                if meta.phase == MigrationPhase.DUAL_WRITE and blocks:
+                    async with meta.target_block_pool_lock:
+                        meta.pending_block_ids.update(blocks)
+                    logger.debug(
+                        "Dual-write: queued %d new blocks for %s",
+                        len(blocks), local_req_id,
+                    )
+
         logger.debug(
             "pulling kv_caches for %s finished (local requests: %s)",
             remote_req_ids, local_req_ids)
@@ -904,6 +1620,9 @@ class MooncakeConnectorWorker:
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if self.kv_role != "kv_producer":
             kv_pulls = self.group_kv_pull(metadata)
+            # Track active requests for migration API
+            for req_id in metadata.reqs_to_recv:
+                self.active_recving_reqs.add(req_id)
             for path, req_blocks in kv_pulls.items():
                 asyncio.run_coroutine_threadsafe(
                     self.receive_kv(path, req_blocks), self.receiver_loop
