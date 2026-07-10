@@ -17,9 +17,15 @@
 
 namespace mooncake {
 
+namespace test {
+class MasterServiceTest;
+}
+
 // Forward declaration
 class HttpMetadataServer;
 class WrappedMasterService {
+    friend class test::MasterServiceTest;
+
    public:
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata

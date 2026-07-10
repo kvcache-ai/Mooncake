@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <string>
 #include <thread>
@@ -192,6 +193,22 @@ class SnapshotChildProcessTest : public ::testing::Test {
             }
         }
         return false;
+    }
+
+    std::optional<WorkloadHints> GetObjectWorkloadHintsFromMetadata(
+        const std::string& key) {
+        for (auto& shard : service_->metadata_shards_) {
+            SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
+            auto tenant_it = shard.tenants.find("default");
+            if (tenant_it == shard.tenants.end()) {
+                continue;
+            }
+            auto it = tenant_it->second.metadata.find(key);
+            if (it != tenant_it->second.metadata.end()) {
+                return it->second.workload_hints;
+            }
+        }
+        return std::nullopt;
     }
 
     std::string FindGroupIdOnDifferentShard(MasterService* svc,
@@ -508,6 +525,9 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     replicate_config.replica_num = 1;
     replicate_config.group_ids = std::vector<std::string>{
         FindGroupIdOnDifferentShard(service_.get(), key)};
+    replicate_config.workload_hints.session_id = kDefaultTestWorkloadSessionId;
+    replicate_config.workload_hints.retention_priority =
+        kDefaultTestRetentionPriority;
 
     auto put_start =
         service_->PutStart(client_id, key, "default", 1024, replicate_config);
@@ -526,6 +546,11 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     auto restored_replicas = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(restored_replicas.has_value())
         << "Grouped key should remain reachable by key after restore";
+    auto restored_hints = GetObjectWorkloadHintsFromMetadata(key);
+    ASSERT_TRUE(restored_hints.has_value());
+    EXPECT_EQ(restored_hints->session_id, kDefaultTestWorkloadSessionId);
+    EXPECT_EQ(restored_hints->retention_priority,
+              kDefaultTestRetentionPriority);
     ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());
     EXPECT_FALSE(service_->ExistKey(key, "default").value_or(true));
 }
@@ -581,6 +606,74 @@ TEST_F(SnapshotChildProcessTest,
         << deserialize_result.error().message;
 
     EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+    // This v1 payload predates workload hints; the new reader must supply
+    // their API defaults rather than rejecting the snapshot.
+    auto restored_hints = GetObjectWorkloadHintsFromMetadata(key);
+    ASSERT_TRUE(restored_hints.has_value());
+    EXPECT_TRUE(restored_hints->session_id.empty());
+    EXPECT_EQ(restored_hints->retention_priority, 0);
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DeserializePreviousMetadataWithoutWorkloadHintsUsesDefaults) {
+    CreateDefaultService();
+    const std::string key = "snapshot_v4_without_workload_hints";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(3);
+    shard_packer.pack(std::string("default"));
+    shard_packer.pack(key);
+
+    // v4: 7 base fields + data_type + one replica + hard_pinned + group_id.
+    shard_packer.pack_array(11);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    shard_packer.pack(static_cast<uint8_t>(ObjectDataType::TENSOR));
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+    shard_packer.pack(true);
+    shard_packer.pack(std::string("snapshot-v4-group"));
+
+    auto compressed_shard =
+        zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                      shard_buffer.size(), 3);
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(1);
+    root_packer.pack(shard_idx);
+    root_packer.pack_bin(compressed_shard.size());
+    root_packer.pack_bin_body(
+        reinterpret_cast<const char*>(compressed_shard.data()),
+        compressed_shard.size());
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(uint64_t{11});
+
+    auto deserialize_result =
+        DeserializeMetadataForTest(ToByteVector(root_buffer));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    EXPECT_TRUE(ObjectIsGroupedInMetadata(key, shard_idx));
+    auto restored_hints = GetObjectWorkloadHintsFromMetadata(key);
+    ASSERT_TRUE(restored_hints.has_value());
+    EXPECT_TRUE(restored_hints->session_id.empty());
+    EXPECT_EQ(restored_hints->retention_priority, 0);
 }
 
 TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {

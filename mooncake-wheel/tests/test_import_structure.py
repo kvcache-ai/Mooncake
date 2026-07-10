@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import unittest
 
-class TestImportStructure(unittest.TestCase):
 
+class TestImportStructure(unittest.TestCase):
     def test_new_import_structure(self):
         """Test that the new import structure works."""
         import mooncake.engine
@@ -16,15 +16,29 @@ class TestImportStructure(unittest.TestCase):
         # Verify direct access to TransferOpcode
         self.assertIsNotNone(mooncake.engine.TransferOpcode)
 
-        from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+        from mooncake.store import (
+            MooncakeDistributedStore,
+            ReplicateConfig,
+            WorkloadHints,
+        )
 
         # Just verify we can create instances
         store = MooncakeDistributedStore()
         config = ReplicateConfig()
         config.group_ids = ["group-a", ""]
 
+        hints = WorkloadHints()
+        self.assertEqual(hints.session_id, "")
+        self.assertEqual(hints.retention_priority, 0)
+
+        hints.session_id = "session-a"
+        hints.retention_priority = 7
+        config.workload_hints = hints
+
         self.assertIsNotNone(store)
         self.assertEqual(config.group_ids, ["group-a", ""])
+        self.assertEqual(config.workload_hints.session_id, "session-a")
+        self.assertEqual(config.workload_hints.retention_priority, 7)
 
         config.group_ids = None
         self.assertIsNone(config.group_ids)
@@ -43,5 +57,6 @@ class TestImportStructure(unittest.TestCase):
 
         self.assertIs(BufferPool, RegisteredBufferPool)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

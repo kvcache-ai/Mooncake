@@ -55,6 +55,7 @@ struct MetadataStoragePlugin;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
+class MasterServiceTest;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
 // deserialize cycle directly via the otherwise-private
 // MetadataSerializer, and inspect private clamp fields. This avoids
@@ -85,6 +86,7 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
+    friend class test::MasterServiceTest;
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
@@ -894,7 +896,7 @@ class MasterService {
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
             std::string group_id_ = "", std::string tenant_id_ = "default",
-            std::string user_key_ = {})
+            std::string user_key_ = {}, WorkloadHints workload_hints_ = {})
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -902,6 +904,7 @@ class MasterService {
               group_id(std::move(group_id_)),
               tenant_id(std::move(tenant_id_)),
               user_key(std::move(user_key_)),
+              workload_hints(std::move(workload_hints_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -928,6 +931,7 @@ class MasterService {
         const std::string group_id;
         const std::string tenant_id;
         const std::string user_key;
+        const WorkloadHints workload_hints;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing

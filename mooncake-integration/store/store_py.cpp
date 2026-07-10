@@ -1826,6 +1826,12 @@ PYBIND11_MODULE(store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    py::class_<WorkloadHints>(m, "WorkloadHints")
+        .def(py::init<>())
+        .def_readwrite("session_id", &WorkloadHints::session_id)
+        .def_readwrite("retention_priority",
+                       &WorkloadHints::retention_priority);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -1842,6 +1848,7 @@ PYBIND11_MODULE(store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_readwrite("workload_hints", &ReplicateConfig::workload_hints)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

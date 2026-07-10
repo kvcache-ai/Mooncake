@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -37,6 +38,8 @@ constexpr uint64_t kDefaultTestLeaseTimeoutMs = 4102444800000ULL;
 constexpr uint64_t kDefaultTestSnapshotSeq = 42;
 constexpr uint64_t kDefaultTestProducerViewVersion = 7;
 constexpr int64_t kDefaultTestCreatedAtMs = 1700000000000LL;
+constexpr char kDefaultTestWorkloadSessionId[] = "test-session";
+constexpr int32_t kDefaultTestRetentionPriority = -17;
 
 struct CatalogBackendParam {
     std::string name;
@@ -53,13 +56,16 @@ struct CatalogBackendParam {
 //   kDataTypeAndHardPinned:
 //                    9 + replica_count, data_type plus trailing hard_pinned
 //   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
-//                    (the current writer format)
+//   kWithWorkloadHints:
+//                    11 + replica_count, kWithGroupId plus trailing
+//                    [session_id, retention_priority] array (current writer)
 enum class SnapshotMetadataFormat {
     kLegacy,
     kDataTypeOnly,
     kHardPinnedOnly,
     kDataTypeAndHardPinned,
     kWithGroupId,
+    kWithWorkloadHints,
 };
 
 class ScopedEnvVar {
@@ -177,18 +183,25 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     const bool include_data_type =
         format == SnapshotMetadataFormat::kDataTypeOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithWorkloadHints;
     const bool include_hard_pinned =
         format == SnapshotMetadataFormat::kHardPinnedOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithWorkloadHints;
     const bool include_group_id =
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithWorkloadHints;
+    const bool include_workload_hints =
+        format == SnapshotMetadataFormat::kWithWorkloadHints;
     constexpr uint32_t kReplicaCount = 1;
-    // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
+    // 7 leading fields + replicas + optional data_type/hard_pinned/group_id/
+    // workload_hints.
     const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
                               (include_hard_pinned ? 1 : 0) +
-                              (include_group_id ? 1 : 0);
+                              (include_group_id ? 1 : 0) +
+                              (include_workload_hints ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -215,6 +228,11 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     }
     if (include_group_id) {
         shard_packer.pack(std::string("test-group"));
+    }
+    if (include_workload_hints) {
+        shard_packer.pack_array(2);
+        shard_packer.pack(std::string(kDefaultTestWorkloadSessionId));
+        shard_packer.pack(kDefaultTestRetentionPriority);
     }
 
     return WrapShardIntoMetadataRoot(shard_buffer);

@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_client.h"
 #include "rpc_service.h"
 
 #include <glog/logging.h>
@@ -64,6 +65,11 @@ class ScopedEnvVar {
 
 class MasterServiceTest : public ::testing::Test {
    protected:
+    struct ObjectHintState {
+        WorkloadHints workload_hints;
+        std::string group_id;
+    };
+
     void SetUp() override {
         google::InitGoogleLogging("MasterServiceTest");
         FLAGS_logtostderr = true;
@@ -307,6 +313,32 @@ class MasterServiceTest : public ::testing::Test {
         EXPECT_TRUE(predicate());
     }
 
+    std::optional<ObjectHintState> GetObjectHintState(
+        MasterService& service, const std::string& key,
+        const std::string& tenant_id = "default") const {
+        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        auto& shard = service.metadata_shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
+        auto tenant_it = shard.tenants.find(tenant_id);
+        if (tenant_it == shard.tenants.end()) {
+            return std::nullopt;
+        }
+        auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return std::nullopt;
+        }
+        return ObjectHintState{
+            .workload_hints = metadata_it->second.workload_hints,
+            .group_id = metadata_it->second.group_id,
+        };
+    }
+
+    std::optional<ObjectHintState> GetObjectHintState(
+        WrappedMasterService& service, const std::string& key,
+        const std::string& tenant_id = "default") const {
+        return GetObjectHintState(service.master_service_, key, tenant_id);
+    }
+
     std::vector<Replica::Descriptor> replica_list;
     std::vector<std::string> policy_files_;
     size_t next_policy_file_ = 0;
@@ -339,6 +371,169 @@ TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     auto [legacy_tenant, legacy_key] = ParseTenantScopedStorageKey(legacy);
     EXPECT_EQ(legacy_tenant, "legacy_tenant");
     EXPECT_EQ(legacy_key, "legacy_key");
+}
+
+TEST(WorkloadHintsTest, DefaultsAndForSingleKeyPreserveSharedHints) {
+    ReplicateConfig config;
+    EXPECT_TRUE(config.IsDefault());
+    EXPECT_TRUE(config.workload_hints.session_id.empty());
+    EXPECT_EQ(config.workload_hints.retention_priority, 0);
+
+    config.workload_hints.session_id = "session-shared-by-batch";
+    config.workload_hints.retention_priority = -17;
+    config.group_ids = std::vector<std::string>{"group-a", "group-b"};
+    EXPECT_FALSE(config.IsDefault());
+
+    ReplicateConfig key_config = config.ForSingleKey(1);
+    EXPECT_EQ(key_config.workload_hints.session_id, "session-shared-by-batch");
+    EXPECT_EQ(key_config.workload_hints.retention_priority, -17);
+    ASSERT_TRUE(key_config.group_ids.has_value());
+    EXPECT_EQ(*key_config.group_ids, (std::vector<std::string>{"group-b"}));
+}
+
+TEST_F(MasterServiceTest, PutStoresHintsAndDuplicatePutKeepsOriginalHints) {
+    MasterService service;
+    const auto mounted = PrepareSimpleSegment(service);
+
+    ReplicateConfig config;
+    config.workload_hints.session_id = "put-session";
+    config.workload_hints.retention_priority = -9;
+    PutCompletedObject(service, mounted.client_id, "hinted-put", config);
+
+    auto stored = GetObjectHintState(service, "hinted-put");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->workload_hints.session_id, "put-session");
+    EXPECT_EQ(stored->workload_hints.retention_priority, -9);
+
+    ReplicateConfig duplicate_config = config;
+    duplicate_config.workload_hints.session_id = "replacement-session";
+    duplicate_config.workload_hints.retention_priority = 99;
+    auto duplicate = service.PutStart(mounted.client_id, "hinted-put",
+                                      "default", 1024, duplicate_config);
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    stored = GetObjectHintState(service, "hinted-put");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->workload_hints.session_id, "put-session");
+    EXPECT_EQ(stored->workload_hints.retention_priority, -9);
+}
+
+TEST_F(MasterServiceTest, UpsertPreservesExistingHintsAndSetsHintsOnInsert) {
+    MasterService service;
+    const auto mounted = PrepareSimpleSegment(service);
+
+    ReplicateConfig original_config;
+    original_config.workload_hints.session_id = "original-session";
+    original_config.workload_hints.retention_priority = 7;
+    PutCompletedObject(service, mounted.client_id, "hinted-upsert",
+                       original_config);
+
+    ReplicateConfig incoming_config;
+    incoming_config.workload_hints.session_id = "incoming-session";
+    incoming_config.workload_hints.retention_priority = 100;
+
+    auto same_size = service.UpsertStart(mounted.client_id, "hinted-upsert",
+                                         "default", 1024, incoming_config);
+    ASSERT_TRUE(same_size.has_value()) << toString(same_size.error());
+    auto stored = GetObjectHintState(service, "hinted-upsert");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->workload_hints.session_id, "original-session");
+    EXPECT_EQ(stored->workload_hints.retention_priority, 7);
+    ASSERT_TRUE(service
+                    .UpsertEnd(mounted.client_id, "hinted-upsert", "default",
+                               ReplicaType::MEMORY)
+                    .has_value());
+
+    incoming_config.workload_hints.session_id = "new-size-session";
+    incoming_config.workload_hints.retention_priority = -100;
+    auto different_size = service.UpsertStart(
+        mounted.client_id, "hinted-upsert", "default", 2048, incoming_config);
+    ASSERT_TRUE(different_size.has_value()) << toString(different_size.error());
+    stored = GetObjectHintState(service, "hinted-upsert");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->workload_hints.session_id, "original-session");
+    EXPECT_EQ(stored->workload_hints.retention_priority, 7);
+    ASSERT_TRUE(service
+                    .UpsertEnd(mounted.client_id, "hinted-upsert", "default",
+                               ReplicaType::MEMORY)
+                    .has_value());
+
+    auto insert = service.UpsertStart(mounted.client_id, "hinted-upsert-new",
+                                      "default", 1024, incoming_config);
+    ASSERT_TRUE(insert.has_value()) << toString(insert.error());
+    stored = GetObjectHintState(service, "hinted-upsert-new");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->workload_hints.session_id, "new-size-session");
+    EXPECT_EQ(stored->workload_hints.retention_priority, -100);
+    ASSERT_TRUE(service
+                    .UpsertEnd(mounted.client_id, "hinted-upsert-new",
+                               "default", ReplicaType::MEMORY)
+                    .has_value());
+}
+
+TEST_F(MasterServiceTest, BatchPutRpcPreservesHintsAlongsideGroupIds) {
+    const int rpc_port = getFreeTcpPort();
+    ASSERT_GT(rpc_port, 0);
+
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    WrappedMasterService service(service_config);
+    coro_rpc::coro_rpc_server server(/*thread_num=*/2, rpc_port,
+                                     /*address=*/"127.0.0.1");
+    RegisterRpcService(server, service);
+    auto start_error = server.async_start();
+    ASSERT_FALSE(start_error.hasResult());
+
+    const UUID client_id = generate_uuid();
+    const Segment segment = MakeSegment("workload-hints-rpc-segment");
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    {
+        MasterClient client(client_id);
+        ErrorCode connect_result = ErrorCode::INTERNAL_ERROR;
+        WaitUntil(
+            [&] {
+                connect_result =
+                    client.Connect("127.0.0.1:" + std::to_string(rpc_port));
+                return connect_result == ErrorCode::OK;
+            },
+            std::chrono::seconds(3));
+        ASSERT_EQ(connect_result, ErrorCode::OK);
+
+        const std::vector<std::string> keys = {"rpc-hint-grouped",
+                                               "rpc-hint-ungrouped"};
+        ReplicateConfig config;
+        config.workload_hints.session_id = "rpc-session";
+        config.workload_hints.retention_priority = -31;
+        config.group_ids = std::vector<std::string>{"rpc-workload-group", ""};
+
+        auto results = client.BatchPutStart(
+            keys, std::vector<std::vector<uint64_t>>{{1024}, {2048}}, config);
+        ASSERT_EQ(results.size(), keys.size());
+        ASSERT_TRUE(results[0].has_value()) << toString(results[0].error());
+        ASSERT_TRUE(results[1].has_value()) << toString(results[1].error());
+
+        auto grouped = GetObjectHintState(service, keys[0]);
+        ASSERT_TRUE(grouped.has_value());
+        EXPECT_EQ(grouped->workload_hints.session_id, "rpc-session");
+        EXPECT_EQ(grouped->workload_hints.retention_priority, -31);
+        EXPECT_EQ(grouped->group_id, "rpc-workload-group");
+
+        auto ungrouped = GetObjectHintState(service, keys[1]);
+        ASSERT_TRUE(ungrouped.has_value());
+        EXPECT_EQ(ungrouped->workload_hints.session_id, "rpc-session");
+        EXPECT_EQ(ungrouped->workload_hints.retention_priority, -31);
+        EXPECT_TRUE(ungrouped->group_id.empty());
+
+        auto end_results = client.BatchPutEnd(keys, ReplicaType::MEMORY);
+        ASSERT_EQ(end_results.size(), keys.size());
+        EXPECT_TRUE(end_results[0].has_value());
+        EXPECT_TRUE(end_results[1].has_value());
+    }
+
+    server.stop();
 }
 
 std::string GenerateKeyForSegment(const UUID& client_id,
