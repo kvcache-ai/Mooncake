@@ -120,6 +120,10 @@ struct XferMetricStats {
 
     void add(double value) { samples.push_back(value); }
 
+    void add(const std::vector<double>& values) {
+        samples.insert(samples.end(), values.begin(), values.end());
+    }
+
     void clear() { samples.clear(); }
 
     size_t count() { return samples.size(); }
@@ -163,10 +167,6 @@ void printStatsHeader();
 
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
-
-void printDeadlineGroupStats(const char* group, size_t block_size,
-                             size_t batch_size, XferBenchStats& stats,
-                             int num_threads, uint64_t deadline_us);
 
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {

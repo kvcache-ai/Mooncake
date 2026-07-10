@@ -27,6 +27,16 @@ namespace mooncake {
 namespace tent {
 namespace {
 
+TEST(QosMetricsTest, SupportsBulkSamples) {
+    XferMetricStats stats;
+    stats.add(std::vector<double>{3.0, 1.0, 2.0});
+
+    EXPECT_EQ(stats.count(), 3u);
+    EXPECT_DOUBLE_EQ(stats.min(), 1.0);
+    EXPECT_DOUBLE_EQ(stats.max(), 3.0);
+    EXPECT_DOUBLE_EQ(stats.avg(), 2.0);
+}
+
 TEST(QosMetricsTest, ParsesClassContract) {
     std::vector<QosClassConfig> classes;
     std::string error;
