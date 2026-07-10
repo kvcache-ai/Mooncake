@@ -52,6 +52,7 @@ TEST(QosMetricsTest, RejectsAmbiguousOrInvalidContracts) {
     std::string error;
     EXPECT_FALSE(parseQosClasses("fg:1:100:1,fg:1:0:1", &classes, &error));
     EXPECT_FALSE(parseQosClasses("fg:0:100:1", &classes, &error));
+    EXPECT_FALSE(parseQosClasses("fg:1::1", &classes, &error));
     EXPECT_FALSE(parseQosClasses("fg:1:-1:1", &classes, &error));
     EXPECT_FALSE(parseQosClasses("fg:1:100:0", &classes, &error));
     EXPECT_FALSE(parseQosClasses("fg:1:100:1:0", &classes, &error));
@@ -102,7 +103,7 @@ TEST(QosMetricsTest, UsesNullForUnavailableJsonMetrics) {
     stats[0].transfer_duration.add(100.0);
     const auto report = calculateQosMetrics(1000, 1, 1, classes, &stats, 0.0);
 
-    const std::string path = "/tmp/tebench_qos_metrics_test.jsonl";
+    const std::string path = "tebench_qos_metrics_test.jsonl";
     std::remove(path.c_str());
     std::string error;
     ASSERT_TRUE(appendQosMetricsJsonl(path, report, &error)) << error;
