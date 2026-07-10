@@ -114,7 +114,8 @@ four focused review areas inside one integration PR:
 
 - Upstream project: <https://github.com/kvcache-ai/Mooncake>
 - Submission repository: <https://github.com/Pinoeer-kingxi/Mooncake>
-- Submission branch: `epd-vllm-serve-20260709-a6000`
+- Submission branch: `feature/epd-vllm-multimodal-agent`
+- Main upstream PR: <https://github.com/kvcache-ai/Mooncake/pull/2836>
 - Overview: [`README.md`](README.md)
 - Design: [`DESIGN.md`](DESIGN.md)
 - Evaluation: [`EVALUATION.md`](EVALUATION.md)

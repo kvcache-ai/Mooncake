@@ -18,8 +18,8 @@ are backed by
 
 - Upstream Mooncake repository: <https://github.com/kvcache-ai/Mooncake>
 - Public submission repository: <https://github.com/Pinoeer-kingxi/Mooncake>
-- EPD branch: <https://github.com/Pinoeer-kingxi/Mooncake/tree/epd-vllm-serve-20260709-a6000>
-- Main upstream PR: **Mooncake EPD: Multimodal and Agent-State Disaggregation**.
+- EPD branch: <https://github.com/Pinoeer-kingxi/Mooncake/tree/feature/epd-vllm-multimodal-agent>
+- Main upstream PR: [Mooncake EPD: Multimodal and Agent-State Disaggregation](https://github.com/kvcache-ai/Mooncake/pull/2836)
 
 The subsystem-oriented review guide for the single integration PR is
 documented in `PR_DESCRIPTION.md`.
