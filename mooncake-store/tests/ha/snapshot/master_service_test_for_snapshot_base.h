@@ -1,6 +1,7 @@
 #pragma once
 
 #include "master_service.h"
+#include "master_snapshot_manager.h"
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
@@ -159,11 +160,43 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Snapshot Helper Methods ====================
 
-    // Wrapper method: Call MasterService's private method PersistState
-    // This class is a friend of MasterService, so it can access private members
+    // Wrapper method: Call MasterSnapshotManager's PersistState through
+    // MasterService This class is a friend of MasterService, so it can access
+    // private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
-        return service->PersistState(snapshot_id);
+        // If snapshot_manager_ exists, use it; otherwise create a temporary one
+        if (service->snapshot_manager_) {
+            return service->snapshot_manager_->PersistState(snapshot_id);
+        }
+
+        // For tests that don't have snapshot_manager_ initialized,
+        // we need to access the old implementation or create a temporary
+        // manager This is a temporary compatibility layer for tests
+        EnsureSnapshotStores(service);
+
+        MasterSnapshotManagerOptions options;
+        options.enable_snapshot = true;
+        options.snapshot_interval_seconds = 300;
+        options.snapshot_child_timeout_seconds = 300;
+        options.snapshot_retention_count = 3;
+        options.snapshot_backup_dir = "";
+        options.use_snapshot_backup_dir = false;
+        options.snapshot_catalog_store_type =
+            service->snapshot_catalog_store_type_;
+        options.snapshot_catalog_store_connstring =
+            service->snapshot_catalog_store_connstring_;
+        options.ha_backend_type = service->ha_backend_type_;
+        options.ha_backend_connstring = service->ha_backend_connstring_;
+        options.cluster_id = service->cluster_id_;
+        options.enable_ha = service->enable_ha_;
+
+        auto temp_manager = std::make_unique<MasterSnapshotManager>(
+            service, options, service->snapshot_mutex_,
+            service->snapshot_object_store_.get(),
+            service->snapshot_catalog_store_.get());
+
+        return temp_manager->PersistState(snapshot_id);
     }
 
     static void EnsureSnapshotStores(MasterService* service) {

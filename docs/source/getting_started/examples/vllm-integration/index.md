@@ -5,7 +5,7 @@
 Mooncake integrates with vLLM to accelerate large language model serving through high-performance KV cache transfer and shared storage. The integration supports two primary scenarios:
 
 - **Disaggregated Prefill-Decode Serving**: Seamlessly split prefill and decode across nodes using `MooncakeConnector`, with RDMA-powered cross-node KV cache transfer achieving up to **142.25 GB/s** peak bandwidth (71.1% utilization of 8x RoCE). Transfer overhead is negligible &mdash; for 32K-token prompts (4.50 GB of KV data), transfer takes only **31.65 ms**, accounting for just **4.2%** of total TTFT.
-- **KV Cache Storage & Sharing**: Extend effective KV cache capacity via `MooncakeStore` / `MooncakeStoreConnector`, with hash-based prefix caching that enables multiple vLLM instances to share cached KV blocks. Supports CPU/Disk offloading and dynamic XpYd topologies at runtime. Distributed KV cache pool improves throughput by **3.8x**, reduces P50 TTFT and E2E latency by **46x** and **8.6x** (1P1D, 12GPUs), and scales to **60 GPUs** with >95% cache hit rate as shown in this [webpage](../../../../../docs/source/performance/vllm-v1-kvcache-sharing.md).
+- **KV Cache Storage & Sharing**: Extend effective KV cache capacity via `MooncakeStore` / `MooncakeStoreConnector`, with hash-based prefix caching that enables multiple vLLM instances to share cached KV blocks. Supports CPU/Disk offloading and dynamic XpYd topologies at runtime. Distributed KV cache pool improves throughput by **3.8x**, reduces P50 TTFT and E2E latency by **46x** and **8.6x** (1P1D, 12GPUs), and scales to **60 GPUs** with >95% cache hit rate as shown in this [webpage](../../../performance/vllm/vllm-v1-mooncake-store.md).
 
 | Scenario | Guide | vLLM Backend |
 |----------|-------|-------------|
