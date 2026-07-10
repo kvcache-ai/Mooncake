@@ -534,10 +534,9 @@ MasterService::~MasterService() {
     eviction_running_ = false;
     client_monitor_running_ = false;
 
-    // Stop snapshot manager (which handles its own thread lifecycle)
+    // Stop snapshot manager (non-blocking)
     if (snapshot_manager_) {
         snapshot_manager_->Stop();
-        snapshot_manager_.reset();
     }
 
     task_cleanup_running_ = false;
@@ -571,6 +570,12 @@ MasterService::~MasterService() {
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
+    }
+
+    // Reset snapshot manager after all other threads have joined
+    // This triggers the destructor which joins the snapshot thread
+    if (snapshot_manager_) {
+        snapshot_manager_.reset();
     }
 }
 

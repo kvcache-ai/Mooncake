@@ -62,7 +62,12 @@ MasterSnapshotManager::MasterSnapshotManager(
           snapshot_object_store, snapshot_catalog_store,
           options_.snapshot_backup_dir, options_.use_snapshot_backup_dir)) {}
 
-MasterSnapshotManager::~MasterSnapshotManager() { Stop(); }
+MasterSnapshotManager::~MasterSnapshotManager() {
+    Stop();
+    if (snapshot_thread_.joinable()) {
+        snapshot_thread_.join();
+    }
+}
 
 void MasterSnapshotManager::Start() {
     if (snapshot_running_.load()) {
@@ -80,11 +85,7 @@ void MasterSnapshotManager::Stop() {
         snapshot_running_ = false;
     }
     snapshot_thread_cv_.notify_all();
-
-    if (snapshot_thread_.joinable()) {
-        snapshot_thread_.join();
-    }
-    LOG(INFO) << "[MasterSnapshotManager] Stopped";
+    LOG(INFO) << "[MasterSnapshotManager] Stop signaled";
 }
 
 std::string MasterSnapshotManager::FormatTimestamp(
