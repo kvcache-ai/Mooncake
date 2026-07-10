@@ -27,6 +27,12 @@ target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)
 
+add_executable(promotion_policy_test promotion_policy_test.cpp)
+target_link_libraries(promotion_policy_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(promotion_policy_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME promotion_policy_test COMMAND promotion_policy_test)
+
 add_executable(tent_ip_utils_test ip_utils_test.cpp)
 target_link_libraries(tent_ip_utils_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(tent_ip_utils_test
