@@ -104,8 +104,7 @@ struct TransferHandshakeUtil {
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
         if (!root.isObject()) return ERR_INVALID_ARGUMENT;
         for (const char *field : {"protocol", "payload", "local_nic_path",
-                                  "local_gid", "peer_nic_path",
-                                  "reply_msg"}) {
+                                  "local_gid", "peer_nic_path", "reply_msg"}) {
             if (root.isMember(field) && !root[field].isString()) {
                 return ERR_INVALID_ARGUMENT;
             }
@@ -424,10 +423,9 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             }
         }
         if (!is_multi_protocol) {
-            LOG(ERROR) << "Unsupported multi-protocol combination: "
-                       << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip, maca and nccl may be "
-                          "combined.";
+            LOG(ERROR)
+                << "Unsupported multi-protocol combination: " << desc.protocol
+                << ". Only cxl, tcp, rdma, hip, maca and nccl may be combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -1421,8 +1419,9 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
     return 0;
 }
 
-int TransferMetadata::removeLocalMemoryBuffer(
-    void *addr, const std::string &protocol, bool update_metadata) {
+int TransferMetadata::removeLocalMemoryBuffer(void *addr,
+                                              const std::string &protocol,
+                                              bool update_metadata) {
     return removeLocalMemoryBuffers({addr}, protocol, update_metadata);
 }
 
@@ -1459,10 +1458,9 @@ int TransferMetadata::removeLocalMemoryBuffers(
             bool address_matches = it->addr == reinterpret_cast<uint64_t>(addr);
 #ifdef USE_CXL
             if (protocol == "cxl") {
-                address_matches =
-                    address_matches ||
-                    (it->offset + candidate->cxl_base_addr) ==
-                        reinterpret_cast<uint64_t>(addr);
+                address_matches = address_matches ||
+                                  (it->offset + candidate->cxl_base_addr) ==
+                                      reinterpret_cast<uint64_t>(addr);
             }
 #endif
             if (address_matches) {
@@ -1616,9 +1614,8 @@ int TransferMetadata::startHandshakeDaemon(
                     return 0;
                 }
             } catch (const Json::Exception &exception) {
-                local_desc.reply_msg =
-                    "Malformed transfer handshake: " +
-                    std::string(exception.what());
+                local_desc.reply_msg = "Malformed transfer handshake: " +
+                                       std::string(exception.what());
                 local = TransferHandshakeUtil::encode(local_desc);
                 return 0;
             }
@@ -1669,16 +1666,15 @@ int TransferMetadata::startHandshakeDaemon(
 }
 
 int TransferMetadata::registerHandshakeHandler(
-    const std::string &protocol,
-    OnReceiveHandShake on_receive_handshake) {
+    const std::string &protocol, OnReceiveHandShake on_receive_handshake) {
     if (protocol.empty() || !on_receive_handshake) {
         LOG(ERROR) << "Handshake handlers require a protocol and callback";
         return ERR_INVALID_ARGUMENT;
     }
 
     std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
-    auto [it, inserted] = handshake_handlers_.emplace(
-        protocol, std::move(on_receive_handshake));
+    auto [it, inserted] =
+        handshake_handlers_.emplace(protocol, std::move(on_receive_handshake));
     if (!inserted) {
         LOG(ERROR) << "Handshake handler already registered for " << protocol;
         return ERR_INVALID_ARGUMENT;

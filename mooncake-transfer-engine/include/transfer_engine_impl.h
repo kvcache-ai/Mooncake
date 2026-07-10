@@ -34,7 +34,7 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #if ((defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
-     !defined(USE_CXI)) || \
+     !defined(USE_CXI)) ||                                            \
     defined(USE_NCCL_DEVICE)
 #include "transport/device/device_transport.h"
 #endif

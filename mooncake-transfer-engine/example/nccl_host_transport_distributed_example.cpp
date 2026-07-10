@@ -68,9 +68,9 @@ bool waitForDeviceByte(const void* device_ptr, uint8_t expected) {
                           std::chrono::seconds(FLAGS_timeout_seconds);
     while (std::chrono::steady_clock::now() < deadline) {
         uint8_t value = 0;
-        if (!checkCuda(cudaMemcpy(&value, device_ptr, 1,
-                                  cudaMemcpyDeviceToHost),
-                       "cudaMemcpy control byte")) {
+        if (!checkCuda(
+                cudaMemcpy(&value, device_ptr, 1, cudaMemcpyDeviceToHost),
+                "cudaMemcpy control byte")) {
             return false;
         }
         if (value == expected) return true;
@@ -211,11 +211,12 @@ int main(int argc, char** argv) {
         local_host + ":" + std::to_string(local_port);
     const std::string peer_endpoint =
         FLAGS_peer_host + ":" + std::to_string(peer_port);
-    if (engine->init(P2PHANDSHAKE, local_endpoint, local_host, local_port) != 0 ||
+    if (engine->init(P2PHANDSHAKE, local_endpoint, local_host, local_port) !=
+            0 ||
         !engine->installTransport("nccl", nullptr) ||
-        engine->registerLocalMemory(
-            buffer, kAllocationBytes,
-            "cuda:" + std::to_string(FLAGS_gpu_id)) != 0) {
+        engine->registerLocalMemory(buffer, kAllocationBytes,
+                                    "cuda:" + std::to_string(FLAGS_gpu_id)) !=
+            0) {
         LOG(ERROR) << "Failed to initialize NCCL host transport";
         return 1;
     }
@@ -238,8 +239,7 @@ int main(int argc, char** argv) {
                        FLAGS_transfer_bytes, TransferRequest::WRITE)) {
             return 1;
         }
-        const double first_write_ms =
-            elapsedMilliseconds(first_write_start);
+        const double first_write_ms = elapsedMilliseconds(first_write_start);
 
         const auto control_start = std::chrono::steady_clock::now();
         if (!checkCuda(cudaMemset(tx_control, 1, 1), "cudaMemset control") ||
@@ -263,9 +263,8 @@ int main(int argc, char** argv) {
 
         const auto benchmark_start = std::chrono::steady_clock::now();
         for (int i = 0; i < FLAGS_iterations; ++i) {
-            if (!submitOne(engine.get(), peer_segment, buffer,
-                           peer_buffer_addr, FLAGS_transfer_bytes,
-                           TransferRequest::WRITE)) {
+            if (!submitOne(engine.get(), peer_segment, buffer, peer_buffer_addr,
+                           FLAGS_transfer_bytes, TransferRequest::WRITE)) {
                 return 1;
             }
         }
@@ -273,17 +272,16 @@ int main(int argc, char** argv) {
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           benchmark_start)
                 .count();
-        const double gib =
-            static_cast<double>(FLAGS_transfer_bytes) * FLAGS_iterations /
-            static_cast<double>(1ULL << 30);
+        const double gib = static_cast<double>(FLAGS_transfer_bytes) *
+                           FLAGS_iterations / static_cast<double>(1ULL << 30);
         const double usec_per_op =
             seconds * 1.0e6 / std::max(1, FLAGS_iterations);
         LOG(INFO) << "Distributed NCCL host validation passed: cold WRITE "
                   << first_write_ms << " ms, RMA control sync " << control_ms
                   << " ms, reverse-PUT READ " << read_ms << " ms; steady WRITE "
                   << FLAGS_iterations << " x " << FLAGS_transfer_bytes
-                  << " bytes, " << gib / seconds << " GiB/s, "
-                  << usec_per_op << " us/op";
+                  << " bytes, " << gib / seconds << " GiB/s, " << usec_per_op
+                  << " us/op";
         if (!checkCuda(cudaMemset(tx_control, 2, 1), "cudaMemset control") ||
             !submitOne(engine.get(), peer_segment, tx_control,
                        peer_buffer_addr + kBufferBytes + 1, 1,
@@ -291,8 +289,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     } else {
-        if (!waitForDeviceByte(rx_control, 1) ||
-            !verifyPattern(buffer, 0x5a) ||
+        if (!waitForDeviceByte(rx_control, 1) || !verifyPattern(buffer, 0x5a) ||
             !checkCuda(cudaMemset(buffer, 0xa5, FLAGS_transfer_bytes),
                        "cudaMemset read source") ||
             !checkCuda(cudaMemset(tx_control, 1, 1), "cudaMemset control") ||

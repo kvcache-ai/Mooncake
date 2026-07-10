@@ -72,12 +72,11 @@ std::string bootstrapPath() {
         CHECK(std::isalnum(c) || c == '-' || c == '_' || c == '.')
             << "--run_id may contain only letters, digits, '.', '-', and '_'";
     }
-    return FLAGS_bootstrap_dir + "/mooncake_nccl_device_" +
-           FLAGS_run_id + ".bin";
+    return FLAGS_bootstrap_dir + "/mooncake_nccl_device_" + FLAGS_run_id +
+           ".bin";
 }
 
-void writeUniqueId(const std::string& path,
-                   const std::vector<int32_t>& id) {
+void writeUniqueId(const std::string& path, const std::vector<int32_t>& id) {
     const std::string temporary = path + ".tmp";
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     CHECK(output) << "Cannot open " << temporary;
@@ -146,19 +145,19 @@ __global__ void senderKernel(mooncake::device::NcclDeviceContext ctx,
 
     const NcclDeviceRoute route = mc_nccl_route(ctx, peer);
     const bool use_gin = force_gin || route == NcclDeviceRoute::kGin;
-    auto* data_signal = reinterpret_cast<uint64_t*>(
-        local_buffer + data_signal_offset);
-    auto* ack_signal = reinterpret_cast<uint64_t*>(
-        local_buffer + ack_signal_offset);
+    auto* data_signal =
+        reinterpret_cast<uint64_t*>(local_buffer + data_signal_offset);
+    auto* ack_signal =
+        reinterpret_cast<uint64_t*>(local_buffer + ack_signal_offset);
 
     if (use_gin) {
         if (!mc_nccl_gin_available(ctx)) {
             *result = -1;
             return;
         }
-        mc_nccl_put_with_signal(
-            ctx, 0, peer, 1, local_buffer, local_buffer,
-            static_cast<uint32_t>(bytes), data_signal, 1, 0);
+        mc_nccl_put_with_signal(ctx, 0, peer, 1, local_buffer, local_buffer,
+                                static_cast<uint32_t>(bytes), data_signal, 1,
+                                0);
         mc_nccl_flush(ctx, 0, 0);
     } else if (route == NcclDeviceRoute::kLsa) {
         char* peer_buffer =
@@ -185,10 +184,10 @@ __global__ void receiverKernel(mooncake::device::NcclDeviceContext ctx,
     constexpr int peer = 0;
     mc_nccl_lsa_barrier(ctx, 0);
 
-    auto* data_signal = reinterpret_cast<uint64_t*>(
-        local_buffer + data_signal_offset);
-    auto* ack_signal = reinterpret_cast<uint64_t*>(
-        local_buffer + ack_signal_offset);
+    auto* data_signal =
+        reinterpret_cast<uint64_t*>(local_buffer + data_signal_offset);
+    auto* ack_signal =
+        reinterpret_cast<uint64_t*>(local_buffer + ack_signal_offset);
     mc_nccl_wait_signal(ctx, 0, data_signal, 1, 0);
 
     int mismatches = 0;
@@ -256,15 +255,13 @@ int main(int argc, char** argv) {
 
     const size_t data_signal_offset =
         alignUp(static_cast<size_t>(FLAGS_data_bytes), kSignalAlignment);
-    const size_t ack_signal_offset =
-        data_signal_offset + kSignalAlignment;
-    const size_t allocation_bytes =
-        ack_signal_offset + kSignalAlignment;
+    const size_t ack_signal_offset = data_signal_offset + kSignalAlignment;
+    const size_t allocation_bytes = ack_signal_offset + kSignalAlignment;
 
     void* allocation = nullptr;
     mooncake::device::NcclBufferRegistration registration;
-    CHECK_EQ(transport->allocateAndRegisterBuffer(
-                 allocation_bytes, &allocation, &registration),
+    CHECK_EQ(transport->allocateAndRegisterBuffer(allocation_bytes, &allocation,
+                                                  &registration),
              0);
     CHECK_NOTNULL(allocation);
     CHECK(registration.valid());
@@ -289,13 +286,13 @@ int main(int argc, char** argv) {
     const auto context = transport->deviceContext(registration);
     CHECK(context.valid());
     if (FLAGS_rank == 0) {
-        senderKernel<<<1, 1>>>(
-            context, buffer, FLAGS_data_bytes, data_signal_offset,
-            ack_signal_offset, FLAGS_force_gin, device_result);
+        senderKernel<<<1, 1>>>(context, buffer, FLAGS_data_bytes,
+                               data_signal_offset, ack_signal_offset,
+                               FLAGS_force_gin, device_result);
     } else {
-        receiverKernel<<<1, 1>>>(
-            context, buffer, FLAGS_data_bytes, data_signal_offset,
-            ack_signal_offset, device_result);
+        receiverKernel<<<1, 1>>>(context, buffer, FLAGS_data_bytes,
+                                 data_signal_offset, ack_signal_offset,
+                                 device_result);
     }
     checkCuda(cudaGetLastError(), "kernel launch");
     checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
@@ -320,13 +317,10 @@ int main(int argc, char** argv) {
 
     const auto properties = transport->properties();
     LOG(INFO) << "PASS rank=" << FLAGS_rank
-              << " gin_backend="
-              << static_cast<int>(properties.gin_backend)
+              << " gin_backend=" << static_cast<int>(properties.gin_backend)
               << " gin_connections=" << properties.gin_connection_count
-              << " multimem_supported="
-              << properties.multimem_supported
-              << " multimem_enabled="
-              << properties.lsa_multimem_enabled
+              << " multimem_supported=" << properties.multimem_supported
+              << " multimem_enabled=" << properties.lsa_multimem_enabled
               << " force_gin=" << FLAGS_force_gin
               << " disable_gin=" << FLAGS_disable_gin;
 
