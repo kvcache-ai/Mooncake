@@ -110,7 +110,12 @@ class LegacyReadServer {
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
-        if (inet_pton(AF_INET, "127.0.0.2", &addr.sin_addr) != 1) return;
+        // The production HTTP-metadata path advertises the engine-selected
+        // LAN address in RPC metadata even when local_server_name is a
+        // loopback test name. Listen on every local interface so the stale
+        // descriptor can redirect either that path or P2PHANDSHAKE's
+        // loopback path to this fake legacy peer.
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
         if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
                  sizeof(addr)) != 0)
             return;
@@ -218,9 +223,15 @@ struct EngineHandle {
         memset(pool, 0, pool_size);
         rc = engine->registerLocalMemory(pool, pool_size, "cpu:0");
         ASSERT_EQ(rc, 0);
-        // With P2PHANDSHAKE metadata the engine's actual RPC port is
-        // auto-assigned; open the segment via the engine-reported address.
-        segment_id = engine->openSegment(engine->getLocalIpAndPort());
+        // The descriptor is fetchable under the name it was registered
+        // with: in P2P-handshake mode the RPC port is auto-assigned, so
+        // that is the engine-reported ip:port; against a real metadata
+        // service (CI runs one at http://...) it is the requested
+        // server_name, matching how production callers open segments.
+        std::string segment_name = (metadata_server == P2PHANDSHAKE)
+                                       ? engine->getLocalIpAndPort()
+                                       : server_name;
+        segment_id = engine->openSegment(segment_name);
         auto desc = engine->getMetadata()->getSegmentDescByID(segment_id);
         ASSERT_NE(desc, nullptr);
         remote_base = (uint64_t)desc->buffers[0].addr;
