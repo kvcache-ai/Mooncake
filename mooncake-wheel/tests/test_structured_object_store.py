@@ -2096,6 +2096,124 @@ def test_legacy_dict_schema_honors_explicit_non_ndarray_codec_for_numeric_ndarra
     assert ref.encoded_non_tensor["values"]["codec"] == "typed_ragged"
 
 
+def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
+    _store, transfer = make_transfer()
+    rows = [
+        np.asarray(7, dtype=np.int32),
+        np.arange(3, dtype=np.int32),
+        None,
+        np.arange(4, dtype=np.int32).reshape(2, 2),
+        np.arange(6, dtype=np.int32).reshape(2, 3),
+    ]
+
+    ref = transfer.put_legacy_dict(
+        {"values": rows},
+        field_schemas={
+            "values": FieldSchema(
+                codec="typed_ragged",
+                nullable=False,
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+    )
+    result = transfer.get_legacy_dict(ref)
+    view = transfer.dataproto_manifest_view(ref)
+
+    encoded = ref.encoded_non_tensor["values"]
+    assert encoded["codec"] == "typed_ragged"
+    assert encoded["metadata"]["physical_layout"] == "contiguous_flat"
+    assert view["non_tensor_fields"]["values"]["spec"]["payload_specs"]["data"][
+        "shape"
+    ] == [14]
+    assert [
+        None if row is None else row.tolist() for row in result["values"]
+    ] == [
+        None if row is None else row.tolist() for row in rows
+    ]
+    assert all(
+        row is None or isinstance(row, np.ndarray) for row in result["values"]
+    )
+    assert result["values"][0].shape == ()
+    assert [row.dtype for row in result["values"] if row is not None] == [
+        np.dtype(np.int32)
+    ] * 4
+    gathered = transfer.get_dataproto(
+        ref, non_tensor_fields=["values"], rows=[4, 2, 0]
+    )
+    assert [
+        None if row is None else row.tolist()
+        for row in gathered["non_tensor_batch"]["values"]
+    ] == [
+        rows[4].tolist(),
+        None,
+        rows[0].tolist(),
+    ]
+    assert gathered["non_tensor_batch"]["values"][2].shape == ()
+    imported = import_dataproto_ref(export_dataproto_ref(ref))
+    imported_result = transfer.get_legacy_dict(imported)
+    assert [
+        None if row is None else row.tolist() for row in imported_result["values"]
+    ] == [None if row is None else row.tolist() for row in rows]
+
+
+def test_typed_ragged_single_ndarray_pack_reuses_source_memory() -> None:
+    row = np.arange(8, dtype=np.int32).reshape(2, 4)
+
+    payload, metadata = sos._encode_typed_ragged_values([row])
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert payload["data"].shape == (8,)
+    assert np.shares_memory(payload["data"], row)
+
+
+def test_typed_ragged_regular_ndarray_rows_pack_as_contiguous_block() -> None:
+    rows = [np.arange(6, dtype=np.float32).reshape(2, 3) + row for row in range(4)]
+
+    payload, metadata = sos._encode_typed_ragged_values(rows, dtype_hint=np.float32)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert payload["data"].shape == (24,)
+    assert payload["offsets"].tolist() == [0, 6, 12, 18, 24]
+    assert payload["shapes"].tolist() == [[2, 3]] * 4
+    decoded = sos._decode_typed_ragged_values(payload, len(rows), metadata)
+    assert [row.tolist() for row in decoded] == [row.tolist() for row in rows]
+
+
+def test_release_result_recurses_into_ragged_row_views() -> None:
+    class FakeOwner:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    class OwnedArray(np.ndarray):
+        def __new__(cls, data, owner):
+            array = np.asarray(data).view(cls)
+            array._mooncake_pool_owner = owner
+            return array
+
+        def __array_finalize__(self, obj) -> None:
+            if obj is not None:
+                self._mooncake_pool_owner = getattr(
+                    obj, "_mooncake_pool_owner", None
+                )
+
+    owner = FakeOwner()
+    other_owner = FakeOwner()
+    base = OwnedArray(np.arange(6, dtype=np.int64), owner)
+    other = OwnedArray(np.arange(2, dtype=np.int64), other_owner)
+    object_items = np.empty(1, dtype=object)
+    object_items[0] = base[4:5]
+
+    MooncakeBundleTransfer.release_result(
+        {"values": [None, 0, base[:2], {"nested": (base[2:4], object_items)}, other[:1]]}
+    )
+
+    assert owner.release_count == 1
+    assert other_owner.release_count == 1
+
+
 def test_legacy_dict_schema_codec_mismatch_falls_back() -> None:
     _store, transfer = make_transfer()
     ref = transfer.put_legacy_dict(
