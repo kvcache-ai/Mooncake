@@ -361,18 +361,18 @@ int TransferEnginePy::transferSyncRead(const char* target_hostname,
 }
 
 int TransferEnginePy::batchTransferSyncWrite(
-    const char* target_hostname, const std::vector<uintptr_t>& buffers,
-    const std::vector<uintptr_t>& peer_buffer_addresses,
-    const std::vector<size_t>& lengths, const std::string& transport_hint) {
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    const std::string& transport_hint) {
     return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
                              lengths, TransferOpcode::WRITE, nullptr,
                              transport_hint);
 }
 
 int TransferEnginePy::batchTransferSyncRead(
-    const char* target_hostname, const std::vector<uintptr_t>& buffers,
-    const std::vector<uintptr_t>& peer_buffer_addresses,
-    const std::vector<size_t>& lengths, const std::string& transport_hint) {
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    const std::string& transport_hint) {
     return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
                              lengths, TransferOpcode::READ, nullptr,
                              transport_hint);

@@ -85,15 +85,15 @@ class TransferEnginePy {
                          const std::string &transport_hint = "");
 
     int batchTransferSyncWrite(
-        const char *target_hostname, const std::vector<uintptr_t> &buffers,
-        const std::vector<uintptr_t> &peer_buffer_addresses,
-        const std::vector<size_t> &lengths,
+        const char *target_hostname, std::vector<uintptr_t> buffers,
+        std::vector<uintptr_t> peer_buffer_addresses,
+        std::vector<size_t> lengths,
         const std::string &transport_hint = "");
 
     int batchTransferSyncRead(
-        const char *target_hostname, const std::vector<uintptr_t> &buffers,
-        const std::vector<uintptr_t> &peer_buffer_addresses,
-        const std::vector<size_t> &lengths,
+        const char *target_hostname, std::vector<uintptr_t> buffers,
+        std::vector<uintptr_t> peer_buffer_addresses,
+        std::vector<size_t> lengths,
         const std::string &transport_hint = "");
 
     batch_id_t batchTransferAsyncWrite(
