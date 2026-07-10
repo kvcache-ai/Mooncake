@@ -509,6 +509,56 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     ASSERT_TRUE(is_exist.value());
 }
 
+TEST_F(StorageBackendTest, MissingBucketDataFileCleanup) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+
+    int64_t bucket_id = 0;
+    {
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+
+        std::string value = "restart_data";
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace("missing_data_key",
+                      std::vector<Slice>{Slice{value.data(), value.size()}});
+
+        auto result = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(result.has_value());
+        bucket_id = result.value();
+    }
+
+    const auto bucket_path =
+        fs::path(data_path) / (std::to_string(bucket_id) + ".bucket");
+    const auto metadata_path =
+        fs::path(data_path) / (std::to_string(bucket_id) + ".meta");
+    ASSERT_TRUE(fs::remove(bucket_path));
+    ASSERT_TRUE(fs::exists(metadata_path));
+
+    BucketStorageBackend restarted_backend(config, bucket_config);
+    ASSERT_TRUE(restarted_backend.Init());
+    EXPECT_FALSE(fs::exists(metadata_path));
+
+    auto exists = restarted_backend.IsExist("missing_data_key");
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+
+    std::vector<std::string> recovered_keys;
+    auto scan_result =
+        restarted_backend.ScanMeta([&](const std::vector<std::string>& keys,
+                                       std::vector<StorageObjectMetadata>&) {
+            recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                  keys.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_result.has_value());
+    EXPECT_TRUE(recovered_keys.empty());
+}
+
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     FileStorageConfig cfg;
 
@@ -2743,6 +2793,104 @@ TEST_F(StorageBackendTest,
     EXPECT_TRUE(std::filesystem::exists(test_dir + "/f3"));
 }
 
+TEST_F(StorageBackendTest, StoreObjectRejectsOverwriteDuringFailedEviction) {
+    std::string test_dir = data_path + "/eviction_overwrite_race_test";
+    std::filesystem::create_directories(test_dir);
+
+    constexpr size_t kUnit = 1024;
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(3 * kUnit));
+
+    const std::string overwritten_path = test_dir + "/overwritten";
+    const std::string incoming_path = test_dir + "/incoming";
+    const std::string old_value(kUnit, 'A');
+    const std::string replacement_value(kUnit / 2, 'B');
+    const std::string incoming_value(5 * kUnit / 2, 'C');
+    ASSERT_TRUE(backend.StoreObject(overwritten_path, old_value, "old_key")
+                    .has_value());
+
+    std::optional<tl::expected<std::vector<std::string>, ErrorCode>>
+        overwrite_result;
+    auto eviction_result = backend.StoreObject(
+        incoming_path, incoming_value, "incoming_key",
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            EXPECT_EQ(keys, std::vector<std::string>{"old_key"});
+            overwrite_result.emplace(backend.StoreObject(
+                overwritten_path, replacement_value, "new_key"));
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        });
+
+    ASSERT_TRUE(overwrite_result.has_value());
+    ASSERT_FALSE(overwrite_result->has_value());
+    EXPECT_EQ(overwrite_result->error(), ErrorCode::FILE_WRITE_FAIL);
+    ASSERT_FALSE(eviction_result.has_value());
+    EXPECT_EQ(eviction_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    std::string loaded;
+    auto load_result = backend.LoadObject(
+        overwritten_path, loaded, static_cast<int64_t>(old_value.size()));
+    ASSERT_TRUE(load_result.has_value());
+    EXPECT_EQ(loaded, old_value);
+
+    ASSERT_TRUE(
+        backend.StoreObject(overwritten_path, replacement_value, "new_key")
+            .has_value());
+    ASSERT_TRUE(
+        backend.StoreObject(incoming_path, incoming_value, "incoming_key")
+            .has_value());
+
+    loaded.clear();
+    ASSERT_TRUE(backend
+                    .LoadObject(overwritten_path, loaded,
+                                static_cast<int64_t>(replacement_value.size()))
+                    .has_value());
+    EXPECT_EQ(loaded, replacement_value);
+}
+
+TEST_F(StorageBackendTest, StoreObjectOverwriteReleasesPreviousReservation) {
+    std::string test_dir = data_path + "/overwrite_accounting_test";
+    std::filesystem::create_directories(test_dir);
+
+    constexpr size_t kUnit = 1024;
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(2 * kUnit));
+
+    const std::string overwritten_path = test_dir + "/overwritten";
+    const std::string second_path = test_dir + "/second";
+    const std::string old_value(kUnit, 'A');
+    const std::string replacement_value(kUnit, 'B');
+    const std::string second_value(kUnit, 'C');
+
+    ASSERT_TRUE(backend.StoreObject(overwritten_path, old_value, "old_key")
+                    .has_value());
+    ASSERT_TRUE(
+        backend
+            .StoreObject(overwritten_path, replacement_value, "replacement_key")
+            .has_value());
+
+    std::vector<std::string> evicted_keys;
+    auto second_result =
+        backend.StoreObject(second_path, second_value, "second_key",
+                            [&](const std::vector<std::string>& keys)
+                                -> tl::expected<void, ErrorCode> {
+                                evicted_keys = keys;
+                                return {};
+                            });
+
+    ASSERT_TRUE(second_result.has_value());
+    EXPECT_TRUE(evicted_keys.empty());
+    EXPECT_TRUE(std::filesystem::exists(overwritten_path));
+    EXPECT_TRUE(std::filesystem::exists(second_path));
+
+    std::string loaded;
+    ASSERT_TRUE(backend
+                    .LoadObject(overwritten_path, loaded,
+                                static_cast<int64_t>(replacement_value.size()))
+                    .has_value());
+    EXPECT_EQ(loaded, replacement_value);
+}
+
 TEST_F(StorageBackendTest,
        AdaptorWatermarkEvictionNotifiesRecoveredKeysAfterRestart) {
     FileStorageConfig cfg;
@@ -2856,6 +3004,346 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     auto newest_exists = storage_backend.IsExist("bucket_key_2");
     ASSERT_TRUE(newest_exists.has_value());
     EXPECT_TRUE(newest_exists.value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketPendingEvictionRejectsConcurrentDuplicateWrite) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string old_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> old_batch;
+    old_batch.emplace("old_key", std::vector<Slice>{Slice{old_value.data(),
+                                                          old_value.size()}});
+    ASSERT_TRUE(storage_backend
+                    .BatchOffload(old_batch,
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+
+    std::string incoming_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> incoming_batch;
+    incoming_batch.emplace("incoming_key",
+                           std::vector<Slice>{Slice{incoming_value.data(),
+                                                    incoming_value.size()}});
+    std::string replacement_value(3 * 1024, 'C');
+    std::unordered_map<std::string, std::vector<Slice>> replacement_batch;
+    replacement_batch.emplace(
+        "old_key", std::vector<Slice>{Slice{replacement_value.data(),
+                                            replacement_value.size()}});
+    std::optional<tl::expected<int64_t, ErrorCode>> replacement_result;
+    auto failed_eviction_result = storage_backend.BatchOffload(
+        incoming_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; },
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            EXPECT_EQ(keys, std::vector<std::string>{"old_key"});
+            replacement_result.emplace(storage_backend.BatchOffload(
+                replacement_batch, [](const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                }));
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        });
+
+    ASSERT_FALSE(failed_eviction_result.has_value());
+    EXPECT_EQ(failed_eviction_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    ASSERT_TRUE(replacement_result.has_value());
+    ASSERT_FALSE(replacement_result->has_value());
+    EXPECT_EQ(replacement_result->error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    std::vector<char> load_buffer(old_value.size());
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch.emplace(
+        "old_key",
+        Slice{load_buffer.data(), static_cast<size_t>(load_buffer.size())});
+    ASSERT_TRUE(storage_backend.BatchLoad(load_batch).has_value());
+    EXPECT_EQ(std::string(load_buffer.begin(), load_buffer.end()), old_value);
+}
+
+TEST_F(StorageBackendTest,
+       BucketRollbackPreservesCapacityAgainstConcurrentWrite) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string old_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> old_batch;
+    old_batch.emplace("old_key", std::vector<Slice>{Slice{old_value.data(),
+                                                          old_value.size()}});
+    ASSERT_TRUE(storage_backend
+                    .BatchOffload(old_batch,
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+
+    std::string incoming_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> incoming_batch;
+    incoming_batch.emplace("incoming_key",
+                           std::vector<Slice>{Slice{incoming_value.data(),
+                                                    incoming_value.size()}});
+
+    std::string concurrent_value(3 * 1024, 'C');
+    std::unordered_map<std::string, std::vector<Slice>> concurrent_batch;
+    concurrent_batch.emplace(
+        "concurrent_key", std::vector<Slice>{Slice{concurrent_value.data(),
+                                                   concurrent_value.size()}});
+
+    std::optional<tl::expected<int64_t, ErrorCode>> concurrent_result;
+    auto failed_eviction_result = storage_backend.BatchOffload(
+        incoming_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; },
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            EXPECT_EQ(keys, std::vector<std::string>{"old_key"});
+            concurrent_result.emplace(storage_backend.BatchOffload(
+                concurrent_batch, [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                }));
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        });
+
+    ASSERT_TRUE(concurrent_result.has_value());
+    ASSERT_FALSE(concurrent_result->has_value());
+    EXPECT_EQ(concurrent_result->error(), ErrorCode::FILE_WRITE_FAIL);
+    ASSERT_FALSE(failed_eviction_result.has_value());
+    EXPECT_EQ(failed_eviction_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    auto old_exists = storage_backend.IsExist("old_key");
+    ASSERT_TRUE(old_exists.has_value());
+    EXPECT_TRUE(old_exists.value());
+
+    ASSERT_TRUE(storage_backend
+                    .BatchOffload(concurrent_batch,
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+}
+
+TEST_F(StorageBackendTest, BucketPendingWriteRejectsReentrantDuplicate) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 20 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string outer_value(3 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> outer_batch;
+    outer_batch.emplace(
+        "shared_key",
+        std::vector<Slice>{Slice{outer_value.data(), outer_value.size()}});
+
+    std::string nested_value(1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> nested_batch;
+    nested_batch.emplace(
+        "shared_key",
+        std::vector<Slice>{Slice{nested_value.data(), nested_value.size()}});
+
+    std::optional<tl::expected<int64_t, ErrorCode>> nested_result;
+    auto outer_result = storage_backend.BatchOffload(
+        outer_batch, [&](const std::vector<std::string>&,
+                         std::vector<StorageObjectMetadata>&) {
+            nested_result.emplace(storage_backend.BatchOffload(
+                nested_batch, [](const std::vector<std::string>&,
+                                 std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                }));
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(outer_result.has_value());
+    ASSERT_TRUE(nested_result.has_value());
+    ASSERT_FALSE(nested_result->has_value());
+    EXPECT_EQ(nested_result->error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    std::vector<char> load_buffer(outer_value.size());
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch.emplace(
+        "shared_key",
+        Slice{load_buffer.data(), static_cast<size_t>(load_buffer.size())});
+    ASSERT_TRUE(storage_backend.BatchLoad(load_batch).has_value());
+    EXPECT_EQ(std::string(load_buffer.begin(), load_buffer.end()), outer_value);
+}
+
+TEST_F(StorageBackendTest, BucketBatchOffloadContinuesAfterFinalizeFailure) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string old_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> old_batch;
+    old_batch.emplace("old_key", std::vector<Slice>{Slice{old_value.data(),
+                                                          old_value.size()}});
+    auto old_result = storage_backend.BatchOffload(
+        old_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(old_result.has_value());
+
+    const auto old_bucket_path =
+        fs::path(data_path) / (std::to_string(old_result.value()) + ".bucket");
+    const auto old_metadata_path =
+        fs::path(data_path) / (std::to_string(old_result.value()) + ".meta");
+    ASSERT_TRUE(fs::remove(old_bucket_path));
+    ASSERT_TRUE(fs::create_directory(old_bucket_path));
+    {
+        std::ofstream blocker(old_bucket_path / "blocker");
+        ASSERT_TRUE(blocker.is_open());
+        blocker << "prevent directory removal";
+    }
+
+    std::vector<std::string> notified_keys;
+    std::string new_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> new_batch;
+    new_batch.emplace("new_key", std::vector<Slice>{Slice{new_value.data(),
+                                                          new_value.size()}});
+    auto new_result = storage_backend.BatchOffload(
+        new_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; },
+        [&](const std::vector<std::string>& keys) {
+            notified_keys = keys;
+            return tl::expected<void, ErrorCode>{};
+        });
+
+    ASSERT_TRUE(new_result.has_value());
+    EXPECT_EQ(notified_keys, std::vector<std::string>{"old_key"});
+    EXPECT_FALSE(fs::exists(old_metadata_path));
+    EXPECT_TRUE(fs::exists(old_bucket_path));
+
+    auto old_exists = storage_backend.IsExist("old_key");
+    ASSERT_TRUE(old_exists.has_value());
+    EXPECT_FALSE(old_exists.value());
+
+    auto new_exists = storage_backend.IsExist("new_key");
+    ASSERT_TRUE(new_exists.has_value());
+    EXPECT_TRUE(new_exists.value());
+
+    BucketStorageBackend restarted_backend(config, bucket_config);
+    ASSERT_TRUE(restarted_backend.Init());
+
+    auto restarted_old_exists = restarted_backend.IsExist("old_key");
+    ASSERT_TRUE(restarted_old_exists.has_value());
+    EXPECT_FALSE(restarted_old_exists.value());
+
+    auto restarted_new_exists = restarted_backend.IsExist("new_key");
+    ASSERT_TRUE(restarted_new_exists.has_value());
+    EXPECT_TRUE(restarted_new_exists.value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketWatermarkEvictionReturnsKeysAfterFinalizeFailure) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string value(6 * 1024, 'W');
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace("watermark_key",
+                  std::vector<Slice>{Slice{value.data(), value.size()}});
+    auto result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(result.has_value());
+
+    const auto bucket_path =
+        fs::path(data_path) / (std::to_string(result.value()) + ".bucket");
+    const auto metadata_path =
+        fs::path(data_path) / (std::to_string(result.value()) + ".meta");
+    ASSERT_TRUE(fs::remove(bucket_path));
+    ASSERT_TRUE(fs::create_directory(bucket_path));
+    {
+        std::ofstream blocker(bucket_path / "blocker");
+        ASSERT_TRUE(blocker.is_open());
+        blocker << "prevent directory removal";
+    }
+
+    std::vector<std::string> notified_keys;
+    auto eviction_result = storage_backend.EvictAboveDiskWatermark(
+        /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.25,
+        [&](const std::vector<std::string>& keys) {
+            notified_keys = keys;
+            return tl::expected<void, ErrorCode>{};
+        });
+
+    ASSERT_TRUE(eviction_result.has_value());
+    EXPECT_EQ(eviction_result.value(),
+              std::vector<std::string>{"watermark_key"});
+    EXPECT_EQ(notified_keys, eviction_result.value());
+    EXPECT_FALSE(fs::exists(metadata_path));
+    EXPECT_TRUE(fs::exists(bucket_path));
+
+    auto exists = storage_backend.IsExist("watermark_key");
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+
+    BucketStorageBackend restarted_backend(config, bucket_config);
+    ASSERT_TRUE(restarted_backend.Init());
+
+    auto restarted_exists = restarted_backend.IsExist("watermark_key");
+    ASSERT_TRUE(restarted_exists.has_value());
+    EXPECT_FALSE(restarted_exists.value());
+
+    std::vector<std::string> recovered_keys;
+    auto scan_result =
+        restarted_backend.ScanMeta([&](const std::vector<std::string>& keys,
+                                       std::vector<StorageObjectMetadata>&) {
+            recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                  keys.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_result.has_value());
+    EXPECT_TRUE(recovered_keys.empty());
 }
 
 TEST_F(StorageBackendTest,

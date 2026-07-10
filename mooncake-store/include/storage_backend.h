@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -10,6 +11,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "file_interface.h"
@@ -489,8 +491,11 @@ class StorageBackend {
     std::list<FileRecord> file_write_queue_;
     std::unordered_map<std::string, std::list<FileRecord>::iterator>
         file_queue_map_;
+    std::unordered_set<std::string> pending_eviction_paths_;
     mutable std::shared_mutex
         file_queue_mutex_;  // Mutex to protect file queue operations
+    static constexpr size_t kFilePathLockCount = 64;
+    std::array<Mutex, kFilePathLockCount> file_path_mutexes_;
 
     // Storage space tracking variables
     mutable std::shared_mutex
@@ -588,6 +593,10 @@ class StorageBackend {
      * @return true if eviction is enabled, false otherwise.
      */
     bool IsEvictionEnabled() const;
+
+    Mutex& GetFilePathMutex(const std::string& path);
+
+    bool IsFilePendingEviction(const std::string& path) const;
 
     /**
      * @brief Helper: Creates a file for writing and handles errors
@@ -905,20 +914,23 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<bool, ErrorCode> HasNext();
 
     /**
-     * @brief Cleanup orphaned bucket files (data + metadata) for a given bucket
-     * ID. Called when BatchOffload fails due to duplicate keys after files were
-     * written.
+     * @brief Remove any remaining data and metadata files for a bucket.
+     * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
 
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.
-    // FinalizeEviction waits for in-flight reads and deletes the files.
+    // FinalizeEviction removes persisted metadata, waits for in-flight reads,
+    // and then deletes the data files.
     struct PendingEviction {
         std::vector<std::string> keys;  // All keys in evicted buckets
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
+        std::vector<std::string> write_keys;
+        int64_t evicted_size = 0;
+        int64_t write_size = 0;
     };
 
     /**
@@ -929,9 +941,18 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param required_size Size of the incoming bucket to be written.
      * @return PendingEviction with all keys and bucket metadata removed.
      */
-    PendingEviction PrepareEviction(int64_t required_size);
+    tl::expected<PendingEviction, ErrorCode> PrepareEviction(
+        int64_t required_size, const std::vector<std::string>& write_keys = {});
 
     void RestorePreparedEviction(PendingEviction&& pending);
+
+    void RestorePreparedEvictionLocked(PendingEviction&& pending);
+
+    void CommitPreparedEviction(const PendingEviction& pending);
+
+    void ReleasePreparedWrite(const PendingEviction& pending);
+
+    void ReleasePreparedWriteLocked(const PendingEviction& pending);
 
     /**
      * @brief Select the next bucket to evict according to the configured
@@ -943,8 +964,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     SelectEvictionCandidate();
 
     /**
-     * @brief Phase 2 of eviction: wait for in-flight reads on each evicted
-     * bucket to drain, then delete the data and metadata files.
+     * @brief Phase 2 of eviction: delete persisted metadata for each evicted
+     * bucket, wait for in-flight reads to drain, then delete the data file.
+     * When metadata removal succeeds, doing it first prevents a later read
+     * timeout or data-file deletion failure from leaving a bucket that Init()
+     * could recover.
      * Must be called AFTER master has been notified via eviction_handler.
      * @param pending The result of a prior PrepareEviction call.
      */
@@ -997,6 +1021,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
+    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
+    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
+    int64_t pending_eviction_size_ GUARDED_BY(mutex_) = 0;
+    int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.

@@ -200,14 +200,22 @@ The caller invokes the `eviction_handler` callback with the full list of evicted
 **Phase 2 — `FinalizeEviction(pending)`** (called after master notification):
 
 For each evicted bucket:
-1. Spin-wait (with a 10-second timeout) until `inflight_reads_ == 0`.
-2. Evict any stale file-handle cache entries.
-3. Delete the `.bucket` and `.meta` files.
+1. Attempt to delete the `.meta` file first, reducing the chance that a later
+   restart recovers a bucket whose master replica has already been removed.
+2. Spin-wait (with a 10-second timeout) until `inflight_reads_ == 0`.
+3. Evict any stale file-handle cache entries.
+4. Delete the `.bucket` file.
 
-This ordering guarantees:
+This ordering provides the following behavior when the relevant file operations
+succeed:
 - The master never serves a stale disk-replica location for a file that has already been deleted.
 - Ongoing reads complete successfully before their files are removed.
 - Freed disk space is available for the incoming write before `WriteBucket` is called.
+
+Cleanup failures after the master update are logged and treated as best-effort.
+A crash or filesystem failure that leaves both files intact still requires
+cross-node reconciliation; local file ordering alone cannot make that window
+transactional.
 
 ---
 
