@@ -22,11 +22,15 @@ namespace mooncake {
 namespace integration {
 
 #if defined(__GNUC__) || defined(__clang__)
-__attribute__((cold, noinline))
+#define MOONCAKE_RETRY_COLD __attribute__((cold, noinline))
+#else
+#define MOONCAKE_RETRY_COLD
 #endif
-inline void updateRetryHints(std::vector<TransferRequest>& entries, int retry) {
+MOONCAKE_RETRY_COLD inline void updateRetryHints(
+    std::vector<TransferRequest>& entries, int retry) {
     for (auto& entry : entries) entry.advise_retry_cnt = retry;
 }
+#undef MOONCAKE_RETRY_COLD
 
 }  // namespace integration
 }  // namespace mooncake
