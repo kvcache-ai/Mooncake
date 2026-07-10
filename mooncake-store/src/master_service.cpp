@@ -235,12 +235,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.snapshot_catalog_store_connstring),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl),
       offloading_queue_limit_(config.offloading_queue_limit),
-      offload_cap_ratio_(config.offload_cap_ratio) {
+      offload_cap_ratio_(config.offload_cap_ratio),
+      task_manager_(config.task_manager_config) {
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -4502,7 +4502,7 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     }
 
     PublishKvRemoved(key, metadata, tenant_id);
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state [[maybe_unused]] = accessor.GetTenantState();
     accessor.Erase();
     return {};
 }

@@ -4377,7 +4377,7 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
-    auto start_time = std::chrono::steady_clock::now();
+    [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -4646,8 +4646,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
-    size_t offload_object_count = 0;
-    auto start_read_store_time = std::chrono::steady_clock::now();
+    [[maybe_unused]] size_t offload_object_count = 0;
+    [[maybe_unused]] auto start_read_store_time =
+        std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
@@ -4664,10 +4665,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     auto end_time = std::chrono::steady_clock::now();
-    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time)
-                            .count();
-    auto read_store_time =
+    [[maybe_unused]] auto elapsed_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_time -
+                                                              start_time)
+            .count();
+    [[maybe_unused]] auto read_store_time =
         std::chrono::duration_cast<std::chrono::microseconds>(
             end_time - start_read_store_time)
             .count();
