@@ -346,8 +346,11 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
 }
 
 void* UrmaContext::lastRegisteredSeg() {
-    if (local_tseg_list_.empty()) return nullptr;
-    return local_tseg_list_.back();
+    for (auto iter = local_tseg_list_.rbegin(); iter != local_tseg_list_.rend();
+         ++iter) {
+        if (*iter) return *iter;
+    }
+    return nullptr;
 }
 
 int UrmaContext::adoptLocalSeg(uint64_t va, size_t length, void* seg) {
@@ -386,12 +389,9 @@ int UrmaContext::unregisterMemoryRegion(uint64_t addr) {
                 urma_target_seg_t* seg_ptr = (*iter).first;
                 uint64_t seg_va = seg_ptr->seg.ubva.va;
 
-                // Release the app-side reference in local_tseg_list_ BEFORE
-                // calling urma_unregister_seg.  URMA reference-counts segments:
-                // while the app holds the pointer the VA range stays "in use"
-                // and a subsequent urma_register_seg for the same VA fails with
-                // "duplicate".  Nulling the entry here lets the ref count drop
-                // to zero inside urma_unregister_seg.
+                // l_seg_index is published in BufferDesc and remains valid for
+                // the lifetime of the context. Keep this slot as a tombstone;
+                // erasing it would shift indices for other registered buffers.
                 for (auto& tseg : local_tseg_list_) {
                     if (tseg == seg_ptr) {
                         tseg = nullptr;

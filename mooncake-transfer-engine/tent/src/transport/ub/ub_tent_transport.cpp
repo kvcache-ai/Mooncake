@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
 #include <vector>
@@ -216,6 +217,9 @@ Status UbTentTransport::setupUbLocalSegment() {
 }
 
 Status UbTentTransport::uninstall() {
+    if (control_service_) {
+        control_service_->setBootstrapUbCallback(nullptr);
+    }
     ub_transport_.reset();
     te_metadata_bridge_.reset();
     te_topology_.reset();
@@ -366,7 +370,8 @@ Status UbTentTransport::submitTransferTasks(
     // The converted requests are stored inside ub_batch->te_requests so that
     // the raw pointers assigned to TransferTask::request remain valid until
     // freeSubBatch() is called.
-    size_t first_new = ub_batch->te_requests.size();
+    std::vector<mooncake::Transport::TransferRequest> converted_requests;
+    converted_requests.reserve(request_list.size());
     for (const auto& req : request_list) {
         mooncake::Transport::TransferRequest te_req{};
         te_req.opcode = (req.opcode == Request::READ)
@@ -388,8 +393,13 @@ Status UbTentTransport::submitTransferTasks(
             }
             te_req.target_id = te_id;
         }
-        ub_batch->te_requests.push_back(te_req);
+        converted_requests.push_back(te_req);
     }
+
+    size_t first_new = ub_batch->te_requests.size();
+    ub_batch->te_requests.insert(ub_batch->te_requests.end(),
+                                 converted_requests.begin(),
+                                 converted_requests.end());
 
     // Set up old-TE task list inside the existing BatchDesc.
     size_t first_task = batch_desc.task_list.size();
@@ -408,6 +418,9 @@ Status UbTentTransport::submitTransferTasks(
 
     auto old_s = ub_transport_->submitTransferTask(task_ptrs);
     if (!old_s.ok()) {
+        batch_desc.task_list.resize(first_task);
+        ub_batch->te_requests.resize(first_new);
+        ub_batch->task_count_ -= request_list.size();
         return Status::InternalError(
             "UbTentTransport: submitTransferTask failed: " +
             std::string(old_s.message()) + LOC_MARK);

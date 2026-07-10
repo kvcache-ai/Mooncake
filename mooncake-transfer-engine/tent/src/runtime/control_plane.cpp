@@ -265,11 +265,16 @@ void ControlService::onBootstrapUb(const std::string_view& request,
         json::parse(std::string(request)).get<UbBootstrapDesc>();
     UbBootstrapDesc response_desc;
     int ret = 0;
-    if (ub_bootstrap_callback_) {
-        ret = ub_bootstrap_callback_(request_desc, response_desc);
-    } else {
-        ret = -1;
-        response_desc.reply_msg = "BootstrapUb callback is not registered";
+    {
+        // Serialize callback replacement with invocation so uninstall waits
+        // for an in-flight bootstrap before destroying the UB transport.
+        std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+        if (ub_bootstrap_callback_) {
+            ret = ub_bootstrap_callback_(request_desc, response_desc);
+        } else {
+            ret = -1;
+            response_desc.reply_msg = "BootstrapUb callback is not registered";
+        }
     }
     if (ret != 0 && response_desc.reply_msg.empty()) {
         response_desc.reply_msg =

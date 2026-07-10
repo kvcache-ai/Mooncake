@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -147,6 +148,7 @@ class ControlService {
     }
 
     void setBootstrapUbCallback(const OnReceiveUbBootstrap& callback) {
+        std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
         ub_bootstrap_callback_ = callback;
     }
 
@@ -192,6 +194,7 @@ class ControlService {
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 
     OnReceiveBootstrap bootstrap_callback_;
+    std::mutex ub_bootstrap_callback_mutex_;
     OnReceiveUbBootstrap ub_bootstrap_callback_;
     OnNotify notify_callback_;
     TransferEngineImpl* impl_;

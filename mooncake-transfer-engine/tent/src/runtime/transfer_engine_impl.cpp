@@ -1550,11 +1550,9 @@ Status TransferEngineImpl::commitPreparedSubmit(
             // LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
             //              << status.ToString();
             for (auto& task_id : task_id_list[type]) {
-                // Mark as UNSPEC so pollTaskStatus returns FAILED, then
-                // reset failover_count so updateTaskStatusAfterPoll can
-                // trigger resubmitTransferTask() to try a fallback transport.
+                // Mark as UNSPEC so pollTaskStatus returns FAILED and
+                // updateTaskStatusAfterPoll can try the next transport.
                 batch->task_list[task_id].type = UNSPEC;
-                batch->task_list[task_id].failover_count = 0;
             }
         }
     }
@@ -1975,8 +1973,7 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
     if (!allow_failover || task_status.s != FAILED) return;
 
     // Allow resubmission for UNSPEC tasks: these occur when submitTransferTasks
-    // failed (e.g., UB transport submission error) and the task was marked with
-    // type=UNSPEC and failover_count=0 to signal a pending retry opportunity.
+    // failed (e.g., UB transport submission error).
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task.status = PENDING;
