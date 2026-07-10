@@ -500,8 +500,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         // Use the new MasterSnapshotCodec to encode all state
         ha::MasterSnapshotCodec codec;
         ha::MasterSnapshotStateView state_view(
-            *master_service_,
-            master_service_->segment_manager_,
+            *master_service_, master_service_->segment_manager_,
             master_service_->nof_segment_manager_,
             master_service_->task_manager_);
 
@@ -515,14 +514,13 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             return tl::make_unexpected(encode_result.error());
         }
 
-        SNAP_LOG_INFO(
-            "[Snapshot] state encoding successful, snapshot_id={}",
-            snapshot_id);
+        SNAP_LOG_INFO("[Snapshot] state encoding successful, snapshot_id={}",
+                      snapshot_id);
 
         const auto& payloads = encode_result.value();
-        const auto& serialized_metadata = payloads.at("metadata");
-        const auto& serialized_segment = payloads.at("segments");
-        const auto& serialized_task_manager = payloads.at("task_manager");
+        const auto& serialized_metadata = payloads.metadata;
+        const auto& serialized_segment = payloads.segments;
+        const auto& serialized_task_manager = payloads.task_manager;
 
         // When backup_dir is enabled, try all uploads to ensure complete backup
         // When backup_dir is disabled, use fail-fast mode
@@ -589,7 +587,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Upload manifest
-        std::string manifest_content = ha::MasterSnapshotCodec::GetManifestContent();
+        std::string manifest_content =
+            ha::MasterSnapshotCodec::GetManifestContent();
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
                                             manifest_content.end());
         upload_result = repository_->UploadPayloadFile(
