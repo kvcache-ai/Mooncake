@@ -25,6 +25,9 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#if TENT_METRICS_ENABLED
+#include "tent/metrics/tent_metrics.h"
+#endif
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 
@@ -276,7 +279,6 @@ TEST(CausalChain, TimestampsPopulatedOnDirectPath) {
 }
 
 #if TENT_METRICS_ENABLED
-#include "tent/metrics/tent_metrics.h"
 TEST(CausalChain, MetricsRecordStageLatencyIsCallable) {
     TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait, 100.0);
     TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch, 50.0);
