@@ -239,6 +239,9 @@ mooncake-wheel/mooncake/mooncake_client
 .DS_Store
 .envrc
 
+# nohup output
+nohup.out
+
 # Next.js build artifacts
 mooncake-operator/ui/.next/
 mooncake-operator/ui/node_modules/
