@@ -168,6 +168,7 @@ class MooncakeStoreService:
             web.post('/api/mount', _timed_handler("MOUNT", self.handle_mount)),
             web.post('/api/unmount', _timed_handler("UNMOUNT", self.handle_unmount)),
             web.put('/api/put', _timed_handler("PUT", self.handle_put)),
+            web.put('/api/put_bytes/{key}', _timed_handler("PUT_BYTES", self.handle_put_bytes)),
             web.get('/api/get/{key}', _timed_handler("GET", self.handle_get)),
             web.get('/api/exist/{key}', _timed_handler("EXIST", self.handle_exist)),
             web.delete('/api/remove/{key}', _timed_handler("REMOVE", self.handle_remove)),
@@ -487,6 +488,53 @@ class MooncakeStoreService:
             )
         except Exception as e:
             logging.error("PUT error: %s", e)
+            return web.Response(
+                status=500,
+                text=json.dumps({'error': str(e)}),
+                content_type='application/json'
+            )
+
+    async def handle_put_bytes(self, request):
+        """Store an octet-stream payload without JSON/base64 expansion.
+
+        The legacy ``/api/put`` endpoint intentionally accepts JSON strings for
+        easy debugging, but large EPD FeatureBundle payloads pay a large CPU and
+        memory tax when they are base64 encoded just to cross the local HTTP
+        boundary.  This binary endpoint keeps the same key/value Store semantic
+        while allowing Prefill workers to retrieve exactly the bytes published
+        by Encoder workers through the existing ``/api/get/{key}`` path.
+        """
+
+        try:
+            key = request.match_info['key']
+            if not key:
+                return web.Response(
+                    status=400,
+                    text=json.dumps({'error': 'Missing key'}),
+                    content_type='application/json'
+                )
+            value = await request.read()
+            if value is None:
+                return web.Response(
+                    status=400,
+                    text=json.dumps({'error': 'Missing value'}),
+                    content_type='application/json'
+                )
+            ret = self.store.put(key, value)
+            if ret != 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({'error': 'PUT_BYTES operation failed'}),
+                    content_type='application/json'
+                )
+
+            return web.Response(
+                status=200,
+                text=json.dumps({'status': 'success'}),
+                content_type='application/json'
+            )
+        except Exception as e:
+            logging.error("PUT_BYTES error: %s", e)
             return web.Response(
                 status=500,
                 text=json.dumps({'error': str(e)}),
