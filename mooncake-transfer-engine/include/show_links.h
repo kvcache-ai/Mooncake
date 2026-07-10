@@ -15,6 +15,7 @@
 #ifndef MOONCAKE_SHOW_LINKS_H_
 #define MOONCAKE_SHOW_LINKS_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
