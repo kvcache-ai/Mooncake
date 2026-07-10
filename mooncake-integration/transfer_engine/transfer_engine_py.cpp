@@ -536,10 +536,6 @@ int TransferEnginePy::batchTransferSync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
-        // Entries are initialized with hint 0; only touch the whole batch when
-        // advancing to another RNIC/context after an actual failure.
-        if (retry != 0) mooncake::integration::updateRetryHints(entries, retry);
-
         auto batch_id = engine_->allocateBatchID(batch_size);
         Status s =
             notify
@@ -594,6 +590,9 @@ int TransferEnginePy::batchTransferSync(
                 return -1;
             }
         }
+        if (retry + 1 < max_retry) {
+            mooncake::integration::updateRetryHints(entries, retry + 1);
+        }
     }
     return -1;
 }
@@ -647,8 +646,6 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
-        if (retry != 0) mooncake::integration::updateRetryHints(entries, retry);
-
         batch_id = engine_->allocateBatchID(batch_size);
         auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
 
@@ -658,7 +655,8 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
-            return 0;
+            if (retry + 1 == max_retry) return 0;
+            mooncake::integration::updateRetryHints(entries, retry + 1);
         } else {
             break;
         }
