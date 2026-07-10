@@ -19,3 +19,4 @@ dist/
 .cache/
 third_party/
 3rdparty/
+!README.md
