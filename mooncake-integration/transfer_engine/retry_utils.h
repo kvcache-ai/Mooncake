@@ -21,6 +21,9 @@
 namespace mooncake {
 namespace integration {
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((cold, noinline))
+#endif
 inline void updateRetryHints(std::vector<TransferRequest>& entries, int retry) {
     for (auto& entry : entries) entry.advise_retry_cnt = retry;
 }
