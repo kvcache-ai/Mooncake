@@ -68,6 +68,8 @@ struct TransferNotifyUtil {
 struct TransferHandshakeUtil {
     static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
+        root["protocol"] = desc.protocol;
+        root["payload"] = desc.payload;
         root["local_nic_path"] = desc.local_nic_path;
         root["local_lid"] = desc.local_lid;
         root["local_gid"] = desc.local_gid;
@@ -100,6 +102,8 @@ struct TransferHandshakeUtil {
     }
 
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
+        desc.protocol = root["protocol"].asString();
+        desc.payload = root["payload"].asString();
         desc.local_nic_path = root["local_nic_path"].asString();
         if (root.isMember("local_lid") && root["local_lid"].isUInt()) {
             desc.local_lid = root["local_lid"].asUInt();
@@ -342,6 +346,9 @@ static int encodeMultiProtocolSegmentDesc(
         } else if (buffer.protocol == "hip" || buffer.protocol == "maca") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
+        } else if (buffer.protocol == "nccl") {
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["device_id"] = buffer.device_id;
         }
         buffersJSON.append(bufferJSON);
     }
@@ -368,7 +375,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip" && proto != "maca") {
+                proto != "hip" && proto != "maca" && proto != "nccl") {
                 is_multi_protocol = false;
                 break;
             }
@@ -376,7 +383,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip and maca may be "
+                       << ". Only cxl, tcp, rdma, hip, maca and nccl may be "
                           "combined.";
             return ERR_INVALID_ARGUMENT;
         }
@@ -456,6 +463,18 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "nccl") {
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            if (buffer.device_id < 0) continue;
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            bufferJSON["device_id"] = buffer.device_id;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -699,6 +718,21 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "nccl") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.device_id = bufferJSON["device_id"].asInt();
+            buffer.protocol = buffer_protocol;
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.device_id < 0) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
         }
     }
 
@@ -721,7 +755,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip" && proto != "maca") {
+                    proto != "hip" && proto != "maca" && proto != "nccl") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -730,7 +764,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma, hip and maca may be combined.";
+                    << ". Only cxl, tcp, rdma, hip, maca and nccl may be "
+                       "combined.";
                 return nullptr;
             }
         }
@@ -844,6 +879,21 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             if (buffer.name.empty() || !buffer.addr || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+    } else if (desc->protocol == "nccl") {
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.device_id = bufferJSON["device_id"].asInt();
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.device_id < 0) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
@@ -1323,6 +1373,10 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
         if (rc != 0) {
             return rc;
         }
+        {
+            std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+            handshake_daemon_started_ = true;
+        }
 
         return 0;
     }
@@ -1404,14 +1458,44 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
+    bool start_daemon = false;
+    {
+        std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+        if (on_receive_handshake) {
+            default_handshake_handler_ = std::move(on_receive_handshake);
+        }
+        if (!handshake_daemon_started_) {
+            handshake_daemon_started_ = true;
+            start_daemon = true;
+        }
+    }
+
     handshake_plugin_->registerOnConnectionCallBack(
-        [on_receive_handshake](const Json::Value &peer,
-                               Json::Value &local) -> int {
+        [this](const Json::Value &peer, Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
             TransferHandshakeUtil::decode(peer, peer_desc);
-            if (on_receive_handshake) {
-                int ret = on_receive_handshake(peer_desc, local_desc);
+
+            OnReceiveHandShake handler;
+            {
+                std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+                if (!peer_desc.protocol.empty()) {
+                    auto it = handshake_handlers_.find(peer_desc.protocol);
+                    if (it != handshake_handlers_.end()) handler = it->second;
+                } else {
+                    handler = default_handshake_handler_;
+                }
+            }
+
+            local_desc.protocol = peer_desc.protocol;
+            if (handler) {
+                int ret = handler(peer_desc, local_desc);
                 if (ret) return ret;
+            } else {
+                local_desc.reply_msg =
+                    peer_desc.protocol.empty()
+                        ? "No default handshake handler is registered"
+                        : "Unsupported handshake protocol: " +
+                              peer_desc.protocol;
             }
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
@@ -1425,10 +1509,42 @@ int TransferMetadata::startHandshakeDaemon(
             return receivePeerProbe(peer, local);
         });
 
-    int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
-    if (rc != 0) {
-        return rc;
+    if (start_daemon) {
+        int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
+        if (rc != 0) {
+            std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+            handshake_daemon_started_ = false;
+            return rc;
+        }
     }
+    return 0;
+}
+
+int TransferMetadata::registerHandshakeHandler(
+    const std::string &protocol,
+    OnReceiveHandShake on_receive_handshake) {
+    if (protocol.empty() || !on_receive_handshake) {
+        LOG(ERROR) << "Handshake handlers require a protocol and callback";
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+    auto [it, inserted] = handshake_handlers_.emplace(
+        protocol, std::move(on_receive_handshake));
+    if (!inserted) {
+        LOG(ERROR) << "Handshake handler already registered for " << protocol;
+        return ERR_INVALID_ARGUMENT;
+    }
+    return 0;
+}
+
+int TransferMetadata::unregisterHandshakeHandler(const std::string &protocol) {
+    if (protocol.empty()) return ERR_INVALID_ARGUMENT;
+
+    std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+    auto it = handshake_handlers_.find(protocol);
+    if (it == handshake_handlers_.end()) return ERR_INVALID_ARGUMENT;
+    handshake_handlers_.erase(it);
     return 0;
 }
 

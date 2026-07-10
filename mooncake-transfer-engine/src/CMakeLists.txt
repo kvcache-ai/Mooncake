@@ -74,9 +74,9 @@ if(USE_CUDA)
   endif()
 endif()
 
-if(USE_NCCL_DEVICE)
+if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
   target_link_libraries(transfer_engine PUBLIC NCCL::nccl)
-  target_compile_definitions(transfer_engine PUBLIC USE_NCCL_DEVICE)
+  target_compile_definitions(transfer_engine PUBLIC NCCL_DEVICE_PERMIT_EXPERIMENTAL_CODE=1)
 endif()
 
 if(USE_MACA)
