@@ -1,4 +1,4 @@
-# Benchmark performance
+# vLLM x Mooncake Store Performance
 Mooncake leverages the `MooncakeStoreConnector` in vLLM V1 to enable a distributed KV cache pool, supporting cross-instance sharing and reuse of KV caches. Furthermore, vLLM's `MultiConnector` can be configured to orchestrate both the `MooncakeConnector` (for peer-to-peer KV transfer) and the `MooncakeStoreConnector` (for the shared pool), enabling prefill-decode (PD) disaggregation.
 
 ![Overall Performance](https://vllm.ai/blog-assets/figures/2026-05-06-mooncake-store/hero_vllm_mooncake.svg)
@@ -42,4 +42,3 @@ This result shows that the distributed KV cache pool substantially improves cach
 ## Benchmark Scripts
 
 The benchmark scripts are provided in the artifact repository [here](https://github.com/ivanium/vllm/tree/feat/mooncake-store-int/scripts/mooncake/artifacts).
-

@@ -305,6 +305,8 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/deadline_aware", false);
     runtime_queue_config_.limits.mlu_local_threshold =
         conf_->get("runtime_queue/mlu_local_threshold", 0.0);
+    runtime_queue_config_.limits.promotion_slack_ns =
+        conf_->get("runtime_queue/promotion_slack_ns", 0UL);
     runtime_queue_config_.max_dispatch_owners =
         conf_->get("runtime_queue/max_dispatch_owners", 64UL);
     runtime_queue_config_.max_dispatch_bytes =
