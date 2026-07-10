@@ -1191,14 +1191,6 @@ class MasterService {
         ReplicaID source_id;
         std::vector<ReplicaID> replica_ids;
         uint64_t reserved_quota_charge_bytes{0};
-
-        ReplicationTask(UUID cid, std::chrono::system_clock::time_point st,
-                        Type t, ReplicaID sid, std::vector<ReplicaID> rids)
-            : client_id(cid),
-              start_time(st),
-              type(t),
-              source_id(sid),
-              replica_ids(std::move(rids)) {}
     };
 
     struct OffloadingTask {
