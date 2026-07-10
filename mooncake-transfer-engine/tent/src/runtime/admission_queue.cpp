@@ -262,27 +262,26 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     // non-promoted groups while avoiding std::stable_partition on deque in the
     // dispatch hot path.
     if (promotion_enabled) {
-        promoted_scratch_.clear();
-        non_promoted_scratch_.clear();
-        promoted_scratch_.reserve(fifo_.size());
-        non_promoted_scratch_.reserve(fifo_.size());
+        std::vector<QueueOwnerId> promoted;
+        std::vector<QueueOwnerId> non_promoted;
+        promoted.reserve(fifo_.size());
+        non_promoted.reserve(fifo_.size());
         for (QueueOwnerId id : fifo_) {
             auto it = owners_.find(id);
             if (it == owners_.end() || it->second.state != QueueState::Queued) {
-                non_promoted_scratch_.push_back(id);
+                non_promoted.push_back(id);
                 continue;
             }
             const uint64_t dl = it->second.request.deadline_ns;
             if (dl != 0 && dl > now_ns &&
                 (dl - now_ns) < limits_.promotion_slack_ns) {
-                promoted_scratch_.push_back(id);
+                promoted.push_back(id);
             } else {
-                non_promoted_scratch_.push_back(id);
+                non_promoted.push_back(id);
             }
         }
-        fifo_.assign(promoted_scratch_.begin(), promoted_scratch_.end());
-        fifo_.insert(fifo_.end(), non_promoted_scratch_.begin(),
-                     non_promoted_scratch_.end());
+        fifo_.assign(promoted.begin(), promoted.end());
+        fifo_.insert(fifo_.end(), non_promoted.begin(), non_promoted.end());
     }
 
     // Predicted MLU = predicted_transfer_time / remaining_window. Returns true

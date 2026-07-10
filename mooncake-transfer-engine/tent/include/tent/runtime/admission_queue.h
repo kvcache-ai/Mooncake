@@ -167,11 +167,6 @@ class LocalTransferAdmissionQueue {
     std::map<QueueOwnerId, QueueOwner> owners_;
     std::map<std::pair<uint64_t, size_t>, QueueOwnerId> public_to_owner_;
     std::deque<QueueOwnerId> fifo_;
-    // Reused by deadline proximity promotion. The queue is intentionally
-    // single-threaded, so member scratch buffers avoid allocating on every
-    // dispatch while remaining safe and deterministic.
-    std::vector<QueueOwnerId> promoted_scratch_;
-    std::vector<QueueOwnerId> non_promoted_scratch_;
     size_t outstanding_owners_{0};
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
