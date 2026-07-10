@@ -19,7 +19,6 @@
 #include <limits>
 #include <set>
 #include <utility>
-#include <vector>
 
 namespace mooncake {
 namespace tent {
@@ -258,30 +257,20 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
                              .count()))
             : 0;
 
-    // Deadline proximity promotion: keep stable ordering within promoted and
-    // non-promoted groups while avoiding std::stable_partition on deque in the
-    // dispatch hot path.
+    // Deadline proximity promotion: partition fifo_ so owners with critical
+    // slack (deadline approaching within promotion_slack_ns) appear before
+    // owners with comfortable slack or no deadline. stable_partition preserves
+    // relative EDF order within each group.
     if (promotion_enabled) {
-        std::vector<QueueOwnerId> promoted;
-        std::vector<QueueOwnerId> non_promoted;
-        promoted.reserve(fifo_.size());
-        non_promoted.reserve(fifo_.size());
-        for (QueueOwnerId id : fifo_) {
+        std::stable_partition(fifo_.begin(), fifo_.end(), [&](QueueOwnerId id) {
             auto it = owners_.find(id);
             if (it == owners_.end() || it->second.state != QueueState::Queued) {
-                non_promoted.push_back(id);
-                continue;
+                return false;
             }
             const uint64_t dl = it->second.request.deadline_ns;
-            if (dl != 0 && dl > now_ns &&
-                (dl - now_ns) < limits_.promotion_slack_ns) {
-                promoted.push_back(id);
-            } else {
-                non_promoted.push_back(id);
-            }
-        }
-        fifo_.assign(promoted.begin(), promoted.end());
-        fifo_.insert(fifo_.end(), non_promoted.begin(), non_promoted.end());
+            if (dl == 0 || dl <= now_ns) return false;
+            return (dl - now_ns) < limits_.promotion_slack_ns;
+        });
     }
 
     // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
