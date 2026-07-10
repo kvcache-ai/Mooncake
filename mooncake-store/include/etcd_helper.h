@@ -20,10 +20,10 @@ class EtcdHelper {
      * libetcd. It is used for all the etcd operations for mooncake-store. This
      * function ensures the client is only connected once.
      *
-     * TLS support: If TLS has been globally configured via SetTLSConfig() before
-     * calling this function, it automatically delegates to the TLS variant
-     * (ConnectToEtcdStoreClientWithTLS). Otherwise, a plain-text connection is
-     * established.
+     * TLS support: If TLS has been globally configured via SetTLSConfig()
+     * before calling this function, it automatically delegates to the TLS
+     * variant (ConnectToEtcdStoreClientWithTLS). Otherwise, a plain-text
+     * connection is established.
      *
      * @param etcd_endpoints: The endpoints of the etcd store client.
      *        Multiple endpoints are separated by semicolons.
@@ -49,10 +49,10 @@ class EtcdHelper {
      *        endpoints. This cancels active store watches/keepalives in the Go
      *        wrapper and creates a fresh clientv3.Client.
      *
-     * TLS support: If TLS has been globally configured via SetTLSConfig() before
-     * calling this function, it automatically delegates to the TLS variant
-     * (ResetEtcdStoreClientWithTLS). Otherwise, a plain-text connection is
-     * established.
+     * TLS support: If TLS has been globally configured via SetTLSConfig()
+     * before calling this function, it automatically delegates to the TLS
+     * variant (ResetEtcdStoreClientWithTLS). Otherwise, a plain-text connection
+     * is established.
      *
      * @param etcd_endpoints: The endpoints of the etcd store client.
      * @return: Error code.

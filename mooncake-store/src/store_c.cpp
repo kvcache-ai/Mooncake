@@ -89,8 +89,8 @@ bool etcd_tls_explicitly_set = false;
 
 void set_etcd_tls_config_internal(const char *ca_file, const char *cert_file,
                                   const char *key_file) {
-    bool use_fallback = (ca_file == nullptr && cert_file == nullptr &&
-                         key_file == nullptr);
+    bool use_fallback =
+        (ca_file == nullptr && cert_file == nullptr && key_file == nullptr);
     std::string ca = ca_file ? ca_file : "";
     std::string cert = cert_file ? cert_file : "";
     std::string key = key_file ? key_file : "";

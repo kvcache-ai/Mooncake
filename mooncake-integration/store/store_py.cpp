@@ -2105,13 +2105,11 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self, const std::string &ca_file,
                const std::string &cert_file, const std::string &key_file) {
                 mooncake_store_set_etcd_tls_config(
-                    nullptr,
-                    ca_file.empty() ? nullptr : ca_file.c_str(),
+                    nullptr, ca_file.empty() ? nullptr : ca_file.c_str(),
                     cert_file.empty() ? nullptr : cert_file.c_str(),
                     key_file.empty() ? nullptr : key_file.c_str());
             },
-            py::arg("ca_file") = "",
-            py::arg("cert_file") = "",
+            py::arg("ca_file") = "", py::arg("cert_file") = "",
             py::arg("key_file") = "",
             "Configure etcd TLS certificates.\n\n"
             "Must be called BEFORE setup().\n"

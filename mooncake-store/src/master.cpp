@@ -259,15 +259,12 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_string(
-    etcd_ca_file, "",
-    "Path to CA certificate file for etcd TLS connections");
-DEFINE_string(
-    etcd_cert_file, "",
-    "Path to client certificate file for etcd TLS connections");
-DEFINE_string(
-    etcd_key_file, "",
-    "Path to client key file for etcd TLS connections");
+DEFINE_string(etcd_ca_file, "",
+              "Path to CA certificate file for etcd TLS connections");
+DEFINE_string(etcd_cert_file, "",
+              "Path to client certificate file for etcd TLS connections");
+DEFINE_string(etcd_key_file, "",
+              "Path to client key file for etcd TLS connections");
 DEFINE_int64(
     client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
     "Seconds a client stays considered alive after the last heartbeat. "

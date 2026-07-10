@@ -37,7 +37,8 @@ DECLARE_int32(http_port);
 
 #ifdef STORE_USE_ETCD
 DEFINE_string(etcd_ca_file, "", "Path to CA certificate file for etcd TLS");
-DEFINE_string(etcd_cert_file, "", "Path to client certificate file for etcd TLS");
+DEFINE_string(etcd_cert_file, "",
+              "Path to client certificate file for etcd TLS");
 DEFINE_string(etcd_key_file, "", "Path to client key file for etcd TLS");
 #endif
 
@@ -126,16 +127,14 @@ int main(int argc, char *argv[]) {
     if (!FLAGS_etcd_ca_file.empty() || !FLAGS_etcd_cert_file.empty() ||
         !FLAGS_etcd_key_file.empty()) {
         // Configure TLS for transfer engine's etcd client (globalClient)
-        SetGlobalTLSConfig(
-            const_cast<char*>(FLAGS_etcd_ca_file.c_str()),
-            const_cast<char*>(FLAGS_etcd_cert_file.c_str()),
-            const_cast<char*>(FLAGS_etcd_key_file.c_str()));
+        SetGlobalTLSConfig(const_cast<char *>(FLAGS_etcd_ca_file.c_str()),
+                           const_cast<char *>(FLAGS_etcd_cert_file.c_str()),
+                           const_cast<char *>(FLAGS_etcd_key_file.c_str()));
         // Configure TLS for HA backend's etcd store client (storeClient)
-        mooncake::EtcdHelper::SetTLSConfig(FLAGS_etcd_ca_file,
-                                            FLAGS_etcd_cert_file,
-                                            FLAGS_etcd_key_file);
-        LOG(INFO) << "etcd TLS configured for client (ca="
-                  << FLAGS_etcd_ca_file << ")";
+        mooncake::EtcdHelper::SetTLSConfig(
+            FLAGS_etcd_ca_file, FLAGS_etcd_cert_file, FLAGS_etcd_key_file);
+        LOG(INFO) << "etcd TLS configured for client (ca=" << FLAGS_etcd_ca_file
+                  << ")";
     }
 #endif
 

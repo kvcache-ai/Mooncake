@@ -85,8 +85,8 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClientWithTLS(
         if (ca_file.empty() && cert_file.empty() && key_file.empty()) {
             LOG(WARNING) << "ConnectToEtcdStoreClientWithTLS called with empty "
                             "TLS file paths, using non-TLS client";
-            ret = NewStoreEtcdClient(
-                const_cast<char*>(etcd_endpoints.c_str()), &err_msg);
+            ret = NewStoreEtcdClient(const_cast<char*>(etcd_endpoints.c_str()),
+                                     &err_msg);
         } else {
             LOG(INFO) << "Connecting to etcd store client with TLS (ca="
                       << ca_file << ", cert=" << cert_file
@@ -95,8 +95,7 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClientWithTLS(
                 const_cast<char*>(etcd_endpoints.c_str()),
                 const_cast<char*>(ca_file.c_str()),
                 const_cast<char*>(cert_file.c_str()),
-                const_cast<char*>(key_file.c_str()),
-                &err_msg);
+                const_cast<char*>(key_file.c_str()), &err_msg);
         }
         if (ret != 0 && ret != -2) {
             LOG(ERROR) << "Failed to initialize etcd client: "
@@ -157,15 +156,13 @@ ErrorCode EtcdHelper::ResetEtcdStoreClientWithTLS(
         ret = EtcdStoreResetClientWrapper(
             const_cast<char*>(etcd_endpoints.c_str()), &err_msg);
     } else {
-        LOG(INFO) << "Resetting etcd store client with TLS (ca="
-                  << ca_file << ", cert=" << cert_file
-                  << ", key=" << key_file << ")";
+        LOG(INFO) << "Resetting etcd store client with TLS (ca=" << ca_file
+                  << ", cert=" << cert_file << ", key=" << key_file << ")";
         ret = EtcdStoreResetClientWrapperWithTLS(
             const_cast<char*>(etcd_endpoints.c_str()),
             const_cast<char*>(ca_file.c_str()),
             const_cast<char*>(cert_file.c_str()),
-            const_cast<char*>(key_file.c_str()),
-            &err_msg);
+            const_cast<char*>(key_file.c_str()), &err_msg);
     }
 
     if (ret != 0) {
@@ -757,9 +754,7 @@ void EtcdHelper::SetTLSConfig(const std::string& ca_file,
     LOG(FATAL) << "Etcd is not enabled in compilation";
 }
 
-bool EtcdHelper::IsTLSConfigured() {
-    return false;
-}
+bool EtcdHelper::IsTLSConfigured() { return false; }
 
 #endif
 
