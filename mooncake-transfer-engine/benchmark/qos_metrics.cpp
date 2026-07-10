@@ -92,7 +92,7 @@ bool parseQosClasses(const std::string& spec,
             *error = "qos class threads must be a positive integer";
             return false;
         }
-        if (fields[2].front() == '-' ||
+        if (fields[2].empty() || fields[2].front() == '-' ||
             !parseNumber(fields[2], &config.slo_us)) {
             *error = "qos class slo_us must be a non-negative integer";
             return false;
