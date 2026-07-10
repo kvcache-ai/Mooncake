@@ -74,9 +74,8 @@ TEST(EtcdTlsConfigTest, SetupWithInvalidParamsDoesNotCrash) {
 
     // Call setup with obviously invalid endpoints — will fail internally
     // but must not crash.
-    int ret = mooncake_store_setup(store, "localhost", "metadata-service",
-                                   1024, 1024, "tcp", "eth0",
-                                   "127.0.0.1:1");
+    int ret = mooncake_store_setup(store, "localhost", "metadata-service", 1024,
+                                   1024, "tcp", "eth0", "127.0.0.1:1");
     // Expected to fail because there is no real master at 127.0.0.1:1
     EXPECT_NE(ret, 0);
 
@@ -118,8 +117,7 @@ TEST(EtcdTlsConfigTest, EnvFallbackLoadsWithoutCrash) {
     // Set environment variables BEFORE creating store / calling setup.
     // Use a known non-existent path so we don't accidentally use real certs.
     ASSERT_EQ(setenv("MC_ETCD_CA_FILE", "/tmp/mooncake-test-ca.pem", 1), 0);
-    ASSERT_EQ(setenv("MC_ETCD_CERT_FILE", "/tmp/mooncake-test-cert.pem", 1),
-              0);
+    ASSERT_EQ(setenv("MC_ETCD_CERT_FILE", "/tmp/mooncake-test-cert.pem", 1), 0);
     ASSERT_EQ(setenv("MC_ETCD_KEY_FILE", "/tmp/mooncake-test-key.pem", 1), 0);
 
     // Start with clean TLS state — the previous test
@@ -137,9 +135,8 @@ TEST(EtcdTlsConfigTest, EnvFallbackLoadsWithoutCrash) {
     // The setup call will fail (no real master), but the env-var loading
     // and SetGlobalTLSConfig / EtcdHelper::SetTLSConfig calls should
     // complete without crashing.
-    int ret = mooncake_store_setup(store, "localhost", "metadata-service",
-                                   1024, 1024, "tcp", "eth0",
-                                   "127.0.0.1:1");
+    int ret = mooncake_store_setup(store, "localhost", "metadata-service", 1024,
+                                   1024, "tcp", "eth0", "127.0.0.1:1");
     EXPECT_NE(ret, 0);
 
     // Verify that the env-var fallback actually consumed the environment
@@ -178,9 +175,8 @@ TEST(EtcdTlsConfigTest, ExplicitConfigSkipsEnvFallback) {
 
     // Setup will fail (no real master), but it should use the explicit
     // values, not the env-var fallback.
-    int ret = mooncake_store_setup(store, "localhost", "metadata-service",
-                                   1024, 1024, "tcp", "eth0",
-                                   "127.0.0.1:1");
+    int ret = mooncake_store_setup(store, "localhost", "metadata-service", 1024,
+                                   1024, "tcp", "eth0", "127.0.0.1:1");
     EXPECT_NE(ret, 0);
 
     // TLS should be configured (the explicit C API call set it up).
