@@ -1608,6 +1608,8 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         input.derived_task_ids = owner.derived_task_ids;
         input.request = owner.request;
         input.kind = owner_kind;
+        input.degradation_eligible =
+            owner.route.transport == RDMA && !owner.staging;
         submit.owners.push_back(std::move(input));
     }
 

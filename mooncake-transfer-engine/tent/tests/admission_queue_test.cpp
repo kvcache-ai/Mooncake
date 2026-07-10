@@ -633,6 +633,27 @@ TEST(AdmissionQueueTest, Step3DynamicBandwidthProvider) {
     EXPECT_EQ(hook_calls, 1);
 }
 
+TEST(AdmissionQueueTest, Step3SkipsNonRdmaOwner) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                               [] { return uint64_t{1'000'000'000}; });
+
+    auto owner = makeOwnerWithDeadline(0, 16, 1'000'000'010);
+    owner.degradation_eligible = false;
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(makeSubmit(1, 1, {owner}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(hook_calls, 0);
+}
+
 // --- Deadline proximity promotion (step 4) --------------------------------
 
 QueueLimits promotionLimits(uint64_t slack_ns) {
