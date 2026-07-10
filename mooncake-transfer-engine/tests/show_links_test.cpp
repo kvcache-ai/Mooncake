@@ -15,10 +15,12 @@
 #include <gtest/gtest.h>
 #include <json/json.h>
 
+#include <cstring>
 #include <memory>
 #include <string>
 
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 
 using namespace mooncake;
 
@@ -37,6 +39,26 @@ TEST(ShowLinksTest, NoInitReturnsEmptyOrPlaceholder) {
                               &errors))
         << errors;
     EXPECT_TRUE(root.isMember("local_nics"));
+}
+
+TEST(ShowLinksTest, CApiSupportsJsonAndRejectsInvalidArguments) {
+    auto engine = std::make_unique<TransferEngine>(false);
+    char output[4096] = {};
+    auto handle = reinterpret_cast<transfer_engine_t>(engine.get());
+
+    ASSERT_EQ(::showLinks(handle, output, sizeof(output), 1), 0);
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    ASSERT_TRUE(reader->parse(output, output + std::strlen(output), &root,
+                              &errors))
+        << errors;
+    EXPECT_TRUE(root.isMember("local_nics"));
+
+    EXPECT_NE(::showLinks(nullptr, output, sizeof(output), 0), 0);
+    EXPECT_NE(::showLinks(handle, nullptr, sizeof(output), 0), 0);
+    EXPECT_NE(::showLinks(handle, output, 0, 0), 0);
 }
 
 TEST(ShowLinksTest, AutoDiscoverShowsNics) {

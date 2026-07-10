@@ -16,6 +16,7 @@
 
 #include <json/json.h>
 
+#include <algorithm>
 #include <sstream>
 
 #include "transfer_engine_impl.h"
@@ -64,6 +65,8 @@ static bool hasTransportDetails(const NicDiagInfo& nic) {
 }
 
 static int computeSpeedGbps(int active_speed, int active_width) {
+    if (active_width <= 0) return 0;
+
     int lane_gbps = 0;
     switch (active_speed) {
         case 1:
@@ -94,7 +97,7 @@ static int computeSpeedGbps(int active_speed, int active_width) {
             lane_gbps = 200;
             break;
         default:
-            lane_gbps = active_speed;
+            lane_gbps = std::max(0, active_speed);
             break;
     }
     int lanes = 1;
