@@ -43,6 +43,14 @@ DEFINE_int32(deadline_tight_threads, 0,
              "workers have no deadline.");
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
+DEFINE_string(
+    qos_classes, "",
+    "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
+    "enables per-class QoS metrics and requires a fixed thread count.");
+DEFINE_double(qos_link_capacity_gbps, 0.0,
+              "Link capacity in GB/s for total utilization (0 reports N/A).");
+DEFINE_string(qos_output_jsonl, "",
+              "Append versioned QoS metric records to this JSONL file.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
 DEFINE_string(metadata_type, "p2p",
@@ -81,6 +89,9 @@ int XferBenchConfig::start_num_threads = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
 bool XferBenchConfig::deadline_bw_arbitration = false;
+std::string XferBenchConfig::qos_classes;
+double XferBenchConfig::qos_link_capacity_gbps = 0.0;
+std::string XferBenchConfig::qos_output_jsonl;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
@@ -110,6 +121,9 @@ void XferBenchConfig::loadFromFlags() {
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
+    qos_classes = FLAGS_qos_classes;
+    qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
+    qos_output_jsonl = FLAGS_qos_output_jsonl;
     duration = FLAGS_duration;
 
     metadata_type = FLAGS_metadata_type;
