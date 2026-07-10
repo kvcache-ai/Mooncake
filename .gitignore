@@ -204,6 +204,7 @@ _codeql_detected_source_root
 # CodeBuddy Memory
 .codebuddy/
 contest_info/
+.claude/.claude_backup/
 .gstack/
 
 # core dumps
