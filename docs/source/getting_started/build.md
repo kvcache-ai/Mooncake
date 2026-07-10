@@ -13,7 +13,8 @@ This document describes how to build Mooncake.
 
 Install common build dependencies first. A stable Internet connection is
 required because the script installs system packages, initializes submodules,
-installs Go, and builds/installs yalantinglibs.
+installs Go, installs the xxHash development package, and builds/installs
+yalantinglibs from the `extern/yalantinglibs` submodule.
 
 ```bash
 sudo bash dependencies.sh
@@ -179,10 +180,19 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_TE=ON/OFF` | `ON` | Build the Mooncake Transfer Engine component and sample code. |
 | `-DWITH_STORE=ON/OFF` | `ON` | Build the Mooncake Store component. |
 | `-DWITH_STORE_GO=ON/OFF` | `OFF` | Build Go bindings for Mooncake Store when `-DWITH_STORE=ON`. |
+| `-DWITH_CONDUCTOR=ON/OFF` | `OFF` | Build the Mooncake Conductor service. |
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
 | `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.12.1"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
+
+To build only the Conductor target from a configured build tree, enable the
+component and build `mooncake_conductor`:
+
+```bash
+cmake -S . -B build -DWITH_CONDUCTOR=ON
+cmake --build build --target mooncake_conductor
+```
 
 ### Build Behavior Options
 
