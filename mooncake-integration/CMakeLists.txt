@@ -74,6 +74,16 @@ if(WITH_TE)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
   endif()
+
+  if(BUILD_TESTING)
+    add_executable(transfer_retry_hint_test
+                   transfer_engine/retry_utils_test.cpp)
+    target_include_directories(transfer_retry_hint_test PRIVATE
+                               transfer_engine)
+    target_link_libraries(transfer_retry_hint_test PRIVATE transfer_engine
+                          gtest gtest_main)
+    add_test(NAME transfer_retry_hint_test COMMAND transfer_retry_hint_test)
+  endif()
 endif()
 
 set(ALLOCATOR_SO_PATH

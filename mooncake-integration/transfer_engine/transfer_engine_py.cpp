@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "retry_utils.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
@@ -536,9 +537,7 @@ int TransferEnginePy::batchTransferSync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
-        for (auto& entry : entries) {
-            entry.advise_retry_cnt = retry;
-        }
+        mooncake::integration::updateRetryHints(entries, retry);
 
         auto batch_id = engine_->allocateBatchID(batch_size);
         Status s =
@@ -647,9 +646,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
-        for (auto& entry : entries) {
-            entry.advise_retry_cnt = retry;
-        }
+        mooncake::integration::updateRetryHints(entries, retry);
 
         batch_id = engine_->allocateBatchID(batch_size);
         auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
