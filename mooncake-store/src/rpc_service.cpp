@@ -85,9 +85,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::RetainGroups(
     const auto accepted = std::count_if(
         result.begin(), result.end(),
         [](const auto& item) { return item.has_value() && item.value(); });
-    LOG(INFO) << "RetainGroups accepted " << accepted << "/"
-              << group_ids.size() << " groups for ttl_ms=" << ttl_ms
-              << ", tenant_id=" << tenant_id;
+    LOG(INFO) << "RetainGroups accepted " << accepted << "/" << group_ids.size()
+              << " groups for ttl_ms=" << ttl_ms << ", tenant_id=" << tenant_id;
     return result;
 }
 

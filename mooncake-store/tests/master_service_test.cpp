@@ -1447,9 +1447,8 @@ TEST_F(MasterServiceTest, RetainGroupsProtectsFutureGroupMembers) {
     constexpr size_t kSegmentSize = 4 * 1024 * 1024;
     constexpr size_t kObjectSize = 2 * 1024 * 1024;
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "retained_group_segment",
-                             kDefaultSegmentBase, kSegmentSize);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        *service_, "retained_group_segment", kDefaultSegmentBase, kSegmentSize);
     const UUID client_id = generate_uuid();
 
     const std::string key_a = "retained_group_key_a";
@@ -1459,8 +1458,8 @@ TEST_F(MasterServiceTest, RetainGroupsProtectsFutureGroupMembers) {
     config.replica_num = 1;
     config.group_ids = std::vector<std::string>{group_id};
 
-    auto retained = service_->RetainGroups({group_id, "missing_group"}, 1000,
-                                           "default");
+    auto retained =
+        service_->RetainGroups({group_id, "missing_group"}, 1000, "default");
     ASSERT_EQ(retained.size(), 2);
     ASSERT_TRUE(retained[0].has_value());
     EXPECT_TRUE(retained[0].value());
@@ -1473,9 +1472,9 @@ TEST_F(MasterServiceTest, RetainGroupsProtectsFutureGroupMembers) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     ReplicateConfig trigger_config;
     trigger_config.replica_num = 1;
-    auto trigger_result = service_->PutStart(
-        client_id, "trigger_retained_group_eviction", "default", kObjectSize,
-        trigger_config);
+    auto trigger_result =
+        service_->PutStart(client_id, "trigger_retained_group_eviction",
+                           "default", kObjectSize, trigger_config);
     ASSERT_FALSE(trigger_result.has_value());
     EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
     EXPECT_TRUE(service_->GetReplicaList(key_a, "default").has_value());

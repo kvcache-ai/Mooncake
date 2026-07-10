@@ -1222,8 +1222,7 @@ class MasterService {
 
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
-        std::unordered_map<std::string,
-                           std::chrono::system_clock::time_point>
+        std::unordered_map<std::string, std::chrono::system_clock::time_point>
             group_retention_deadlines;
 
         bool Empty() const {

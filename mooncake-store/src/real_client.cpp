@@ -2059,9 +2059,8 @@ std::vector<int> RealClient::retainGroups(
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto &result : internal_results) {
-        results.push_back(result.has_value()
-                              ? (result.value() ? 1 : 0)
-                              : toInt(result.error()));
+        results.push_back(result.has_value() ? (result.value() ? 1 : 0)
+                                             : toInt(result.error()));
     }
     return results;
 }
