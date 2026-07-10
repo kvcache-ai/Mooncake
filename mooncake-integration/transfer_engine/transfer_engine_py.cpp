@@ -570,6 +570,9 @@ int TransferEnginePy::batchTransferSync(
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 already_freed = true;
+                if (retry + 1 < max_retry) {
+                    mooncake::integration::updateRetryHints(entries, retry + 1);
+                }
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
@@ -589,9 +592,6 @@ int TransferEnginePy::batchTransferSync(
                 }
                 return -1;
             }
-        }
-        if (retry + 1 < max_retry) {
-            mooncake::integration::updateRetryHints(entries, retry + 1);
         }
     }
     return -1;
