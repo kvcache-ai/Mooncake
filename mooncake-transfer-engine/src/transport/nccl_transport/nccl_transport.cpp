@@ -87,8 +87,39 @@ bool decodeJson(const std::string& encoded, Json::Value* value,
                 std::string* error) {
     if (!value) return false;
     Json::CharReaderBuilder builder;
+    builder["allowComments"] = false;
+    builder["allowTrailingCommas"] = false;
+    builder["failIfExtra"] = true;
+    builder["rejectDupKeys"] = true;
+    builder["strictRoot"] = true;
     std::istringstream input(encoded);
-    return Json::parseFromStream(builder, input, value, error);
+    try {
+        if (!Json::parseFromStream(builder, input, value, error)) return false;
+    } catch (const Json::Exception& exception) {
+        if (error) *error = exception.what();
+        return false;
+    }
+    if (!value->isObject()) {
+        if (error) *error = "NCCL handshake payload is not an object";
+        return false;
+    }
+    return true;
+}
+
+bool hasStringField(const Json::Value& value, const char* name) {
+    return value.isObject() && value.isMember(name) && value[name].isString();
+}
+
+bool hasIntField(const Json::Value& value, const char* name) {
+    return value.isObject() && value.isMember(name) && value[name].isInt();
+}
+
+bool hasUInt64Field(const Json::Value& value, const char* name) {
+    return value.isObject() && value.isMember(name) && value[name].isUInt64();
+}
+
+bool hasArrayField(const Json::Value& value, const char* name) {
+    return value.isObject() && value.isMember(name) && value[name].isArray();
 }
 
 Json::Value encodeBuffers(const std::vector<BufferInfo>& buffers) {
@@ -105,28 +136,49 @@ Json::Value encodeBuffers(const std::vector<BufferInfo>& buffers) {
 
 bool decodeBuffers(const Json::Value& value, int expected_device,
                    std::vector<BufferInfo>* buffers, std::string* error) {
-    if (!buffers || !value.isArray()) {
+    if (!buffers || expected_device < 0 || !value.isArray()) {
         if (error) *error = "NCCL buffer catalog is not an array";
         return false;
     }
 
-    buffers->clear();
+    std::vector<BufferInfo> decoded;
+    decoded.reserve(value.size());
     for (const auto& item : value) {
+        if (!item.isObject() || !item.isMember("addr") ||
+            !item["addr"].isUInt64() || !item.isMember("length") ||
+            !item["length"].isUInt64() ||
+            !item.isMember("device_id") || !item["device_id"].isInt()) {
+            if (error) *error = "Malformed NCCL buffer catalog entry";
+            return false;
+        }
         BufferInfo buffer;
         buffer.addr = item["addr"].asUInt64();
         buffer.length = item["length"].asUInt64();
         buffer.device_id = item["device_id"].asInt();
         if (!buffer.addr || !buffer.length ||
+            buffer.length > std::numeric_limits<uint64_t>::max() - buffer.addr ||
             buffer.device_id != expected_device) {
             if (error) *error = "Invalid NCCL buffer catalog entry";
             return false;
         }
-        buffers->push_back(buffer);
+        decoded.push_back(buffer);
     }
-    std::sort(buffers->begin(), buffers->end(),
+    if (decoded.empty()) {
+        if (error) *error = "NCCL buffer catalog is empty";
+        return false;
+    }
+    std::sort(decoded.begin(), decoded.end(),
               [](const BufferInfo& lhs, const BufferInfo& rhs) {
                   return lhs.addr < rhs.addr;
               });
+    for (size_t i = 1; i < decoded.size(); ++i) {
+        const auto& previous = decoded[i - 1];
+        if (previous.addr + previous.length > decoded[i].addr) {
+            if (error) *error = "NCCL buffer catalog contains overlap";
+            return false;
+        }
+    }
+    *buffers = std::move(decoded);
     return true;
 }
 
@@ -140,17 +192,21 @@ std::string encodeUniqueId(const ncclUniqueId& id) {
     return out.str();
 }
 
+int decodeHexNibble(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
 bool decodeUniqueId(const std::string& encoded, ncclUniqueId* id) {
     if (!id || encoded.size() != 2 * sizeof(*id)) return false;
     auto* bytes = reinterpret_cast<unsigned char*>(id);
     for (size_t i = 0; i < sizeof(*id); ++i) {
-        unsigned int value = 0;
-        std::istringstream in(encoded.substr(2 * i, 2));
-        in >> std::hex >> value;
-        if (!in || value > std::numeric_limits<unsigned char>::max()) {
-            return false;
-        }
-        bytes[i] = static_cast<unsigned char>(value);
+        const int high = decodeHexNibble(encoded[2 * i]);
+        const int low = decodeHexNibble(encoded[2 * i + 1]);
+        if (high < 0 || low < 0) return false;
+        bytes[i] = static_cast<unsigned char>((high << 4) | low);
     }
     return true;
 }
@@ -251,8 +307,14 @@ class NcclSession {
         ncclResult_t result = ncclPutSignal(
             source, length, ncclUint8, owner_rank, window->handle,
             dest_addr - destination.addr, 0, 0, 0, comm_, stream_);
+        cudaError_t sync_result = cudaSuccess;
         if (result == ncclSuccess && event) {
             cuda_result = cudaEventRecord(event, stream_);
+            if (cuda_result != cudaSuccess) {
+                // The put is already enqueued. Do not let the caller reuse or
+                // free its source until the stream has drained.
+                sync_result = cudaStreamSynchronize(stream_);
+            }
         }
         if (saved_device >= 0) cudaSetDevice(saved_device);
 
@@ -261,7 +323,13 @@ class NcclSession {
             return -1;
         }
         if (cuda_result != cudaSuccess) {
-            if (error) *error = cudaError(cuda_result, "cudaEventRecord");
+            std::string failure = cudaError(cuda_result, "cudaEventRecord");
+            if (sync_result != cudaSuccess) {
+                failure += "; fallback " +
+                           cudaError(sync_result, "cudaStreamSynchronize");
+                setFailure(failure);
+            }
+            if (error) *error = std::move(failure);
             return -1;
         }
         return 0;
@@ -535,55 +603,66 @@ class NcclHostTransport::Impl {
     int registerMemory(void* addr, size_t length,
                        const std::string& location, bool remote_accessible,
                        bool update_metadata) {
-        (void)remote_accessible;
-        if (!addr || length == 0) return ERR_INVALID_ARGUMENT;
-        int device_id = getPointerDevice(addr);
-        if (device_id < 0) {
-            LOG(ERROR) << "[Host NCCL] only CUDA device or managed memory "
-                          "can be registered";
-            return ERR_INVALID_ARGUMENT;
-        }
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        return registerMemoryLocked(addr, length, location, remote_accessible,
+                                    update_metadata);
+    }
 
-        {
-            std::lock_guard<std::mutex> sessions_lock(sessions_mutex_);
-            if (!sessions_.empty() || !bootstrap_ids_.empty()) {
-                LOG(ERROR) << "[Host NCCL] register all buffers before the "
-                              "first transfer creates a session";
-                return ERR_INVALID_ARGUMENT;
+    int unregisterMemory(void* addr, bool update_metadata) {
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        return unregisterMemoryLocked(addr, update_metadata);
+    }
+
+    int registerMemoryBatch(const std::vector<BufferEntry>& buffer_list,
+                            const std::string& location) {
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        std::vector<void*> registered;
+        registered.reserve(buffer_list.size());
+        for (const auto& buffer : buffer_list) {
+            int result = registerMemoryLocked(buffer.addr, buffer.length,
+                                              location, true, false);
+            if (result != 0) {
+                for (auto it = registered.rbegin(); it != registered.rend();
+                     ++it) {
+                    unregisterMemoryLocked(*it, false);
+                }
+                return result;
             }
+            registered.push_back(buffer.addr);
         }
-
-        const uint64_t address = reinterpret_cast<uint64_t>(addr);
-        if (length > std::numeric_limits<uint64_t>::max() - address) {
-            LOG(ERROR) << "[Host NCCL] memory registration range overflows";
-            return ERR_INVALID_ARGUMENT;
-        }
-
-        BufferInfo info{address, length, device_id};
-        {
-            std::lock_guard<std::mutex> lock(buffers_mutex_);
-            for (const auto& buffer : local_buffers_) {
-                const uint64_t lhs_end = info.addr + info.length;
-                const uint64_t rhs_end = buffer.addr + buffer.length;
-                if (info.addr < rhs_end && buffer.addr < lhs_end) {
-                    LOG(ERROR) << "[Host NCCL] overlapping memory registration";
-                    return ERR_ADDRESS_OVERLAPPED;
+        int result = metadata_->updateLocalSegmentDesc();
+        if (result != 0) {
+            for (auto it = registered.rbegin(); it != registered.rend(); ++it) {
+                int rollback_result = unregisterMemoryLocked(*it, false);
+                if (rollback_result != 0) {
+                    LOG(ERROR) << "[Host NCCL] failed to roll back buffer "
+                               << *it << " after metadata publication failure: "
+                               << rollback_result;
                 }
             }
-            local_buffers_.push_back(info);
         }
+        return result;
+    }
 
-        BufferDesc desc;
-        desc.name = location;
-        desc.addr = info.addr;
-        desc.length = info.length;
-        desc.device_id = info.device_id;
-#ifdef ENABLE_MULTI_PROTOCOL
-        desc.protocol = kHandshakeProtocol;
-#endif
-        int result = metadata_->addLocalMemoryBuffer(desc, update_metadata);
-        if (result != 0) {
-            std::lock_guard<std::mutex> lock(buffers_mutex_);
+    int unregisterMemoryBatch(const std::vector<void*>& addr_list) {
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        if (buffers_frozen_) {
+            LOG(ERROR) << "[Host NCCL] cannot unregister memory after the "
+                          "session catalog has been frozen";
+            return ERR_INVALID_ARGUMENT;
+        }
+        for (void* addr : addr_list) {
+            auto it = std::find_if(
+                local_buffers_.begin(), local_buffers_.end(),
+                [addr](const BufferInfo& buffer) {
+                    return buffer.addr == reinterpret_cast<uint64_t>(addr);
+                });
+            if (it == local_buffers_.end()) return ERR_ADDRESS_NOT_REGISTERED;
+        }
+        int result = metadata_->removeLocalMemoryBuffers(
+            addr_list, kHandshakeProtocol, true);
+        if (result != 0) return result;
+        for (void* addr : addr_list) {
             local_buffers_.erase(
                 std::remove_if(local_buffers_.begin(), local_buffers_.end(),
                                [addr](const BufferInfo& buffer) {
@@ -592,34 +671,7 @@ class NcclHostTransport::Impl {
                                }),
                 local_buffers_.end());
         }
-        return result;
-    }
-
-    int unregisterMemory(void* addr, bool update_metadata) {
-        {
-            std::lock_guard<std::mutex> sessions_lock(sessions_mutex_);
-            if (!sessions_.empty() || !bootstrap_ids_.empty()) {
-                LOG(ERROR) << "[Host NCCL] cannot unregister memory while "
-                              "NCCL sessions own collective windows";
-                return ERR_INVALID_ARGUMENT;
-            }
-        }
-
-        bool found = false;
-        {
-            std::lock_guard<std::mutex> lock(buffers_mutex_);
-            auto it = std::find_if(
-                local_buffers_.begin(), local_buffers_.end(),
-                [addr](const BufferInfo& buffer) {
-                    return buffer.addr == reinterpret_cast<uint64_t>(addr);
-                });
-            if (it != local_buffers_.end()) {
-                local_buffers_.erase(it);
-                found = true;
-            }
-        }
-        if (!found) return ERR_ADDRESS_NOT_REGISTERED;
-        return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+        return 0;
     }
 
     Status submitTasks(const std::vector<TransferTask*>& task_list) {
@@ -667,7 +719,7 @@ class NcclHostTransport::Impl {
                 local_device = getPointerDevice(request.source);
                 if (local_device < 0) {
                     error = "NCCL local buffer must be CUDA device memory";
-                } else if (!isLocalBuffer(
+                } else if (!freezeAndValidateLocalBuffer(
                                reinterpret_cast<uint64_t>(request.source),
                                request.length, local_device)) {
                     error = "NCCL local buffer is not registered";
@@ -766,17 +818,128 @@ class NcclHostTransport::Impl {
     }
 
    private:
-    std::vector<BufferInfo> buffersForDevice(int device_id) const {
-        std::lock_guard<std::mutex> lock(buffers_mutex_);
-        std::vector<BufferInfo> result;
-        for (const auto& buffer : local_buffers_) {
-            if (buffer.device_id == device_id) result.push_back(buffer);
+    // buffers_mutex_ must be held across each complete catalog mutation so the
+    // first session cannot snapshot a partially committed registration.
+    int registerMemoryLocked(void* addr, size_t length,
+                             const std::string& location,
+                             bool remote_accessible, bool update_metadata) {
+        (void)remote_accessible;
+        if (!addr || length == 0) return ERR_INVALID_ARGUMENT;
+        int device_id = getPointerDevice(addr);
+        if (device_id < 0) {
+            LOG(ERROR) << "[Host NCCL] only CUDA device or managed memory "
+                          "can be registered";
+            return ERR_INVALID_ARGUMENT;
         }
-        std::sort(result.begin(), result.end(),
+
+        const uint64_t address = reinterpret_cast<uint64_t>(addr);
+        if (length > std::numeric_limits<uint64_t>::max() - address) {
+            LOG(ERROR) << "[Host NCCL] memory registration range overflows";
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        BufferInfo info{address, length, device_id};
+        if (buffers_frozen_) {
+            LOG(ERROR) << "[Host NCCL] register all buffers before the first "
+                          "transfer freezes the session catalog";
+            return ERR_INVALID_ARGUMENT;
+        }
+        for (const auto& buffer : local_buffers_) {
+            const uint64_t lhs_end = info.addr + info.length;
+            const uint64_t rhs_end = buffer.addr + buffer.length;
+            if (info.addr < rhs_end && buffer.addr < lhs_end) {
+                LOG(ERROR) << "[Host NCCL] overlapping memory registration";
+                return ERR_ADDRESS_OVERLAPPED;
+            }
+        }
+        local_buffers_.push_back(info);
+
+        BufferDesc desc;
+        desc.name = location;
+        desc.addr = info.addr;
+        desc.length = info.length;
+        desc.device_id = info.device_id;
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = kHandshakeProtocol;
+#endif
+        int result = metadata_->addLocalMemoryBuffer(desc, update_metadata);
+        if (result != 0) {
+            // addLocalMemoryBuffer preserves the legacy local-first behavior
+            // used by other transports. Roll back NCCL's protocol-specific
+            // descriptor when publication fails so both local catalogs agree.
+            int rollback_result = metadata_->removeLocalMemoryBuffer(
+                addr, kHandshakeProtocol, false);
+            if (rollback_result != 0 &&
+                rollback_result != ERR_ADDRESS_NOT_REGISTERED) {
+                LOG(ERROR) << "[Host NCCL] failed to roll back metadata for "
+                           << addr << ": " << rollback_result;
+            }
+            local_buffers_.erase(
+                std::remove_if(local_buffers_.begin(), local_buffers_.end(),
+                               [addr](const BufferInfo& buffer) {
+                                   return buffer.addr ==
+                                          reinterpret_cast<uint64_t>(addr);
+                               }),
+                local_buffers_.end());
+        }
+        return result;
+    }
+
+    int unregisterMemoryLocked(void* addr, bool update_metadata) {
+        if (buffers_frozen_) {
+            LOG(ERROR) << "[Host NCCL] cannot unregister memory after the "
+                          "session catalog has been frozen";
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        auto it = std::find_if(
+            local_buffers_.begin(), local_buffers_.end(),
+            [addr](const BufferInfo& buffer) {
+                return buffer.addr == reinterpret_cast<uint64_t>(addr);
+            });
+        if (it == local_buffers_.end()) return ERR_ADDRESS_NOT_REGISTERED;
+
+        int result = metadata_->removeLocalMemoryBuffer(
+            addr, kHandshakeProtocol, update_metadata);
+        if (result != 0) return result;
+        local_buffers_.erase(it);
+        return 0;
+    }
+
+    bool freezeBuffersForDevice(int device_id,
+                                std::vector<BufferInfo>* result) {
+        if (!result) return false;
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        std::vector<BufferInfo> snapshot;
+        for (const auto& buffer : local_buffers_) {
+            if (buffer.device_id == device_id) snapshot.push_back(buffer);
+        }
+        if (snapshot.empty()) return false;
+        // Registration and unregistration take the same lock and check this
+        // flag. The first session therefore snapshots a complete, immutable
+        // catalog instead of racing a buffer mutation between two locks.
+        buffers_frozen_ = true;
+        std::sort(snapshot.begin(), snapshot.end(),
                   [](const BufferInfo& lhs, const BufferInfo& rhs) {
                       return lhs.addr < rhs.addr;
                   });
-        return result;
+        *result = std::move(snapshot);
+        return true;
+    }
+
+    bool freezeAndValidateLocalBuffer(uint64_t addr, size_t length,
+                                      int device_id) {
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        for (const auto& buffer : local_buffers_) {
+            if (buffer.device_id == device_id &&
+                containsRange(buffer, addr, length)) {
+                // Once validation succeeds, unregister must not be able to
+                // remove the source before the session snapshots its windows.
+                buffers_frozen_ = true;
+                return true;
+            }
+        }
+        return false;
     }
 
     bool findRemoteBuffer(const SegmentDesc& segment, uint64_t addr,
@@ -867,6 +1030,11 @@ class NcclHostTransport::Impl {
             return existing;
         }
 
+        std::vector<BufferInfo> local_buffers;
+        if (!freezeBuffersForDevice(local_device, &local_buffers)) {
+            if (error) *error = "No NCCL buffers registered on local device";
+            return nullptr;
+        }
         const int local_rank = local_server_name_ < peer_name ? 0 : 1;
         ncclUniqueId unique_id{};
         std::string unique_id_string;
@@ -876,7 +1044,6 @@ class NcclHostTransport::Impl {
             return nullptr;
         }
 
-        const auto local_buffers = buffersForDevice(local_device);
         Json::Value request;
         request["op"] = "bootstrap";
         request["peer_name"] = local_server_name_;
@@ -900,6 +1067,11 @@ class NcclHostTransport::Impl {
         std::string parse_error;
         if (!decodeJson(peer_desc.payload, &response, &parse_error)) {
             if (error) *error = "Invalid NCCL bootstrap response: " + parse_error;
+            return nullptr;
+        }
+        if (!hasStringField(response, "unique_id") ||
+            !hasArrayField(response, "buffers")) {
+            if (error) *error = "Malformed NCCL bootstrap response";
             return nullptr;
         }
         const std::string response_id = response["unique_id"].asString();
@@ -948,20 +1120,31 @@ class NcclHostTransport::Impl {
             local_desc.reply_msg = "Invalid NCCL handshake payload: " + error;
             return 0;
         }
+        if (!hasStringField(request, "op")) {
+            local_desc.reply_msg =
+                "Missing or invalid 'op' field in NCCL handshake request";
+            return 0;
+        }
 
         const std::string op = request["op"].asString();
         Json::Value response;
-        if (op == "bootstrap") {
-            if (handleBootstrap(request, &response, &error) != 0) {
-                local_desc.reply_msg = error;
+        try {
+            if (op == "bootstrap") {
+                if (handleBootstrap(request, &response, &error) != 0) {
+                    local_desc.reply_msg = error;
+                }
+            } else if (op == "reverse_put") {
+                if (handleReversePut(request, &error) != 0) {
+                    local_desc.reply_msg = error;
+                }
+                response["status"] = error.empty() ? "ok" : "error";
+            } else {
+                local_desc.reply_msg = "Unknown NCCL handshake operation";
             }
-        } else if (op == "reverse_put") {
-            if (handleReversePut(request, &error) != 0) {
-                local_desc.reply_msg = error;
-            }
-            response["status"] = error.empty() ? "ok" : "error";
-        } else {
-            local_desc.reply_msg = "Unknown NCCL handshake operation";
+        } catch (const Json::Exception& exception) {
+            local_desc.reply_msg =
+                "Malformed NCCL handshake request: " +
+                std::string(exception.what());
         }
         local_desc.payload = encodeJson(response);
         return 0;
@@ -969,6 +1152,14 @@ class NcclHostTransport::Impl {
 
     int handleBootstrap(const Json::Value& request, Json::Value* response,
                         std::string* error) {
+        if (!response || !hasStringField(request, "peer_name") ||
+            !hasIntField(request, "local_device") ||
+            !hasIntField(request, "remote_device") ||
+            !hasStringField(request, "unique_id") ||
+            !hasArrayField(request, "buffers")) {
+            if (error) *error = "Malformed NCCL bootstrap request";
+            return -1;
+        }
         const std::string peer_name = request["peer_name"].asString();
         const int peer_device = request["local_device"].asInt();
         const int local_device = request["remote_device"].asInt();
@@ -982,16 +1173,32 @@ class NcclHostTransport::Impl {
                            error)) {
             return -1;
         }
-        auto local_buffers = buffersForDevice(local_device);
         const int local_rank = local_server_name_ < peer_name ? 0 : 1;
 
         const std::string key = makeSessionKey(
             local_server_name_, local_device, peer_name, peer_device);
         ncclUniqueId unique_id{};
         std::string unique_id_string;
-        if (!selectBootstrapId(
-                key, request["unique_id"].asString(), local_rank == 0,
-                &unique_id, &unique_id_string, error)) {
+        const std::string proposed_id = request["unique_id"].asString();
+        ncclUniqueId proposed_unique_id{};
+        if ((!proposed_id.empty() &&
+             !decodeUniqueId(proposed_id, &proposed_unique_id)) ||
+            (proposed_id.empty() && local_rank != 0)) {
+            if (error) *error = "Invalid NCCL unique ID in bootstrap";
+            return -1;
+        }
+
+        // Do not let malformed endpoint data permanently freeze registration.
+        // Once the request is valid, take the immutable catalog snapshot used
+        // to create the collective windows.
+        std::vector<BufferInfo> local_buffers;
+        if (!freezeBuffersForDevice(local_device, &local_buffers)) {
+            if (error) *error = "No NCCL buffers registered on local device";
+            return -1;
+        }
+
+        if (!selectBootstrapId(key, proposed_id, local_rank == 0, &unique_id,
+                               &unique_id_string, error)) {
             return -1;
         }
 
@@ -1048,21 +1255,46 @@ class NcclHostTransport::Impl {
             }
             return -1;
         }
+        Json::Value response;
+        std::string parse_error;
+        if (!decodeJson(peer_desc.payload, &response, &parse_error) ||
+            !hasStringField(response, "status") ||
+            response["status"].asString() != "ok") {
+            if (error) {
+                *error = "Invalid NCCL reverse PUT response";
+                if (!parse_error.empty()) *error += ": " + parse_error;
+            }
+            return -1;
+        }
         return 0;
     }
 
     int handleReversePut(const Json::Value& request, std::string* error) {
+        if (!hasStringField(request, "peer_name") ||
+            !hasIntField(request, "local_device") ||
+            !hasIntField(request, "remote_device") ||
+            !hasUInt64Field(request, "source") ||
+            !hasUInt64Field(request, "destination") ||
+            !hasUInt64Field(request, "length")) {
+            if (error) *error = "Malformed NCCL reverse PUT request";
+            return -1;
+        }
         const std::string peer_name = request["peer_name"].asString();
         const int peer_device = request["local_device"].asInt();
         const int local_device = request["remote_device"].asInt();
         const uint64_t source = request["source"].asUInt64();
         const uint64_t destination = request["destination"].asUInt64();
-        const size_t length = request["length"].asUInt64();
+        const uint64_t encoded_length = request["length"].asUInt64();
         if (peer_name.empty() || local_device < 0 || peer_device < 0 ||
-            !source || !destination || !length) {
+            !source || !destination || !encoded_length ||
+            encoded_length > std::numeric_limits<size_t>::max() ||
+            encoded_length > std::numeric_limits<uint64_t>::max() - source ||
+            encoded_length >
+                std::numeric_limits<uint64_t>::max() - destination) {
             if (error) *error = "Invalid NCCL reverse PUT request";
             return -1;
         }
+        const size_t length = static_cast<size_t>(encoded_length);
         if (!isLocalBuffer(source, length, local_device)) {
             if (error) *error = "NCCL READ source is not registered";
             return -1;
@@ -1092,6 +1324,7 @@ class NcclHostTransport::Impl {
 
     mutable std::mutex buffers_mutex_;
     std::vector<BufferInfo> local_buffers_;
+    bool buffers_frozen_ = false;
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<NcclSession>> sessions_;
     std::unordered_map<std::string, std::string> bootstrap_ids_;
@@ -1156,26 +1389,12 @@ int NcclHostTransport::unregisterLocalMemory(void* addr,
 int NcclHostTransport::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list,
     const std::string& location) {
-    std::vector<void*> registered;
-    for (const auto& buffer : buffer_list) {
-        int result = registerLocalMemory(buffer.addr, buffer.length, location,
-                                         true, false);
-        if (result != 0) {
-            for (void* addr : registered) unregisterLocalMemory(addr, false);
-            return result;
-        }
-        registered.push_back(buffer.addr);
-    }
-    return metadata_->updateLocalSegmentDesc();
+    return impl_->registerMemoryBatch(buffer_list, location);
 }
 
 int NcclHostTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    for (void* addr : addr_list) {
-        int result = unregisterLocalMemory(addr, false);
-        if (result != 0) return result;
-    }
-    return metadata_->updateLocalSegmentDesc();
+    return impl_->unregisterMemoryBatch(addr_list);
 }
 
 }  // namespace mooncake
