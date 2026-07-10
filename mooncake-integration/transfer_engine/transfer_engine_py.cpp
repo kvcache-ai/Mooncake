@@ -519,7 +519,6 @@ int TransferEnginePy::batchTransferSync(
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
     auto batch_size = buffers.size();
     std::vector<TransferRequest> entries;
-    entries.reserve(batch_size);
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
         if (opcode == TransferOpcode::WRITE) {
