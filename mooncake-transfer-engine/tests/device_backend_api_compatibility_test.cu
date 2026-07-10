@@ -24,9 +24,11 @@ namespace compatibility_test {
 struct NcclOps {
     using Context = NcclDeviceContext;
 
-    __device__ __forceinline__ static void put(
-        const Context& ctx, int channel, int peer, int qps_per_rank,
-        const void* source, void* destination, uint32_t bytes, int lane) {
+    __device__ __forceinline__ static void put(const Context& ctx, int channel,
+                                               int peer, int qps_per_rank,
+                                               const void* source,
+                                               void* destination,
+                                               uint32_t bytes, int lane) {
         mc_nccl_put(ctx, channel, peer, qps_per_rank, source, destination,
                     bytes, lane);
     }
@@ -35,34 +37,38 @@ struct NcclOps {
 struct IbgdaOps {
     using Context = CommCtx;
 
-    __device__ __forceinline__ static void put(
-        const Context& ctx, int channel, int peer, int qps_per_rank,
-        const void* source, void* destination, uint32_t bytes, int lane) {
+    __device__ __forceinline__ static void put(const Context& ctx, int channel,
+                                               int peer, int qps_per_rank,
+                                               const void* source,
+                                               void* destination,
+                                               uint32_t bytes, int lane) {
         mc_rdma_put(ctx, channel, peer, qps_per_rank, source, destination,
                     bytes, lane);
     }
 };
 
 template <typename Ops>
-__device__ __forceinline__ void exchange(
-    const typename Ops::Context& ctx, int channel, int peer, int qps_per_rank,
-    const void* source, void* destination, uint32_t bytes, int lane) {
+__device__ __forceinline__ void exchange(const typename Ops::Context& ctx,
+                                         int channel, int peer,
+                                         int qps_per_rank, const void* source,
+                                         void* destination, uint32_t bytes,
+                                         int lane) {
     Ops::put(ctx, channel, peer, qps_per_rank, source, destination, bytes,
              lane);
 }
 
 // These kernels are compile probes. They deliberately share the same templated
 // operation and are never executed, so the test needs neither GPUs nor NICs.
-__global__ void instantiateNccl(
-    NcclOps::Context ctx, int channel, int peer, int qps_per_rank,
-    const void* source, void* destination, uint32_t bytes, int lane) {
+__global__ void instantiateNccl(NcclOps::Context ctx, int channel, int peer,
+                                int qps_per_rank, const void* source,
+                                void* destination, uint32_t bytes, int lane) {
     exchange<NcclOps>(ctx, channel, peer, qps_per_rank, source, destination,
                       bytes, lane);
 }
 
-__global__ void instantiateIbgda(
-    IbgdaOps::Context ctx, int channel, int peer, int qps_per_rank,
-    const void* source, void* destination, uint32_t bytes, int lane) {
+__global__ void instantiateIbgda(IbgdaOps::Context ctx, int channel, int peer,
+                                 int qps_per_rank, const void* source,
+                                 void* destination, uint32_t bytes, int lane) {
     exchange<IbgdaOps>(ctx, channel, peer, qps_per_rank, source, destination,
                        bytes, lane);
 }

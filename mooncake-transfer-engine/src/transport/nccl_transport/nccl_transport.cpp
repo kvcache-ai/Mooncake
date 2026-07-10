@@ -146,8 +146,8 @@ bool decodeBuffers(const Json::Value& value, int expected_device,
     for (const auto& item : value) {
         if (!item.isObject() || !item.isMember("addr") ||
             !item["addr"].isUInt64() || !item.isMember("length") ||
-            !item["length"].isUInt64() ||
-            !item.isMember("device_id") || !item["device_id"].isInt()) {
+            !item["length"].isUInt64() || !item.isMember("device_id") ||
+            !item["device_id"].isInt()) {
             if (error) *error = "Malformed NCCL buffer catalog entry";
             return false;
         }
@@ -156,7 +156,8 @@ bool decodeBuffers(const Json::Value& value, int expected_device,
         buffer.length = item["length"].asUInt64();
         buffer.device_id = item["device_id"].asInt();
         if (!buffer.addr || !buffer.length ||
-            buffer.length > std::numeric_limits<uint64_t>::max() - buffer.addr ||
+            buffer.length >
+                std::numeric_limits<uint64_t>::max() - buffer.addr ||
             buffer.device_id != expected_device) {
             if (error) *error = "Invalid NCCL buffer catalog entry";
             return false;
@@ -346,8 +347,7 @@ class NcclSession {
         }
 
         cudaEvent_t event = nullptr;
-        cuda_result =
-            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        cuda_result = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
         if (cuda_result != cudaSuccess) {
             if (saved_device >= 0) cudaSetDevice(saved_device);
             if (error) *error = cudaError(cuda_result, "cudaEventCreate");
@@ -446,9 +446,9 @@ class NcclSession {
             const auto& local_buffer = window.buffers[rank_];
             window.local_ptr = reinterpret_cast<void*>(local_buffer.addr);
 
-            result = ncclCommWindowRegister(
-                comm_, window.local_ptr, local_buffer.length, &window.handle,
-                NCCL_WIN_COLL_SYMMETRIC);
+            result = ncclCommWindowRegister(comm_, window.local_ptr,
+                                            local_buffer.length, &window.handle,
+                                            NCCL_WIN_COLL_SYMMETRIC);
             if (result != ncclSuccess || !window.handle) {
                 if (result == ncclSuccess) result = ncclInternalError;
                 setFailure(ncclError(result, "ncclCommWindowRegister"));
@@ -461,8 +461,7 @@ class NcclSession {
         // NCCL initializes the host-RMA copy-engine resources collectively on
         // the first host RMA submission. Warm them here while both session
         // ranks are already participating, so later TE puts are one-sided.
-        result =
-            ncclSignal(1 - rank_, 0, 0, 0, comm_, stream_);
+        result = ncclSignal(1 - rank_, 0, 0, 0, comm_, stream_);
         if (result != ncclSuccess) {
             setFailure(ncclError(result, "ncclSignal (RMA warm-up)"));
             if (saved_device >= 0) cudaSetDevice(saved_device);
@@ -600,9 +599,8 @@ class NcclHostTransport::Impl {
         return metadata_->updateLocalSegmentDesc();
     }
 
-    int registerMemory(void* addr, size_t length,
-                       const std::string& location, bool remote_accessible,
-                       bool update_metadata) {
+    int registerMemory(void* addr, size_t length, const std::string& location,
+                       bool remote_accessible, bool update_metadata) {
         std::lock_guard<std::mutex> lock(buffers_mutex_);
         return registerMemoryLocked(addr, length, location, remote_accessible,
                                     update_metadata);
@@ -652,11 +650,11 @@ class NcclHostTransport::Impl {
             return ERR_INVALID_ARGUMENT;
         }
         for (void* addr : addr_list) {
-            auto it = std::find_if(
-                local_buffers_.begin(), local_buffers_.end(),
-                [addr](const BufferInfo& buffer) {
-                    return buffer.addr == reinterpret_cast<uint64_t>(addr);
-                });
+            auto it = std::find_if(local_buffers_.begin(), local_buffers_.end(),
+                                   [addr](const BufferInfo& buffer) {
+                                       return buffer.addr ==
+                                              reinterpret_cast<uint64_t>(addr);
+                                   });
             if (it == local_buffers_.end()) return ERR_ADDRESS_NOT_REGISTERED;
         }
         int result = metadata_->removeLocalMemoryBuffers(
@@ -699,8 +697,7 @@ class NcclHostTransport::Impl {
             __sync_fetch_and_add(&task->slice_count, 1);
 
             std::string error;
-            auto target =
-                metadata_->getSegmentDescByID(request.target_id);
+            auto target = metadata_->getSegmentDescByID(request.target_id);
             if (!target) {
                 error = "Target segment metadata is unavailable";
             } else if (request.target_id == LOCAL_SEGMENT_ID) {
@@ -753,9 +750,9 @@ class NcclHostTransport::Impl {
                     }
                 }
             } else if (error.empty()) {
-                if (requestReversePut(
-                        session, target->name, request.source,
-                        request.target_offset, request.length, &error) == 0) {
+                if (requestReversePut(session, target->name, request.source,
+                                      request.target_offset, request.length,
+                                      &error) == 0) {
                     slice->markSuccess();
                 }
             }
@@ -892,11 +889,11 @@ class NcclHostTransport::Impl {
             return ERR_INVALID_ARGUMENT;
         }
 
-        auto it = std::find_if(
-            local_buffers_.begin(), local_buffers_.end(),
-            [addr](const BufferInfo& buffer) {
-                return buffer.addr == reinterpret_cast<uint64_t>(addr);
-            });
+        auto it = std::find_if(local_buffers_.begin(), local_buffers_.end(),
+                               [addr](const BufferInfo& buffer) {
+                                   return buffer.addr ==
+                                          reinterpret_cast<uint64_t>(addr);
+                               });
         if (it == local_buffers_.end()) return ERR_ADDRESS_NOT_REGISTERED;
 
         int result = metadata_->removeLocalMemoryBuffer(
@@ -972,9 +969,9 @@ class NcclHostTransport::Impl {
     }
 
     bool selectBootstrapId(const std::string& key,
-                           const std::string& proposed_id,
-                           bool may_create, ncclUniqueId* unique_id,
-                           std::string* encoded_id, std::string* error) {
+                           const std::string& proposed_id, bool may_create,
+                           ncclUniqueId* unique_id, std::string* encoded_id,
+                           std::string* error) {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         auto it = bootstrap_ids_.find(key);
         if (it != bootstrap_ids_.end()) {
@@ -1015,8 +1012,8 @@ class NcclHostTransport::Impl {
     std::shared_ptr<NcclSession> getOrCreateSession(
         const std::string& peer_name, int local_device, int peer_device,
         std::string* error) {
-        const std::string key = makeSessionKey(
-            local_server_name_, local_device, peer_name, peer_device);
+        const std::string key = makeSessionKey(local_server_name_, local_device,
+                                               peer_name, peer_device);
         std::shared_ptr<NcclSession> existing;
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -1038,9 +1035,8 @@ class NcclHostTransport::Impl {
         const int local_rank = local_server_name_ < peer_name ? 0 : 1;
         ncclUniqueId unique_id{};
         std::string unique_id_string;
-        if (local_rank == 0 &&
-            !selectBootstrapId(key, "", true, &unique_id,
-                               &unique_id_string, error)) {
+        if (local_rank == 0 && !selectBootstrapId(key, "", true, &unique_id,
+                                                  &unique_id_string, error)) {
             return nullptr;
         }
 
@@ -1056,8 +1052,7 @@ class NcclHostTransport::Impl {
         local_desc.protocol = kHandshakeProtocol;
         local_desc.payload = encodeJson(request);
         HandShakeDesc peer_desc;
-        int result =
-            metadata_->sendHandshake(peer_name, local_desc, peer_desc);
+        int result = metadata_->sendHandshake(peer_name, local_desc, peer_desc);
         if (result != 0) {
             if (error) *error = "NCCL bootstrap handshake failed";
             return nullptr;
@@ -1066,7 +1061,8 @@ class NcclHostTransport::Impl {
         Json::Value response;
         std::string parse_error;
         if (!decodeJson(peer_desc.payload, &response, &parse_error)) {
-            if (error) *error = "Invalid NCCL bootstrap response: " + parse_error;
+            if (error)
+                *error = "Invalid NCCL bootstrap response: " + parse_error;
             return nullptr;
         }
         if (!hasStringField(response, "unique_id") ||
@@ -1075,8 +1071,8 @@ class NcclHostTransport::Impl {
             return nullptr;
         }
         const std::string response_id = response["unique_id"].asString();
-        if (!selectBootstrapId(key, response_id, local_rank == 0,
-                               &unique_id, &unique_id_string, error)) {
+        if (!selectBootstrapId(key, response_id, local_rank == 0, &unique_id,
+                               &unique_id_string, error)) {
             return nullptr;
         }
 
@@ -1111,8 +1107,7 @@ class NcclHostTransport::Impl {
         return session;
     }
 
-    int onHandshake(const HandShakeDesc& peer_desc,
-                    HandShakeDesc& local_desc) {
+    int onHandshake(const HandShakeDesc& peer_desc, HandShakeDesc& local_desc) {
         local_desc.protocol = kHandshakeProtocol;
         Json::Value request;
         std::string error;
@@ -1142,9 +1137,8 @@ class NcclHostTransport::Impl {
                 local_desc.reply_msg = "Unknown NCCL handshake operation";
             }
         } catch (const Json::Exception& exception) {
-            local_desc.reply_msg =
-                "Malformed NCCL handshake request: " +
-                std::string(exception.what());
+            local_desc.reply_msg = "Malformed NCCL handshake request: " +
+                                   std::string(exception.what());
         }
         local_desc.payload = encodeJson(response);
         return 0;
@@ -1175,8 +1169,8 @@ class NcclHostTransport::Impl {
         }
         const int local_rank = local_server_name_ < peer_name ? 0 : 1;
 
-        const std::string key = makeSessionKey(
-            local_server_name_, local_device, peer_name, peer_device);
+        const std::string key = makeSessionKey(local_server_name_, local_device,
+                                               peer_name, peer_device);
         ncclUniqueId unique_id{};
         std::string unique_id_string;
         const std::string proposed_id = request["unique_id"].asString();
@@ -1238,16 +1232,15 @@ class NcclHostTransport::Impl {
         request["local_device"] = session->localDevice();
         request["remote_device"] = session->peerDevice();
         request["source"] = static_cast<Json::UInt64>(remote_source);
-        request["destination"] = static_cast<Json::UInt64>(
-            reinterpret_cast<uint64_t>(destination));
+        request["destination"] =
+            static_cast<Json::UInt64>(reinterpret_cast<uint64_t>(destination));
         request["length"] = static_cast<Json::UInt64>(length);
 
         HandShakeDesc local_desc;
         local_desc.protocol = kHandshakeProtocol;
         local_desc.payload = encodeJson(request);
         HandShakeDesc peer_desc;
-        int result =
-            metadata_->sendHandshake(peer_name, local_desc, peer_desc);
+        int result = metadata_->sendHandshake(peer_name, local_desc, peer_desc);
         if (result != 0) {
             if (error) {
                 *error =
@@ -1300,8 +1293,8 @@ class NcclHostTransport::Impl {
             return -1;
         }
 
-        const std::string key = makeSessionKey(
-            local_server_name_, local_device, peer_name, peer_device);
+        const std::string key = makeSessionKey(local_server_name_, local_device,
+                                               peer_name, peer_device);
         std::shared_ptr<NcclSession> session;
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -1313,9 +1306,8 @@ class NcclHostTransport::Impl {
             session = it->second;
         }
         const int owner_rank = session->rank() == 0 ? 1 : 0;
-        return session->putAndWait(
-            reinterpret_cast<const void*>(source), owner_rank, destination,
-            length, error);
+        return session->putAndWait(reinterpret_cast<const void*>(source),
+                                   owner_rank, destination, length, error);
     }
 
     NcclHostTransport* owner_;
@@ -1330,8 +1322,7 @@ class NcclHostTransport::Impl {
     std::unordered_map<std::string, std::string> bootstrap_ids_;
 };
 
-NcclHostTransport::NcclHostTransport()
-    : impl_(std::make_unique<Impl>(this)) {}
+NcclHostTransport::NcclHostTransport() : impl_(std::make_unique<Impl>(this)) {}
 
 NcclHostTransport::~NcclHostTransport() = default;
 
@@ -1374,21 +1365,20 @@ Status NcclHostTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return impl_->poll(batch_id, task_id, status);
 }
 
-int NcclHostTransport::registerLocalMemory(
-    void* addr, size_t length, const std::string& location,
-    bool remote_accessible, bool update_metadata) {
+int NcclHostTransport::registerLocalMemory(void* addr, size_t length,
+                                           const std::string& location,
+                                           bool remote_accessible,
+                                           bool update_metadata) {
     return impl_->registerMemory(addr, length, location, remote_accessible,
                                  update_metadata);
 }
 
-int NcclHostTransport::unregisterLocalMemory(void* addr,
-                                             bool update_metadata) {
+int NcclHostTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     return impl_->unregisterMemory(addr, update_metadata);
 }
 
 int NcclHostTransport::registerLocalMemoryBatch(
-    const std::vector<BufferEntry>& buffer_list,
-    const std::string& location) {
+    const std::vector<BufferEntry>& buffer_list, const std::string& location) {
     return impl_->registerMemoryBatch(buffer_list, location);
 }
 

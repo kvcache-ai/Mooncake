@@ -274,16 +274,14 @@ class NcclTransport {
     // successful deregistration.
     virtual int registerBuffer(void* ptr, size_t bytes,
                                NcclBufferRegistration* registration) = 0;
-    virtual int deregisterBuffer(
-        NcclBufferRegistration* registration) = 0;
+    virtual int deregisterBuffer(NcclBufferRegistration* registration) = 0;
 
     // Safe common path: every rank allocates, collectively checks that all
     // allocations succeeded, and only then enters registration. All ranks
     // must call this method in the same order. On failure, successful local
     // allocations and registrations are cleaned up before returning.
     virtual int allocateAndRegisterBuffer(
-        size_t bytes, void** ptr,
-        NcclBufferRegistration* registration) = 0;
+        size_t bytes, void** ptr, NcclBufferRegistration* registration) = 0;
 
     // Snapshot passed by value to a CUDA kernel and bound to one registered
     // buffer. Device helpers accept local pointers within that buffer and

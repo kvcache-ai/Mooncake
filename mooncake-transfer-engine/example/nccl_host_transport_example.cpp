@@ -144,12 +144,12 @@ int main(int argc, char** argv) {
         }
 
         engines[rank] = std::make_unique<TransferEngine>(false);
-        if (engines[rank]->init(P2PHANDSHAKE, "127.0.0.1:0",
-                                "127.0.0.1", 0) != 0 ||
+        if (engines[rank]->init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0) !=
+                0 ||
             !engines[rank]->installTransport("nccl", nullptr) ||
             engines[rank]->registerLocalMemory(
-                buffers[rank], kBufferBytes,
-                "cuda:" + std::to_string(rank)) != 0) {
+                buffers[rank], kBufferBytes, "cuda:" + std::to_string(rank)) !=
+                0) {
             LOG(ERROR) << "Failed to initialize NCCL TE rank " << rank;
             return 1;
         }

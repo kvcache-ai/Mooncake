@@ -57,8 +57,7 @@ struct NcclDeviceContextAccess {
         return static_cast<const char*>(ctx.local_base_);
     }
 
-    __device__ __forceinline__ static int rank(
-        const NcclDeviceContext& ctx) {
+    __device__ __forceinline__ static int rank(const NcclDeviceContext& ctx) {
         return ctx.rank_;
     }
 
@@ -78,15 +77,14 @@ struct NcclDeviceContextAccess {
     }
 };
 
-__device__ __forceinline__ size_t mc_nccl_pointer_offset(
-    const NcclDeviceContext& ctx, const void* ptr) {
-    return static_cast<size_t>(
-        static_cast<const char*>(ptr) -
-        NcclDeviceContextAccess::localBase(ctx));
+__device__ __forceinline__ size_t
+mc_nccl_pointer_offset(const NcclDeviceContext& ctx, const void* ptr) {
+    return static_cast<size_t>(static_cast<const char*>(ptr) -
+                               NcclDeviceContextAccess::localBase(ctx));
 }
 
-__device__ __forceinline__ int mc_nccl_gin_context(
-    const NcclDeviceContext& ctx, unsigned int channel) {
+__device__ __forceinline__ int mc_nccl_gin_context(const NcclDeviceContext& ctx,
+                                                   unsigned int channel) {
     const int count = NcclDeviceContextAccess::ginContextCount(ctx);
     return static_cast<int>(channel % static_cast<unsigned int>(count));
 }
@@ -113,8 +111,8 @@ __device__ __forceinline__ bool mc_nccl_gin_available(
     return detail::NcclDeviceContextAccess::ginEnabled(ctx);
 }
 
-__device__ __forceinline__ NcclDeviceRoute mc_nccl_route(
-    const NcclDeviceContext& ctx, int peer) {
+__device__ __forceinline__ NcclDeviceRoute
+mc_nccl_route(const NcclDeviceContext& ctx, int peer) {
     if (peer == detail::NcclDeviceContextAccess::rank(ctx))
         return NcclDeviceRoute::kLocal;
     if (mc_nccl_lsa_available(ctx, peer)) return NcclDeviceRoute::kLsa;
@@ -124,8 +122,9 @@ __device__ __forceinline__ NcclDeviceRoute mc_nccl_route(
 
 // Resolve the peer address corresponding to local_ptr. local_ptr must lie in
 // the registration used to create ctx, and peer must be local or LSA reachable.
-__device__ __forceinline__ void* mc_nccl_peer_ptr(
-    const NcclDeviceContext& ctx, int peer, const void* local_ptr) {
+__device__ __forceinline__ void* mc_nccl_peer_ptr(const NcclDeviceContext& ctx,
+                                                  int peer,
+                                                  const void* local_ptr) {
     if (peer == detail::NcclDeviceContextAccess::rank(ctx))
         return const_cast<void*>(local_ptr);
 
@@ -171,9 +170,8 @@ __device__ __forceinline__ void mc_nccl_lsa_barrier(
 // objects inside the registration.
 
 __device__ __forceinline__ void mc_nccl_put(
-    const NcclDeviceContext& ctx, int channel, int dst_rank,
-    int qps_per_rank, const void* send_ptr, void* recv_ptr, uint32_t nbytes,
-    int lane_id) {
+    const NcclDeviceContext& ctx, int channel, int dst_rank, int qps_per_rank,
+    const void* send_ptr, void* recv_ptr, uint32_t nbytes, int lane_id) {
     (void)qps_per_rank;
     if (lane_id != 0) return;
 
@@ -192,8 +190,8 @@ __device__ __forceinline__ void mc_nccl_put(
 // after this payload and preceding puts to the same peer/context have settled.
 // recv_ptr and completion_ptr identify offsets in the peer's matching buffer.
 __device__ __forceinline__ void mc_nccl_put_with_signal(
-    const NcclDeviceContext& ctx, int channel, int dst_rank,
-    int qps_per_rank, const void* send_ptr, void* recv_ptr, uint32_t nbytes,
+    const NcclDeviceContext& ctx, int channel, int dst_rank, int qps_per_rank,
+    const void* send_ptr, void* recv_ptr, uint32_t nbytes,
     uint64_t* completion_ptr, uint64_t completion_delta, int lane_id) {
     (void)qps_per_rank;
     if (lane_id != 0) return;
@@ -216,8 +214,8 @@ __device__ __forceinline__ void mc_nccl_put_with_signal(
 // explicitly increment semantics, not assignment. Local/LSA routes use a
 // system-scope atomic; GIN uses a VA signal on the selected context.
 __device__ __forceinline__ void mc_nccl_signal_add(
-    const NcclDeviceContext& ctx, int dst_rank, int channel,
-    int qps_per_rank, uint64_t* signal_ptr, uint64_t value, int lane_id) {
+    const NcclDeviceContext& ctx, int dst_rank, int channel, int qps_per_rank,
+    uint64_t* signal_ptr, uint64_t value, int lane_id) {
     (void)qps_per_rank;
     if (lane_id != 0) return;
 
@@ -232,9 +230,9 @@ __device__ __forceinline__ void mc_nccl_signal_add(
                              dst_rank)) {
         const size_t signal_offset =
             detail::mc_nccl_pointer_offset(ctx, signal_ptr);
-        auto* target = static_cast<uint64_t*>(ncclGetPeerPointer(
-            detail::NcclDeviceContextAccess::window(ctx), signal_offset,
-            dst_rank));
+        auto* target = static_cast<uint64_t*>(
+            ncclGetPeerPointer(detail::NcclDeviceContextAccess::window(ctx),
+                               signal_offset, dst_rank));
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(*target);
         signal.fetch_add(value, cuda::memory_order_release);
         return;
@@ -250,8 +248,8 @@ __device__ __forceinline__ void mc_nccl_signal_add(
                ncclCoopThread{});
 }
 
-__device__ __forceinline__ void mc_nccl_flush(
-    const NcclDeviceContext& ctx, int channel, int lane_id) {
+__device__ __forceinline__ void mc_nccl_flush(const NcclDeviceContext& ctx,
+                                              int channel, int lane_id) {
     if (lane_id != 0) return;
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
@@ -260,8 +258,7 @@ __device__ __forceinline__ void mc_nccl_flush(
 }
 
 __device__ __forceinline__ uint64_t mc_nccl_read_signal(
-    const NcclDeviceContext& ctx, int channel,
-    const uint64_t* signal_ptr) {
+    const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr) {
     if (!mc_nccl_gin_available(ctx)) {
         auto& value = *const_cast<uint64_t*>(signal_ptr);
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(value);
@@ -297,8 +294,8 @@ __device__ __forceinline__ void mc_nccl_wait_signal(
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
     gin.waitSignal(ncclCoopThread{},
-                   detail::NcclDeviceContextAccess::window(ctx),
-                   signal_offset, least);
+                   detail::NcclDeviceContextAccess::window(ctx), signal_offset,
+                   least);
 }
 
 }  // namespace device

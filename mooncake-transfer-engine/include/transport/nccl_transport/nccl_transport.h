@@ -35,9 +35,8 @@ class NcclHostTransport final : public Transport {
     NcclHostTransport();
     ~NcclHostTransport() override;
 
-    Status submitTransfer(
-        BatchID batch_id,
-        const std::vector<TransferRequest>& entries) override;
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest>& entries) override;
 
     Status submitTransferTask(
         const std::vector<TransferTask*>& task_list) override;
@@ -52,14 +51,11 @@ class NcclHostTransport final : public Transport {
 
    private:
     int registerLocalMemory(void* addr, size_t length,
-                            const std::string& location,
-                            bool remote_accessible,
+                            const std::string& location, bool remote_accessible,
                             bool update_metadata = true) override;
-    int unregisterLocalMemory(void* addr,
-                              bool update_metadata = true) override;
-    int registerLocalMemoryBatch(
-        const std::vector<BufferEntry>& buffer_list,
-        const std::string& location) override;
+    int unregisterLocalMemory(void* addr, bool update_metadata = true) override;
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
+                                 const std::string& location) override;
     int unregisterLocalMemoryBatch(
         const std::vector<void*>& addr_list) override;
 
