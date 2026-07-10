@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -321,7 +322,9 @@ PYBIND11_MODULE(tent, m) {
         .def(py::init([](Request::OpCode opcode, uint64_t source,
                          uint64_t target_id, uint64_t target_offset,
                          size_t length, int priority,
-                         TransportType transport_hint) {
+                         TransportType transport_hint,
+                         std::optional<std::string> policy_name,
+                         uint64_t deadline_ns) {
                  Request r;
                  r.opcode = opcode;
                  r.source = U64ToPtr(source);
@@ -330,12 +333,15 @@ PYBIND11_MODULE(tent, m) {
                  r.length = length;
                  r.priority = priority;
                  r.transport_hint = transport_hint;
+                 r.policy_name = std::move(policy_name);
+                 r.deadline_ns = deadline_ns;
                  return r;
              }),
              py::arg("opcode"), py::arg("source"), py::arg("target_id"),
              py::arg("target_offset"), py::arg("length"),
              py::arg("priority") = PRIO_HIGH,
-             py::arg("transport_hint") = TransportType::UNSPEC)
+             py::arg("transport_hint") = TransportType::UNSPEC,
+             py::arg("policy_name") = std::nullopt, py::arg("deadline_ns") = 0)
         .def_property(
             "opcode", [](const Request& r) { return r.opcode; },
             [](Request& r, Request::OpCode op) { r.opcode = op; })
@@ -346,7 +352,9 @@ PYBIND11_MODULE(tent, m) {
         .def_readwrite("target_offset", &Request::target_offset)
         .def_readwrite("length", &Request::length)
         .def_readwrite("priority", &Request::priority)
-        .def_readwrite("transport_hint", &Request::transport_hint);
+        .def_readwrite("transport_hint", &Request::transport_hint)
+        .def_readwrite("policy_name", &Request::policy_name)
+        .def_readwrite("deadline_ns", &Request::deadline_ns);
 
     py::class_<TransferStatus>(m, "TransferStatus")
         .def(py::init<>())
