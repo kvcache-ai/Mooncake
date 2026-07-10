@@ -93,6 +93,9 @@ static TransportType getTransportType(const std::string& xport_type) {
 }
 
 static IntentType getIntentType(const std::string& intent_type) {
+    std::string normalized_intent = intent_type;
+    for (auto& c : normalized_intent) c = to_lower(c);
+
     static const std::unordered_map<std::string, IntentType> kIntentTypes = {
         {"unspec", IntentType::INTENT_UNSPEC},
         {"intent_unspec", IntentType::INTENT_UNSPEC},
@@ -103,7 +106,7 @@ static IntentType getIntentType(const std::string& intent_type) {
         {"weight_loading", IntentType::WEIGHT_LOADING},
         {"staging_internal", IntentType::STAGING_INTERNAL},
     };
-    auto it = kIntentTypes.find(intent_type);
+    auto it = kIntentTypes.find(normalized_intent);
     LOG_ASSERT(it != kIntentTypes.end())
         << "Invalid --tent_intent_type=" << intent_type;
     return it->second;
