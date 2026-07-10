@@ -128,7 +128,10 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             LOG(ERROR)
                 << "[Device NCCL] Device API requires matching compile-time "
                    "and runtime NCCL versions: compiled="
-                << NCCL_VERSION_CODE << " runtime=" << runtime_version;
+                << NCCL_VERSION_CODE << " runtime=" << runtime_version
+                << ". Rebuild Mooncake against the runtime NCCL installation, "
+                   "and rebuild AOT NCCL device kernels or invalidate and "
+                   "re-JIT cached NCCL Device API kernels";
             return -1;
         }
 
@@ -406,11 +409,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         context.native_comm_ = device_comm_;
         context.native_window_ = it->second.window;
         context.local_base_ = it->second.ptr;
-        context.buffer_bytes_ = it->second.bytes;
         context.rank_ = properties_.rank;
-        context.num_ranks_ = properties_.num_ranks;
         context.gin_context_count_ = properties_.gin_context_count;
-        context.lsa_barrier_count_ = properties_.lsa_barrier_count;
         context.gin_enabled_ = properties_.gin_enabled;
         context.lsa_multimem_enabled_ =
             properties_.lsa_multimem_enabled;

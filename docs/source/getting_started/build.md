@@ -56,6 +56,7 @@ environment setup must be prepared separately.
 | Hardware / backend | Build option | External SDK / setup | Environment and notes |
 | --- | --- | --- | --- |
 | NVIDIA CUDA / GPUDirect | `-DUSE_CUDA=ON` | Install CUDA 12.1+ and enable `nvidia-fs` for cuFile builds. | Add CUDA libraries to `LIBRARY_PATH` and `LD_LIBRARY_PATH`, for example `/usr/local/cuda/lib64`. |
+| NVIDIA NCCL DeviceTransport | `-DUSE_NCCL_DEVICE=ON` | Install NCCL 2.30.4+ with `nccl_device.h`. Requires CUDA. | Set `NCCL_ROOT` when NCCL is outside the standard search paths. The compile-time NCCL headers must exactly match the runtime `libnccl`. |
 | NVIDIA Multi-Node NVLink | `-DUSE_MNNVL=ON` | Requires CUDA. | Also set `-DUSE_CUDA=ON`. Not used with MUSA, HIP, or MACA builds. |
 | Moore Threads MUSA | `-DUSE_MUSA=ON` | Install MUSA SDK and `mthreads-peermem` for GPUDirect RDMA. | Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`. |
 | Cambricon MLU | `-DUSE_MLU=ON` | Install Cambricon Neuware SDK. | Set `NEUWARE_HOME`, or pass `-DNEUWARE_ROOT=/path/to/neuware`. Use `-DMLU_INCLUDE_DIR` and `-DMLU_LIB_DIR` for custom layouts. |
@@ -65,6 +66,17 @@ environment setup must be prepared separately.
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
 | Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
+
+```{admonition} NCCL DeviceTransport version contract
+:class: important
+Mooncake currently requires the NCCL headers used to compile its host and
+device code to exactly match the loaded runtime `libnccl.so`.
+`NcclTransport::initialize()` rejects a mismatch. After upgrading NCCL,
+rebuild Mooncake and every AOT CUDA kernel that includes
+`transport/device/nccl_device.cuh`. Invalidate and regenerate any cached NCCL
+Device API JIT kernels before running. This is required for GIN device kernels,
+which are not cross-version compatible.
+```
 
 ```{admonition} GPU-Direct RDMA
 :class: note
@@ -129,6 +141,7 @@ The following options can be passed to `cmake ..`.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-DUSE_CUDA=ON/OFF` | `OFF` | Enable GPU memory support, including GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport. Required when transferring GPU memory, even when using TCP. |
+| `-DUSE_NCCL_DEVICE=ON/OFF` | `OFF` | Enable the experimental NCCL DeviceTransport backend. Requires CUDA and NCCL 2.30.4+; compile-time headers and runtime `libnccl` must match exactly. |
 | `-DUSE_MNNVL=ON/OFF` | `OFF` | Enable Multi-Node NVLink transport. Requires `-DUSE_CUDA=ON`; not used with MUSA, HIP, or MACA builds. |
 | `-DUSE_MUSA=ON/OFF` | `OFF` | Enable Moore Threads GPU support via MUSA. |
 | `-DUSE_MACA=ON/OFF` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |
