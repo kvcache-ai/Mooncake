@@ -145,8 +145,8 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
-    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream));
-    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream));
+    // Streams are created lazily in submitTransferTasks where the correct
+    // GPU device can be inferred from request source pointers.
     return Status::OK();
 }
 
@@ -167,13 +167,49 @@ Status MnnvlTransport::submitTransferTasks(
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
+
     if (request_list.size() + mnnvl_batch->task_list.size() >
         mnnvl_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    // Get local segment for buffer lookup
+    auto &segment_manager = metadata_->segmentManager();
+    // Owning reference: keeps the snapshot alive while we read through it.
+    SegmentDescRef local_segment = segment_manager.getLocal();
+    if (!local_segment)
+        return Status::InternalError("Local segment not found" LOC_MARK);
+
+    // Determine device for this batch and validate all requests
+    int batch_device_id = -1;
     std::vector<MnnvlTask *> new_tasks;
+
     for (auto &request : request_list) {
+        // Find the buffer this source pointer belongs to
+        BufferDesc *buf = local_segment->findBuffer(
+            reinterpret_cast<uint64_t>(request.source), request.length);
+        if (!buf) {
+            return Status::InvalidArgument(
+                "Unregistered buffer: source pointer not in any registered "
+                "buffer" LOC_MARK);
+        }
+
+        // Parse device ID from buffer location (e.g., "cuda:0" -> 0, "cpu" ->
+        // -1)
+        int device_id = LocationParser(buf->location).index();
+
+        // Capture the first GPU device encountered for stream creation.
+        // Mixed-GPU batches use the first GPU's stream and rely on CUDA P2P
+        // for cross-device access (same behavior as pre-#2569 code).
+        // A future refactor could group requests by device and dispatch to
+        // per-device streams, but that requires SubBatch structure changes.
+        if (batch_device_id < 0 && device_id >= 0) {
+            batch_device_id = device_id;
+        }
+
+        // Create and populate task
         mnnvl_batch->task_list.push_back(MnnvlTask{});
         auto &task = mnnvl_batch->task_list[mnnvl_batch->task_list.size() - 1];
+
         uint64_t target_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
@@ -184,11 +220,27 @@ Status MnnvlTransport::submitTransferTasks(
                 return status;
             }
         }
+
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
         new_tasks.push_back(&task);
     }
+
+    // Get or create streams for this batch's device
+    if (!mnnvl_batch->async_stream.get()) {
+        int stream_device = batch_device_id;
+        if (stream_device < 0) {
+            // CPU-only batch: use current CUDA device
+            cudaGetDevice(&stream_device);
+        }
+        CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream,
+                                                  stream_device));
+        CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream,
+                                                  stream_device));
+        mnnvl_batch->stream_device_id = stream_device;
+    }
+
     startTransfer(new_tasks, mnnvl_batch);
     return Status::OK();
 }
@@ -261,11 +313,39 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
         return;
     }
 
+    // Save and set device to match the stream's device to ensure event
+    // creation and recording happen on the correct device (fix for #2722).
+    int saved_device = -1;
+    if (batch->stream_device_id >= 0) {
+        auto err = cudaGetDevice(&saved_device);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "MnnvlTransport: cudaGetDevice failed: "
+                       << cudaGetErrorString(err);
+            for (auto *task : tasks)
+                task->status_word = TransferStatusEnum::FAILED;
+            return;
+        }
+        if (saved_device != batch->stream_device_id) {
+            err = cudaSetDevice(batch->stream_device_id);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "MnnvlTransport: cudaSetDevice failed: "
+                           << cudaGetErrorString(err);
+                for (auto *task : tasks)
+                    task->status_word = TransferStatusEnum::FAILED;
+                return;
+            }
+        }
+    }
+
     cudaEvent_t event;
     auto event_err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     if (event_err != cudaSuccess) {
         LOG(ERROR) << "MnnvlTransport: cudaEventCreateWithFlags failed: "
                    << cudaGetErrorString(event_err);
+        // Restore device before returning
+        if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+            cudaSetDevice(saved_device);
+        }
         for (auto *task : tasks) task->status_word = TransferStatusEnum::FAILED;
         return;
     }
@@ -274,9 +354,19 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
         LOG(ERROR) << "MnnvlTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(record_err);
         cudaEventDestroy(event);
+        // Restore device before returning
+        if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+            cudaSetDevice(saved_device);
+        }
         for (auto *task : tasks) task->status_word = TransferStatusEnum::FAILED;
         return;
     }
+
+    // Restore original device
+    if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+        cudaSetDevice(saved_device);
+    }
+
     batch->completion_events.push_back(event);
     for (auto *task : tasks) task->completion_event = event;
 }
@@ -288,7 +378,6 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto &task = mnnvl_batch->task_list[task_id];
-    status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
         auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
@@ -298,6 +387,9 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
             task.status_word = TransferStatusEnum::FAILED;
         }
     }
+    // Read status AFTER the poll so a just-observed completion/failure is
+    // reported on this call rather than one poll cycle late.
+    status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
 
@@ -501,9 +593,11 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     RWSpinlock::WriteGuard guard(relocate_lock_);
 
     BufferDesc *buffer;
+    // Owning reference: `buffer` is used after the lambda returns.
+    SegmentDescRef pin;
     auto &segment_manager = metadata_->segmentManager();
-    CHECK_STATUS(
-        segment_manager.withCachedSegment(target_id, [&](SegmentDesc *segment) {
+    CHECK_STATUS(segment_manager.withCachedSegment(
+        target_id, pin, [&](SegmentDesc *segment) {
             buffer = segment->findBuffer(dest_addr, length);
             if (!buffer || buffer->mnnvl_handle.empty())
                 return Status::NeedsRefreshCache(

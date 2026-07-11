@@ -36,7 +36,11 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     ctx.p2p.peer_ptrs = ipc_peer_ptrs;
     ctx.p2p.local_base = gdr_buffer;
 
+#ifdef MOONCAKE_EP_USE_MACA
+    ctx.ibgda.qp_devctxs = qp_devctxs;
+#else
     ctx.ibgda.qp_devctxs = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+#endif
     ctx.ibgda.raddrs = reinterpret_cast<const uint64_t*>(raddrs);
     ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(rkeys);
     ctx.ibgda.local_atomic_base = rdma_send_signal_buffer;

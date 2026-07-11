@@ -14,6 +14,7 @@
 
 #ifndef USE_TENT
 #include "transfer_engine.h"
+#include "show_links.h"
 #include "transfer_engine_impl.h"
 #include <utility>
 
@@ -179,7 +180,8 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
 device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
     return impl_->getOrCreateP2pTransport(num_ranks);
 }
@@ -220,6 +222,12 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
+std::string TransferEngine::showLinks(bool json) const {
+    if (!impl_) return "{}";
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
+}
+
 }  // namespace mooncake
 #else
 #include "transfer_engine.h"
@@ -228,6 +236,7 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
 #include "tent/common/config.h"
 
 #include <utility>
+#include "show_links.h"
 
 namespace mooncake {
 
@@ -595,7 +604,8 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
         return impl_->getTransport(proto);
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
 device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
     if (use_tent_) return nullptr;
     return impl_->getOrCreateP2pTransport(num_ranks);
@@ -666,6 +676,14 @@ void* TransferEngine::getBaseAddr() {
         return nullptr;
     } else
         return impl_->getBaseAddr();
+}
+
+std::string TransferEngine::showLinks(bool json) const {
+    if (use_tent_ || !impl_) {
+        return json ? "{}" : "(TENT mode or not initialized)";
+    }
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
 }
 
 }  // namespace mooncake

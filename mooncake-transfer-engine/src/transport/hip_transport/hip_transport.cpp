@@ -27,6 +27,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "hip_device_guard.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -251,16 +252,8 @@ static int setDeviceContext(void* source_ptr, int& device_id) {
 }
 
 static void setupP2PAccess(int num_devices) {
-    // Save the active device. The loop below calls hipSetDevice once per
-    // iteration; without restoring it before returning, the calling thread is
-    // left with its active device pinned to num_devices-1, causing downstream
-    // HIP calls on the same thread (e.g. PyTorch allocations in TP workers) to
-    // target the wrong GPU.
-    int original_device = -1;
-    if (!checkHip(hipGetDevice(&original_device),
-                  "HipTransport: failed to get current device")) {
-        return;
-    }
+    // The loop switches devices; the guard restores the caller's on return.
+    HipDeviceGuard device_guard;
 
     auto clearStickyPeerAccessError = [](int src_device, int dst_device) {
         // hipDeviceEnablePeerAccess may leave hipErrorPeerAccessAlreadyEnabled
@@ -310,12 +303,6 @@ static void setupP2PAccess(int num_devices) {
                     << i << " and device " << j;
             }
         }
-    }
-
-    // Restore the active device so this function is transparent to the caller.
-    if (original_device >= 0) {
-        (void)checkHip(hipSetDevice(original_device),
-                       "HipTransport: failed to restore device");
     }
 }
 
@@ -440,11 +427,26 @@ int HipTransport::install(std::string& local_server_name,
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
+    // Compose with any local segment another transport (e.g. RDMA) already
+    // installed instead of overwriting it, so a single-node segment can
+    // advertise both protocols (e.g. "rdma,hip"). Work on a copy (the map may
+    // hand back a descriptor other threads are reading) and publish the new
+    // one atomically via addLocalSegment.
+    auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
+    if (old_desc) *desc = *old_desc;
 
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (desc->protocol.empty()) {
+        desc->protocol = "hip";
+    } else if (desc->protocol.find("hip") == std::string::npos) {
+        desc->protocol += ",hip";
+    }
+#else
     desc->protocol = "hip";
+#endif
 
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -456,6 +458,8 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
                                         PendingTransfer& pending) {
     hipError_t err;
     int device_id;
+
+    HipDeviceGuard device_guard;
 
     if (setDeviceContext(request.source, device_id) != 0) {
         return Status::InvalidArgument("Failed to set device context");
@@ -660,17 +664,23 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 
     // IPC-based memory registration
     if (!use_fabric_mem_) {
-        // Validate memory type
+        // Only device memory can be exported via HIP IPC. Callers that register
+        // a batch across all transports (e.g. SGLang's PD metadata/aux buffers,
+        // which live in host memory) also hand those host buffers to this
+        // transport. Skip non-device memory gracefully and let RDMA/TCP
+        // register it; returning an error would roll back the entire
+        // multi-protocol batch and tear down every session.
         hipPointerAttribute_t attr;
-        if (!checkHip(hipPointerGetAttributes(&attr, addr),
-                      "HipTransport: hipPointerGetAttributes failed")) {
-            return -1;
-        }
-
-        if (attr.type != hipMemoryTypeDevice) {
-            LOG(ERROR) << "Unsupported memory type, " << addr << " "
-                       << attr.type;
-            return -1;
+        hipError_t attr_err = hipPointerGetAttributes(&attr, addr);
+        if (attr_err != hipSuccess || attr.type != hipMemoryTypeDevice) {
+            // Clear any sticky error the failed query latched so it does not
+            // poison subsequent HIP calls made by the caller.
+            (void)hipGetLastError();
+            if (globalConfig().trace) {
+                LOG(INFO) << "HipTransport: skipping non-device memory " << addr
+                          << ", leaving it to other transports";
+            }
+            return 0;
         }
 
         // Get IPC handle
@@ -687,6 +697,9 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.length = length;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 

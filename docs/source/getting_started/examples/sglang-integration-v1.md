@@ -4,7 +4,7 @@
 
 SGLang uses Mooncake's Transfer Engine to enable disaggregated prefill-decode (PD) serving across nodes via RDMA, with support for EP and EPD backends. This integration is based on [PR 4654](https://github.com/sgl-project/sglang/pull/4654) and [PR 4880](https://github.com/sgl-project/sglang/pull/4880).
 
-In benchmarks, PD disaggregation with Mooncake achieves **~30% lower ITL** while maintaining comparable throughput ([details](../../performance/sglang-benchmark-results-v1)).
+In benchmarks, PD disaggregation with Mooncake achieves **~30% lower ITL** while maintaining comparable throughput ([details](../../performance/sglang/sglang-benchmark-results-v1)).
 
 ```
   +-----------+   Transfer Engine (RDMA)    +-----------+

@@ -16,6 +16,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
+| **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
 
 ## Commonly Used Protocols (Python API)
 
@@ -266,6 +267,39 @@ export MC_FORCE_MNNVL=true
 - [Heterogeneous Ascend](../design/transfer-engine/heterogeneous_ascend.md)
 - [Ascend Transport](../design/transfer-engine/ascend_transport.md)
 
+### TPU Transport (tpu) — Experimental
+
+**Description:** Google TPU support in the TENT runtime. Because TPU HBM is not
+directly addressable by the NIC, transfers touching TPU memory are staged
+through host DRAM: the HBM ↔ host-DRAM hop is performed by a PJRT device-copy
+adapter, and the host ↔ host hop is carried by an existing transport (RDMA/TCP).
+The two stages are chained automatically by the TENT staging pipeline
+(`ProxyManager`), so no separate networked TPU transport is required.
+
+**Status:** Experimental. The C++/TENT data path is gated behind `-DUSE_TPU=ON`
+(OFF by default). A serving-framework (JAX / PyTorch-XLA) integration layer is
+planned as a follow-up.
+
+**Use When:**
+- Disaggregated prefill/decode serving on TPU hosts
+- KV-cache transfer between TPU nodes over RDMA/TCP
+
+**Requirements:**
+- Built with `-DUSE_TPU=ON -DUSE_TENT=ON`
+- A PJRT device-copy adapter shared library exposing the `mc_tpu_pjrt_*` C ABI
+  (see `tpu_pjrt_abi.h`). The adapter is resolved at runtime via `dlopen`; its
+  path defaults to `libmooncake_tpu_pjrt.so` and can be overridden with the
+  `MC_TPU_PJRT_LIB` environment variable. No PJRT/TPU SDK is required at build
+  time.
+- An RDMA (or TCP) transport enabled for the host ↔ host hop.
+
+**Design notes:**
+- TPU memory is reported as a distinct memory type (`tpu:N` locations); the
+  staging policy routes the local HBM ↔ host copy to the TPU device-copy
+  transport and the cross-node hop to RDMA/TCP.
+- DMA-mapped (pinned) staging buffers for true async device DMA are a planned
+  performance follow-up.
+
 ## Configuration Examples
 
 ### Configuration File (JSON)
@@ -363,7 +397,7 @@ If a protocol fails to initialize:
 
 ## See Also
 
-- [Quick Start Guide](quick-start.md) - Getting started with Mooncake
+- [Quick Start](quick-start.md) - Start with Mooncake integrations for serving frameworks
 - [Transfer Engine Design](../design/transfer-engine/index.md) - Detailed architecture
 - [Transfer Engine Benchmark](../design/transfer-engine/transfer-engine-bench-tuning.md) - Performance tuning
 - [Python API Reference](../python-api-reference/transfer-engine.md) - API documentation

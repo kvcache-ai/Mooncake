@@ -85,7 +85,7 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 :::{toctree}
 :caption: Getting Started
-:maxdepth: 2
+:maxdepth: 1
 
 getting_started/build
 getting_started/quick-start
@@ -96,7 +96,7 @@ getting_started/quick-start
 
 :::{toctree}
 :caption: Deployment
-:maxdepth: 2
+:maxdepth: 1
 
 deployment/mooncake-store-deployment-guide
 getting_started/examples/sglang-integration/index
@@ -111,17 +111,16 @@ Mooncake x LMDeploy Integration<getting_started/examples/lmdeploy-integration-v0
 :::{toctree}
 :caption: Performance
 :maxdepth: 1
-
-performance/vllm/index
-performance/sglang/index
 performance/mooncake/index
+performance/sglang/index
+performance/vllm/index
 :::
 
 % Explanation of Mooncake internals
 
 :::{toctree}
 :caption: Design Documents
-:maxdepth: 2
+:maxdepth: 1
 
 design/architecture
 design/mooncake-store
@@ -135,17 +134,19 @@ design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
+design/ssd-free-ratio-first-allocation
 :::
 
 % API Documentation
 
 :::{toctree}
 :caption: API Reference
-:maxdepth: 2
+:maxdepth: 1
 
 api-reference/python/index
 api-reference/cpp/index
 api-reference/http/index
+api-reference/rust/index
 :::
 
 % Q&A for Mooncake
@@ -171,12 +172,9 @@ community/governance
 
 % Archived content
 
-:::{toctree}
-:caption: Archived
-:maxdepth: 1
+### Archived
 
-getting_started/examples/vllm-integration/vllm-mooncakestoreconnector
-getting_started/examples/vllm-integration/vllm-integration-v0.2
-getting_started/examples/vllm-integration/vllm-integration-v0.3
-getting_started/examples/vllm-integration/vllm-integration-v1.0
-:::
+- [Guide: vLLM MooncakeStoreConnector](getting_started/examples/vllm-integration/vllm-mooncakestoreconnector)
+- [vLLM V0 Disaggregated Serving Demo](getting_started/examples/vllm-integration/vllm-integration-v0.2)
+- [vLLM V0 Disaggregated Serving with MooncakeStore](getting_started/examples/vllm-integration/vllm-integration-v0.3)
+- [vLLM v1 backend Disaggregated Serving with MooncakeConnector](getting_started/examples/vllm-integration/vllm-integration-v1.0)

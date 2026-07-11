@@ -13,8 +13,19 @@
 namespace mooncake {
 
 WrappedMasterService::WrappedMasterService(
-    const WrappedMasterServiceConfig& config)
-    : master_service_(MasterServiceConfig(config)) {}
+    const WrappedMasterServiceConfig& config,
+    HttpMetadataServer* http_metadata_server,
+    const std::string& http_metadata_remote_url)
+    : master_service_(MasterServiceConfig(config)) {
+    // Configure metadata cleanup on client timeout. Prefer the co-located
+    // in-process server; otherwise fall back to a separately-deployed HTTP
+    // metadata server derived from the cluster configuration.
+    if (http_metadata_server) {
+        master_service_.setHttpMetadataServer(http_metadata_server);
+    } else if (!http_metadata_remote_url.empty()) {
+        master_service_.setHttpMetadataRemoteUrl(http_metadata_remote_url);
+    }
+}
 
 WrappedMasterService::~WrappedMasterService() = default;
 
@@ -217,6 +228,21 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     return results;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaListForAdmin(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    return master_service_.BatchGetReplicaListForAdmin(keys, tenant_id);
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
+                                             const std::string& tenant_id) {
+    return execute_rpc(
+        "GetReplicaListForAdmin",
+        [&] { return master_service_.GetReplicaListForAdmin(key, tenant_id); },
+        [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -1054,6 +1080,52 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
+WrappedMasterService::ListTenantQuotaSnapshots() {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.ListTenantQuotaSnapshots();
+}
+
+tl::expected<TenantQuotaSnapshot, ErrorCode>
+WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    auto snapshot = master_service_.GetTenantQuotaSnapshot(tenant_id);
+    if (!snapshot.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return snapshot.value();
+}
+
+tl::expected<TenantQuotaSnapshot, ErrorCode>
+WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
+                                              uint64_t requested_quota_bytes) {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.UpsertTenantQuotaPolicy(tenant_id,
+                                                   requested_quota_bytes);
+}
+
+tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.DeleteTenantQuotaPolicy(tenant_id);
+}
+
+tl::expected<uint64_t, ErrorCode>
+WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.GetTenantQuotaAllocatableCapacityBytes();
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     // Compatibility endpoint: /get_all_keys historically listed only the
@@ -1184,6 +1256,14 @@ tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(
 tl::expected<SegmentStatus, ErrorCode>
 WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
     return master_service_.QuerySegmentStatusById(segment_id);
+}
+
+bool WrappedMasterService::KvEventsEnabled() const {
+    return master_service_.KvEventsEnabled();
+}
+
+KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
+    return master_service_.GetKvEventStats();
 }
 
 void RegisterRpcService(

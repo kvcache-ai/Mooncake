@@ -12,13 +12,25 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
+#include "kv_event/kv_event_publisher.h"
 #include "segment.h"
 
 namespace mooncake {
 
+// Forward declaration
+class HttpMetadataServer;
 class WrappedMasterService {
    public:
-    WrappedMasterService(const WrappedMasterServiceConfig& config);
+    // Constructor with optional metadata-cleanup-on-timeout configuration.
+    // - http_metadata_server: in-process pointer used when the HTTP metadata
+    //   server is co-located in the master process (nullptr = not co-located).
+    // - http_metadata_remote_url: http(s) connection string used when the
+    //   metadata server is deployed separately (empty = none). Only consulted
+    //   when http_metadata_server is nullptr. If both are unset, cleanup is
+    //   disabled.
+    WrappedMasterService(const WrappedMasterServiceConfig& config,
+                         HttpMetadataServer* http_metadata_server = nullptr,
+                         const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
 
@@ -53,6 +65,15 @@ class WrappedMasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
+
+    // Read-only admin variants: no lease grants, no promotion, no metric
+    // updates.
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
+                                const std::string& tenant_id = "default");
+
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
+        const std::string& key, const std::string& tenant_id = "default");
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
@@ -166,6 +187,16 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
+    ListTenantQuotaSnapshots();
+    tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
+        const std::string& tenant_id);
+    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
+        const std::string& tenant_id, uint64_t requested_quota_bytes);
+    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+    DeleteTenantQuotaPolicy(const std::string& tenant_id);
+    tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
+
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
@@ -268,6 +299,9 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
+
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
     MasterService master_service_;

@@ -131,6 +131,7 @@ foreach(
   platform_rocm
   platform_ascend
   platform_sunrise
+  platform_tpu
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -141,6 +142,7 @@ foreach(
   tent_xport_tcp
   tent_xport_ascend_direct
   tent_xport_sunrise_link
+  tent_xport_tpu
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})
