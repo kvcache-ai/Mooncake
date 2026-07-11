@@ -65,16 +65,16 @@ TEST(ReceiverCreditControl, CapabilityWireDrivesMixedVersionNegotiation) {
 
 TEST(ReceiverCreditControl, CapabilityWireRejectsMalformedOffersAtomically) {
     std::string wire = "sentinel";
-    EXPECT_TRUE(CreditCapabilityCodecV1::encode({1, 1}, wire)
-                    .IsInvalidArgument());
+    EXPECT_TRUE(
+        CreditCapabilityCodecV1::encode({1, 1}, wire).IsInvalidArgument());
     EXPECT_EQ(wire, "sentinel");
     EXPECT_TRUE(CreditCapabilityCodecV1::encode({0}, wire).IsInvalidArgument());
     EXPECT_EQ(wire, "sentinel");
-    EXPECT_TRUE(CreditCapabilityCodecV1::encode(
-                    std::vector<uint16_t>(
-                        CreditCapabilityCodecV1::kMaxVersions + 1, 1),
-                    wire)
-                    .IsInvalidArgument());
+    EXPECT_TRUE(
+        CreditCapabilityCodecV1::encode(
+            std::vector<uint16_t>(CreditCapabilityCodecV1::kMaxVersions + 1, 1),
+            wire)
+            .IsInvalidArgument());
     EXPECT_EQ(wire, "sentinel");
 
     ASSERT_TRUE(CreditCapabilityCodecV1::encode({1, 2}, wire).ok());
@@ -88,8 +88,8 @@ TEST(ReceiverCreditControl, CapabilityWireRejectsMalformedOffersAtomically) {
     std::string duplicate = wire;
     duplicate[10] = 0;
     duplicate[11] = 1;
-    EXPECT_TRUE(CreditCapabilityCodecV1::decode(duplicate, output)
-                    .IsInvalidArgument());
+    EXPECT_TRUE(
+        CreditCapabilityCodecV1::decode(duplicate, output).IsInvalidArgument());
     EXPECT_EQ(output, std::vector<uint16_t>({99}));
 }
 
@@ -110,8 +110,8 @@ TEST(ReceiverCreditControl, ActivationWireCreatesEpochFencedLedgerContext) {
     SenderCreditLedger ledger;
     ASSERT_TRUE(ledger.activate(activation_key, decoded.epoch).ok());
     ASSERT_TRUE(ledger.activate(activation_key, decoded.epoch + 1).ok());
-    EXPECT_TRUE(ledger.deactivate(activation_key, decoded.epoch)
-                    .IsInvalidEntry());
+    EXPECT_TRUE(
+        ledger.deactivate(activation_key, decoded.epoch).IsInvalidEntry());
 }
 
 TEST(ReceiverCreditControl, ActivationWireRejectsMalformedInputAtomically) {
@@ -130,8 +130,8 @@ TEST(ReceiverCreditControl, ActivationWireRejectsMalformedInputAtomically) {
     }
     std::string reserved = wire;
     reserved.back() = 1;
-    EXPECT_TRUE(CreditActivationCodecV1::decode(reserved, output)
-                    .IsInvalidArgument());
+    EXPECT_TRUE(
+        CreditActivationCodecV1::decode(reserved, output).IsInvalidArgument());
     EXPECT_EQ(output.epoch, 99);
 
     original.receiver_session_id = {};
@@ -164,17 +164,17 @@ TEST(ReceiverCreditControl, PeerContextRestartFencesOldCleanup) {
     first.receiver_session_id = {11, 22};
     first.epoch = 7;
     ASSERT_TRUE(contexts.activate(100, 200, 3, first).ok());
-    EXPECT_TRUE(contexts.activate(100, 200, 3,
-                                  CreditActivationV1{1, 1, {11, 22}, 6, 0})
-                    .IsInvalidEntry());
+    EXPECT_TRUE(
+        contexts.activate(100, 200, 3, CreditActivationV1{1, 1, {11, 22}, 6, 0})
+            .IsInvalidEntry());
 
     CreditActivationV1 restarted;
     restarted.receiver_session_id = {33, 44};
     restarted.epoch = 1;
     ASSERT_TRUE(contexts.activate(100, 200, 3, restarted).ok());
-    EXPECT_TRUE(contexts.deactivate(100, 3, first.receiver_session_id,
-                                    first.epoch)
-                    .IsInvalidEntry());
+    EXPECT_TRUE(
+        contexts.deactivate(100, 3, first.receiver_session_id, first.epoch)
+            .IsInvalidEntry());
     CreditPeerContextSnapshot snapshot;
     ASSERT_TRUE(contexts.lookup(100, 3, snapshot).ok());
     EXPECT_EQ(snapshot.key.receiver_session, restarted.receiver_session_id);
@@ -187,10 +187,10 @@ TEST(ReceiverCreditControl, PeerContextCapacityRecoversAfterExactCleanup) {
     activation.receiver_session_id = {11, 22};
     activation.epoch = 7;
     ASSERT_TRUE(contexts.activate(100, 200, 3, activation).ok());
-    EXPECT_TRUE(contexts.activate(101, 200, 3, activation)
-                    .IsTooManyRequests());
-    ASSERT_TRUE(contexts.deactivate(100, 3, activation.receiver_session_id,
-                                    activation.epoch)
+    EXPECT_TRUE(contexts.activate(101, 200, 3, activation).IsTooManyRequests());
+    ASSERT_TRUE(contexts
+                    .deactivate(100, 3, activation.receiver_session_id,
+                                activation.epoch)
                     .ok());
     ASSERT_TRUE(contexts.activate(101, 200, 3, activation).ok());
     EXPECT_EQ(contexts.size(), 1);
@@ -453,8 +453,8 @@ TEST(ReceiverCreditControl, IngressValidatesBeforePublishing) {
     BoundedCreditUpdateInbox inbox(2);
     ReceiverCreditIngress ingress(inbox, key(), 7);
     std::string wire;
-    ASSERT_TRUE(ReceiverCreditCodecV1::encode(envelope(1, 10).update, wire)
-                    .ok());
+    ASSERT_TRUE(
+        ReceiverCreditCodecV1::encode(envelope(1, 10).update, wire).ok());
     ASSERT_TRUE(ingress.tryAccept(wire).ok());
 
     auto wrong_session = envelope(2, 20).update;
@@ -478,12 +478,11 @@ TEST(ReceiverCreditControl, IngressQueueFullIsExplicitAndRetryable) {
     BoundedCreditUpdateInbox inbox(1);
     ReceiverCreditIngress ingress(inbox, key(), 7);
     std::string first_wire, second_wire;
-    ASSERT_TRUE(ReceiverCreditCodecV1::encode(envelope(1, 10).update,
-                                               first_wire)
-                    .ok());
-    ASSERT_TRUE(ReceiverCreditCodecV1::encode(envelope(2, 20).update,
-                                               second_wire)
-                    .ok());
+    ASSERT_TRUE(
+        ReceiverCreditCodecV1::encode(envelope(1, 10).update, first_wire).ok());
+    ASSERT_TRUE(
+        ReceiverCreditCodecV1::encode(envelope(2, 20).update, second_wire)
+            .ok());
     ASSERT_TRUE(ingress.tryAccept(first_wire).ok());
     EXPECT_TRUE(ingress.tryAccept(second_wire).IsTooManyRequests());
 

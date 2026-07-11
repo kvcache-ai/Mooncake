@@ -35,22 +35,22 @@ int runServer(uint16_t port, uint64_t expected_calls, uint64_t drain_delay_us,
     std::atomic<uint64_t> queue_full{0};
     std::atomic<uint64_t> invalid{0};
     CoroRpcAgent server;
-    server.registerFunction(
-        kCreditTestRpc, [&](std::string_view wire, std::string& response) {
-            auto status = ingress.tryAccept(wire);
-            if (status.IsTooManyRequests()) {
-                ++queue_full;
-                response = "FULL";
-                return;
-            }
-            if (!status.ok()) {
-                ++invalid;
-                response = "INVALID";
-                return;
-            }
-            ++accepted;
-            response = "OK";
-        });
+    server.registerFunction(kCreditTestRpc,
+                            [&](std::string_view wire, std::string& response) {
+                                auto status = ingress.tryAccept(wire);
+                                if (status.IsTooManyRequests()) {
+                                    ++queue_full;
+                                    response = "FULL";
+                                    return;
+                                }
+                                if (!status.ok()) {
+                                    ++invalid;
+                                    response = "INVALID";
+                                    return;
+                                }
+                                ++accepted;
+                                response = "OK";
+                            });
     auto status = server.start(port);
     if (!status.ok()) return 3;
     uint64_t applied = 0, duplicate = 0, gaps = 0;
@@ -125,22 +125,22 @@ int runCapabilityServer(uint16_t port, uint64_t expected_calls,
     std::atomic<uint64_t> calls{0};
     std::atomic<uint64_t> invalid{0};
     CoroRpcAgent server;
-    server.registerFunction(
-        kCapabilityTestRpc,
-        [&](std::string_view request, std::string& response) {
-            std::vector<uint16_t> offered;
-            if (!CreditCapabilityCodecV1::decode(request, offered).ok()) {
-                ++invalid;
-                response = "INVALID";
-                return;
-            }
-            ++calls;
-            response = advertised_wire;
-        });
+    server.registerFunction(kCapabilityTestRpc, [&](std::string_view request,
+                                                    std::string& response) {
+        std::vector<uint16_t> offered;
+        if (!CreditCapabilityCodecV1::decode(request, offered).ok()) {
+            ++invalid;
+            response = "INVALID";
+            return;
+        }
+        ++calls;
+        response = advertised_wire;
+    });
     auto status = server.start(port);
     if (!status.ok()) return 3;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (calls < expected_calls && std::chrono::steady_clock::now() < deadline)
+    while (calls < expected_calls &&
+           std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     std::cout << "calls=" << calls << " invalid=" << invalid << std::endl;
     return calls == expected_calls && invalid == 0 ? 0 : 4;
@@ -154,7 +154,8 @@ int runCapabilityClient(const std::string& address, CreditRolloutMode mode,
     auto status = client.call(address, kCapabilityTestRpc, request, response);
     if (!status.ok()) return 3;
     std::vector<uint16_t> peer_versions;
-    if (!CreditCapabilityCodecV1::decode(response, peer_versions).ok()) return 4;
+    if (!CreditCapabilityCodecV1::decode(response, peer_versions).ok())
+        return 4;
     CreditCapabilityState state(mode);
     status = state.completeNegotiation(peer_versions);
     if (expected == CreditPeerState::Failed) {

@@ -84,7 +84,7 @@ size_t BoundedCreditUpdateInbox::size() const {
 }
 
 namespace {
-constexpr uint32_t kCreditMagic = 0x54435231;  // "TCR1"
+constexpr uint32_t kCreditMagic = 0x54435231;      // "TCR1"
 constexpr uint32_t kCapabilityMagic = 0x54434331;  // "TCC1"
 constexpr uint32_t kActivationMagic = 0x54434131;  // "TCA1"
 void append16(std::string& out, uint16_t v) {
@@ -129,9 +129,9 @@ Status CreditCapabilityCodecV1::encode(const std::vector<uint16_t>& versions,
     append16(encoded, static_cast<uint16_t>(versions.size()));
     append16(encoded, 0);
     for (uint16_t version : versions) {
-        if (version == 0 || std::find(encoded_versions.begin(),
-                                      encoded_versions.end(), version) !=
-                                encoded_versions.end())
+        if (version == 0 ||
+            std::find(encoded_versions.begin(), encoded_versions.end(),
+                      version) != encoded_versions.end())
             return Status::InvalidArgument(
                 "invalid or duplicate receiver credit version" LOC_MARK);
         encoded_versions.push_back(version);
@@ -141,8 +141,8 @@ Status CreditCapabilityCodecV1::encode(const std::vector<uint16_t>& versions,
     return Status::OK();
 }
 
-Status CreditCapabilityCodecV1::decode(
-    std::string_view wire, std::vector<uint16_t>& versions) {
+Status CreditCapabilityCodecV1::decode(std::string_view wire,
+                                       std::vector<uint16_t>& versions) {
     if (wire.size() < kHeaderBytes || wire.size() > kMaxWireBytes)
         return Status::InvalidArgument(
             "invalid receiver credit capability length" LOC_MARK);
@@ -222,14 +222,15 @@ Status CreditActivationCodecV1::decode(std::string_view wire,
 size_t CreditPeerContextTable::LookupKeyHash::operator()(
     const LookupKey& key) const noexcept {
     size_t h = std::hash<uint64_t>{}(key.target_id);
-    h ^= std::hash<uint32_t>{}(key.qos_class) + 0x9e3779b9 + (h << 6) +
-         (h >> 2);
+    h ^=
+        std::hash<uint32_t>{}(key.qos_class) + 0x9e3779b9 + (h << 6) + (h >> 2);
     return h;
 }
 
-Status CreditPeerContextTable::activate(
-    uint64_t target_id, uint64_t sender_peer, uint32_t qos_class,
-    const CreditActivationV1& activation) {
+Status CreditPeerContextTable::activate(uint64_t target_id,
+                                        uint64_t sender_peer,
+                                        uint32_t qos_class,
+                                        const CreditActivationV1& activation) {
     if (!target_id || !sender_peer || activation.schema_version != 1 ||
         activation.chosen_version != 1 ||
         (!activation.receiver_session_id.high &&
@@ -238,10 +239,10 @@ Status CreditPeerContextTable::activate(
         return Status::InvalidArgument(
             "invalid receiver credit peer context" LOC_MARK);
     LookupKey lookup_key{target_id, qos_class};
-    CreditPeerContextSnapshot next{{activation.receiver_session_id,
-                                    sender_peer, qos_class},
-                                   activation.epoch,
-                                   activation.freshness_ttl_ms};
+    CreditPeerContextSnapshot next{
+        {activation.receiver_session_id, sender_peer, qos_class},
+        activation.epoch,
+        activation.freshness_ttl_ms};
     std::lock_guard lock(mutex_);
     auto it = contexts_.find(lookup_key);
     if (it == contexts_.end()) {

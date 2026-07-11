@@ -69,8 +69,7 @@ class CreditActivationCodecV1 {
     static constexpr size_t kWireBytes = 40;
     static Status encode(const CreditActivationV1& activation,
                          std::string& wire);
-    static Status decode(std::string_view wire,
-                         CreditActivationV1& activation);
+    static Status decode(std::string_view wire, CreditActivationV1& activation);
 };
 
 struct CreditPeerContextSnapshot {
@@ -101,8 +100,7 @@ class CreditPeerContextTable {
         uint64_t target_id{0};
         uint32_t qos_class{0};
         bool operator==(const LookupKey& other) const {
-            return target_id == other.target_id &&
-                   qos_class == other.qos_class;
+            return target_id == other.target_id && qos_class == other.qos_class;
         }
     };
     struct LookupKeyHash {
