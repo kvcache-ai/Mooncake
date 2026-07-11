@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "tent/runtime/receiver_credit.h"
@@ -59,6 +61,18 @@ class BoundedCreditUpdateInbox {
     const size_t capacity_;
     mutable std::mutex mutex_;
     std::deque<CreditControlEnvelope> queue_;
+};
+
+class ReceiverCreditCodecV1 {
+   public:
+    static constexpr size_t kHeaderBytes = 52;
+    static constexpr size_t kGrantBytes = 12;
+    static constexpr size_t kMaxWireBytes =
+        kHeaderBytes + kCreditResourceCount * kGrantBytes;
+
+    static Status encode(const ReceiverCreditUpdateV1& update,
+                         std::string& wire);
+    static Status decode(std::string_view wire, ReceiverCreditUpdateV1& update);
 };
 
 }  // namespace mooncake::tent

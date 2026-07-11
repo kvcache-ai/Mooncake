@@ -4,6 +4,7 @@
 #include "tent/runtime/receiver_credit_control.h"
 
 #include <algorithm>
+#include <array>
 
 namespace mooncake::tent {
 
@@ -80,6 +81,111 @@ size_t BoundedCreditUpdateInbox::drain(
 size_t BoundedCreditUpdateInbox::size() const {
     std::lock_guard lock(mutex_);
     return queue_.size();
+}
+
+namespace {
+constexpr uint32_t kCreditMagic = 0x54435231;  // "TCR1"
+void append16(std::string& out, uint16_t v) {
+    out.push_back(static_cast<char>(v >> 8));
+    out.push_back(static_cast<char>(v));
+}
+void append32(std::string& out, uint32_t v) {
+    for (int shift = 24; shift >= 0; shift -= 8)
+        out.push_back(static_cast<char>(v >> shift));
+}
+void append64(std::string& out, uint64_t v) {
+    for (int shift = 56; shift >= 0; shift -= 8)
+        out.push_back(static_cast<char>(v >> shift));
+}
+uint16_t read16(std::string_view in, size_t& p) {
+    uint16_t v = 0;
+    for (int i = 0; i < 2; ++i) v = (v << 8) | uint8_t(in[p++]);
+    return v;
+}
+uint32_t read32(std::string_view in, size_t& p) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) v = (v << 8) | uint8_t(in[p++]);
+    return v;
+}
+uint64_t read64(std::string_view in, size_t& p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v = (v << 8) | uint8_t(in[p++]);
+    return v;
+}
+}  // namespace
+
+Status ReceiverCreditCodecV1::encode(const ReceiverCreditUpdateV1& u,
+                                     std::string& wire) {
+    if (u.schema_version != 1 || !u.epoch || !u.sequence ||
+        u.grants.size() > kCreditResourceCount)
+        return Status::InvalidArgument("invalid credit wire update" LOC_MARK);
+    std::array<bool, kCreditResourceCount> present{};
+    for (const auto& grant : u.grants) {
+        auto raw = static_cast<uint16_t>(grant.resource);
+        if (raw < 1 || raw > kCreditResourceCount || present[raw - 1])
+            return Status::InvalidArgument(
+                "invalid or duplicate wire resource" LOC_MARK);
+        present[raw - 1] = true;
+    }
+    std::string encoded;
+    encoded.reserve(kHeaderBytes + u.grants.size() * kGrantBytes);
+    append32(encoded, kCreditMagic);
+    append16(encoded, u.schema_version);
+    append16(encoded, u.flags);
+    append32(encoded, u.qos_class);
+    append64(encoded, u.receiver_session_id.high);
+    append64(encoded, u.receiver_session_id.low);
+    append64(encoded, u.epoch);
+    append64(encoded, u.sequence);
+    append32(encoded, u.freshness_ttl_ms);
+    append16(encoded, static_cast<uint16_t>(u.grants.size()));
+    append16(encoded, 0);
+    for (const auto& grant : u.grants) {
+        append16(encoded, static_cast<uint16_t>(grant.resource));
+        append16(encoded, 0);
+        append64(encoded, grant.grant_total);
+    }
+    wire.swap(encoded);  // do not mutate output on validation failure
+    return Status::OK();
+}
+
+Status ReceiverCreditCodecV1::decode(std::string_view wire,
+                                     ReceiverCreditUpdateV1& update) {
+    if (wire.size() < kHeaderBytes || wire.size() > kMaxWireBytes)
+        return Status::InvalidArgument("invalid credit wire length" LOC_MARK);
+    size_t p = 0;
+    if (read32(wire, p) != kCreditMagic)
+        return Status::InvalidArgument("invalid credit wire magic" LOC_MARK);
+    ReceiverCreditUpdateV1 decoded;
+    decoded.schema_version = read16(wire, p);
+    decoded.flags = read16(wire, p);
+    decoded.qos_class = read32(wire, p);
+    decoded.receiver_session_id.high = read64(wire, p);
+    decoded.receiver_session_id.low = read64(wire, p);
+    decoded.epoch = read64(wire, p);
+    decoded.sequence = read64(wire, p);
+    decoded.freshness_ttl_ms = read32(wire, p);
+    uint16_t count = read16(wire, p);
+    uint16_t reserved = read16(wire, p);
+    if (decoded.schema_version != 1 || !decoded.epoch || !decoded.sequence ||
+        reserved != 0 || count > kCreditResourceCount ||
+        wire.size() != kHeaderBytes + count * kGrantBytes)
+        return Status::InvalidArgument("invalid credit wire header" LOC_MARK);
+    std::array<bool, kCreditResourceCount> present{};
+    decoded.grants.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        uint16_t raw = read16(wire, p);
+        uint16_t grant_reserved = read16(wire, p);
+        uint64_t total = read64(wire, p);
+        if (raw < 1 || raw > kCreditResourceCount || present[raw - 1] ||
+            grant_reserved != 0)
+            return Status::InvalidArgument(
+                "invalid credit wire grant" LOC_MARK);
+        present[raw - 1] = true;
+        decoded.grants.push_back({static_cast<CreditResource>(raw), total});
+    }
+    update = std::move(decoded);  // atomic decode result
+    return Status::OK();
 }
 
 }  // namespace mooncake::tent

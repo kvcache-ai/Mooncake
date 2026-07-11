@@ -185,5 +185,74 @@ TEST(ReceiverCreditControl, ReconnectRequiresNegotiationAndNewLedgerEpoch) {
     fresh.update.epoch = 8;
     ASSERT_TRUE(ledger.applyUpdate(key(), fresh.update, disposition).ok());
 }
+
+TEST(ReceiverCreditControl, WireCodecRoundTripsAndUsesNetworkByteOrder) {
+    auto original =
+        envelope(0x0102030405060708ULL, 0x1122334455667788ULL).update;
+    original.flags = 3;
+    original.freshness_ttl_ms = 900;
+    original.grants.push_back({CreditResource::RequestSlots, 17});
+    std::string wire;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(original, wire).ok());
+    EXPECT_EQ(wire.size(), ReceiverCreditCodecV1::kHeaderBytes +
+                               2 * ReceiverCreditCodecV1::kGrantBytes);
+    EXPECT_EQ(static_cast<uint8_t>(wire[0]), 0x54);
+    EXPECT_EQ(static_cast<uint8_t>(wire[1]), 0x43);
+    ReceiverCreditUpdateV1 decoded;
+    ASSERT_TRUE(ReceiverCreditCodecV1::decode(wire, decoded).ok());
+    EXPECT_EQ(decoded.sequence, original.sequence);
+    EXPECT_EQ(decoded.grants.size(), 2);
+    EXPECT_EQ(decoded.grants[0].grant_total, 0x1122334455667788ULL);
+    EXPECT_EQ(decoded.grants[1].resource, CreditResource::RequestSlots);
+}
+
+TEST(ReceiverCreditControl, EveryTruncationFailsWithoutMutatingOutput) {
+    auto original = envelope(7, 100).update;
+    std::string wire;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(original, wire).ok());
+    for (size_t length = 0; length < wire.size(); ++length) {
+        ReceiverCreditUpdateV1 output;
+        output.sequence = 999;
+        EXPECT_TRUE(ReceiverCreditCodecV1::decode(
+                        std::string_view(wire.data(), length), output)
+                        .IsInvalidArgument());
+        EXPECT_EQ(output.sequence, 999);
+    }
+}
+
+TEST(ReceiverCreditControl, OversizedDuplicateAndUnknownWireFieldsFail) {
+    auto original = envelope(7, 100).update;
+    std::string wire;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(original, wire).ok());
+    ReceiverCreditUpdateV1 output;
+    std::string oversized(ReceiverCreditCodecV1::kMaxWireBytes + 1, 'x');
+    EXPECT_TRUE(
+        ReceiverCreditCodecV1::decode(oversized, output).IsInvalidArgument());
+
+    original.grants.push_back({CreditResource::DataBytes, 200});
+    std::string unchanged = "sentinel";
+    EXPECT_TRUE(
+        ReceiverCreditCodecV1::encode(original, unchanged).IsInvalidArgument());
+    EXPECT_EQ(unchanged, "sentinel");
+}
+
+TEST(ReceiverCreditControl, DeterministicMalformedWireFuzzIsMemorySafe) {
+    std::mt19937_64 random(0x2860);
+    ReceiverCreditUpdateV1 output;
+    for (int iteration = 0; iteration < 100000; ++iteration) {
+        size_t length = random() % (ReceiverCreditCodecV1::kMaxWireBytes + 33);
+        std::string wire(length, '\0');
+        for (char& byte : wire) byte = static_cast<char>(random());
+        auto status = ReceiverCreditCodecV1::decode(wire, output);
+        if (status.ok()) {
+            EXPECT_EQ(output.schema_version, 1);
+            EXPECT_LE(output.grants.size(), kCreditResourceCount);
+            EXPECT_NE(output.epoch, 0);
+            EXPECT_NE(output.sequence, 0);
+        } else {
+            EXPECT_TRUE(status.IsInvalidArgument());
+        }
+    }
+}
 }  // namespace
 }  // namespace mooncake::tent
