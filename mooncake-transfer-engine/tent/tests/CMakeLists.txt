@@ -34,6 +34,15 @@ target_include_directories(receiver_credit_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME receiver_credit_test COMMAND receiver_credit_test)
 
+add_executable(receiver_credit_control_test receiver_credit_control_test.cpp
+                                            ../src/runtime/receiver_credit.cpp
+                                            ../src/runtime/receiver_credit_control.cpp)
+target_link_libraries(receiver_credit_control_test
+                      PRIVATE tent_common gtest gtest_main)
+target_include_directories(receiver_credit_control_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_control_test COMMAND receiver_credit_control_test)
+
 # Reproducible hot-path microbenchmark; intentionally not registered with
 # ctest. Run manually when changing deadline promotion partitioning.
 add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
