@@ -3,8 +3,11 @@
 
 #include "tent/runtime/receiver_credit_control.h"
 
+#include <algorithm>
 #include <atomic>
+#include <random>
 #include <thread>
+#include <unordered_set>
 
 #include <gtest/gtest.h>
 
@@ -98,6 +101,89 @@ TEST(ReceiverCreditControl, DisconnectMakesActivePeerStale) {
     ASSERT_TRUE(peer.markStale().ok());
     EXPECT_EQ(peer.state(), CreditPeerState::Stale);
     EXPECT_TRUE(peer.completeNegotiation({1}).IsInvalidEntry());
+}
+
+TEST(ReceiverCreditControl, ZeroCapacityInboxAlwaysFailsFast) {
+    BoundedCreditUpdateInbox inbox(0);
+    EXPECT_TRUE(inbox.tryPublish(envelope(1, 1)).IsTooManyRequests());
+    std::vector<CreditControlEnvelope> drained;
+    EXPECT_EQ(inbox.drain(drained, 100), 0);
+}
+
+TEST(ReceiverCreditControl, SustainedConcurrentPublishAndDrainLosesNothing) {
+    constexpr int kProducers = 16;
+    constexpr int kPerProducer = 2000;
+    constexpr int kTotal = kProducers * kPerProducer;
+    BoundedCreditUpdateInbox inbox(127);
+    std::atomic<int> producers_done{0};
+    std::vector<std::thread> producers;
+    for (int producer = 0; producer < kProducers; ++producer) {
+        producers.emplace_back([&, producer] {
+            for (int i = 0; i < kPerProducer; ++i) {
+                uint64_t sequence = producer * kPerProducer + i + 1;
+                while (!inbox.tryPublish(envelope(sequence, sequence)).ok())
+                    std::this_thread::yield();
+            }
+            ++producers_done;
+        });
+    }
+
+    std::vector<CreditControlEnvelope> received;
+    received.reserve(kTotal);
+    while (producers_done != kProducers || inbox.size() != 0) {
+        inbox.drain(received, 31);
+        std::this_thread::yield();
+    }
+    for (auto& producer : producers) producer.join();
+    EXPECT_EQ(received.size(), static_cast<size_t>(kTotal));
+    std::unordered_set<uint64_t> unique;
+    for (const auto& item : received) unique.insert(item.update.sequence);
+    EXPECT_EQ(unique.size(), static_cast<size_t>(kTotal));
+}
+
+TEST(ReceiverCreditControl, DeterministicReorderDuplicateFuzzNeverMints) {
+    constexpr uint64_t kUpdates = 10000;
+    std::vector<CreditControlEnvelope> traffic;
+    traffic.reserve(kUpdates * 2);
+    for (uint64_t sequence = 1; sequence <= kUpdates; ++sequence) {
+        traffic.push_back(envelope(sequence, sequence * 8));
+        if (sequence % 3 == 0)
+            traffic.push_back(envelope(sequence, sequence * 8));
+    }
+    std::mt19937_64 random(0x2849);
+    std::shuffle(traffic.begin(), traffic.end(), random);
+
+    SenderCreditLedger ledger;
+    ASSERT_TRUE(ledger.activate(key(), 7).ok());
+    for (const auto& item : traffic) {
+        CreditUpdateDisposition disposition;
+        ASSERT_TRUE(
+            ledger.applyUpdate(item.key, item.update, disposition).ok());
+    }
+    uint64_t available;
+    ASSERT_TRUE(
+        ledger.available(key(), CreditResource::DataBytes, available).ok());
+    EXPECT_EQ(available, kUpdates * 8);
+}
+
+TEST(ReceiverCreditControl, ReconnectRequiresNegotiationAndNewLedgerEpoch) {
+    CreditCapabilityState peer(CreditRolloutMode::Required);
+    ASSERT_TRUE(peer.completeNegotiation({1}).ok());
+    ASSERT_TRUE(peer.markStale().ok());
+    ASSERT_TRUE(peer.beginNegotiation().ok());
+    ASSERT_TRUE(peer.completeNegotiation({1}).ok());
+
+    SenderCreditLedger ledger;
+    ASSERT_TRUE(ledger.activate(key(), 7).ok());
+    CreditUpdateDisposition disposition;
+    ASSERT_TRUE(
+        ledger.applyUpdate(key(), envelope(1, 100).update, disposition).ok());
+    ASSERT_TRUE(ledger.activate(key(), 8).ok());
+    EXPECT_TRUE(ledger.applyUpdate(key(), envelope(2, 200).update, disposition)
+                    .IsInvalidEntry());
+    auto fresh = envelope(1, 10);
+    fresh.update.epoch = 8;
+    ASSERT_TRUE(ledger.applyUpdate(key(), fresh.update, disposition).ok());
 }
 }  // namespace
 }  // namespace mooncake::tent
