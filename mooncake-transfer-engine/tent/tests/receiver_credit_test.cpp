@@ -114,6 +114,32 @@ TEST(ReceiverCredit, LedgerEntryCountIsBounded) {
     EXPECT_TRUE(l.activate(key(), 8).ok());
 }
 
+TEST(ReceiverCredit, DeactivationReleasesCapacityAfterExactEpochFence) {
+    SenderCreditLedger l(1);
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    grant(l, 1);
+    ASSERT_TRUE(l.tryReserve(key(), charge(80, 1)).ok());
+    auto other = key();
+    ++other.sender_peer;
+    EXPECT_TRUE(l.activate(other, 1).IsTooManyRequests());
+
+    EXPECT_TRUE(l.deactivate(key(), 6).IsInvalidEntry());
+    EXPECT_TRUE(l.activate(other, 1).IsTooManyRequests());
+    ASSERT_TRUE(l.deactivate(key(), 7).ok());
+    ASSERT_TRUE(l.deactivate(key(), 7).ok());  // cleanup is idempotent
+    EXPECT_TRUE(l.activate(other, 1).ok());
+}
+
+TEST(ReceiverCredit, OldCleanupCannotEraseReactivatedEpoch) {
+    SenderCreditLedger l;
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    ASSERT_TRUE(l.activate(key(), 8).ok());
+    EXPECT_TRUE(l.deactivate(key(), 7).IsInvalidEntry());
+    CreditUpdateDisposition disposition;
+    auto fresh = update(8, 1, {{CreditResource::DataBytes, 10}});
+    ASSERT_TRUE(l.applyUpdate(key(), fresh, disposition).ok());
+}
+
 TEST(ReceiverCredit, InvalidUpdateDoesNotPartiallyMutate) {
     SenderCreditLedger l;
     ASSERT_TRUE(l.activate(key(), 7).ok());

@@ -67,6 +67,10 @@ class SenderCreditLedger {
     explicit SenderCreditLedger(size_t max_entries = 1024)
         : max_entries_(max_entries) {}
     Status activate(const CreditKey&, uint64_t epoch);
+    // Removes an exactly matched epoch after the caller has fenced and drained
+    // (or failed) its transport-owned work. An old cleanup cannot erase a
+    // reactivated, newer epoch.
+    Status deactivate(const CreditKey&, uint64_t epoch);
     Status applyUpdate(const CreditKey&, const ReceiverCreditUpdateV1&,
                        CreditUpdateDisposition&);
     Status tryReserve(const CreditKey&, const CreditCharge&);
