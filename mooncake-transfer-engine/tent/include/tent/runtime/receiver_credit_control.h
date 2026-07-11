@@ -75,5 +75,21 @@ class ReceiverCreditCodecV1 {
     static Status decode(std::string_view wire, ReceiverCreditUpdateV1& update);
 };
 
+// Transport-neutral ingress used by a control-plane callback. It performs no
+// ledger mutation and never blocks waiting for queue capacity.
+class ReceiverCreditIngress {
+   public:
+    ReceiverCreditIngress(BoundedCreditUpdateInbox& inbox, CreditKey key,
+                          uint64_t epoch)
+        : inbox_(inbox), key_(key), epoch_(epoch) {}
+
+    Status tryAccept(std::string_view wire);
+
+   private:
+    BoundedCreditUpdateInbox& inbox_;
+    CreditKey key_;
+    uint64_t epoch_;
+};
+
 }  // namespace mooncake::tent
 #endif

@@ -188,4 +188,14 @@ Status ReceiverCreditCodecV1::decode(std::string_view wire,
     return Status::OK();
 }
 
+Status ReceiverCreditIngress::tryAccept(std::string_view wire) {
+    ReceiverCreditUpdateV1 decoded;
+    CHECK_STATUS(ReceiverCreditCodecV1::decode(wire, decoded));
+    if (!(decoded.receiver_session_id == key_.receiver_session) ||
+        decoded.qos_class != key_.qos_class || decoded.epoch != epoch_)
+        return Status::InvalidEntry(
+            "credit update does not match active ingress" LOC_MARK);
+    return inbox_.tryPublish({key_, std::move(decoded)});
+}
+
 }  // namespace mooncake::tent

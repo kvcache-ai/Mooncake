@@ -254,5 +254,51 @@ TEST(ReceiverCreditControl, DeterministicMalformedWireFuzzIsMemorySafe) {
         }
     }
 }
+
+TEST(ReceiverCreditControl, IngressValidatesBeforePublishing) {
+    BoundedCreditUpdateInbox inbox(2);
+    ReceiverCreditIngress ingress(inbox, key(), 7);
+    std::string wire;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(envelope(1, 10).update, wire)
+                    .ok());
+    ASSERT_TRUE(ingress.tryAccept(wire).ok());
+
+    auto wrong_session = envelope(2, 20).update;
+    ++wrong_session.receiver_session_id.low;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(wrong_session, wire).ok());
+    EXPECT_TRUE(ingress.tryAccept(wire).IsInvalidEntry());
+
+    auto wrong_qos = envelope(2, 20).update;
+    ++wrong_qos.qos_class;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(wrong_qos, wire).ok());
+    EXPECT_TRUE(ingress.tryAccept(wire).IsInvalidEntry());
+
+    auto wrong_epoch = envelope(2, 20).update;
+    ++wrong_epoch.epoch;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(wrong_epoch, wire).ok());
+    EXPECT_TRUE(ingress.tryAccept(wire).IsInvalidEntry());
+    EXPECT_EQ(inbox.size(), 1);
+}
+
+TEST(ReceiverCreditControl, IngressQueueFullIsExplicitAndRetryable) {
+    BoundedCreditUpdateInbox inbox(1);
+    ReceiverCreditIngress ingress(inbox, key(), 7);
+    std::string first_wire, second_wire;
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(envelope(1, 10).update,
+                                               first_wire)
+                    .ok());
+    ASSERT_TRUE(ReceiverCreditCodecV1::encode(envelope(2, 20).update,
+                                               second_wire)
+                    .ok());
+    ASSERT_TRUE(ingress.tryAccept(first_wire).ok());
+    EXPECT_TRUE(ingress.tryAccept(second_wire).IsTooManyRequests());
+
+    std::vector<CreditControlEnvelope> drained;
+    ASSERT_EQ(inbox.drain(drained, 1), 1);
+    ASSERT_TRUE(ingress.tryAccept(second_wire).ok());
+    drained.clear();
+    ASSERT_EQ(inbox.drain(drained, 1), 1);
+    EXPECT_EQ(drained.front().update.sequence, 2);
+}
 }  // namespace
 }  // namespace mooncake::tent

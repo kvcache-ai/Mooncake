@@ -26,6 +26,7 @@ ReceiverCreditUpdateV1 update(uint64_t sequence, uint64_t epoch) {
 int runServer(uint16_t port, uint64_t expected_calls, uint64_t drain_delay_us,
               uint64_t epoch) {
     BoundedCreditUpdateInbox inbox(64);
+    ReceiverCreditIngress ingress(inbox, key(), epoch);
     SenderCreditLedger ledger;
     if (!ledger.activate(key(), epoch).ok()) return 2;
     std::atomic<uint64_t> accepted{0};
@@ -34,17 +35,15 @@ int runServer(uint16_t port, uint64_t expected_calls, uint64_t drain_delay_us,
     CoroRpcAgent server;
     server.registerFunction(
         kCreditTestRpc, [&](std::string_view wire, std::string& response) {
-            ReceiverCreditUpdateV1 decoded;
-            auto status = ReceiverCreditCodecV1::decode(wire, decoded);
-            if (!status.ok() || decoded.epoch != epoch) {
-                ++invalid;
-                response = "INVALID";
-                return;
-            }
-            status = inbox.tryPublish({key(), decoded});
-            if (!status.ok()) {
+            auto status = ingress.tryAccept(wire);
+            if (status.IsTooManyRequests()) {
                 ++queue_full;
                 response = "FULL";
+                return;
+            }
+            if (!status.ok()) {
+                ++invalid;
+                response = "INVALID";
                 return;
             }
             ++accepted;
