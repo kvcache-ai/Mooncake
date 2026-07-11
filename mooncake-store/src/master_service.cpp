@@ -3384,7 +3384,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
+    const bool created_metadata = !accessor.Exists();
+    if (created_metadata) {
         accessor.Create(
             client_id,
             replica.get_descriptor().get_local_disk_descriptor().object_size,
@@ -3404,6 +3405,11 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         auto& shard = accessor.GetShard();
         shard.OnDiskReplicaAdded(metadata);
         SyncCacheTotalAccounting(metadata);
+        if (created_metadata) {
+            const auto scoped_key = MakeTenantScopedKey(normalized_tenant, key);
+            bloom_filter_.Add(scoped_key);
+            prefix_index_.Insert(scoped_key);
+        }
         return true;
     }
 

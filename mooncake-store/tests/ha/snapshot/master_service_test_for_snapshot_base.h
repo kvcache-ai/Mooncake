@@ -778,6 +778,13 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
                 .set_enable_snapshot_restore(true)
                 .set_snapshot_object_store_type("local")
+                .set_default_kv_lease_ttl(service->default_kv_lease_ttl_)
+                .set_default_kv_soft_pin_ttl(service->DefaultKvSoftPinTtl())
+                .set_allow_evict_soft_pinned_objects(
+                    service->allow_evict_soft_pinned_objects_)
+                .set_eviction_ratio(service->EvictionRatio())
+                .set_eviction_high_watermark_ratio(
+                    service->EvictionHighWatermarkRatio())
                 .set_root_fs_dir(service->root_fs_dir_)
                 .build();
         std::unique_ptr<MasterService> restored_service(
