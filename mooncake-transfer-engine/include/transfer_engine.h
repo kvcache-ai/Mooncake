@@ -202,6 +202,7 @@ class TransferEngine {
     std::shared_ptr<Topology> getLocalTopology();
 
     void enableGracefulShutdown();
+    std::string showLinks(bool json = false) const;
 
    private:
     std::shared_ptr<TransferEngineImpl> impl_;

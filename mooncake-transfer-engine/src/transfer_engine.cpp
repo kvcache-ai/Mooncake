@@ -14,6 +14,7 @@
 
 #ifndef USE_TENT
 #include "transfer_engine.h"
+#include "show_links.h"
 #include "transfer_engine_impl.h"
 #include "graceful_shutdown.h"
 #include <mutex>
@@ -299,6 +300,12 @@ void TransferEngine::enableGracefulShutdown() {
     installGracefulShutdownHandlers();
 }
 
+std::string TransferEngine::showLinks(bool json) const {
+    if (!impl_) return "{}";
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
+}
+
 }  // namespace mooncake
 #else
 #include "transfer_engine.h"
@@ -309,6 +316,7 @@ void TransferEngine::enableGracefulShutdown() {
 #include <mutex>
 #include <utility>
 #include "graceful_shutdown.h"
+#include "show_links.h"
 
 namespace mooncake {
 namespace {
@@ -825,6 +833,14 @@ void TransferEngine::enableGracefulShutdown() {
         shutdown_token_ = registerTransferEngineShutdownToken(this);
     }
     installGracefulShutdownHandlers();
+}
+
+std::string TransferEngine::showLinks(bool json) const {
+    if (use_tent_ || !impl_) {
+        return json ? "{}" : "(TENT mode or not initialized)";
+    }
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
 }
 
 }  // namespace mooncake

@@ -141,4 +141,4 @@ python examples/disaggregated/disaggregated_serving/mooncake_connector/mooncake_
 
 ### 4. Performance
 
-Please refer to this [webpage](../../../../../docs/source/performance/vllm-v1-kvcache-sharing.md).
+Please refer to this [webpage](../../../performance/vllm/vllm-v1-mooncake-store.md).

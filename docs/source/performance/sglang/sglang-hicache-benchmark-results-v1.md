@@ -1,4 +1,4 @@
-# SGLang HiCache with Mooncake Backend Benchmark
+# SGLang HiCache x Mooncake Store Performance
 
 We evaluated the performance of SGLang HiCache using a multi-turn conversation benchmark designed to simulate realistic user interactions. The benchmark spawns concurrent clients, each engaging in multi-round conversations. For every client, starting from the second round, the input consists of the concatenation of the input and output from the preceding round.
 
@@ -13,13 +13,13 @@ Since HiCache is currently used to accelerate the prefill stage, this benchmark 
 
 ## Benchmark Result
 
-![overall performance](../image/hicache_multi_turn_overall.png)
+![overall performance](../../image/hicache_multi_turn_overall.png)
 
 We first evaluated the overall performance on a cluster consisting 3 servers, each has 2 NVIDIA A10 GPUs and 2 100Gbps eRDMA NICs.
 
 As shown in the figure, in terms of prefill performance, `populated Mooncake` achieves the best results, followed by `+Mooncake`, `+L2`, and finally `GPU only`.
 
-![overall performance](../image/hicache_multi_turn_per_turn.png)
+![overall performance](../../image/hicache_multi_turn_per_turn.png)
 
 Next, we take a closer look at the sources of performance differences. We recorded the TTFT and cache hit rate for each conversation round. The experiment was conducted on a server equipped with 8 × H800 GPUs and 8 × mlx5 RDMA NICs. To minimize interference from the decode stage and highlight prefill performance differences, we set the output length to 1.
 
@@ -43,7 +43,7 @@ In practical deployment, Mooncake aggregates memory across the entire cluster in
 **Cluster Deployment:**
 The benchmark was conducted across a 3-node cluster connected via eRDMA:
 - Machine A: SGLang server, Mooncake master service, Mooncake client (30GB memory)
-- Machine B: Mooncake client (60GB memory)  
+- Machine B: Mooncake client (60GB memory)
 - Machine C: Mooncake client (60GB memory)
 - Total Distributed Memory Pool: 150GB
 

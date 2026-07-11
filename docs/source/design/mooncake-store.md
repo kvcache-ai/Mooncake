@@ -494,7 +494,7 @@ Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
 
 **OffsetBufferAllocator (default and recommended)**: This allocator is derived from [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), which uses a custom bin-based allocation strategy that supports fast hard realtime `O(1)` offset allocation with minimal fragmentation. Mooncake Store optimizes this allocator based on the specific memory usage characteristics of LLM inference workloads, thereby enhancing memory utilization in LLM scenarios.
 
-For measured utilization and allocation latency across LLM-style workloads, see [Allocator Performance](../performance/allocator-benchmark-result.md).
+For measured utilization and allocation latency across LLM-style workloads, see [Allocator Performance](../performance/mooncake/allocator-benchmark-result.md).
 
 **CachelibBufferAllocator (deprecated)**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios. However, in our modified version, it does not handle workloads with highly variable object sizes effectively, so it is currently marked as deprecated.
 
@@ -588,7 +588,7 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 
 **Use `local_first`** when inference workers and Mooncake Store memory segments are colocated and you want writes to prefer the writer's host before falling back to other hosts. For this strategy to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`.
 
-For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../performance/allocation-strategy-benchmark-result.md).
+For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../performance/mooncake/allocation-strategy-benchmark-result.md).
 
 #### Strategy Details
 

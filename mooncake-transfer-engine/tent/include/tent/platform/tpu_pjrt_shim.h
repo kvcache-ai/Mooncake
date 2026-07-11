@@ -46,18 +46,22 @@ class TpuPjrtShim {
     // True when the adapter library was loaded and initialized successfully.
     bool available() const { return available_; }
 
-    // Returns true if `addr` refers to memory owned by the TPU runtime (HBM).
-    // Returns false when the adapter is unavailable or the pointer is host
-    // memory, so a caller can safely treat "not TPU" as host memory.
+    // Returns true if `addr` refers to memory owned by the TPU runtime (HBM),
+    // including addresses interior to a registered buffer. Returns false when
+    // the adapter is unavailable or the pointer is host memory, so a caller can
+    // safely treat "not TPU" as host memory.
     bool isDevicePtr(const void *addr) const;
 
-    // Device ordinal backing `addr`, or -1 if `addr` is not TPU device memory.
+    // Device ordinal of the buffer containing `addr` (base or interior), or -1
+    // if `addr` is not TPU device memory.
     int deviceIndex(const void *addr) const;
 
-    // Synchronous HBM -> host DMA copy of `length` bytes.
+    // Synchronous HBM -> host DMA copy of `length` bytes. `device_src` may be
+    // interior to a registered buffer; the range must not run past its end.
     Status copyD2H(void *host_dst, const void *device_src, size_t length) const;
 
-    // Synchronous host -> HBM DMA copy of `length` bytes.
+    // Synchronous host -> HBM DMA copy of `length` bytes. `device_dst` may be
+    // interior to a registered buffer; the range must not run past its end.
     Status copyH2D(void *device_dst, const void *host_src, size_t length) const;
 
     // Number of visible TPU devices (0 when the adapter is unavailable).

@@ -21,6 +21,7 @@
 #include <sstream>
 
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/promotion_policy.h"
 #include "tent/transport/rdma/shared_quota.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
@@ -141,6 +142,11 @@ Workers::Workers(RdmaTransport* transport)
     priority_promotion_timeout_ns_ =
         conf->get("transports/rdma/priority_promotion_timeout_us", 10000) *
         1000ull;
+
+    // Opt-in per-entry promotion (issue #2528). Default false = historical
+    // head-only "flush the tier" behavior.
+    priority_promotion_per_entry_ =
+        conf->get("transports/rdma/priority_promotion_per_entry", false);
 
     // ============================================================
     // Global Slot Coordination (Multi-Process)
@@ -420,40 +426,61 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
     // Set next check time (1ms from now)
     worker.next_promotion_check_ns = current_ts + 1000000ull;
 
-    // Check MEDIUM -> HIGH promotion
-    std::vector<RdmaSliceList> promoted;
-    worker.queues[PRIO_MEDIUM].pop(promoted);
-    if (!promoted.empty()) {
-        auto* slice = promoted.front().first;
-        if (slice && slice->enqueue_ts > 0 &&
-            (current_ts - slice->enqueue_ts) >=
-                priority_promotion_timeout_ns_) {
-            for (auto& slice_list : promoted) {
-                worker.queues[PRIO_HIGH].push(slice_list);
+    // Drain one level, promote the entries the policy selects to `to`, and put
+    // the rest back on `from` in their original order. Returns true if anything
+    // was promoted (used to preserve the historical "one level per tick" stop).
+    auto promote_level = [&](int from, int to) -> bool {
+        std::vector<RdmaSliceList> drained;
+        worker.queues[from].pop(drained);
+        if (drained.empty()) return false;
+
+        if (!priority_promotion_per_entry_) {
+            auto* slice = drained.front().first;
+            const bool head_timed_out = slice && slice->enqueue_ts > 0 &&
+                                        current_ts >= slice->enqueue_ts &&
+                                        (current_ts - slice->enqueue_ts) >=
+                                            priority_promotion_timeout_ns_;
+            for (auto& slice_list : drained) {
+                worker.queues[head_timed_out ? to : from].push(slice_list);
             }
-            return;
+            return head_timed_out;
         }
-        for (auto& slice_list : promoted) {
-            worker.queues[PRIO_MEDIUM].push(slice_list);
+
+        std::vector<uint64_t> enqueue_ts;
+        enqueue_ts.reserve(drained.size());
+        for (auto& slice_list : drained) {
+            auto* slice = slice_list.first;
+            enqueue_ts.push_back(slice ? slice->enqueue_ts : 0);
         }
-    }
+
+        PromotionDecision decision = DecidePromotionPerEntry(
+            enqueue_ts, current_ts, priority_promotion_timeout_ns_);
+
+        if (!decision.promoted_any()) {
+            for (auto& slice_list : drained)
+                worker.queues[from].push(slice_list);
+            return false;
+        }
+
+        std::vector<bool> promote(drained.size(), false);
+        for (size_t idx : decision.promote_indices) {
+            if (idx < drained.size()) promote[idx] = true;
+        }
+        for (size_t i = 0; i < drained.size(); ++i) {
+            worker.queues[promote[i] ? to : from].push(drained[i]);
+        }
+        return true;
+    };
+
+    // Check MEDIUM -> HIGH promotion. Preserve the historical behavior of
+    // handling at most one level per tick when the head-only policy is active;
+    // with per-entry promotion, both levels are considered each tick so a
+    // starving LOW entry is not stalled behind an unrelated MEDIUM promotion.
+    bool promoted_medium = promote_level(PRIO_MEDIUM, PRIO_HIGH);
+    if (promoted_medium && !priority_promotion_per_entry_) return;
 
     // Check LOW -> MEDIUM promotion
-    worker.queues[PRIO_LOW].pop(promoted);
-    if (!promoted.empty()) {
-        auto* slice = promoted.front().first;
-        if (slice && slice->enqueue_ts > 0 &&
-            (current_ts - slice->enqueue_ts) >=
-                priority_promotion_timeout_ns_) {
-            for (auto& slice_list : promoted) {
-                worker.queues[PRIO_MEDIUM].push(slice_list);
-            }
-            return;
-        }
-        for (auto& slice_list : promoted) {
-            worker.queues[PRIO_LOW].push(slice_list);
-        }
-    }
+    promote_level(PRIO_LOW, PRIO_MEDIUM);
 }
 
 void Workers::asyncPollCq() {

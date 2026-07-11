@@ -4,7 +4,7 @@
 
 This guide demonstrates how to use `MooncakeStore` / `MooncakeStoreConnector` with vLLM to build a distributed KV cache storage pool. It enables KV cache offloading to CPU/SSD, hash-based prefix caching across multiple vLLM instances, and flexible XpYd disaggregated deployment — where you can dynamically adjust prefill and decode group sizes at runtime.
 
-Compared to Redis-based backends, MooncakeStore achieves significantly lower TTFT (e.g., **~32% improvement** in mean TTFT for 2P2D tp=2 under RDMA). See [benchmark results](../../../performance/vllm-benchmark-results-v1.md) for details.
+Compared to Redis-based backends, MooncakeStore achieves significantly lower TTFT (e.g., **~32% improvement** in mean TTFT for 2P2D tp=2 under RDMA).
 
 ---
 
@@ -385,15 +385,6 @@ curl -s http://localhost:8000/v1/completions \
 ```
 
 - If you are not testing on the proxy server, change `localhost` to the IP address of the proxy server.
-
----
-
-## Performance
-
-| Scenario | Document |
-|----------|----------|
-| V1 MooncakeStoreConnector vs Redis | [Benchmark V1](../../../performance/vllm-benchmark-results-v1.md) |
-| V0 MooncakeStore vs Redis | [Benchmark V0](../../../performance/vllm-benchmark-results-v0.2.md) |
 
 ---
 
