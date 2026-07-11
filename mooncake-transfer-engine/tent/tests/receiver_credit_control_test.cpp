@@ -196,6 +196,47 @@ TEST(ReceiverCreditControl, PeerContextCapacityRecoversAfterExactCleanup) {
     EXPECT_EQ(contexts.size(), 1);
 }
 
+TEST(ReceiverCreditControl, ConcurrentPeerRestartLookupNeverTearsSnapshot) {
+    CreditPeerContextTable contexts;
+    CreditActivationV1 initial;
+    initial.receiver_session_id = {1, 2};
+    initial.epoch = 1;
+    ASSERT_TRUE(contexts.activate(100, 200, 3, initial).ok());
+
+    std::atomic<bool> writer_done{false};
+    std::atomic<uint64_t> invalid_snapshots{0};
+    std::thread writer([&] {
+        for (uint64_t epoch = 2; epoch <= 10000; ++epoch) {
+            CreditActivationV1 activation;
+            activation.receiver_session_id = {epoch, epoch + 1};
+            activation.epoch = epoch;
+            if (!contexts.activate(100, 200, 3, activation).ok())
+                ++invalid_snapshots;
+        }
+        writer_done = true;
+    });
+    std::vector<std::thread> readers;
+    for (int reader = 0; reader < 16; ++reader) {
+        readers.emplace_back([&] {
+            do {
+                CreditPeerContextSnapshot snapshot;
+                if (!contexts.lookup(100, 3, snapshot).ok() ||
+                    snapshot.key.receiver_session.high != snapshot.epoch ||
+                    snapshot.key.receiver_session.low != snapshot.epoch + 1 ||
+                    snapshot.key.sender_peer != 200 ||
+                    snapshot.key.qos_class != 3)
+                    ++invalid_snapshots;
+            } while (!writer_done.load());
+        });
+    }
+    writer.join();
+    for (auto& reader : readers) reader.join();
+    EXPECT_EQ(invalid_snapshots, 0);
+    CreditPeerContextSnapshot final;
+    ASSERT_TRUE(contexts.lookup(100, 3, final).ok());
+    EXPECT_EQ(final.epoch, 10000);
+}
+
 TEST(ReceiverCreditControl, InboxIsBoundedAndDrainIsLimited) {
     BoundedCreditUpdateInbox inbox(2);
     ASSERT_TRUE(inbox.tryPublish(envelope(1, 10)).ok());
