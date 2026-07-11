@@ -38,7 +38,7 @@ struct QosPolicyFields {
     std::optional<uint64_t> max_inflight_bytes;
     std::optional<uint64_t> max_inflight_requests;
     std::optional<std::string> deadline_profile;
-    std::vector<std::string> allowed_degraded_actions;
+    std::optional<std::vector<std::string>> allowed_degraded_actions;
 };
 
 struct QosRequestContext {

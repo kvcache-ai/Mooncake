@@ -124,7 +124,8 @@ TEST(QosContractTest, ResolvesTenantIntentContractWithInheritedDefaults) {
     EXPECT_EQ(*effective.max_inflight_requests, 4096u);
     ASSERT_TRUE(effective.deadline_profile.has_value());
     EXPECT_EQ(*effective.deadline_profile, "interactive");
-    EXPECT_EQ(effective.allowed_degraded_actions.size(), 3u);
+    ASSERT_TRUE(effective.allowed_degraded_actions.has_value());
+    EXPECT_EQ(effective.allowed_degraded_actions->size(), 3u);
 
     auto explain = nlohmann::json::parse(resolver.explainJson(effective));
     EXPECT_EQ(explain["matched_contract"], "tenant-a.foreground_get");
@@ -212,6 +213,66 @@ TEST(QosContractTest, StrictModeRejectsUnknownTenant) {
     EXPECT_TRUE(status.IsInvalidArgument());
 }
 
+TEST(QosContractTest, EmptyAllowedDegradedActionsOverridesInherited) {
+    Config config;
+    loadConfig(&config, R"json(
+{
+  "qos": {
+    "version": 1,
+    "defaults": {
+      "allowed_degraded_actions": ["fallback_transport", "reject"]
+    },
+    "tenants": [
+      {
+        "name": "tenant-a",
+        "intents": {
+          "foreground_get": {
+            "allowed_degraded_actions": []
+          }
+        }
+      }
+    ]
+  }
+}
+)json");
+    QosContractResolver resolver;
+    ASSERT_TRUE(resolver.loadFromConfig(config).ok());
+
+    EffectiveQosPolicy effective;
+    auto status = resolver.resolve({.tenant = "tenant-a",
+                                    .intent = "foreground_get",
+                                    .policy_name = std::nullopt,
+                                    .requested_priority = PRIO_HIGH},
+                                   &effective);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(effective.allowed_degraded_actions.has_value());
+    EXPECT_TRUE(effective.allowed_degraded_actions->empty());
+}
+
+TEST(QosContractTest, MergedBandwidthRangeFailsClosed) {
+    Config config;
+    loadConfig(&config, R"json(
+{
+  "qos": {
+    "version": 1,
+    "defaults": {"max_bandwidth_gbps": 10},
+    "intent_defaults": {"foreground_get": {"min_bandwidth_gbps": 20}}
+  }
+}
+)json");
+    QosContractResolver resolver;
+    ASSERT_TRUE(resolver.loadFromConfig(config).ok());
+
+    EffectiveQosPolicy effective;
+    auto status = resolver.resolve({.tenant = "tenant-a",
+                                    .intent = "foreground_get",
+                                    .policy_name = std::nullopt,
+                                    .requested_priority = PRIO_HIGH},
+                                   &effective);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsInvalidArgument());
+}
+
 TEST(QosContractTest, InvalidSchemaFailsClosed) {
     Config config;
     loadConfig(&config, R"json(
@@ -243,6 +304,22 @@ TEST(QosContractTest, InvalidSchemaFailsClosed) {
 {"qos":{"version":1,"defaults":{"max_inflight_requests":"64MiB"}}}
 )json");
     status = resolver.loadFromConfig(bad_request_count);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsInvalidArgument());
+
+    Config unknown_key;
+    loadConfig(&unknown_key, R"json(
+{"qos":{"version":1,"defaults":{"unexpected_qos_key":10}}}
+)json");
+    status = resolver.loadFromConfig(unknown_key);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsInvalidArgument());
+
+    Config bad_version_type;
+    loadConfig(&bad_version_type, R"json(
+{"qos":{"version":"1","defaults":{"priority":"high"}}}
+)json");
+    status = resolver.loadFromConfig(bad_version_type);
     EXPECT_FALSE(status.ok());
     EXPECT_TRUE(status.IsInvalidArgument());
 }
