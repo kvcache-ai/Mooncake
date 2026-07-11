@@ -141,6 +141,61 @@ TEST(ReceiverCreditControl, ActivationWireRejectsMalformedInputAtomically) {
     EXPECT_EQ(unchanged, "sentinel");
 }
 
+TEST(ReceiverCreditControl, PeerContextSnapshotsActivationByTargetAndQos) {
+    CreditPeerContextTable contexts;
+    CreditActivationV1 activation;
+    activation.receiver_session_id = {11, 22};
+    activation.epoch = 7;
+    activation.freshness_ttl_ms = 900;
+    ASSERT_TRUE(contexts.activate(100, 200, 3, activation).ok());
+    CreditPeerContextSnapshot snapshot;
+    ASSERT_TRUE(contexts.lookup(100, 3, snapshot).ok());
+    EXPECT_EQ(snapshot.key.receiver_session, activation.receiver_session_id);
+    EXPECT_EQ(snapshot.key.sender_peer, 200);
+    EXPECT_EQ(snapshot.key.qos_class, 3);
+    EXPECT_EQ(snapshot.epoch, 7);
+    EXPECT_EQ(snapshot.freshness_ttl_ms, 900);
+    EXPECT_TRUE(contexts.lookup(100, 4, snapshot).IsInvalidEntry());
+}
+
+TEST(ReceiverCreditControl, PeerContextRestartFencesOldCleanup) {
+    CreditPeerContextTable contexts;
+    CreditActivationV1 first;
+    first.receiver_session_id = {11, 22};
+    first.epoch = 7;
+    ASSERT_TRUE(contexts.activate(100, 200, 3, first).ok());
+    EXPECT_TRUE(contexts.activate(100, 200, 3,
+                                  CreditActivationV1{1, 1, {11, 22}, 6, 0})
+                    .IsInvalidEntry());
+
+    CreditActivationV1 restarted;
+    restarted.receiver_session_id = {33, 44};
+    restarted.epoch = 1;
+    ASSERT_TRUE(contexts.activate(100, 200, 3, restarted).ok());
+    EXPECT_TRUE(contexts.deactivate(100, 3, first.receiver_session_id,
+                                    first.epoch)
+                    .IsInvalidEntry());
+    CreditPeerContextSnapshot snapshot;
+    ASSERT_TRUE(contexts.lookup(100, 3, snapshot).ok());
+    EXPECT_EQ(snapshot.key.receiver_session, restarted.receiver_session_id);
+    EXPECT_EQ(snapshot.epoch, 1);
+}
+
+TEST(ReceiverCreditControl, PeerContextCapacityRecoversAfterExactCleanup) {
+    CreditPeerContextTable contexts(1);
+    CreditActivationV1 activation;
+    activation.receiver_session_id = {11, 22};
+    activation.epoch = 7;
+    ASSERT_TRUE(contexts.activate(100, 200, 3, activation).ok());
+    EXPECT_TRUE(contexts.activate(101, 200, 3, activation)
+                    .IsTooManyRequests());
+    ASSERT_TRUE(contexts.deactivate(100, 3, activation.receiver_session_id,
+                                    activation.epoch)
+                    .ok());
+    ASSERT_TRUE(contexts.activate(101, 200, 3, activation).ok());
+    EXPECT_EQ(contexts.size(), 1);
+}
+
 TEST(ReceiverCreditControl, InboxIsBoundedAndDrainIsLimited) {
     BoundedCreditUpdateInbox inbox(2);
     ASSERT_TRUE(inbox.tryPublish(envelope(1, 10)).ok());

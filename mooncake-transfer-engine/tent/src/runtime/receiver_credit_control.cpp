@@ -219,6 +219,85 @@ Status CreditActivationCodecV1::decode(std::string_view wire,
     return Status::OK();
 }
 
+size_t CreditPeerContextTable::LookupKeyHash::operator()(
+    const LookupKey& key) const noexcept {
+    size_t h = std::hash<uint64_t>{}(key.target_id);
+    h ^= std::hash<uint32_t>{}(key.qos_class) + 0x9e3779b9 + (h << 6) +
+         (h >> 2);
+    return h;
+}
+
+Status CreditPeerContextTable::activate(
+    uint64_t target_id, uint64_t sender_peer, uint32_t qos_class,
+    const CreditActivationV1& activation) {
+    if (!target_id || !sender_peer || activation.schema_version != 1 ||
+        activation.chosen_version != 1 ||
+        (!activation.receiver_session_id.high &&
+         !activation.receiver_session_id.low) ||
+        !activation.epoch)
+        return Status::InvalidArgument(
+            "invalid receiver credit peer context" LOC_MARK);
+    LookupKey lookup_key{target_id, qos_class};
+    CreditPeerContextSnapshot next{{activation.receiver_session_id,
+                                    sender_peer, qos_class},
+                                   activation.epoch,
+                                   activation.freshness_ttl_ms};
+    std::lock_guard lock(mutex_);
+    auto it = contexts_.find(lookup_key);
+    if (it == contexts_.end()) {
+        if (contexts_.size() >= max_entries_)
+            return Status::TooManyRequests(
+                "receiver credit peer context table full" LOC_MARK);
+        contexts_.emplace(lookup_key, next);
+        return Status::OK();
+    }
+    const auto& current = it->second;
+    if (current.key.receiver_session == activation.receiver_session_id &&
+        activation.epoch < current.epoch)
+        return Status::InvalidEntry(
+            "stale receiver credit peer activation" LOC_MARK);
+    if (current.key.receiver_session == activation.receiver_session_id &&
+        activation.epoch == current.epoch) {
+        if (current.key.sender_peer != sender_peer)
+            return Status::InvalidEntry(
+                "receiver credit sender identity changed" LOC_MARK);
+        return Status::OK();
+    }
+    it->second = next;
+    return Status::OK();
+}
+
+Status CreditPeerContextTable::lookup(
+    uint64_t target_id, uint32_t qos_class,
+    CreditPeerContextSnapshot& snapshot) const {
+    std::lock_guard lock(mutex_);
+    auto it = contexts_.find({target_id, qos_class});
+    if (it == contexts_.end())
+        return Status::InvalidEntry(
+            "receiver credit peer context not found" LOC_MARK);
+    snapshot = it->second;
+    return Status::OK();
+}
+
+Status CreditPeerContextTable::deactivate(
+    uint64_t target_id, uint32_t qos_class,
+    const ReceiverSessionId& receiver_session, uint64_t epoch) {
+    std::lock_guard lock(mutex_);
+    auto it = contexts_.find({target_id, qos_class});
+    if (it == contexts_.end()) return Status::OK();
+    if (!(it->second.key.receiver_session == receiver_session) ||
+        it->second.epoch != epoch)
+        return Status::InvalidEntry(
+            "receiver credit peer cleanup is stale" LOC_MARK);
+    contexts_.erase(it);
+    return Status::OK();
+}
+
+size_t CreditPeerContextTable::size() const {
+    std::lock_guard lock(mutex_);
+    return contexts_.size();
+}
+
 Status ReceiverCreditCodecV1::encode(const ReceiverCreditUpdateV1& u,
                                      std::string& wire) {
     if (u.schema_version != 1 || !u.epoch || !u.sequence ||

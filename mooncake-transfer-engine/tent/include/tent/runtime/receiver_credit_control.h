@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "tent/runtime/receiver_credit.h"
@@ -70,6 +71,48 @@ class CreditActivationCodecV1 {
                          std::string& wire);
     static Status decode(std::string_view wire,
                          CreditActivationV1& activation);
+};
+
+struct CreditPeerContextSnapshot {
+    CreditKey key;
+    uint64_t epoch{0};
+    uint32_t freshness_ttl_ms{0};
+};
+
+// Bounded sender-side mapping established by capability activation. Runtime
+// admission snapshots this context so a later receiver restart cannot retag
+// already queued work.
+class CreditPeerContextTable {
+   public:
+    explicit CreditPeerContextTable(size_t max_entries = 1024)
+        : max_entries_(max_entries) {}
+
+    Status activate(uint64_t target_id, uint64_t sender_peer,
+                    uint32_t qos_class, const CreditActivationV1& activation);
+    Status lookup(uint64_t target_id, uint32_t qos_class,
+                  CreditPeerContextSnapshot& snapshot) const;
+    Status deactivate(uint64_t target_id, uint32_t qos_class,
+                      const ReceiverSessionId& receiver_session,
+                      uint64_t epoch);
+    size_t size() const;
+
+   private:
+    struct LookupKey {
+        uint64_t target_id{0};
+        uint32_t qos_class{0};
+        bool operator==(const LookupKey& other) const {
+            return target_id == other.target_id &&
+                   qos_class == other.qos_class;
+        }
+    };
+    struct LookupKeyHash {
+        size_t operator()(const LookupKey& key) const noexcept;
+    };
+
+    mutable std::mutex mutex_;
+    const size_t max_entries_;
+    std::unordered_map<LookupKey, CreditPeerContextSnapshot, LookupKeyHash>
+        contexts_;
 };
 
 struct CreditControlEnvelope {
