@@ -85,6 +85,7 @@ size_t BoundedCreditUpdateInbox::size() const {
 
 namespace {
 constexpr uint32_t kCreditMagic = 0x54435231;  // "TCR1"
+constexpr uint32_t kCapabilityMagic = 0x54434331;  // "TCC1"
 void append16(std::string& out, uint16_t v) {
     out.push_back(static_cast<char>(v >> 8));
     out.push_back(static_cast<char>(v));
@@ -113,6 +114,60 @@ uint64_t read64(std::string_view in, size_t& p) {
     return v;
 }
 }  // namespace
+
+Status CreditCapabilityCodecV1::encode(const std::vector<uint16_t>& versions,
+                                       std::string& wire) {
+    if (versions.size() > kMaxVersions)
+        return Status::InvalidArgument(
+            "too many receiver credit versions" LOC_MARK);
+    std::vector<uint16_t> encoded_versions;
+    encoded_versions.reserve(versions.size());
+    std::string encoded;
+    encoded.reserve(kHeaderBytes + versions.size() * sizeof(uint16_t));
+    append32(encoded, kCapabilityMagic);
+    append16(encoded, static_cast<uint16_t>(versions.size()));
+    append16(encoded, 0);
+    for (uint16_t version : versions) {
+        if (version == 0 || std::find(encoded_versions.begin(),
+                                      encoded_versions.end(), version) !=
+                                encoded_versions.end())
+            return Status::InvalidArgument(
+                "invalid or duplicate receiver credit version" LOC_MARK);
+        encoded_versions.push_back(version);
+        append16(encoded, version);
+    }
+    wire.swap(encoded);
+    return Status::OK();
+}
+
+Status CreditCapabilityCodecV1::decode(
+    std::string_view wire, std::vector<uint16_t>& versions) {
+    if (wire.size() < kHeaderBytes || wire.size() > kMaxWireBytes)
+        return Status::InvalidArgument(
+            "invalid receiver credit capability length" LOC_MARK);
+    size_t p = 0;
+    if (read32(wire, p) != kCapabilityMagic)
+        return Status::InvalidArgument(
+            "invalid receiver credit capability magic" LOC_MARK);
+    uint16_t count = read16(wire, p);
+    uint16_t reserved = read16(wire, p);
+    if (reserved != 0 || count > kMaxVersions ||
+        wire.size() != kHeaderBytes + count * sizeof(uint16_t))
+        return Status::InvalidArgument(
+            "invalid receiver credit capability header" LOC_MARK);
+    std::vector<uint16_t> decoded;
+    decoded.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        uint16_t version = read16(wire, p);
+        if (version == 0 ||
+            std::find(decoded.begin(), decoded.end(), version) != decoded.end())
+            return Status::InvalidArgument(
+                "invalid receiver credit capability version" LOC_MARK);
+        decoded.push_back(version);
+    }
+    versions = std::move(decoded);
+    return Status::OK();
+}
 
 Status ReceiverCreditCodecV1::encode(const ReceiverCreditUpdateV1& u,
                                      std::string& wire) {

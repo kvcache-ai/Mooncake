@@ -42,6 +42,19 @@ class CreditCapabilityState {
     uint16_t version_{0};
 };
 
+class CreditCapabilityCodecV1 {
+   public:
+    static constexpr size_t kHeaderBytes = 8;
+    static constexpr size_t kMaxVersions = 8;
+    static constexpr size_t kMaxWireBytes =
+        kHeaderBytes + kMaxVersions * sizeof(uint16_t);
+
+    static Status encode(const std::vector<uint16_t>& versions,
+                         std::string& wire);
+    static Status decode(std::string_view wire,
+                         std::vector<uint16_t>& versions);
+};
+
 struct CreditControlEnvelope {
     CreditKey key;
     ReceiverCreditUpdateV1 update;

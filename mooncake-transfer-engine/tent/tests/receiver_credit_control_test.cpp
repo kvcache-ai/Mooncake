@@ -43,6 +43,56 @@ TEST(ReceiverCreditControl, NegotiatesOptionalAndRequiredModes) {
     ASSERT_TRUE(required.refresh(1).ok());
 }
 
+TEST(ReceiverCreditControl, CapabilityWireDrivesMixedVersionNegotiation) {
+    std::string wire;
+    ASSERT_TRUE(CreditCapabilityCodecV1::encode({2, 1}, wire).ok());
+    std::vector<uint16_t> versions;
+    ASSERT_TRUE(CreditCapabilityCodecV1::decode(wire, versions).ok());
+    CreditCapabilityState supported(CreditRolloutMode::Required);
+    ASSERT_TRUE(supported.completeNegotiation(versions).ok());
+    EXPECT_EQ(supported.state(), CreditPeerState::Active);
+    EXPECT_EQ(supported.version(), 1);
+
+    ASSERT_TRUE(CreditCapabilityCodecV1::encode({2}, wire).ok());
+    ASSERT_TRUE(CreditCapabilityCodecV1::decode(wire, versions).ok());
+    CreditCapabilityState optional(CreditRolloutMode::Optional);
+    ASSERT_TRUE(optional.completeNegotiation(versions).ok());
+    EXPECT_EQ(optional.state(), CreditPeerState::Legacy);
+    CreditCapabilityState required(CreditRolloutMode::Required);
+    EXPECT_TRUE(required.completeNegotiation(versions).IsNotImplemented());
+    EXPECT_EQ(required.state(), CreditPeerState::Failed);
+}
+
+TEST(ReceiverCreditControl, CapabilityWireRejectsMalformedOffersAtomically) {
+    std::string wire = "sentinel";
+    EXPECT_TRUE(CreditCapabilityCodecV1::encode({1, 1}, wire)
+                    .IsInvalidArgument());
+    EXPECT_EQ(wire, "sentinel");
+    EXPECT_TRUE(CreditCapabilityCodecV1::encode({0}, wire).IsInvalidArgument());
+    EXPECT_EQ(wire, "sentinel");
+    EXPECT_TRUE(CreditCapabilityCodecV1::encode(
+                    std::vector<uint16_t>(
+                        CreditCapabilityCodecV1::kMaxVersions + 1, 1),
+                    wire)
+                    .IsInvalidArgument());
+    EXPECT_EQ(wire, "sentinel");
+
+    ASSERT_TRUE(CreditCapabilityCodecV1::encode({1, 2}, wire).ok());
+    std::vector<uint16_t> output{99};
+    for (size_t length = 0; length < wire.size(); ++length) {
+        EXPECT_TRUE(CreditCapabilityCodecV1::decode(
+                        std::string_view(wire.data(), length), output)
+                        .IsInvalidArgument());
+        EXPECT_EQ(output, std::vector<uint16_t>({99}));
+    }
+    std::string duplicate = wire;
+    duplicate[10] = 0;
+    duplicate[11] = 1;
+    EXPECT_TRUE(CreditCapabilityCodecV1::decode(duplicate, output)
+                    .IsInvalidArgument());
+    EXPECT_EQ(output, std::vector<uint16_t>({99}));
+}
+
 TEST(ReceiverCreditControl, InboxIsBoundedAndDrainIsLimited) {
     BoundedCreditUpdateInbox inbox(2);
     ASSERT_TRUE(inbox.tryPublish(envelope(1, 10)).ok());
