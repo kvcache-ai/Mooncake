@@ -55,16 +55,19 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::Decode(
             ErrorCode::INVALID_PARAMS, "master_service is null"));
     }
 
-    // 1. Decode metadata (must be first to restore metadata shards)
-    auto metadata_result = DecodeMetadata(master_service, payloads.metadata);
-    if (!metadata_result) {
-        return tl::make_unexpected(metadata_result.error());
-    }
-
-    // 2. Decode segments
+    // 1. Decode segments first. A MEMORY replica's allocator is bound to its
+    //    mounted segment, so the segment/allocator must be restored before
+    //    metadata; otherwise GetMountedSegment() returns SEGMENT_NOT_FOUND
+    //    while deserializing the replica.
     auto segments_result = DecodeSegments(master_service, payloads.segments);
     if (!segments_result) {
         return tl::make_unexpected(segments_result.error());
+    }
+
+    // 2. Decode metadata (shards, discarded replicas, replica_next_id)
+    auto metadata_result = DecodeMetadata(master_service, payloads.metadata);
+    if (!metadata_result) {
+        return tl::make_unexpected(metadata_result.error());
     }
 
     // 3. Decode task manager

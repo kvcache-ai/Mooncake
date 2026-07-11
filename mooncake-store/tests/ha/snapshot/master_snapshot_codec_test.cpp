@@ -66,6 +66,60 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTrip) {
         << "Decode failed: " << decode_result.error().message;
 }
 
+TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
+    // Mount a segment and store an object backed by a MEMORY replica. On
+    // decode, the segment/allocator must be restored before the metadata,
+    // otherwise deserializing the replica fails with SEGMENT_NOT_FOUND because
+    // GetMountedSegment() cannot find its backing segment.
+    constexpr size_t kSegmentBase = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    const std::string kKey = "memory_replica_key";
+    const std::string kTenant = "default";
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "codec_test_segment";
+    segment.base = kSegmentBase;
+    segment.size = kSegmentSize;
+    segment.te_endpoint = segment.name;
+
+    UUID client_id = generate_uuid();
+    auto mount_result = master_service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    auto put_start = master_service_->PutStart(
+        client_id, kKey, kTenant,
+        /*slice_length=*/1024, ReplicateConfig{.replica_num = 1});
+    ASSERT_TRUE(put_start.has_value())
+        << "PutStart failed: " << static_cast<int>(put_start.error());
+    auto put_end =
+        master_service_->PutEnd(client_id, kKey, kTenant, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value())
+        << "PutEnd failed: " << static_cast<int>(put_end.error());
+
+    MasterSnapshotCodec codec;
+    MasterSnapshotStateView state_view = MakeStateView(*master_service_);
+
+    auto encode_result = codec.Encode(state_view);
+    ASSERT_TRUE(encode_result.has_value())
+        << "Encode failed: " << encode_result.error().message;
+    EXPECT_FALSE(encode_result.value().segments.empty());
+
+    // Decode into a fresh service. This exercises the segments-before-metadata
+    // restore order.
+    auto target_service = MakeMasterService();
+    auto decode_result =
+        codec.Decode(target_service.get(), encode_result.value());
+    ASSERT_TRUE(decode_result.has_value())
+        << "Decode failed: " << decode_result.error().message;
+
+    // The MEMORY replica must be fully restored and queryable.
+    auto get_result = target_service->GetReplicaList(kKey, kTenant);
+    ASSERT_TRUE(get_result.has_value())
+        << "GetReplicaList failed: " << static_cast<int>(get_result.error());
+    EXPECT_EQ(get_result.value().replicas.size(), 1u);
+}
+
 TEST_F(MasterSnapshotCodecTest, DecodeWithCorruptPayloadFails) {
     MasterSnapshotCodec codec;
 
