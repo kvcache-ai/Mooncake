@@ -64,6 +64,8 @@ enum class CreditUpdateDisposition : uint8_t {
 // Private, sender-side state model. It has no network or Admission integration.
 class SenderCreditLedger {
    public:
+    explicit SenderCreditLedger(size_t max_entries = 1024)
+        : max_entries_(max_entries) {}
     Status activate(const CreditKey&, uint64_t epoch);
     Status applyUpdate(const CreditKey&, const ReceiverCreditUpdateV1&,
                        CreditUpdateDisposition&);
@@ -84,6 +86,7 @@ class SenderCreditLedger {
     static Status normalize(const CreditCharge&,
                             std::array<uint64_t, kCreditResourceCount>&);
     mutable std::mutex mutex_;
+    const size_t max_entries_;
     std::unordered_map<CreditKey, Entry, CreditKeyHash> entries_;
 };
 

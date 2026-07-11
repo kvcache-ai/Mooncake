@@ -44,6 +44,14 @@ Status SenderCreditLedger::normalize(
 Status SenderCreditLedger::activate(const CreditKey& k, uint64_t epoch) {
     if (!epoch) return Status::InvalidArgument("zero credit epoch" LOC_MARK);
     std::lock_guard lock(mutex_);
+    auto existing = entries_.find(k);
+    if (existing != entries_.end()) {
+        if (epoch < existing->second.epoch)
+            return Status::InvalidEntry("stale credit activation" LOC_MARK);
+        if (epoch == existing->second.epoch) return Status::OK();
+    } else if (entries_.size() >= max_entries_) {
+        return Status::TooManyRequests("credit ledger entry limit" LOC_MARK);
+    }
     Entry e;
     e.epoch = epoch;
     entries_.insert_or_assign(k, e);  // fences all prior-epoch unused state

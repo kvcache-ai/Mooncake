@@ -90,6 +90,30 @@ TEST(ReceiverCredit, StaleEpochFailsAndActivationFencesOldState) {
         l.available(key(), CreditResource::DataBytes, v).IsInvalidEntry());
 }
 
+TEST(ReceiverCredit, ActivationReplayCannotMintCredit) {
+    SenderCreditLedger l;
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    grant(l, 1);
+    ASSERT_TRUE(l.tryReserve(key(), charge(80, 1)).ok());
+    ASSERT_TRUE(l.activate(key(), 7).ok());  // idempotent, not a reset
+    uint64_t v;
+    ASSERT_TRUE(l.consumed(key(), CreditResource::DataBytes, v).ok());
+    EXPECT_EQ(v, 80);
+    EXPECT_TRUE(l.activate(key(), 6).IsInvalidEntry());
+    ASSERT_TRUE(l.consumed(key(), CreditResource::DataBytes, v).ok());
+    EXPECT_EQ(v, 80);
+}
+
+TEST(ReceiverCredit, LedgerEntryCountIsBounded) {
+    SenderCreditLedger l(1);
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    auto other = key();
+    ++other.sender_peer;
+    EXPECT_TRUE(l.activate(other, 7).IsTooManyRequests());
+    // A new epoch for an existing key does not consume another entry.
+    EXPECT_TRUE(l.activate(key(), 8).ok());
+}
+
 TEST(ReceiverCredit, InvalidUpdateDoesNotPartiallyMutate) {
     SenderCreditLedger l;
     ASSERT_TRUE(l.activate(key(), 7).ok());
