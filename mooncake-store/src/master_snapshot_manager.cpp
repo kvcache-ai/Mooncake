@@ -496,55 +496,64 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
             snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
-        MasterService::MetadataSerializer metadata_serializer(master_service_);
-        SegmentSerializer segment_serializer(
-            &master_service_->segment_manager_);
-        TaskManagerSerializer task_manager_serializer(
-            &master_service_->task_manager_);
+        std::vector<uint8_t> serialized_metadata;
+        std::vector<uint8_t> serialized_segment;
+        std::vector<uint8_t> serialized_task_manager;
+        {
+            std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+            MasterService::MetadataSerializer metadata_serializer(
+                master_service_);
+            SegmentSerializer segment_serializer(
+                &master_service_->segment_manager_);
+            TaskManagerSerializer task_manager_serializer(
+                &master_service_->task_manager_);
 
-        auto metadata_result = metadata_serializer.Serialize();
-        if (!metadata_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] metadata serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(metadata_result.error().code),
-                metadata_result.error().message);
+            auto metadata_result = metadata_serializer.Serialize();
+            if (!metadata_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] metadata serialization failed, snapshot_id={}, "
+                    "code={}, msg={}",
+                    snapshot_id, toString(metadata_result.error().code),
+                    metadata_result.error().message);
 
-            return tl::make_unexpected(metadata_result.error());
+                return tl::make_unexpected(metadata_result.error());
+            }
+            SNAP_LOG_INFO(
+                "[Snapshot] metadata serialization_successful, snapshot_id={}",
+                snapshot_id);
+
+            auto segment_result = segment_serializer.Serialize();
+            if (!segment_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] segment serialization failed, snapshot_id={}, "
+                    "code={}, msg={}",
+                    snapshot_id, toString(segment_result.error().code),
+                    segment_result.error().message);
+                return tl::make_unexpected(segment_result.error());
+            }
+            SNAP_LOG_INFO(
+                "[Snapshot] segment serialization_successful, snapshot_id={}",
+                snapshot_id);
+
+            auto task_manager_result = task_manager_serializer.Serialize();
+            if (!task_manager_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] task manager serialization failed, "
+                    "snapshot_id={}, "
+                    "code={}, msg={}",
+                    snapshot_id, toString(task_manager_result.error().code),
+                    task_manager_result.error().message);
+                return tl::make_unexpected(task_manager_result.error());
+            }
+            SNAP_LOG_INFO(
+                "[Snapshot] task manager serialization_successful, "
+                "snapshot_id={}",
+                snapshot_id);
+
+            serialized_metadata = std::move(metadata_result.value());
+            serialized_segment = std::move(segment_result.value());
+            serialized_task_manager = std::move(task_manager_result.value());
         }
-        SNAP_LOG_INFO(
-            "[Snapshot] metadata serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        auto segment_result = segment_serializer.Serialize();
-        if (!segment_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] segment serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(segment_result.error().code),
-                segment_result.error().message);
-            return tl::make_unexpected(segment_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] segment serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        auto task_manager_result = task_manager_serializer.Serialize();
-        if (!task_manager_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] task manager serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(task_manager_result.error().code),
-                task_manager_result.error().message);
-            return tl::make_unexpected(task_manager_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] task manager serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        const auto& serialized_metadata = metadata_result.value();
-        const auto& serialized_segment = segment_result.value();
-        const auto& serialized_task_manager = task_manager_result.value();
 
         // When backup_dir is enabled, try all uploads to ensure complete backup
         // When backup_dir is disabled, use fail-fast mode

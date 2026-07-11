@@ -7920,6 +7920,8 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
         packer.pack(entry.tenant_id);
         packer.pack(entry.key);
 
+        entry.metadata->FlushDeferredLease(service_->default_kv_lease_ttl_,
+                                           service_->DefaultKvSoftPinTtl());
         auto result = SerializeMetadata(*entry.metadata, packer);
         if (!result) {
             return tl::make_unexpected(SerializationError(
