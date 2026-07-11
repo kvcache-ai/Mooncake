@@ -91,9 +91,8 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
             }
         } else {
             const auto runOperation = [&]() {
-                auto val = runner.runSingleTransfer(local_addr, target_addr,
-                                                    block_size, batch_size,
-                                                    opcode);
+                auto val = runner.runSingleTransfer(
+                    local_addr, target_addr, block_size, batch_size, opcode);
                 transfer_duration.push_back(val);
             };
             if (XferBenchConfig::receiver_credit_mode != "disabled" &&
