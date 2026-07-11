@@ -28,6 +28,7 @@ int runServer(uint16_t port, uint64_t expected_calls) {
     SenderCreditLedger ledger;
     if (!ledger.activate(key(), 7).ok()) return 2;
     std::atomic<uint64_t> accepted{0};
+    std::atomic<uint64_t> queue_full{0};
     CoroRpcAgent server;
     server.registerFunction(
         kCreditTestRpc, [&](std::string_view wire, std::string& response) {
@@ -39,6 +40,7 @@ int runServer(uint16_t port, uint64_t expected_calls) {
             }
             status = inbox.tryPublish({key(), decoded});
             if (!status.ok()) {
+                ++queue_full;
                 response = "FULL";
                 return;
             }
@@ -71,7 +73,8 @@ int runServer(uint16_t port, uint64_t expected_calls) {
     status = ledger.available(key(), CreditResource::DataBytes, available);
     std::cout << "accepted=" << accepted << " applied=" << applied
               << " duplicate=" << duplicate << " gaps=" << gaps
-              << " available=" << available << std::endl;
+              << " queue_full=" << queue_full << " available=" << available
+              << std::endl;
     return !status.ok() || accepted != expected_calls ? 5 : 0;
 }
 
