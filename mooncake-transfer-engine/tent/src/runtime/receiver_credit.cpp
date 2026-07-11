@@ -31,7 +31,7 @@ Status SenderCreditLedger::normalize(
     if (c.resources.empty())
         return Status::InvalidArgument("empty credit charge" LOC_MARK);
     for (auto [r, amount] : c.resources) {
-        size_t i;
+        size_t i = 0;
         CHECK_STATUS(resourceIndex(r, i));
         if (!amount || out[i])
             return Status::InvalidArgument(
@@ -61,7 +61,7 @@ Status SenderCreditLedger::applyUpdate(const CreditKey& k,
     std::array<uint64_t, kCreditResourceCount> proposed{};
     std::array<bool, kCreditResourceCount> present{};
     for (auto a : u.grants) {
-        size_t i;
+        size_t i = 0;
         CHECK_STATUS(resourceIndex(a.resource, i));
         if (present[i])
             return Status::InvalidArgument("duplicate grant resource" LOC_MARK);
@@ -127,7 +127,7 @@ Status SenderCreditLedger::rollbackReservation(const CreditKey& k,
 
 Status SenderCreditLedger::available(const CreditKey& k, CreditResource r,
                                      uint64_t& v) const {
-    size_t i;
+    size_t i = 0;
     CHECK_STATUS(resourceIndex(r, i));
     std::lock_guard lock(mutex_);
     auto it = entries_.find(k);
@@ -139,7 +139,7 @@ Status SenderCreditLedger::available(const CreditKey& k, CreditResource r,
 
 Status SenderCreditLedger::consumed(const CreditKey& k, CreditResource r,
                                     uint64_t& v) const {
-    size_t i;
+    size_t i = 0;
     CHECK_STATUS(resourceIndex(r, i));
     std::lock_guard lock(mutex_);
     auto it = entries_.find(k);
