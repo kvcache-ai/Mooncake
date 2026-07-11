@@ -184,9 +184,13 @@ class BatchEvictBench {
 
     static bool ReadStrictEnvSize(const char* name, size_t& result) {
         const char* value = std::getenv(name);
+        if (value == nullptr) {
+            LOG(ERROR) << "Environment variable " << name << " is not set";
+            return false;
+        }
         const std::string_view input(value);
         size_t parsed = 0;
-        const auto [end, error] =
+        const auto [end, error] = 
             std::from_chars(input.begin(), input.end(), parsed);
         if (input.empty() || error != std::errc() || end != input.end()) {
             LOG(ERROR) << "Invalid " << name << " value '" << value
