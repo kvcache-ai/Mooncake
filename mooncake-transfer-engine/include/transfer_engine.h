@@ -198,6 +198,8 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
+    std::string showLinks(bool json = false) const;
+
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;

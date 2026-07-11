@@ -292,3 +292,7 @@ if(ENABLE_MULTI_PROTOCOL)
                                                  gtest_main)
   add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()
+
+add_executable(show_links_test ${WORKSPACE}/show_links_test.cpp)
+target_link_libraries(show_links_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME show_links_test COMMAND show_links_test)

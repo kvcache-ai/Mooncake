@@ -1136,6 +1136,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         lid_ = attr.lid;
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
+        active_width_ = attr.active_width;
         {
             std::lock_guard<std::mutex> guard(gid_lock_);
             gid_index_ = gid_index;
