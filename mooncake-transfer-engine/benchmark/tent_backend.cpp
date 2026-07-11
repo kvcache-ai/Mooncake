@@ -15,10 +15,20 @@
 #include "tent_backend.h"
 #include "utils.h"
 #include "char_util.h"
+#include "receiver_credit_metrics.h"
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/runtime/transport_selector.h"
+
+#include <algorithm>
+#include <chrono>
+#include <deque>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "tent/thirdparty/nlohmann/json.h"
 
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
 #include "cuda_alike.h"
@@ -30,6 +40,47 @@
 
 namespace mooncake {
 namespace tent {
+
+namespace {
+
+constexpr const char* kReceiverCreditDemand = "receiver-credit-demand-v1";
+constexpr const char* kReceiverCreditRelease = "receiver-credit-release-v1";
+constexpr const char* kReceiverCreditGrant = "receiver-credit-grant-v1";
+constexpr useconds_t kReceiverCreditPollIntervalUs = 10;
+
+uint64_t steadyNowUs() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+}
+
+struct ReceiverDemand {
+    std::string sender_segment;
+    uint64_t request_id{0};
+    uint64_t bytes{0};
+    uint64_t slots{0};
+    uint64_t arrival_us{0};
+};
+
+struct DelayedReceiverRelease {
+    ReceiverDemand demand;
+    uint64_t due_us{0};
+};
+
+std::string demandKey(const std::string& sender_segment, uint64_t request_id) {
+    return sender_segment + "#" + std::to_string(request_id);
+}
+
+double p99(std::vector<double> samples) {
+    if (samples.empty()) return 0.0;
+    std::sort(samples.begin(), samples.end());
+    const double rank = 0.99 * static_cast<double>(samples.size() - 1);
+    const size_t index = static_cast<size_t>(rank);
+    const double fraction = rank - static_cast<double>(index);
+    if (index + 1 == samples.size()) return samples[index];
+    return samples[index] * (1.0 - fraction) + samples[index + 1] * fraction;
+}
+
+}  // namespace
 
 volatile bool g_tent_running = true;
 volatile bool g_tent_triggered_sig = false;
@@ -207,7 +258,388 @@ TENTBenchRunner::TENTBenchRunner() {
 TENTBenchRunner::~TENTBenchRunner() { freeBuffers(); }
 
 int TENTBenchRunner::runTarget() {
-    while (g_tent_running) sleep(1);
+    const auto& mode = XferBenchConfig::receiver_credit_mode;
+    if (mode == "disabled") {
+        while (g_tent_running) sleep(1);
+        return 0;
+    }
+
+    ReceiverCapacityTracker tracker(XferBenchConfig::receiver_capacity_bytes,
+                                    XferBenchConfig::receiver_capacity_slots);
+    std::unordered_map<std::string, ReceiverDemand> active;
+    std::unordered_set<std::string> seen;
+    std::deque<ReceiverDemand> pending;
+    std::vector<DelayedReceiverRelease> delayed;
+    std::unordered_map<std::string, SegmentID> sender_handles;
+    std::vector<double> completion_latency_us;
+    uint64_t offered = 0;
+    uint64_t completed = 0;
+    uint64_t completed_bytes = 0;
+    uint64_t data_errors = 0;
+    uint64_t first_demand_us = 0;
+    uint64_t last_completion_us = 0;
+
+    auto sendGrant = [&](const ReceiverDemand& demand) -> bool {
+        auto handle = sender_handles.find(demand.sender_segment);
+        if (handle == sender_handles.end()) {
+            SegmentID sender_handle = 0;
+            auto status =
+                engine_->openSegment(sender_handle, demand.sender_segment);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open receiver-credit sender segment "
+                           << demand.sender_segment << ": "
+                           << status.ToString();
+                return false;
+            }
+            handle =
+                sender_handles.emplace(demand.sender_segment, sender_handle)
+                    .first;
+        }
+        nlohmann::json payload = {{"schema_version", 1},
+                                  {"request_id", demand.request_id},
+                                  {"slots", demand.slots}};
+        auto status = engine_->sendNotification(
+            handle->second, Notification{kReceiverCreditGrant, payload.dump()});
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to send receiver-credit grant: "
+                       << status.ToString();
+            return false;
+        }
+        return true;
+    };
+
+    auto admit = [&](const ReceiverDemand& demand, bool enforce) -> bool {
+        if (!tracker.tryReserve(demand.bytes, demand.slots, enforce)) {
+            return false;
+        }
+        active.emplace(demandKey(demand.sender_segment, demand.request_id),
+                       demand);
+        if (enforce && !sendGrant(demand)) {
+            ++data_errors;
+            active.erase(demandKey(demand.sender_segment, demand.request_id));
+            if (!tracker.release(demand.bytes, demand.slots)) ++data_errors;
+            return false;
+        }
+        return true;
+    };
+
+    auto grantPending = [&]() {
+        while (!pending.empty()) {
+            const auto demand = pending.front();
+            if (!admit(demand, true)) break;
+            pending.pop_front();
+        }
+    };
+
+    auto processDueReleases = [&]() {
+        const uint64_t now_us = steadyNowUs();
+        bool released = false;
+        for (auto it = delayed.begin(); it != delayed.end();) {
+            if (it->due_us > now_us) {
+                ++it;
+                continue;
+            }
+            if (!tracker.release(it->demand.bytes, it->demand.slots)) {
+                ++data_errors;
+            } else {
+                completed += it->demand.slots;
+                completed_bytes += it->demand.bytes;
+                last_completion_us = now_us;
+                completion_latency_us.push_back(
+                    static_cast<double>(now_us - it->demand.arrival_us));
+            }
+            it = delayed.erase(it);
+            released = true;
+        }
+        if (released && mode == "credit") grantPending();
+    };
+
+    auto processNotifications = [&]() {
+        std::vector<Notification> notifications;
+        auto status = engine_->receiveNotification(notifications);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to receive receiver-credit notification: "
+                       << status.ToString();
+            ++data_errors;
+            return;
+        }
+        for (const auto& notification : notifications) {
+            try {
+                const auto payload = nlohmann::json::parse(notification.msg);
+                if (payload.value("schema_version", 0) != 1) {
+                    ++data_errors;
+                    continue;
+                }
+                const auto sender = payload.value("sender_segment", "");
+                const auto request_id = payload.value("request_id", 0ull);
+                const auto key = demandKey(sender, request_id);
+                if (notification.name == kReceiverCreditDemand) {
+                    ReceiverDemand demand{
+                        sender, request_id, payload.value("bytes", 0ull),
+                        payload.value("slots", 0ull), steadyNowUs()};
+                    if (sender.empty() || request_id == 0 ||
+                        demand.bytes == 0 || demand.slots == 0 ||
+                        payload.value("mode", "") != mode ||
+                        !seen.emplace(key).second) {
+                        ++data_errors;
+                        continue;
+                    }
+                    if (first_demand_us == 0)
+                        first_demand_us = demand.arrival_us;
+                    offered += demand.slots;
+                    if (mode == "fixed") {
+                        if (!admit(demand, false)) ++data_errors;
+                    } else if (!admit(demand, true)) {
+                        pending.push_back(std::move(demand));
+                    }
+                } else if (notification.name == kReceiverCreditRelease) {
+                    auto active_it = active.find(key);
+                    const auto release_bytes = payload.value("bytes", 0ull);
+                    const auto release_slots = payload.value("slots", 0ull);
+                    if (active_it == active.end() || release_bytes == 0 ||
+                        release_slots == 0 ||
+                        release_bytes > active_it->second.bytes ||
+                        release_slots > active_it->second.slots) {
+                        ++data_errors;
+                        continue;
+                    }
+                    delayed.push_back(DelayedReceiverRelease{
+                        ReceiverDemand{active_it->second.sender_segment,
+                                       active_it->second.request_id,
+                                       release_bytes, release_slots,
+                                       active_it->second.arrival_us},
+                        steadyNowUs() +
+                            XferBenchConfig::receiver_consumer_delay_us});
+                    active_it->second.bytes -= release_bytes;
+                    active_it->second.slots -= release_slots;
+                    if ((active_it->second.bytes == 0) !=
+                        (active_it->second.slots == 0)) {
+                        ++data_errors;
+                    }
+                    if (active_it->second.bytes == 0 &&
+                        active_it->second.slots == 0) {
+                        active.erase(active_it);
+                    }
+                }
+            } catch (const std::exception& error) {
+                LOG(ERROR) << "Malformed receiver-credit notification: "
+                           << error.what();
+                ++data_errors;
+            }
+        }
+    };
+
+    while (g_tent_running) {
+        processNotifications();
+        processDueReleases();
+        usleep(kReceiverCreditPollIntervalUs);
+    }
+
+    const uint64_t drain_deadline_us =
+        steadyNowUs() +
+        std::max<uint64_t>(5000000,
+                           XferBenchConfig::receiver_consumer_delay_us * 2);
+    while ((!active.empty() || !pending.empty() || !delayed.empty()) &&
+           steadyNowUs() < drain_deadline_us) {
+        processNotifications();
+        processDueReleases();
+        usleep(kReceiverCreditPollIntervalUs);
+    }
+    if (!active.empty() || !pending.empty() || !delayed.empty()) {
+        data_errors += active.size() + pending.size() + delayed.size();
+    }
+
+    const double elapsed_us =
+        last_completion_us > first_demand_us
+            ? static_cast<double>(last_completion_us - first_demand_us)
+            : 0.0;
+    ReceiverCreditRunReport report;
+    report.run_id = XferBenchConfig::receiver_credit_run_id;
+    report.mode = mode;
+    report.condition = XferBenchConfig::receiver_credit_condition;
+    report.sender_count = XferBenchConfig::receiver_credit_sender_count;
+    report.repetition = XferBenchConfig::receiver_credit_repetition;
+    report.offered = offered;
+    report.completed = completed;
+    report.data_errors = data_errors;
+    report.throughput_gbps =
+        elapsed_us > 0.0 ? completed_bytes / elapsed_us / 1000.0 : 0.0;
+    report.p99_us = p99(completion_latency_us);
+    report.oracle_throughput_gbps =
+        XferBenchConfig::receiver_credit_oracle_throughput_gbps;
+    report.receiver = tracker.snapshot();
+
+    LOG(INFO) << "RECEIVER_CREDIT_RESULT mode=" << report.mode
+              << " senders=" << report.sender_count
+              << " offered=" << report.offered
+              << " completed=" << report.completed << " capacity_violations="
+              << report.receiver.capacity_violation_total
+              << " peak_bytes=" << report.receiver.peak_bytes
+              << " peak_slots=" << report.receiver.peak_slots
+              << " throughput_gbps=" << report.throughput_gbps
+              << " p99_us=" << report.p99_us
+              << " data_errors=" << report.data_errors;
+    if (!XferBenchConfig::receiver_credit_output_jsonl.empty()) {
+        std::string error;
+        if (!appendReceiverCreditRunJsonl(
+                XferBenchConfig::receiver_credit_output_jsonl, report,
+                &error)) {
+            LOG(ERROR) << error;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int TENTBenchRunner::beginReceiverCreditTransfer(uint64_t* request_id,
+                                                 uint64_t bytes) {
+    const bool lease_mode = XferBenchConfig::receiver_credit_mode == "credit";
+    if (lease_mode) {
+        if (receiver_credit_bytes_per_transfer_ == 0) {
+            receiver_credit_bytes_per_transfer_ = bytes;
+        } else if (receiver_credit_bytes_per_transfer_ != bytes) {
+            LOG(ERROR) << "Receiver-credit transfer size changed within a run";
+            return -1;
+        }
+        if (pollReceiverCreditGrants(false) != 0) return -1;
+        if (receiver_credit_leases_.empty()) {
+            if (receiver_credit_pending_leases_.empty()) {
+                const uint64_t remaining =
+                    XferBenchConfig::receiver_credit_operations -
+                    receiver_credit_requested_;
+                const uint64_t slots = std::min(
+                    XferBenchConfig::receiver_credit_grant_batch, remaining);
+                if (requestReceiverCreditLease(bytes, slots) != 0) return -1;
+            }
+            if (pollReceiverCreditGrants(true) != 0) return -1;
+        }
+        auto& lease = receiver_credit_leases_.front();
+        *request_id = lease.id;
+        --lease.remaining;
+        --receiver_credit_available_;
+        ++receiver_credit_consumed_;
+        if (lease.remaining == 0) receiver_credit_leases_.pop_front();
+
+        const uint64_t low_watermark = std::max<uint64_t>(
+            1, XferBenchConfig::receiver_credit_grant_batch / 2);
+        if (receiver_credit_available_ <= low_watermark &&
+            receiver_credit_pending_leases_.empty() &&
+            receiver_credit_requested_ <
+                XferBenchConfig::receiver_credit_operations) {
+            const uint64_t remaining =
+                XferBenchConfig::receiver_credit_operations -
+                receiver_credit_requested_;
+            const uint64_t slots = std::min(
+                XferBenchConfig::receiver_credit_grant_batch, remaining);
+            if (requestReceiverCreditLease(bytes, slots) != 0) return -1;
+        }
+        return 0;
+    }
+
+    nlohmann::json payload = {
+        {"schema_version", 1},
+        {"sender_segment", engine_->getSegmentName()},
+        {"request_id", *request_id},
+        {"bytes", bytes},
+        {"slots", 1},
+        {"mode", XferBenchConfig::receiver_credit_mode},
+    };
+    auto status = engine_->sendNotification(
+        handle_, Notification{kReceiverCreditDemand, payload.dump()});
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to send receiver-credit demand: "
+                   << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
+int TENTBenchRunner::requestReceiverCreditLease(uint64_t bytes,
+                                                uint64_t slots) {
+    if (slots == 0 || bytes > std::numeric_limits<uint64_t>::max() / slots) {
+        LOG(ERROR) << "Receiver-credit lease size is invalid";
+        return -1;
+    }
+    const uint64_t request_id = ++receiver_credit_request_id_;
+    nlohmann::json payload = {
+        {"schema_version", 1},
+        {"sender_segment", engine_->getSegmentName()},
+        {"request_id", request_id},
+        {"bytes", bytes * slots},
+        {"slots", slots},
+        {"mode", XferBenchConfig::receiver_credit_mode},
+    };
+    auto status = engine_->sendNotification(
+        handle_, Notification{kReceiverCreditDemand, payload.dump()});
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to send receiver-credit lease demand: "
+                   << status.ToString();
+        return -1;
+    }
+    receiver_credit_pending_leases_.emplace(request_id, slots);
+    receiver_credit_requested_ += slots;
+    return 0;
+}
+
+int TENTBenchRunner::pollReceiverCreditGrants(bool wait_for_available) {
+    const uint64_t deadline_us =
+        steadyNowUs() +
+        XferBenchConfig::receiver_credit_grant_timeout_ms * 1000;
+    do {
+        std::vector<Notification> notifications;
+        auto status = engine_->receiveNotification(notifications);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to receive receiver-credit grant: "
+                       << status.ToString();
+            return -1;
+        }
+        for (const auto& notification : notifications) {
+            if (notification.name != kReceiverCreditGrant) continue;
+            try {
+                const auto grant = nlohmann::json::parse(notification.msg);
+                const auto request_id = grant.value("request_id", 0ull);
+                const auto pending =
+                    receiver_credit_pending_leases_.find(request_id);
+                if (grant.value("schema_version", 0) != 1 ||
+                    pending == receiver_credit_pending_leases_.end() ||
+                    grant.value("slots", 0ull) != pending->second) {
+                    LOG(ERROR) << "Unexpected receiver-credit grant";
+                    return -1;
+                }
+                receiver_credit_leases_.push_back(
+                    ReceiverCreditLease{request_id, pending->second});
+                receiver_credit_available_ += pending->second;
+                receiver_credit_pending_leases_.erase(pending);
+            } catch (const std::exception& error) {
+                LOG(ERROR) << "Malformed receiver-credit grant: "
+                           << error.what();
+                return -1;
+            }
+        }
+        if (!wait_for_available || !receiver_credit_leases_.empty()) return 0;
+        usleep(kReceiverCreditPollIntervalUs);
+    } while (steadyNowUs() < deadline_us);
+
+    LOG(ERROR) << "Timed out waiting for receiver-credit lease";
+    return -1;
+}
+
+int TENTBenchRunner::finishReceiverCreditTransfer(uint64_t request_id,
+                                                  uint64_t bytes) {
+    uint64_t release_bytes = bytes;
+    uint64_t release_slots = 1;
+    nlohmann::json payload = {{"schema_version", 1},
+                              {"sender_segment", engine_->getSegmentName()},
+                              {"request_id", request_id},
+                              {"bytes", release_bytes},
+                              {"slots", release_slots}};
+    auto status = engine_->sendNotification(
+        handle_, Notification{kReceiverCreditRelease, payload.dump()});
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to send receiver-credit release: "
+                   << status.ToString();
+        return -1;
+    }
     return 0;
 }
 
@@ -258,7 +690,8 @@ static inline int getGpuDeviceNumaID(int gpu_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++)
+        ;
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #elif defined(USE_HIP)
@@ -338,6 +771,16 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t target_addr,
                                           uint64_t block_size,
                                           uint64_t batch_size, OpCode opcode) {
+    XferBenchTimer timer;
+    uint64_t receiver_credit_request_id = 0;
+    const uint64_t receiver_credit_bytes = block_size * batch_size;
+    if (XferBenchConfig::receiver_credit_mode != "disabled") {
+        receiver_credit_request_id = ++receiver_credit_request_id_;
+        if (beginReceiverCreditTransfer(&receiver_credit_request_id,
+                                        receiver_credit_bytes) != 0) {
+            exit(EXIT_FAILURE);
+        }
+    }
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -350,7 +793,6 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.transport_hint = transport_hint_;
         requests.emplace_back(entry);
     }
-    XferBenchTimer timer;
     if (XferBenchConfig::notifi) {
         // Use target_addr as msg for verification by peer
         Notification notifi{"benchmark", std::to_string(target_addr)};
@@ -370,6 +812,11 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
     }
     auto duration = timer.lap_us();
     CHECK_FAIL(engine_->freeBatch(batch_id));
+    if (XferBenchConfig::receiver_credit_mode != "disabled" &&
+        finishReceiverCreditTransfer(receiver_credit_request_id,
+                                     receiver_credit_bytes) != 0) {
+        exit(EXIT_FAILURE);
+    }
     return duration;
 }
 

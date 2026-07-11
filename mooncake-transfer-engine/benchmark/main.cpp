@@ -51,15 +51,16 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
             target_gpu_offset + thread_id, max_block_size, max_batch_size);
 
         XferBenchTimer timer;
-        while (timer.lap_us(false) < 1000000ull) {
-            runner.runSingleTransfer(local_addr, target_addr, block_size,
-                                     batch_size, opcode);
+        if (XferBenchConfig::receiver_credit_mode == "disabled") {
+            while (timer.lap_us(false) < 1000000ull) {
+                runner.runSingleTransfer(local_addr, target_addr, block_size,
+                                         batch_size, opcode);
+            }
         }
         timer.reset();
         std::vector<double> transfer_duration;
         if (mixed_opcode) {
-            while (timer.lap_us(false) <
-                   XferBenchConfig::duration * 1000000ull) {
+            const auto runConsistencyPair = [&]() {
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
                     pattern =
@@ -74,13 +75,39 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
                     verifyData((void*)local_addr, block_size * batch_size,
                                pattern);
                 transfer_duration.push_back(val);
+            };
+            if (XferBenchConfig::receiver_credit_mode != "disabled" &&
+                XferBenchConfig::receiver_credit_operations > 0) {
+                for (uint64_t operation = 0;
+                     operation < XferBenchConfig::receiver_credit_operations;
+                     operation += 2) {
+                    runConsistencyPair();
+                }
+            } else {
+                while (timer.lap_us(false) <
+                       XferBenchConfig::duration * 1000000ull) {
+                    runConsistencyPair();
+                }
             }
         } else {
-            while (timer.lap_us(false) <
-                   XferBenchConfig::duration * 1000000ull) {
-                auto val = runner.runSingleTransfer(
-                    local_addr, target_addr, block_size, batch_size, opcode);
+            const auto runOperation = [&]() {
+                auto val = runner.runSingleTransfer(local_addr, target_addr,
+                                                    block_size, batch_size,
+                                                    opcode);
                 transfer_duration.push_back(val);
+            };
+            if (XferBenchConfig::receiver_credit_mode != "disabled" &&
+                XferBenchConfig::receiver_credit_operations > 0) {
+                for (uint64_t operation = 0;
+                     operation < XferBenchConfig::receiver_credit_operations;
+                     ++operation) {
+                    runOperation();
+                }
+            } else {
+                while (timer.lap_us(false) <
+                       XferBenchConfig::duration * 1000000ull) {
+                    runOperation();
+                }
             }
         }
         auto total_duration = timer.lap_us();
@@ -102,6 +129,73 @@ int main(int argc, char* argv[]) {
         "Usage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
+    const auto& receiver_credit_mode = XferBenchConfig::receiver_credit_mode;
+    if (receiver_credit_mode != "disabled" && receiver_credit_mode != "fixed" &&
+        receiver_credit_mode != "credit") {
+        LOG(ERROR) << "receiver_credit_mode must be disabled, fixed, or credit";
+        return EXIT_FAILURE;
+    }
+    if (receiver_credit_mode != "disabled") {
+        if (XferBenchConfig::backend != "tent" ||
+            XferBenchConfig::xport_type != "rdma") {
+            LOG(ERROR) << "receiver-credit experiments require tent RDMA";
+            return EXIT_FAILURE;
+        }
+        if (XferBenchConfig::receiver_capacity_bytes == 0 ||
+            XferBenchConfig::receiver_capacity_slots == 0) {
+            LOG(ERROR) << "receiver capacity bytes and slots must be positive";
+            return EXIT_FAILURE;
+        }
+        if (XferBenchConfig::receiver_credit_grant_batch == 0) {
+            LOG(ERROR) << "receiver_credit_grant_batch must be positive";
+            return EXIT_FAILURE;
+        }
+        if (!XferBenchConfig::target_seg_name.empty() &&
+            receiver_credit_mode == "credit" &&
+            XferBenchConfig::receiver_credit_operations == 0) {
+            LOG(ERROR) << "credit mode requires receiver_credit_operations";
+            return EXIT_FAILURE;
+        }
+        if (!XferBenchConfig::target_seg_name.empty() &&
+            receiver_credit_mode == "credit" &&
+            XferBenchConfig::receiver_credit_operations %
+                    XferBenchConfig::receiver_credit_grant_batch !=
+                0) {
+            LOG(ERROR) << "receiver_credit_operations must be divisible by "
+                          "receiver_credit_grant_batch";
+            return EXIT_FAILURE;
+        }
+        if (!XferBenchConfig::target_seg_name.empty() &&
+            (XferBenchConfig::start_block_size !=
+                 XferBenchConfig::max_block_size ||
+             XferBenchConfig::start_batch_size !=
+                 XferBenchConfig::max_batch_size)) {
+            LOG(ERROR) << "receiver-credit runs require one block and batch "
+                          "size";
+            return EXIT_FAILURE;
+        }
+        if (!XferBenchConfig::target_seg_name.empty() &&
+            (XferBenchConfig::start_num_threads != 1 ||
+             XferBenchConfig::max_num_threads != 1)) {
+            LOG(ERROR)
+                << "the benchmark-only receiver-credit protocol requires "
+                   "one worker per sender process";
+            return EXIT_FAILURE;
+        }
+        if (!XferBenchConfig::target_seg_name.empty() &&
+            XferBenchConfig::op_type != "write" &&
+            XferBenchConfig::op_type != "mix") {
+            LOG(ERROR) << "receiver-credit capacity runs require "
+                          "--op_type=write or mix";
+            return EXIT_FAILURE;
+        }
+        if (!XferBenchConfig::target_seg_name.empty() &&
+            XferBenchConfig::op_type == "mix" &&
+            XferBenchConfig::receiver_credit_operations % 2 != 0) {
+            LOG(ERROR) << "receiver_credit_operations must be even for mix";
+            return EXIT_FAILURE;
+        }
+    }
     std::unique_ptr<BenchRunner> runner;
     if (XferBenchConfig::backend == "classic") {
         runner = std::make_unique<TEBenchRunner>();

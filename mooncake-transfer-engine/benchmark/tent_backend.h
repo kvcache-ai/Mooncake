@@ -23,6 +23,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <fcntl.h>
 #include <gflags/gflags.h>
@@ -30,6 +31,8 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <memory>
+#include <atomic>
+#include <unordered_map>
 
 #include "tent/transfer_engine.h"
 #include "tent/common/utils/random.h"
@@ -74,6 +77,14 @@ class TENTBenchRunner : public BenchRunner {
                              uint64_t block_size, uint64_t batch_size,
                              OpCode opcode);
 
+    int beginReceiverCreditTransfer(uint64_t* request_id, uint64_t bytes);
+
+    int finishReceiverCreditTransfer(uint64_t request_id, uint64_t bytes);
+
+    int requestReceiverCreditLease(uint64_t bytes, uint64_t slots);
+
+    int pollReceiverCreditGrants(bool wait_for_available);
+
    private:
     int allocateBuffers();
 
@@ -87,6 +98,17 @@ class TENTBenchRunner : public BenchRunner {
     SegmentID handle_;
     SegmentInfo info_;
     TransportType transport_hint_{UNSPEC};
+    std::atomic<uint64_t> receiver_credit_request_id_{0};
+    struct ReceiverCreditLease {
+        uint64_t id{0};
+        uint64_t remaining{0};
+    };
+    std::deque<ReceiverCreditLease> receiver_credit_leases_;
+    std::unordered_map<uint64_t, uint64_t> receiver_credit_pending_leases_;
+    uint64_t receiver_credit_available_{0};
+    uint64_t receiver_credit_requested_{0};
+    uint64_t receiver_credit_consumed_{0};
+    uint64_t receiver_credit_bytes_per_transfer_{0};
 
     std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;

@@ -63,3 +63,23 @@ endif()
 set_target_properties(
   tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
                      INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
+
+if(BUILD_UNIT_TESTS)
+  add_executable(
+    tebench_receiver_credit_metrics_test
+    tests/receiver_credit_metrics_test.cpp receiver_credit_metrics.cpp)
+  target_link_libraries(tebench_receiver_credit_metrics_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  target_include_directories(
+    tebench_receiver_credit_metrics_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_receiver_credit_metrics_test
+           COMMAND tebench_receiver_credit_metrics_test)
+
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(
+    NAME tebench_receiver_credit_verifier_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_receiver_credit_results_test.py)
+endif()
