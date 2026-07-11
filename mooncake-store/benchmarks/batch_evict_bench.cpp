@@ -1,8 +1,6 @@
 #include "master_service.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -11,8 +9,6 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <string_view>
-#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -20,45 +16,25 @@
 #include "glog/logging.h"
 #include "types.h"
 
+DEFINE_uint64(
+    num_objects, 0,
+    "Run a single custom scale with this object count (0 = default scales)");
+DEFINE_double(evict_ratio_target, 0.50, "BatchEvict target eviction ratio");
+DEFINE_double(evict_ratio_lowerbound, 0.25,
+              "BatchEvict lower-bound eviction ratio");
+
 namespace mooncake::benchmarks {
 
 class BatchEvictBench {
    public:
-    static bool ConfigureFromEnv() {
-        if (!ReadEvictionRatios(evict_ratio_target_, evict_ratio_lowerbound_)) {
-            return false;
-        }
-
-        if (std::getenv("MOONCAKE_EVICT_BENCH_OBJECTS") != nullptr ||
-            std::getenv("MOONCAKE_EVICT_BENCH_TARGET_RATIO") != nullptr ||
-            std::getenv("MOONCAKE_EVICT_BENCH_LOWERBOUND_RATIO") != nullptr) {
-            LOG(INFO) << "BatchEvict benchmark config: target_ratio="
-                      << evict_ratio_target_
-                      << ", lowerbound_ratio=" << evict_ratio_lowerbound_;
-        }
-        return true;
-    }
-
     static bool RunRealBatchEvictScales() {
         std::vector<size_t> scales = {10000, 100000};
-        const char* objects = std::getenv("MOONCAKE_EVICT_BENCH_OBJECTS");
-        if (objects != nullptr) {
-            size_t num_objects = 0;
-            if (!ReadStrictEnvSize("MOONCAKE_EVICT_BENCH_OBJECTS",
-                                   num_objects)) {
-                return false;
-            }
-            if (num_objects == 0) {
-                LOG(ERROR) << "MOONCAKE_EVICT_BENCH_OBJECTS must be greater "
-                              "than zero";
-                return false;
-            }
-            scales = {num_objects};
-        }
         const char* large_mode = std::getenv("MOONCAKE_EVICT_BENCH_LARGE");
-        if (objects == nullptr && large_mode != nullptr &&
-            std::string(large_mode) == "1") {
+        if (large_mode != nullptr && std::string(large_mode) == "1") {
             scales.push_back(1000000);
+        }
+        if (FLAGS_num_objects > 0) {
+            scales = {static_cast<size_t>(FLAGS_num_objects)};
         }
 
         std::cout << "num_objects,total_us,objects_before,objects_after,"
@@ -119,11 +95,6 @@ class BatchEvictBench {
     static constexpr const char* kSegmentName = "batch_evict_bench_segment";
     static constexpr size_t kSegmentBase = 0x300000000;
     static constexpr uint64_t kObjectSize = 1024;
-    static constexpr double kEvictRatioTarget = 0.50;
-    static constexpr double kEvictRatioLowerbound = 0.25;
-
-    inline static double evict_ratio_target_ = kEvictRatioTarget;
-    inline static double evict_ratio_lowerbound_ = kEvictRatioLowerbound;
 
     struct MetadataStats {
         size_t object_count{0};
@@ -180,66 +151,6 @@ class BatchEvictBench {
             return default_value;
         }
         return static_cast<size_t>(parsed);
-    }
-
-    static bool ReadStrictEnvSize(const char* name, size_t& result) {
-        const char* value = std::getenv(name);
-        if (value == nullptr) {
-            LOG(ERROR) << "Environment variable " << name << " is not set";
-            return false;
-        }
-        const std::string_view input(value);
-        size_t parsed = 0;
-        const auto [end, error] = 
-            std::from_chars(input.begin(), input.end(), parsed);
-        if (input.empty() || error != std::errc() || end != input.end()) {
-            LOG(ERROR) << "Invalid " << name << " value '" << value
-                       << "': expected a base-10 size_t";
-            return false;
-        }
-
-        result = parsed;
-        return true;
-    }
-
-    static bool ReadEnvDouble(const char* name, double default_value,
-                              double& result) {
-        const char* value = std::getenv(name);
-        if (value == nullptr) {
-            result = default_value;
-            return true;
-        }
-
-        errno = 0;
-        char* end = nullptr;
-        const double parsed = std::strtod(value, &end);
-        if (value[0] == '\0' || end == value || end[0] != '\0' ||
-            errno == ERANGE || !std::isfinite(parsed)) {
-            LOG(ERROR) << "Invalid " << name << " value '" << value
-                       << "': expected a finite floating-point number";
-            return false;
-        }
-
-        result = parsed;
-        return true;
-    }
-
-    static bool ReadEvictionRatios(double& target_ratio,
-                                   double& lowerbound_ratio) {
-        if (!ReadEnvDouble("MOONCAKE_EVICT_BENCH_TARGET_RATIO",
-                           kEvictRatioTarget, target_ratio) ||
-            !ReadEnvDouble("MOONCAKE_EVICT_BENCH_LOWERBOUND_RATIO",
-                           kEvictRatioLowerbound, lowerbound_ratio)) {
-            return false;
-        }
-        if (!(lowerbound_ratio > 0.0 && lowerbound_ratio <= target_ratio &&
-              target_ratio <= 1.0)) {
-            LOG(ERROR) << "Invalid eviction ratios: require 0 < lowerbound <= "
-                          "target <= 1, got target="
-                       << target_ratio << ", lowerbound=" << lowerbound_ratio;
-            return false;
-        }
-        return true;
     }
 
     static uint64_t PercentileValue(std::vector<uint64_t> values,
@@ -399,7 +310,7 @@ class BatchEvictBench {
                                        size_t evicted_count,
                                        uint64_t freed_bytes) {
         const size_t lowerbound = static_cast<size_t>(
-            std::ceil(objects_before * evict_ratio_lowerbound_));
+            std::ceil(objects_before * FLAGS_evict_ratio_lowerbound));
         if (evicted_count < lowerbound) {
             LOG(ERROR) << "evicted_count below lowerbound: evicted="
                        << evicted_count << ", lowerbound=" << lowerbound;
@@ -435,7 +346,8 @@ class BatchEvictBench {
         }
 
         const auto evict_start = std::chrono::steady_clock::now();
-        service.BatchEvict(evict_ratio_target_, evict_ratio_lowerbound_);
+        service.BatchEvict(FLAGS_evict_ratio_target,
+                           FLAGS_evict_ratio_lowerbound);
         const auto total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - evict_start)
@@ -490,7 +402,8 @@ class BatchEvictBench {
         });
 
         const auto evict_start = std::chrono::steady_clock::now();
-        service.BatchEvict(evict_ratio_target_, evict_ratio_lowerbound_);
+        service.BatchEvict(FLAGS_evict_ratio_target,
+                           FLAGS_evict_ratio_lowerbound);
         const auto batch_evict_total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - evict_start)
@@ -525,9 +438,24 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+    if (!(FLAGS_evict_ratio_lowerbound > 0.0 &&
+          FLAGS_evict_ratio_lowerbound <= FLAGS_evict_ratio_target &&
+          FLAGS_evict_ratio_target <= 1.0)) {
+        LOG(ERROR) << "Invalid eviction ratios: require 0 < lowerbound <= "
+                      "target <= 1, got target="
+                   << FLAGS_evict_ratio_target
+                   << ", lowerbound=" << FLAGS_evict_ratio_lowerbound;
+        google::ShutdownGoogleLogging();
+        return 1;
+    }
+
+    LOG(INFO) << "BatchEvict benchmark config: num_objects="
+              << FLAGS_num_objects
+              << ", target_ratio=" << FLAGS_evict_ratio_target
+              << ", lowerbound_ratio=" << FLAGS_evict_ratio_lowerbound;
+
     using mooncake::benchmarks::BatchEvictBench;
-    const bool ok = BatchEvictBench::ConfigureFromEnv() &&
-                    BatchEvictBench::RunRealBatchEvictScales() &&
+    const bool ok = BatchEvictBench::RunRealBatchEvictScales() &&
                     BatchEvictBench::RunSingleWaiterSnapshotMutexProbe();
 
     google::ShutdownGoogleLogging();
