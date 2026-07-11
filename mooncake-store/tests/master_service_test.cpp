@@ -2240,11 +2240,11 @@ TEST_F(MasterServiceTest, GetReplicaListFallsBackToLongestStoredPrefix) {
     const std::string extended_key = prefix_key + "_turn2_user_prompt";
     put_object(*service_, client_id, prefix_key);
 
-    auto exact_result = service_->GetReplicaList(prefix_key);
+    auto exact_result = service_->GetReplicaList(prefix_key, "default");
     ASSERT_TRUE(exact_result.has_value());
     ASSERT_EQ(1, exact_result.value().replicas.size());
 
-    auto prefix_result = service_->GetReplicaList(extended_key);
+    auto prefix_result = service_->GetReplicaList(extended_key, "default");
     ASSERT_TRUE(prefix_result.has_value())
         << "GetReplicaList should return the longest stored KVCache prefix";
     ASSERT_EQ(1, prefix_result.value().replicas.size());
