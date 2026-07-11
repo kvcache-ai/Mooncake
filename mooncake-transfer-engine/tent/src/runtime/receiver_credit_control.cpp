@@ -231,7 +231,7 @@ Status CreditPeerContextTable::activate(uint64_t target_id,
                                         uint64_t sender_peer,
                                         uint32_t qos_class,
                                         const CreditActivationV1& activation) {
-    if (!target_id || !sender_peer || activation.schema_version != 1 ||
+    if (!sender_peer || activation.schema_version != 1 ||
         activation.chosen_version != 1 ||
         (!activation.receiver_session_id.high &&
          !activation.receiver_session_id.low) ||

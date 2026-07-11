@@ -171,6 +171,24 @@ TEST(AdmissionQueueTest, RejectsExistingPublicTaskConflictWithoutMutation) {
     EXPECT_EQ(admitted_ids[0], 2u);
 }
 
+TEST(AdmissionQueueTest, DeferredDispatchReturnsOwnerToQueue) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    ASSERT_TRUE(
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids)
+            .ok());
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(queue.deferDispatch(picked[0]).ok());
+    EXPECT_TRUE(queue.deferDispatch(picked[0]).IsInvalidEntry());
+
+    auto retried = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(retried.size(), 1u);
+    EXPECT_EQ(retried[0], picked[0]);
+    EXPECT_TRUE(queue.complete(retried[0], TransferStatusEnum::COMPLETED).ok());
+}
+
 TEST(AdmissionQueueTest, AccountsPublicSlotsSeparatelyFromQueueOwners) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;

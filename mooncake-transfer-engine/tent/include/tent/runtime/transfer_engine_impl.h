@@ -20,8 +20,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +33,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/receiver_credit_dispatch.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 
@@ -176,6 +179,16 @@ class TransferEngineImpl {
         }
     }
 
+    using CreditQosProvider = std::function<uint32_t(const Request&)>;
+    // Installs the control-plane state used by the opt-in receiver-credit
+    // dispatch gate. The engine retains shared ownership so queued snapshots
+    // and reservations cannot outlive their context or ledger. Must be called
+    // before submitting transfers when receiver_credit/enabled is true.
+    Status installReceiverCreditDispatch(
+        std::shared_ptr<CreditPeerContextTable> contexts,
+        std::shared_ptr<SenderCreditLedger> ledger,
+        CreditQosProvider qos_provider = nullptr);
+
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
@@ -294,6 +307,8 @@ class TransferEngineImpl {
 
     struct RuntimeQueueConfig {
         bool enabled{false};
+        bool receiver_credit_enabled{false};
+        uint32_t receiver_credit_default_qos_class{0};
         QueueLimits limits{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
@@ -306,6 +321,8 @@ class TransferEngineImpl {
         std::vector<size_t> public_task_ids;
         size_t byte_charge{0};
         bool in_dispatch_window{false};
+        std::optional<CreditDispatchSnapshot> credit_snapshot;
+        std::optional<CreditDispatchReservation> credit_reservation;
     };
 
    private:
@@ -337,6 +354,10 @@ class TransferEngineImpl {
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
+    std::shared_ptr<CreditPeerContextTable> receiver_credit_contexts_;
+    std::shared_ptr<SenderCreditLedger> receiver_credit_ledger_;
+    std::shared_ptr<ReceiverCreditDispatchGate> receiver_credit_dispatch_gate_;
+    CreditQosProvider receiver_credit_qos_provider_;
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};
     uint64_t next_batch_token_{1};

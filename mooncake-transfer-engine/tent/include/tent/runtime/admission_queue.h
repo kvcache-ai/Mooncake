@@ -126,6 +126,8 @@ class LocalTransferAdmissionQueue {
         size_t max_owners, size_t max_bytes,
         std::vector<QueueOwnerId>* dropped_owner_ids = nullptr);
 
+    Status deferDispatch(QueueOwnerId owner_id);
+
     // Install the step-3 degradation policy inputs. Optional; without it the
     // queue never drops (default behavior). now defaults to steady_clock.
     void setDegradationPolicy(BandwidthProvider bandwidth_provider,
