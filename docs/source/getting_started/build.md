@@ -13,8 +13,7 @@ This document describes how to build Mooncake.
 
 Install common build dependencies first. A stable Internet connection is
 required because the script installs system packages, initializes submodules,
-installs Go, installs the xxHash development package, and builds/installs
-yalantinglibs from the `extern/yalantinglibs` submodule.
+installs Go, and builds/installs yalantinglibs.
 
 ```bash
 sudo bash dependencies.sh
