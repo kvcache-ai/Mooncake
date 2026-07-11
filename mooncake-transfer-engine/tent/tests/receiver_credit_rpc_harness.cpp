@@ -23,7 +23,7 @@ ReceiverCreditUpdateV1 update(uint64_t sequence) {
     return u;
 }
 
-int runServer(uint16_t port, uint64_t expected_calls) {
+int runServer(uint16_t port, uint64_t expected_calls, uint64_t drain_delay_us) {
     BoundedCreditUpdateInbox inbox(64);
     SenderCreditLedger ledger;
     if (!ledger.activate(key(), 7).ok()) return 2;
@@ -67,6 +67,9 @@ int runServer(uint16_t port, uint64_t expected_calls) {
             else
                 ++applied;
         }
+        if (drain_delay_us)
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(drain_delay_us));
         std::this_thread::yield();
     }
     uint64_t available = 0;
@@ -98,11 +101,13 @@ int runClient(const std::string& address, uint64_t first, uint64_t count) {
 
 int main(int argc, char** argv) {
     using namespace mooncake::tent;
-    if (argc == 4 && std::string(argv[1]) == "server")
+    if ((argc == 4 || argc == 5) && std::string(argv[1]) == "server")
         return runServer(static_cast<uint16_t>(std::stoul(argv[2])),
-                         std::stoull(argv[3]));
+                         std::stoull(argv[3]),
+                         argc == 5 ? std::stoull(argv[4]) : 0);
     if (argc == 5 && std::string(argv[1]) == "client")
         return runClient(argv[2], std::stoull(argv[3]), std::stoull(argv[4]));
-    std::cerr << "server <port> <calls> | client <ip:port> <first> <count>\n";
+    std::cerr << "server <port> <calls> [drain_delay_us] | client <ip:port> "
+                 "<first> <count>\n";
     return 1;
 }
