@@ -55,6 +55,23 @@ class CreditCapabilityCodecV1 {
                          std::vector<uint16_t>& versions);
 };
 
+struct CreditActivationV1 {
+    uint16_t schema_version{1};
+    uint16_t chosen_version{1};
+    ReceiverSessionId receiver_session_id;
+    uint64_t epoch{0};
+    uint32_t freshness_ttl_ms{0};
+};
+
+class CreditActivationCodecV1 {
+   public:
+    static constexpr size_t kWireBytes = 40;
+    static Status encode(const CreditActivationV1& activation,
+                         std::string& wire);
+    static Status decode(std::string_view wire,
+                         CreditActivationV1& activation);
+};
+
 struct CreditControlEnvelope {
     CreditKey key;
     ReceiverCreditUpdateV1 update;

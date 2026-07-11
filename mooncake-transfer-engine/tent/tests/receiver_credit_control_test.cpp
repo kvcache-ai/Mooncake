@@ -93,6 +93,54 @@ TEST(ReceiverCreditControl, CapabilityWireRejectsMalformedOffersAtomically) {
     EXPECT_EQ(output, std::vector<uint16_t>({99}));
 }
 
+TEST(ReceiverCreditControl, ActivationWireCreatesEpochFencedLedgerContext) {
+    CreditActivationV1 original;
+    original.receiver_session_id = {11, 22};
+    original.epoch = 7;
+    original.freshness_ttl_ms = 900;
+    std::string wire;
+    ASSERT_TRUE(CreditActivationCodecV1::encode(original, wire).ok());
+    EXPECT_EQ(wire.size(), CreditActivationCodecV1::kWireBytes);
+    CreditActivationV1 decoded;
+    ASSERT_TRUE(CreditActivationCodecV1::decode(wire, decoded).ok());
+    EXPECT_EQ(decoded.receiver_session_id, original.receiver_session_id);
+    EXPECT_EQ(decoded.epoch, 7);
+
+    CreditKey activation_key{decoded.receiver_session_id, 33, 4};
+    SenderCreditLedger ledger;
+    ASSERT_TRUE(ledger.activate(activation_key, decoded.epoch).ok());
+    ASSERT_TRUE(ledger.activate(activation_key, decoded.epoch + 1).ok());
+    EXPECT_TRUE(ledger.deactivate(activation_key, decoded.epoch)
+                    .IsInvalidEntry());
+}
+
+TEST(ReceiverCreditControl, ActivationWireRejectsMalformedInputAtomically) {
+    CreditActivationV1 original;
+    original.receiver_session_id = {11, 22};
+    original.epoch = 7;
+    std::string wire;
+    ASSERT_TRUE(CreditActivationCodecV1::encode(original, wire).ok());
+    CreditActivationV1 output;
+    output.epoch = 99;
+    for (size_t length = 0; length < wire.size(); ++length) {
+        EXPECT_TRUE(CreditActivationCodecV1::decode(
+                        std::string_view(wire.data(), length), output)
+                        .IsInvalidArgument());
+        EXPECT_EQ(output.epoch, 99);
+    }
+    std::string reserved = wire;
+    reserved.back() = 1;
+    EXPECT_TRUE(CreditActivationCodecV1::decode(reserved, output)
+                    .IsInvalidArgument());
+    EXPECT_EQ(output.epoch, 99);
+
+    original.receiver_session_id = {};
+    std::string unchanged = "sentinel";
+    EXPECT_TRUE(CreditActivationCodecV1::encode(original, unchanged)
+                    .IsInvalidArgument());
+    EXPECT_EQ(unchanged, "sentinel");
+}
+
 TEST(ReceiverCreditControl, InboxIsBoundedAndDrainIsLimited) {
     BoundedCreditUpdateInbox inbox(2);
     ASSERT_TRUE(inbox.tryPublish(envelope(1, 10)).ok());

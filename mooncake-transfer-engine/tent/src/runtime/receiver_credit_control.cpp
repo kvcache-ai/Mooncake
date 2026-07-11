@@ -86,6 +86,7 @@ size_t BoundedCreditUpdateInbox::size() const {
 namespace {
 constexpr uint32_t kCreditMagic = 0x54435231;  // "TCR1"
 constexpr uint32_t kCapabilityMagic = 0x54434331;  // "TCC1"
+constexpr uint32_t kActivationMagic = 0x54434131;  // "TCA1"
 void append16(std::string& out, uint16_t v) {
     out.push_back(static_cast<char>(v >> 8));
     out.push_back(static_cast<char>(v));
@@ -166,6 +167,55 @@ Status CreditCapabilityCodecV1::decode(
         decoded.push_back(version);
     }
     versions = std::move(decoded);
+    return Status::OK();
+}
+
+Status CreditActivationCodecV1::encode(const CreditActivationV1& activation,
+                                       std::string& wire) {
+    if (activation.schema_version != 1 || activation.chosen_version != 1 ||
+        (!activation.receiver_session_id.high &&
+         !activation.receiver_session_id.low) ||
+        !activation.epoch)
+        return Status::InvalidArgument(
+            "invalid receiver credit activation" LOC_MARK);
+    std::string encoded;
+    encoded.reserve(kWireBytes);
+    append32(encoded, kActivationMagic);
+    append16(encoded, activation.schema_version);
+    append16(encoded, activation.chosen_version);
+    append64(encoded, activation.receiver_session_id.high);
+    append64(encoded, activation.receiver_session_id.low);
+    append64(encoded, activation.epoch);
+    append32(encoded, activation.freshness_ttl_ms);
+    append32(encoded, 0);
+    wire.swap(encoded);
+    return Status::OK();
+}
+
+Status CreditActivationCodecV1::decode(std::string_view wire,
+                                       CreditActivationV1& activation) {
+    if (wire.size() != kWireBytes)
+        return Status::InvalidArgument(
+            "invalid receiver credit activation length" LOC_MARK);
+    size_t p = 0;
+    if (read32(wire, p) != kActivationMagic)
+        return Status::InvalidArgument(
+            "invalid receiver credit activation magic" LOC_MARK);
+    CreditActivationV1 decoded;
+    decoded.schema_version = read16(wire, p);
+    decoded.chosen_version = read16(wire, p);
+    decoded.receiver_session_id.high = read64(wire, p);
+    decoded.receiver_session_id.low = read64(wire, p);
+    decoded.epoch = read64(wire, p);
+    decoded.freshness_ttl_ms = read32(wire, p);
+    uint32_t reserved = read32(wire, p);
+    if (decoded.schema_version != 1 || decoded.chosen_version != 1 ||
+        (!decoded.receiver_session_id.high &&
+         !decoded.receiver_session_id.low) ||
+        !decoded.epoch || reserved != 0)
+        return Status::InvalidArgument(
+            "invalid receiver credit activation header" LOC_MARK);
+    activation = decoded;
     return Status::OK();
 }
 
