@@ -189,9 +189,11 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
         if (!XferBenchConfig::target_seg_name.empty() &&
-            XferBenchConfig::op_type == "mix" &&
+            (XferBenchConfig::op_type == "mix" ||
+             XferBenchConfig::check_consistency) &&
             XferBenchConfig::receiver_credit_operations % 2 != 0) {
-            LOG(ERROR) << "receiver_credit_operations must be even for mix";
+            LOG(ERROR) << "receiver_credit_operations must be even for mix "
+                          "or consistency workloads";
             return EXIT_FAILURE;
         }
     }

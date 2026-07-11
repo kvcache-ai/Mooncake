@@ -269,7 +269,7 @@ int TENTBenchRunner::runTarget() {
     std::unordered_map<std::string, ReceiverDemand> active;
     std::unordered_set<std::string> seen;
     std::deque<ReceiverDemand> pending;
-    std::vector<DelayedReceiverRelease> delayed;
+    std::deque<DelayedReceiverRelease> delayed;
     std::unordered_map<std::string, SegmentID> sender_handles;
     std::vector<double> completion_latency_us;
     uint64_t offered = 0;
@@ -334,21 +334,19 @@ int TENTBenchRunner::runTarget() {
     auto processDueReleases = [&]() {
         const uint64_t now_us = steadyNowUs();
         bool released = false;
-        for (auto it = delayed.begin(); it != delayed.end();) {
-            if (it->due_us > now_us) {
-                ++it;
-                continue;
-            }
-            if (!tracker.release(it->demand.bytes, it->demand.slots)) {
+        while (!delayed.empty() && delayed.front().due_us <= now_us) {
+            auto release = std::move(delayed.front());
+            delayed.pop_front();
+            if (!tracker.release(release.demand.bytes,
+                                 release.demand.slots)) {
                 ++data_errors;
             } else {
-                completed += it->demand.slots;
-                completed_bytes += it->demand.bytes;
+                completed += release.demand.slots;
+                completed_bytes += release.demand.bytes;
                 last_completion_us = now_us;
                 completion_latency_us.push_back(
-                    static_cast<double>(now_us - it->demand.arrival_us));
+                    static_cast<double>(now_us - release.demand.arrival_us));
             }
-            it = delayed.erase(it);
             released = true;
         }
         if (released && mode == "credit") grantPending();
@@ -364,6 +362,10 @@ int TENTBenchRunner::runTarget() {
             return;
         }
         for (const auto& notification : notifications) {
+            if (notification.name != kReceiverCreditDemand &&
+                notification.name != kReceiverCreditRelease) {
+                continue;
+            }
             try {
                 const auto payload = nlohmann::json::parse(notification.msg);
                 if (payload.value("schema_version", 0) != 1) {
