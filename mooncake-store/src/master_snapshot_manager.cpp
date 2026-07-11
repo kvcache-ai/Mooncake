@@ -183,7 +183,7 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             // Save current state using the configured persistence mechanism
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                           snapshot_id);
-            auto result = PersistState(descriptor.value());
+            auto result = PersistState(descriptor.value(), false);
             if (!result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
@@ -481,6 +481,11 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
 
 tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     const ha::SnapshotDescriptor& descriptor) {
+    return PersistState(descriptor, true);
+}
+
+tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
+    const ha::SnapshotDescriptor& descriptor, bool lock_snapshot_mutex) {
     const std::string& snapshot_id = descriptor.snapshot_id;
     const std::string& path_prefix = descriptor.object_prefix;
     const std::string& manifest_path = descriptor.manifest_key;
@@ -499,8 +504,9 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         std::vector<uint8_t> serialized_metadata;
         std::vector<uint8_t> serialized_segment;
         std::vector<uint8_t> serialized_task_manager;
-        {
-            std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+
+        auto serialize_payloads =
+            [&]() -> tl::expected<void, SerializationError> {
             MasterService::MetadataSerializer metadata_serializer(
                 master_service_);
             SegmentSerializer segment_serializer(
@@ -553,6 +559,20 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             serialized_metadata = std::move(metadata_result.value());
             serialized_segment = std::move(segment_result.value());
             serialized_task_manager = std::move(task_manager_result.value());
+            return {};
+        };
+
+        if (lock_snapshot_mutex) {
+            std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+            auto serialize_result = serialize_payloads();
+            if (!serialize_result) {
+                return tl::make_unexpected(serialize_result.error());
+            }
+        } else {
+            auto serialize_result = serialize_payloads();
+            if (!serialize_result) {
+                return tl::make_unexpected(serialize_result.error());
+            }
         }
 
         // When backup_dir is enabled, try all uploads to ensure complete backup
